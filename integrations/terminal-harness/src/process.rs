@@ -4,17 +4,191 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until, timeout_at};
-use tracing::debug;
+use tracing::{debug, warn};
 
-use crate::{HarnessError, Outcome, RunFailure, RunnerEvent, TRACE_TARGET};
+use crate::output_limits::charge;
+use crate::{
+    HarnessError, Outcome, OutputLimitKind, RunFailure, RunnerEvent, TRACE_TARGET,
+    TurnOutputControl,
+};
 
 const STDERR_CAPTURE_BYTES: usize = 4096;
 const POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const STDOUT_SCRATCH_BYTES: usize = 8 * 1024;
+
+/// Why the stdout framer stopped before producing a record.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FrameError {
+    Limit(OutputLimitKind),
+    Io,
+}
+
+/// Incremental LF-delimited record reader with fixed scratch space.
+///
+/// Raw bytes are charged before they are copied; a record never grows past
+/// `max_record_bytes`. `next_record` awaits only when no buffered bytes remain,
+/// so cancelling it never loses data.
+pub(crate) struct RecordFramer<R> {
+    reader: R,
+    scratch: Box<[u8]>,
+    start: usize,
+    end: usize,
+    record: Vec<u8>,
+    max_record_bytes: usize,
+    max_stdout_bytes: usize,
+    stdout_bytes: usize,
+    eof: bool,
+}
+
+impl<R: AsyncRead + Unpin> RecordFramer<R> {
+    pub(crate) fn new(reader: R, max_record_bytes: usize, max_stdout_bytes: usize) -> Self {
+        Self {
+            reader,
+            scratch: vec![0; STDOUT_SCRATCH_BYTES].into_boxed_slice(),
+            start: 0,
+            end: 0,
+            record: Vec::new(),
+            max_record_bytes,
+            max_stdout_bytes,
+            stdout_bytes: 0,
+            eof: false,
+        }
+    }
+
+    /// Returns the next record without its LF (and a CR directly before that LF),
+    /// the final unterminated record at EOF, or `None` after EOF.
+    pub(crate) async fn next_record(&mut self) -> Result<Option<Vec<u8>>, FrameError> {
+        loop {
+            if let Some(record) = self.take_buffered_record()? {
+                return Ok(Some(record));
+            }
+            if self.eof {
+                return Ok((!self.record.is_empty()).then(|| std::mem::take(&mut self.record)));
+            }
+            let remaining = self.max_stdout_bytes - self.stdout_bytes;
+            // Read at most one byte past the budget so a breach is exact.
+            let want = self.scratch.len().min(remaining.saturating_add(1));
+            let read = self
+                .reader
+                .read(&mut self.scratch[..want])
+                .await
+                .map_err(|_| FrameError::Io)?;
+            if read == 0 {
+                self.eof = true;
+                continue;
+            }
+            if read > remaining {
+                return Err(FrameError::Limit(OutputLimitKind::StdoutBytes));
+            }
+            self.stdout_bytes += read;
+            self.start = 0;
+            self.end = read;
+        }
+    }
+
+    fn take_buffered_record(&mut self) -> Result<Option<Vec<u8>>, FrameError> {
+        let pending = &self.scratch[self.start..self.end];
+        if pending.is_empty() {
+            return Ok(None);
+        }
+        let delimiter = pending.iter().position(|byte| *byte == b'\n');
+        let take = delimiter.unwrap_or(pending.len());
+        if self
+            .record
+            .len()
+            .checked_add(take)
+            .is_none_or(|length| length > self.max_record_bytes)
+        {
+            return Err(FrameError::Limit(OutputLimitKind::StdoutRecord));
+        }
+        let needed = self.record.len() + take;
+        if needed > self.record.capacity() {
+            let target = needed.max(
+                self.record
+                    .capacity()
+                    .saturating_mul(2)
+                    .min(self.max_record_bytes),
+            );
+            self.record.reserve_exact(target - self.record.len());
+        }
+        self.record.extend_from_slice(&pending[..take]);
+        match delimiter {
+            Some(position) => {
+                self.start += position + 1;
+                let mut record = std::mem::take(&mut self.record);
+                if record.last() == Some(&b'\r') {
+                    record.pop();
+                }
+                Ok(Some(record))
+            }
+            None => {
+                self.start = self.end;
+                Ok(None)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn record_capacity(&self) -> usize {
+        self.record.capacity()
+    }
+
+    #[cfg(test)]
+    fn stdout_bytes(&self) -> usize {
+        self.stdout_bytes
+    }
+}
+
+/// Producer-side invocation counters, checked before parsing and forwarding.
+struct ProducerBudget {
+    events: usize,
+    text_bytes: usize,
+    text_events: usize,
+}
+
+impl ProducerBudget {
+    fn new() -> Self {
+        Self {
+            events: 0,
+            text_bytes: 0,
+            text_events: 0,
+        }
+    }
+
+    fn charge_record(&mut self, output: &TurnOutputControl) -> Result<(), OutputLimitKind> {
+        charge(
+            &mut self.events,
+            1,
+            output.limits().max_backend_events(),
+            OutputLimitKind::BackendEvents,
+        )
+    }
+
+    fn charge_text(
+        &mut self,
+        output: &TurnOutputControl,
+        text: &str,
+    ) -> Result<(), OutputLimitKind> {
+        let limits = output.limits();
+        charge(
+            &mut self.text_events,
+            1,
+            limits.max_text_events(),
+            OutputLimitKind::AssistantTextEvents,
+        )?;
+        charge(
+            &mut self.text_bytes,
+            text.len(),
+            limits.max_text_bytes(),
+            OutputLimitKind::AssistantTextBytes,
+        )
+    }
+}
 
 #[cfg(unix)]
 struct ProcessGroupGuard {
@@ -176,6 +350,8 @@ pub struct ProcessSpec {
     pub total_timeout: Duration,
     /// Presentation-idle interval. Expiry reports unknown liveness but never kills work.
     pub idle_timeout: Duration,
+    /// Invocation output limits and stop latch shared with the reply collector.
+    pub output: TurnOutputControl,
 }
 
 impl fmt::Debug for ProcessSpec {
@@ -189,6 +365,7 @@ impl fmt::Debug for ProcessSpec {
             .field("backend_name", &self.backend_name)
             .field("total_timeout", &self.total_timeout)
             .field("idle_timeout", &self.idle_timeout)
+            .field("output", &self.output)
             .finish_non_exhaustive()
     }
 }
@@ -274,7 +451,14 @@ where
         backend_name,
         total_timeout,
         idle_timeout,
+        output,
     } = spec;
+    if let Some(error) = output.stop_error() {
+        return Err(RunFailure {
+            error,
+            observed_session: None,
+        });
+    }
     let mut command = Command::new(executable);
     command
         .args(args)
@@ -347,7 +531,13 @@ where
     let mut reported_liveness_unknown = false;
 
     let lifecycle_result = timeout_at(total_deadline, async {
-        let mut lines = BufReader::new(stdout).lines();
+        let limits = output.limits();
+        let mut records = RecordFramer::new(
+            stdout,
+            limits.max_record_bytes(),
+            limits.max_stdout_bytes(),
+        );
+        let mut budget = ProducerBudget::new();
         let mut child_status = None;
         let mut post_exit_deadline = None;
         // Preserve exit polling and its backoff while stdout is active.
@@ -357,8 +547,9 @@ where
             // Buffered lines may complete without touching the I/O driver.
             // Keep timers and other tasks live even under continuous output.
             tokio::task::consume_budget().await;
-            let line = tokio::select! {
+            let record = tokio::select! {
                 biased;
+                kind = output.stopped() => return Err(HarnessError::OutputLimitExceeded { kind }),
                 _ = sleep_until(post_exit_deadline.unwrap_or(total_deadline)), if post_exit_deadline.is_some() => break,
                 status = &mut child_exit, if child_status.is_none() => {
                     child_status = Some(status.map_err(HarnessError::from)?);
@@ -367,23 +558,26 @@ where
                     // notification loses the race to exit observation. Drain to EOF.
                     continue;
                 },
-                line = lines.next_line() => Some(line),
+                record = records.next_record() => record,
                 _ = sleep_until(idle_deadline) => {
                     if !reported_liveness_unknown {
-                        tx.send(RunnerEvent::LivenessUnknown)
-                            .await
-                            .map_err(|_| HarnessError::BackendStream)?;
+                        output.send_event(&tx, RunnerEvent::LivenessUnknown).await?;
                         reported_liveness_unknown = true;
                     }
                     idle_deadline = Instant::now() + idle_timeout;
                     continue;
                 }
             };
-            let line = match line.expect("line branch returns a value") {
-                Err(_) => return Err(HarnessError::BackendStream),
-                Ok(Some(line)) => line,
+            let record = match record {
+                Err(FrameError::Limit(kind)) => return Err(output.exceeded(kind)),
+                Err(FrameError::Io) => return Err(HarnessError::BackendStream),
+                Ok(Some(record)) => record,
                 Ok(None) => break,
             };
+            budget
+                .charge_record(&output)
+                .map_err(|kind| output.exceeded(kind))?;
+            let line = String::from_utf8(record).map_err(|_| HarnessError::BackendStream)?;
             if !line.is_empty() {
                 match parse_event(&line) {
                     Ok(ParsedEvent::Session(session_id)) => {
@@ -392,12 +586,13 @@ where
                         }
                     }
                     Ok(ParsedEvent::Text(text)) => {
+                        budget
+                            .charge_text(&output, &text)
+                            .map_err(|kind| output.exceeded(kind))?;
                         if !text.trim().is_empty() {
                             // Reset below only after bounded backpressure clears. The total
                             // deadline, not the idle deadline, covers intentional send waits.
-                            tx.send(RunnerEvent::Text(text))
-                                .await
-                                .map_err(|_| HarnessError::BackendStream)?;
+                            output.send_event(&tx, RunnerEvent::Text(text)).await?;
                         }
                     }
                     Ok(ParsedEvent::Error {
@@ -496,12 +691,12 @@ where
         tokio::pin!(completion);
         let (status, stderr) = loop {
             tokio::select! {
+                biased;
+                kind = output.stopped() => return Err(HarnessError::OutputLimitExceeded { kind }),
                 result = &mut completion => break result?,
                 _ = sleep_until(idle_deadline) => {
                     if !reported_liveness_unknown {
-                        tx.send(RunnerEvent::LivenessUnknown)
-                            .await
-                            .map_err(|_| HarnessError::BackendStream)?;
+                        output.send_event(&tx, RunnerEvent::LivenessUnknown).await?;
                         reported_liveness_unknown = true;
                     }
                     idle_deadline = Instant::now() + idle_timeout;
@@ -519,6 +714,30 @@ where
     })
     .await;
 
+    // A breach latched by either side outranks any later success or failure.
+    if let Some(kind) = output.latched() {
+        let cleanup_required = !matches!(lifecycle_result, Ok(Ok(_)));
+        if cleanup_required {
+            cleanup_failed_run(
+                &mut child,
+                &mut process_group,
+                &mut stderr_task,
+                writer_task.as_mut(),
+            )
+            .await;
+        }
+        warn!(
+            target: TRACE_TARGET,
+            method = trace_method,
+            backend = backend_name,
+            limit = kind.as_str(),
+            "backend output limit exceeded; process group terminated"
+        );
+        return Err(RunFailure {
+            error: HarnessError::OutputLimitExceeded { kind },
+            observed_session,
+        });
+    }
     match lifecycle_result {
         Ok(Ok(outcome)) => Ok(outcome),
         Ok(Err(error)) => {
@@ -736,6 +955,129 @@ mod tests {
         let mut value = "ééé".to_owned();
         truncate_to_char_boundary(&mut value, 5);
         assert_eq!(value, "éé");
+    }
+
+    /// Yields at most `chunk` bytes per read to exercise split records.
+    struct ChunkedReader {
+        data: Vec<u8>,
+        position: usize,
+        chunk: usize,
+    }
+
+    impl ChunkedReader {
+        fn new(data: impl Into<Vec<u8>>, chunk: usize) -> Self {
+            Self {
+                data: data.into(),
+                position: 0,
+                chunk,
+            }
+        }
+    }
+
+    impl AsyncRead for ChunkedReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let end = self
+                .data
+                .len()
+                .min(self.position + self.chunk.min(buf.remaining()));
+            let position = self.position;
+            buf.put_slice(&self.data[position..end]);
+            self.position = end;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn frame_all(
+        data: &[u8],
+        chunk: usize,
+        max_record: usize,
+        max_stdout: usize,
+    ) -> (Vec<Vec<u8>>, Option<FrameError>) {
+        let mut framer = RecordFramer::new(ChunkedReader::new(data, chunk), max_record, max_stdout);
+        let mut records = Vec::new();
+        loop {
+            match framer.next_record().await {
+                Ok(Some(record)) => {
+                    assert!(framer.record_capacity() <= max_record);
+                    records.push(record);
+                }
+                Ok(None) => return (records, None),
+                Err(error) => return (records, Some(error)),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn framer_admits_records_exactly_at_cap_on_lf_and_eof() {
+        for chunk in [1, 3, STDOUT_SCRATCH_BYTES] {
+            let (records, error) = frame_all(b"abcd\nefgh", chunk, 4, 64).await;
+            assert_eq!(error, None);
+            assert_eq!(records, vec![b"abcd".to_vec(), b"efgh".to_vec()]);
+        }
+    }
+
+    #[tokio::test]
+    async fn framer_rejects_record_one_byte_over_cap_before_newline() {
+        for chunk in [1, 2, STDOUT_SCRATCH_BYTES] {
+            let (records, error) = frame_all(b"ok\nabcde\nlater\n", chunk, 4, 64).await;
+            assert_eq!(records, vec![b"ok".to_vec()]);
+            assert_eq!(
+                error,
+                Some(FrameError::Limit(OutputLimitKind::StdoutRecord))
+            );
+            let (_, error) = frame_all(b"abcde", chunk, 4, 64).await;
+            assert_eq!(
+                error,
+                Some(FrameError::Limit(OutputLimitKind::StdoutRecord))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn framer_counts_carriage_return_and_strips_it_only_before_lf() {
+        let (records, error) = frame_all(b"abc\r\na\rb\n", 1, 4, 64).await;
+        assert_eq!(error, None);
+        assert_eq!(records, vec![b"abc".to_vec(), b"a\rb".to_vec()]);
+        let (_, error) = frame_all(b"abcd\r\n", 2, 4, 64).await;
+        assert_eq!(
+            error,
+            Some(FrameError::Limit(OutputLimitKind::StdoutRecord))
+        );
+        let (records, error) = frame_all(b"abc\r", 1, 4, 64).await;
+        assert_eq!(error, None);
+        assert_eq!(records, vec![b"abc\r".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn framer_counts_every_raw_stdout_byte_including_blank_records() {
+        let data = b"a\n\n\r\nb\n";
+        let (records, error) = frame_all(data, 1, 8, data.len()).await;
+        assert_eq!(error, None);
+        assert_eq!(records.len(), 4);
+        for chunk in [1, 4, STDOUT_SCRATCH_BYTES] {
+            let (_, error) = frame_all(data, chunk, 8, data.len() - 1).await;
+            assert_eq!(error, Some(FrameError::Limit(OutputLimitKind::StdoutBytes)));
+        }
+    }
+
+    #[tokio::test]
+    async fn framer_tracks_stdout_bytes_and_never_reads_far_past_the_budget() {
+        let data = vec![b'x'; STDOUT_SCRATCH_BYTES * 4];
+        let mut framer = RecordFramer::new(
+            ChunkedReader::new(data, STDOUT_SCRATCH_BYTES),
+            STDOUT_SCRATCH_BYTES * 8,
+            STDOUT_SCRATCH_BYTES + 3,
+        );
+        assert_eq!(
+            framer.next_record().await,
+            Err(FrameError::Limit(OutputLimitKind::StdoutBytes))
+        );
+        assert_eq!(framer.stdout_bytes(), STDOUT_SCRATCH_BYTES);
+        assert!(framer.record_capacity() <= STDOUT_SCRATCH_BYTES * 8);
     }
 
     #[tokio::test]

@@ -9,6 +9,29 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- `wn-claude`, `wn-codex`, `wn-opencode`, and `wn-pi` now bound each backend
+  turn's output. They cap single JSONL records, raw stdout, framed events,
+  assistant text, artifact captions and counts, staged reply chunks, and
+  durable send attempts (including retries and status notices). Each cap has a
+  finite default and hard maximum, configurable through
+  `WN_<BACKEND>_MAX_*` variables. On the first breach the connector stops the
+  backend and its process group, sends nothing more for that turn, and leaves a
+  limited turn that `/discard-last` clears (or `/retry-last` reruns when a
+  backend session is known). A completed buffered reply batch that would
+  exceed the chunk cap is rejected before any of it is sent, and a
+  `/retry-last` that breaches a limit keeps the earlier turn's pending
+  deliveries. Durable send budgets persist across restarts and also cap
+  reconciliation replays. A discarded turn stays withheld until its pending
+  artifact deliveries are durably removed; if that fails, `/discard-last`
+  reports the failure instead of releasing the turn's output on a fresh
+  budget. A turn interrupted by a connector restart is loaded
+  as a limited turn that `/discard-last` clears, and a message queued behind a
+  limited turn receives one notice naming the recovery command instead of
+  waiting silently. See the
+  [terminal harness output limits](../../integrations/terminal-harness/README.md#output-limits).
+
 ## [0.12.0] - 2026-10-02
 
 Update generated Swift/Kotlin bindings, native libraries and C headers together. Account storage advances through

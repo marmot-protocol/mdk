@@ -123,6 +123,8 @@ All connectors:
 - reject a complete attachment batch before backend invocation when any download, regular-file/ownership check, count limit, or aggregate-byte limit fails;
 - give backends `attachment_preflight::revalidate`, which re-opens a staged copy without following symlinks immediately before spawn and fails the batch on a relative or non-UTF-8 path, a non-regular file, or a size change;
 - remove batch copies after every terminal path and reconcile stale connector-owned batch directories on startup;
+- bound every backend invocation's stdout framing, parsed output, and durable
+  output requests with the per-turn [output limits](#output-limits);
 - keep diagnostics free of identifiers, paths, prompts, attachment names, and backend output.
 
 Backends that declare artifact support can also return completed files to the chat through `wn-agent`'s encrypted
@@ -133,6 +135,72 @@ its [README](../codex/marmot/README.md).
 Download timeouts, connector rejections, and local file-validation failures have
 distinct privacy-safe pre-backend replies. The connector never forwards a
 server-provided error string or attachment metadata into those replies.
+
+### Output Limits
+
+Each backend invocation gets finite output budgets. Connectors read them from
+`<PREFIX>_<SUFFIX>`, where the prefix is `WN_CLAUDE`, `WN_CODEX`,
+`WN_OPENCODE`, or `WN_PI`. Every value must be a decimal integer from 1 to its
+hard maximum; zero, signs, malformed values, and values above the maximum are
+rejected at startup without echoing the value.
+
+| Suffix | Default | Hard maximum | Counts |
+| --- | --- | --- | --- |
+| `MAX_BACKEND_RECORD_BYTES` | 1 MiB | 4 MiB | Bytes in one stdout JSONL record, excluding the delimiter |
+| `MAX_BACKEND_STDOUT_BYTES` | 16 MiB | 64 MiB | Raw stdout bytes, including delimiters and blank, ignored, or malformed records |
+| `MAX_BACKEND_EVENTS` | 8192 | 65536 | Framed stdout records, charged before UTF-8 decoding or parsing |
+| `MAX_ASSISTANT_TEXT_BYTES` | 1 MiB | 8 MiB | Parsed assistant-text bytes, including whitespace-only text |
+| `MAX_ASSISTANT_TEXT_EVENTS` | 256 | 4096 | Parsed assistant-text events |
+| `MAX_ARTIFACT_BUFFER_BYTES` | 512 KiB | 4 MiB | Assistant text retained as an artifact caption, including separators |
+| `ARTIFACT_MAX_COUNT` | 10 | 10 | Declared artifacts summed across every artifact event in the turn |
+| `MAX_REPLY_CHUNKS` | 64 | 256 | Reply chunks staged for the turn; a text, or a completed buffered batch, that would cross the cap stages none of its chunks |
+| `MAX_DURABLE_SENDS` | 128 | 512 | Final, media, and activity requests for the turn, including every retry and status notice |
+
+The stdout framer never buffers more than one record plus a fixed scratch
+buffer, so an unterminated or oversized record is rejected before any of it is
+parsed. The first breached limit wins: the connector stops the backend, drains
+nothing further from it, and terminates its process group. A durable request
+already waiting for acknowledgement is abandoned rather than awaited. Channel
+backpressure between the runner and the delivery loop only delays the runner;
+it never grows a buffer.
+
+After a breach the turn sends nothing more: no buffered text, fallback text,
+liveness or activity notice, artifact, or error reply. The turn is persisted as
+limited behind an incomplete-final barrier, and any chunks staged but unsent
+are withheld from reconciliation. When a backend session is known, the prompt
+is kept as an uncertain-outcome recovery record because the backend may already
+have acted; `/retry-last` reruns it and `/discard-last` clears it. Without a
+session the barrier is discard-only. Either command releases the group's FIFO
+lane; other groups are unaffected. A retry releases the earlier turn's pending
+deliveries only after its own completion, including its final status notice,
+stays within every limit; a retry that breaches a limit keeps both turns behind
+the barrier until `/discard-last`.
+
+A discard keeps its turns withheld and the group blocked until the turns'
+pending artifact deliveries are durably removed. If that removal fails,
+`/discard-last` reports the failure and nothing from those turns is sent,
+including after a restart. Sending `/discard-last` again completes the discard.
+Replay rechecks that each staged chunk or artifact delivery is still pending
+before it is sent, so a discarded turn is never replayed on a fresh budget.
+
+Durable send budgets survive restarts. Startup and periodic reconciliation
+replay staged chunks only for turns that have finished, charge each replay
+attempt against the same budget, and mark a turn limited instead of sending once
+its budget is exhausted. Records written before budgets existed get a fresh
+finite budget on first replay. Each admitted send attempt rewrites the private
+delivery-state file before its request, so a turn performs at most
+`MAX_DURABLE_SENDS` such writes.
+
+If the connector stops or restarts while a turn is running, that turn's outcome
+is unknown: the backend may have acted or breached a limit before the stop.
+Startup therefore loads it as limited behind the same discardable barrier, and
+its staged but unacknowledged chunks are not replayed. Other groups and turns
+that had already finished are unaffected. Send `/discard-last` in that chat to
+release it. Discarding does not clear a saved backend session.
+
+While a chat waits on `/retry-last` or `/discard-last` for a limited or
+interrupted turn, each newly queued message gets one activity notice naming the
+available command, then stays queued until the barrier is released.
 
 ## Chat Commands
 
@@ -150,8 +218,8 @@ never reaches the backend:
 | `/new` | End the active backend session and keep the workdir. |
 | `/reset-session` | Same as `/new`. |
 | `/session-status` | Reserved for the active-turn status lane; until that lane is supported, return an unavailable reply without invoking the backend. |
-| `/retry-last` | Retry the durable recovery record that currently blocks this chat. |
-| `/discard-last` | Discard the durable recovery record without replay. |
+| `/retry-last` | Retry the pending durable recovery record that blocks this chat. |
+| `/discard-last` | Discard the recovery record and any incomplete, interrupted, or limited turn that blocks this chat, without replay. |
 | `/goal <text>` | Store a standing instruction for this chat. `/goal` shows it; `/goal clear` removes it. |
 
 A reserved name used with arguments it does not accept, such as
@@ -191,11 +259,18 @@ That costs prompt tokens on every turn and, in exchange, survives session
 resets, lost session ids, and backend context compaction. Goals are bounded to
 4096 bytes and live only in the connector's private per-group state file.
 
-`/retry-last` and `/discard-last` are available only while one matching durable
-recovery record blocks that group. Retry consumes that record once and runs ahead
-of queued prompts; discard removes it without replay. An uncertain outcome warns
-that retrying may repeat side effects. Recovery state is stored in private files
-and is never included in logs or diagnostics.
+`/retry-last` and `/discard-last` run ahead of queued prompts and are refused
+while a turn is running. Retry requires a pending durable recovery record for
+that group: it consumes the record once and reruns its prompt in the saved
+session and workdir. A barrier without such a record, such as an incomplete,
+interrupted, or limited turn with no known backend session, cannot be retried.
+Discard removes the recovery record when one exists and also clears every
+incomplete-final, interrupted, or limited-turn barrier in that group, with or
+without a record or session. Nothing from a discarded turn is replayed, and the
+discard is confirmed only after the turn's pending deliveries are durably
+removed (see [output limits](#output-limits)). An uncertain outcome warns that
+retrying may repeat side effects. Recovery state is stored in private files and
+is never included in logs or diagnostics.
 
 The connector READMEs document their environment variables, installer topology,
 and backend contracts:

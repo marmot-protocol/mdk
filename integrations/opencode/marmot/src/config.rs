@@ -94,4 +94,36 @@ mod tests {
         pairs.push(("WN_OPENCODE_MAX_REPLY_BYTES", "60001"));
         assert!(Config::from_pairs(&pairs).is_err());
     }
+
+    #[test]
+    fn output_limits_use_the_adapter_env_prefix() {
+        let config = Config::from_pairs(&defaults()).unwrap();
+        let limits = config.0.harness.output_limits;
+        assert_eq!(limits.max_record_bytes(), 1024 * 1024);
+        assert_eq!(limits.max_durable_sends(), 128);
+
+        let mut pairs = defaults();
+        pairs.push(("WN_OPENCODE_MAX_BACKEND_RECORD_BYTES", "64"));
+        pairs.push(("WN_OPENCODE_MAX_ASSISTANT_TEXT_EVENTS", "2"));
+        pairs.push(("WN_OPENCODE_MAX_DURABLE_SENDS", "3"));
+        let config = Config::from_pairs(&pairs).unwrap();
+        let limits = config.0.harness.output_limits;
+        assert_eq!(limits.max_record_bytes(), 64);
+        assert_eq!(limits.max_text_events(), 2);
+        assert_eq!(limits.max_durable_sends(), 3);
+
+        for (name, value) in [
+            ("WN_OPENCODE_MAX_BACKEND_STDOUT_BYTES", "67108865"),
+            ("WN_OPENCODE_MAX_REPLY_CHUNKS", "0"),
+            ("WN_OPENCODE_MAX_BACKEND_EVENTS", "-1"),
+        ] {
+            let mut pairs = defaults();
+            pairs.push((name, value));
+            let error = Config::from_pairs(&pairs)
+                .err()
+                .expect("out-of-range output limit");
+            assert!(error.to_string().contains(name));
+            assert!(!error.to_string().contains(value));
+        }
+    }
 }

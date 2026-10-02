@@ -95,6 +95,7 @@ async fn run_with_bin(
         session_id,
         prompt,
         artifact_output: _,
+        output,
     } = invocation;
     let prepared = prepare_attachments(attachments).map_err(|error| RunFailure {
         error,
@@ -117,6 +118,7 @@ async fn run_with_bin(
             backend_name: "pi",
             total_timeout: timeout,
             idle_timeout,
+            output,
         },
         tx,
         |line| parser.parse(line),
@@ -490,6 +492,7 @@ printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"
                 session_id: None,
                 prompt: "--prompt-via-stdin".to_owned(),
                 artifact_output: None,
+                output: Default::default(),
             },
             &[],
             tx,
@@ -545,6 +548,7 @@ printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"
                 session_id: Some("missing-session".to_owned()),
                 prompt: "p".repeat(60_000),
                 artifact_output: None,
+                output: Default::default(),
             },
             &[],
             tx,
@@ -589,6 +593,7 @@ exit 64
                 session_id: None,
                 prompt: "p".repeat(60_000),
                 artifact_output: None,
+                output: Default::default(),
             },
             &[],
             tx,
@@ -624,6 +629,7 @@ exit 64
                 session_id: Some("wn-pi-real-contract".to_owned()),
                 prompt: "Reply with exactly PI_CONNECTOR_OK and nothing else.".to_owned(),
                 artifact_output: None,
+                output: Default::default(),
             },
             &[],
             tx,
@@ -711,6 +717,7 @@ exit 64
             session_id: session_id.map(str::to_owned),
             prompt: "caption on stdin".to_owned(),
             artifact_output: None,
+            output: Default::default(),
         }
     }
 
@@ -1308,6 +1315,7 @@ printf '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type
             session_id: session_id.map(str::to_owned),
             prompt: prompt.to_owned(),
             artifact_output: None,
+            output: Default::default(),
         };
 
         let (tx, mut rx) = mpsc::channel(8);
@@ -1363,5 +1371,83 @@ printf '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type
             reply.push_str(&text);
         }
         assert!(reply.contains(token), "{reply}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runner_inherits_the_configured_record_limit() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("oversized-backend");
+        let pid_path = root.path().join("descendant.pid");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env bash\nsleep 30 &\necho $! > '{}'\nprintf '%0100d\\n' 0\nwait\n",
+                pid_path.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let limits = marmot_terminal_harness::OutputLimits::new(
+            marmot_terminal_harness::OutputLimitSettings {
+                max_record_bytes: 16,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let invocation = Invocation {
+            timeout: std::time::Duration::from_secs(10),
+            idle_timeout: std::time::Duration::from_secs(5),
+            cwd: root.path().to_path_buf(),
+            session_id: None,
+            prompt: "private prompt".to_owned(),
+            artifact_output: None,
+            output: marmot_terminal_harness::TurnOutputControl::new(limits),
+        };
+        let (tx, mut rx) = mpsc::channel(4);
+        let session_dir = root.path().join("private-sessions");
+        fs_private::create_dir_all_private(&session_dir).unwrap();
+        let failure = run_with_bin(
+            script.to_str().unwrap(),
+            &session_dir,
+            ExecutionProfile::Inherit,
+            invocation,
+            &[],
+            tx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            failure.error,
+            marmot_terminal_harness::HarnessError::OutputLimitExceeded {
+                kind: marmot_terminal_harness::OutputLimitKind::StdoutRecord
+            }
+        ));
+        assert!(rx.recv().await.is_none());
+        let pid = std::fs::read_to_string(&pid_path).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .output()
+            .is_ok_and(|output| output.status.success())
+            && std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(") ")
+                        .map(|(_, rest)| rest.starts_with('Z'))
+                })
+                != Some(true)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "backend descendant survived the limit"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 }

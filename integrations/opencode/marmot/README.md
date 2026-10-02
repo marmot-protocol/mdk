@@ -135,6 +135,7 @@ Configure with environment variables:
 | `WN_OPENCODE_TIMEOUT_SECS` | `3600` | Total invocation policy limit; ongoing output does not reset it |
 | `WN_OPENCODE_REQUEST_TIMEOUT_SECS` | `30` | Timeout for each control-socket request |
 | `WN_OPENCODE_MAX_REPLY_BYTES` | `30000` | UTF-8 byte limit for each durable Marmot reply chunk |
+| `WN_OPENCODE_MAX_BACKEND_RECORD_BYTES`, `WN_OPENCODE_MAX_BACKEND_STDOUT_BYTES`, `WN_OPENCODE_MAX_BACKEND_EVENTS`, `WN_OPENCODE_MAX_ASSISTANT_TEXT_BYTES`, `WN_OPENCODE_MAX_ASSISTANT_TEXT_EVENTS`, `WN_OPENCODE_MAX_ARTIFACT_BUFFER_BYTES`, `WN_OPENCODE_MAX_REPLY_CHUNKS`, `WN_OPENCODE_MAX_DURABLE_SENDS` | shared defaults | Per-turn backend output and durable-send limits; see [Output Limits](../../terminal-harness/README.md#output-limits) |
 | `WN_OPENCODE_MAX_PENDING_PER_GROUP` | `4` | Per-group in-flight/queued prompt cap |
 | `WN_OPENCODE_MAX_ATTACHMENTS` | `8` | Maximum inbound files in one turn |
 | `WN_OPENCODE_MAX_ATTACHMENT_BYTES` | `67108864` | Maximum aggregate plaintext bytes in one inbound batch |

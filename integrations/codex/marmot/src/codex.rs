@@ -95,6 +95,7 @@ async fn run_with_bin(
         session_id,
         mut prompt,
         artifact_output,
+        output,
     } = invocation;
     let prepared = prepare_attachments(&attachments).map_err(|error| RunFailure {
         error,
@@ -126,6 +127,7 @@ async fn run_with_bin(
             backend_name: "codex",
             total_timeout: timeout,
             idle_timeout,
+            output: output.clone(),
         },
         tx.clone(),
         parse_event_line,
@@ -140,32 +142,39 @@ async fn run_with_bin(
             return Err(failure);
         }
     };
+    if let Some(error) = output.stop_error() {
+        // A breach latched after exit withholds the completion file entirely.
+        if let Some(request) = &artifact_output {
+            let _ = std::fs::remove_file(request.manifest_path());
+        }
+        return Err(RunFailure {
+            error,
+            observed_session: outcome.observed_session,
+        });
+    }
     if let Some(request) = artifact_output {
         let artifacts_result = read_artifact_output_manifest(request.manifest_path());
         let _ = std::fs::remove_file(request.manifest_path());
-        match artifacts_result {
-            Ok(artifacts) if !artifacts.is_empty() => {
-                tx.send(RunnerEvent::Artifacts(artifacts))
-                    .await
-                    .map_err(|_| RunFailure {
-                        error: HarnessError::BackendStream,
-                        observed_session: outcome.observed_session.clone(),
-                    })?;
-            }
-            Ok(_) => {}
+        let event = match artifacts_result {
+            Ok(artifacts) if !artifacts.is_empty() => Some(RunnerEvent::Artifacts(artifacts)),
+            Ok(_) => None,
             Err(_) => {
                 tracing::warn!(
                     target: "codex",
                     method = "run_with_bin",
                     "artifact manifest unreadable; reporting typed artifact failure"
                 );
-                tx.send(RunnerEvent::ArtifactDeclarationFailed)
-                    .await
-                    .map_err(|_| RunFailure {
-                        error: HarnessError::BackendStream,
-                        observed_session: outcome.observed_session.clone(),
-                    })?;
+                Some(RunnerEvent::ArtifactDeclarationFailed)
             }
+        };
+        if let Some(event) = event {
+            output
+                .send_event(&tx, event)
+                .await
+                .map_err(|error| RunFailure {
+                    error,
+                    observed_session: outcome.observed_session.clone(),
+                })?;
         }
     }
     Ok(outcome)
@@ -620,6 +629,7 @@ mod tests {
                 session_id: None,
                 prompt: "inspect".to_owned(),
                 artifact_output: None,
+                output: Default::default(),
             },
             vec![attachment(&image, "image/png", "image.png")],
             tx,
@@ -671,6 +681,7 @@ mod tests {
                 session_id: None,
                 prompt: "inspect".to_owned(),
                 artifact_output: None,
+                output: Default::default(),
             },
             vec![attachment(&image, "image/png", "image.png")],
             tx,
@@ -1011,6 +1022,7 @@ mod tests {
                 session_id: None,
                 prompt: "inspect".to_owned(),
                 artifact_output: None,
+                output: Default::default(),
             },
             vec![
                 attachment(&text, "text/plain", "notes.txt"),
@@ -1090,6 +1102,7 @@ printf '%s\n' '{{"type":"item.completed","item":{{"type":"agent_message","text":
                 session_id: Some("thread-123".to_owned()),
                 prompt: "inspect".to_owned(),
                 artifact_output: None,
+                output: Default::default(),
             },
             vec![
                 Attachment {
@@ -1169,6 +1182,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"f
                 session_id: None,
                 prompt: "inspect".to_owned(),
                 artifact_output: None,
+                output: Default::default(),
             },
             vec![
                 attachment(&notes, "text/plain", "000-notes.txt"),
@@ -1251,6 +1265,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"f
                     session_id,
                     prompt: "Read every attachment before returning.".to_owned(),
                     artifact_output: None,
+                    output: Default::default(),
                 },
                 attachments.clone(),
                 tx,
@@ -1344,6 +1359,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens
                 session_id: None,
                 prompt: "--prompt-via-stdin".to_owned(),
                 artifact_output: None,
+                output: Default::default(),
             },
             Vec::new(),
             tx,
@@ -1407,6 +1423,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"C
                     "auth".to_owned(),
                     root.path().to_path_buf(),
                 )),
+                output: Default::default(),
             },
             Vec::new(),
             tx,
@@ -1474,6 +1491,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"C
                     "auth".to_owned(),
                     workdir,
                 )),
+                output: Default::default(),
             },
             Vec::new(),
             tx,
@@ -1530,6 +1548,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"t
                     "auth".to_owned(),
                     root.path().to_path_buf(),
                 )),
+                output: Default::default(),
             },
             Vec::new(),
             tx,
@@ -1584,6 +1603,7 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"received
                 session_id: Some("thread-123".to_owned()),
                 prompt: "p".repeat(60_000),
                 artifact_output: None,
+                output: Default::default(),
             },
             Vec::new(),
             tx,
@@ -1635,6 +1655,7 @@ exit 64
                     "auth".to_owned(),
                     root.path().to_path_buf(),
                 )),
+                output: Default::default(),
             },
             Vec::new(),
             tx,
@@ -1674,6 +1695,7 @@ exit 64
                 prompt: "Read the staged non-image attachment. Reply with CODEX_ATTACHMENT_OK: followed by the exact token contained in the file. The token is not present in this prompt."
                     .to_owned(),
                 artifact_output: None,
+                output: Default::default(),
             },
             vec![attachment(
                 &notes,
@@ -1709,6 +1731,7 @@ exit 64
                 session_id: Some(session_id.clone()),
                 prompt: "Reply with exactly CODEX_RESUME_OK and nothing else.".to_owned(),
                 artifact_output: None,
+                output: Default::default(),
             },
             Vec::new(),
             resume_tx,
@@ -1731,5 +1754,148 @@ exit 64
                 .any(|line| line.trim() == "CODEX_RESUME_OK"),
             "real Codex did not confirm the resumed session: {resumed_reply:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runner_inherits_the_configured_record_limit() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("oversized-backend");
+        let pid_path = root.path().join("descendant.pid");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env bash\nsleep 30 &\necho $! > '{}'\nprintf '%0100d\\n' 0\nwait\n",
+                pid_path.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let limits = marmot_terminal_harness::OutputLimits::new(
+            marmot_terminal_harness::OutputLimitSettings {
+                max_record_bytes: 16,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let invocation = Invocation {
+            timeout: std::time::Duration::from_secs(10),
+            idle_timeout: std::time::Duration::from_secs(5),
+            cwd: root.path().to_path_buf(),
+            session_id: None,
+            prompt: "private prompt".to_owned(),
+            artifact_output: None,
+            output: marmot_terminal_harness::TurnOutputControl::new(limits),
+        };
+        let (tx, mut rx) = mpsc::channel(4);
+        let failure = run_with_bin(
+            script.to_str().unwrap(),
+            ExecutionProfile::Inherit,
+            invocation,
+            Vec::new(),
+            tx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            failure.error,
+            marmot_terminal_harness::HarnessError::OutputLimitExceeded {
+                kind: marmot_terminal_harness::OutputLimitKind::StdoutRecord
+            }
+        ));
+        assert!(rx.recv().await.is_none());
+        let pid = std::fs::read_to_string(&pid_path).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .output()
+            .is_ok_and(|output| output.status.success())
+            && std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(") ")
+                        .map(|(_, rest)| rest.starts_with('Z'))
+                })
+                != Some(true)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "backend descendant survived the limit"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn text_limit_breach_emits_no_artifact_event() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("limited-artifact-codex");
+        fs::write(root.path().join("report.pdf"), b"pdf").unwrap();
+        fs::write(
+            &script,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+prompt="$(cat)"
+if [ -n "${WN_ARTIFACT_MANIFEST:-}" ]; then
+  manifest="$WN_ARTIFACT_MANIFEST"
+else
+  manifest="$(printf '%s' "$prompt" | sed -n 's/.*write exactly one JSON object to \([^ ]*\) using.*/\1/p')"
+fi
+printf '{"artifacts":[{"authorization_id":"%s","path":"report.pdf","media_type":"application/pdf","file_name":"report.pdf"}]}' "$WN_ARTIFACT_AUTHORIZATION_ID" >"$manifest"
+printf '%s\n' '{"type":"thread.started","thread_id":"codex-limited"}'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"too much text"}}'
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        let manifest = root.path().join("manifest.json");
+        fs::write(&manifest, br#"{"artifacts":[]}"#).unwrap();
+        let limits = marmot_terminal_harness::OutputLimits::new(
+            marmot_terminal_harness::OutputLimitSettings {
+                max_text_bytes: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+
+        let failure = run_with_bin(
+            script.to_str().unwrap(),
+            ExecutionProfile::Inherit,
+            Invocation {
+                timeout: Duration::from_secs(5),
+                idle_timeout: Duration::from_secs(2),
+                cwd: root.path().to_path_buf(),
+                session_id: None,
+                prompt: "create the report".to_owned(),
+                artifact_output: Some(ArtifactOutputRequest::new(
+                    manifest,
+                    "auth".to_owned(),
+                    root.path().to_path_buf(),
+                )),
+                output: marmot_terminal_harness::TurnOutputControl::new(limits),
+            },
+            Vec::new(),
+            tx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            failure.error,
+            HarnessError::OutputLimitExceeded {
+                kind: marmot_terminal_harness::OutputLimitKind::AssistantTextBytes
+            }
+        ));
+        assert_eq!(failure.observed_session.as_deref(), Some("codex-limited"));
+        assert!(rx.recv().await.is_none());
     }
 }

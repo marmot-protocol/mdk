@@ -6,7 +6,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use marmot_terminal_harness::{
-    ParsedEvent, PromptTransport, RunnerEvent,
+    HarnessError, OutputLimitKind, OutputLimitSettings, OutputLimits, ParsedEvent, PromptTransport,
+    RunnerEvent, TurnOutputControl,
     process::{EnvironmentChange, ProcessSpec, run_jsonl_process},
 };
 use serde_json::Value;
@@ -72,6 +73,7 @@ fn process_spec(
         backend_name: "test",
         total_timeout: Duration::from_secs(5),
         idle_timeout: Duration::from_secs(2),
+        output: Default::default(),
     }
 }
 
@@ -813,6 +815,298 @@ fn process_is_active(pid: &str) -> bool {
     }
 }
 
+fn limited_output(configure: impl FnOnce(&mut OutputLimitSettings)) -> TurnOutputControl {
+    let mut settings = OutputLimitSettings::default();
+    configure(&mut settings);
+    TurnOutputControl::new(OutputLimits::new(settings).unwrap())
+}
+
+fn assert_limit(error: &HarnessError, expected: OutputLimitKind) {
+    match error {
+        HarnessError::OutputLimitExceeded { kind } => assert_eq!(*kind, expected),
+        other => panic!("expected {expected:?}, got {}", other.privacy_safe_kind()),
+    }
+}
+
+async fn read_pid(path: &std::path::Path) -> String {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(pid) = fs::read_to_string(path)
+                .ok()
+                .map(|pid| pid.trim().to_owned())
+                .filter(|pid| pid.parse::<u32>().is_ok_and(|pid| pid > 0))
+            {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("descendant pid was written")
+}
+
+async fn assert_descendant_cleaned(pid_path: &std::path::Path) {
+    let pid = read_pid(pid_path).await;
+    let exited = wait_for_process_exit(&pid).await;
+    if !exited {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid])
+            .status();
+    }
+    assert!(exited, "descendant process survived output-limit cleanup");
+}
+
+#[tokio::test]
+async fn oversized_record_terminates_descendants_without_parsing_it() {
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let pid_path = root.path().join("descendant.pid");
+    let script = executable_script(
+        root.path(),
+        "record-flood-backend",
+        r#"#!/bin/sh
+sleep 30 &
+printf '%s' "$!" > "$1"
+printf '%s\n' '{"type":"session","id":"limited-session"}'
+yes x | tr -d '\n'
+"#,
+    );
+    let (tx, _rx) = mpsc::channel(1);
+    let mut spec = process_spec(&script, root.path(), PromptTransport::Stdin(String::new()));
+    spec.args = vec![pid_path.to_string_lossy().into_owned()];
+    spec.total_timeout = Duration::from_secs(30);
+    spec.output = limited_output(|settings| settings.max_record_bytes = 64);
+    let parsed_oversized = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = parsed_oversized.clone();
+    let started = std::time::Instant::now();
+
+    let failure = run_jsonl_process(spec, tx, move |line| {
+        if line.len() > 64 {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        parse_event(line)
+    })
+    .await
+    .unwrap_err();
+
+    assert_limit(&failure.error, OutputLimitKind::StdoutRecord);
+    assert_eq!(failure.error.privacy_safe_kind(), "stdout_record_limit");
+    assert_eq!(failure.observed_session.as_deref(), Some("limited-session"));
+    assert!(!parsed_oversized.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(started.elapsed() < Duration::from_secs(15));
+    assert_descendant_cleaned(&pid_path).await;
+}
+
+#[tokio::test]
+async fn raw_stdout_limit_counts_blank_ignored_and_malformed_records() {
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let script = executable_script(
+        root.path(),
+        "noise-backend",
+        r#"#!/bin/sh
+while :; do printf '\n\n{"type":"progress"}\nnot-json\n'; done
+"#,
+    );
+    let (tx, mut rx) = mpsc::channel(1);
+    let mut spec = process_spec(&script, root.path(), PromptTransport::Stdin(String::new()));
+    spec.output = limited_output(|settings| settings.max_stdout_bytes = 4096);
+
+    let failure = run_jsonl_process(spec, tx, parse_event).await.unwrap_err();
+
+    assert_limit(&failure.error, OutputLimitKind::StdoutBytes);
+    assert!(rx.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn backend_event_limit_counts_every_record_before_parsing() {
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let script = executable_script(
+        root.path(),
+        "event-count-backend",
+        r#"#!/bin/sh
+printf '\n'
+printf '%s\n' 'not-json'
+printf '%s\n' '{"type":"progress"}'
+printf '%s\n' '{"type":"text","text":"fourth"}'
+printf '%s\n' '{"type":"text","text":"fifth"}'
+"#,
+    );
+    let parsed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = parsed.clone();
+    let (tx, mut rx) = mpsc::channel(4);
+    let mut spec = process_spec(&script, root.path(), PromptTransport::Stdin(String::new()));
+    spec.output = limited_output(|settings| settings.max_backend_events = 4);
+
+    let failure = run_jsonl_process(spec, tx, move |line| {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        parse_event(line)
+    })
+    .await
+    .unwrap_err();
+
+    assert_limit(&failure.error, OutputLimitKind::BackendEvents);
+    assert_eq!(parsed.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(
+        rx.recv().await,
+        Some(RunnerEvent::Text("fourth".to_owned()))
+    );
+    assert!(rx.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn assistant_text_limits_charge_blank_text_before_forwarding() {
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let script = executable_script(
+        root.path(),
+        "text-backend",
+        r#"#!/bin/sh
+printf '%s\n' '{"type":"text","text":"   "}'
+printf '%s\n' '{"type":"text","text":"abc"}'
+printf '%s\n' '{"type":"text","text":"def"}'
+"#,
+    );
+    for (configure, kind, forwarded) in [
+        (
+            Box::new(|settings: &mut OutputLimitSettings| settings.max_text_events = 2)
+                as Box<dyn FnOnce(&mut OutputLimitSettings)>,
+            OutputLimitKind::AssistantTextEvents,
+            vec!["abc"],
+        ),
+        (
+            Box::new(|settings: &mut OutputLimitSettings| settings.max_text_bytes = 8),
+            OutputLimitKind::AssistantTextBytes,
+            vec!["abc"],
+        ),
+    ] {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut spec = process_spec(&script, root.path(), PromptTransport::Stdin(String::new()));
+        spec.output = limited_output(configure);
+
+        let failure = run_jsonl_process(spec, tx, parse_event).await.unwrap_err();
+
+        assert_limit(&failure.error, kind);
+        for text in forwarded {
+            assert_eq!(rx.recv().await, Some(RunnerEvent::Text(text.to_owned())));
+        }
+        assert!(rx.recv().await.is_none());
+    }
+}
+
+#[tokio::test]
+async fn output_exactly_at_every_producer_limit_completes() {
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let script = executable_script(
+        root.path(),
+        "exact-backend",
+        r#"#!/bin/sh
+printf '%s\r\n' '{"type":"text","text":"abc"}'
+printf '%s' '{"type":"text","text":"de"}'
+"#,
+    );
+    let first = r#"{"type":"text","text":"abc"}"#.len();
+    let second = r#"{"type":"text","text":"de"}"#.len();
+    let (tx, mut rx) = mpsc::channel(4);
+    let mut spec = process_spec(&script, root.path(), PromptTransport::Stdin(String::new()));
+    spec.output = limited_output(|settings| {
+        settings.max_record_bytes = first + 1;
+        settings.max_stdout_bytes = first + 2 + second;
+        settings.max_backend_events = 2;
+        settings.max_text_bytes = 5;
+        settings.max_text_events = 2;
+    });
+
+    let outcome = run_jsonl_process(spec, tx, parse_event).await.unwrap();
+
+    assert_eq!(outcome.exit_code, Some(0));
+    assert_eq!(rx.recv().await, Some(RunnerEvent::Text("abc".to_owned())));
+    assert_eq!(rx.recv().await, Some(RunnerEvent::Text("de".to_owned())));
+    assert!(rx.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn collector_latch_interrupts_blocked_channel_send_and_cleans_group() {
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let pid_path = root.path().join("descendant.pid");
+    let script = executable_script(
+        root.path(),
+        "blocked-send-backend",
+        r#"#!/bin/sh
+sleep 30 &
+printf '%s' "$!" > "$1"
+while :; do printf '%s\n' '{"type":"text","text":"queued"}'; sleep 0.01; done
+"#,
+    );
+    let (tx, rx) = mpsc::channel(1);
+    let output = TurnOutputControl::default();
+    let mut spec = process_spec(&script, root.path(), PromptTransport::Stdin(String::new()));
+    spec.args = vec![pid_path.to_string_lossy().into_owned()];
+    spec.total_timeout = Duration::from_secs(30);
+    spec.idle_timeout = Duration::from_secs(30);
+    spec.output = output.clone();
+    let task = tokio::spawn(run_jsonl_process(spec, tx, parse_event));
+    read_pid(&pid_path).await;
+    // The channel holds one event and nobody receives, so the runner is blocked in send.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let started = std::time::Instant::now();
+
+    output.latch(OutputLimitKind::ReplyChunks);
+    let failure = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("latched stop interrupts channel backpressure")
+        .unwrap()
+        .unwrap_err();
+
+    assert_limit(&failure.error, OutputLimitKind::ReplyChunks);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    drop(rx);
+    assert_descendant_cleaned(&pid_path).await;
+}
+
+#[tokio::test]
+async fn pre_latched_limit_never_spawns_the_backend() {
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("spawned");
+    let script = executable_script(
+        root.path(),
+        "success-backend",
+        &format!("#!/bin/sh\n: > {}\n", marker.display()),
+    );
+    let output = TurnOutputControl::default();
+    output.latch(OutputLimitKind::ArtifactBuffer);
+    let (tx, _rx) = mpsc::channel(1);
+    let mut spec = process_spec(&script, root.path(), PromptTransport::Stdin(String::new()));
+    spec.output = output;
+
+    let failure = run_jsonl_process(spec, tx, parse_event).await.unwrap_err();
+
+    assert_limit(&failure.error, OutputLimitKind::ArtifactBuffer);
+    assert!(!marker.exists());
+}
+
+#[tokio::test]
+async fn invalid_utf8_record_is_a_privacy_safe_stream_failure() {
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let script = executable_script(
+        root.path(),
+        "invalid-utf8-backend",
+        "#!/bin/sh\nprintf '\\377\\376\\n'\n",
+    );
+    let (tx, mut rx) = mpsc::channel(1);
+    let spec = process_spec(&script, root.path(), PromptTransport::Stdin(String::new()));
+
+    let failure = run_jsonl_process(spec, tx, parse_event).await.unwrap_err();
+
+    assert!(matches!(failure.error, HarnessError::BackendStream));
+    assert!(rx.recv().await.is_none());
+}
+
 #[test]
 fn process_debug_output_redacts_paths_arguments_prompts_and_events() {
     let spec = ProcessSpec {
@@ -828,6 +1122,7 @@ fn process_debug_output_redacts_paths_arguments_prompts_and_events() {
         backend_name: "safe_backend",
         total_timeout: Duration::from_secs(5),
         idle_timeout: Duration::from_secs(2),
+        output: Default::default(),
     };
     let debug = format!("{spec:?}");
     for secret in [

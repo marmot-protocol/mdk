@@ -14,8 +14,30 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
-use crate::TRACE_TARGET;
 use crate::error::{HarnessError, Result};
+use crate::{TRACE_TARGET, TurnOutputControl};
+
+/// Runs one turn-scoped output request unless the turn's output limit is, or
+/// becomes, latched while connecting, writing or awaiting the acknowledgement.
+///
+/// A request abandoned mid-flight cannot be retracted and may still take
+/// effect; callers keep its idempotency record and treat it as uncertain.
+pub(crate) async fn until_output_stopped<T>(
+    output: Option<&TurnOutputControl>,
+    request: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let Some(output) = output else {
+        return request.await;
+    };
+    if let Some(error) = output.stop_error() {
+        return Err(error);
+    }
+    tokio::select! {
+        biased;
+        kind = output.stopped() => Err(HarnessError::OutputLimitExceeded { kind }),
+        result = request => result,
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct ControlClient {
@@ -692,6 +714,54 @@ mod tests {
             }
         ));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn output_stop_abandons_a_request_waiting_for_its_acknowledgement() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, _write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let request: AgentControlEnvelope<AgentControlRequest> =
+                read_envelope(&mut reader).await.unwrap().unwrap();
+            assert!(matches!(
+                request.payload,
+                AgentControlRequest::SendFinal { .. }
+            ));
+            received_tx.send(()).unwrap();
+            // Never acknowledge; the admitted request's outcome stays uncertain.
+            std::future::pending::<()>().await;
+        });
+        let client = ControlClient::new(socket, None, Duration::from_secs(30), "wn-test");
+        let output = TurnOutputControl::default();
+        let stopper = output.clone();
+        tokio::spawn(async move {
+            received_rx.await.unwrap();
+            stopper.latch(crate::OutputLimitKind::DurableSends);
+        });
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            until_output_stopped(
+                Some(&output),
+                client.send_final("account", "group", "message", "text", 1),
+            ),
+        )
+        .await
+        .expect("stop interrupts the pending acknowledgement")
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            HarnessError::OutputLimitExceeded {
+                kind: crate::OutputLimitKind::DurableSends
+            }
+        ));
+        server.abort();
     }
 
     #[tokio::test]

@@ -350,10 +350,22 @@ impl ArtifactOutbox {
         self.batches.clone()
     }
 
+    pub(crate) fn contains(&self, key: &str) -> bool {
+        self.batches
+            .iter()
+            .any(|batch| batch.idempotency_key == key)
+    }
+
     pub(crate) fn has_pending_group(&self, group_ref: &str) -> bool {
         self.batches
             .iter()
             .any(|batch| batch.group_ref == group_ref)
+    }
+
+    pub(crate) fn has_pending_reply(&self, group_ref: &str, reply_to_ref: &str) -> bool {
+        self.batches
+            .iter()
+            .any(|batch| batch.group_ref == group_ref && batch.reply_to_message_ref == reply_to_ref)
     }
 
     pub(crate) fn record(&mut self, batch: PendingArtifactBatch) -> Result<()> {

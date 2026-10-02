@@ -6,6 +6,7 @@ mod commands;
 mod config;
 mod control;
 mod error;
+mod output_limits;
 pub mod process;
 mod repo_picker;
 mod store;
@@ -28,6 +29,7 @@ pub use artifacts::{
 pub use bridge::run;
 pub use config::{ConfigSpec, ExecutionProfile, LoadedConfig, load_config_with};
 pub use error::{HarnessError, Result};
+pub use output_limits::{OutputLimitKind, OutputLimitSettings, OutputLimits, TurnOutputControl};
 pub use process::{ParsedEvent, PromptTransport};
 
 /// Default maximum byte length for one Marmot reply chunk.
@@ -74,6 +76,8 @@ pub struct Config {
     pub execution_profile: ExecutionProfile,
     /// Explicitly authorized outbound artifact export policy.
     pub artifact_exports: ArtifactExportConfig,
+    /// Mandatory finite per-invocation limits for backend output and durable sends.
+    pub output_limits: OutputLimits,
     /// Connector identity and naming.
     pub spec: ConfigSpec,
 }
@@ -94,6 +98,7 @@ impl fmt::Debug for Config {
             .field("backend_idle_timeout", &self.backend_idle_timeout)
             .field("execution_profile", &self.execution_profile)
             .field("artifact_exports_enabled", &self.artifact_exports.enabled())
+            .field("output_limits", &self.output_limits)
             .field("spec", &self.spec)
             .finish_non_exhaustive()
     }
@@ -137,6 +142,8 @@ pub struct Invocation {
     pub prompt: String,
     /// Backend completion-file contract for typed artifact output.
     pub artifact_output: Option<ArtifactOutputRequest>,
+    /// Shared output limits and stop latch; forward unchanged into `ProcessSpec`.
+    pub output: TurnOutputControl,
 }
 
 impl fmt::Debug for Invocation {
@@ -148,6 +155,7 @@ impl fmt::Debug for Invocation {
             .field("prompt_len", &self.prompt.len())
             .field("session_present", &self.session_id.is_some())
             .field("artifact_output_enabled", &self.artifact_output.is_some())
+            .field("output", &self.output)
             .finish()
     }
 }
@@ -363,6 +371,7 @@ mod privacy_tests {
             session_id: Some("secret-session".to_owned()),
             prompt: "secret prompt".to_owned(),
             artifact_output: None,
+            output: TurnOutputControl::default(),
         };
         let invocation_debug = format!("{invocation:?}");
         for secret in ["/secret", "secret-session", "secret prompt"] {

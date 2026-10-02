@@ -143,6 +143,7 @@ instruction alive across thread resets and Codex-side context compaction.
 | `WN_CODEX_TIMEOUT_SECS` | `3600` | Total invocation cap |
 | `WN_CODEX_REQUEST_TIMEOUT_SECS` | `30` | Control connect/write and ordinary response timeout. Inbound media-download responses wait at least 16 minutes. Artifact `send_media` responses wait at least 451 minutes: 10 attachments, 3 Blossom servers each, 15 minutes per upload, plus 1 minute |
 | `WN_CODEX_MAX_REPLY_BYTES` | `30000` | Durable reply chunk limit |
+| `WN_CODEX_MAX_BACKEND_RECORD_BYTES`, `WN_CODEX_MAX_BACKEND_STDOUT_BYTES`, `WN_CODEX_MAX_BACKEND_EVENTS`, `WN_CODEX_MAX_ASSISTANT_TEXT_BYTES`, `WN_CODEX_MAX_ASSISTANT_TEXT_EVENTS`, `WN_CODEX_MAX_ARTIFACT_BUFFER_BYTES`, `WN_CODEX_MAX_REPLY_CHUNKS`, `WN_CODEX_MAX_DURABLE_SENDS` | shared defaults | Per-turn backend output and durable-send limits; see [Output Limits](../../terminal-harness/README.md#output-limits) |
 | `WN_CODEX_MAX_PENDING_PER_GROUP` | `4` | Per-group prompt queue limit |
 | `WN_CODEX_MAX_ATTACHMENTS` | `8` | Maximum inbound files in one turn |
 | `WN_CODEX_MAX_ATTACHMENT_BYTES` | `67108864` | Maximum aggregate plaintext bytes in one inbound batch |
@@ -150,7 +151,7 @@ instruction alive across thread resets and Codex-side context compaction.
 | `WN_CODEX_ACTIVATION` | `always` | Only supported activation mode |
 | `WN_CODEX_ARTIFACT_EXPORTS_ENABLED` | `false` | Opt in to typed Codex completion-file artifact delivery |
 | `WN_CODEX_ARTIFACT_GRANTS_JSON` | unset | Required JSON array of exact `group_id_hex`, absolute `export_root`, and positive `ttl_seconds` grants |
-| `WN_CODEX_ARTIFACT_MAX_COUNT` | `10` | Maximum artifacts accepted per result; configurable from 1 to 10 |
+| `WN_CODEX_ARTIFACT_MAX_COUNT` | `10` | Maximum artifacts accepted per turn, summed across artifact events; configurable from 1 to 10 |
 | `WN_CODEX_ARTIFACT_STAGING_ROOT` | `$MARMOT_HOME/media-uploads` | Private staging root that must also be passed to `wn-agent --media-allowed-root` |
 
 Artifact export is fail-closed and Codex-only in the initial release. Enable it only with both layers configured:

@@ -5,10 +5,17 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
+use crate::output_limits::{
+    DEFAULT_MAX_ARTIFACT_BUFFER_BYTES, DEFAULT_MAX_BACKEND_EVENTS, DEFAULT_MAX_DURABLE_SENDS,
+    DEFAULT_MAX_RECORD_BYTES, DEFAULT_MAX_REPLY_CHUNKS, DEFAULT_MAX_STDOUT_BYTES,
+    DEFAULT_MAX_TEXT_BYTES, DEFAULT_MAX_TEXT_EVENTS, HARD_MAX_ARTIFACT_BUFFER_BYTES,
+    HARD_MAX_BACKEND_EVENTS, HARD_MAX_DURABLE_SENDS, HARD_MAX_RECORD_BYTES, HARD_MAX_REPLY_CHUNKS,
+    HARD_MAX_STDOUT_BYTES, HARD_MAX_TEXT_BYTES, HARD_MAX_TEXT_EVENTS,
+};
 use crate::{
     ArtifactExportConfig, ArtifactExportGrant, Config, DEFAULT_MAX_ATTACHMENT_BYTES,
     DEFAULT_MAX_ATTACHMENTS, DEFAULT_MAX_REPLY_BYTES, HarnessError, MARMOT_MESSAGE_BYTES_CEILING,
-    Result,
+    OutputLimitSettings, OutputLimits, Result,
 };
 
 const DEFAULT_BACKEND_TIMEOUT_SECS: u64 = 3600;
@@ -271,6 +278,53 @@ pub fn load_config_with(
             crate::artifacts::MAX_ARTIFACTS_PER_RESULT
         )));
     }
+    let mut output_limit = |suffix: &str, default: usize, maximum: usize| {
+        let name = env_name(suffix);
+        parse_output_limit(lookup(&name), default, maximum, &name)
+    };
+    let output_limits = OutputLimits::new(OutputLimitSettings {
+        max_record_bytes: output_limit(
+            "MAX_BACKEND_RECORD_BYTES",
+            DEFAULT_MAX_RECORD_BYTES,
+            HARD_MAX_RECORD_BYTES,
+        )?,
+        max_stdout_bytes: output_limit(
+            "MAX_BACKEND_STDOUT_BYTES",
+            DEFAULT_MAX_STDOUT_BYTES,
+            HARD_MAX_STDOUT_BYTES,
+        )?,
+        max_text_bytes: output_limit(
+            "MAX_ASSISTANT_TEXT_BYTES",
+            DEFAULT_MAX_TEXT_BYTES,
+            HARD_MAX_TEXT_BYTES,
+        )?,
+        max_artifact_buffer_bytes: output_limit(
+            "MAX_ARTIFACT_BUFFER_BYTES",
+            DEFAULT_MAX_ARTIFACT_BUFFER_BYTES,
+            HARD_MAX_ARTIFACT_BUFFER_BYTES,
+        )?,
+        max_backend_events: output_limit(
+            "MAX_BACKEND_EVENTS",
+            DEFAULT_MAX_BACKEND_EVENTS,
+            HARD_MAX_BACKEND_EVENTS,
+        )?,
+        max_text_events: output_limit(
+            "MAX_ASSISTANT_TEXT_EVENTS",
+            DEFAULT_MAX_TEXT_EVENTS,
+            HARD_MAX_TEXT_EVENTS,
+        )?,
+        max_reply_chunks: output_limit(
+            "MAX_REPLY_CHUNKS",
+            DEFAULT_MAX_REPLY_CHUNKS,
+            HARD_MAX_REPLY_CHUNKS,
+        )?,
+        max_durable_sends: output_limit(
+            "MAX_DURABLE_SENDS",
+            DEFAULT_MAX_DURABLE_SENDS,
+            HARD_MAX_DURABLE_SENDS,
+        )?,
+        max_artifacts: artifact_max_count,
+    })?;
     let artifact_staging_root = lookup(&env_name("ARTIFACT_STAGING_ROOT"))
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join("media-uploads"));
@@ -301,6 +355,7 @@ pub fn load_config_with(
             backend_idle_timeout,
             execution_profile,
             artifact_exports,
+            output_limits,
             spec,
         },
         home,
@@ -357,6 +412,24 @@ fn parse_usize(raw: Option<String>, default: usize, name: &str) -> Result<usize>
             .parse()
             .map_err(|_| config_error(format!("{name} must be an integer")))
     })
+}
+
+/// Parses one unsigned decimal output limit. Errors never echo the raw value.
+fn parse_output_limit(
+    raw: Option<String>,
+    default: usize,
+    maximum: usize,
+    name: &str,
+) -> Result<usize> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    raw.bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then(|| raw.parse::<usize>().ok())
+        .flatten()
+        .filter(|value| (1..=maximum).contains(value))
+        .ok_or_else(|| config_error(format!("{name} must be an integer between 1 and {maximum}")))
 }
 
 fn parse_bool(raw: Option<String>, default: bool, name: &str) -> Result<bool> {
@@ -473,6 +546,122 @@ mod tests {
             values.push(("WN_TEST_ARTIFACT_MAX_COUNT", invalid));
             let error = load(&values).unwrap_err();
             assert!(error.to_string().contains("ARTIFACT_MAX_COUNT"));
+        }
+    }
+
+    const OUTPUT_LIMIT_ENV: [(&str, usize, usize); 8] = [
+        (
+            "WN_TEST_MAX_BACKEND_RECORD_BYTES",
+            DEFAULT_MAX_RECORD_BYTES,
+            HARD_MAX_RECORD_BYTES,
+        ),
+        (
+            "WN_TEST_MAX_BACKEND_STDOUT_BYTES",
+            DEFAULT_MAX_STDOUT_BYTES,
+            HARD_MAX_STDOUT_BYTES,
+        ),
+        (
+            "WN_TEST_MAX_ASSISTANT_TEXT_BYTES",
+            DEFAULT_MAX_TEXT_BYTES,
+            HARD_MAX_TEXT_BYTES,
+        ),
+        (
+            "WN_TEST_MAX_ARTIFACT_BUFFER_BYTES",
+            DEFAULT_MAX_ARTIFACT_BUFFER_BYTES,
+            HARD_MAX_ARTIFACT_BUFFER_BYTES,
+        ),
+        (
+            "WN_TEST_MAX_BACKEND_EVENTS",
+            DEFAULT_MAX_BACKEND_EVENTS,
+            HARD_MAX_BACKEND_EVENTS,
+        ),
+        (
+            "WN_TEST_MAX_ASSISTANT_TEXT_EVENTS",
+            DEFAULT_MAX_TEXT_EVENTS,
+            HARD_MAX_TEXT_EVENTS,
+        ),
+        (
+            "WN_TEST_MAX_REPLY_CHUNKS",
+            DEFAULT_MAX_REPLY_CHUNKS,
+            HARD_MAX_REPLY_CHUNKS,
+        ),
+        (
+            "WN_TEST_MAX_DURABLE_SENDS",
+            DEFAULT_MAX_DURABLE_SENDS,
+            HARD_MAX_DURABLE_SENDS,
+        ),
+    ];
+
+    fn limit_value(limits: &OutputLimits, name: &str) -> usize {
+        match name.trim_start_matches("WN_TEST_") {
+            "MAX_BACKEND_RECORD_BYTES" => limits.max_record_bytes(),
+            "MAX_BACKEND_STDOUT_BYTES" => limits.max_stdout_bytes(),
+            "MAX_ASSISTANT_TEXT_BYTES" => limits.max_text_bytes(),
+            "MAX_ARTIFACT_BUFFER_BYTES" => limits.max_artifact_buffer_bytes(),
+            "MAX_BACKEND_EVENTS" => limits.max_backend_events(),
+            "MAX_ASSISTANT_TEXT_EVENTS" => limits.max_text_events(),
+            "MAX_REPLY_CHUNKS" => limits.max_reply_chunks(),
+            "MAX_DURABLE_SENDS" => limits.max_durable_sends(),
+            other => panic!("unknown output limit {other}"),
+        }
+    }
+
+    #[test]
+    fn output_limits_load_defaults_minimum_and_hard_maximum_for_each_setting() {
+        let base = [
+            ("HOME", "/home/test"),
+            ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+        ];
+        let defaults = load(&base).unwrap().harness.output_limits;
+        assert_eq!(defaults, OutputLimits::default());
+        assert_eq!(
+            defaults.max_artifacts(),
+            crate::artifacts::MAX_ARTIFACTS_PER_RESULT
+        );
+        for (name, default, maximum) in OUTPUT_LIMIT_ENV {
+            assert_eq!(limit_value(&defaults, name), default, "{name}");
+            for value in [1, maximum] {
+                let raw = value.to_string();
+                let mut values = base.to_vec();
+                values.push((name, raw.as_str()));
+                let limits = load(&values).unwrap().harness.output_limits;
+                assert_eq!(limit_value(&limits, name), value, "{name}");
+            }
+        }
+
+        let mut configured = base.to_vec();
+        configured.push(("WN_TEST_ARTIFACT_MAX_COUNT", "3"));
+        let loaded = load(&configured).unwrap().harness;
+        assert_eq!(loaded.output_limits.max_artifacts(), 3);
+        assert_eq!(loaded.artifact_exports.max_count(), 3);
+    }
+
+    #[test]
+    fn output_limits_reject_zero_negative_malformed_overflow_and_over_maximum_without_echo() {
+        let base = [
+            ("HOME", "/home/test"),
+            ("WN_TEST_ALLOWED_SENDERS_HEX", SENDER),
+        ];
+        for (name, _, maximum) in OUTPUT_LIMIT_ENV {
+            let over = (maximum + 1).to_string();
+            for invalid in [
+                "0",
+                "-1",
+                "+5",
+                " 5",
+                "",
+                "12abc",
+                "99999999999999999999999999",
+                over.as_str(),
+            ] {
+                let mut values = base.to_vec();
+                values.push((name, invalid));
+                let error = load(&values).unwrap_err().to_string();
+                assert!(error.contains(name), "{name}={invalid}");
+                if ["-1", "12abc", "99999999999999999999999999"].contains(&invalid) {
+                    assert!(!error.contains(invalid), "{name} echoed input");
+                }
+            }
         }
     }
 

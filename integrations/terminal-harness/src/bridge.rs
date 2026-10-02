@@ -18,18 +18,20 @@ use crate::artifacts::{
     ArtifactDeliveryContext, ArtifactOutbox, PendingArtifactBatch, prepare_manifest_path,
     remove_staged_files, remove_unreferenced_staged_files, stage_artifacts, validate_staged_batch,
 };
-use crate::chunking::split_reply_chunks;
+use crate::chunking::{count_reply_chunks, split_reply_chunks};
 use crate::commands::{self, ChatCommand, Routed};
-use crate::control::{ControlClient, DownloadedMedia};
+use crate::control::{ControlClient, DownloadedMedia, until_output_stopped};
 use crate::error::{HarnessError, Result};
+use crate::output_limits::charge;
 use crate::repo_picker::{RepoPicker, parse_repo_picker, resolve_repo, validate_session_cwd};
 use crate::store::{
     FinalDeliveryRecord, FinalDeliveryStore, RecoveryKind, RecoveryRecord, RecoveryStatus,
-    RecoveryStore, SessionRecord, SessionStore,
+    RecoveryStore, SendAdmission, SendMode, SessionRecord, SessionStore,
 };
 use crate::{
     ArtifactOutput, ArtifactOutputRequest, ArtifactSupport, Attachment, Backend, Config,
-    Invocation, Outcome, RunFailure, RunnerEvent, TRACE_TARGET, dirs_home,
+    Invocation, Outcome, OutputLimitKind, OutputLimits, RunFailure, RunnerEvent, TRACE_TARGET,
+    TurnOutputControl, dirs_home,
 };
 
 const DEDUPE_LIMIT: usize = 2048;
@@ -40,6 +42,7 @@ const SEND_RETRY_ATTEMPTS: usize = 3;
 const LIVENESS_UNKNOWN_TEXT: &str = "The backend is still running, but the connector cannot confirm progress. No action is needed; it will keep checking until the configured total limit.";
 const TEXT_FINAL_ACK_UNKNOWN_TEXT: &str = "The backend finished, but the connector could not confirm delivery of its final response. No action is needed; it is reconciling delivery.";
 const INCOMPLETE_FINAL_TEXT: &str = "The backend finished, but the connector could not persist the complete final response. Send `/retry-last` to retry it, or `/discard-last` to abandon it and continue queued work.";
+const UNRESOLVED_TURN_TEXT: &str = "An earlier turn in this chat stopped before it completed, and its remaining output is withheld.";
 
 /// Connects to `wn-agent`, subscribes to allowed prompts, and runs the backend.
 pub async fn run<B: Backend>(mut config: Config, backend: B) -> Result<()> {
@@ -114,7 +117,13 @@ pub async fn run<B: Backend>(mut config: Config, backend: B) -> Result<()> {
     let deliveries = Arc::new(FinalDeliveryStore::load(
         config.state_path.with_extension("delivery.json"),
     )?);
-    reconcile_pending_deliveries(&client, &deliveries).await;
+    reconcile_pending_deliveries(
+        &client,
+        &deliveries,
+        &outbox,
+        config.output_limits.max_durable_sends(),
+    )
+    .await;
     let queues = Arc::new(GroupQueues::new(config.max_pending_per_group));
     let ctx = Arc::new(BridgeContext {
         cfg: Arc::new(config),
@@ -300,7 +309,13 @@ async fn drain_events(
                     let ctx = ctx.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
-                        reconcile_pending_deliveries(&ctx.client, &ctx.deliveries).await;
+                        reconcile_pending_deliveries(
+                            &ctx.client,
+                            &ctx.deliveries,
+                            &ctx.outbox,
+                            ctx.cfg.output_limits.max_durable_sends(),
+                        )
+                        .await;
                     });
                 }
             }
@@ -547,8 +562,18 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
     } else {
         let mut recovery_changes = permit.queue.recovery_changed.subscribe();
         let mut delivery_changes = ctx.deliveries.subscribe();
+        let mut recovery_notice_sent = false;
         loop {
             while fifo_is_blocked(&ctx, &inbound.group_ref).await {
+                if !recovery_notice_sent
+                    && ctx
+                        .deliveries
+                        .requires_recovery_command(&inbound.group_ref)
+                        .await
+                {
+                    recovery_notice_sent = true;
+                    send_recovery_required_notice(&ctx, &inbound).await;
+                }
                 tokio::select! {
                     result = recovery_changes.changed() => {
                         if result.is_err() {
@@ -605,15 +630,9 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
         }
         PromptDisposition::DiscardLast => {
             let recovery = ctx.recovery.discard(&inbound.group_ref).await;
-            let incomplete = ctx
-                .deliveries
-                .discard_incomplete_final(&inbound.group_ref)
-                .await;
+            let incomplete = discard_unresolved_turns(&ctx, &inbound.group_ref, None).await;
             if let Err(err) = &recovery {
                 warn!(target: TRACE_TARGET, method = "discard_recovery", error_kind = err.privacy_safe_kind(), "failed to discard recovery record");
-            }
-            if let Err(err) = &incomplete {
-                warn!(target: TRACE_TARGET, method = "discard_incomplete_final", error_kind = err.privacy_safe_kind(), "failed to discard incomplete-final barrier");
             }
             let message = match (recovery, incomplete) {
                 (Err(_), _) | (_, Err(_)) => format!(
@@ -823,6 +842,35 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
     let artifact_setup_failed =
         artifact_setup_failed || (artifact_authorization.is_some() && artifact_output.is_none());
     let buffer_text_for_artifacts = artifact_output.is_some();
+    let limits = ctx.cfg.output_limits;
+    let output = TurnOutputControl::new(limits);
+    if let Err(err) = ctx
+        .deliveries
+        .begin_turn(
+            &inbound.group_ref,
+            &inbound.message_ref,
+            limits.max_durable_sends(),
+        )
+        .await
+    {
+        warn!(target: TRACE_TARGET, method = "turn_budget", error_kind = err.privacy_safe_kind(), "failed to persist the durable output budget; backend not started");
+        if retrying && let Err(reset_err) = ctx.recovery.reset_retry(&inbound.group_ref).await {
+            warn!(target: TRACE_TARGET, method = "retry_recovery", error_kind = reset_err.privacy_safe_kind(), "failed to restore retryable recovery state");
+        }
+        let _ = send_reply(
+            &ctx,
+            &inbound.account_ref,
+            &inbound.group_ref,
+            &inbound.message_ref,
+            &format!(
+                "[{}] failed to prepare this prompt.",
+                ctx.cfg.spec.reply_prefix
+            ),
+            0,
+        )
+        .await;
+        return;
+    }
     let invocation = Invocation {
         timeout: ctx.cfg.backend_timeout,
         idle_timeout: ctx.cfg.backend_idle_timeout,
@@ -830,6 +878,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
         session_id,
         prompt,
         artifact_output,
+        output: output.clone(),
     };
     let (tx, mut rx) = mpsc::channel(16);
     let backend = ctx.backend.clone();
@@ -851,12 +900,40 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
     let mut delivered_chunks = 0usize;
     let mut delivery_failed = false;
     let mut persist_failed = false;
-    while let Some(event) = rx.recv().await {
+    let mut collector = TurnCollector::new(limits);
+    let gate = TurnGate::live(&ctx, &inbound, &output);
+    loop {
+        // A latched breach outranks events already queued behind it.
+        let event = tokio::select! {
+            biased;
+            _ = output.stopped() => break,
+            event = rx.recv() => match event {
+                Some(event) => event,
+                None => break,
+            },
+        };
         match event {
             RunnerEvent::Text(text) => {
+                if let Err(kind) = collector.charge_text(&text) {
+                    output.latch(kind);
+                    break;
+                }
                 if buffer_text_for_artifacts {
+                    if let Err(kind) =
+                        collector.charge_buffered_text(&text, !buffered_text.is_empty())
+                    {
+                        output.latch(kind);
+                        break;
+                    }
                     buffered_text.push(text);
                     continue;
+                }
+                if persist_failed || delivery_failed {
+                    continue;
+                }
+                if let Err(kind) = collector.reserve_reply_chunks(&text, ctx.cfg.max_reply_bytes) {
+                    output.latch(kind);
+                    break;
                 }
                 let staged = match stage_text_chunks(
                     &FinalReplyTarget {
@@ -887,6 +964,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
                 for (key, chunk, index) in staged {
                     if let Err(err) = send_staged_backend_reply(
                         &ctx,
+                        Some(gate),
                         &key,
                         &inbound.account_ref,
                         &inbound.group_ref,
@@ -906,25 +984,58 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
             RunnerEvent::LivenessUnknown => {
                 let text = format!("[{}] {LIVENESS_UNKNOWN_TEXT}", ctx.cfg.spec.reply_prefix);
                 chunk_index += 1;
-                if let Err(err) = send_reply(
-                    &ctx,
-                    &inbound.account_ref,
-                    &inbound.group_ref,
-                    &inbound.message_ref,
-                    &text,
-                    chunk_index,
-                )
-                .await
+                if let Err(err) =
+                    send_turn_reply(&ctx, gate, &inbound.account_ref, &text, chunk_index).await
                 {
                     warn!(target: TRACE_TARGET, method = "liveness_status", error_kind = err.privacy_safe_kind(), "failed to send liveness status");
                 }
             }
-            RunnerEvent::Artifacts(outputs) => artifact_outputs.extend(outputs),
+            RunnerEvent::Artifacts(outputs) => {
+                if let Err(kind) = collector.charge_artifacts(outputs.len()) {
+                    output.latch(kind);
+                    break;
+                }
+                artifact_outputs.extend(outputs);
+            }
             RunnerEvent::ArtifactDeclarationFailed => artifact_declaration_failed = true,
         }
+        if output.latched().is_some() {
+            break;
+        }
     }
+    // Discard queued output; the runner observes the latch and cleans up its process group.
+    drop(rx);
+    let run_result = runner.await;
+    let latched = output.latched().or_else(|| match &run_result {
+        Ok(Err(RunFailure {
+            error: HarnessError::OutputLimitExceeded { kind },
+            ..
+        })) => Some(output.latch(*kind)),
+        _ => None,
+    });
+    if let Some(kind) = latched {
+        let observed_session = match &run_result {
+            Ok(Ok(outcome)) => outcome.observed_session.clone(),
+            Ok(Err(failure)) => failure.observed_session.clone(),
+            Err(_) => None,
+        };
+        handle_output_limit(
+            &ctx,
+            &inbound,
+            known_session.as_ref(),
+            cwd,
+            recovery_prompt,
+            observed_session,
+            kind,
+            retrying,
+        )
+        .await;
+        return;
+    }
+    let limit_context = (cwd.clone(), recovery_prompt.clone());
+    let mut retry_completed = false;
 
-    match runner.await {
+    let observed_session = match run_result {
         Ok(Ok(outcome)) => {
             let artifact_delivery_attempted = artifact_setup_failed
                 || artifact_declaration_failed
@@ -933,6 +1044,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
                 let _ = send_artifact_failure_activity(
                     &ctx,
                     &inbound,
+                    gate,
                     1,
                     "rejected because the connector could not initialize its private export state",
                 )
@@ -942,6 +1054,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
                 let _ = send_artifact_failure_activity(
                     &ctx,
                     &inbound,
+                    gate,
                     1,
                     "rejected because the backend artifact declaration was malformed or unreadable",
                 )
@@ -952,6 +1065,8 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
                     deliver_artifact_outputs(
                         &ctx,
                         &inbound,
+                        gate,
+                        &mut collector,
                         authorization,
                         (!buffered_text.is_empty()).then(|| buffered_text.join("\n\n")),
                         &artifact_outputs,
@@ -961,6 +1076,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
                     let _ = send_artifact_failure_activity(
                         &ctx,
                         &inbound,
+                        gate,
                         artifact_outputs.len(),
                         "rejected because this group has no active artifact grant",
                     )
@@ -971,12 +1087,15 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
                 ArtifactDeliveryOutcome::FallbackAllowed
             };
 
-            if !artifact_delivery_attempted
-                || matches!(artifact_delivery, ArtifactDeliveryOutcome::FallbackAllowed)
+            if (!artifact_delivery_attempted
+                || matches!(artifact_delivery, ArtifactDeliveryOutcome::FallbackAllowed))
+                && output.latched().is_none()
             {
                 deliver_buffered_text(
                     &ctx,
                     &inbound,
+                    gate,
+                    &mut collector,
                     &buffered_text,
                     &mut chunk_index,
                     &mut delivered_chunks,
@@ -984,6 +1103,20 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
                     &mut persist_failed,
                 )
                 .await;
+            }
+            if let Some(kind) = output.latched() {
+                handle_output_limit(
+                    &ctx,
+                    &inbound,
+                    known_session.as_ref(),
+                    cwd,
+                    recovery_prompt,
+                    outcome.observed_session,
+                    kind,
+                    retrying,
+                )
+                .await;
+                return;
             }
             let terminal_delivery_count = if artifact_delivery_attempted {
                 // Preflight failures may fall back to completed text. Once a durable media
@@ -996,33 +1129,13 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
             } else {
                 delivered_chunks
             };
-            if retrying && outcome.exit_code == Some(0) && !persist_failed {
-                match ctx.recovery.discard(&inbound.group_ref).await {
-                    Ok(_) => {
-                        permit
-                            .queue
-                            .recovery_changed
-                            .send_modify(|generation| *generation = generation.wrapping_add(1));
-                    }
-                    Err(err) => {
-                        warn!(target: TRACE_TARGET, method = "discard_recovery", error_kind = err.privacy_safe_kind(), "failed to discard completed recovery record");
-                        if let Err(reset_err) = ctx.recovery.reset_retry(&inbound.group_ref).await {
-                            warn!(target: TRACE_TARGET, method = "retry_recovery", error_kind = reset_err.privacy_safe_kind(), "failed to restore retryable recovery state");
-                        }
-                    }
-                }
-                if let Err(err) = ctx
-                    .deliveries
-                    .discard_incomplete_final(&inbound.group_ref)
-                    .await
-                {
-                    warn!(target: TRACE_TARGET, method = "discard_incomplete_final", error_kind = err.privacy_safe_kind(), "failed to discard incomplete-final barrier");
-                }
-            }
+            retry_completed = retrying && outcome.exit_code == Some(0) && !persist_failed;
+            let observed_session = outcome.observed_session.clone();
             finish_success(
-                ctx,
-                inbound,
-                known_session,
+                &ctx,
+                &inbound,
+                gate,
+                known_session.clone(),
                 cwd,
                 recovery_prompt,
                 outcome,
@@ -1034,6 +1147,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
                 },
             )
             .await;
+            observed_session
         }
         Ok(Err(failure)) => {
             warn!(
@@ -1045,6 +1159,8 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
             deliver_buffered_text(
                 &ctx,
                 &inbound,
+                gate,
+                &mut collector,
                 &buffered_text,
                 &mut chunk_index,
                 &mut delivered_chunks,
@@ -1052,6 +1168,20 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
                 &mut persist_failed,
             )
             .await;
+            if let Some(kind) = output.latched() {
+                handle_output_limit(
+                    &ctx,
+                    &inbound,
+                    known_session.as_ref(),
+                    cwd,
+                    recovery_prompt,
+                    failure.observed_session,
+                    kind,
+                    retrying,
+                )
+                .await;
+                return;
+            }
             if retrying && let Err(err) = ctx.recovery.reset_retry(&inbound.group_ref).await {
                 warn!(target: TRACE_TARGET, method = "retry_recovery", error_kind = err.privacy_safe_kind(), "failed to restore retryable recovery state");
             }
@@ -1069,15 +1199,8 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
                 &failure,
             )
             .await;
-            let _ = send_reply(
-                &ctx,
-                &inbound.account_ref,
-                &inbound.group_ref,
-                &inbound.message_ref,
-                &text,
-                chunk_index + 1,
-            )
-            .await;
+            let _ = send_turn_reply(&ctx, gate, &inbound.account_ref, &text, chunk_index + 1).await;
+            failure.observed_session
         }
         Err(err) => {
             let err = HarnessError::from(err);
@@ -1090,6 +1213,8 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
             deliver_buffered_text(
                 &ctx,
                 &inbound,
+                gate,
+                &mut collector,
                 &buffered_text,
                 &mut chunk_index,
                 &mut delivered_chunks,
@@ -1097,23 +1222,427 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
                 &mut persist_failed,
             )
             .await;
-            if retrying && let Err(reset_err) = ctx.recovery.reset_retry(&inbound.group_ref).await {
-                warn!(target: TRACE_TARGET, method = "retry_recovery", error_kind = reset_err.privacy_safe_kind(), "failed to restore retryable recovery state");
+            if output.latched().is_none() {
+                if retrying
+                    && let Err(reset_err) = ctx.recovery.reset_retry(&inbound.group_ref).await
+                {
+                    warn!(target: TRACE_TARGET, method = "retry_recovery", error_kind = reset_err.privacy_safe_kind(), "failed to restore retryable recovery state");
+                }
+                let _ = send_turn_reply(
+                    &ctx,
+                    gate,
+                    &inbound.account_ref,
+                    &format!(
+                        "[{}] {} failed while completing this prompt.",
+                        ctx.cfg.spec.reply_prefix, ctx.cfg.spec.display_name
+                    ),
+                    chunk_index + 1,
+                )
+                .await;
             }
-            let _ = send_reply(
-                &ctx,
-                &inbound.account_ref,
-                &inbound.group_ref,
-                &inbound.message_ref,
-                &format!(
-                    "[{}] {} failed while completing this prompt.",
-                    ctx.cfg.spec.reply_prefix, ctx.cfg.spec.display_name
-                ),
-                chunk_index + 1,
-            )
-            .await;
+            None
+        }
+    };
+    if let Some(kind) = output.latched() {
+        let (cwd, recovery_prompt) = limit_context;
+        handle_output_limit(
+            &ctx,
+            &inbound,
+            known_session.as_ref(),
+            cwd,
+            recovery_prompt,
+            observed_session,
+            kind,
+            retrying,
+        )
+        .await;
+        return;
+    }
+    // The prior obligations are released only after every completion step,
+    // including the terminal status, stayed within this retry's budgets.
+    if retry_completed {
+        match ctx.recovery.discard(&inbound.group_ref).await {
+            Ok(_) => {
+                permit
+                    .queue
+                    .recovery_changed
+                    .send_modify(|generation| *generation = generation.wrapping_add(1));
+            }
+            Err(err) => {
+                warn!(target: TRACE_TARGET, method = "discard_recovery", error_kind = err.privacy_safe_kind(), "failed to discard completed recovery record");
+                if let Err(reset_err) = ctx.recovery.reset_retry(&inbound.group_ref).await {
+                    warn!(target: TRACE_TARGET, method = "retry_recovery", error_kind = reset_err.privacy_safe_kind(), "failed to restore retryable recovery state");
+                }
+            }
+        }
+        let _ =
+            discard_unresolved_turns(&ctx, &inbound.group_ref, Some(&inbound.message_ref)).await;
+    }
+    let pending_artifacts = ctx
+        .outbox
+        .lock()
+        .await
+        .has_pending_reply(&inbound.group_ref, &inbound.message_ref);
+    if let Err(err) = ctx
+        .deliveries
+        .finish_turn(&inbound.group_ref, &inbound.message_ref, pending_artifacts)
+        .await
+    {
+        warn!(target: TRACE_TARGET, method = "turn_budget", error_kind = err.privacy_safe_kind(), "failed to release the durable output budget; the group stays blocked until discarded");
+    }
+}
+
+/// Per-turn admission for every durable output request: final text, status
+/// notices, media and activity. Each attempt, including retries, is charged
+/// durably before its effect and is abandoned once the turn's limit latches.
+#[derive(Clone, Copy)]
+struct TurnGate<'a> {
+    deliveries: &'a FinalDeliveryStore,
+    group_ref: &'a str,
+    reply_to_ref: &'a str,
+    mode: SendMode,
+    default_max: usize,
+    output: Option<&'a TurnOutputControl>,
+    work: Option<ReplayWork<'a>>,
+}
+
+/// The durable item a replay sends. Each admission first confirms the item is
+/// still pending, so a stale snapshot cannot resend work that was delivered or
+/// discarded after the snapshot was taken.
+#[derive(Clone, Copy)]
+enum ReplayWork<'a> {
+    Final {
+        key: &'a str,
+    },
+    Artifact {
+        outbox: &'a Mutex<ArtifactOutbox>,
+        key: &'a str,
+    },
+}
+
+impl<'a> TurnGate<'a> {
+    fn live(
+        ctx: &'a BridgeContext,
+        inbound: &'a InboundPrompt,
+        output: &'a TurnOutputControl,
+    ) -> Self {
+        Self {
+            deliveries: &ctx.deliveries,
+            group_ref: &inbound.group_ref,
+            reply_to_ref: &inbound.message_ref,
+            mode: SendMode::Live,
+            default_max: output.limits().max_durable_sends(),
+            output: Some(output),
+            work: None,
         }
     }
+
+    fn replay(
+        deliveries: &'a FinalDeliveryStore,
+        group_ref: &'a str,
+        reply_to_ref: &'a str,
+        default_max: usize,
+        work: ReplayWork<'a>,
+    ) -> Self {
+        Self {
+            deliveries,
+            group_ref,
+            reply_to_ref,
+            mode: SendMode::Replay,
+            default_max,
+            output: None,
+            work: Some(work),
+        }
+    }
+
+    fn check_stop(&self) -> Result<()> {
+        match self.output.and_then(TurnOutputControl::stop_error) {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    async fn admit(&self) -> Result<()> {
+        self.check_stop()?;
+        let admission = match self.work {
+            None => {
+                self.deliveries
+                    .reserve_send(
+                        self.group_ref,
+                        self.reply_to_ref,
+                        self.mode,
+                        self.default_max,
+                    )
+                    .await?
+            }
+            Some(ReplayWork::Final { key }) => {
+                self.deliveries
+                    .reserve_record_replay(key, self.group_ref, self.reply_to_ref, self.default_max)
+                    .await?
+            }
+            Some(ReplayWork::Artifact { outbox, key }) => {
+                // A discard tombstones the turn before it removes the intent under
+                // this lock, so admission sees the tombstone or no intent.
+                let outbox = outbox.lock().await;
+                if outbox.contains(key) {
+                    self.deliveries
+                        .reserve_send(
+                            self.group_ref,
+                            self.reply_to_ref,
+                            self.mode,
+                            self.default_max,
+                        )
+                        .await?
+                } else {
+                    SendAdmission::Withheld
+                }
+            }
+        };
+        match admission {
+            SendAdmission::Admitted => {}
+            SendAdmission::Exhausted => {
+                let kind = OutputLimitKind::DurableSends;
+                return Err(match self.output {
+                    Some(output) => output.exceeded(kind),
+                    None => HarnessError::OutputLimitExceeded { kind },
+                });
+            }
+            SendAdmission::Withheld => return Err(HarnessError::DeliveryWithheld),
+        }
+        // The reservation write is an await point; a breach latched meanwhile wins.
+        self.check_stop()
+    }
+
+    async fn request<T>(&self, request: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        self.admit().await?;
+        until_output_stopped(self.output, request).await
+    }
+}
+
+/// Consumer-side per-invocation counters. These validate what the bridge
+/// accepts from any `Backend`, independently of producer-side accounting.
+struct TurnCollector {
+    limits: OutputLimits,
+    text_bytes: usize,
+    text_events: usize,
+    artifact_buffer_bytes: usize,
+    artifacts: usize,
+    reply_chunks: usize,
+}
+
+impl TurnCollector {
+    fn new(limits: OutputLimits) -> Self {
+        Self {
+            limits,
+            text_bytes: 0,
+            text_events: 0,
+            artifact_buffer_bytes: 0,
+            artifacts: 0,
+            reply_chunks: 0,
+        }
+    }
+
+    fn charge_text(&mut self, text: &str) -> std::result::Result<(), OutputLimitKind> {
+        charge(
+            &mut self.text_events,
+            1,
+            self.limits.max_text_events(),
+            OutputLimitKind::AssistantTextEvents,
+        )?;
+        charge(
+            &mut self.text_bytes,
+            text.len(),
+            self.limits.max_text_bytes(),
+            OutputLimitKind::AssistantTextBytes,
+        )
+    }
+
+    /// Charges a retained caption item plus the `\n\n` separator that joins it.
+    fn charge_buffered_text(
+        &mut self,
+        text: &str,
+        has_previous: bool,
+    ) -> std::result::Result<(), OutputLimitKind> {
+        let separator = if has_previous { 2 } else { 0 };
+        let amount = text
+            .len()
+            .checked_add(separator)
+            .ok_or(OutputLimitKind::ArtifactBuffer)?;
+        charge(
+            &mut self.artifact_buffer_bytes,
+            amount,
+            self.limits.max_artifact_buffer_bytes(),
+            OutputLimitKind::ArtifactBuffer,
+        )
+    }
+
+    fn charge_artifacts(&mut self, count: usize) -> std::result::Result<(), OutputLimitKind> {
+        charge(
+            &mut self.artifacts,
+            count,
+            self.limits.max_artifacts(),
+            OutputLimitKind::ArtifactCount,
+        )
+    }
+
+    /// Reserves every chunk of `text` before any of them is staged, counting at
+    /// most one chunk past the remaining budget. Returns the reserved count.
+    fn reserve_reply_chunks(
+        &mut self,
+        text: &str,
+        max_reply_bytes: usize,
+    ) -> std::result::Result<usize, OutputLimitKind> {
+        let maximum = self.limits.max_reply_chunks();
+        let remaining = maximum.saturating_sub(self.reply_chunks);
+        let count = count_reply_chunks(text, max_reply_bytes, remaining);
+        charge(
+            &mut self.reply_chunks,
+            count,
+            maximum,
+            OutputLimitKind::ReplyChunks,
+        )?;
+        Ok(count)
+    }
+
+    /// Reserves the combined chunks of a complete batch before any item is
+    /// staged. On a breach nothing from the batch stays reserved.
+    fn reserve_reply_batch(
+        &mut self,
+        texts: &[String],
+        max_reply_bytes: usize,
+    ) -> std::result::Result<usize, OutputLimitKind> {
+        let mut reserved = 0usize;
+        for text in texts {
+            match self.reserve_reply_chunks(text, max_reply_bytes) {
+                Ok(count) => reserved += count,
+                Err(kind) => {
+                    self.release_reply_chunks(reserved);
+                    return Err(kind);
+                }
+            }
+        }
+        Ok(reserved)
+    }
+
+    /// Returns reserved chunks that were never staged or sent.
+    fn release_reply_chunks(&mut self, count: usize) {
+        self.reply_chunks = self.reply_chunks.saturating_sub(count);
+    }
+}
+
+/// Withholds all further output for a turn that exceeded an output limit and
+/// persists its recovery state. No reply, activity or fallback is sent.
+#[allow(clippy::too_many_arguments)]
+async fn handle_output_limit(
+    ctx: &BridgeContext,
+    inbound: &InboundPrompt,
+    known_session: Option<&SessionRecord>,
+    cwd: PathBuf,
+    recovery_prompt: String,
+    observed_session: Option<String>,
+    kind: OutputLimitKind,
+    retrying: bool,
+) {
+    warn!(
+        target: TRACE_TARGET,
+        method = "output_limit",
+        limit = kind.as_str(),
+        "backend turn exceeded an output limit; remaining output is withheld"
+    );
+    if let Err(err) = persist_observed_session_if_unset(
+        &ctx.sessions,
+        &inbound.group_ref,
+        known_session,
+        cwd.clone(),
+        observed_session.clone(),
+    )
+    .await
+    {
+        warn!(target: TRACE_TARGET, method = "session_store", error_kind = err.privacy_safe_kind(), "failed to persist backend session");
+    }
+    let session_id = observed_session
+        .or_else(|| known_session.map(|record| record.session_id.clone()))
+        .filter(|value| !value.is_empty());
+    if let Some(session_id) = session_id {
+        // Earlier no-side-effects evidence does not cover output after it.
+        if let Err(err) = persist_recovery_record(
+            &ctx.recovery,
+            &inbound.group_ref,
+            recovery_prompt,
+            inbound.media.clone(),
+            cwd,
+            session_id,
+            RecoveryKind::UncertainOutcome,
+        )
+        .await
+        {
+            warn!(target: TRACE_TARGET, method = "recovery_store", error_kind = err.privacy_safe_kind(), "failed to persist recovery record");
+        }
+    } else if retrying && let Err(err) = ctx.recovery.reset_retry(&inbound.group_ref).await {
+        warn!(target: TRACE_TARGET, method = "retry_recovery", error_kind = err.privacy_safe_kind(), "failed to restore retryable recovery state");
+    }
+    if let Err(err) = ctx
+        .deliveries
+        .limit_turn(
+            &inbound.group_ref,
+            &inbound.message_ref,
+            ctx.cfg.output_limits.max_durable_sends(),
+        )
+        .await
+    {
+        warn!(target: TRACE_TARGET, method = "turn_budget", error_kind = err.privacy_safe_kind(), "failed to persist the limited turn; its active budget keeps the group blocked");
+    }
+}
+
+/// Discards incomplete-final barriers and unresolved turns for a group,
+/// including their pending artifact batches. Returns whether anything was
+/// discarded. The turns stay tombstoned, withheld and blocking until every
+/// matching artifact intent is durably removed; any failure is returned so the
+/// discard is never confirmed, and a later discard resumes it.
+async fn discard_unresolved_turns(
+    ctx: &BridgeContext,
+    group_ref: &str,
+    keep_reply_to: Option<&str>,
+) -> Result<bool> {
+    let discarded = match ctx.deliveries.begin_discard(group_ref, keep_reply_to).await {
+        Ok(discarded) => discarded,
+        Err(err) => {
+            warn!(target: TRACE_TARGET, method = "discard_incomplete_final", error_kind = err.privacy_safe_kind(), "failed to discard incomplete-final barrier");
+            return Err(err);
+        }
+    };
+    if discarded.is_empty() {
+        return Ok(false);
+    }
+    let batches: Vec<_> = ctx
+        .outbox
+        .lock()
+        .await
+        .pending()
+        .into_iter()
+        .filter(|batch| {
+            batch.group_ref == group_ref && discarded.contains(&batch.reply_to_message_ref)
+        })
+        .collect();
+    for batch in batches {
+        match remove_artifact_batch(ctx, &batch.idempotency_key).await {
+            Ok(paths) => remove_staged_files(&ctx.cfg.artifact_exports, paths),
+            Err(err) => {
+                warn!(target: TRACE_TARGET, method = "artifact_outbox_discard", error_kind = err.privacy_safe_kind(), "failed to discard a pending artifact delivery intent; the discarded turn stays withheld");
+                return Err(err);
+            }
+        }
+    }
+    if let Err(err) = ctx
+        .deliveries
+        .release_discarded(group_ref, &discarded)
+        .await
+    {
+        warn!(target: TRACE_TARGET, method = "discard_incomplete_final", error_kind = err.privacy_safe_kind(), "failed to release discarded turns; the group stays blocked until discarded again");
+        return Err(err);
+    }
+    ctx.queues.signal_group_changed(group_ref).await;
+    Ok(true)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1141,6 +1670,39 @@ fn invalid_replay_batch_can_be_discarded(batch: &PendingArtifactBatch) -> bool {
 async fn deliver_artifact_outputs(
     ctx: &Arc<BridgeContext>,
     inbound: &InboundPrompt,
+    gate: TurnGate<'_>,
+    collector: &mut TurnCollector,
+    authorization: &crate::artifacts::ArtifactAuthorization,
+    caption: Option<String>,
+    outputs: &[ArtifactOutput],
+) -> ArtifactDeliveryOutcome {
+    // The caption and its remaining text are reply chunks; reserve them before staging.
+    let reserved_chunks = match caption.as_deref() {
+        Some(text) => match collector.reserve_reply_chunks(text, ctx.cfg.max_reply_bytes) {
+            Ok(count) => count,
+            Err(kind) => {
+                if let Some(output) = gate.output {
+                    output.latch(kind);
+                }
+                return ArtifactDeliveryOutcome::Pending;
+            }
+        },
+        None => 0,
+    };
+    let outcome =
+        deliver_reserved_artifact_outputs(ctx, inbound, gate, authorization, caption, outputs)
+            .await;
+    if outcome == ArtifactDeliveryOutcome::FallbackAllowed {
+        // Fallback text is reserved again, chunk by chunk, when it is staged.
+        collector.release_reply_chunks(reserved_chunks);
+    }
+    outcome
+}
+
+async fn deliver_reserved_artifact_outputs(
+    ctx: &Arc<BridgeContext>,
+    inbound: &InboundPrompt,
+    gate: TurnGate<'_>,
     authorization: &crate::artifacts::ArtifactAuthorization,
     caption: Option<String>,
     outputs: &[ArtifactOutput],
@@ -1193,7 +1755,7 @@ async fn deliver_artifact_outputs(
                 }
                 _ => "rejected by the connector safety policy",
             };
-            let _ = send_artifact_failure_activity(ctx, inbound, outputs.len(), reason).await;
+            let _ = send_artifact_failure_activity(ctx, inbound, gate, outputs.len(), reason).await;
             return ArtifactDeliveryOutcome::FallbackAllowed;
         }
     };
@@ -1209,6 +1771,7 @@ async fn deliver_artifact_outputs(
         let _ = send_artifact_failure_activity(
             ctx,
             inbound,
+            gate,
             outputs.len(),
             "rejected because durable delivery state could not be recorded",
         )
@@ -1224,11 +1787,13 @@ async fn deliver_artifact_outputs(
         return ArtifactDeliveryOutcome::FallbackAllowed;
     }
 
-    match send_pending_artifact_batch(ctx, &batch).await {
+    match send_pending_artifact_batch(ctx, &batch, gate).await {
         Ok(()) => {
             complete_artifact_batch(ctx, &batch.idempotency_key, &batch.group_ref).await;
             ArtifactDeliveryOutcome::Delivered
         }
+        // The durable intent stays pending and its turn becomes limited; send nothing more.
+        Err(HarnessError::OutputLimitExceeded { .. }) => ArtifactDeliveryOutcome::Pending,
         Err(err) => {
             let validation_failed = err.artifact_validation_failed();
             let invalid_batch_discarded = validation_failed
@@ -1247,7 +1812,7 @@ async fn deliver_artifact_outputs(
             } else {
                 "is pending automatic retry after a delivery failure"
             };
-            let _ = send_artifact_failure_activity(ctx, inbound, outputs.len(), reason).await;
+            let _ = send_artifact_failure_activity(ctx, inbound, gate, outputs.len(), reason).await;
             outcome
         }
     }
@@ -1258,9 +1823,49 @@ async fn retry_pending_artifacts(ctx: &Arc<BridgeContext>) {
         return;
     }
     let pending = ctx.outbox.lock().await.pending();
+    replay_artifact_batches(ctx, pending).await;
+}
+
+/// Replays a snapshot of pending batches; each admission rechecks that its
+/// batch is still pending, so the snapshot may be stale.
+async fn replay_artifact_batches(ctx: &Arc<BridgeContext>, pending: Vec<PendingArtifactBatch>) {
+    let default_max = ctx.cfg.output_limits.max_durable_sends();
     for batch in pending {
-        match send_pending_artifact_batch(ctx, &batch).await {
-            Ok(()) => complete_artifact_batch(ctx, &batch.idempotency_key, &batch.group_ref).await,
+        let gate = TurnGate::replay(
+            &ctx.deliveries,
+            &batch.group_ref,
+            &batch.reply_to_message_ref,
+            default_max,
+            ReplayWork::Artifact {
+                outbox: &ctx.outbox,
+                key: &batch.idempotency_key,
+            },
+        );
+        match send_pending_artifact_batch(ctx, &batch, gate).await {
+            Ok(()) => {
+                complete_artifact_batch(ctx, &batch.idempotency_key, &batch.group_ref).await;
+                prune_replayed_turn(
+                    &ctx.deliveries,
+                    &ctx.outbox,
+                    &batch.group_ref,
+                    &batch.reply_to_message_ref,
+                )
+                .await;
+            }
+            Err(HarnessError::DeliveryWithheld) => debug!(
+                target: TRACE_TARGET,
+                method = "send_media_retry",
+                "artifact replay withheld for an unresolved turn"
+            ),
+            Err(HarnessError::OutputLimitExceeded { kind }) => {
+                limit_replayed_turn(
+                    &ctx.deliveries,
+                    &batch.group_ref,
+                    &batch.reply_to_message_ref,
+                    kind,
+                )
+                .await;
+            }
             Err(err) => {
                 if err.artifact_validation_failed() && invalid_replay_batch_can_be_discarded(&batch)
                 {
@@ -1311,6 +1916,7 @@ async fn begin_validated_retry(
 async fn send_pending_artifact_batch(
     ctx: &BridgeContext,
     batch: &PendingArtifactBatch,
+    gate: TurnGate<'_>,
 ) -> Result<()> {
     validate_staged_batch(&ctx.cfg.artifact_exports, ctx.cfg.spec.reply_prefix, batch)?;
     let attachments = batch
@@ -1327,15 +1933,14 @@ async fn send_pending_artifact_batch(
     let mut last_error = None;
     let mut sent = false;
     for attempt in 0..SEND_RETRY_ATTEMPTS {
-        match ctx
-            .client
-            .send_artifacts(
+        match gate
+            .request(ctx.client.send_artifacts(
                 &batch.account_ref,
                 &batch.group_ref,
                 attachments.clone(),
                 batch.caption.clone(),
                 batch.idempotency_key.clone(),
-            )
+            ))
             .await
         {
             Ok(()) => {
@@ -1353,8 +1958,9 @@ async fn send_pending_artifact_batch(
         return Err(last_error.unwrap_or(HarnessError::ControlClosed));
     }
     for (index, chunk) in batch.remaining_text.iter().enumerate() {
-        send_reply(
-            ctx,
+        send_final_with_retry(
+            &ctx.client,
+            Some(gate),
             &batch.account_ref,
             &batch.group_ref,
             &batch.reply_to_message_ref,
@@ -1420,6 +2026,7 @@ async fn complete_artifact_batch(ctx: &BridgeContext, key: &str, group_ref: &str
 async fn send_artifact_failure_activity(
     ctx: &BridgeContext,
     inbound: &InboundPrompt,
+    gate: TurnGate<'_>,
     artifact_count: usize,
     reason: &str,
 ) -> Result<()> {
@@ -1427,17 +2034,43 @@ async fn send_artifact_failure_activity(
         .map(|index| format!("Artifact {index}: {reason}."))
         .collect::<Vec<_>>()
         .join("\n");
-    ctx.client
+    gate.request(ctx.client.send_agent_activity_error(
+        &inbound.account_ref,
+        &inbound.group_ref,
+        &inbound.message_ref,
+        format!(
+            "[{}] Attachments withheld. {details}",
+            ctx.cfg.spec.reply_prefix
+        ),
+    ))
+    .await
+}
+
+/// Tells a message queued behind a turn that only a recovery command can
+/// release why it is waiting. Activity carries no reply idempotency key, so it
+/// cannot collide with the queued message's own later replies.
+async fn send_recovery_required_notice(ctx: &BridgeContext, inbound: &InboundPrompt) {
+    let commands = if ctx.recovery.get(&inbound.group_ref).await.is_some() {
+        "Send `/retry-last` to retry it, or `/discard-last` to abandon it"
+    } else {
+        "Send `/discard-last` to abandon it"
+    };
+    let text = format!(
+        "[{}] {UNRESOLVED_TURN_TEXT} {commands}; this message stays queued until then.",
+        ctx.cfg.spec.reply_prefix
+    );
+    if let Err(err) = ctx
+        .client
         .send_agent_activity_error(
             &inbound.account_ref,
             &inbound.group_ref,
             &inbound.message_ref,
-            format!(
-                "[{}] Attachments withheld. {details}",
-                ctx.cfg.spec.reply_prefix
-            ),
+            text,
         )
         .await
+    {
+        warn!(target: TRACE_TARGET, method = "recovery_notice", error_kind = err.privacy_safe_kind(), "failed to send the recovery-required notice");
+    }
 }
 
 async fn fifo_is_blocked(ctx: &BridgeContext, group_ref: &str) -> bool {
@@ -1824,9 +2457,11 @@ async fn send_command_reply(ctx: &BridgeContext, inbound: &InboundPrompt, body: 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finish_success(
-    ctx: Arc<BridgeContext>,
-    inbound: InboundPrompt,
+    ctx: &BridgeContext,
+    inbound: &InboundPrompt,
+    gate: TurnGate<'_>,
     known_session: Option<SessionRecord>,
     cwd: PathBuf,
     recovery_prompt: String,
@@ -1905,11 +2540,10 @@ async fn finish_success(
                 ctx.cfg.spec.reply_prefix
             )
         };
-        let _ = send_reply(
-            &ctx,
+        let _ = send_turn_reply(
+            ctx,
+            gate,
             &inbound.account_ref,
-            &inbound.group_ref,
-            &inbound.message_ref,
             &message,
             delivery.status_chunk_index,
         )
@@ -1938,21 +2572,19 @@ async fn finish_success(
         {
             warn!(target: TRACE_TARGET, method = "recovery_store", error_kind = err.privacy_safe_kind(), "failed to persist recovery record");
         }
-        let _ = send_reply(
-            &ctx,
+        let _ = send_turn_reply(
+            ctx,
+            gate,
             &inbound.account_ref,
-            &inbound.group_ref,
-            &inbound.message_ref,
             &format!("[{}] {INCOMPLETE_FINAL_TEXT}", ctx.cfg.spec.reply_prefix),
             delivery.status_chunk_index,
         )
         .await;
     } else if completion_route == CompletionRoute::TextFinalAckUnknown {
-        let _ = send_reply(
-            &ctx,
+        let _ = send_turn_reply(
+            ctx,
+            gate,
             &inbound.account_ref,
-            &inbound.group_ref,
-            &inbound.message_ref,
             &format!(
                 "[{}] {TEXT_FINAL_ACK_UNKNOWN_TEXT}",
                 ctx.cfg.spec.reply_prefix
@@ -1977,11 +2609,10 @@ async fn finish_success(
             message.push_str(&format!(" (exit {code})"));
         }
         message.push('.');
-        let _ = send_reply(
-            &ctx,
+        let _ = send_turn_reply(
+            ctx,
+            gate,
             &inbound.account_ref,
-            &inbound.group_ref,
-            &inbound.message_ref,
             &message,
             delivery.status_chunk_index,
         )
@@ -2336,19 +2967,32 @@ async fn install_allowlist(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn deliver_buffered_text(
     ctx: &BridgeContext,
     inbound: &InboundPrompt,
+    gate: TurnGate<'_>,
+    collector: &mut TurnCollector,
     buffered_text: &[String],
     chunk_index: &mut usize,
     delivered_chunks: &mut usize,
     delivery_failed: &mut bool,
     persist_failed: &mut bool,
 ) {
-    if *delivery_failed || *persist_failed {
+    if *delivery_failed || *persist_failed || gate.check_stop().is_err() {
+        return;
+    }
+    // The batch is complete, so an over-budget batch must not produce a partial reply.
+    if let Err(kind) = collector.reserve_reply_batch(buffered_text, ctx.cfg.max_reply_bytes) {
+        if let Some(output) = gate.output {
+            output.latch(kind);
+        }
         return;
     }
     for text in buffered_text {
+        if gate.check_stop().is_err() {
+            return;
+        }
         let staged = match stage_text_chunks(
             &FinalReplyTarget {
                 deliveries: &ctx.deliveries,
@@ -2379,6 +3023,7 @@ async fn deliver_buffered_text(
         for (key, chunk, index) in staged {
             if let Err(err) = send_staged_backend_reply(
                 ctx,
+                Some(gate),
                 &key,
                 &inbound.account_ref,
                 &inbound.group_ref,
@@ -2397,10 +3042,26 @@ async fn deliver_buffered_text(
     }
 }
 
-async fn reconcile_pending_deliveries(client: &ControlClient, store: &FinalDeliveryStore) {
+/// Replays acknowledgement-unknown finals. Every attempt is admitted against
+/// its turn's durable budget at send time, and only while its record is still
+/// pending, so a stale snapshot cannot replay an active, limited or discarded turn.
+async fn reconcile_pending_deliveries(
+    client: &ControlClient,
+    store: &FinalDeliveryStore,
+    outbox: &Mutex<ArtifactOutbox>,
+    default_max: usize,
+) {
     for (key, record) in store.list_reconcilable().await {
+        let gate = TurnGate::replay(
+            store,
+            &record.group_ref,
+            &record.reply_to_ref,
+            default_max,
+            ReplayWork::Final { key: &key },
+        );
         match send_final_with_retry(
             client,
+            Some(gate),
             &record.account_ref,
             &record.group_ref,
             &record.reply_to_ref,
@@ -2409,15 +3070,65 @@ async fn reconcile_pending_deliveries(client: &ControlClient, store: &FinalDeliv
         )
         .await
         {
-            Ok(()) => {
-                if let Err(err) = store.remove(&key).await {
+            Ok(()) => match store.remove(&key).await {
+                Ok(_) => {
+                    prune_replayed_turn(store, outbox, &record.group_ref, &record.reply_to_ref)
+                        .await
+                }
+                Err(err) => {
                     warn!(target: TRACE_TARGET, method = "final_reconcile", error_kind = err.privacy_safe_kind(), "failed to clear reconciled final-delivery record");
                 }
+            },
+            Err(HarnessError::DeliveryWithheld) => debug!(
+                target: TRACE_TARGET,
+                method = "final_reconcile",
+                "final-delivery replay withheld for an unresolved turn"
+            ),
+            Err(HarnessError::OutputLimitExceeded { kind }) => {
+                limit_replayed_turn(store, &record.group_ref, &record.reply_to_ref, kind).await;
             }
             Err(err) => {
                 warn!(target: TRACE_TARGET, method = "final_reconcile", error_kind = err.privacy_safe_kind(), "final-delivery reconciliation remains pending");
             }
         }
+    }
+}
+
+async fn prune_replayed_turn(
+    store: &FinalDeliveryStore,
+    outbox: &Mutex<ArtifactOutbox>,
+    group_ref: &str,
+    reply_to_ref: &str,
+) {
+    let pending_artifacts = outbox
+        .lock()
+        .await
+        .has_pending_reply(group_ref, reply_to_ref);
+    if let Err(err) = store
+        .prune_turn(group_ref, reply_to_ref, pending_artifacts)
+        .await
+    {
+        warn!(target: TRACE_TARGET, method = "turn_budget", error_kind = err.privacy_safe_kind(), "failed to prune a reconciled turn budget");
+    }
+}
+
+/// Stops replay for a turn whose durable-send budget is exhausted; its pending
+/// work stays behind the incomplete-final barrier until explicitly discarded.
+/// A turn already being discarded keeps its tombstone.
+async fn limit_replayed_turn(
+    store: &FinalDeliveryStore,
+    group_ref: &str,
+    reply_to_ref: &str,
+    kind: OutputLimitKind,
+) {
+    warn!(
+        target: TRACE_TARGET,
+        method = "output_limit",
+        limit = kind.as_str(),
+        "delivery replay exceeded its turn budget; remaining output is withheld"
+    );
+    if let Err(err) = store.limit_replayed_turn(group_ref, reply_to_ref).await {
+        warn!(target: TRACE_TARGET, method = "turn_budget", error_kind = err.privacy_safe_kind(), "failed to persist the limited turn");
     }
 }
 
@@ -2490,8 +3201,10 @@ async fn stage_delivery_record(
     Ok(key)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_staged_backend_reply(
     ctx: &BridgeContext,
+    gate: Option<TurnGate<'_>>,
     key: &str,
     account_ref: &str,
     group_ref: &str,
@@ -2501,6 +3214,7 @@ async fn send_staged_backend_reply(
 ) -> Result<()> {
     send_final_with_retry(
         &ctx.client,
+        gate,
         account_ref,
         group_ref,
         reply_to_ref,
@@ -2512,6 +3226,7 @@ async fn send_staged_backend_reply(
     Ok(())
 }
 
+/// Sends a connector reply that is not part of any backend turn's output.
 async fn send_reply(
     ctx: &BridgeContext,
     account_ref: &str,
@@ -2522,6 +3237,7 @@ async fn send_reply(
 ) -> Result<()> {
     send_final_with_retry(
         &ctx.client,
+        None,
         account_ref,
         group_ref,
         reply_to_ref,
@@ -2531,8 +3247,29 @@ async fn send_reply(
     .await
 }
 
+/// Sends a status notice charged against the turn's durable-send budget.
+async fn send_turn_reply(
+    ctx: &BridgeContext,
+    gate: TurnGate<'_>,
+    account_ref: &str,
+    text: &str,
+    chunk_index: usize,
+) -> Result<()> {
+    send_final_with_retry(
+        &ctx.client,
+        Some(gate),
+        account_ref,
+        gate.group_ref,
+        gate.reply_to_ref,
+        text,
+        chunk_index,
+    )
+    .await
+}
+
 async fn send_final_with_retry(
     client: &ControlClient,
+    gate: Option<TurnGate<'_>>,
     account_ref: &str,
     group_ref: &str,
     reply_to_ref: &str,
@@ -2541,10 +3278,12 @@ async fn send_final_with_retry(
 ) -> Result<()> {
     let mut last_error: Option<HarnessError> = None;
     for attempt in 1..=SEND_RETRY_ATTEMPTS {
-        match client
-            .send_final(account_ref, group_ref, reply_to_ref, text, chunk_index)
-            .await
-        {
+        let request = client.send_final(account_ref, group_ref, reply_to_ref, text, chunk_index);
+        let result = match gate {
+            Some(gate) => gate.request(request).await,
+            None => request.await,
+        };
+        match result {
             Ok(()) => return Ok(()),
             Err(err) if err.retryable() && attempt < SEND_RETRY_ATTEMPTS => {
                 last_error = Some(err);
@@ -2862,6 +3601,7 @@ mod tests {
             backend_idle_timeout: Duration::from_secs(45),
             execution_profile: crate::ExecutionProfile::Inherit,
             artifact_exports: crate::ArtifactExportConfig::default(),
+            output_limits: OutputLimits::default(),
             spec: crate::ConfigSpec {
                 env_prefix: "WN_OPENCODE",
                 default_home_name: "harnesses",
@@ -3181,9 +3921,9 @@ mod tests {
     ) -> Vec<agent_control::AgentControlRequest> {
         let root = tempfile::tempdir().unwrap();
         let export_root = root.path().join("exports");
-        std::fs::create_dir(&export_root).unwrap();
-        std::fs::write(export_root.join("report.pdf"), b"report").unwrap();
-        std::fs::write(export_root.join("chart.png"), b"chart").unwrap();
+        fs_private::create_dir_all_private(&export_root).unwrap();
+        fs_private::write_private(&export_root.join("report.pdf"), b"report").unwrap();
+        fs_private::write_private(&export_root.join("chart.png"), b"chart").unwrap();
 
         let socket = root.path().join("control.sock");
         let listener = StdUnixListener::bind(&socket).unwrap();
@@ -4067,7 +4807,7 @@ mod tests {
         let _artifact_test_guard = ARTIFACT_DELIVERY_TEST_LOCK.lock().await;
         let root = tempfile::tempdir().unwrap();
         let export_root = root.path().join("exports");
-        std::fs::create_dir(&export_root).unwrap();
+        fs_private::create_dir_all_private(&export_root).unwrap();
 
         let socket = root.path().join("control.sock");
         let listener = StdUnixListener::bind(&socket).unwrap();
@@ -4194,8 +4934,8 @@ mod tests {
         let _artifact_test_guard = ARTIFACT_DELIVERY_TEST_LOCK.lock().await;
         let root = tempfile::tempdir().unwrap();
         let export_root = root.path().join("exports");
-        std::fs::create_dir(&export_root).unwrap();
-        std::fs::write(export_root.join("report.pdf"), b"report").unwrap();
+        fs_private::create_dir_all_private(&export_root).unwrap();
+        fs_private::write_private(&export_root.join("report.pdf"), b"report").unwrap();
 
         let socket = root.path().join("control.sock");
         let listener = StdUnixListener::bind(&socket).unwrap();
@@ -5033,6 +5773,7 @@ mod tests {
             session_id: Some("existing-session".to_owned()),
             prompt: "text accompanying a file".to_owned(),
             artifact_output: None,
+            output: Default::default(),
         };
         let attachment = Attachment {
             path: root.path().join("staged.png"),
@@ -5156,12 +5897,7 @@ mod tests {
             CompletionRoute::IncompleteFinal
         );
 
-        assert!(
-            ctx.deliveries
-                .discard_incomplete_final("group")
-                .await
-                .unwrap()
-        );
+        assert!(discard_unresolved_turns(&ctx, "group", None).await.unwrap());
         assert!(!fifo_is_blocked(&ctx, "group").await);
         assert!(ctx.deliveries.list().await.is_empty());
     }
@@ -5282,5 +6018,1378 @@ mod tests {
             RecoveryStatus::Pending
         );
         assert!(store.begin_retry("group").await.unwrap().is_some());
+    }
+
+    type RecordedRequests = Arc<std::sync::Mutex<Vec<AgentControlRequest>>>;
+
+    /// Acknowledges every output request and records it, however many arrive.
+    fn spawn_recording_server(
+        socket: &std::path::Path,
+    ) -> (tokio::task::JoinHandle<()>, RecordedRequests) {
+        let listener = UnixListener::bind(socket).unwrap();
+        let requests = RecordedRequests::default();
+        let recorded = requests.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                let request: AgentControlEnvelope<AgentControlRequest> =
+                    read_envelope(&mut reader).await.unwrap().unwrap();
+                let response = match &request.payload {
+                    AgentControlRequest::SendAgentActivity { .. } => {
+                        AgentControlResponse::AppEventSent {
+                            message_ids_hex: vec!["activity".to_owned()],
+                            maintenance_disposition: Default::default(),
+                        }
+                    }
+                    _ => AgentControlResponse::FinalSent {
+                        message_ids_hex: vec!["sent".to_owned()],
+                        maintenance_disposition: AgentControlSendMaintenanceDisposition::Ready,
+                    },
+                };
+                recorded.lock().unwrap().push(request.payload.clone());
+                write_frame(
+                    &mut write_half,
+                    &AgentControlEnvelope::request(request.id, response),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        (server, requests)
+    }
+
+    fn final_texts(requests: &RecordedRequests) -> Vec<String> {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| match request {
+                AgentControlRequest::SendFinal { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Emits scripted events without observing the output latch, like an
+    /// arbitrary custom `Backend` would.
+    struct ScriptedEventsBackend {
+        events: std::sync::Mutex<Vec<RunnerEvent>>,
+        observed_session: Option<String>,
+    }
+
+    impl ScriptedEventsBackend {
+        fn new(events: Vec<RunnerEvent>, observed_session: Option<&str>) -> Arc<Self> {
+            Arc::new(Self {
+                events: std::sync::Mutex::new(events),
+                observed_session: observed_session.map(str::to_owned),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Backend for ScriptedEventsBackend {
+        async fn run(
+            &self,
+            _invocation: Invocation,
+            tx: mpsc::Sender<RunnerEvent>,
+        ) -> std::result::Result<Outcome, RunFailure> {
+            let events = std::mem::take(&mut *self.events.lock().unwrap());
+            for event in events {
+                if tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+            Ok(Outcome {
+                observed_session: self.observed_session.clone(),
+                exit_code: Some(0),
+                error_summary: None,
+                no_side_effects_proven: true,
+                stderr: String::new(),
+                elapsed_ms: 1,
+            })
+        }
+    }
+
+    fn limited_config(
+        root: &std::path::Path,
+        configure: impl FnOnce(&mut crate::OutputLimitSettings),
+    ) -> Config {
+        let mut settings = crate::OutputLimitSettings::default();
+        configure(&mut settings);
+        let mut config = test_config(root);
+        config.output_limits = OutputLimits::new(settings).unwrap();
+        config
+    }
+
+    fn texts(values: &[&str]) -> Vec<RunnerEvent> {
+        values
+            .iter()
+            .map(|value| RunnerEvent::Text((*value).to_owned()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn text_event_limit_withholds_later_output_and_leaves_a_discardable_barrier() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let config = limited_config(root.path(), |settings| settings.max_text_events = 2);
+        let (server, requests) = spawn_recording_server(&config.socket);
+        let ctx = test_context_with_backend(
+            root.path(),
+            &home,
+            config,
+            ScriptedEventsBackend::new(texts(&["one", "two", "three"]), Some("limited-session")),
+        );
+
+        assert!(dispatch_test_message(ctx.clone(), "message", "work").await);
+
+        assert_eq!(final_texts(&requests), vec!["one", "two"]);
+        let budget = ctx
+            .deliveries
+            .turn_budget("group", "message")
+            .await
+            .unwrap();
+        assert_eq!(budget.phase, crate::store::TurnPhase::Limited);
+        assert!(ctx.deliveries.has_incomplete_final("group").await);
+        assert!(fifo_is_blocked(&ctx, "group").await);
+        assert!(!fifo_is_blocked(&ctx, "other-group").await);
+        let recovery = ctx.recovery.get("group").await.unwrap();
+        // A no-side-effects claim cannot cover output that breached a limit.
+        assert_eq!(recovery.kind, RecoveryKind::UncertainOutcome);
+        assert_eq!(recovery.session_id, "limited-session");
+        assert_eq!(
+            ctx.sessions.get("group").await.unwrap().session_id,
+            "limited-session"
+        );
+        assert!(ctx.deliveries.list_reconcilable().await.is_empty());
+
+        assert!(dispatch_test_message(ctx.clone(), "discard", "/discard-last").await);
+        assert!(!fifo_is_blocked(&ctx, "group").await);
+        assert!(
+            ctx.deliveries
+                .turn_budget("group", "message")
+                .await
+                .is_none()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn limit_without_a_session_keeps_only_a_discardable_barrier() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let config = limited_config(root.path(), |settings| settings.max_text_bytes = 4);
+        let (server, requests) = spawn_recording_server(&config.socket);
+        let ctx = test_context_with_backend(
+            root.path(),
+            &home,
+            config,
+            ScriptedEventsBackend::new(texts(&["12345"]), None),
+        );
+
+        assert!(dispatch_test_message(ctx.clone(), "message", "work").await);
+
+        assert!(requests.lock().unwrap().is_empty());
+        assert!(ctx.recovery.get("group").await.is_none());
+        assert!(fifo_is_blocked(&ctx, "group").await);
+        assert!(dispatch_test_message(ctx.clone(), "discard", "/discard-last").await);
+        assert!(!fifo_is_blocked(&ctx, "group").await);
+        server.abort();
+    }
+
+    fn recovery_notices(requests: &RecordedRequests) -> Vec<String> {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| match request {
+                AgentControlRequest::SendAgentActivity { text, .. }
+                    if text.contains(UNRESOLVED_TURN_TEXT) =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn wait_for_recovery_notice(requests: &RecordedRequests) -> String {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(notice) = recovery_notices(requests).pop() {
+                    return notice;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a prompt queued behind an unresolved turn must be told how to release it")
+    }
+
+    #[tokio::test]
+    async fn restart_during_a_turn_leaves_a_visible_discardable_barrier() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let config = limited_config(root.path(), |_| {});
+        let delivery_path = config.state_path.with_extension("delivery.json");
+        {
+            // The connector stopped while a live turn had one chunk staged and
+            // its send attempt charged but unacknowledged.
+            let before_restart = FinalDeliveryStore::load(delivery_path).unwrap();
+            before_restart
+                .begin_turn("group", "interrupted", 4)
+                .await
+                .unwrap();
+            before_restart
+                .set(
+                    "group:interrupted:1",
+                    FinalDeliveryRecord {
+                        account_ref: "account".to_owned(),
+                        group_ref: "group".to_owned(),
+                        reply_to_ref: "interrupted".to_owned(),
+                        text: "interrupted chunk".to_owned(),
+                        chunk_index: 1,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                before_restart
+                    .reserve_send("group", "interrupted", SendMode::Live, 4)
+                    .await
+                    .unwrap(),
+                SendAdmission::Admitted
+            );
+        }
+        let (server, requests) = spawn_recording_server(&config.socket);
+        let ctx = test_context_with_backend(
+            root.path(),
+            &home,
+            config,
+            ScriptedEventsBackend::new(texts(&["later reply"]), Some("session")),
+        );
+
+        assert!(ctx.deliveries.requires_recovery_command("group").await);
+        reconcile_pending_deliveries(&ctx.client, &ctx.deliveries, &ctx.outbox, 99).await;
+        assert!(requests.lock().unwrap().is_empty());
+
+        let queued = tokio::spawn(dispatch_test_message(ctx.clone(), "later", "later work"));
+        let notice = wait_for_recovery_notice(&requests).await;
+        assert!(notice.starts_with("[wn-opencode] "));
+        assert!(notice.contains("`/discard-last`"));
+        assert!(
+            !notice.contains("/retry-last"),
+            "no recovery record exists for an interrupted turn"
+        );
+        assert!(final_texts(&requests).is_empty());
+        assert!(!queued.is_finished());
+
+        assert!(dispatch_test_message(ctx.clone(), "discard", "/discard-last").await);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), queued)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        let finals = final_texts(&requests);
+        assert_eq!(finals.len(), 2);
+        assert!(finals[0].contains("discarded"));
+        assert_eq!(finals[1], "later reply");
+        assert_eq!(recovery_notices(&requests).len(), 1);
+        assert!(ctx.deliveries.list().await.is_empty());
+        assert!(
+            ctx.deliveries
+                .turn_budget("group", "interrupted")
+                .await
+                .is_none()
+        );
+        assert!(!fifo_is_blocked(&ctx, "group").await);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn prompt_queued_behind_a_limited_turn_is_told_its_recovery_commands_once() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let config = limited_config(root.path(), |settings| settings.max_text_events = 1);
+        let (server, requests) = spawn_recording_server(&config.socket);
+        let ctx = test_context_with_backend(
+            root.path(),
+            &home,
+            config,
+            ScriptedEventsBackend::new(texts(&["one", "two"]), Some("limited-session")),
+        );
+        assert!(dispatch_test_message(ctx.clone(), "message", "work").await);
+        assert_eq!(final_texts(&requests), vec!["one"]);
+        assert!(recovery_notices(&requests).is_empty());
+
+        let queued = tokio::spawn(dispatch_test_message(ctx.clone(), "later", "later work"));
+        let notice = wait_for_recovery_notice(&requests).await;
+        assert!(notice.contains("`/retry-last`") && notice.contains("`/discard-last`"));
+        // Reconciliation and unrelated store changes do not repeat the notice.
+        reconcile_pending_deliveries(&ctx.client, &ctx.deliveries, &ctx.outbox, 99).await;
+        ctx.deliveries.begin_turn("other", "work", 4).await.unwrap();
+        ctx.deliveries
+            .finish_turn("other", "work", false)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!queued.is_finished());
+        assert_eq!(recovery_notices(&requests).len(), 1);
+        assert_eq!(final_texts(&requests), vec!["one"]);
+
+        assert!(dispatch_test_message(ctx.clone(), "discard", "/discard-last").await);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), queued)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert_eq!(recovery_notices(&requests).len(), 1);
+        assert!(!fifo_is_blocked(&ctx, "group").await);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn durable_send_budget_stops_final_and_status_requests_at_the_cap() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let config = limited_config(root.path(), |settings| settings.max_durable_sends = 2);
+        let (server, requests) = spawn_recording_server(&config.socket);
+        let ctx = test_context_with_backend(
+            root.path(),
+            &home,
+            config,
+            ScriptedEventsBackend::new(texts(&["one", "two", "three"]), Some("session")),
+        );
+
+        assert!(dispatch_test_message(ctx.clone(), "message", "work").await);
+
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert_eq!(final_texts(&requests), vec!["one", "two"]);
+        let budget = ctx
+            .deliveries
+            .turn_budget("group", "message")
+            .await
+            .unwrap();
+        assert_eq!(budget.phase, crate::store::TurnPhase::Limited);
+        assert_eq!(budget.sends_charged, 2);
+        // The staged third chunk keeps its idempotency key but is never replayed.
+        let pending = ctx.deliveries.list().await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, "group:message:3");
+        assert!(ctx.deliveries.list_reconcilable().await.is_empty());
+        reconcile_pending_deliveries(&ctx.client, &ctx.deliveries, &ctx.outbox, 99).await;
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reply_chunk_preflight_rejects_the_whole_text_before_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let mut config = limited_config(root.path(), |settings| settings.max_reply_chunks = 3);
+        config.max_reply_bytes = 8;
+        let (server, requests) = spawn_recording_server(&config.socket);
+        let ctx = test_context_with_backend(
+            root.path(),
+            &home,
+            config,
+            ScriptedEventsBackend::new(texts(&["short", "aaaaaaa bbbbbbb ccccccc"]), None),
+        );
+
+        assert!(dispatch_test_message(ctx.clone(), "message", "work").await);
+
+        assert_eq!(final_texts(&requests), vec!["short"]);
+        assert!(ctx.deliveries.list().await.is_empty());
+        assert_eq!(
+            ctx.deliveries
+                .turn_budget("group", "message")
+                .await
+                .unwrap()
+                .phase,
+            crate::store::TurnPhase::Limited
+        );
+        server.abort();
+    }
+
+    /// Buffers every text event behind a live artifact grant and declares no
+    /// artifacts, so completed text reaches the buffered fallback path.
+    struct BufferedTextBackend {
+        texts: Vec<String>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl Backend for BufferedTextBackend {
+        fn artifact_support(&self) -> ArtifactSupport {
+            ArtifactSupport::CompletionFile
+        }
+
+        async fn run(
+            &self,
+            invocation: Invocation,
+            tx: mpsc::Sender<RunnerEvent>,
+        ) -> std::result::Result<Outcome, RunFailure> {
+            assert!(
+                invocation.artifact_output.is_some(),
+                "grant must be live so completed text is buffered"
+            );
+            for text in &self.texts {
+                tx.send(RunnerEvent::Text(text.clone())).await.unwrap();
+            }
+            if self.fail {
+                return Err(RunFailure {
+                    error: HarnessError::BackendTimedOut,
+                    observed_session: None,
+                });
+            }
+            Ok(Outcome {
+                observed_session: None,
+                exit_code: Some(0),
+                error_summary: None,
+                no_side_effects_proven: false,
+                stderr: String::new(),
+                elapsed_ms: 1,
+            })
+        }
+    }
+
+    async fn run_buffered_fallback_case(
+        texts: &[&str],
+        fail: bool,
+        max_reply_chunks: usize,
+    ) -> (tempfile::TempDir, Arc<BridgeContext>, RecordedRequests) {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let export_root = root.path().join("exports");
+        fs_private::create_dir_all_private(&export_root).unwrap();
+        let mut config = limited_config(root.path(), |settings| {
+            settings.max_reply_chunks = max_reply_chunks;
+        });
+        config.artifact_exports = crate::ArtifactExportConfig::new(
+            true,
+            vec![crate::ArtifactExportGrant {
+                group_id_hex: "group".to_owned(),
+                export_root,
+                ttl_seconds: 300,
+            }],
+            root.path().join("staging"),
+            root.path().join("outbox.json"),
+        );
+        let (_server, requests) = spawn_recording_server(&config.socket);
+        let ctx = test_context_with_backend(
+            root.path(),
+            &home,
+            config,
+            Arc::new(BufferedTextBackend {
+                texts: texts.iter().map(|text| (*text).to_owned()).collect(),
+                fail,
+            }),
+        );
+        assert!(dispatch_test_message(ctx.clone(), "message", "work").await);
+        (root, ctx, requests)
+    }
+
+    #[tokio::test]
+    async fn buffered_fallback_batch_over_the_chunk_budget_stages_and_sends_nothing() {
+        for fail in [false, true] {
+            let (_root, ctx, requests) = run_buffered_fallback_case(&["one", "two"], fail, 1).await;
+
+            assert!(
+                requests.lock().unwrap().is_empty(),
+                "no batch item, status or failure reply may be sent (fail={fail})"
+            );
+            assert!(ctx.deliveries.list().await.is_empty());
+            assert_eq!(
+                ctx.deliveries
+                    .turn_budget("group", "message")
+                    .await
+                    .unwrap()
+                    .phase,
+                crate::store::TurnPhase::Limited
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_fallback_batch_exactly_at_the_chunk_budget_is_delivered() {
+        let (_root, ctx, requests) = run_buffered_fallback_case(&["one", "two"], false, 2).await;
+        assert_eq!(final_texts(&requests), vec!["one", "two"]);
+        assert!(ctx.deliveries.list().await.is_empty());
+        assert!(
+            ctx.deliveries
+                .turn_budget("group", "message")
+                .await
+                .is_none()
+        );
+
+        let (_root, ctx, requests) = run_buffered_fallback_case(&["one", "two"], true, 2).await;
+        let finals = final_texts(&requests);
+        assert_eq!(
+            finals.len(),
+            3,
+            "both items plus the ordinary failure reply"
+        );
+        assert_eq!(&finals[..2], ["one", "two"]);
+        assert!(ctx.deliveries.list().await.is_empty());
+    }
+
+    /// Seeds a limited earlier turn holding an acknowledgement-unknown chunk and
+    /// a pending recovery that `/retry-last` will consume.
+    async fn seed_limited_turn_with_recovery(ctx: &BridgeContext, repo: &std::path::Path) {
+        ctx.deliveries
+            .set(
+                "group:original:1",
+                FinalDeliveryRecord {
+                    account_ref: "account".to_owned(),
+                    group_ref: "group".to_owned(),
+                    reply_to_ref: "original".to_owned(),
+                    text: "original chunk".to_owned(),
+                    chunk_index: 1,
+                },
+            )
+            .await
+            .unwrap();
+        ctx.deliveries
+            .begin_turn("group", "original", 4)
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.deliveries
+                .reserve_send("group", "original", SendMode::Live, 4)
+                .await
+                .unwrap(),
+            SendAdmission::Admitted
+        );
+        ctx.deliveries
+            .limit_turn("group", "original", 4)
+            .await
+            .unwrap();
+        ctx.recovery
+            .set(
+                "group",
+                RecoveryRecord {
+                    prompt: "private prompt".to_owned(),
+                    media: Vec::new(),
+                    cwd: repo.to_path_buf(),
+                    session_id: "session".to_owned(),
+                    kind: RecoveryKind::UncertainOutcome,
+                    status: RecoveryStatus::Pending,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn assert_original_obligation_retained(deliveries: &FinalDeliveryStore) {
+        let original = deliveries.turn_budget("group", "original").await.unwrap();
+        assert_eq!(original.phase, crate::store::TurnPhase::Limited);
+        assert_eq!(original.sends_charged, 1);
+        let retry = deliveries.turn_budget("group", "retry").await.unwrap();
+        assert_eq!(retry.phase, crate::store::TurnPhase::Limited);
+        assert_eq!(retry.sends_charged, 1);
+        let pending = deliveries.list().await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, "group:original:1");
+        assert_eq!(pending[0].1.text, "original chunk");
+        assert!(deliveries.has_incomplete_final("group").await);
+        assert!(deliveries.list_reconcilable().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retry_whose_status_breaches_the_send_budget_keeps_original_obligations() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let config = limited_config(root.path(), |settings| settings.max_durable_sends = 1);
+        let delivery_path = config.state_path.with_extension("delivery.json");
+        let (server, requests) = spawn_recording_server(&config.socket);
+        let ctx = test_context_with_backend(
+            root.path(),
+            &home,
+            config,
+            ScriptedEventsBackend::new(vec![RunnerEvent::LivenessUnknown], Some("session")),
+        );
+        seed_limited_turn_with_recovery(&ctx, &repo).await;
+
+        assert!(dispatch_test_message(ctx.clone(), "retry", "/retry-last").await);
+
+        // Only the liveness notice was admitted; the no-text status breached.
+        let recorded = requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1);
+        assert!(matches!(
+            &recorded[0],
+            AgentControlRequest::SendFinal { text, .. } if text.contains(LIVENESS_UNKNOWN_TEXT)
+        ));
+        assert_original_obligation_retained(&ctx.deliveries).await;
+        let recovery = ctx.recovery.get("group").await.unwrap();
+        assert_eq!(recovery.kind, RecoveryKind::UncertainOutcome);
+        assert_eq!(recovery.status, RecoveryStatus::Pending);
+        assert!(fifo_is_blocked(&ctx, "group").await);
+
+        let reloaded = FinalDeliveryStore::load(delivery_path).unwrap();
+        assert_original_obligation_retained(&reloaded).await;
+
+        assert!(dispatch_test_message(ctx.clone(), "discard", "/discard-last").await);
+        assert!(ctx.deliveries.list().await.is_empty());
+        for reply_to in ["original", "retry"] {
+            assert!(
+                ctx.deliveries
+                    .turn_budget("group", reply_to)
+                    .await
+                    .is_none()
+            );
+        }
+        assert!(ctx.recovery.get("group").await.is_none());
+        assert!(!fifo_is_blocked(&ctx, "group").await);
+        // The discard confirmation is a connector reply, not turn output.
+        let finals = final_texts(&requests);
+        assert_eq!(finals.len(), 2);
+        assert!(!finals.iter().any(|text| text == "original chunk"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn retry_within_every_budget_clears_original_obligations() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let config = limited_config(root.path(), |settings| settings.max_durable_sends = 2);
+        let (server, requests) = spawn_recording_server(&config.socket);
+        let ctx = test_context_with_backend(
+            root.path(),
+            &home,
+            config,
+            ScriptedEventsBackend::new(texts(&["done"]), Some("session")),
+        );
+        seed_limited_turn_with_recovery(&ctx, &repo).await;
+
+        assert!(dispatch_test_message(ctx.clone(), "retry", "/retry-last").await);
+
+        assert_eq!(final_texts(&requests), vec!["done"]);
+        assert!(ctx.deliveries.list().await.is_empty());
+        for reply_to in ["original", "retry"] {
+            assert!(
+                ctx.deliveries
+                    .turn_budget("group", reply_to)
+                    .await
+                    .is_none()
+            );
+        }
+        assert!(!ctx.deliveries.has_incomplete_final("group").await);
+        assert!(ctx.recovery.get("group").await.is_none());
+        assert!(!fifo_is_blocked(&ctx, "group").await);
+        server.abort();
+    }
+
+    /// A context whose artifact exports cover `group` and `other`, staged in
+    /// `root` like a restarted connector's outbox.
+    fn artifact_replay_context(
+        root: &std::path::Path,
+        home: &std::path::Path,
+        backend: Arc<dyn Backend>,
+    ) -> (
+        Arc<BridgeContext>,
+        tokio::task::JoinHandle<()>,
+        RecordedRequests,
+    ) {
+        let mut config = limited_config(root, |settings| settings.max_durable_sends = 4);
+        config.artifact_exports = crate::ArtifactExportConfig::new(
+            true,
+            ["group", "other"]
+                .into_iter()
+                .map(|group| crate::ArtifactExportGrant {
+                    group_id_hex: group.to_owned(),
+                    export_root: root.to_path_buf(),
+                    ttl_seconds: 300,
+                })
+                .collect(),
+            root.to_path_buf(),
+            root.join("outbox.json"),
+        );
+        let (server, requests) = spawn_recording_server(&config.socket);
+        let ctx = test_context_with_backend(root, home, config, backend);
+        (ctx, server, requests)
+    }
+
+    /// Durably records one valid staged batch answering `reply_to`.
+    async fn record_staged_artifact_batch(
+        ctx: &BridgeContext,
+        root: &std::path::Path,
+        group_ref: &str,
+        reply_to: &str,
+    ) -> PendingArtifactBatch {
+        let staged = root.join(format!("{group_ref}-{reply_to}.bin"));
+        fs_private::write_private(&staged, b"payload").unwrap();
+        let artifacts = vec![crate::artifacts::StagedArtifact {
+            path: staged,
+            media_type: "application/octet-stream".to_owned(),
+            file_name: "result.bin".to_owned(),
+            size_bytes: 7,
+            plaintext_sha256: hex::encode(sha2::Sha256::digest(b"payload")),
+        }];
+        let caption = Some("Report attached");
+        let batch = PendingArtifactBatch {
+            idempotency_key: crate::artifacts::artifact_idempotency_key(
+                ctx.cfg.spec.reply_prefix,
+                "account",
+                group_ref,
+                reply_to,
+                caption,
+                &artifacts,
+            )
+            .unwrap(),
+            account_ref: "account".to_owned(),
+            group_ref: group_ref.to_owned(),
+            reply_to_message_ref: reply_to.to_owned(),
+            caption: caption.map(str::to_owned),
+            remaining_text: vec!["remaining text".to_owned()],
+            artifacts,
+        };
+        validate_staged_batch(&ctx.cfg.artifact_exports, ctx.cfg.spec.reply_prefix, &batch)
+            .unwrap();
+        ctx.outbox.lock().await.record(batch.clone()).unwrap();
+        batch
+    }
+
+    /// Seeds a limited turn whose only allowed send is already charged, with a
+    /// pending artifact batch withheld behind it.
+    async fn seed_limited_artifact_turn(
+        ctx: &BridgeContext,
+        root: &std::path::Path,
+        reply_to: &str,
+    ) -> PendingArtifactBatch {
+        ctx.deliveries
+            .begin_turn("group", reply_to, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.deliveries
+                .reserve_send("group", reply_to, SendMode::Live, 1)
+                .await
+                .unwrap(),
+            SendAdmission::Admitted
+        );
+        let batch = record_staged_artifact_batch(ctx, root, "group", reply_to).await;
+        ctx.deliveries
+            .limit_turn("group", reply_to, 1)
+            .await
+            .unwrap();
+        batch
+    }
+
+    async fn assert_discarded_with_original_accounting(
+        deliveries: &FinalDeliveryStore,
+        reply_to: &str,
+    ) {
+        let budget = deliveries.turn_budget("group", reply_to).await.unwrap();
+        assert_eq!(budget.phase, crate::store::TurnPhase::Discarded);
+        assert_eq!((budget.sends_charged, budget.max_durable_sends), (1, 1));
+        assert!(deliveries.blocks_group("group").await);
+        assert!(deliveries.requires_recovery_command("group").await);
+    }
+
+    /// Media sent to `group`, plus finals and activity answering one of
+    /// `reply_tos` there: turn output, as opposed to command replies.
+    fn turn_output_requests(requests: &RecordedRequests, reply_tos: &[&str]) -> usize {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| match request {
+                AgentControlRequest::SendMedia { group_id_hex, .. } => group_id_hex == "group",
+                AgentControlRequest::SendFinal {
+                    group_id_hex,
+                    reply_to_message_id_hex,
+                    ..
+                }
+                | AgentControlRequest::SendAgentActivity {
+                    group_id_hex,
+                    reply_to_message_id_hex,
+                    ..
+                } => {
+                    group_id_hex == "group"
+                        && reply_to_message_id_hex
+                            .as_deref()
+                            .is_some_and(|reply_to| reply_tos.contains(&reply_to))
+                }
+                _ => false,
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn failed_artifact_discard_keeps_the_limited_turn_withheld_across_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let (ctx, server, requests) =
+            artifact_replay_context(root.path(), &home, Arc::new(NoopBackend));
+        let batch = seed_limited_artifact_turn(&ctx, root.path(), "original").await;
+        record_staged_artifact_batch(&ctx, root.path(), "other", "legacy").await;
+        let outbox_temp = root.path().join("outbox.tmp");
+        std::fs::create_dir(&outbox_temp).unwrap();
+
+        assert!(dispatch_test_message(ctx.clone(), "discard", "/discard-last").await);
+
+        assert!(final_texts(&requests)[0].contains("Failed to discard"));
+        assert!(ctx.outbox.lock().await.contains(&batch.idempotency_key));
+        assert_discarded_with_original_accounting(&ctx.deliveries, "original").await;
+        assert!(fifo_is_blocked(&ctx, "group").await);
+        let reloaded =
+            FinalDeliveryStore::load(ctx.cfg.state_path.with_extension("delivery.json")).unwrap();
+        assert_discarded_with_original_accounting(&reloaded, "original").await;
+        assert!(
+            ArtifactOutbox::load(root.path().join("outbox.json"))
+                .unwrap()
+                .contains(&batch.idempotency_key)
+        );
+
+        std::fs::remove_dir(&outbox_temp).unwrap();
+        let before = requests.lock().unwrap().len();
+        retry_pending_artifacts(&ctx).await;
+        reconcile_pending_deliveries(&ctx.client, &ctx.deliveries, &ctx.outbox, 4).await;
+        // The unrelated legacy batch is replayed on a finite budget; the
+        // discarded turn sends nothing and keeps its original accounting.
+        let replayed = requests.lock().unwrap()[before..].to_vec();
+        assert_eq!(replayed.len(), 2);
+        assert!(replayed.iter().all(|request| matches!(
+            request,
+            AgentControlRequest::SendMedia { group_id_hex, .. }
+                | AgentControlRequest::SendFinal { group_id_hex, .. } if group_id_hex == "other"
+        )));
+        assert_discarded_with_original_accounting(&ctx.deliveries, "original").await;
+        assert!(ctx.outbox.lock().await.contains(&batch.idempotency_key));
+
+        // Repeating the discard resumes and completes it.
+        assert!(dispatch_test_message(ctx.clone(), "discard-again", "/discard-last").await);
+        assert!(
+            final_texts(&requests)
+                .last()
+                .unwrap()
+                .contains("queued work can continue")
+        );
+        assert!(ctx.outbox.lock().await.pending().is_empty());
+        assert!(!batch.artifacts[0].path.exists());
+        assert!(
+            ctx.deliveries
+                .turn_budget("group", "original")
+                .await
+                .is_none()
+        );
+        assert!(!fifo_is_blocked(&ctx, "group").await);
+        assert_eq!(turn_output_requests(&requests, &["original"]), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stale_artifact_snapshot_cannot_replay_a_turn_during_or_after_its_discard() {
+        const TURNS: &[&str] = &["original", "second", "unbudgeted"];
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let (ctx, server, requests) =
+            artifact_replay_context(root.path(), &home, Arc::new(NoopBackend));
+        seed_limited_artifact_turn(&ctx, root.path(), "original").await;
+        let snapshot = ctx.outbox.lock().await.pending();
+        assert_eq!(snapshot.len(), 1);
+
+        // Disposal has begun: the turn is tombstoned, its intent not yet removed.
+        assert_eq!(
+            ctx.deliveries.begin_discard("group", None).await.unwrap(),
+            vec!["original".to_owned()]
+        );
+        replay_artifact_batches(&ctx, snapshot.clone()).await;
+        assert_eq!(turn_output_requests(&requests, TURNS), 0);
+        assert_discarded_with_original_accounting(&ctx.deliveries, "original").await;
+
+        // Disposal has completed: the stale snapshot names a removed intent.
+        // Staged-file removal is best effort, so the bytes may outlive it.
+        assert!(discard_unresolved_turns(&ctx, "group", None).await.unwrap());
+        fs_private::write_private(&snapshot[0].artifacts[0].path, b"payload").unwrap();
+        validate_staged_batch(
+            &ctx.cfg.artifact_exports,
+            ctx.cfg.spec.reply_prefix,
+            &snapshot[0],
+        )
+        .unwrap();
+        replay_artifact_batches(&ctx, snapshot).await;
+        assert_eq!(turn_output_requests(&requests, TURNS), 0);
+        assert!(
+            ctx.deliveries
+                .turn_budget("group", "original")
+                .await
+                .is_none(),
+            "discarded work must not receive a fresh legacy budget"
+        );
+        assert!(!fifo_is_blocked(&ctx, "group").await);
+
+        // Replay racing a discard paused after its delivery-store write.
+        seed_limited_artifact_turn(&ctx, root.path(), "second").await;
+        let snapshot = ctx.outbox.lock().await.pending();
+        let held = ctx.outbox.lock().await;
+        let discard = tokio::spawn({
+            let ctx = ctx.clone();
+            async move { discard_unresolved_turns(&ctx, "group", None).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while ctx
+                .deliveries
+                .turn_budget("group", "second")
+                .await
+                .is_none_or(|budget| budget.phase != crate::store::TurnPhase::Discarded)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("discard tombstones the turn before touching the outbox");
+        let replay = tokio::spawn({
+            let ctx = ctx.clone();
+            async move { replay_artifact_batches(&ctx, snapshot).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(held);
+        assert!(discard.await.unwrap().unwrap());
+        replay.await.unwrap();
+        assert_eq!(turn_output_requests(&requests, TURNS), 0);
+        assert!(
+            ctx.deliveries
+                .turn_budget("group", "second")
+                .await
+                .is_none()
+        );
+        assert!(ctx.outbox.lock().await.pending().is_empty());
+        assert!(!fifo_is_blocked(&ctx, "group").await);
+
+        // Positive control: an unbudgeted (legacy) batch that was never
+        // discarded is still replayed: its media and remaining text.
+        record_staged_artifact_batch(&ctx, root.path(), "group", "unbudgeted").await;
+        retry_pending_artifacts(&ctx).await;
+        assert_eq!(turn_output_requests(&requests, TURNS), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn retry_cleanup_failure_keeps_the_original_artifact_turn_withheld() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let (ctx, server, requests) = artifact_replay_context(
+            root.path(),
+            &home,
+            ScriptedEventsBackend::new(texts(&["done"]), Some("session")),
+        );
+        let batch = seed_limited_artifact_turn(&ctx, root.path(), "original").await;
+        ctx.recovery
+            .set(
+                "group",
+                RecoveryRecord {
+                    prompt: "private prompt".to_owned(),
+                    media: Vec::new(),
+                    cwd: repo.clone(),
+                    session_id: "session".to_owned(),
+                    kind: RecoveryKind::UncertainOutcome,
+                    status: RecoveryStatus::Pending,
+                },
+            )
+            .await
+            .unwrap();
+        let outbox_temp = root.path().join("outbox.tmp");
+        std::fs::create_dir(&outbox_temp).unwrap();
+
+        assert!(dispatch_test_message(ctx.clone(), "retry", "/retry-last").await);
+
+        assert_eq!(final_texts(&requests), vec!["done"]);
+        assert_discarded_with_original_accounting(&ctx.deliveries, "original").await;
+        assert!(ctx.outbox.lock().await.contains(&batch.idempotency_key));
+        assert!(ctx.recovery.get("group").await.is_none());
+        assert!(fifo_is_blocked(&ctx, "group").await);
+
+        std::fs::remove_dir(&outbox_temp).unwrap();
+        retry_pending_artifacts(&ctx).await;
+        reconcile_pending_deliveries(&ctx.client, &ctx.deliveries, &ctx.outbox, 4).await;
+        assert_eq!(final_texts(&requests), vec!["done"]);
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| matches!(request, AgentControlRequest::SendMedia { .. }))
+        );
+        assert_discarded_with_original_accounting(&ctx.deliveries, "original").await;
+
+        assert!(dispatch_test_message(ctx.clone(), "discard", "/discard-last").await);
+        assert!(ctx.outbox.lock().await.pending().is_empty());
+        assert!(
+            ctx.deliveries
+                .turn_budget("group", "original")
+                .await
+                .is_none()
+        );
+        assert!(!fifo_is_blocked(&ctx, "group").await);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn turns_within_every_budget_complete_and_prune_their_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let config = limited_config(root.path(), |settings| {
+            settings.max_text_events = 2;
+            settings.max_text_bytes = 6;
+            settings.max_reply_chunks = 2;
+            settings.max_durable_sends = 2;
+        });
+        let (server, requests) = spawn_recording_server(&config.socket);
+        let ctx = test_context_with_backend(
+            root.path(),
+            &home,
+            config,
+            ScriptedEventsBackend::new(texts(&["one", "two"]), Some("session")),
+        );
+
+        assert!(dispatch_test_message(ctx.clone(), "message", "work").await);
+
+        assert_eq!(final_texts(&requests), vec!["one", "two"]);
+        assert!(
+            ctx.deliveries
+                .turn_budget("group", "message")
+                .await
+                .is_none()
+        );
+        assert!(ctx.recovery.get("group").await.is_none());
+        assert!(!fifo_is_blocked(&ctx, "group").await);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_budget_write_prevents_backend_spawn() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let backend = Arc::new(RecordingBackend {
+            invocations: Mutex::new(Vec::new()),
+        });
+        let (ctx, server) = test_context(root.path(), &home, backend.clone());
+        ctx.deliveries.fail_next_budget_write();
+
+        assert!(dispatch_test_message(ctx.clone(), "message", "work").await);
+
+        assert!(backend.invocations.lock().await.is_empty());
+        assert!(
+            ctx.deliveries
+                .turn_budget("group", "message")
+                .await
+                .is_none()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reconciliation_replays_only_reconcilable_turns_within_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let config = test_config(root.path());
+        let (server, requests) = spawn_recording_server(&config.socket);
+        let ctx = test_context_with_backend(
+            root.path(),
+            &home,
+            config,
+            ScriptedEventsBackend::new(Vec::new(), None),
+        );
+        let record = |reply_to: &str| FinalDeliveryRecord {
+            account_ref: "account".to_owned(),
+            group_ref: "group".to_owned(),
+            reply_to_ref: reply_to.to_owned(),
+            text: format!("{reply_to} text"),
+            chunk_index: 1,
+        };
+        for reply_to in ["legacy", "active", "exhausted"] {
+            ctx.deliveries
+                .set(&format!("group:{reply_to}:1"), record(reply_to))
+                .await
+                .unwrap();
+        }
+        ctx.deliveries
+            .begin_turn("group", "active", 4)
+            .await
+            .unwrap();
+        ctx.deliveries
+            .begin_turn("group", "exhausted", 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx.deliveries
+                .reserve_send("group", "exhausted", SendMode::Live, 1)
+                .await
+                .unwrap(),
+            SendAdmission::Admitted
+        );
+        ctx.deliveries
+            .finish_turn("group", "exhausted", false)
+            .await
+            .unwrap();
+
+        reconcile_pending_deliveries(&ctx.client, &ctx.deliveries, &ctx.outbox, 4).await;
+
+        assert_eq!(final_texts(&requests), vec!["legacy text"]);
+        assert!(
+            ctx.deliveries
+                .turn_budget("group", "legacy")
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            ctx.deliveries
+                .turn_budget("group", "exhausted")
+                .await
+                .unwrap()
+                .phase,
+            crate::store::TurnPhase::Limited
+        );
+        let keys: Vec<_> = ctx
+            .deliveries
+            .list()
+            .await
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(keys, vec!["group:active:1", "group:exhausted:1"]);
+        server.abort();
+    }
+
+    #[test]
+    fn collector_counts_separators_artifacts_across_events_and_releases_unsent_chunks() {
+        let settings = crate::OutputLimitSettings {
+            max_artifact_buffer_bytes: 8,
+            max_artifacts: 3,
+            max_reply_chunks: 2,
+            ..Default::default()
+        };
+        let mut collector = TurnCollector::new(OutputLimits::new(settings).unwrap());
+
+        assert!(collector.charge_buffered_text("abc", false).is_ok());
+        assert!(collector.charge_buffered_text("abc", true).is_ok());
+        assert_eq!(
+            collector.charge_buffered_text("", true),
+            Err(OutputLimitKind::ArtifactBuffer)
+        );
+
+        assert!(collector.charge_artifacts(2).is_ok());
+        assert_eq!(
+            collector.charge_artifacts(2),
+            Err(OutputLimitKind::ArtifactCount)
+        );
+        assert!(collector.charge_artifacts(1).is_ok());
+
+        assert_eq!(collector.reserve_reply_chunks("abcdefgh", 4), Ok(2));
+        assert_eq!(
+            collector.reserve_reply_chunks("a", 4),
+            Err(OutputLimitKind::ReplyChunks)
+        );
+        collector.release_reply_chunks(2);
+        assert_eq!(collector.reserve_reply_chunks("abcd", 4), Ok(1));
+
+        collector.release_reply_chunks(1);
+        let batch = ["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        assert_eq!(
+            collector.reserve_reply_batch(&batch, 4),
+            Err(OutputLimitKind::ReplyChunks)
+        );
+        assert_eq!(collector.reserve_reply_batch(&batch[..2], 4), Ok(2));
+    }
+
+    #[tokio::test]
+    async fn latched_gate_never_admits_or_charges_another_request() {
+        let root = tempfile::tempdir().unwrap();
+        let deliveries = FinalDeliveryStore::load(root.path().join("delivery.json")).unwrap();
+        deliveries.begin_turn("group", "message", 4).await.unwrap();
+        let output = TurnOutputControl::default();
+        let inbound = InboundPrompt {
+            account_ref: "account".to_owned(),
+            group_ref: "group".to_owned(),
+            message_ref: "message".to_owned(),
+            text: String::new(),
+            media: Vec::new(),
+        };
+        let gate = TurnGate {
+            deliveries: &deliveries,
+            group_ref: &inbound.group_ref,
+            reply_to_ref: &inbound.message_ref,
+            mode: SendMode::Live,
+            default_max: 4,
+            output: Some(&output),
+            work: None,
+        };
+        output.latch(OutputLimitKind::StdoutBytes);
+        let polled = std::sync::atomic::AtomicBool::new(false);
+
+        let result = gate
+            .request(async {
+                polled.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(HarnessError::OutputLimitExceeded {
+                kind: OutputLimitKind::StdoutBytes
+            })
+        ));
+        assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            deliveries
+                .turn_budget("group", "message")
+                .await
+                .unwrap()
+                .sends_charged,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_reconciliation_snapshot_cannot_replay_a_turn_that_became_active() {
+        let root = tempfile::tempdir().unwrap();
+        let config = test_config(root.path());
+        let (server, requests) = spawn_recording_server(&config.socket);
+        let client = ControlClient::new(config.socket.clone(), None, Duration::from_secs(1), "wn");
+        let deliveries = FinalDeliveryStore::load(root.path().join("delivery.json")).unwrap();
+        deliveries
+            .set(
+                "group:message:1",
+                FinalDeliveryRecord {
+                    account_ref: "account".to_owned(),
+                    group_ref: "group".to_owned(),
+                    reply_to_ref: "message".to_owned(),
+                    text: "pending".to_owned(),
+                    chunk_index: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let snapshot = deliveries.list_reconcilable().await;
+        assert_eq!(snapshot.len(), 1);
+        deliveries.begin_turn("group", "message", 4).await.unwrap();
+
+        let (key, record) = &snapshot[0];
+        let gate = TurnGate::replay(
+            &deliveries,
+            &record.group_ref,
+            &record.reply_to_ref,
+            4,
+            ReplayWork::Final { key },
+        );
+        let result = send_final_with_retry(
+            &client,
+            Some(gate),
+            &record.account_ref,
+            &record.group_ref,
+            &record.reply_to_ref,
+            &record.text,
+            record.chunk_index,
+        )
+        .await;
+
+        assert!(matches!(result, Err(HarnessError::DeliveryWithheld)));
+        assert!(requests.lock().unwrap().is_empty());
+        let budget = deliveries.turn_budget("group", "message").await.unwrap();
+        assert_eq!(budget.phase, crate::store::TurnPhase::Active);
+        assert_eq!(budget.sends_charged, 0);
+        assert_eq!(deliveries.list().await.len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stop_during_an_admitted_request_abandons_it_and_admits_nothing_more() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("hold.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counted = connections.clone();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        // Accepts and holds each connection without ever acknowledging it.
+        let server = tokio::spawn(async move {
+            let mut accepted_tx = Some(accepted_tx);
+            let mut held = Vec::new();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                counted.fetch_add(1, Ordering::SeqCst);
+                held.push(stream);
+                if let Some(tx) = accepted_tx.take() {
+                    let _ = tx.send(());
+                }
+            }
+        });
+        let client = ControlClient::new(socket, None, Duration::from_secs(30), "wn");
+        let deliveries = FinalDeliveryStore::load(root.path().join("delivery.json")).unwrap();
+        deliveries.begin_turn("group", "message", 4).await.unwrap();
+        let output = TurnOutputControl::default();
+        let gate = TurnGate {
+            deliveries: &deliveries,
+            group_ref: "group",
+            reply_to_ref: "message",
+            mode: SendMode::Live,
+            default_max: 4,
+            output: Some(&output),
+            work: None,
+        };
+
+        let (result, ()) = tokio::join!(
+            send_final_with_retry(
+                &client,
+                Some(gate),
+                "account",
+                "group",
+                "message",
+                "text",
+                1
+            ),
+            async {
+                accepted_rx.await.unwrap();
+                output.latch(OutputLimitKind::ReplyChunks);
+            }
+        );
+
+        assert!(matches!(
+            result,
+            Err(HarnessError::OutputLimitExceeded {
+                kind: OutputLimitKind::ReplyChunks
+            })
+        ));
+        // The admitted attempt stays charged: its effect is unknown, not refunded.
+        let charged = || async {
+            deliveries
+                .turn_budget("group", "message")
+                .await
+                .unwrap()
+                .sends_charged
+        };
+        assert_eq!(charged().await, 1);
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+
+        let again = send_final_with_retry(
+            &client,
+            Some(gate),
+            "account",
+            "group",
+            "message",
+            "text",
+            2,
+        )
+        .await;
+        assert!(matches!(
+            again,
+            Err(HarnessError::OutputLimitExceeded { .. })
+        ));
+        assert_eq!(charged().await, 1);
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 }

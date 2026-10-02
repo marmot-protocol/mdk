@@ -187,6 +187,7 @@ documented in the
 | `WN_PI_TIMEOUT_SECS` | `3600` | Total invocation cap |
 | `WN_PI_REQUEST_TIMEOUT_SECS` | `30` | Control request timeout |
 | `WN_PI_MAX_REPLY_BYTES` | `30000` | Durable reply chunk limit |
+| `WN_PI_MAX_BACKEND_RECORD_BYTES`, `WN_PI_MAX_BACKEND_STDOUT_BYTES`, `WN_PI_MAX_BACKEND_EVENTS`, `WN_PI_MAX_ASSISTANT_TEXT_BYTES`, `WN_PI_MAX_ASSISTANT_TEXT_EVENTS`, `WN_PI_MAX_ARTIFACT_BUFFER_BYTES`, `WN_PI_MAX_REPLY_CHUNKS`, `WN_PI_MAX_DURABLE_SENDS` | shared defaults | Per-turn backend output and durable-send limits; see [Output Limits](../../terminal-harness/README.md#output-limits) |
 | `WN_PI_MAX_PENDING_PER_GROUP` | `4` | Per-group prompt queue limit |
 | `WN_PI_MAX_ATTACHMENTS` | `8` | Maximum inbound files validated before backend rejection |
 | `WN_PI_MAX_ATTACHMENT_BYTES` | `67108864` | Maximum aggregate inbound bytes validated before rejection |
