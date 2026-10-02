@@ -1818,6 +1818,97 @@ async fn repairs_declaring_a_loopback_relay_are_not_exported_to_public_indexers(
 }
 
 #[tokio::test]
+async fn loopback_filter_keeps_declared_relays_and_ignores_the_replaced_record() {
+    let loopback = "ws://127.0.0.1:7777";
+    let indexers = crate::default_directory_discovery_relays();
+    let declared_indexer = indexers
+        .iter()
+        .find(|indexer| indexer.0 == "wss://nos.lol")
+        .unwrap()
+        .0
+        .clone();
+    let mut sources = vec!["wss://index.example".to_owned()];
+    sources.extend(indexers.iter().map(|indexer| indexer.0.clone()));
+
+    // A profile repair for an account that declares nos.lol and a loopback
+    // relay: nos.lol stays a destination, the added indexer copies do not.
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    c.records[OnboardingStep::Relays.index()] = Some(signed(
+        &keys,
+        10002,
+        vec![
+            vec!["r".into(), declared_indexer.clone()],
+            vec!["r".into(), loopback.into()],
+        ],
+        "",
+        unix_now_seconds(),
+    ));
+    c.snapshot.revision += 1;
+    c.snapshot.proposal = Some(OnboardingRepairProposal {
+        step: OnboardingStep::Profile,
+        revision: c.snapshot.revision,
+        previous_event_id: None,
+        read_relays: Vec::new(),
+        write_relays: Vec::new(),
+        profile: Some(UserProfileMetadata {
+            name: Some("dev".into()),
+            ..Default::default()
+        }),
+        follows: None,
+    });
+    c.approved = true;
+    c.approved_sources = Some(sources.clone());
+    manager.save_onboarding(&mut c).unwrap();
+    assert!(manager.publish_onboarding_repair(&mut c).await.unwrap());
+    let published = network.published_endpoints.lock().unwrap()[0].clone();
+    assert!(published.contains(&declared_indexer));
+    assert!(
+        indexers
+            .iter()
+            .filter(|indexer| indexer.0 != declared_indexer)
+            .all(|indexer| !published.contains(&indexer.0))
+    );
+    runtime.shutdown_and_close().await.unwrap();
+
+    // An explicit relay replacement that drops the loopback relay is judged by
+    // the new list, so it replaces the old list on the indexers.
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    c.records[OnboardingStep::Relays.index()] = Some(signed(
+        &keys,
+        10002,
+        vec![vec!["r".into(), loopback.into()]],
+        "",
+        unix_now_seconds(),
+    ));
+    c.snapshot.revision += 1;
+    c.snapshot.proposal = Some(OnboardingRepairProposal {
+        step: OnboardingStep::Relays,
+        revision: c.snapshot.revision,
+        previous_event_id: None,
+        read_relays: vec!["wss://default.example".into()],
+        write_relays: vec!["wss://default.example".into()],
+        profile: None,
+        follows: None,
+    });
+    c.append_relays = false;
+    c.approved = true;
+    c.approved_sources = Some(sources);
+    manager.save_onboarding(&mut c).unwrap();
+    assert!(manager.publish_onboarding_repair(&mut c).await.unwrap());
+    let published = network.published_endpoints.lock().unwrap()[0].clone();
+    assert!(
+        indexers
+            .iter()
+            .all(|indexer| published.contains(&indexer.0))
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
 async fn approved_repairs_publish_to_the_sources_inspected_at_approval() {
     let (_dir, runtime, network, _keys, id) = fixture().await;
     missing_relays(&runtime, &id).await;
