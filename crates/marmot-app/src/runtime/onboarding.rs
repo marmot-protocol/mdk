@@ -261,11 +261,6 @@ struct OnboardingCheckpoint {
     // so a host can still look past an unreachable indexer.
     #[serde(default)]
     explicit_discovery: bool,
-    // The sources inspected when the repair was approved. A retry publishes
-    // only there. None on a repair approved before these were recorded: its
-    // retry keeps the original, indexer-free destinations.
-    #[serde(default)]
-    approved_sources: Option<Vec<String>>,
 }
 
 pub struct OnboardingSubscription {
@@ -356,7 +351,6 @@ impl OnboardingCheckpoint {
             setup_cleanup_pending: false,
             attempt_start_revision: 0,
             explicit_discovery: false,
-            approved_sources: None,
         }
     }
     fn new_attempt(
@@ -2265,7 +2259,6 @@ impl AccountManager {
             );
         } else {
             c.approved = true;
-            c.approved_sources = Some(sources);
             c.set(proposal.step, OnboardingStatus::Checking, Vec::new());
             // All route-dependent checks must be repeated after publication.
             c.set(
@@ -2352,46 +2345,16 @@ impl AccountManager {
         if self.require_live_onboarding_attempt(c).is_err() {
             return Ok(false);
         }
-        let mut endpoints = match c.approved_sources.clone() {
-            Some(sources) => sources,
-            None => {
-                self.await_while_onboarding_live(
-                    &c.snapshot.account_id_hex,
-                    c.attempt(),
-                    self.onboarding_sources_with(c, proposal.step, &[]),
-                )
-                .await?
-            }
-        };
-        // Like public indexer copies, a record that declares a loopback relay
-        // is a development record: search indexers for it, never export it.
-        if declares_loopback_relay(c, &proposal, &event) {
-            // Drop only the indexer copies onboarding added; a relay the host,
-            // the account's relay lists, or the proposal names stays.
-            let named: HashSet<String> = c
-                .options
-                .discovery_relays
-                .iter()
-                .chain(&proposal.read_relays)
-                .chain(&proposal.write_relays)
-                .cloned()
-                .chain(
-                    [OnboardingStep::Relays, OnboardingStep::InboxRelays]
-                        .into_iter()
-                        .filter_map(|step| c.records[step.index()].as_ref())
-                        .flat_map(relay_tag_values),
-                )
-                .map(|relay| relay_key(&relay))
-                .collect();
-            let indexers: HashSet<String> = default_directory_discovery_relays()
-                .iter()
-                .map(|endpoint| relay_key(&endpoint.0))
-                .collect();
-            endpoints.retain(|endpoint| {
-                let key = relay_key(endpoint);
-                !indexers.contains(&key) || named.contains(&key)
-            });
-        }
+        // Repairs publish where they did before indexers were searched: the
+        // host's discovery relays and the account's declared relays. Indexers
+        // pick up replaceable records from those relays themselves.
+        let mut endpoints = self
+            .await_while_onboarding_live(
+                &c.snapshot.account_id_hex,
+                c.attempt(),
+                self.onboarding_sources_with(c, proposal.step, &[]),
+            )
+            .await?;
         endpoints.extend(
             proposal
                 .read_relays
@@ -2435,7 +2398,6 @@ impl AccountManager {
                     })?;
                 c.records[proposal.step.index()] = Some(event);
                 c.approved = false;
-                c.approved_sources = None;
                 c.signed_repair = None;
                 c.snapshot.proposal = None;
                 c.reset_step(proposal.step);
@@ -2512,42 +2474,6 @@ fn is_loopback_relay(endpoint: &str) -> bool {
         url.host()
             .is_some_and(cgka_traits::app_components::is_loopback_host)
     })
-}
-
-fn relay_tag_values(event: &NostrTransportEvent) -> Vec<String> {
-    event
-        .tags
-        .iter()
-        .filter(|tag| {
-            tag.first()
-                .is_some_and(|name| name == "r" || name == "relay")
-        })
-        .filter_map(|tag| tag.get(1).cloned())
-        .collect()
-}
-
-/// Whether a repair declares a loopback relay, or would be published for an
-/// account whose relay lists do. A relay-list repair is judged by its own
-/// signed event and proposal, never by the record it replaces.
-fn declares_loopback_relay(
-    c: &OnboardingCheckpoint,
-    proposal: &OnboardingRepairProposal,
-    event: &NostrTransportEvent,
-) -> bool {
-    proposal
-        .read_relays
-        .iter()
-        .chain(&proposal.write_relays)
-        .cloned()
-        .chain(relay_tag_values(event))
-        .chain(
-            [OnboardingStep::Relays, OnboardingStep::InboxRelays]
-                .into_iter()
-                .filter(|step| *step != proposal.step)
-                .filter_map(|step| c.records[step.index()].as_ref())
-                .flat_map(relay_tag_values),
-        )
-        .any(|relay| is_loopback_relay(&relay))
 }
 
 fn relay_key(endpoint: &str) -> String {
