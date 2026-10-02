@@ -51,6 +51,15 @@ struct AdmissionRoute {
     fetched: usize,
     /// What the relays returned, for the attempt's audit row only.
     acquisition: super::super::audit_recovery::RouteAcquisition,
+    /// The group whose epoch this route holds while it still has known
+    /// history to download, and whether this pass proved none is left.
+    acquisition_hold: Option<AcquisitionHold>,
+}
+
+struct AcquisitionHold {
+    group_id: cgka_traits::GroupId,
+    transport_group_id: [u8; 32],
+    complete: bool,
 }
 
 fn comparison_failure(error: AppError) -> ClassifiedSyncFailure {
@@ -464,6 +473,7 @@ impl AppClient {
             );
             let mut acquisition = super::super::audit_recovery::RouteAcquisition::default();
             let mut reached_endpoints = Vec::new();
+            let mut acquisition_hold = None;
             let (outcome, certified, answered, events) = match route.result {
                 ComparisonRouteWorkResult::Skipped => {
                     (Outcome::ServicedPartial, false, false, Vec::new())
@@ -502,10 +512,49 @@ impl AppClient {
                             }));
                         }
                     }
-                    let (outcome, certified, answered) = inventory
+                    let (outcome, mut certified, answered) = inventory
                         .map_or((Outcome::TransientFailure, false, false), |inventory| {
                             inventory.judge(&summary)
                         });
+                    if let (
+                        Some(super::TransportReconciliationWork::Group(group)),
+                        TransportReconciliationRoute::Group(transport_group_id),
+                    ) = (inventory.map(|inventory| &inventory.work), &route.route)
+                    {
+                        // Hold before admitting anything: a commit in this
+                        // batch must not carry the epoch past a message the
+                        // comparison named but did not return (mdk#2086).
+                        let storage = self.app.account_storage(&self.state.label)?;
+                        if summary.unreturned_items > 0 {
+                            storage
+                                .hold_history_acquisition(&group.group_id, transport_group_id)?;
+                            // Named history is debt even when only a
+                            // best-effort relay has it. A certificate would
+                            // satisfy the obligation and release the hold
+                            // before it arrives; without one the route is
+                            // downloaded or parks with a notice.
+                            certified = false;
+                        } else if summary.relays_failed > 0
+                            && storage.history_acquisition_route_held(
+                                &group.group_id,
+                                transport_group_id,
+                            )?
+                        {
+                            // A relay that did not answer may be the one that
+                            // named the held history, best-effort or not, so
+                            // this pass cannot show it was downloaded.
+                            certified = false;
+                        }
+                        // A relay that failed negotiation or truncated its
+                        // set names nothing, so only a certified comparison
+                        // that left nothing unreturned shows the download is
+                        // complete.
+                        acquisition_hold = Some(AcquisitionHold {
+                            group_id: group.group_id.clone(),
+                            transport_group_id: *transport_group_id,
+                            complete: certified,
+                        });
+                    }
                     (outcome, certified, answered, events)
                 }
             };
@@ -523,6 +572,7 @@ impl AppClient {
                 admitted,
                 fetched: 0,
                 acquisition,
+                acquisition_hold,
             });
         }
         Ok(Some(admission))
@@ -868,6 +918,19 @@ impl AppClient {
                     .advance_transport_reconciliation_replay_cursor(&route.route, route.cursor)
                     .map_err(|error| comparison_failure(error.into()))?;
             }
+            // Every named event is now durably held, so the group may
+            // converge over all of it.
+            if route.admitted
+                && let Some(hold) = &route.acquisition_hold
+                && hold.complete
+            {
+                self.release_history_acquisition_hold(
+                    &storage,
+                    &hold.group_id,
+                    &hold.transport_group_id,
+                )
+                .map_err(comparison_failure)?;
+            }
             outcomes.push(super::RouteComparison {
                 route: route.route,
                 outcome: if route.admitted {
@@ -884,14 +947,20 @@ impl AppClient {
                 acquisition: route.acquisition,
             });
         }
-        self.settle_recovery_grant(
-            grant,
-            &mut execution.counts,
-            &mut execution.tally,
-            outcomes,
-            admission.summary,
-        )
-        .await
+        let settled = self
+            .settle_recovery_grant(
+                grant,
+                &mut execution.counts,
+                &mut execution.tally,
+                outcomes,
+                admission.summary,
+            )
+            .await?;
+        // Settlement is where an obligation parks, completes or is retired.
+        // A parked one already raised its "history may be incomplete" notice.
+        self.release_unowed_history_acquisition_holds(&storage)
+            .map_err(comparison_failure)?;
+        Ok(settled)
     }
 }
 

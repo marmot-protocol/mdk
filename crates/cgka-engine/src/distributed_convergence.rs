@@ -208,6 +208,11 @@ impl<S: StorageProvider> Engine<S> {
         if self.ensure_group_live(group_id).is_err() {
             return Ok(None);
         }
+        // A held group has no convergence work to schedule: a due pass would
+        // only wait. The caller that releases the hold reschedules the group.
+        if self.history_acquisition_held(group_id)? {
+            return Ok(None);
+        }
         let tip = self.convergence_tip_epoch(group_id)?;
         let policy = self.convergence_policy_for_group(group_id)?;
         let now = self.convergence_now();
@@ -675,6 +680,14 @@ impl<S: StorageProvider> Engine<S> {
                 .map_err(storage_projection_error)?
                 .epoch),
         }
+    }
+
+    /// Whether the caller holds this group's epoch while it acquires known
+    /// history (`HistoryAcquisitionHoldStorage`).
+    fn history_acquisition_held(&self, group_id: &GroupId) -> Result<bool, OpenMlsProjectionError> {
+        self.storage
+            .history_acquisition_held(group_id)
+            .map_err(storage_projection_error)
     }
 
     /// Discard a pass whose base epoch disagrees with the current tip, so the
@@ -1153,11 +1166,17 @@ impl<S: StorageProvider> Engine<S> {
         // under the final context fingerprint (mdk#1176). Uncontested catch-up
         // needs the same barrier so commit replay cannot prune epoch material
         // before the raw application backlog has been peeled.
+        //
+        // A history-acquisition hold extends that protection to history the
+        // caller knows of but has not downloaded: until it arrives, advancing
+        // more than the retained-epoch window would leave it unpeelable
+        // (mdk#2086).
         if self
             .storage
             .deferred_peel_generation(group_id)
             .map_err(|error| OpenMlsProjectionError::Storage(format!("{error:?}")))?
             .is_some()
+            || self.history_acquisition_held(group_id)?
         {
             let epoch = self
                 .epoch_manager

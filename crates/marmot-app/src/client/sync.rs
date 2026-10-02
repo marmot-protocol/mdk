@@ -792,6 +792,32 @@ impl AppClient {
         }
     }
 
+    /// Release the history-acquisition hold `transport_group_id` placed on
+    /// `group_id`, and schedule the convergence it deferred once no route
+    /// holds the group.
+    pub(super) fn release_history_acquisition_hold(
+        &mut self,
+        storage: &storage_sqlite::SqliteAccountStorage,
+        group_id: &cgka_traits::GroupId,
+        transport_group_id: &[u8; 32],
+    ) -> Result<(), AppError> {
+        if storage.release_history_acquisition_hold(group_id, transport_group_id)? {
+            self.pending_convergence_groups.insert(group_id.clone());
+        }
+        Ok(())
+    }
+
+    /// Release every hold whose route no automatic recovery still owes, and
+    /// schedule those groups' deferred convergence.
+    pub(crate) fn release_unowed_history_acquisition_holds(
+        &mut self,
+        storage: &storage_sqlite::SqliteAccountStorage,
+    ) -> Result<(), AppError> {
+        self.pending_convergence_groups
+            .extend(storage.release_unowed_history_acquisition_holds()?);
+        Ok(())
+    }
+
     /// Retain engine-provided scheduling edges from an effects batch until the
     /// account worker can arm their group timers.
     pub(crate) fn remember_pending_convergence_groups(

@@ -7,6 +7,7 @@ mod deferred_peel_generations;
 /// at read time instead of denormalizing it into `chat_list_rows`.
 pub(crate) mod disband_requests;
 pub(crate) mod groups;
+mod history_acquisition_holds;
 /// `pub(crate)` because the chat-list projection reads durable leave requests at
 /// read time instead of denormalizing them into `chat_list_rows`.
 pub(crate) mod leave_requests;
