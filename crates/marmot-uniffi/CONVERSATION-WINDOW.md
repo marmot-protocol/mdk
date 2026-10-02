@@ -70,6 +70,32 @@ expose reactions for omitted emoji kinds. The compatibility timeline's raw
 Regenerate native sources and use matching libraries when adopting this field:
 it changes the UniFFI record schema and the C `MarmotConversationReaction` layout.
 
+## Complete reaction details
+
+Use `messageReactions(accountRef, groupIdHex, messageIdHex)` when the reactor
+sheet opens. The window's two-identity preview and reaction-kind budget do not
+limit this exact-message local read. One result contains every distinct
+sender/emoji pair, selecting the latest `(reactedAt, reactionMessageIdHex)`
+event, ordered by timestamp, sender and emoji. Multiple different emoji from
+one sender remain separate entries. Existing unreact commands retract all
+matching events; do not retract only the representative event returned here.
+
+The materialized projection applies block visibility; missing, hidden,
+deleted, invalidated and retention-pruned targets have no participants. This
+read does not introduce a wall-clock expiry policy before the engine's sweep.
+All participants are read under one store lock; there are no cursor pages or
+network requests. Work is proportional to this message's stored reactions,
+without scanning the conversation's history. Call off the UI thread, refresh
+when an installed conversation revision changes, and discard completed reads
+after the account, message or screen lifetime changes. The full internal
+snapshot participates in revision comparison even when the bounded preview
+and count stay unchanged.
+
+Bindings return owned records. Hosts render localized labels and retain only
+screen-scoped presentation state. Avoid logging identities or reaction payloads.
+C hosts free the root with `marmot_timeline_user_reaction_list_free`; use the
+matching generated sources/header and native library for this method.
+
 ## Paging and lifetime
 
 Commands can run while `next()` waits. Supply the revision from the installed

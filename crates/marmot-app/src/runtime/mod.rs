@@ -115,6 +115,7 @@ mod local_submissions;
 mod onboarding;
 mod presentation;
 mod presented_chat_list;
+mod reactions;
 pub use chat_list_window::{
     CHAT_LIST_WINDOW_INITIAL_ROWS, CHAT_LIST_WINDOW_MAX_ROWS, ChatListAnchorOutcome,
     ChatListPageDirection, ChatListView, ChatListWindowError, ChatListWindowHandle,
