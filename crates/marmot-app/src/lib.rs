@@ -1959,6 +1959,11 @@ impl MarmotApp {
         // it repairs a crash-lost branch-selection announcement on every open,
         // deferred ones included.
         client.reconcile_branch_selection_withdrawals();
+        // A crash between settling an obligation and releasing its holds
+        // must not leave a group's epoch held with nothing left to fetch.
+        client.release_unowed_history_acquisition_holds(
+            &self.account_storage(&client.state.label)?,
+        )?;
         if !defer_group_hydration {
             // These repairs read live group state. Deferred runtime opens run
             // them after the account worker's hydration pipeline instead.

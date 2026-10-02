@@ -941,6 +941,21 @@ pub trait DeferredPeelGenerationStorage {
     fn delete_deferred_peel_generation(&self, group_id: &GroupId) -> StorageResult<()>;
 }
 
+// ── HistoryAcquisitionHoldStorage ────────────────────────────────────────
+
+/// Durable hold on a group's epoch while known inbound history is still
+/// being acquired.
+///
+/// The deferred-peel barrier protects raw rows already stored. A caller that
+/// knows of group history it has not downloaded yet holds the group here, so
+/// convergence cannot advance the epoch more than the retained-epoch window
+/// past messages that have not arrived. The engine only reads the hold; the
+/// caller that learned of the missing history installs and releases it.
+pub trait HistoryAcquisitionHoldStorage {
+    /// Whether convergence for `group_id` must wait for acquisition.
+    fn history_acquisition_held(&self, group_id: &GroupId) -> StorageResult<bool>;
+}
+
 // ── StorageProvider aggregate ───────────────────────────────────────────────
 
 /// The single storage type parameter carried by the engine.
@@ -962,6 +977,7 @@ pub trait StorageProvider:
     + ConvergencePolicyStorage
     + ConvergencePassStorage
     + DeferredPeelGenerationStorage
+    + HistoryAcquisitionHoldStorage
     + MemberValidationCacheStorage
     + AccountDeviceSignerStorage
     + KeyPackageBundleStorage

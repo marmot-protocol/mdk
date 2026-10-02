@@ -1644,6 +1644,46 @@ async fn deferred_peel_retries_after_epoch_advance() {
     );
 }
 
+/// A history-acquisition hold keeps the epoch while the caller still knows of
+/// history it has not downloaded, and the group converges once the hold is
+/// released (mdk#2086).
+#[tokio::test]
+async fn history_acquisition_hold_defers_convergence_until_released() {
+    let (_alice, mut carol, carol_storage, _carol_peeler, group_id, commit2, commit3) =
+        carol_behind_two_epochs().await;
+    carol_storage
+        .hold_history_acquisition(&group_id, &[9; 32])
+        .unwrap();
+
+    carol.ingest(commit2).await.unwrap();
+    carol.ingest(commit3).await.unwrap();
+    carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .unwrap();
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(1));
+    assert_eq!(
+        carol
+            .prepare_convergence_cutoff_delay_ms(&group_id)
+            .unwrap(),
+        None,
+        "a held group has no convergence to schedule"
+    );
+
+    assert!(
+        carol_storage
+            .release_history_acquisition_hold(&group_id, &[9; 32])
+            .unwrap()
+    );
+    for now_ms in 1_000_001..1_000_004 {
+        carol
+            .converge_and_drain_queued_outbound_intents(&group_id, now_ms)
+            .await
+            .unwrap();
+    }
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(3));
+}
+
 /// A row that exhausts its retry budget is resource-refused and released
 /// without poisoning same-id redelivery as a terminal duplicate.
 #[tokio::test]

@@ -156,6 +156,10 @@ pub struct NostrReconciliationSummary {
     pub incomplete_endpoints: Vec<TransportEndpoint>,
     pub remote_items: usize,
     pub received_items: usize,
+    /// Remote-only IDs from completed comparisons that this pass did not
+    /// return. Nonzero means the route has known history the account has not
+    /// downloaded yet; the caller holds the group's epoch until it arrives.
+    pub unreturned_items: usize,
 }
 
 /// Planned SDK subscription derived from a transport-adapter subscription.
@@ -1238,6 +1242,12 @@ impl NostrSdkRelayClient {
             .iter()
             .filter_map(|id| EventId::from_hex(id).ok())
             .collect::<HashSet<_>>();
+        let unreturned_items = remote_by_endpoint
+            .values()
+            .flatten()
+            .filter(|id| !returned.contains(id))
+            .collect::<HashSet<_>>()
+            .len();
         for (endpoint, ids) in &remote_by_endpoint {
             if ids.iter().any(|id| !returned.contains(id)) {
                 // A pass cut short by its deadline did not hear the endpoint
@@ -1281,6 +1291,7 @@ impl NostrSdkRelayClient {
             incomplete_endpoints: sorted(&incomplete_endpoints),
             remote_items: remote_item_count,
             received_items: remote_events.len(),
+            unreturned_items,
         };
         Ok((summary, remote_events))
     }

@@ -798,6 +798,12 @@ impl cgka_traits::storage::DeferredPeelGenerationStorage for FaultStorage {
     }
 }
 
+impl cgka_traits::storage::HistoryAcquisitionHoldStorage for FaultStorage {
+    fn history_acquisition_held(&self, group_id: &GroupId) -> StorageResult<bool> {
+        self.inner.history_acquisition_held(group_id)
+    }
+}
+
 impl StorageProvider for FaultStorage {
     type Mls = <SqliteAccountStorage as StorageProvider>::Mls;
 

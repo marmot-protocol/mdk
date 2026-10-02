@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+Account storage advances to migration 102 on first open; downgrade is
+unsupported.
+
+### Added
+
+- Migration 0102 adds per-group history-acquisition holds. The engine reads
+  them through `HistoryAcquisitionHoldStorage`. The app installs and releases
+  them with `hold_history_acquisition`, `release_history_acquisition_hold` and
+  `release_unowed_history_acquisition_holds` (#2086).
+
 ## 0.12.0 - 2026-10-02
 
 Account storage advances from migration 98 through 101 on first open; downgrade

@@ -197,6 +197,25 @@ Every cause runs the same job:
    the tier rules, using the existing revision checks. Old attempts still cannot clear newer
    demand.
 
+**The epoch waits for known history (mdk#2086).** A pass fetches at most 16 events per
+relay, chosen by event id, not time. So a large backlog can deliver every commit before
+some older messages. If the group applied those commits, it would move more than the
+retained-epoch window (5) past those messages, which could then never be decrypted. Two
+steps prevent this:
+
+- Before admitting a pass's batch, the job holds the group's epoch if the route still has
+  remote-only events the pass did not return (`unreturned_items`). The hold is a durable
+  per-group row that the engine reads at convergence, next to the deferred-peel barrier.
+  While it is in place, commits buffer and queued sends wait.
+- The hold ends at the checkpoint of a pass that returned and durably admitted every
+  remote-only event. It also ends at any settlement or account open that finds no runnable
+  obligation scope still owing the route. That covers recovery giving up on the route,
+  which already raises its "history may be incomplete" notice. Releasing reschedules the
+  group's convergence.
+
+Passes that fetch something count as progress. So the hold lasts as long as the download
+of the backlog, and a stuck download parks after the usual quiet or unserved passes.
+
 The worker loop never awaits the network. There is one recovery job per account, and
 every cause and every caller runs it:
 
@@ -480,6 +499,8 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   account load after the upgrade stamps each retained route in `account_groups` that has
   none, and persists the stamp in the same step
   (`stamp_unrecorded_prior_route_switches`).
+- Migration 0102 adds `cgka_history_acquisition_holds`: one row per held group with the
+  route that holds it, removed with the group (mdk#2086).
 - Tables that no code reads any more are dropped in a later migration, once their rows have
   been converted.
 
