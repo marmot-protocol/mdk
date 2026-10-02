@@ -11,7 +11,9 @@ is unsupported.
 
 - Migration 0100 keeps a tapped attachment's explicit priority when its
   history row is reprojected, and migration 0101
-  adds bounded outgoing-upload retention records for genuinely sent files.
+  adds bounded outgoing-upload staging records, written after the blob upload
+  and before publication; confirmed sends later promote them to retained
+  attachment bytes.
   (#2142)
 
 - `SqliteAccountStorage::poll_votes` pages each voter's effective selection for

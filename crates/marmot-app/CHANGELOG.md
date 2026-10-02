@@ -49,9 +49,11 @@
   those mentions. Hosts using notification subscriptions apply their own
   permission, channel, and foreground policy to emitted updates.
   (marmot-protocol/whitenoise-android#2984)
-- A successful outgoing upload stages a private local copy bound to its
-  confirmed source, so the sender reopens it without reacquisition. Staging is
-  best-effort and bounded; its failure never blocks the send. (#2142)
+- A successful outgoing upload stages a private local copy before the message
+  is published. Once the send is confirmed, the staged bytes gain owners and
+  are promoted to retained attachment bytes, so the sender reopens the file
+  without reacquisition. Staging is best-effort and bounded; its failure never
+  blocks the send. (#2142)
 
 ### Fixed
 

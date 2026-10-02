@@ -17,12 +17,6 @@ Regenerate Swift/Kotlin bindings with the matching native library. See the
 
 ### Added
 
-- `create_identity`, `create_identity_with_profile`, `login`,
-  `login_recovering_incomplete_setup`, `login_external_signer` and
-  `publish_relay_lists` take a trailing `inbox_relays` (binding default empty)
-  that declares the kind-10050 inbox list separately from `default_relays`.
-  `OnboardingOptionsFfi.inbox_relays` (default empty) does the same for
-  onboarding. Empty keeps declaring `default_relays` in both lists. (#2141)
 - `Marmot::group_app_component` and `update_app_component` read and
   admin-update optional application-owned group components (ids at or above
   `0xf000`, up to 4096 bytes each) carried in MLS group state, so shared
@@ -33,14 +27,13 @@ Regenerate Swift/Kotlin bindings with the matching native library. See the
   explicit priority without resetting retry budgets, backoff or active
   deadlines. Use it for ordinary taps; keep `control_attachment(Retry)` and
   `download_attachment_again` for deliberate recovery. (#2142)
-
 - `create_identity`, `create_identity_with_profile`, `login`,
   `login_recovering_incomplete_setup`, `login_external_signer` and
   `publish_relay_lists` take a trailing `inbox_relays` argument, and
   `OnboardingOptionsFfi` an `inbox_relays` field, that set the kind-10050 inbox
   list separately from `default_relays`. Both default to empty, which declares
   `default_relays` in both lists as before, so existing Swift, Kotlin and
-  Python callers keep working unchanged.
+  Python callers keep working unchanged. (#2141)
 - `Marmot::poll_votes` pages each voter's effective poll selection
   (`PollVoteFfi`: voter account id, option ids, vote time) for a "View votes"
   sheet, 1..=100 per `PollVotePageFfi` with a `(voted_at, voter)` cursor. It
@@ -60,20 +53,9 @@ Regenerate Swift/Kotlin bindings with the matching native library. See the
 
 ### Changed
 
-- A durable chat mute still lets a direct mention of the receiving account
-  reach notification subscriptions with `NotificationUpdateFfi.is_mention`;
-  ordinary traffic stays silent and blocked senders stay suppressed. (#2143)
-- Genuinely sent attachments are retained locally after a successful upload,
-  so the sender reopens them without downloading them again. (#2142)
-
-### Fixed
-
-- Attachments from a message whose epoch the group had already left (common
-  for agent sends) no longer stay downloading forever; missing-key deferrals
-  now fail after about eight minutes, and blobs every Blossom server reports
-  as 404/410 fail without retrying. (#2106)
-### Changed
-
+- Sent attachments are staged locally after a successful upload and retained
+  once the send is confirmed, so the sender reopens them without downloading
+  them again. (#2142)
 - `set_chat_muted` now allows direct mentions of the receiving account through
   the durable mute in notification subscriptions; ordinary traffic stays silent
   and blocked senders remain suppressed. Hosts still apply their own permission,
@@ -83,7 +65,7 @@ Regenerate Swift/Kotlin bindings with the matching native library. See the
   indefinitely when the blob is gone (404/410 everywhere) or its epoch key stays
   unavailable for about eight minutes. Hosts should offer Retry: it derives a
   missing key from retained epoch state, recovering attachments whose key was
-  never cached. Retry budgets are unchanged.
+  never cached. Retry budgets are unchanged. (#2106)
 
 
 ## 0.11.0 - 2026-09-29
