@@ -204,14 +204,18 @@ struct BootstrapAccountState {
     key_package_bytes: Option<usize>,
 }
 
-struct ControlClient {
+pub(crate) struct ControlClient {
     socket_path: PathBuf,
     auth_token: Option<String>,
     request_timeout: Duration,
 }
 
 impl ControlClient {
-    fn new(socket_path: PathBuf, auth_token: Option<String>, request_timeout: Duration) -> Self {
+    pub(crate) fn new(
+        socket_path: PathBuf,
+        auth_token: Option<String>,
+        request_timeout: Duration,
+    ) -> Self {
         Self {
             socket_path,
             auth_token,
@@ -219,7 +223,7 @@ impl ControlClient {
         }
     }
 
-    async fn request(
+    pub(crate) async fn request(
         &self,
         payload: AgentControlRequest,
     ) -> Result<AgentControlEnvelope<AgentControlResponse>, BootstrapError> {

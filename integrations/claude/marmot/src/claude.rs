@@ -597,6 +597,9 @@ mod tests {
             &script,
             r#"#!/usr/bin/env bash
 set -euo pipefail
+test "$MARMOT_ACCOUNT_ID_HEX" = "test-account"
+test "$MARMOT_GROUP_ID_HEX" = "test-group"
+test "$MARMOT_AGENT_AUTH_TOKEN" = "test-token"
 test "$1" = "-p"
 test "$2" = "--output-format"
 test "$3" = "stream-json"
@@ -611,18 +614,28 @@ printf '{"type":"result","subtype":"success","is_error":false,"result":"reply: %
 "#,
         );
         let (tx, mut rx) = mpsc::channel(4);
-        let outcome = run_with_bin(
-            script.to_str().unwrap(),
-            ExecutionProfile::Inherit,
-            Invocation {
-                timeout: Duration::from_secs(5),
-                idle_timeout: Duration::from_secs(2),
-                cwd: root.path().to_path_buf(),
-                session_id: None,
-                prompt: "--stdin-only".to_owned(),
-                artifact_output: None,
-            },
-            tx,
+        let context = marmot_terminal_harness::GroupProfileContext {
+            socket: root.path().join("test.sock"),
+            auth_token: Some("test-token".into()),
+            account_id_hex: "test-account".into(),
+            group_id_hex: "test-group".into(),
+            request_timeout: Duration::from_secs(30),
+        };
+        let outcome = marmot_terminal_harness::with_group_profile_context(
+            context,
+            run_with_bin(
+                script.to_str().unwrap(),
+                ExecutionProfile::Inherit,
+                Invocation {
+                    timeout: Duration::from_secs(5),
+                    idle_timeout: Duration::from_secs(2),
+                    cwd: root.path().to_path_buf(),
+                    session_id: None,
+                    prompt: "--stdin-only".to_owned(),
+                    artifact_output: None,
+                },
+                tx,
+            ),
         )
         .await
         .unwrap();

@@ -19,6 +19,7 @@ the Python Hermes plugin in [`../../hermes/marmot/`](../../hermes/marmot).
 
 ## Contents
 
+- [Admin group profile tool](#admin-group-profile-tool)
 - [Install (release)](#install-release)
 - [Dev setup](#dev-setup)
 - [Docker phone test](#docker-phone-test)
@@ -26,6 +27,24 @@ the Python Hermes plugin in [`../../hermes/marmot/`](../../hermes/marmot).
 - [How it works](#how-it-works)
 - [Local gateway harness](#local-gateway-harness)
 - [Tests](#tests)
+
+## Admin group profile tool
+
+The model-callable `marmot_group_profile` tool updates an existing group name,
+description, or both through the selected Marmot delivery account. Supply
+`group_id_hex` and at least one field. Omit a field to keep it; an empty string
+clears it. Names are bounded to 256 UTF-8 bytes and descriptions to 4096 bytes.
+MDK requires current group admin authority when committing. Successful replies
+include the published commit message ids. Transport timeouts or invalid
+acknowledgements have an unknown outcome and are never retried automatically;
+check current group details before retrying. This tool preserves the existing
+full-control socket authentication boundary.
+
+The tool binds the selected account to the current delivery context but accepts
+an explicit target group, like the message tool. This is intentionally not a
+per-conversation capability: the selected account must be a current admin of
+the target group. Use conversation metadata for the current group, and target
+another group only when the user explicitly requests it.
 
 ## Install (release)
 

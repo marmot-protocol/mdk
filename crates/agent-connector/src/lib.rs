@@ -8,6 +8,7 @@ mod connection;
 mod diagnostics;
 mod error;
 mod event_projection;
+mod group_profile_tool;
 mod identity;
 mod inbound;
 mod invite_policy;
@@ -34,6 +35,7 @@ pub use bootstrap::{
     resolve_bootstrap_socket, run_bootstrap,
 };
 pub use error::ConnectorError;
+pub use group_profile_tool::{GroupProfileToolConfig, run_group_profile_tool};
 pub use identity::{
     ExistingIdentityError, ExistingIdentityImport, MAX_IDENTITY_BYTES,
     import_existing_identity_file, import_existing_identity_secret,

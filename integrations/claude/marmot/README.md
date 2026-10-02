@@ -124,6 +124,14 @@ as independent lanes. Do not resume the connector-owned UUID concurrently from
 another Claude Code client. V1 does not claim simultaneous TUI observation or
 a shared event bus.
 
+## Admin group profile updates
+
+This harness exposes the shared `wn-agent group-profile` command to the agent
+for the active conversation. It supports name and description changes for
+current admins, partial updates and explicit clearing. See the
+[shared control-command contract](../../terminal-harness/README.md#admin-group-profile-updates)
+for routing, release compatibility, permissions and uncertain outcomes.
+
 ## Configuration
 
 | Environment variable | Default | Meaning |
@@ -159,6 +167,12 @@ version at startup without reading or changing credentials or configuration.
 The CLI contract and event schema were checked against Claude Code 2.1.270.
 
 ## Security Notes
+
+- Group-profile routing passes a configured bearer token as a raw child
+  environment value, including tokens loaded from files. Trusted tool shells,
+  MCP servers and other descendants may inherit its full connector authority.
+  Backend environment filtering must preserve the turn's route and token;
+  see the [shared control-command contract](../../terminal-harness/README.md#admin-group-profile-updates).
 
 - An allowlisted sender can cause Claude Code to read, modify, and execute code
   with the service user's authority. Use a dedicated OS user, container, or VM

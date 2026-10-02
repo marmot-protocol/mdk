@@ -8480,7 +8480,9 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
             record = await original_call(adapter._inbound_spool.get, event["message_id_hex"])
             self.assertEqual("pending", record.state)
             await adapter._try_admit_spooled(event["message_id_hex"], ignore_backoff=True)
-            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+            # Dispatch also claims the ambient SQLite journal and persists the
+            # spool outcome. Bound a hang, not contended runner disk latency.
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=5)
             self.assertEqual(["durable"], [message.text for message in adapter.events])
         finally:
             release.set()
