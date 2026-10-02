@@ -7,6 +7,14 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Added
+
+- Add `marmot_propose_onboarding_relay_repair` and nested typed relay-repair
+  preview records. `MarmotOnboardingRepairProposal` gains an optional
+  `relay_repair` pointer; regenerate and recompile with the matching header
+  and library. The preview is non-publishing, and `ManualReview` has no
+  approvable action.
+
 ## [0.12.0] - 2026-10-02
 
 Recompile against the matching `marmot.h` and library: several signatures and

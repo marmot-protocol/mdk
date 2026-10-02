@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- `Marmot::propose_onboarding_relay_repair` previews a lossless relay-list repair
+  without signing or publishing. `OnboardingRepairProposalFfi.relay_repair` carries
+  the typed before/after tags, exact diff, restored capabilities and ManualReview
+  mode. Regenerate Swift/Kotlin bindings and update record initializers for the new
+  optional field. Optional passed-step previews retain readiness when dismissed
+  before approval.
+
 ## 0.12.0 - 2026-10-02
 
 Regenerate Swift/Kotlin bindings with the matching native library. See the
