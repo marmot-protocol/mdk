@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-09-27
+updated: 2026-09-30
 tags: [marmot, architecture, index]
 ---
 
@@ -58,8 +58,8 @@ Written to be readable in 5 minutes each, shareable as a package.
     bundle), and the sequencing to real carrier swaps.
 
 - **Doc:** [`overview/app-core-boundary.md`](./overview/app-core-boundary.md)
-  - **What it covers:** The boundary between `wn`, `marmot-app`, `marmot-account`, sessions, and future Swift/TUI
-    bindings.
+  - **What it covers:** The MDK/host-app ownership contract, including Android as a minimal display/platform layer,
+    shared runtime rules, bindings and storage boundaries.
 
 - **Doc:** [`overview/marmot-app-runtime.md`](./overview/marmot-app-runtime.md)
   - **What it covers:** The implemented first slice of the multi-account `marmot-app` runtime, its shared Nostr relay
