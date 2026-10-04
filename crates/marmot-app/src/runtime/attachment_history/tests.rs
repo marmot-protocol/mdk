@@ -328,7 +328,9 @@ async fn attachment_discovery_roles_preserve_slots_and_refresh() {
             photo,
             vec!["imeta".into(), "v future".into()],
             tag("image/png"),
+            tag("image/png"),
             vec!["emoji".into(), "wave".into(), emoji_url.clone()],
+            vec!["emoji".into(), "alias".into(), emoji_url.clone()],
         ],
         recorded_at: 1,
         received_at: 1,
@@ -382,6 +384,7 @@ async fn attachment_discovery_roles_preserve_slots_and_refresh() {
         vec![
             AttachmentRole::Shared,
             AttachmentRole::Shared,
+            AttachmentRole::InlineEmoji,
             AttachmentRole::InlineEmoji
         ]
     );
@@ -396,6 +399,13 @@ async fn attachment_discovery_roles_preserve_slots_and_refresh() {
         album[2].attachment,
         MediaAttachmentOutcome::Accepted {
             attachment_index: 2,
+            ..
+        }
+    ));
+    assert!(matches!(
+        album[3].attachment,
+        MediaAttachmentOutcome::Accepted {
+            attachment_index: 3,
             ..
         }
     ));
