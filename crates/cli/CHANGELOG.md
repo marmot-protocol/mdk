@@ -9,6 +9,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed
+
+- `relay.damus.io` is no longer a retired relay host. The relay is still
+  operating, so relay lists, invites and `wn` commands accept it again.
+  `relay.nostr.band` remains retired.
+
 ### Fixed
 
 - A sent message the engine queued while the group was converging is no longer

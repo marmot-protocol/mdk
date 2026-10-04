@@ -11,10 +11,12 @@
 
 ### Fixed
 
-- Inviting a member whose inbox relay list names only retired or unsafe relays
-  now fails with "member inbox relay list names only retired or unsafe
-  relays" instead of "relay-list absence was not authoritatively
-  established". Retrying never helped; the member has to republish the list.
+- When a member lookup does not complete and the member's known inbox relay
+  list has no usable relays, the invite now fails with "known member inbox
+  relay list has no usable relays and its refresh did not complete" instead
+  of "relay-list absence was not authoritatively established". The error is
+  still retryable. A completed lookup still returns
+  `AppError::MissingMemberInboxRoute`.
 
 - A sent message the engine queued while the group was converging is no longer
   marked failed when an unrelated publish in the same batch fails, and a sent
