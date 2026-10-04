@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- Test-only `test-migrated-template` feature adds
+  `SqliteAccountStorage::in_memory_from_migrated_template`, which copies one
+  migrated in-memory database per process instead of replaying every migration
+  for each open. Harnesses that open thousands of databases use it.
+
 ## 0.12.0 - 2026-10-02
 
 Account storage advances from migration 98 through 101 on first open; downgrade
