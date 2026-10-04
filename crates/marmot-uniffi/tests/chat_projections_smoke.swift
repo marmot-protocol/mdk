@@ -2,7 +2,13 @@ import Foundation
 
 @main
 struct ChatProjectionsSmoke {
+    /// Exercise generated record layout and enum discriminants, including presentation roles.
     static func main() throws {
+        for role in [AttachmentRoleFfi.shared, .inlineEmoji] {
+            let entry = AttachmentEntryFfi(messageIdHex: "m", sourceMessageIdHex: "s", sender: "a", timelineAt: 1, receivedAt: 2, sourceEpoch: nil, category: .rejected, role: role, attachment: .rejected(attachmentIndex: 7, rejection: MediaAttachmentRejectionFfi(kind: .unsupportedFormat, detail: "unsupported")))
+            let copy = try FfiConverterTypeAttachmentEntryFfi.lift(FfiConverterTypeAttachmentEntryFfi.lower(entry))
+            precondition(copy == entry)
+        }
         for preview in [SelectedChatPreviewFfi.draft(draft: ChatListDraftPreviewFfi(text: "draft 🦀", textTruncated: true, attachmentCount: 2, attachmentKind: .mixed)), .message, .invitation, .empty] {
             let copy = try FfiConverterTypeSelectedChatPreviewFfi.lift(FfiConverterTypeSelectedChatPreviewFfi.lower(preview))
             precondition(copy == preview)

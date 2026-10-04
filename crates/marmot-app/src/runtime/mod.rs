@@ -105,7 +105,7 @@ pub use attachment_access::{
 mod avatar;
 pub use attachment_history::{
     AttachmentCategory, AttachmentEntry, AttachmentHistoryCursor, AttachmentHistoryVersion,
-    AttachmentPage, AttachmentPageRead, MAX_ATTACHMENT_HISTORY_PAGE,
+    AttachmentPage, AttachmentPageRead, AttachmentRole, MAX_ATTACHMENT_HISTORY_PAGE,
 };
 mod avatar_access;
 pub use avatar_access::{LocalAvatarRead, MAX_AVATAR_BATCH_BYTES, MAX_AVATAR_BATCH_ITEMS};

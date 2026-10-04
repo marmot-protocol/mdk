@@ -32,6 +32,27 @@ local bytes, permission to fetch, or availability of an epoch secret. Existing
 `download_media` still enforces fetch policy. Automatic attachment acquisition
 remains deferred until invitation acceptance and is not implemented by C8-B.
 
+## Inline emoji artwork
+
+Each entry carries `role` (`Shared` or `InlineEmoji`) separately from its MIME
+category. Gallery clients exclude `InlineEmoji`; the API still returns every
+original slot and its parser verdict, so an emoji-only page can have no gallery
+items while `has_more` remains true. Never renumber slots or stop on a filtered page.
+
+The native classifier matches accepted image locators exactly against well-formed
+`["emoji", shortcode, locator]` tags on that source message. Shortcodes use 1–64
+ASCII letters, digits, underscores or hyphens. The first well-formed definition of
+a shortcode wins, even when its locator does not match an attachment. Aliases are
+supported. Every image slot matching a claimed artwork locator has the inline role;
+rejected slots and non-images retain `Shared`. This role does not authorize or
+suppress acquisition, and does not depend on whether the shortcode occurs in text.
+
+Metadata is point-read from canonical source tags within the page's read snapshot,
+including retained rows predating this capability; no history backfill is needed.
+Source-tag changes invalidate versions/cursors. Bindings add `AttachmentRoleFfi`
+and the entry's `role` field; C adds `MarmotAttachmentRole` and changes the entry
+layout. Regenerate Swift/Kotlin bindings and pair the C header with its library.
+
 ## Refresh, removal and restart
 
 Keep the version captured when the current loaded collection began as its baseline.

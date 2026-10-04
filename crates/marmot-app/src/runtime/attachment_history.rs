@@ -15,6 +15,15 @@ pub enum AttachmentCategory {
     Rejected,
 }
 
+/// Presentation role, independent of MIME category and acquisition eligibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachmentRole {
+    /// A normal shared attachment, or a rejected slot whose role cannot be validated.
+    Shared,
+    /// A validated image referenced by a well-formed NIP-30 emoji tag on its message.
+    InlineEmoji,
+}
+
 #[derive(Clone)]
 pub struct AttachmentEntry {
     pub message_id_hex: String,
@@ -25,6 +34,7 @@ pub struct AttachmentEntry {
     /// None for retained legacy rows. Never treat the parser's epoch fallback as authoritative.
     pub source_epoch: Option<u64>,
     pub category: AttachmentCategory,
+    pub role: AttachmentRole,
     pub attachment: MediaAttachmentOutcome,
 }
 impl std::fmt::Debug for AttachmentEntry {
@@ -55,6 +65,7 @@ pub(crate) fn category(media_type: &str) -> AttachmentCategory {
     }
 }
 
+/// Preserve the parser verdict and derive presentation role from source-owned emoji metadata.
 fn present(
     entry: storage_sqlite::AttachmentHistoryEntry,
     allow_loopback: bool,
@@ -88,6 +99,7 @@ fn present(
             AttachmentCategory::Rejected
         }
     };
+    let role = attachment_role(&attachment, &entry.emoji_tags);
     Ok(AttachmentEntry {
         message_id_hex: entry.message_id_hex,
         source_message_id_hex: entry.source_message_id_hex,
@@ -96,9 +108,44 @@ fn present(
         received_at: entry.received_at,
         source_epoch: entry.source_epoch,
         category,
+        role,
         attachment,
     })
 }
+/// First well-formed definition wins for each case-sensitive shortcode, even if unmatched.
+/// Every accepted image slot using that artwork locator has the inline role; acquisition is unchanged.
+fn attachment_role(attachment: &MediaAttachmentOutcome, tags: &[Vec<String>]) -> AttachmentRole {
+    let MediaAttachmentOutcome::Accepted { reference, .. } = attachment else {
+        return AttachmentRole::Shared;
+    };
+    if category(&reference.media_type) != AttachmentCategory::Image {
+        return AttachmentRole::Shared;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for tag in tags {
+        if tag.len() < 3
+            || tag[0] != "emoji"
+            || tag[1].is_empty()
+            || tag[1].len() > 64
+            || !tag[1]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            || tag[2].trim().is_empty()
+            || !seen.insert(&tag[1])
+        {
+            continue;
+        }
+        if reference
+            .locators
+            .iter()
+            .any(|locator| locator.value == tag[2])
+        {
+            return AttachmentRole::InlineEmoji;
+        }
+    }
+    AttachmentRole::Shared
+}
+
 impl MarmotAppRuntime {
     pub(super) async fn attachment_read<T: Send + 'static>(
         &self,

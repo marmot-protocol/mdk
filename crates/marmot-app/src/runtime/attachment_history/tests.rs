@@ -256,6 +256,7 @@ async fn attachment_discovery_fences_changes_isolates_accounts_and_closes() {
     );
 }
 
+/// Legacy epoch absence and parser categories remain independent of the presentation role.
 #[test]
 fn attachment_discovery_legacy_epoch_and_categories_preserve_parser_verdicts() {
     for (mime, category) in [
@@ -274,6 +275,7 @@ fn attachment_discovery_legacy_epoch_and_categories_preserve_parser_verdicts() {
             timeline_at: 1,
             received_at: 2,
             slot: serde_json::json!(raw),
+            emoji_tags: vec![],
         };
         let projected = present(entry, false).unwrap();
         assert_eq!(projected.source_epoch, None);
@@ -294,5 +296,175 @@ fn attachment_discovery_legacy_epoch_and_categories_preserve_parser_verdicts() {
             crate::parse_media_attachment(&raw, None, false).unwrap()
         );
         assert!(!format!("{projected:?}").contains("private"));
+    }
+}
+
+/// Mixed and emoji-only messages remain pageable outside any conversation window.
+#[tokio::test]
+async fn attachment_discovery_roles_preserve_slots_and_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    let emoji_url = format!("https://media.example/{}.bin", "11".repeat(32));
+    let mut photo = tag("image/png");
+    photo[2] = format!(
+        "locator blossom-v1 https://media.example/{}.bin",
+        "44".repeat(32)
+    );
+    photo[3] = format!("ciphertext_sha256 {}", "44".repeat(32));
+    let mut event = StoredAppEvent {
+        group_id_hex: "ab".repeat(16),
+        message_id_hex: "01".repeat(32),
+        source_message_id_hex: Some("02".repeat(32)),
+        source_epoch: Some(1),
+        direction: "received".into(),
+        sender: "cd".repeat(32),
+        plaintext: ":wave:".into(),
+        kind: 9,
+        tags: vec![
+            photo,
+            vec!["imeta".into(), "v future".into()],
+            tag("image/png"),
+            vec!["emoji".into(), "wave".into(), emoji_url.clone()],
+        ],
+        recorded_at: 1,
+        received_at: 1,
+        origin_commit_id: None,
+        moderation_grant: false,
+    };
+    store.record_app_event(&event).unwrap();
+    // Newer ordinary chat pushes the album far outside a recent conversation window.
+    for i in 1..350 {
+        add(&store, i);
+    }
+    event.message_id_hex = "ff".repeat(32);
+    event.source_message_id_hex = Some("fe".repeat(32));
+    event.tags = vec![
+        tag("image/png"),
+        vec!["emoji".into(), "wave".into(), emoji_url],
+    ];
+    event.recorded_at = 10000;
+    store.record_app_event(&event).unwrap();
+    let runtime = app.runtime();
+    let group = GroupId::new(vec![0xab; 16]);
+    let AttachmentPageRead::Page(first) = runtime
+        .attachment_history_page("alice", &group, 1, None)
+        .await
+        .unwrap()
+    else {
+        panic!("page")
+    };
+    assert_eq!(first.entries[0].role, AttachmentRole::InlineEmoji);
+    assert!(first.next_cursor.is_some());
+    let mut cursor = first.next_cursor.clone();
+    let mut album = Vec::new();
+    while let Some(next) = cursor {
+        let AttachmentPageRead::Page(page) = runtime
+            .attachment_history_page("alice", &group, 1, Some(next))
+            .await
+            .unwrap()
+        else {
+            panic!("page")
+        };
+        assert_eq!(page.entries.len(), 1);
+        album.extend(
+            page.entries
+                .into_iter()
+                .filter(|e| e.message_id_hex == "01".repeat(32)),
+        );
+        cursor = page.next_cursor;
+    }
+    assert_eq!(
+        album.iter().map(|e| e.role).collect::<Vec<_>>(),
+        vec![
+            AttachmentRole::Shared,
+            AttachmentRole::Shared,
+            AttachmentRole::InlineEmoji
+        ]
+    );
+    assert!(matches!(
+        album[1].attachment,
+        MediaAttachmentOutcome::Rejected {
+            attachment_index: 1,
+            ..
+        }
+    ));
+    assert!(matches!(
+        album[2].attachment,
+        MediaAttachmentOutcome::Accepted {
+            attachment_index: 2,
+            ..
+        }
+    ));
+    // Removing the tag preserves the image's acquisition reference but changes its role.
+    event.tags.pop();
+    store.record_app_event(&event).unwrap();
+    let changed = runtime
+        .attachment_history_version("alice", &group)
+        .await
+        .unwrap();
+    assert!(changed.requires_restart_since(&first.version));
+    let AttachmentPageRead::Page(fresh) = runtime
+        .attachment_history_page("alice", &group, 1, None)
+        .await
+        .unwrap()
+    else {
+        panic!("page")
+    };
+    assert_eq!(fresh.entries[0].role, AttachmentRole::Shared);
+    assert_eq!(fresh.entries[0].attachment, first.entries[0].attachment);
+    assert!(runtime.accounts.workers.lock().await.is_empty());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// Malformed tags, shadowed codes and non-image/rejected slots cannot hide shared content.
+#[test]
+fn attachment_roles_validate_definitions_without_changing_parser_outcomes() {
+    let url = format!("https://media.example/{}.bin", "11".repeat(32));
+    for (mime, tags, expected) in [
+        (
+            "image/png",
+            vec![vec!["emoji", "wave", url.as_str()]],
+            AttachmentRole::InlineEmoji,
+        ),
+        (
+            "image/png",
+            vec![vec!["emoji", "bad code", url.as_str()]],
+            AttachmentRole::Shared,
+        ),
+        (
+            "image/png",
+            vec![
+                vec!["emoji", "wave", "https://absent.example"],
+                vec!["emoji", "wave", url.as_str()],
+            ],
+            AttachmentRole::Shared,
+        ),
+        (
+            "image/png",
+            vec![
+                vec!["emoji", "wave", ""],
+                vec!["emoji", "wave", url.as_str()],
+            ],
+            AttachmentRole::InlineEmoji,
+        ),
+        (
+            "audio/ogg",
+            vec![vec!["emoji", "wave", url.as_str()]],
+            AttachmentRole::Shared,
+        ),
+    ] {
+        let attachment = MediaAttachmentOutcome::Accepted {
+            attachment_index: 4,
+            reference: crate::parse_media_attachment(&tag(mime), Some(1), false).unwrap(),
+        };
+        let tags = tags
+            .into_iter()
+            .map(|t| t.into_iter().map(str::to_owned).collect())
+            .collect::<Vec<_>>();
+        assert_eq!(attachment_role(&attachment, &tags), expected);
     }
 }

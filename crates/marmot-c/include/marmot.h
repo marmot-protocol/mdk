@@ -195,6 +195,11 @@ typedef enum MarmotAttachmentCategory {
   MARMOT_ATTACHMENT_CATEGORY_REJECTED,
 } MarmotAttachmentCategory;
 
+typedef enum MarmotAttachmentRole {
+  MARMOT_ATTACHMENT_ROLE_SHARED,
+  MARMOT_ATTACHMENT_ROLE_INLINE_EMOJI,
+} MarmotAttachmentRole;
+
 /**
  * Stable category of a rejected encrypted-media attachment (mdk#1787).
  * Branch on this rather than on `detail`; the set only grows.
@@ -1438,6 +1443,7 @@ typedef struct MarmotAttachmentEntry {
    */
   uint64_t source_epoch;
   enum MarmotAttachmentCategory category;
+  enum MarmotAttachmentRole role;
   struct MarmotMediaAttachmentOutcome attachment;
 } MarmotAttachmentEntry;
 
