@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use convergence_campaign_runner::file_control_relay_builder;
-use nostr_relay_builder::{LocalRelay, RelayBuilder};
+use nostr_relay_builder::LocalRelay;
 
 struct RelayOptions {
     bind: SocketAddr,
@@ -40,7 +40,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let options = parse_relay_options(std::env::args().skip(1))?;
     let builder = match options.control_root {
         Some(control_root) => file_control_relay_builder(&control_root)?,
-        None => RelayBuilder::default(),
+        None => cgka_conformance_simulator::harness_relay_builder(),
     };
     let relay = LocalRelay::new(builder.addr(options.bind.ip()).port(options.bind.port()));
     relay.run().await?;

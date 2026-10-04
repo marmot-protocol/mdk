@@ -948,6 +948,7 @@ dependencies = [
  "marmot-forensics",
  "nostr 0.45.5",
  "nostr-relay-builder",
+ "nostr-sdk",
  "openmls",
  "openmls_basic_credential",
  "openmls_rust_crypto",

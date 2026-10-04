@@ -74,6 +74,10 @@ jobs:
       - name: Run nightly convergence lane
         id: convergence_lane
         continue-on-error: true
+        # Stay inside the 150-minute job budget. A job timeout cancels the job,
+        # which skips the failure report below; a step timeout is a failure
+        # outcome that the propagate step turns into a reported job failure.
+        timeout-minutes: 125
         run: |
           # SQLCipher deliberately locks sensitive allocations. Give the test
           # process enough memlock headroom so the runner does not amplify one
@@ -88,6 +92,7 @@ jobs:
       - name: Capture failed adversarial scenarios
         if: steps.convergence_lane.outcome == 'failure'
         continue-on-error: true
+        timeout-minutes: 15
         run: |
           sudo prlimit --pid "$$" --memlock=unlimited:unlimited
           cargo run -p cgka-conformance-simulator \

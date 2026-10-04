@@ -20,7 +20,9 @@ pretty-printed file bytes.
 
 This is a public workload companion to the pinned 1,024-message engine input. It preserves all original sends and
 16 profile-update rounds, with a founding recipient offline throughout. The real local Nostr relay chooses query
-order; this does **not** reproduce the engine fixture's forced reverse delivery. Initial group creation uses public
+order; this does **not** reproduce the engine fixture's forced reverse delivery. The harness relay does not apply the
+mock's per-connection write limiter (`harness_relay_builder`); with retained publisher sockets, that limiter otherwise
+refuses each member's 61st event and stalls setup. Initial group creation uses public
 app acknowledgement semantics. Private MLS assertions and simulated relay steps are not presented as app coverage.
 
 The reproduction repeats explicit full-history repairs with two seconds between passes, allowing up to three recipient
