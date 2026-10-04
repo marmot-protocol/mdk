@@ -266,6 +266,7 @@ fn page_work_is_bounded_even_with_large_hidden_history() {
     );
 }
 
+/// Rebuilds invalidate cursors even when only source emoji tags change; reopening preserves them.
 #[test]
 fn production_projection_rebuild_invalidation_expiry_and_encrypted_reopen() {
     use cgka_traits::app_event::AppMessageRetentionDecision;
@@ -285,6 +286,11 @@ fn production_projection_rebuild_invalidation_expiry_and_encrypted_reopen() {
         tags: vec![
             vec!["imeta".into(), "url https://example.com/a".into()],
             vec!["imeta".into(), "url https://example.com/b".into()],
+            vec![
+                "emoji".into(),
+                "wave".into(),
+                "https://example.com/a".into(),
+            ],
         ],
         recorded_at: 10,
         received_at: 10,
@@ -314,7 +320,23 @@ fn production_projection_rebuild_invalidation_expiry_and_encrypted_reopen() {
             .attachment_index,
         1
     );
+    // Change the retained event without touching the materialized timeline. Rebuild
+    // uses DELETE + INSERT, so the emoji UPDATE trigger cannot supply this fence.
+    assert_eq!(page(&store).entries[0].emoji_tags.len(), 1);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE app_events SET tags_json=?1 WHERE group_id_hex='aa' AND message_id_hex='message'",
+            [serde_json::to_string(&event.tags[..2]).unwrap()],
+        )
+        .unwrap();
+    assert_eq!(page(&store).version, initial.version);
+    assert_eq!(page(&store).entries[0].emoji_tags.len(), 1);
     store.rebuild_message_timeline_for_group("aa").unwrap();
+    let rebuilt = page(&store);
+    assert!(rebuilt.entries[0].emoji_tags.is_empty());
+    assert!(rebuilt.version.requires_restart_since(&initial.version));
     assert_eq!(
         store
             .attachment_history_page("aa", 100, None)
