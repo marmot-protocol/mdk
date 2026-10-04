@@ -18,6 +18,9 @@ pub(crate) struct SessionRecord {
     /// Standing instruction prepended to every prompt in this chat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) goal: Option<String>,
+    /// Resolved backend model override, retained across session/workdir resets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) model: Option<String>,
     /// Monotonic session epoch used to reject observations from work that
     /// started before a `/new` or `/cd` boundary.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -97,6 +100,8 @@ enum RawRecord {
         #[serde(default)]
         goal: Option<String>,
         #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
         generation: u64,
         #[serde(default)]
         reset_receipts: Vec<ResetReceipt>,
@@ -110,6 +115,7 @@ impl RawRecord {
                 session_id,
                 cwd: Some(default_cwd.to_path_buf()),
                 goal: None,
+                model: None,
                 generation: 0,
                 reset_receipts: Vec::new(),
             },
@@ -117,12 +123,14 @@ impl RawRecord {
                 session_id,
                 cwd,
                 goal,
+                model,
                 generation,
                 reset_receipts,
             } => SessionRecord {
                 session_id,
                 cwd,
                 goal,
+                model,
                 generation,
                 reset_receipts,
             },
@@ -212,6 +220,11 @@ impl SessionStore {
     /// Replaces the standing goal, retaining the session and working directory.
     pub(crate) async fn set_goal(&self, group_key: &str, goal: Option<String>) -> Result<()> {
         self.update(group_key, |record| record.goal = goal).await
+    }
+
+    /// Replaces only the model override, retaining the session, workdir, goal and epoch.
+    pub(crate) async fn set_model(&self, group_key: &str, model: Option<String>) -> Result<()> {
+        self.update(group_key, |record| record.model = model).await
     }
 
     pub(crate) async fn reset_session(
@@ -642,6 +655,55 @@ mod tests {
         assert_eq!(record.session_id, "ses_abc123");
         assert_eq!(record.cwd, Some(home.join("proj")));
         assert_eq!(record.goal.as_deref(), Some("ship the release"));
+    }
+
+    #[tokio::test]
+    async fn model_selection_is_private_per_group_and_survives_session_resets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state/sessions.json");
+        let home = dir.path();
+        let store = SessionStore::load(path.clone(), home).unwrap();
+        store
+            .record_session("group1", "session".to_owned(), home.join("repo"))
+            .await
+            .unwrap();
+        store
+            .set_goal("group1", Some("goal".to_owned()))
+            .await
+            .unwrap();
+        store
+            .set_model("group1", Some("venice/model".to_owned()))
+            .await
+            .unwrap();
+        let record = store.get("group1").await.unwrap();
+        assert_eq!(record.session_id, "session");
+        assert_eq!(record.cwd, Some(home.join("repo")));
+        assert_eq!(record.goal.as_deref(), Some("goal"));
+        assert_eq!(record.generation, 0);
+        assert!(store.get("group2").await.is_none());
+        store.reset_session("group1", "reset").await.unwrap();
+        store
+            .set_workdir("group1", home.join("other"))
+            .await
+            .unwrap();
+        let loaded = SessionStore::load(path.clone(), home).unwrap();
+        assert_eq!(
+            loaded.get("group1").await.unwrap().model.as_deref(),
+            Some("venice/model")
+        );
+        loaded.set_model("group1", None).await.unwrap();
+        let record = loaded.get("group1").await.unwrap();
+        assert_eq!(record.model, None);
+        assert_eq!(record.goal.as_deref(), Some("goal"));
+        assert_eq!(record.cwd, Some(home.join("other")));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[tokio::test]

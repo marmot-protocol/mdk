@@ -483,7 +483,11 @@ fn is_inspect_disposition(disposition: &PromptDisposition) -> bool {
         disposition,
         PromptDisposition::Usage(_)
             | PromptDisposition::HarnessCommand(
-                ChatCommand::Help | ChatCommand::Status | ChatCommand::Pwd | ChatCommand::GoalShow
+                ChatCommand::Help
+                    | ChatCommand::Status
+                    | ChatCommand::Pwd
+                    | ChatCommand::GoalShow
+                    | ChatCommand::ModelShow
             )
     )
 }
@@ -833,12 +837,18 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
     };
     let (tx, mut rx) = mpsc::channel(16);
     let backend = ctx.backend.clone();
+    let model = backend.model_selection().and_then(|models| {
+        known_session
+            .as_ref()
+            .and_then(|record| record.model.clone())
+            .or_else(|| models.default_model().map(str::to_owned))
+    });
     let runner = tokio::spawn(async move {
         // The staging lease lives in the backend task so its paths cannot
         // disappear while that task still has access to them.
         let _attachment_batch = attachment_batch;
         backend
-            .run_with_attachments(invocation, attachments, tx)
+            .run_with_model(invocation, attachments, model, tx)
             .await
     });
     // Dropping a JoinHandle detaches its task. Abort explicitly when this
@@ -1646,6 +1656,14 @@ async fn handle_command(ctx: &BridgeContext, inbound: &InboundPrompt, command: C
                 None => "No working directory is selected yet. Use `/cd <path>`.".to_owned(),
             },
             ChatCommand::NewSession => new_session_body(ctx, inbound).await,
+            ChatCommand::ModelShow => match ctx.backend.model_selection() {
+                Some(models) => {
+                    models.describe(record.as_ref().and_then(|record| record.model.as_deref()))
+                }
+                None => "Model selection is not supported by this backend.".to_owned(),
+            },
+            ChatCommand::ModelDefault => change_model_body(ctx, inbound, None).await,
+            ChatCommand::ModelSet { value } => change_model_body(ctx, inbound, Some(&value)).await,
             ChatCommand::Cd { path } => {
                 change_workdir_body(ctx, inbound, record.as_ref(), &path).await
             }
@@ -1713,6 +1731,40 @@ async fn new_session_body(ctx: &BridgeContext, inbound: &InboundPrompt) -> Strin
     }
 }
 
+async fn change_model_body(
+    ctx: &BridgeContext,
+    inbound: &InboundPrompt,
+    value: Option<&str>,
+) -> String {
+    let Some(models) = ctx.backend.model_selection() else {
+        return "Model selection is not supported by this backend.".to_owned();
+    };
+    let selected = match value {
+        Some(value) => match models.resolve(value) {
+            Some(model) => Some(model),
+            None => return "Unknown alias or invalid model id. Use `/model` to list configured aliases.".to_owned(),
+        },
+        None => None,
+    };
+    match ctx
+        .sessions
+        .set_model(&inbound.group_ref, selected.clone())
+        .await
+    {
+        Ok(()) => format!(
+            "Model set to {}. The existing session is retained; selection takes effect on the next prompt.",
+            selected
+                .as_deref()
+                .or(models.default_model())
+                .unwrap_or("backend default")
+        ),
+        Err(err) => {
+            warn!(target: TRACE_TARGET, method = "set_model", error_kind = err.privacy_safe_kind(), "failed to record model selection");
+            "Failed to set the model.".to_owned()
+        }
+    }
+}
+
 async fn change_workdir_body(
     ctx: &BridgeContext,
     inbound: &InboundPrompt,
@@ -1770,8 +1822,18 @@ fn status_text(ctx: &BridgeContext, record: Option<&SessionRecord>) -> String {
     let goal = record
         .and_then(|record| record.goal.as_deref())
         .unwrap_or("none");
+    let model = ctx
+        .backend
+        .model_selection()
+        .map(|models| {
+            record
+                .and_then(|record| record.model.as_deref())
+                .or(models.default_model())
+                .unwrap_or("backend default")
+        })
+        .unwrap_or("not selectable");
     format!(
-        "backend: {}\nworkdir: {workdir}\nsession: {session}\nexecution profile: {}\ngoal: {goal}",
+        "backend: {}\nworkdir: {workdir}\nsession: {session}\nmodel: {model}\nexecution profile: {}\ngoal: {goal}",
         ctx.cfg.spec.display_name,
         ctx.cfg.execution_profile.as_str()
     )
@@ -3025,6 +3087,44 @@ mod tests {
         invocations: Mutex<Vec<Invocation>>,
     }
 
+    struct ModelRecordingBackend {
+        models: crate::ModelSelection,
+        turns: Mutex<Vec<(Option<String>, Option<String>)>>,
+    }
+
+    #[async_trait]
+    impl Backend for ModelRecordingBackend {
+        fn model_selection(&self) -> Option<&crate::ModelSelection> {
+            Some(&self.models)
+        }
+
+        async fn run(
+            &self,
+            _invocation: Invocation,
+            _tx: mpsc::Sender<RunnerEvent>,
+        ) -> std::result::Result<Outcome, RunFailure> {
+            unreachable!("model-selecting bridge must use run_with_model")
+        }
+
+        async fn run_with_model(
+            &self,
+            invocation: Invocation,
+            _attachments: Vec<Attachment>,
+            model: Option<String>,
+            _tx: mpsc::Sender<RunnerEvent>,
+        ) -> std::result::Result<Outcome, RunFailure> {
+            self.turns.lock().await.push((model, invocation.session_id));
+            Ok(Outcome {
+                observed_session: Some("existing-session".to_owned()),
+                exit_code: Some(0),
+                error_summary: None,
+                no_side_effects_proven: false,
+                stderr: String::new(),
+                elapsed_ms: 1,
+            })
+        }
+    }
+
     #[derive(Debug)]
     struct AttachmentSnapshot {
         path: PathBuf,
@@ -3552,6 +3652,46 @@ mod tests {
 
         assert!(backend.invocations.lock().await.is_empty());
         assert!(ctx.sessions.get("group").await.is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn bridge_model_alias_switch_preserves_session_and_unknown_alias_leaves_state_unchanged()
+    {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let config = test_config(root.path());
+        let server = spawn_final_server(&config.socket);
+        let backend = Arc::new(ModelRecordingBackend {
+            models: crate::ModelSelection::from_config(
+                Some("venice/default-model".to_owned()),
+                Some(r#"{"deepseek":"venice/deepseek-v4-1-flash"}"#),
+            )
+            .unwrap(),
+            turns: Mutex::new(Vec::new()),
+        });
+        let ctx = test_context_with_backend(root.path(), &home, config, backend.clone());
+        ctx.sessions
+            .record_session("group", "existing-session".to_owned(), home.clone())
+            .await
+            .unwrap();
+        assert!(dispatch_test_message(ctx.clone(), "model-1", "/model deepseek").await);
+        assert!(backend.turns.lock().await.is_empty());
+        assert!(dispatch_test_message(ctx.clone(), "prompt-1", "continue").await);
+        assert!(dispatch_test_message(ctx.clone(), "model-2", "/model unknown").await);
+        assert!(dispatch_test_message(ctx.clone(), "prompt-2", "continue again").await);
+        assert!(dispatch_test_message(ctx.clone(), "model-3", "/model default").await);
+        assert!(dispatch_test_message(ctx.clone(), "prompt-3", "use default").await);
+        let turns = backend.turns.lock().await;
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0].0.as_deref(), Some("venice/deepseek-v4-1-flash"));
+        assert_eq!(turns[1].0, turns[0].0);
+        assert_eq!(turns[2].0.as_deref(), Some("venice/default-model"));
+        assert!(
+            turns
+                .iter()
+                .all(|(_, session)| session.as_deref() == Some("existing-session"))
+        );
         server.abort();
     }
 

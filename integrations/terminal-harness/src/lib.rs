@@ -6,6 +6,7 @@ mod commands;
 mod config;
 mod control;
 mod error;
+mod models;
 pub mod process;
 mod repo_picker;
 mod store;
@@ -28,6 +29,7 @@ pub use artifacts::{
 pub use bridge::run;
 pub use config::{ConfigSpec, ExecutionProfile, LoadedConfig, load_config_with};
 pub use error::{HarnessError, Result};
+pub use models::ModelSelection;
 pub use process::{ParsedEvent, PromptTransport};
 
 /// Default maximum byte length for one Marmot reply chunk.
@@ -234,6 +236,30 @@ impl fmt::Debug for RunnerEvent {
 /// Backend-specific command construction and event parsing boundary.
 #[async_trait]
 pub trait Backend: Send + Sync + 'static {
+    /// Opt-in model selection. Other backends reserve `/model` but do not implement it.
+    fn model_selection(&self) -> Option<&ModelSelection> {
+        None
+    }
+
+    /// Runs a turn with the model selected by the serialized per-group lane.
+    async fn run_with_model(
+        &self,
+        invocation: Invocation,
+        attachments: Vec<Attachment>,
+        model: Option<String>,
+        tx: mpsc::Sender<RunnerEvent>,
+    ) -> std::result::Result<Outcome, RunFailure> {
+        if model.is_some() {
+            return Err(RunFailure {
+                error: HarnessError::Config(
+                    "model selection is unsupported by this backend".to_owned(),
+                ),
+                observed_session: invocation.session_id,
+            });
+        }
+        self.run_with_attachments(invocation, attachments, tx).await
+    }
+
     /// Privacy-safe capability state emitted when the harness starts.
     fn execution_support(&self) -> ExecutionSupport {
         ExecutionSupport::INHERITED

@@ -2,7 +2,7 @@
 use std::collections::HashMap;
 use std::env;
 
-use marmot_terminal_harness::{ConfigSpec, LoadedConfig, Result, load_config_with};
+use marmot_terminal_harness::{ConfigSpec, LoadedConfig, ModelSelection, Result, load_config_with};
 
 use crate::opencode::OpencodeBackend;
 
@@ -18,7 +18,7 @@ const SPEC: ConfigSpec = ConfigSpec {
 };
 
 #[derive(Clone)]
-pub(crate) struct Config(LoadedConfig);
+pub(crate) struct Config(LoadedConfig, ModelSelection);
 
 impl Config {
     pub(crate) fn from_env() -> Result<Self> {
@@ -32,13 +32,18 @@ impl Config {
     }
 
     fn from_lookup(lookup: &mut impl FnMut(&str) -> Option<String>) -> Result<Self> {
-        load_config_with(SPEC, lookup).map(Self)
+        let models = ModelSelection::from_config(
+            lookup("WN_OPENCODE_MODEL"),
+            lookup("WN_OPENCODE_MODEL_ALIASES_JSON").as_deref(),
+        )?;
+        Ok(Self(load_config_with(SPEC, lookup)?, models))
     }
 
     pub(crate) fn into_harness(self) -> (marmot_terminal_harness::Config, OpencodeBackend) {
         let backend = OpencodeBackend {
             bin: self.0.bin,
             execution_profile: self.0.harness.execution_profile,
+            models: self.1,
         };
         (self.0.harness, backend)
     }
@@ -86,6 +91,25 @@ mod tests {
             Config::from_pairs(&[("HOME", "/home/test"), ("WN_OPENCODE_ADMIN_HEX", SENDER)])
                 .unwrap();
         assert!(config.0.harness.allowed_senders.contains(SENDER));
+    }
+
+    #[test]
+    fn config_loads_model_default_and_aliases() {
+        let mut pairs = defaults();
+        pairs.push(("WN_OPENCODE_MODEL", "venice/deepseek-v4-1-flash"));
+        pairs.push((
+            "WN_OPENCODE_MODEL_ALIASES_JSON",
+            r#"{"deepseek":"venice/deepseek-v4-1-flash"}"#,
+        ));
+        let (_, backend) = Config::from_pairs(&pairs).unwrap().into_harness();
+        assert_eq!(
+            backend.models.default_model(),
+            Some("venice/deepseek-v4-1-flash")
+        );
+        assert_eq!(
+            backend.models.resolve("deepseek").as_deref(),
+            backend.models.default_model()
+        );
     }
 
     #[test]

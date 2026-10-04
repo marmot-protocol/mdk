@@ -149,6 +149,7 @@ still land on the same epoch and group state. The engine — not relay order or 
 | | [`agent-control`](crates/agent-control/README.md) | Agent control protocol messages and framing |
 | | [`agent-stream-compose`](crates/agent-stream-compose/README.md) | Live-preview stream composition |
 | | [`integrations/`](integrations/README.md) | Per-runtime plugins and terminal harnesses |
+| | [`OpenCode model selection`](integrations/opencode/marmot/README.md#model-selection) | Per-chat `/model` selection and operator-configured aliases |
 | Verification | [`cgka-conformance-simulator`](crates/cgka-conformance-simulator/README.md) | Multi-client scenarios, vectors, chaos, property tests |
 | | [`convergence-campaign-runner`](crates/convergence-campaign-runner/README.md) | Distributed container/VM campaigns |
 | | [`incident-replay`](crates/incident-replay/README.md) | Triages forensic exports of real incidents into verdicts and simulator vectors |
