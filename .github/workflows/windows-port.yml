@@ -1,7 +1,17 @@
 name: Windows filesystem contracts
 
 on:
+  # Pull requests run only when Windows-specific code or this lane changes.
+  # Every master push still runs, so an indirect break surfaces at its merge.
+  # This check is not required; a required check must not be path-filtered,
+  # or it would stay pending on pull requests that skip it.
   pull_request:
+    paths:
+      - crates/fs-private/**
+      - crates/marmot-account/**
+      - crates/marmot-forensics/**
+      - crates/marmot-app/src/root_runtime_lease.rs
+      - .github/workflows/windows-port.yml
   push:
     branches:
       - master
@@ -28,7 +38,25 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # nextest
+        with:
+          tool: cargo-nextest@0.9.132
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      # The Windows code lives in fs-private, account file replacement and
+      # local audit delivery, and is covered by those crates' unit tests,
+      # marmot-account's home tests and marmot-forensics' audit tests.
+      # marmot-account's runtime binary is excluded: its publish, fanout and
+      # maintenance scenarios are platform-neutral, run on Linux CI, and took
+      # over 30 minutes here.
       - name: Test filesystem, account replacement, and audit delivery
-        run: cargo test --locked -p fs-private -p marmot-account -p marmot-forensics
+        run: >-
+          cargo nextest run --locked -p fs-private -p marmot-account -p marmot-forensics
+          -E 'not (package(marmot-account) & binary(runtime))'
       - name: Test runtime root ownership
-        run: cargo test --locked -p marmot-app --lib root_runtime_lease
+        run: >-
+          cargo nextest run --locked -p marmot-app --lib
+          -E 'test(root_runtime_lease)'
