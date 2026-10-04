@@ -906,7 +906,9 @@ impl SqliteAccountStorage {
     /// so the send path calls this *after* re-recording: the fresh send intent
     /// is the evidence, only the local send path can produce one, and running
     /// last keeps the tombstone standing until the revival itself commits (see
-    /// `AppClient::record_send_intent_projection`).
+    /// `AppClient::record_send_intent_projection`). Publish finalization is the
+    /// other caller: a relay accepting the row's own fanout contradicts a
+    /// retraction the send path wrote before that fanout ran.
     ///
     /// The predicate is deliberately narrow, and every conjunct earns its place:
     ///
@@ -923,10 +925,12 @@ impl SqliteAccountStorage {
     ///
     /// The reason literal is shared, by design, with the terminal-group sweep
     /// ([`Self::invalidate_pending_sent_app_events_for_group`]), so reason alone
-    /// would not be a safe predicate anywhere the send intent is absent. That is
-    /// exactly why this is a primitive the send path calls explicitly and not a
-    /// carve-out in the upsert: replay seams re-record swept rows without ever
-    /// entering the send path, and an upsert-level carve-out would revive them.
+    /// would not be a safe predicate anywhere the send intent or a publish
+    /// acceptance is absent. That is exactly why this is a primitive those
+    /// callers invoke explicitly and not a carve-out in the upsert: replay seams
+    /// re-record swept rows without either, and an upsert-level carve-out would
+    /// revive them. Publish finalization also skips terminal groups, so a late
+    /// acceptance never overturns the sweep.
     ///
     /// Returns `None` when no row matched, so a caller can tell a real revival
     /// from a no-op without a second read.

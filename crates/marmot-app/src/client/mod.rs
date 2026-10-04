@@ -4441,8 +4441,8 @@ impl AppClient {
     ///
     /// Split out of `send_app_event_with_local_projection` so the ordering is
     /// exercisable against a given batch of effects. An aggregate effects batch
-    /// can contain an accepted or retained current send plus an unrelated
-    /// sibling failure; that sibling must not retract an already-delivered row.
+    /// can contain an accepted, unresolved, or durably queued current send plus
+    /// an unrelated sibling failure; that sibling must not retract the row.
     /// The caller keeps the local-projection retraction, which needs the send's
     /// own locals.
     pub(crate) async fn observe_recovery_evidence_then_gate_send_publish(
@@ -4468,12 +4468,26 @@ impl AppClient {
                 );
             }
         }
+        // Every attempted application fanout lands in exactly one of the
+        // published, unresolved, or failed lists. A send in none of them was
+        // never fanned out: unsettled convergence or an in-flight publication
+        // made the engine queue it durably, and the queued-outbound drain
+        // publishes it later. An unrelated failure in the same batch is not
+        // evidence about that intent, so it must not retract the row.
+        let current_send_failed = effects
+            .failed_app_messages
+            .iter()
+            .any(|failed| failed.group_id == *group_id && failed.app_event_id == app_event_id);
         let current_send_is_retained =
             effects.published_app_messages.iter().any(|published| {
                 published.group_id == *group_id && published.app_event_id == app_event_id
             }) || effects.unresolved_app_messages.iter().any(|unresolved| {
                 unresolved.group_id == *group_id && unresolved.app_event_id == app_event_id
-            });
+            }) || (!current_send_failed
+                && effects
+                    .queued
+                    .iter()
+                    .any(|queued| queued.group_id == *group_id));
         if current_send_is_retained {
             return Ok(());
         }
