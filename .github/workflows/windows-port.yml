@@ -1,8 +1,10 @@
 name: Windows filesystem contracts
 
 on:
-  # Pull requests run only when Windows-specific code or this lane changes.
-  # Every master push still runs, so an indirect break surfaces at its merge.
+  # Pull requests run only when Windows-specific code, a shared build input
+  # (toolchain, dependency versions, Cargo or nextest config) or this lane
+  # changes. Platform-neutral workspace dependencies are not listed; every
+  # master push still runs, so an indirect break surfaces at its merge.
   # This check is not required; a required check must not be path-filtered,
   # or it would stay pending on pull requests that skip it.
   pull_request:
@@ -11,6 +13,11 @@ on:
       - crates/marmot-account/**
       - crates/marmot-forensics/**
       - crates/marmot-app/src/root_runtime_lease.rs
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .cargo/config.toml
+      - .config/nextest.toml
       - .github/workflows/windows-port.yml
   push:
     branches:
