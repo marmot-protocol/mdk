@@ -8068,7 +8068,7 @@ async fn incomplete_discovery_is_not_cleared_by_an_empty_cached_outbox() {
         .expect_err("an empty outbox cannot prove absence after discovery failed");
 
     assert!(
-        matches!(error, AppError::RelayDirectory(_)),
+        matches!(error, AppError::RelayDirectory(ref message) if message.contains("not authoritatively established")),
         "unknown discovery must remain retryable instead of becoming a missing-route verdict: {error:?}"
     );
     assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
@@ -8077,6 +8077,30 @@ async fn incomplete_discovery_is_not_cleared_by_an_empty_cached_outbox() {
             .iter()
             .any(|endpoint| endpoint.0 == outbox)
     }));
+}
+
+#[tokio::test]
+/// A found inbox list naming only retired relays is reported as such, even
+/// when an unreachable outbox leaves the metadata hop incomplete.
+async fn member_inbox_of_only_retired_relays_is_reported_distinctly() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let account_id = accounts[0].account_id_hex.clone();
+    for event in fetcher.events.lock().unwrap().iter_mut() {
+        if event.kind == KIND_MARMOT_INBOX_RELAY_LIST {
+            event.tags = vec![vec!["relay".into(), "wss://relay.nostr.band".into()]];
+        }
+    }
+    *fetcher.incomplete_endpoint.lock().unwrap() = Some("wss://shared.example".into());
+
+    let error = app
+        .resolve_member_key_packages(&[account_id.as_str()])
+        .await
+        .expect_err("a member with no usable inbox cannot be invited");
+
+    assert!(
+        matches!(error, AppError::RelayDirectory(ref message) if message.contains("only retired or unsafe relays")),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]

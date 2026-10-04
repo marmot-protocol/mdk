@@ -2,7 +2,19 @@
 
 ## Unreleased
 
+### Changed
+
+- `relay.damus.io` is no longer on the retired-relay denylist; the relay is
+  still operating. `retired_relay_hosts()` now returns only
+  `relay.nostr.band`. Members whose kind-10050 inbox list names only
+  `relay.damus.io` can be invited again.
+
 ### Fixed
+
+- Inviting a member whose inbox relay list names only retired or unsafe relays
+  now fails with "member inbox relay list names only retired or unsafe
+  relays" instead of "relay-list absence was not authoritatively
+  established". Retrying never helped; the member has to republish the list.
 
 - A sent message the engine queued while the group was converging is no longer
   marked failed when an unrelated publish in the same batch fails, and a sent

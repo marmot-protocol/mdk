@@ -657,13 +657,10 @@ async fn relay_list_binding_methods_are_public() {
             .is_err()
     );
 
-    assert_eq!(
-        kit.retired_relay_hosts(),
-        vec!["relay.damus.io", "relay.nostr.band"]
-    );
+    assert_eq!(kit.retired_relay_hosts(), vec!["relay.nostr.band"]);
     let classifications = kit.classify_relay_endpoints(vec![
         "wss://relay.example".into(),
-        "wss://relay.damus.io".into(),
+        "wss://relay.nostr.band".into(),
         "not a relay".into(),
         "ws://relay.example".into(),
     ]);

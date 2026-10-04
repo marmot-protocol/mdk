@@ -614,8 +614,7 @@ fn default_directory_discovery_relays_use_live_indexers() {
     assert!(
         relays
             .iter()
-            .all(|relay| !["wss://relay.nostr.band", "wss://relay.damus.io",]
-                .contains(&relay.0.as_str())),
+            .all(|relay| relay.0 != "wss://relay.nostr.band"),
         "retired relays must never return to discovery defaults"
     );
 }
