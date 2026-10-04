@@ -785,19 +785,30 @@ impl AppClient {
     /// A terminal group keeps its sweep's verdict: the terminal-group sweep
     /// writes the same reason, and nothing about a late acceptance reopens a
     /// disbanded or removed copy. Convergence withdrawals carry other reasons
-    /// and the storage predicate never clears them. A group record that cannot
-    /// be read proves neither, so it keeps the tombstone rather than blocking
-    /// the finalize that acknowledges the fanout.
+    /// and the storage predicate never clears them.
+    ///
+    /// The group is read only when a tombstone is there to clear, and a read
+    /// error propagates: a seeded, quarantined or busy copy decides nothing,
+    /// and the caller's projection-error path keeps the accepted fanout for a
+    /// replay that revives the row without publishing again. Acknowledging it
+    /// instead would delete the only evidence the revival needs.
     fn revive_published_local_send(
         &self,
         published: &marmot_account::PublishedApplicationMessage,
         group_id_hex: &str,
     ) -> Result<Option<crate::AppProjectionUpdate>, AppError> {
-        let live = self
+        if !self
+            .app
+            .account_storage(&self.state.label)?
+            .local_publish_failure_is_clearable(group_id_hex, &published.app_event_id)?
+        {
+            return Ok(None);
+        }
+        if self
             .runtime
-            .group_record(&published.group_id)
-            .is_ok_and(|group| !group.is_terminal());
-        if !live {
+            .group_record(&published.group_id)?
+            .is_terminal()
+        {
             return Ok(None);
         }
         self.app.clear_timeline_local_publish_failure(

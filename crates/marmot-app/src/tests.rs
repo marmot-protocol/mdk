@@ -18872,7 +18872,8 @@ async fn a_relay_accepted_send_revives_its_local_publish_failure() {
                 authority: None,
                 group_id: group_id.clone(),
                 app_event_id: app_event_id.to_owned(),
-                message_id: cgka_traits::MessageId::new(vec![0xcd; 32]),
+                // Source ids are unique per account; reuse the event id bytes.
+                message_id: cgka_traits::MessageId::new(hex::decode(app_event_id).unwrap()),
                 source_epoch: cgka_traits::EpochId(1),
                 retention: AppMessageRetentionDecision::new(created_at, 0),
             }],
@@ -18913,7 +18914,7 @@ async fn a_relay_accepted_send_revives_its_local_publish_failure() {
     );
     assert_eq!(
         row.source_message_id_hex,
-        Some(hex::encode([0xcd; 32])),
+        Some(live_event.clone()),
         "the revival keeps the finalized source"
     );
     assert!(row.poll.is_some(), "the revived poll projects again");
@@ -18933,6 +18934,48 @@ async fn a_relay_accepted_send_revives_its_local_publish_failure() {
         row.invalidation_status.as_deref(),
         Some(crate::LOCAL_PUBLISH_FAILED_REASON),
         "a terminal group keeps the sweep's verdict"
+    );
+
+    // A group record that cannot be read yet decides nothing: the fanout must
+    // stay for a replay instead of being acknowledged with the row still failed.
+    let unreadable = cgka_traits::GroupId::new(vec![0x5a; 16]);
+    let unreadable_event = "33".repeat(32);
+    let unreadable_hex = hex::encode(unreadable.as_slice());
+    retracted(&unreadable_event, &unreadable);
+    let accepted = published(&unreadable_event, &unreadable);
+    client
+        .finalize_published_app_message_source_retention(&accepted)
+        .unwrap();
+    let row = app
+        .timeline_message("alice", &unreadable_hex, &unreadable_event)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.invalidation_status.as_deref(),
+        Some(crate::LOCAL_PUBLISH_FAILED_REASON),
+        "an unreadable group cannot revive the row yet"
+    );
+    assert!(
+        client.pending_convergence_groups.contains(&unreadable),
+        "the accepted fanout is kept and its group scheduled for a replay"
+    );
+    {
+        use cgka_traits::storage::GroupStorage;
+        let storage = client.app.account_storage(&client.state.label).unwrap();
+        let mut record = storage.get_group(&live).unwrap();
+        record.id = unreadable.clone();
+        storage.put_group(&record).unwrap();
+    }
+    client
+        .finalize_published_app_message_source_retention(&accepted)
+        .unwrap();
+    let row = app
+        .timeline_message("alice", &unreadable_hex, &unreadable_event)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.invalidation_status, None,
+        "the replay revives the row once the group is readable"
     );
 }
 

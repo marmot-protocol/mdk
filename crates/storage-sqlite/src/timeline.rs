@@ -894,6 +894,18 @@ impl SqliteAccountStorage {
         )
     }
 
+    /// Whether [`Self::clear_local_publish_failure`] would revive this row: a
+    /// primary-key probe on the same predicate, for callers that must check a
+    /// precondition of their own before clearing.
+    pub fn local_publish_failure_is_clearable(
+        &self,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> StorageResult<bool> {
+        let conn = self.lock()?;
+        local_publish_failure_is_clearable_tx(&conn, group_id_hex, message_id_hex)
+    }
+
     /// Clear the `local_publish_failed` retraction on one locally-sent row.
     ///
     /// This is the **only** revival path for an invalidated app event, and it
@@ -941,19 +953,7 @@ impl SqliteAccountStorage {
     ) -> StorageResult<Option<TimelineProjectionUpdate>> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            if conn
-                .query_row_cached(
-                    &format!(
-                        "SELECT 1 FROM app_events
-                         WHERE {CLEARABLE_LOCAL_PUBLISH_FAILURE_PREDICATE}"
-                    ),
-                    params![group_id_hex, message_id_hex, LOCAL_PUBLISH_FAILED_REASON],
-                    |_| Ok(()),
-                )
-                .optional()
-                .storage()?
-                .is_none()
-            {
+            if !local_publish_failure_is_clearable_tx(&conn, group_id_hex, message_id_hex)? {
                 return Ok(None);
             }
             let Some((kind, tags)) =
@@ -2100,6 +2100,25 @@ pub(crate) fn upsert_message_timeline_projection_for_message_tx(
         upsert_agent_stream_start_tx(tx, &stream_start)?;
     }
     Ok(())
+}
+
+fn local_publish_failure_is_clearable_tx(
+    conn: &Connection,
+    group_id_hex: &str,
+    message_id_hex: &str,
+) -> StorageResult<bool> {
+    Ok(conn
+        .query_row_cached(
+            &format!(
+                "SELECT 1 FROM app_events
+                 WHERE {CLEARABLE_LOCAL_PUBLISH_FAILURE_PREDICATE}"
+            ),
+            params![group_id_hex, message_id_hex, LOCAL_PUBLISH_FAILED_REASON],
+            |_| Ok(()),
+        )
+        .optional()
+        .storage()?
+        .is_some())
 }
 
 fn raw_app_event_tx(
