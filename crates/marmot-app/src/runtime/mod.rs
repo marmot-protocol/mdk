@@ -81,6 +81,7 @@ pub use account_attention::{
 };
 mod chat_list_window;
 mod conversation_window;
+mod public_event_preview;
 mod worker_startup;
 pub(crate) use conversation_window::SendCapture;
 pub use conversation_window::{

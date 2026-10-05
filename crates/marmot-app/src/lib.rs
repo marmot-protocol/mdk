@@ -241,6 +241,8 @@ pub use media::{
 pub use messages::{is_reserved_app_event_kind, is_stream_final_event, tag_value, tag_values};
 pub use nostr_secret::is_nostr_secret;
 pub use nostr_verification::verify_public_nostr_event_json;
+
+mod public_event_preview;
 pub use notifications::{
     BackgroundNotificationCollection, ChatNotificationSettings, GroupPushDebugInfo,
     GroupPushTokenDebugEntry, GroupPushTokenRecord, KIND_MARMOT_NOTIFICATION_RUMOR,
@@ -254,6 +256,11 @@ pub use notifications::{
     parse_provider_token, push_token_fingerprint,
 };
 pub use profile_pseudonyms::{default_profile_pseudonym, random_profile_pseudonym};
+pub use public_event_preview::{
+    MAX_PUBLIC_EVENT_REFERENCE_BYTES, MAX_PUBLIC_EVENT_REFERENCES, PUBLIC_EVENT_PROJECTION_VERSION,
+    PublicEventCacheKey, PublicEventCacheRead, PublicEventCacheResult, PublicEventDeletion,
+    PublicEventPreview, PublicEventReference,
+};
 pub use relay_plane::{
     EngineReorgMetrics, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
     RelayEndpointClassification, RelayEndpointPolicy, RelayPlaneHealth, RelayRollupEntry,
@@ -489,6 +496,7 @@ pub struct MarmotApp {
     account_storages: Arc<Mutex<HashMap<String, SqliteAccountStorage>>>,
     account_session_owners: Arc<Mutex<HashSet<String>>>,
     directory_caches: Arc<Mutex<HashMap<String, DirectoryCache>>>,
+    public_event_caches: Arc<Mutex<HashMap<String, public_event_preview::PublicEventCache>>>,
     /// Bounded, process-local composition prewarm. Entries are never durable
     /// directory admission and never reserve or consume a KeyPackage.
     member_key_package_prewarm_cache: Arc<Mutex<directory::MemberKeyPackagePrewarmCache>>,
@@ -1509,6 +1517,7 @@ impl MarmotApp {
             account_storages: Arc::new(Mutex::new(HashMap::new())),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
+            public_event_caches: Arc::new(Mutex::new(HashMap::new())),
             member_key_package_prewarm_cache: Arc::new(Mutex::new(
                 directory::MemberKeyPackagePrewarmCache::default(),
             )),
@@ -1598,6 +1607,7 @@ impl MarmotApp {
             account_storages: Arc::new(Mutex::new(HashMap::new())),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
+            public_event_caches: Arc::new(Mutex::new(HashMap::new())),
             member_key_package_prewarm_cache: Arc::new(Mutex::new(
                 directory::MemberKeyPackagePrewarmCache::default(),
             )),
@@ -5935,6 +5945,13 @@ impl MarmotApp {
             .drain()
             .map(|(_, cache)| cache)
             .collect::<Vec<_>>();
+        let public_event_caches = self
+            .public_event_caches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+            .map(|(_, cache)| cache)
+            .collect::<Vec<_>>();
         let shared_storage = self
             .shared_storage
             .lock()
@@ -5948,6 +5965,12 @@ impl MarmotApp {
             }
         }
         for cache in directory_caches {
+            closed += 1;
+            if let Err(error) = cache.close() {
+                first_error.get_or_insert(error);
+            }
+        }
+        for cache in public_event_caches {
             closed += 1;
             if let Err(error) = cache.close() {
                 first_error.get_or_insert(error);
@@ -6706,6 +6729,14 @@ impl MarmotApp {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(label);
+        if let Some(cache) = self
+            .public_event_caches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(label)
+        {
+            let _ = cache.close();
+        }
         self.account_state_ready
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

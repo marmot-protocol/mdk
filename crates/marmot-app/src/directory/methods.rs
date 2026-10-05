@@ -1517,6 +1517,94 @@ impl MarmotApp {
         self.save_directory_entry(&entry)
     }
 
+    /// Account-scoped kind-0 evidence for a referenced public event's author.
+    ///
+    /// Reuses the directory profile parser, sanitizer, future-skew freshness and
+    /// newer-only timestamp rule, but writes only `account`'s un-promoted
+    /// search-graph tier: a referenced author is not a relationship, never
+    /// reaches `directory_sync_plan`, and is mirrored neither to shared storage
+    /// nor to other accounts. `events` must already be signature-verified.
+    /// Equal or older metadata keeps the cached profile.
+    pub(crate) fn remember_account_profile_events(
+        &self,
+        account: &AccountSummary,
+        author_hex: &str,
+        events: &[nostr::event::Event],
+    ) -> Result<bool, AppError> {
+        let freshness = self.directory_freshness();
+        let records = events
+            .iter()
+            .filter(|event| {
+                u64::from(event.kind.as_u16()) == KIND_NOSTR_METADATA
+                    && event.pubkey.to_hex() == author_hex
+            })
+            .filter_map(|event| NostrTransportEvent::from_nostr_event(event).ok())
+            .map(|event| RelayEventRecord {
+                endpoints: Vec::new(),
+                event,
+            })
+            .collect::<Vec<_>>();
+        let Some(profile) = latest_fresh_profiles_from_records(records, freshness)
+            .value
+            .remove(author_hex)
+        else {
+            return Ok(false);
+        };
+        let cache = self.directory_cache_for_account(account)?;
+        let now = crate::unix_now_seconds() as i64;
+        let promoted = cache.entry(author_hex)?.and_then(|entry| entry.profile);
+        let unpromoted = cache
+            .search_graph_record(author_hex, now)?
+            .and_then(|record| record.profile);
+        if promoted
+            .iter()
+            .chain(unpromoted.iter())
+            .any(|cached| cached.created_at >= profile.created_at)
+        {
+            return Ok(false);
+        }
+        cache.put_search_graph_record(
+            &crate::directory::cache::DirectorySearchGraphRecord {
+                account_id_hex: author_hex.to_owned(),
+                npub: npub_for_account_id_lossy(author_hex),
+                metadata_updated_at: Some(profile.created_at),
+                profile: Some(profile),
+                follows: None,
+                metadata_expires_at: None,
+            },
+            now,
+        )?;
+        Ok(true)
+    }
+
+    /// Newest cached kind-0 per author from `account`'s directory cache, across
+    /// the promoted and un-promoted tiers. Network-free.
+    pub(crate) fn account_scoped_profiles(
+        &self,
+        account: &AccountSummary,
+        authors: &[String],
+    ) -> Result<HashMap<String, UserProfileMetadata>, AppError> {
+        let cache = self.directory_cache_for_account(account)?;
+        let now = crate::unix_now_seconds() as i64;
+        let mut profiles: HashMap<String, UserProfileMetadata> = cache
+            .profiles_for_ids(authors)?
+            .into_iter()
+            .filter_map(|(id, profile)| profile.map(|profile| (id, profile)))
+            .collect();
+        for author in authors {
+            if let Some(candidate) = cache
+                .search_graph_record(author, now)?
+                .and_then(|record| record.profile)
+                && profiles
+                    .get(author)
+                    .is_none_or(|cached| cached.created_at < candidate.created_at)
+            {
+                profiles.insert(author.clone(), candidate);
+            }
+        }
+        Ok(profiles)
+    }
+
     pub(crate) fn remember_directory_profile_if_newer(
         &self,
         account_id_hex: &str,

@@ -69,6 +69,12 @@ impl RelaySafetyPolicy {
         }
     }
 
+    /// Whether the explicit loopback dev opt-in is set. Pinning transports use
+    /// it to admit a literal loopback host over loopback addresses only.
+    pub(crate) fn allows_loopback(&self) -> bool {
+        self.allow_loopback
+    }
+
     pub(crate) fn classify_endpoints(
         &self,
         endpoints: Vec<String>,

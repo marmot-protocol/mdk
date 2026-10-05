@@ -22,6 +22,9 @@ media-benchmarks = []
 
 [dependencies]
 async-trait.workspace = true
+# Message type of the pinned nostr-sdk WebSocket transport trait; must stay the
+# same 0.17 line the SDK uses.
+async-wsocket = { version = "0.17.0", default-features = false }
 base64.workspace = true
 chrono.workspace = true
 cgka-engine.workspace = true
@@ -35,6 +38,7 @@ futures.workspace = true
 hex.workspace = true
 httpdate.workspace = true
 hkdf.workspace = true
+hmac.workspace = true
 image.workspace = true
 jsonschema.workspace = true
 marmot-account.workspace = true
@@ -43,6 +47,10 @@ marmot-markdown.workspace = true
 nostr = { workspace = true, features = ["nip04"] }
 nostr-sdk.workspace = true
 opentelemetry-proto = { workspace = true, optional = true }
+# Request-owned, DNS-pinned WebSocket dials for public-event previews. Same
+# tokio-tungstenite release async-wsocket 0.17 links, so frames convert with
+# its `Message` impls; aliased to stay apart from the 0.26 dev-dependency.
+pinned-tokio-tungstenite = { package = "tokio-tungstenite", version = "0.28.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 prost = { workspace = true, optional = true }
 psl.workspace = true
 rand.workspace = true

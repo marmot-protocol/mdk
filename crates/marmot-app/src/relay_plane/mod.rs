@@ -41,6 +41,8 @@ use crate::directory::DirectorySyncPlan;
 
 mod delivery_spill;
 mod directory;
+mod public_event_query;
+mod public_event_transport;
 #[cfg(test)]
 pub(crate) mod publish_accounting_tests;
 mod safety;
@@ -57,6 +59,10 @@ pub(crate) use directory::{
     DirectoryRelayEventRecord, DirectoryRelayFetcher, DirectoryRelayPlane, DirectoryRelayStats,
     DirectorySubscriptionFilter, DirectorySubscriptionSyncSummary, NostrSdkDirectoryRelayFetcher,
 };
+pub(crate) use public_event_query::{
+    PUBLIC_EVENT_QUERY_MAX_RELAYS, PublicEventQueryBudget, PublicEventQueryFilter,
+};
+pub(crate) use public_event_transport::{PublicEventTrafficLimits, PublicEventTrafficMeter};
 pub(crate) use safety::{RelaySafetyPolicy, recovery_required_endpoints, same_relay};
 pub(crate) use telemetry::rollup_from_snapshots;
 

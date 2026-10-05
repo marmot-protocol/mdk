@@ -65,13 +65,25 @@ The runtime owns these local SQLite stores:
   confirmation state, seen relay events, and sent/received message projections. It has a numbered migration history.
   The older `accounts/<label>/app.sqlite3` legacy projection database is imported once (tracked by the
   `legacy-account-projection-v1` marker) and then superseded.
+- **Per-account public event preview cache** (`accounts/<label>/public-events-v1.sqlite3`, SQLCipher, schema 4):
+  bounded, signature-verified public event selections plus authenticated NIP-09 deletion evidence for offline
+  rehydration. Reference matching, monotonic coordinate replacement and deletion fences are native; retained deletion
+  provenance is bound by per-row HMACs, and the set of retained evidence by an authenticated inventory verified before
+  any index lookup is trusted, both keyed (via HKDF, in memory only) from the cache's SQLCipher key. Byte accounting
+  recomputes every retained field from stored lengths. Cached reads perform no network I/O; the bounded refresh dials
+  through a request-owned transport that validates and pins every resolved relay address, charges raw received wire
+  bytes below TLS/WebSocket parsing to one request budget, and force-closes its sockets at the request deadline.
+  Schema 1 migrates in place in one transaction; the unreleased schemas 2 and 3 and any unknown schema fail closed and
+  are never recreated. Resolved author metadata goes only to the
+  same account's un-promoted directory search-graph tier. It uses a separate key domain, closes with app storage and
+  is removed with the account. See [the host integration contract](../marmot-uniffi/README.md#verified-public-event-previews).
 - **Per-account directory cache** (`accounts/<label>/app-cache.sqlite3`, SQLCipher): the Nostr user directory —
   local-account links, profile metadata, follow-list caches, bounded search-graph edges, discovered user relay lists,
   and KeyPackages. A root-level `app-cache.sqlite3` is a legacy location that is migrated and then removed.
 - **Installation-wide `shared.sqlite3`** (owner-only, unencrypted): a provenance-stripped public-directory mirror,
   relay-telemetry and audit-log preferences, and the telemetry installation id.
 
-For `N` active signing accounts whose stores have been opened, this is up to `2N + 1` current SQLite files.
+For `N` active signing accounts whose stores have been opened, this is up to `3N + 1` current SQLite files.
 
 The two directory tiers are reconcilable caches, but normal upgrades should preserve them, and `shared.sqlite3` also
 holds durable installation settings that are not disposable. The per-account cache has its own numbered

@@ -600,3 +600,8 @@ mod tests {
         );
     }
 }
+
+pub use commands::{
+    PublicEventCacheKeyFfi, PublicEventCacheKeyTypeFfi, PublicEventCacheReadFfi,
+    PublicEventCacheStateFfi, PublicEventDeletionFfi, PublicEventPreviewFfi,
+};

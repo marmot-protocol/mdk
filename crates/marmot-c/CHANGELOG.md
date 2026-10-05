@@ -7,6 +7,17 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Added
+
+- `marmot_cached_public_event_previews` (synchronous, local), `marmot_cache_public_event_preview` (local admission)
+  and `marmot_resolve_public_event_preview` (bounded relay refresh) return `MarmotPublicEventCacheRead` rows: a
+  canonical `MarmotPublicEventCacheKey`, a `MarmotPublicEventCacheState` (`Present`, `AuthoritativeDeleted`,
+  `Missing`, `Busy`) and the matching optional `MarmotPublicEventPreview` or `MarmotPublicEventDeletion`, both carrying
+  `projection_version`. Release a list with `marmot_public_event_cache_read_list_free` and a single row with
+  `marmot_public_event_cache_read_free`; embedded records have no separate free. These additive exports require the
+  matching generated header and library; existing record layouts are unchanged.
+
+
 ## [0.12.0] - 2026-10-02
 
 Recompile against the matching `marmot.h` and library: several signatures and

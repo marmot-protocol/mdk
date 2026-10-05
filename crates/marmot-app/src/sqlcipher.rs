@@ -43,8 +43,8 @@ const SQLCIPHER_MIGRATION_MARKER_SUFFIX: &str = ".salt-migrating";
 const SQLCIPHER_SALT_LEN: usize = 32;
 const SQLCIPHER_KEY_LEN: usize = 32;
 
-/// Bound on the in-process v2-open verdict cache. Three databases per account
-/// (session, account projection, directory cache), so this covers ~85 accounts
+/// Bound on the in-process v2-open verdict cache. Four databases per account
+/// (session, account projection, directory cache, public event previews), so this covers ~64 accounts
 /// per process; overflow evicts oldest-first and an evicted entry simply pays
 /// one recovery probe on its next open. Tracked per the long-lived-state
 /// discipline in `docs/marmot-architecture/runtime-state-bounds.md`.
@@ -185,6 +185,7 @@ pub(crate) enum SqlcipherDatabaseKind {
     Session,
     AccountProjection,
     DirectoryCache,
+    PublicEventCache,
 }
 
 impl SqlcipherDatabaseKind {
@@ -193,6 +194,7 @@ impl SqlcipherDatabaseKind {
             Self::Session => b"marmot-app/session-sqlcipher-key/v2",
             Self::AccountProjection => b"marmot-app/account-projection-sqlcipher-key/v2",
             Self::DirectoryCache => b"marmot-app/directory-cache-sqlcipher-key/v2",
+            Self::PublicEventCache => b"marmot-app/public-event-cache-sqlcipher-key/v1",
         }
     }
 
@@ -200,6 +202,7 @@ impl SqlcipherDatabaseKind {
         match self {
             Self::Session | Self::AccountProjection => b"marmot-app-sqlcipher-key-v1",
             Self::DirectoryCache => b"marmot-app-directory-cache-sqlcipher-key-v1",
+            Self::PublicEventCache => b"marmot-app-public-event-cache-sqlcipher-key-v1",
         }
     }
 }
