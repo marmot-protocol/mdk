@@ -1,19 +1,18 @@
 # Changelog - marmot-c
 
-## Unreleased
-
-- Add `marmot_message_reactions` and the owned
-  `MarmotTimelineUserReactionList` root/free for complete exact-message details.
-  Existing record layouts are unchanged; the new symbols require matching
-  generated headers and native libraries.
-
-
 All notable changes to the Marmot C bindings.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
+
+### Added
+
+- Add `marmot_message_reactions` and the owned
+  `MarmotTimelineUserReactionList` root/free for complete exact-message details.
+  Existing record layouts are unchanged; the new symbols require matching
+  generated headers and native libraries.
 
 ## [0.12.0] - 2026-10-02
 

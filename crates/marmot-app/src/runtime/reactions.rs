@@ -26,6 +26,8 @@ impl MarmotAppRuntime {
         else {
             return Ok(Vec::new());
         };
+        // Projection already clears deleted-message reactions; keep this explicit
+        // guard so the details API preserves that policy if projection changes.
         if message.deleted || message.invalidation_status.is_some() {
             return Ok(Vec::new());
         }

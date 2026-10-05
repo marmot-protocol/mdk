@@ -1009,14 +1009,14 @@ async fn timeline_binding_methods_are_public_and_validate_inputs() {
     )
     .expect("open marmot kit");
 
-    assert!(
-        kit.message_reactions("missing".into(), "00aa".into(), "01".repeat(32))
-            .is_err()
-    );
-    assert!(
-        kit.message_reactions("missing".into(), String::new(), "01".repeat(32))
-            .is_err()
-    );
+    let missing_reaction_account = kit
+        .message_reactions("missing".into(), "00aa".into(), "01".repeat(32))
+        .expect_err("valid opaque MLS group should reach account lookup");
+    assert!(format!("{missing_reaction_account}").contains("missing"));
+    let invalid_reaction_group = kit
+        .message_reactions("missing".into(), String::new(), "01".repeat(32))
+        .expect_err("empty group should fail before account lookup");
+    assert!(format!("{invalid_reaction_group}").contains("invalid hex"));
 
     let missing_account = kit
         .timeline_messages(

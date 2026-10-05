@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- `Marmot::message_reactions` returns complete local reaction details for one exact
+  account/group/message, with one effective entry per sender/emoji and no
+  conversation-preview cap. Missing, hidden, deleted, invalidated and
+  retention-pruned targets return no participants; blocked reactors are excluded.
+  The read performs no network work or conversation-history scan.
+  Regenerate matching Swift/Kotlin bindings to call `messageReactions`.
+
 ### Changed
 
 - `retired_relay_hosts()` no longer includes `relay.damus.io`, and

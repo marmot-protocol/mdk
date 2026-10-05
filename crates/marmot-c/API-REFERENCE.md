@@ -5110,8 +5110,3 @@ Configure or disable the dedicated v5 OTLP sender in memory. To enable, supply a
 [Header contract](include/marmot.h#L8290)
 
 </details>
-
-<details>
-<summary>New exports — complete and organize before merging</summary>
-
-</details>
