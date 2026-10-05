@@ -173,7 +173,15 @@ hermes plugins enable marmot
 Hermes clones the detached exact-commit checkout and copies only this plugin
 subdirectory into `~/.hermes/plugins/marmot`; it does not install an MDK
 workspace. Removing `MDK_PLUGIN_CHECKOUT` after installation does not remove the
-installed plugin. Hermes versions that expose `plugins install --ref` may use it
+installed plugin. Newer Hermes versions may require a separate security-scan
+confirmation for source plugins. Review that report for the exact checked-out
+revision; an unattended process cannot assume the confirmation was granted.
+If admission is blocked, report the findings and obtain the runtime's required
+operator confirmation instead of disabling scanning or forcing installation.
+Plugin source approval is also separate from permission to override built-in
+tools; do not grant the latter just to make setup finish.
+
+Hermes versions that expose `plugins install --ref` may use it
 as a shorter equivalent. The release installer below consumes an archive built
 from these same files. A community-index entry should pin an immutable commit
 or release tag; until such an entry is published, use the exact-checkout source
