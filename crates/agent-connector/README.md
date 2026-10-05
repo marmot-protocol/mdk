@@ -11,11 +11,13 @@ Supported integrations, all speaking the same [`agent-control`](../agent-control
 
 - Hermes (first supported adapter) at [`integrations/hermes/marmot`](../../integrations/hermes/marmot);
 - OpenClaw, a TypeScript channel plugin at [`integrations/openclaw/marmot`](../../integrations/openclaw/marmot);
-- `wn-claude`, `wn-codex`, `wn-opencode`, and `wn-pi`, pure Rust harnesses for Claude Code, Codex, OpenCode, and Pi at
+- `wn-claude`, `wn-codex`, `wn-opencode`, `wn-pi`, and `wn-goose`, pure Rust harnesses for Claude Code, Codex,
+  OpenCode, Pi, and Goose at
   [`integrations/claude/marmot`](../../integrations/claude/marmot),
   [`integrations/codex/marmot`](../../integrations/codex/marmot),
-  [`integrations/opencode/marmot`](../../integrations/opencode/marmot), and
-  [`integrations/pi/marmot`](../../integrations/pi/marmot). All four use the shared hardened runtime in
+  [`integrations/opencode/marmot`](../../integrations/opencode/marmot),
+  [`integrations/pi/marmot`](../../integrations/pi/marmot), and
+  [`integrations/goose/marmot`](../../integrations/goose/marmot). All five use the shared hardened runtime in
   [`integrations/terminal-harness`](../../integrations/terminal-harness).
 
 ## Contents
@@ -219,5 +221,5 @@ The agent root has its own permission, independent from White Noise. See the
 
 The canonical [White Noise + Agents quickstart](../../integrations/README.md#get-started-white-noise--agents) owns the
 current release URLs, runtime chooser, phone onboarding, and repeatable agent/CI example for Hermes, OpenClaw,
-Claude Code, Codex, OpenCode, and Pi. Connector-specific configuration, manual setup, security notes, and development
+Claude Code, Codex, OpenCode, Pi, and Goose. Connector-specific configuration, manual setup, security notes, and development
 workflows live in each integration README under [`integrations/`](../../integrations/README.md).

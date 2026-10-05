@@ -31,7 +31,7 @@ Nested `AGENTS.md` files add rules for their subtree. Read the nearest one befor
 | Hermes gateway plugin | `integrations/hermes/marmot/AGENTS.md` (tests: `integrations/hermes/tests/marmot/AGENTS.md`) |
 | OpenClaw channel plugin | `integrations/openclaw/marmot/AGENTS.md` |
 | Shared terminal-harness runtime | `integrations/terminal-harness/AGENTS.md` |
-| Claude Code / Codex / OpenCode / Pi harnesses | `integrations/{claude,codex,opencode,pi}/marmot/AGENTS.md` |
+| Claude Code / Codex / OpenCode / Pi / Goose harnesses | `integrations/{claude,codex,opencode,pi,goose}/marmot/AGENTS.md` |
 | Forensic audit schema | `crates/marmot-forensics/AGENTS.md` |
 | App runtime UniFFI bindings | `crates/marmot-uniffi/AGENTS.md` |
 | App runtime C ABI bindings | `crates/marmot-c/AGENTS.md` |

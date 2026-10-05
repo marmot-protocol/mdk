@@ -25,6 +25,8 @@ on:
       - scripts/install-terminal-harness-marmot.sh
       - scripts/package-binary-bundle.sh
       - integrations/pi/marmot/**
+      - scripts/install-goose-marmot.sh
+      - integrations/goose/marmot/**
       - integrations/terminal-harness/**
       - Cargo.toml
       - Cargo.lock
@@ -158,14 +160,14 @@ jobs:
         run: ./target/${{ matrix.rust_target }}/release/wn-agent --help
 
       - name: Build terminal harnesses
-        run: cargo build --locked --release -p wn-claude -p wn-codex -p wn-opencode -p wn-pi --bins --target "${{ matrix.rust_target }}"
+        run: cargo build --locked --release -p wn-claude -p wn-codex -p wn-opencode -p wn-pi -p wn-goose --bins --target "${{ matrix.rust_target }}"
 
       - name: Smoke test terminal harnesses
         if: matrix.target != 'darwin-x86_64'
         shell: bash
         run: |
           set -euo pipefail
-          for binary in wn-claude wn-codex wn-opencode wn-pi; do
+          for binary in wn-claude wn-codex wn-opencode wn-pi wn-goose; do
             "./target/${{ matrix.rust_target }}/release/$binary" --help
           done
 
@@ -173,7 +175,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for binary in wn-agent wn-claude wn-codex wn-opencode wn-pi; do
+          for binary in wn-agent wn-claude wn-codex wn-opencode wn-pi wn-goose; do
             ./scripts/package-binary-bundle.sh \
               "$binary" \
               "${{ matrix.target }}" \
@@ -215,6 +217,13 @@ jobs:
           path: dist/wn-pi-${{ matrix.target }}/*
           if-no-files-found: error
 
+      - name: Upload wn-goose bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: wn-goose-${{ matrix.target }}
+          path: dist/wn-goose-${{ matrix.target }}/*
+          if-no-files-found: error
+
   darwin-intel-smoke:
     name: Smoke test packaged binaries (darwin-x86_64)
     needs: build
@@ -238,7 +247,7 @@ jobs:
           for archive in ./*.tar.gz; do
             tar -xzf "$archive"
           done
-          for binary in wn-agent wn-claude wn-codex wn-opencode wn-pi; do
+          for binary in wn-agent wn-claude wn-codex wn-opencode wn-pi wn-goose; do
             "./$binary-darwin-x86_64/$binary" --help
           done
 
@@ -537,7 +546,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          mkdir -p dist/linux dist/linux-arm dist/darwin dist/darwin-intel dist/claude-linux dist/claude-linux-arm dist/claude-darwin dist/claude-darwin-intel dist/codex-linux dist/codex-linux-arm dist/codex-darwin dist/codex-darwin-intel dist/opencode-linux dist/opencode-linux-arm dist/opencode-darwin dist/opencode-darwin-intel dist/pi-linux dist/pi-linux-arm dist/pi-darwin dist/pi-darwin-intel dist/plugin
+          mkdir -p dist/linux dist/linux-arm dist/darwin dist/darwin-intel dist/claude-linux dist/claude-linux-arm dist/claude-darwin dist/claude-darwin-intel dist/codex-linux dist/codex-linux-arm dist/codex-darwin dist/codex-darwin-intel dist/opencode-linux dist/opencode-linux-arm dist/opencode-darwin dist/opencode-darwin-intel dist/pi-linux dist/pi-linux-arm dist/pi-darwin dist/pi-darwin-intel dist/goose-linux dist/goose-linux-arm dist/goose-darwin dist/goose-darwin-intel dist/plugin
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-agent-linux-x86_64 --dir dist/linux
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-agent-linux-aarch64 --dir dist/linux-arm
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-agent-darwin-aarch64 --dir dist/darwin
@@ -558,6 +567,10 @@ jobs:
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-pi-linux-aarch64 --dir dist/pi-linux-arm
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-pi-darwin-aarch64 --dir dist/pi-darwin
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-pi-darwin-x86_64 --dir dist/pi-darwin-intel
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-goose-linux-x86_64 --dir dist/goose-linux
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-goose-linux-aarch64 --dir dist/goose-linux-arm
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-goose-darwin-aarch64 --dir dist/goose-darwin
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name wn-goose-darwin-x86_64 --dir dist/goose-darwin-intel
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name hermes-marmot-plugin --dir dist/plugin
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name openclaw-marmot-plugin --dir dist/plugin
 
@@ -588,7 +601,7 @@ jobs:
             -e "s/^WN_AGENT_VERSION_DEFAULT=.*/WN_AGENT_VERSION_DEFAULT=\"${version}\"/" \
             scripts/install-openclaw-marmot.sh > dist/install/install-openclaw-marmot.sh
           chmod 0755 dist/install/install-openclaw-marmot.sh
-          for harness in claude codex opencode pi; do
+          for harness in claude codex opencode pi goose; do
             awk -v harness="$harness" \
               'NR == 1 { print; print "export MARMOT_TERMINAL_HARNESS=" harness; next } { print }' \
               scripts/install-terminal-harness-marmot.sh | \
@@ -655,6 +668,8 @@ jobs:
           install_verified "\$base_url/install-opencode-marmot.sh" "\$base_url/install-opencode-marmot.sh.sha256"
           # Pi terminal harness
           install_verified "\$base_url/install-pi-marmot.sh" "\$base_url/install-pi-marmot.sh.sha256"
+          # Goose terminal harness
+          install_verified "\$base_url/install-goose-marmot.sh" "\$base_url/install-goose-marmot.sh.sha256"
           \`\`\`
 
           Assets:
@@ -663,6 +678,7 @@ jobs:
           - \`wn-codex-<platform>-$version.tar.gz\`: Codex harness binary bundle.
           - \`wn-opencode-<platform>-$version.tar.gz\`: OpenCode harness binary bundle.
           - \`wn-pi-<platform>-$version.tar.gz\`: Pi harness binary bundle.
+          - \`wn-goose-<platform>-$version.tar.gz\`: Goose harness binary bundle.
           - \`hermes-marmot-plugin-$version.tar.gz\`: Hermes platform plugin directory bundle.
           - \`openclaw-marmot-plugin-$version.tgz\`: OpenClaw channel plugin npm tarball.
           - \`install-hermes-marmot.sh\`: installer for testers with Hermes already installed.
@@ -671,6 +687,7 @@ jobs:
           - \`install-codex-marmot.sh\`: installer for testers with Codex already installed.
           - \`install-opencode-marmot.sh\`: installer for testers with OpenCode already installed.
           - \`install-pi-marmot.sh\`: installer for testers with Pi already installed.
+          - \`install-goose-marmot.sh\`: installer for testers with Goose already installed.
 
           Verify downloads with the accompanying \`.sha256\` files.
           EOF
@@ -716,6 +733,14 @@ jobs:
             dist/pi-darwin/wn-pi-darwin-aarch64-"$version".tar.gz.sha256
             dist/pi-darwin-intel/wn-pi-darwin-x86_64-"$version".tar.gz
             dist/pi-darwin-intel/wn-pi-darwin-x86_64-"$version".tar.gz.sha256
+            dist/goose-linux/wn-goose-linux-x86_64-"$version".tar.gz
+            dist/goose-linux/wn-goose-linux-x86_64-"$version".tar.gz.sha256
+            dist/goose-linux-arm/wn-goose-linux-aarch64-"$version".tar.gz
+            dist/goose-linux-arm/wn-goose-linux-aarch64-"$version".tar.gz.sha256
+            dist/goose-darwin/wn-goose-darwin-aarch64-"$version".tar.gz
+            dist/goose-darwin/wn-goose-darwin-aarch64-"$version".tar.gz.sha256
+            dist/goose-darwin-intel/wn-goose-darwin-x86_64-"$version".tar.gz
+            dist/goose-darwin-intel/wn-goose-darwin-x86_64-"$version".tar.gz.sha256
             dist/plugin/hermes-marmot-plugin-"$version".tar.gz
             dist/plugin/hermes-marmot-plugin-"$version".tar.gz.sha256
             dist/plugin/openclaw-marmot-plugin-"$version".tgz
@@ -732,6 +757,8 @@ jobs:
             dist/install/install-opencode-marmot.sh.sha256
             dist/install/install-pi-marmot.sh
             dist/install/install-pi-marmot.sh.sha256
+            dist/install/install-goose-marmot.sh
+            dist/install/install-goose-marmot.sh.sha256
           )
 
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then

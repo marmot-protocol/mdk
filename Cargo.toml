@@ -28,6 +28,7 @@ members = [
     "integrations/codex/marmot",
     "integrations/opencode/marmot",
     "integrations/pi/marmot",
+    "integrations/goose/marmot",
 ]
 
 [workspace.package]
