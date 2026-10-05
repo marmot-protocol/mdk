@@ -8,6 +8,7 @@ explain topology, identities, and sharing for operators.
 ## Contents
 
 - [Get Started: White Noise + Agents](#get-started-white-noise--agents)
+- [First-install verification](#first-install-verification)
 - [How The Connectors Fit Together](#how-the-connectors-fit-together)
 - [Default Install Topology](#default-install-topology)
 - [Identity Model](#identity-model)
@@ -71,6 +72,12 @@ base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.1
 ### Hermes
 
 Hermes 0.19.0 or newer must already be installed and working.
+
+If Hermes has multiple profiles or a custom home, read
+[first install and profile selection](hermes/marmot/README.md#first-install-and-profile-selection)
+**before** invoking the installer. Export the intended `HERMES_HOME`, and choose
+separate connector homes/sockets/service names for independent agents. The
+installer does not infer the intended profile from the installation prompt.
 
 Run this example in the same shell where `install_verified` above was defined.
 
@@ -193,6 +200,24 @@ before running it.
 
 Use each connector's README for existing-identity imports, shared deployments,
 execution profiles, manual service control, and development workflows.
+
+## First-install verification
+
+Agents following a copied White Noise prompt should use the connector's
+[first-install checklist](../crates/agent-connector/README.md#first-installation-from-a-white-noise-prompt)
+and the selected runtime's guide. Resolve the actual runtime/profile home,
+choose one owner for each connector socket/service, verify the downloaded
+installer checksum and release cohort, and configure both invitation and
+message-sender authorization. A successful install/bootstrap is not proof of
+an agent reply reaching the phone: finish with an invited, allowed-account
+White Noise round trip.
+
+For Hermes files, stage a regular file under the adapter's approved source root
+before returning `MEDIA:<absolute-path>`; see the
+[copy-and-send example](hermes/marmot/README.md#sending-a-generated-file).
+The default source root is the connector home's `dev/inbound-media`, not an
+arbitrary workspace. OpenClaw and terminal harnesses have their own documented
+attachment/export contracts; do not apply Hermes's `MEDIA:` syntax to them.
 
 ## How The Connectors Fit Together
 
