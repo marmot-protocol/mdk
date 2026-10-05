@@ -212,6 +212,16 @@ message-sender authorization. A successful install/bootstrap is not proof of
 an agent reply reaching the phone: finish with an invited, allowed-account
 White Noise round trip.
 
+Before installing, follow the runtime-specific checklist: [Hermes](hermes/marmot/README.md#first-install-and-profile-selection),
+[OpenClaw](openclaw/marmot/README.md#first-install-checklist),
+[Claude Code](claude/marmot/README.md#first-install-checklist),
+[Codex](codex/marmot/README.md#first-install-checklist),
+[OpenCode](opencode/marmot/README.md#first-install-checklist), or
+[Pi](pi/marmot/README.md#first-install-checklist). The four terminal harnesses also
+share a [two-process/environment verification guide](terminal-harness/README.md#first-installation-and-verification).
+These guides distinguish invitation authorization from prompt authorization and
+actual backend replies from local setup/status acknowledgements.
+
 For Hermes files, stage a regular file under the adapter's approved source root
 before returning `MEDIA:<absolute-path>`; see the
 [copy-and-send example](hermes/marmot/README.md#sending-a-generated-file).

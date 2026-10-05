@@ -16,6 +16,7 @@ For the current guided install, runtime chooser, and steps to finish in White No
 
 ## Contents
 
+- [First-install checklist](#first-install-checklist)
 - [Install (OpenCode Already Installed)](#install-opencode-already-installed)
 - [Configuration](#configuration)
 - [Workdir Picker](#workdir-picker)
@@ -24,6 +25,26 @@ For the current guided install, runtime chooser, and steps to finish in White No
 - [Inbound attachments](#inbound-attachments)
 - [Security Notes](#security-notes)
 - [Development](#development)
+
+## First-install checklist
+
+Follow the [shared terminal-harness first-install guide](../../terminal-harness/README.md#first-installation-and-verification)
+before the release command below. It covers the two services, matching home and
+socket, sender authorization, manual environment loading, independent instance
+state, execution policy and the required phone/model round trip.
+
+Verify the selected OpenCode binary, provider/model configuration and a local
+`opencode run` turn under the service user's normal home. Use `WN_OPENCODE_BIN`
+/ `--opencode-bin` for a nonstandard executable. The connector uses the
+non-interactive JSON interface, not an existing TUI, and does not copy login
+state into the Marmot home. OpenCode's own project/configuration permissions
+remain active; do not silently choose `unrestricted` to make an install pass.
+
+After pairing, select the intended trusted directory in chat and verify a
+text-only model reply before attachments. Files must fit the documented
+OpenCode classification; arbitrary audio/archives are not made readable merely
+by staging them. Generated-file return is not implemented in this harness;
+`MEDIA:` is not an OpenCode connector send action.
 
 ## Install (OpenCode Already Installed)
 
@@ -94,23 +115,28 @@ wn-opencode --version
 
 Manual equivalent:
 
+In terminal 1, run the daemon only if its service is not already running:
+
 ```sh
 export MARMOT_HOME="$HOME/.marmot-agents/harnesses"
 export MARMOT_AGENT_SOCKET="$MARMOT_HOME/dev/wn-agent.sock"
-export WN_OPENCODE_ALLOWED_SENDERS_HEX="..."
-
-wn-agent --home "$MARMOT_HOME" \
-  --socket "$MARMOT_AGENT_SOCKET" \
+export WN_OPENCODE_ALLOWED_SENDERS_HEX="<phone-public-key-as-64-hex-characters>"
+wn-agent --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
+```
 
-wn-agent bootstrap \
-  --home "$MARMOT_HOME" \
-  --socket "$MARMOT_AGENT_SOCKET" \
-  --label terminal-harness-agent \
-  --allow-welcomer "$WN_OPENCODE_ALLOWED_SENDERS_HEX" \
-  --qr
+In terminal 2, export the same settings again, bootstrap the single sender in
+this example, then start the harness only if its service is not already running:
 
+```sh
+export MARMOT_HOME="$HOME/.marmot-agents/harnesses"
+export MARMOT_AGENT_SOCKET="$MARMOT_HOME/dev/wn-agent.sock"
+export WN_OPENCODE_ALLOWED_SENDERS_HEX="<phone-public-key-as-64-hex-characters>"
+wn-agent bootstrap --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" \
+  --label terminal-harness-agent --allow-welcomer "$WN_OPENCODE_ALLOWED_SENDERS_HEX" \
+  --relay wss://relay.eu.whitenoise.chat \
+  --relay wss://relay.us.whitenoise.chat --qr
 wn-opencode
 ```
 

@@ -14,11 +14,123 @@ storage, QUIC previews, or backend-specific CLI semantics.
 
 ## Contents
 
+- [First installation and verification](#first-installation-and-verification)
 - [Backend Boundary](#backend-boundary)
 - [Execution Profiles](#execution-profiles)
 - [Shared Behavior](#shared-behavior)
 - [Chat Commands](#chat-commands)
 - [Development](#development)
+
+## First installation and verification
+
+Use the [checksum-verified quickstart](../README.md#get-started-white-noise--agents)
+for the selected runtime. Claude Code, Codex, OpenCode and Pi share this setup
+contract; their READMEs below describe backend-specific permissions and files.
+The installer supplies `wn-agent` and the harness, not the model CLI, its login,
+provider credentials or model configuration. Before installation, verify an
+ordinary local model turn works as the same OS user that will run the service.
+Do not change `HOME` to the connector directory: backend authentication and
+project configuration remain owned by the native CLI.
+
+### Record the two-process configuration
+
+Every terminal connection needs a running `wn-agent` **and** one running
+harness. Record its backend executable, connector home, socket, selected agent
+account, allowed phone sender, relay set, service names and private session-map
+path. Use the installer's `--help` and `--dry-run` to check that plan before
+installing a matching release cohort. `wn-agent --version` and `wn-<runtime> --version` alone do not prove the backend is authenticated or receiving prompts.
+
+The installer accepts public npub or hex values for `--allow-welcomer` /
+`--allow-sender`. A fresh installation uses the normalized list for both invite
+admission and prompt authorization. An existing `<PREFIX>_ALLOWED_SENDERS_HEX`
+can retain a separate prompt-sender list, so verify the final service/env values
+rather than assuming a newly allowed inviter can invoke the backend. The harness mirrors its sender list
+**additively** into the account's invite allowlist. Removing invite permission
+alone is not prompt revocation: update the harness sender list and restart it,
+and remove the invite entry too when that should be revoked.
+
+The default homes/services differ by runtime. For a second instance of the
+**same** harness, make its home, socket, bootstrap label, agent service,
+harness service and launchd labels distinct. Changing only `--home` does not
+change a service name or the default session-map path. Set a separate
+`WN_CLAUDE_STATE_PATH`, `WN_CODEX_STATE_PATH`, `WN_OPENCODE_STATE_PATH` or
+`WN_PI_STATE_PATH` for same-kind instances; Pi's backend session directory also
+needs its own `WN_PI_SESSION_DIR` when explicitly overridden. Persist these
+settings in the actual service/launcher, not just the install shell.
+
+For intentional sharing, one daemon/service owns the shared socket, each harness
+selects its account explicitly, and only trusted consumers share the control
+boundary. A prompt allowlist is not an account-scoped control-token boundary.
+Several eligible subscribers to the same account/group can all respond.
+
+### Manual startup and service environments
+
+A foreground `wn-agent` occupies its terminal. Bootstrap and the harness belong
+in a **second terminal** with the same home/socket/relay/auth settings. Never
+start a second daemon beside an already-installed service to complete bootstrap.
+Without a service manager, supervise both processes explicitly. `--no-service`
+means services are not installed, not that bootstrap cannot start a temporary
+daemon; the installer cleans that temporary process up when it exits.
+`--no-start-wn-agent` also leaves the harness stopped; `--no-start-wn-<runtime>`
+leaves that harness stopped. Follow the printed manual-start instructions.
+
+The release installer writes `$MARMOT_HOME/dev/wn-<runtime>.env`. For a manual
+harness start, load the **trusted, installer-generated** file in Bash and export
+its assignments to the child:
+
+```bash
+# Replace the home and filename with this installation's recorded values.
+export MARMOT_HOME="$HOME/.marmot-agents/codex"
+set -a
+. "$MARMOT_HOME/dev/wn-codex.env"
+set +a
+wn-codex
+```
+
+Do not run this beside an active `wn-codex` service. The file is a Bash-sourceable
+manual-start aid, not a provider-credential export. Generated systemd/launchd
+services embed their own environment; editing this file or exporting a variable
+in a terminal does **not** update a running service. Apply approved overrides
+through the service manager and restart only the corresponding service. Keep
+provider login and tokens private; do not paste them into White Noise.
+
+### Prove the first model reply
+
+1. Check that the two intended services are running, the socket is reachable,
+   and the configured account matches the bootstrap agent npub. Verify the
+   backend executable and native authentication under the service user.
+2. Invite that agent from the authorized phone account over the configured
+   public relays. The phone's public npub identifies the sender to allow; it is
+   not a secret identity to import as the agent.
+3. Send `/help`, then select a trusted directory under the service user's `HOME`
+   with `/<path>` or `/cd <path>` and confirm `/pwd` / `/status`. These are local
+   harness commands, not proof that a model ran. Codex needs a Git repository
+   by default; the other backends retain their own project rules.
+4. Send an ordinary text prompt and verify an actual model reply in the same
+   White Noise conversation. Only then report the round trip verified. If phone
+   testing is unavailable, keep local installation checks and phone verification
+   separate. Do not loosen permissions or sender policy to hide a failure.
+
+### Know the file capability before testing it
+
+| Harness | Inbound files | Generated-file return |
+| --- | --- | --- |
+| Claude Code | Non-empty file batches are rejected before invocation | Not implemented |
+| Codex | Recognized images and the documented staged-file classes | Opt-in completion manifest with an exact group/export-root grant |
+| OpenCode | Its documented text/image/PDF classifications | Not implemented |
+| Pi | Its documented image or nonempty NUL-free UTF-8 classifications | Not implemented |
+
+See the exact [Codex](../codex/marmot/README.md#inbound-attachments),
+[OpenCode](../opencode/marmot/README.md#inbound-attachments) and
+[Pi](../pi/marmot/README.md#attachments) file matrices and Claude Code's
+[security notes](../claude/marmot/README.md#security-notes). A local path is not
+proof the model received or understood a file. Unsupported mixed batches fail
+as a unit; the harness does not silently drop an attachment and run the text.
+`MEDIA:` is Hermes syntax, not an export command for these terminal harnesses.
+For Codex exports, the selected backend must be able to write both the authorized
+export files and its completion manifest under its existing execution policy.
+The harness's source grant and `wn-agent --media-allowed-root` staging permission
+are separate and both must be configured; do not widen either to the whole home.
 
 ## Backend Boundary
 

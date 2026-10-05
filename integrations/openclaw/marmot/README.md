@@ -19,6 +19,7 @@ the Python Hermes plugin in [`../../hermes/marmot/`](../../hermes/marmot).
 
 ## Contents
 
+- [First-install checklist](#first-install-checklist)
 - [Install (release)](#install-release)
 - [Dev setup](#dev-setup)
 - [Docker phone test](#docker-phone-test)
@@ -26,6 +27,89 @@ the Python Hermes plugin in [`../../hermes/marmot/`](../../hermes/marmot).
 - [How it works](#how-it-works)
 - [Local gateway harness](#local-gateway-harness)
 - [Tests](#tests)
+
+## First-install checklist
+
+Use the connector's [first-install checklist](../../../crates/agent-connector/README.md#first-installation-from-a-white-noise-prompt)
+with the [verified release instructions](#install-release) below. OpenClaw and
+its model/provider configuration must already work as the OS user that runs
+the gateway; the Marmot installer does not install or authenticate OpenClaw.
+
+### Resolve the actual gateway configuration
+
+Record which OpenClaw instance/profile and agent workspace the phone should
+reach, then identify that gateway's effective state and config paths. The
+[upstream environment guide](https://docs.openclaw.ai/help/environment) describes
+`OPENCLAW_HOME`, `OPENCLAW_STATE_DIR` and `OPENCLAW_CONFIG_PATH`; explicit state /
+config overrides can take precedence over home defaults. The Marmot installer
+currently patches **`$OPENCLAW_HOME/.openclaw/openclaw.json`**. Its
+`--openclaw-home` option is a base home, not a config-file path or OpenClaw
+`--profile` selector, and it does not automatically follow a separately selected
+state/config path.
+
+For a default layout, export the confirmed base `OPENCLAW_HOME` before installing
+so child plugin commands use the intended environment too. Check the dry-run's
+config path and the gateway's real path agree. For a custom/named-profile
+layout that does not match that path, do not let the installer write another
+instance's default config: use `--no-configure-openclaw` and configure
+`channels.marmot` in the intended instance with its supported configuration
+workflow. Plugin installation/discovery must target that instance as well.
+Do not assume selecting a profile only on a later gateway command repairs an
+installation performed in a different profile.
+
+Choose a distinct `MARMOT_HOME`, socket, bootstrap label and
+`MARMOT_AGENT_SERVICE_NAME` / `MARMOT_AGENT_LAUNCHD_LABEL` for each independent
+connector instance. Changing only the OpenClaw home does not rename the default
+`wn-agent-openclaw` service. Keep one owner for an intentionally shared socket;
+shared tokens grant full control, and overlapping active consumers can reply
+more than once. Persist the actual configuration/environment in the owning
+service, not merely in the shell used to run the installer.
+
+### Configure both invitation and message authorization
+
+`--allow-welcomer` and `dm.allowFrom` admit invitations. They do **not** configure
+the account-global sender gate that permits OpenClaw model turns. After the
+installer writes the selected agent `accountIdHex`, set the phone sender's
+**public 64-character hex key** in the target config's sender policy, preserving
+all other channel settings:
+
+```json
+{
+  "channels": {
+    "marmot": {
+      "senderPolicy": {
+        "allowedUsers": ["<phone-public-key-as-64-hex-characters>"],
+        "allowAll": false
+      }
+    }
+  }
+}
+```
+
+This is a fragment to merge, not a replacement for the whole config file. Use
+a real hex key, not the `npub1...` form accepted by the installer. An explicit
+`senderPolicy` takes precedence over environment fallback; an invalid or empty
+policy fails closed. Keep open access an explicit operator choice. Reload only
+the selected gateway using its existing supervisor; the installer does not
+restart it, and an additional foreground gateway is not a restart of an active
+managed instance.
+
+### Verify text and files separately
+
+Invite the bootstrapped **agent** npub from the allowed phone account, send an
+ordinary prompt, and verify a model reply in the same White Noise conversation.
+Address the agent in a multi-party group according to its configured activation;
+effective DMs activate without a mention. A running daemon, installed plugin
+or successful invite alone does not prove dispatch or phone delivery.
+
+For a generated file, place a regular readable source under the routed agent's
+active workspace or an OpenClaw-managed media store and use the normal message
+tool's `media` / `attachments` fields. Do not use a raw control-client call or
+Hermes `MEDIA:` syntax. The plugin restages authorized bytes under
+`MARMOT_OUTBOUND_MEDIA_DIR`; the one daemon must allow that same path with
+`--media-allowed-root`. For manual/container deployments configure both sides
+and shared path visibility. A successful text reply does not prove file delivery,
+and local source-root permission does not change the remote Blossom endpoint.
 
 ## Install (release)
 
@@ -123,19 +207,35 @@ another connector home, such as Hermes's, requires a separate explicit import;
 the installers never opt into shared home/socket state silently.
 
 The installer prints restart guidance for your existing OpenClaw gateway. It
-does not restart OpenClaw automatically. Manual equivalent:
+does not restart OpenClaw automatically.
+
+For manual startup, keep `wn-agent` in terminal 1, using the confirmed
+home/socket and the daemon's separate outbound staging root:
 
 ```sh
-wn-agent import-identity --json \
-  --home ~/.marmot-agents/openclaw \
-  --label openclaw-agent \
-  --identity-file "$HOME/.config/example/openclaw-agent.nsec" \
-  --expected-identity npub1...
-wn-agent --home ~/.marmot-agents/openclaw \
+export MARMOT_HOME="$HOME/.marmot-agents/openclaw"
+export MARMOT_AGENT_SOCKET="$MARMOT_HOME/dev/wn-agent.sock"
+export MARMOT_OUTBOUND_MEDIA_DIR="$MARMOT_HOME/dev/outbound-media"
+install -d -m 0700 "$MARMOT_OUTBOUND_MEDIA_DIR"
+wn-agent --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" \
+  --media-allowed-root "$MARMOT_OUTBOUND_MEDIA_DIR" \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
-wn-agent bootstrap --home ~/.marmot-agents/openclaw --label openclaw-agent \
-  --no-create --account-id-hex <imported-account-hex> --qr
+```
+
+In terminal 2, export the same settings, bootstrap an account with the allowed
+phone inviter, configure the target OpenClaw channel/account and sender policy,
+then start the gateway only if it is not already managed/running:
+
+```sh
+export MARMOT_HOME="$HOME/.marmot-agents/openclaw"
+export MARMOT_AGENT_SOCKET="$MARMOT_HOME/dev/wn-agent.sock"
+export MARMOT_OUTBOUND_MEDIA_DIR="$MARMOT_HOME/dev/outbound-media"
+wn-agent bootstrap --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" \
+  --label openclaw-agent --allow-welcomer npub1... \
+  --relay wss://relay.eu.whitenoise.chat \
+  --relay wss://relay.us.whitenoise.chat --qr
+# After configuring channels.marmot in the confirmed OpenClaw instance:
 openclaw gateway run
 ```
 

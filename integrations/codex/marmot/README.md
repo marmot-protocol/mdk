@@ -17,6 +17,7 @@ with `codex exec resume --json <thread-id> -`.
 
 ## Contents
 
+- [First-install checklist](#first-install-checklist)
 - [Install (Codex Already Installed)](#install-codex-already-installed)
 - [Manual Setup](#manual-setup)
 - [Chat Commands](#chat-commands)
@@ -24,6 +25,29 @@ with `codex exec resume --json <thread-id> -`.
 - [Inbound attachments](#inbound-attachments)
 - [Security Notes](#security-notes)
 - [Development](#development)
+
+## First-install checklist
+
+Follow the [shared terminal-harness first-install guide](../../terminal-harness/README.md#first-installation-and-verification)
+before the release command below. It covers the two services, matching home and
+socket, sender authorization, manual environment loading, independent instance
+state, execution policy and the required phone/model round trip.
+
+Verify native Codex authentication and a local non-interactive turn as the
+service user, with the intended configuration and a trusted Git working
+directory. `WN_CODEX_BIN` / `--codex-bin` selects the executable; the connector
+does not log in, rewrite global Codex settings or implement TUI slash commands.
+Select the repository in the phone chat before the first model prompt: the
+harness's default working directory is the service user's home, which may not
+be a Git repository.
+
+Use a text-only round trip first. Native image inputs require the documented
+CLI image capability; other supported files are offered through a staged-file
+manifest and ordinary file tools. A staged audio/PDF path is not a promise of
+native transcription/PDF processing. Generated files are returned only when
+Codex artifact export is explicitly enabled with an exact chat/root grant,
+backend write access and a connector-approved staging root. An assistant's
+`MEDIA:` line or Markdown download link does not trigger this exporter.
 
 ## Install (Codex Already Installed)
 
@@ -89,20 +113,28 @@ codex --version
 Install Codex first and authenticate it normally, then run an isolated
 `wn-agent` identity and the harness:
 
+In terminal 1, run the daemon only if its service is not already running:
+
 ```sh
 export MARMOT_HOME="$HOME/.marmot-agents/codex"
 export MARMOT_AGENT_SOCKET="$MARMOT_HOME/dev/wn-agent.sock"
-export WN_CODEX_ALLOWED_SENDERS_HEX="..."
-
-# Shell 1: wn-agent runs in the foreground.
+export WN_CODEX_ALLOWED_SENDERS_HEX="<phone-public-key-as-64-hex-characters>"
 wn-agent --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
+```
 
-# Shell 2: bootstrap the identity, then start the harness.
+In terminal 2, export the same settings again, bootstrap the single sender in
+this example, then start the harness only if its service is not already running:
+
+```sh
+export MARMOT_HOME="$HOME/.marmot-agents/codex"
+export MARMOT_AGENT_SOCKET="$MARMOT_HOME/dev/wn-agent.sock"
+export WN_CODEX_ALLOWED_SENDERS_HEX="<phone-public-key-as-64-hex-characters>"
 wn-agent bootstrap --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" \
-  --label codex-harness-agent --allow-welcomer "$WN_CODEX_ALLOWED_SENDERS_HEX" --qr
-
+  --label codex-harness-agent --allow-welcomer "$WN_CODEX_ALLOWED_SENDERS_HEX" \
+  --relay wss://relay.eu.whitenoise.chat \
+  --relay wss://relay.us.whitenoise.chat --qr
 wn-codex
 ```
 
@@ -153,12 +185,24 @@ instruction alive across thread resets and Codex-side context compaction.
 | `WN_CODEX_ARTIFACT_MAX_COUNT` | `10` | Maximum artifacts accepted per result; configurable from 1 to 10 |
 | `WN_CODEX_ARTIFACT_STAGING_ROOT` | `$MARMOT_HOME/media-uploads` | Private staging root that must also be passed to `wn-agent --media-allowed-root` |
 
-Artifact export is fail-closed and Codex-only in the initial release. Enable it only with both layers configured:
+Artifact export is fail-closed and Codex-only in the initial release. Enable it
+only with both layers configured.
+
+The following is a manual daemon example, not a second daemon to run beside
+an installed service. Update/restart the existing daemon with the same approved
+staging-root flag, or run it manually as shown. Create the private staging root
+first, configure the real chat/root grant, and start `wn-codex` in a second
+terminal that exports these same `WN_CODEX_ARTIFACT_*` values and the account /
+sender settings. For managed installs, persist the values in the harness's
+actual service environment; changing only `dev/wn-codex.env` does not change the
+generated service. Do not start with a placeholder grant or claim export works
+before a completion manifest is accepted and the file appears in White Noise.
 
 ```sh
 export WN_CODEX_ARTIFACT_EXPORTS_ENABLED=true
 export WN_CODEX_ARTIFACT_GRANTS_JSON='[{"group_id_hex":"<opaque-hex-group-id>","export_root":"'"$HOME"'/src/my-project/output","ttl_seconds":300}]'
 export WN_CODEX_ARTIFACT_STAGING_ROOT="$MARMOT_HOME/media-uploads"
+install -d -m 0700 "$WN_CODEX_ARTIFACT_STAGING_ROOT"
 wn-agent --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" \
   --media-allowed-root "$WN_CODEX_ARTIFACT_STAGING_ROOT" \
   --relay wss://relay.eu.whitenoise.chat \

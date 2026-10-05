@@ -11,6 +11,7 @@ For the current guided install, runtime chooser, and steps to finish in White No
 ## Contents
 
 - [Attachments](#attachments)
+- [First-install checklist](#first-install-checklist)
 - [Install (Pi Already Installed)](#install-pi-already-installed)
 - [Manual setup](#manual-setup)
 - [Chat Commands](#chat-commands)
@@ -70,6 +71,27 @@ from an earlier turn.
 `@file` processor, image detection, and stdin-plus-files initial message this
 adapter mirrors (checked against Pi source at
 [`36b60d2e`](https://github.com/earendil-works/pi/tree/36b60d2e8985899743c4cf5bd5f8929832a3f05d/packages/coding-agent/src/cli)).
+
+## First-install checklist
+
+Follow the [shared terminal-harness first-install guide](../../terminal-harness/README.md#first-installation-and-verification)
+before the release command below. It covers the two services, matching home and
+socket, sender authorization, manual environment loading, independent instance
+state, execution policy and the required phone/model round trip.
+
+Verify the configured Pi executable, native provider/model login and a local
+JSON-mode turn as the service user. Use `WN_PI_BIN` / `--pi-bin` when Pi is not
+on the service's PATH. Its connector sessions live in the private Pi session
+directory; do not attach another client to a connector-owned session. Pi's
+normal tool invocation is approval-free and provides no OS sandbox, so choose
+an OS/user boundary appropriate for the allowed phone sender.
+
+Start with a text-only phone round trip. Supported attachments are classified
+from bytes and passed as ordered `@file` operands, with all items validated
+before spawn. Unsupported mixed batches are refused rather than forwarding
+just their caption. Generated-file export and Hermes `MEDIA:` delivery are not
+implemented for `wn-pi`; only the documented Codex export path provides that
+terminal-harness feature today.
 
 ## Install (Pi Already Installed)
 
@@ -141,20 +163,28 @@ pi --version
 Install Pi first and authenticate it normally, then run an isolated `wn-agent`
 identity and the harness:
 
+In terminal 1, run the daemon only if its service is not already running:
+
 ```sh
 export MARMOT_HOME="$HOME/.marmot-agents/pi"
 export MARMOT_AGENT_SOCKET="$MARMOT_HOME/dev/wn-agent.sock"
-export WN_PI_ALLOWED_SENDERS_HEX="..."
-
-# Shell 1: wn-agent runs in the foreground.
+export WN_PI_ALLOWED_SENDERS_HEX="<phone-public-key-as-64-hex-characters>"
 wn-agent --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
+```
 
-# Shell 2: bootstrap the identity, then start the harness.
+In terminal 2, export the same settings again, bootstrap the single sender in
+this example, then start the harness only if its service is not already running:
+
+```sh
+export MARMOT_HOME="$HOME/.marmot-agents/pi"
+export MARMOT_AGENT_SOCKET="$MARMOT_HOME/dev/wn-agent.sock"
+export WN_PI_ALLOWED_SENDERS_HEX="<phone-public-key-as-64-hex-characters>"
 wn-agent bootstrap --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" \
-  --label pi-harness-agent --allow-welcomer "$WN_PI_ALLOWED_SENDERS_HEX" --qr
-
+  --label pi-harness-agent --allow-welcomer "$WN_PI_ALLOWED_SENDERS_HEX" \
+  --relay wss://relay.eu.whitenoise.chat \
+  --relay wss://relay.us.whitenoise.chat --qr
 wn-pi
 ```
 

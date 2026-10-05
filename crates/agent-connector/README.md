@@ -64,6 +64,10 @@ agent following that prompt, read the selected runtime's guide as well: the
 [quickstart](../../integrations/README.md#get-started-white-noise--agents) links
 Hermes, OpenClaw, Claude Code, Codex, OpenCode and Pi. Installing `wn-agent`
 alone does not connect the model runtime or start its gateway/harness.
+The detailed preflight is [Hermes profile selection](../../integrations/hermes/marmot/README.md#first-install-and-profile-selection),
+[OpenClaw instance selection](../../integrations/openclaw/marmot/README.md#first-install-checklist),
+or the [terminal-harness installation guide](../../integrations/terminal-harness/README.md#first-installation-and-verification)
+with each backend's checklist. Read that selected path before changing files.
 
 Before changing anything, explain the connector's local account/socket/service,
 which runtime configuration will change, how the supplied **public** phone

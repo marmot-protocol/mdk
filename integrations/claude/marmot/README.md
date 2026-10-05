@@ -19,12 +19,34 @@ canonical [White Noise + Agents quickstart](../../README.md#get-started-white-no
 
 ## Contents
 
+- [First-install checklist](#first-install-checklist)
 - [Install (Claude Code Already Installed)](#install-claude-code-already-installed)
 - [Manual Setup](#manual-setup)
 - [Chat Commands](#chat-commands)
 - [Configuration](#configuration)
 - [Security Notes](#security-notes)
 - [Development](#development)
+
+## First-install checklist
+
+Follow the [shared terminal-harness first-install guide](../../terminal-harness/README.md#first-installation-and-verification)
+before the release command below. It covers the two services, matching home and
+socket, sender authorization, manual environment loading, independent instance
+state, execution policy and the required phone/model round trip.
+
+Verify Claude Code's native login and an ordinary local print-mode turn under
+the service user. `WN_CLAUDE_BIN` / `--claude-bin` selects its executable; the
+connector does not provision credentials, change model settings or reproduce
+interactive TUI onboarding. Select a trusted project before prompting: print
+mode skips the workspace-trust dialog, and `inherit` can deny unanswered
+permission requests. Choose another execution profile only as an explicit
+operator decision, not as an installation workaround.
+
+Use a text-only first phone prompt. This backend rejects any non-empty
+attachment batch before Claude Code starts, including the accompanying text;
+there is no generated-file export or `MEDIA:` handling. The shared harness has
+other backends with file support, but their capabilities are not inherited by
+`wn-claude`. Do not resume its connector-owned UUID in another Claude client.
 
 ## Install (Claude Code Already Installed)
 
@@ -88,18 +110,28 @@ inherited-pipe descendants as well as the direct process.
 Install and authenticate Claude Code normally, then run an isolated `wn-agent`
 identity and the harness:
 
+In terminal 1, run the daemon only if its service is not already running:
+
 ```sh
 export MARMOT_HOME="$HOME/.marmot-agents/claude"
 export MARMOT_AGENT_SOCKET="$MARMOT_HOME/dev/wn-agent.sock"
-export WN_CLAUDE_ALLOWED_SENDERS_HEX="..."
-
+export WN_CLAUDE_ALLOWED_SENDERS_HEX="<phone-public-key-as-64-hex-characters>"
 wn-agent --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
+```
 
+In terminal 2, export the same settings again, bootstrap the single sender in
+this example, then start the harness only if its service is not already running:
+
+```sh
+export MARMOT_HOME="$HOME/.marmot-agents/claude"
+export MARMOT_AGENT_SOCKET="$MARMOT_HOME/dev/wn-agent.sock"
+export WN_CLAUDE_ALLOWED_SENDERS_HEX="<phone-public-key-as-64-hex-characters>"
 wn-agent bootstrap --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" \
-  --label claude-harness-agent --allow-welcomer "$WN_CLAUDE_ALLOWED_SENDERS_HEX" --qr
-
+  --label claude-harness-agent --allow-welcomer "$WN_CLAUDE_ALLOWED_SENDERS_HEX" \
+  --relay wss://relay.eu.whitenoise.chat \
+  --relay wss://relay.us.whitenoise.chat --qr
 wn-claude
 ```
 
