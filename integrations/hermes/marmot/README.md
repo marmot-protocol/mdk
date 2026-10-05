@@ -68,9 +68,11 @@ The two homes serve different purposes: `HERMES_HOME` owns the profile's
 identity, group state and socket. For a default installation, the corresponding
 homes are normally `$HOME/.hermes` and `$HOME/.marmot-agents/hermes`.
 
-Use the [checksum-verified release helper](#release-install-hermes-already-installed)
-in this same shell. Review a dry-run first, then remove `--dry-run` after the
-requested installation approval:
+First define `install_verified` and `base_url` using the
+[checksum-verified release example](#release-install-hermes-already-installed).
+Run this example in the same shell where `install_verified` was defined.
+Review a dry-run first, then remove `--dry-run` after the requested installation
+approval:
 
 ```sh
 install_verified "$base_url/install-hermes-marmot.sh" \
