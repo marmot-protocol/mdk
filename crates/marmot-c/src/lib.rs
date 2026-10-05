@@ -25,6 +25,7 @@ use marmot_uniffi::Marmot;
 pub mod attachment_access;
 pub mod attachment_history;
 pub mod commands;
+pub mod file_media;
 pub(crate) mod macros;
 pub mod memory;
 pub mod publisher;

@@ -3630,6 +3630,18 @@ impl MarmotAppRuntime {
             .await
     }
 
+    pub async fn upload_media_files(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        request: crate::MediaFileUploadRequest,
+        control: std::sync::Arc<crate::MediaFileTransferControl>,
+    ) -> Result<MediaUploadResult, AppError> {
+        self.accounts
+            .upload_media_files(account_ref, group_id, request, control)
+            .await
+    }
+
     /// Send already-uploaded attachments as one kind-9 chat that also carries
     /// application tags, such as NIP-30 `emoji` tags naming those attachments.
     pub async fn send_tagged_media(

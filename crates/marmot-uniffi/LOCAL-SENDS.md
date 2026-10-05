@@ -115,6 +115,15 @@ original token before uploading again. Media references remain epoch-bound and
 can be rejected if the group changes before engine acceptance. A rejected media
 submission needs freshly prepared references and a new token.
 
+`upload_media_files_with_client_token` has the same admission contract for
+file-backed attachments (`source_path` instead of a plaintext byte array). Every
+attachment is snapshotted, encrypted and uploaded before admission. Its
+`MediaFileTransferControlFfi` is the only cancellation input: cancelling before
+admission returns an error and admits nothing, and an upload that already
+completed is left unreferenced on the server. Dropping the host's wait is not a
+cancellation. Once the message is admitted, cancelling has no effect; use
+`local_send_status` and timeline delivery as for any token-bound send.
+
 ## Conversation windows and draft cost
 
 Return-to-latest can consume a coherent pre-publication checkpoint, including an

@@ -56,6 +56,58 @@ pub(super) fn valid_publication_attempt(
 }
 
 impl SqliteAccountStorage {
+    /// Restore a verified ciphertext prefix into a bounded writer rather than
+    /// returning a whole-file array. Source/attempt fencing matches legacy load.
+    pub fn load_attachment_partial_to_writer(
+        &self,
+        job: &AttachmentAcquisition,
+        now: u64,
+        max_bytes: u64,
+        expected: (&[u8; 32], &[u8; 32]),
+        writer: &mut dyn std::io::Write,
+    ) -> StorageResult<Option<(AttachmentPartialIdentity, u64)>> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if !valid_attempt(&conn, job, now)? { return Ok(None); }
+            let row = conn.query_row("SELECT ciphertext_digest,locator_digest,etag,total,received,expires_at FROM attachment_partial WHERE token=?1",
+                [&job.reference.token], |r| Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,Vec<u8>>(1)?,r.get::<_,String>(2)?,nonnegative(r,3)?,nonnegative(r,4)?,nonnegative(r,5)?)))
+                .optional().storage()?;
+            let Some((cipher, locator, etag, total, received, expiry)) = row else { return Ok(None); };
+            if cipher != expected.0 || locator != expected.1 { return Ok(None); }
+            if expiry <= now || total > max_bytes || total > MAX_RETAINED_FILE_ATTACHMENT_BYTES || received > total {
+                conn.execute("DELETE FROM attachment_partial WHERE token=?1", [&job.reference.token]).storage()?;
+                return Ok(None);
+            }
+            let mut statement = conn.prepare("SELECT offset,bytes,digest FROM attachment_partial_chunk WHERE token=?1 ORDER BY offset").storage()?;
+            let mut rows = statement.query([&job.reference.token]).storage()?;
+            let mut copied = 0u64;
+            let mut corrupt = false;
+            while let Some(row) = rows.next().storage()? {
+                let offset = nonnegative(row,0).storage()?;
+                let chunk: Vec<u8> = row.get(1).storage()?;
+                let digest: Vec<u8> = row.get(2).storage()?;
+                if offset != copied || chunk.is_empty() || chunk.len() > ATTACHMENT_CHECKPOINT_BYTES
+                    || copied.saturating_add(chunk.len() as u64) > received || Sha256::digest(&chunk).as_slice() != digest {
+                    corrupt = true;
+                    break;
+                }
+                writer.write_all(&chunk).map_err(|_| invalid("partial checkpoint copy failed"))?;
+                copied += chunk.len() as u64;
+            }
+            drop(rows);
+            drop(statement);
+            if corrupt || copied != received {
+                conn.execute("DELETE FROM attachment_partial WHERE token=?1", [&job.reference.token]).storage()?;
+                return Ok(None);
+            }
+            Ok(Some((AttachmentPartialIdentity {
+                ciphertext_digest: cipher.try_into().map_err(|_| invalid("invalid partial digest"))?,
+                locator_digest: locator.try_into().map_err(|_| invalid("invalid partial locator"))?,
+                etag, total,
+            }, copied)))
+        })
+    }
+
     /// Append at an exact offset, in bounded chunks. A new zero-offset checkpoint
     /// atomically replaces the prior representation. Source/attempt/quota checks
     /// precede all writes; a late task cannot recreate a removed source.
@@ -74,7 +126,7 @@ impl SqliteAccountStorage {
         if bytes.is_empty()
             || bytes.len() > ATTACHMENT_CHECKPOINT_BYTES
             || end > identity.total
-            || identity.total > MAX_RETAINED_ATTACHMENT_BYTES as u64
+            || identity.total > MAX_RETAINED_FILE_ATTACHMENT_BYTES
             || identity.etag.len() > 1024
             || !identity.etag.starts_with('"')
             || !identity.etag.ends_with('"')
@@ -250,12 +302,17 @@ impl SqliteAccountStorage {
             if expiry <= now
                 || total > max_bytes
                 || received > total
-                || total > MAX_RETAINED_ATTACHMENT_BYTES as u64
+                || total > MAX_RETAINED_FILE_ATTACHMENT_BYTES
             {
                 discard()?;
                 return Ok(None);
             }
             if expected.is_some_and(|(c, l)| cipher != c || locator != l) {
+                return Ok(None);
+            }
+            // The legacy array API cannot restore a large prefix. Leave it
+            // intact for the file-backed API rather than destroying resumability.
+            if total > MAX_RETAINED_ATTACHMENT_BYTES as u64 {
                 return Ok(None);
             }
             let mut stmt = conn

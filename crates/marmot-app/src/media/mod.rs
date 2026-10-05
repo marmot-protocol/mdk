@@ -22,6 +22,11 @@ use cgka_traits::SecretBytes;
 
 mod blossom;
 mod crypto;
+#[cfg(test)]
+pub(crate) use blossom::fetch_blossom_file_with_transport;
+#[cfg(test)]
+pub(crate) use crypto::{derive_media_file_key, media_aad};
+pub(crate) mod file_transfer;
 pub(crate) use crypto::media_hash_from_reference;
 mod group_image;
 mod host_safety;
@@ -30,9 +35,11 @@ use blossom::{
     blossom_content_hash_from_url, upload_blossom_blob, upload_blossom_blob_with_content_type,
 };
 use crypto::{
-    canonical_media_type_v1, canonical_media_type_v2, derive_media_file_key, media_aad,
-    media_nonce_from_reference, validate_sha256_hex,
+    canonical_media_type_v1, canonical_media_type_v2, media_nonce_from_reference,
+    validate_sha256_hex,
 };
+#[cfg(not(test))]
+use crypto::{derive_media_file_key, media_aad};
 pub(crate) use host_safety::parse_profile_image_fetch_url;
 use host_safety::{validate_blossom_fetch_url, validate_locator};
 
@@ -1032,6 +1039,8 @@ pub(crate) enum AttachmentDownloadFailure {
     Retry(AppError),
     Stop(AppError),
     SizeLimit(AppError, u64),
+    /// Explicit acquisitions select a file sink before buffering a large body.
+    FileRequired,
 }
 impl From<AppError> for AttachmentDownloadFailure {
     fn from(error: AppError) -> Self {
@@ -1042,6 +1051,9 @@ impl AttachmentDownloadFailure {
     pub(crate) fn into_error(self) -> AppError {
         match self {
             Self::Retry(error) | Self::Stop(error) | Self::SizeLimit(error, _) => error,
+            Self::FileRequired => {
+                AppError::MediaDownloadFailed("file-backed download required".into())
+            }
         }
     }
 }
@@ -1379,6 +1391,9 @@ async fn fetch_encrypted_media_blob_classified(
             }
             Err(err) => {
                 match &err {
+                    AttachmentDownloadFailure::FileRequired => {
+                        return Err(AttachmentDownloadFailure::FileRequired);
+                    }
                     AttachmentDownloadFailure::SizeLimit(_, limit) => size_failure = Some(*limit),
                     AttachmentDownloadFailure::Stop(_) => terminal_failure = true,
                     AttachmentDownloadFailure::Retry(AppError::UnsafeMediaFetch(_)) => {}

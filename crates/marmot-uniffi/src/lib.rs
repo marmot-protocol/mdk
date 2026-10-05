@@ -92,6 +92,7 @@ pub use conversions::{
     LocalPushRegistrationDebugFfi, MaintenanceObligationFfi, MaintenancePhaseFfi,
     MaintenanceTriggerFfi, MediaAttachmentOutcomeFfi, MediaAttachmentReferenceFfi,
     MediaAttachmentRejectionFfi, MediaAttachmentRejectionKindFfi, MediaDownloadResultFfi,
+    MediaFileTransferControlFfi, MediaFileUploadAttachmentRequestFfi, MediaFileUploadRequestFfi,
     MediaLocatorFfi, MediaRecordFfi, MediaUploadAttachmentRequestFfi,
     MediaUploadAttachmentResultFfi, MediaUploadRequestFfi, MediaUploadResultFfi,
     MessageDraftAttachmentFfi, MessageDraftAttachmentSummaryFfi, MessageDraftFfi,

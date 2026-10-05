@@ -1,5 +1,16 @@
 use super::*;
 use crate::local_submissions::LocalMessageRequest;
+use std::sync::Arc;
+
+/// Reject a malformed token before any upload work, not after the PUT.
+fn validate_client_token(client_token: &str) -> Result<(), AppError> {
+    if client_token.is_empty() || client_token.len() > 128 {
+        return Err(AppError::InvalidAppMessagePayload(
+            "client token must contain 1 to 128 UTF-8 bytes".into(),
+        ));
+    }
+    Ok(())
+}
 
 impl MarmotAppRuntime {
     /// Upload first, then durably admit the resulting message when `send` is set.
@@ -11,11 +22,7 @@ impl MarmotAppRuntime {
         mut request: MediaUploadRequest,
         client_token: String,
     ) -> Result<(MediaUploadResult, Option<crate::LocalSendAcceptance>), AppError> {
-        if client_token.is_empty() || client_token.len() > 128 {
-            return Err(AppError::InvalidAppMessagePayload(
-                "client token must contain 1 to 128 UTF-8 bytes".into(),
-            ));
-        }
+        validate_client_token(&client_token)?;
         let runtime = self.clone();
         let account = account.to_owned();
         let group = group.clone();
@@ -24,58 +31,115 @@ impl MarmotAppRuntime {
             request.send = false;
             let caption = request.caption.clone();
             let upload = runtime.upload_media(&account, &group, request).await?;
-            let accepted = if send {
-                let submission = runtime
-                    .submit_media_attachments(
-                        &account,
-                        &group,
-                        upload
-                            .attachments
-                            .iter()
-                            .map(|a| a.reference.clone())
-                            .collect(),
-                        caption,
-                        client_token,
-                    )
-                    .await;
-                match submission {
-                    Ok(accepted) => Some(accepted),
-                    Err(error) => {
-                        let cleanup = (|| -> Result<(), AppError> {
-                            let resolved = runtime.accounts.resolve(&account)?;
-                            let slots = upload
-                                .attachments
-                                .iter()
-                                .map(|a| {
-                                    serde_json::to_value(a.reference.imeta_tag()).map_err(|_| {
-                                        AppError::InvalidEncryptedMedia(
-                                            "invalid upload descriptor".into(),
-                                        )
-                                    })
-                                })
-                                .collect::<Result<Vec<_>, _>>()?;
-                            runtime
-                                .accounts
-                                .app
-                                .account_storage(&resolved.label)?
-                                .abandon_bound_attachment_uploads(
-                                    &hex::encode(group.as_slice()),
-                                    &slots,
-                                )?;
-                            Ok(())
-                        })();
-                        return Err(crate::client::preserve_encrypted_media_upload_error(
-                            error, cleanup,
-                        ));
-                    }
-                }
-            } else {
-                None
-            };
-            Ok((upload, accepted))
+            runtime
+                .admit_uploaded_media(&account, &group, upload, send, caption, client_token, None)
+                .await
         })
         .await
         .map_err(|_| AppError::TransportClosed)?
+    }
+
+    /// File-backed twin of [`Self::upload_media_with_client_token`]. Snapshots
+    /// and ciphertext are prepared from `source_path` before any PUT; nothing
+    /// is admitted until every upload completed. Cancelling `control` before
+    /// durable admission prevents publication and releases optional staging;
+    /// once admission starts it is not interruptible, and the existing durable
+    /// queue then owns delivery (including uncertain-delivery recovery).
+    pub async fn upload_media_files_with_client_token(
+        &self,
+        account: &str,
+        group: &GroupId,
+        mut request: crate::MediaFileUploadRequest,
+        control: Arc<crate::MediaFileTransferControl>,
+        client_token: String,
+    ) -> Result<(MediaUploadResult, Option<crate::LocalSendAcceptance>), AppError> {
+        validate_client_token(&client_token)?;
+        control.check()?;
+        let runtime = self.clone();
+        let account = account.to_owned();
+        let group = group.clone();
+        tokio::spawn(async move {
+            let send = request.send;
+            request.send = false;
+            let caption = request.caption.clone();
+            let upload = runtime
+                .upload_media_files(&account, &group, request, control.clone())
+                .await?;
+            runtime
+                .admit_uploaded_media(
+                    &account,
+                    &group,
+                    upload,
+                    send,
+                    caption,
+                    client_token,
+                    Some(control),
+                )
+                .await
+        })
+        .await
+        .map_err(|_| AppError::TransportClosed)?
+    }
+
+    /// Durable token admission after a completed upload. Shared validation in
+    /// admission rejects a reference whose source epoch is no longer current.
+    /// Any failure before acceptance releases the exact bound staging.
+    #[allow(clippy::too_many_arguments)]
+    async fn admit_uploaded_media(
+        &self,
+        account: &str,
+        group: &GroupId,
+        upload: MediaUploadResult,
+        send: bool,
+        caption: Option<String>,
+        client_token: String,
+        control: Option<Arc<crate::MediaFileTransferControl>>,
+    ) -> Result<(MediaUploadResult, Option<crate::LocalSendAcceptance>), AppError> {
+        if !send {
+            return Ok((upload, None));
+        }
+        let submission = match control.as_ref().map(|control| control.check()) {
+            Some(Err(cancelled)) => Err(cancelled),
+            _ => {
+                self.submit_media_attachments(
+                    account,
+                    group,
+                    upload
+                        .attachments
+                        .iter()
+                        .map(|a| a.reference.clone())
+                        .collect(),
+                    caption,
+                    client_token,
+                )
+                .await
+            }
+        };
+        match submission {
+            Ok(accepted) => Ok((upload, Some(accepted))),
+            Err(error) => {
+                let cleanup = (|| -> Result<(), AppError> {
+                    let resolved = self.accounts.resolve(account)?;
+                    let slots = upload
+                        .attachments
+                        .iter()
+                        .map(|a| {
+                            serde_json::to_value(a.reference.imeta_tag()).map_err(|_| {
+                                AppError::InvalidEncryptedMedia("invalid upload descriptor".into())
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    self.accounts
+                        .app
+                        .account_storage(&resolved.label)?
+                        .abandon_bound_attachment_uploads(&hex::encode(group.as_slice()), &slots)?;
+                    Ok(())
+                })();
+                Err(crate::client::preserve_encrypted_media_upload_error(
+                    error, cleanup,
+                ))
+            }
+        }
     }
 
     pub fn local_send_status(

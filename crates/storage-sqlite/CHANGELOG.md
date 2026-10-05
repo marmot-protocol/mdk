@@ -8,6 +8,20 @@
   `SqliteAccountStorage::in_memory_from_migrated_template`, which copies one
   migrated in-memory database per process instead of replaying every migration
   for each open. Harnesses that open thousands of databases use it.
+- Migration 0102 adds `outgoing_attachment_upload_bodies`, a narrow
+  never-updated body table for file-backed outgoing staging.
+  `SqliteAccountStorage::stage_attachment_upload_files` stages
+  `AttachmentUploadSource` readers and
+  `complete_attachment_acquisition_from_reader` publishes authenticated
+  plaintext readers; both write through `zeroblob` reservations and
+  incremental BLOB I/O in `ATTACHMENT_STAGING_CHUNK_BYTES` (64 KiB) chunks,
+  verify length and digest, and roll back on short, growing, mismatched or
+  cancelled input. Outgoing promotion now copies staged bodies into retained
+  bytes through the same bounded path instead of `INSERT ... SELECT`. Bodies
+  use `MAX_RETAINED_FILE_ATTACHMENT_BYTES` (900 MiB); legacy arrays retain
+  `MAX_RETAINED_ATTACHMENT_BYTES` (512 MiB). Migrations 0103/0104 preserve
+  retained bodies and ciphertext checkpoints while widening file-backed
+  representation bounds, without increasing user quotas. (#2175)
 
 ## 0.12.0 - 2026-10-02
 

@@ -248,7 +248,7 @@ impl AttachmentResume {
         .map_err(|_| retry("partial checkpoint cleanup failed"))?;
         Ok(())
     }
-    async fn save(
+    pub(super) async fn save(
         &self,
         identity: AttachmentPartialIdentity,
         offset: usize,
@@ -281,6 +281,44 @@ impl AttachmentResume {
             return Err(retry("partial checkpoint no longer admitted"));
         }
         Ok(())
+    }
+
+    pub(crate) async fn load_file(
+        &self,
+        url: &url::Url,
+        max: u64,
+        directory: std::path::PathBuf,
+    ) -> Result<
+        Option<(
+            super::file_transfer::PrivateMediaFile,
+            AttachmentPartialIdentity,
+        )>,
+        AttachmentDownloadFailure,
+    > {
+        let this = self.clone();
+        let locator_digest: [u8; 32] = Sha256::digest(url.as_str().as_bytes()).into();
+        tokio::task::spawn_blocking(move || {
+            let mut file = super::file_transfer::PrivateMediaFile::create(&directory)?;
+            let mut writer = file.writer()?;
+            let part = this
+                .storage
+                .load_attachment_partial_to_writer(
+                    &this.job,
+                    crate::unix_now_seconds(),
+                    max,
+                    (&this.ciphertext_digest, &locator_digest),
+                    &mut writer,
+                )
+                .map_err(|_| retry("partial file checkpoint unavailable"))?;
+            if let Some((identity, received)) = part {
+                file.len = received;
+                Ok(Some((file, identity)))
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+        .map_err(|_| retry("partial file checkpoint task failed"))?
     }
 }
 

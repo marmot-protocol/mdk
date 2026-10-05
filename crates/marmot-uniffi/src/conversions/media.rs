@@ -292,6 +292,113 @@ impl From<MediaUploadRequestFfi> for MediaUploadRequest {
     }
 }
 
+/// One host-local file attachment. `source_path` names a regular file the
+/// process can open (not a symlink); it is snapshotted privately before any
+/// upload and never enters message tags. `expected_size`, when set, must equal
+/// the opened file's length. Debug output omits every field.
+#[derive(Clone, uniffi::Record)]
+pub struct MediaFileUploadAttachmentRequestFfi {
+    pub source_path: String,
+    pub expected_size: Option<u64>,
+    pub file_name: String,
+    pub media_type: String,
+    pub dim: Option<String>,
+    pub thumbhash: Option<String>,
+}
+
+impl std::fmt::Debug for MediaFileUploadAttachmentRequestFfi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaFileUploadAttachmentRequestFfi")
+            .finish_non_exhaustive()
+    }
+}
+
+impl From<MediaFileUploadAttachmentRequestFfi> for marmot_app::MediaFileUploadAttachmentRequest {
+    fn from(value: MediaFileUploadAttachmentRequestFfi) -> Self {
+        Self {
+            source_path: value.source_path,
+            expected_size: value.expected_size,
+            file_name: value.file_name,
+            media_type: value.media_type,
+            dim: value.dim,
+            thumbhash: value.thumbhash,
+        }
+    }
+}
+
+/// File-backed counterpart of `MediaUploadRequestFfi`, bounded by
+/// `max_file_media_ciphertext_bytes()` per batch.
+#[derive(Clone, uniffi::Record)]
+pub struct MediaFileUploadRequestFfi {
+    pub attachments: Vec<MediaFileUploadAttachmentRequestFfi>,
+    pub caption: Option<String>,
+    pub send: bool,
+    pub blossom_server: Option<String>,
+    /// Extra tags on the sent kind-9, e.g. NIP-30 `emoji`. `imeta` is rejected.
+    #[uniffi(default = [])]
+    pub message_tags: Vec<Vec<String>>,
+}
+
+impl std::fmt::Debug for MediaFileUploadRequestFfi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaFileUploadRequestFfi")
+            .field("attachments", &self.attachments.len())
+            .field("send", &self.send)
+            .finish_non_exhaustive()
+    }
+}
+
+impl From<MediaFileUploadRequestFfi> for marmot_app::MediaFileUploadRequest {
+    fn from(value: MediaFileUploadRequestFfi) -> Self {
+        Self {
+            attachments: value.attachments.into_iter().map(Into::into).collect(),
+            caption: value.caption,
+            send: value.send,
+            blossom_server: value.blossom_server,
+            message_tags: value.message_tags,
+        }
+    }
+}
+
+/// Cancellation and progress for one file-backed media operation. Create one
+/// per operation; `processed_bytes` is monotonic across snapshot, encryption
+/// and body transfer and is not a percentage. Cancelling before durable
+/// message admission prevents publication; after admission it has no effect
+/// and delivery follows the normal local-send status.
+#[derive(uniffi::Object)]
+pub struct MediaFileTransferControlFfi {
+    pub(crate) inner: std::sync::Arc<marmot_app::MediaFileTransferControl>,
+}
+
+#[uniffi::export]
+impl MediaFileTransferControlFfi {
+    #[uniffi::constructor]
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            inner: std::sync::Arc::default(),
+        })
+    }
+
+    pub fn cancel(&self) {
+        self.inner.cancel();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
+    pub fn processed_bytes(&self) -> u64 {
+        self.inner.processed_bytes()
+    }
+}
+
+/// Per-batch ciphertext ceiling for file-backed uploads. Larger files are
+/// refused before preparation; this is an implementation bound, not protocol.
+#[uniffi::export]
+pub fn max_file_media_ciphertext_bytes() -> u64 {
+    marmot_app::MAX_FILE_MEDIA_CIPHERTEXT_BYTES
+}
+
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct MediaUploadAttachmentResultFfi {
     pub reference: MediaAttachmentReferenceFfi,
@@ -419,6 +526,50 @@ pub(crate) fn timeline_media_outcomes_ffi(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_upload_request_conversion_is_lossless_and_debug_hides_paths() {
+        let request = MediaFileUploadRequestFfi {
+            attachments: vec![MediaFileUploadAttachmentRequestFfi {
+                source_path: "/private/generated/source.bin".into(),
+                expected_size: Some(9),
+                file_name: "generated.bin".into(),
+                media_type: "application/octet-stream".into(),
+                dim: Some("1x1".into()),
+                thumbhash: None,
+            }],
+            caption: Some("caption".into()),
+            send: true,
+            blossom_server: None,
+            message_tags: vec![vec!["t".into(), "x".into()]],
+        };
+        let debug = format!("{request:?} {:?}", request.attachments[0]);
+        assert!(!debug.contains("/private/generated") && !debug.contains("generated.bin"));
+        let app: marmot_app::MediaFileUploadRequest = request.into();
+        let attachment = &app.attachments[0];
+        assert_eq!(attachment.source_path, "/private/generated/source.bin");
+        assert_eq!(attachment.expected_size, Some(9));
+        assert_eq!(attachment.dim.as_deref(), Some("1x1"));
+        assert!(app.send);
+        assert_eq!(app.message_tags, vec![vec!["t".to_owned(), "x".to_owned()]]);
+    }
+
+    #[test]
+    fn file_transfer_control_cancels_and_reports_progress() {
+        let control = MediaFileTransferControlFfi::new();
+        assert!(!control.is_cancelled());
+        assert_eq!(control.processed_bytes(), 0);
+        control.cancel();
+        assert!(control.is_cancelled());
+        assert!(
+            control.inner.is_cancelled(),
+            "the app runtime observes the same token"
+        );
+        assert_eq!(
+            max_file_media_ciphertext_bytes(),
+            marmot_app::MAX_FILE_MEDIA_CIPHERTEXT_BYTES
+        );
+    }
 
     fn imeta_tag(byte: u8, media_type: &str, file_name: &str, extra: &[&str]) -> Vec<String> {
         let mut tag = vec![

@@ -108,7 +108,12 @@ def subscription_coverage() -> set[str]:
     strict form would need per-handle typing for no added drift signal.
     """
     src = _c_source()
-    return set(re.findall(r"\.(\w+)\(", src)) | set(re.findall(r"read(\w+),", src))
+    return (set(re.findall(r"\.(\w+)\(", src))
+            | set(re.findall(r"read(\w+),", src))
+            # Handle constructors are static calls, not .new() methods.
+            # Keep the type qualifier so another type's new cannot hide drift.
+            | {f"{handle}::{method}" for handle, method in
+               re.findall(r"\b(\w+)::(\w+)\(", src)})
 
 
 def main() -> int:
@@ -117,7 +122,7 @@ def main() -> int:
     sub_covered = subscription_coverage()
     def mirrored(name: str) -> bool:
         handle, sep, method = name.rpartition("::")
-        return method in sub_covered if sep else name in covered
+        return (name in sub_covered or method in sub_covered) if sep else name in covered
 
     missing = sorted(n for n in exports if not mirrored(n))
 

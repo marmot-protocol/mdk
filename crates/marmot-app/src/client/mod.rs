@@ -145,7 +145,7 @@ impl PendingWelcomeDeliveryRecovery {
 }
 
 pub(crate) struct EncryptedMediaUploadHttp {
-    request: MediaUploadRequest,
+    request: crate::media::file_transfer::MediaUploadPayload,
     source_epoch: u64,
     media_secret: SecretBytes,
     nostr_signer: Arc<dyn MarmotNostrSigner>,
@@ -161,8 +161,29 @@ pub(crate) struct EncryptedMediaUploadHttp {
 
 impl EncryptedMediaUploadHttp {
     pub(crate) async fn run(self) -> Result<(MediaUploadResult, Vec<Vec<u8>>), AppError> {
+        let request = match self.request {
+            crate::media::file_transfer::MediaUploadPayload::Files(request, control) => {
+                return run_file_upload(
+                    request,
+                    control,
+                    self.source_epoch,
+                    self.media_secret,
+                    self.nostr_signer,
+                    self.version,
+                    self.default_endpoints,
+                    self.allowed_locator_kinds,
+                    self.allow_loopback_http,
+                    self.transport,
+                    self.retention_app,
+                    self.retention_account,
+                    self.retention_group,
+                )
+                .await;
+            }
+            crate::media::file_transfer::MediaUploadPayload::Bytes(request) => request,
+        };
         let (result, plaintext) = upload_encrypted_media_retaining(
-            self.request,
+            request,
             self.source_epoch,
             self.media_secret.as_ref(),
             self.nostr_signer.as_ref(),
@@ -205,6 +226,9 @@ pub(crate) struct EncryptedMediaUploadFinish {
     should_send: bool,
     caption: Option<String>,
     message_tags: Vec<Vec<String>>,
+    /// File-backed uploads only: a cancellation observed before message
+    /// admission prevents publication. Admission itself is not interruptible.
+    control: Option<Arc<crate::MediaFileTransferControl>>,
 }
 
 /// Preserve the primary upload/admission failure when orphan cleanup also fails.
@@ -285,6 +309,176 @@ fn stage_uploaded_media(
     })
 }
 
+/// Network-only file-backed upload job. It owns everything it needs so the
+/// account worker keeps polling; publication stays in the finish phase. Every
+/// snapshot is prepared before the first PUT. A cancellation observed after
+/// HTTP completes skips optional retention, abandons anything staged and
+/// prevents publication; nothing has been admitted at that point.
+#[allow(clippy::too_many_arguments)]
+async fn run_file_upload(
+    request: crate::MediaFileUploadRequest,
+    control: Arc<crate::MediaFileTransferControl>,
+    source_epoch: u64,
+    media_secret: SecretBytes,
+    nostr_signer: Arc<dyn MarmotNostrSigner>,
+    version: EncryptedMediaVersion,
+    default_endpoints: Vec<AppBlobEndpoint>,
+    allowed_locator_kinds: Vec<String>,
+    allow_loopback_http: bool,
+    transport: BlossomHttpTransport,
+    app: MarmotApp,
+    account: String,
+    group: GroupId,
+) -> Result<(MediaUploadResult, Vec<Vec<u8>>), AppError> {
+    let directory = crate::media::file_transfer::media_staging_directory(&app, &account);
+    let (result, plaintext) = crate::media::file_transfer::upload_files_retaining(
+        request,
+        source_epoch,
+        media_secret.as_ref(),
+        nostr_signer.as_ref(),
+        MediaOperationPolicy {
+            version,
+            default_endpoints: &default_endpoints,
+            allowed_locator_kinds: &allowed_locator_kinds,
+            allow_loopback_http,
+        },
+        &transport,
+        directory,
+        control.clone(),
+    )
+    .await?;
+    control.check()?;
+    let descriptors = result.clone();
+    let staging_app = app.clone();
+    let staging_account = account.clone();
+    let staging_control = control.clone();
+    let staged = tokio::task::spawn_blocking(move || {
+        let staged = stage_uploaded_media_files(
+            &staging_app,
+            &staging_account,
+            &group,
+            source_epoch,
+            &descriptors,
+            &plaintext,
+            &staging_control,
+        );
+        // Private snapshots are removed on this blocking thread, not the runtime.
+        drop(plaintext);
+        staged
+    })
+    .await;
+    let tokens = match staged {
+        Ok(Ok(tokens)) => tokens,
+        _ => {
+            tracing::warn!(target: "marmot_app::media", method = "outgoing_retention_stage",
+                "optional outgoing file retention unavailable");
+            Vec::new()
+        }
+    };
+    if let Err(error) = control.check() {
+        let cleanup = app.account_storage(&account).and_then(|storage| {
+            storage
+                .abandon_attachment_uploads(&tokens)
+                .map_err(AppError::from)
+        });
+        return Err(preserve_encrypted_media_upload_error(error, cleanup));
+    }
+    Ok((result, tokens))
+}
+
+/// File-backed twin of [`stage_uploaded_media`]: the same prune, quota, disk
+/// reserve and atomic stage+bind transaction, but each body streams from its
+/// private snapshot in bounded chunks. The exact uploaded `imeta` descriptors
+/// are bound; a descriptor whose plaintext digest differs from its snapshot is
+/// refused before any write. Refusal affects optional retention only.
+fn stage_uploaded_media_files(
+    app: &MarmotApp,
+    account: &str,
+    group: &GroupId,
+    source_epoch: u64,
+    result: &MediaUploadResult,
+    plaintext: &[crate::media::file_transfer::PrivateMediaFile],
+    control: &crate::MediaFileTransferControl,
+) -> Result<Vec<Vec<u8>>, AppError> {
+    control.check()?;
+    let storage = app.account_storage(account)?;
+    let now = crate::unix_now_seconds();
+    if storage.prune_attachment_uploads(now, 64).is_err() {
+        tracing::warn!(target: "marmot_app::media", method = "outgoing_retention_prune",
+                "optional outgoing retention cleanup deferred");
+    }
+    if plaintext.len() != result.attachments.len() {
+        return Err(AppError::InvalidEncryptedMedia(
+            "outgoing retention buffer unavailable".into(),
+        ));
+    }
+    if plaintext
+        .iter()
+        .any(|file| file.len > storage_sqlite::MAX_RETAINED_FILE_ATTACHMENT_BYTES)
+    {
+        return Err(AppError::InvalidEncryptedMedia(
+            "outgoing retention exceeds storage bound".into(),
+        ));
+    }
+    let policy = storage.attachment_download_policy(
+        &crate::runtime::attachment_controls::default_policy(&app.config),
+    )?;
+    let total = plaintext
+        .iter()
+        .fold(0u64, |total, file| total.saturating_add(file.len));
+    if fs4::available_space(app.account_dir(account)).unwrap_or(0)
+        < policy.disk_reserve.saturating_add(total.saturating_mul(4))
+    {
+        return Err(AppError::InvalidEncryptedMedia(
+            "outgoing retention disk reserve unavailable".into(),
+        ));
+    }
+    let slots = result
+        .attachments
+        .iter()
+        .zip(plaintext)
+        .map(|(attachment, file)| {
+            let digest = crate::media::media_hash_from_reference(&attachment.reference)?;
+            if digest != file.digest {
+                return Err(AppError::InvalidEncryptedMedia(
+                    "outgoing retention descriptor mismatch".into(),
+                ));
+            }
+            Ok((
+                serde_json::to_value(attachment.reference.imeta_tag()).map_err(|_| {
+                    AppError::InvalidEncryptedMedia("invalid upload descriptor".into())
+                })?,
+                digest,
+            ))
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    let mut readers = plaintext
+        .iter()
+        .map(|file| file.reader())
+        .collect::<Result<Vec<_>, AppError>>()?;
+    let mut sources = readers
+        .iter_mut()
+        .zip(plaintext)
+        .map(|(reader, file)| storage_sqlite::AttachmentUploadSource {
+            reader: reader as &mut dyn std::io::Read,
+            len: file.len,
+            digest: file.digest,
+        })
+        .collect::<Vec<_>>();
+    cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+        let tokens = storage.stage_attachment_upload_files(
+            &hex::encode(group.as_slice()),
+            source_epoch,
+            &mut sources,
+            now,
+            policy.retained_bytes,
+            &|| control.is_cancelled(),
+        )?;
+        storage.bind_attachment_uploads(&tokens, &slots)?;
+        Ok::<_, AppError>(tokens)
+    })
+}
+
 pub(crate) struct EncryptedMediaDownloadHttp {
     reference: MediaAttachmentReference,
     media_secret: SecretBytes,
@@ -293,7 +487,54 @@ pub(crate) struct EncryptedMediaDownloadHttp {
     transport: BlossomHttpTransport,
 }
 
+pub(crate) enum AcquiredMediaBody {
+    Memory(MediaDownloadResult),
+    File(crate::media::file_transfer::PrivateMediaFile),
+}
+
 impl EncryptedMediaDownloadHttp {
+    pub(crate) async fn run_acquisition(
+        self,
+        resume: crate::media::attachment_resume::AttachmentResume,
+    ) -> Result<AcquiredMediaBody, crate::media::AttachmentDownloadFailure> {
+        let reference = self.reference.clone();
+        let secret = self.media_secret.clone();
+        let endpoints = self.default_blob_endpoints.clone();
+        let kinds = self.allowed_locator_kinds.clone();
+        let transport = self.transport.clone();
+        let directory = resume.directory.join("media-staging");
+        let result = self.run_classified(resume.clone()).await;
+        match result {
+            Ok(result) => Ok(AcquiredMediaBody::Memory(result)),
+            Err(crate::media::AttachmentDownloadFailure::FileRequired) => {
+                let control = Arc::new(crate::MediaFileTransferControl::default());
+                struct CancelOnDrop(Arc<crate::MediaFileTransferControl>);
+                impl Drop for CancelOnDrop {
+                    fn drop(&mut self) {
+                        self.0.cancel();
+                    }
+                }
+                let _cancel = CancelOnDrop(control.clone());
+                resume.phase(0).await?;
+                let file = crate::media::file_transfer::download_file(
+                    reference,
+                    secret.as_ref(),
+                    &endpoints,
+                    &kinds,
+                    &transport,
+                    directory,
+                    crate::MAX_FILE_MEDIA_CIPHERTEXT_BYTES,
+                    control,
+                    Arc::new(resume.clone()),
+                )
+                .await?;
+                resume.progress(file.len, Some(file.len), false).await?;
+                resume.completed_body(file.len as usize).await?;
+                Ok(AcquiredMediaBody::File(file))
+            }
+            Err(error) => Err(error),
+        }
+    }
     pub(crate) async fn run_classified(
         self,
         resume: crate::media::attachment_resume::AttachmentResume,
@@ -4993,6 +5234,18 @@ impl AppClient {
         group_id: &GroupId,
         request: MediaUploadRequest,
     ) -> Result<(EncryptedMediaUploadHttp, EncryptedMediaUploadFinish), AppError> {
+        self.prepare_encrypted_media_upload_payload(
+            group_id,
+            crate::media::file_transfer::MediaUploadPayload::Bytes(request),
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_encrypted_media_upload_payload(
+        &mut self,
+        group_id: &GroupId,
+        request: crate::media::file_transfer::MediaUploadPayload,
+    ) -> Result<(EncryptedMediaUploadHttp, EncryptedMediaUploadFinish), AppError> {
         self.ensure_group_application_messages_allowed(group_id)?;
         self.sync_runtime_groups().await?;
         let policy = self.encrypted_media_policy_for_group(group_id)?;
@@ -5017,7 +5270,7 @@ impl AppClient {
                 "group policy has no usable Blossom endpoint for upload".into(),
             ));
         }
-        let has_explicit_server = request.blossom_server.is_some();
+        let has_explicit_server = request.server().is_some();
         let default_endpoints = if has_explicit_server {
             Vec::new()
         } else {
@@ -5040,11 +5293,17 @@ impl AppClient {
         let (source_epoch, media_secret) = self.encrypted_media_secret(group_id)?;
         let account = self.app.account_home().account(&self.state.label)?;
         let signer = self.app.account_signer_for_summary(&account)?;
-        crate::messages::validate_message_tags(&request.message_tags)?;
-        let message_tags = request.message_tags.clone();
-        let should_send = request.send;
-        let caption = request.caption.clone();
-        crate::media::validate_media_upload_batch(&request.attachments)?;
+        crate::messages::validate_message_tags(request.tags())?;
+        let message_tags = request.tags().to_vec();
+        let should_send = request.send();
+        let caption = request.caption().clone();
+        request.validate()?;
+        let control = match &request {
+            crate::media::file_transfer::MediaUploadPayload::Files(_, control) => {
+                Some(control.clone())
+            }
+            crate::media::file_transfer::MediaUploadPayload::Bytes(_) => None,
+        };
         Ok((
             EncryptedMediaUploadHttp {
                 request,
@@ -5067,6 +5326,7 @@ impl AppClient {
                 should_send,
                 caption,
                 message_tags,
+                control,
             },
         ))
     }
@@ -5080,6 +5340,20 @@ impl AppClient {
     ) -> Result<MediaUploadResult, AppError> {
         if !finish.should_send {
             return Ok(result);
+        }
+        if let Some(control) = &finish.control
+            && let Err(error) = control.check()
+        {
+            return Err(preserve_encrypted_media_upload_error(
+                error,
+                self.app
+                    .account_storage(&self.state.label)
+                    .and_then(|storage| {
+                        storage
+                            .abandon_attachment_uploads(&upload_tokens)
+                            .map_err(AppError::from)
+                    }),
+            ));
         }
         let attachments = result
             .attachments

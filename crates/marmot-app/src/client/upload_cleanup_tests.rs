@@ -12,6 +12,7 @@ fn finish() -> EncryptedMediaUploadFinish {
         should_send: true,
         caption: None,
         message_tags: Vec::new(),
+        control: None,
     }
 }
 
@@ -157,6 +158,215 @@ async fn upload_endpoint() -> (
         }
     });
     (url, puts, task)
+}
+
+/// File-backed direct and durable-token sends upload once, stage through the
+/// bounded body table, bind the exact descriptor and promote to retained bytes
+/// that read back in bounded ranges. No private snapshot survives the send.
+#[tokio::test]
+async fn file_backed_sends_retain_bounded_bodies_and_publish_once() {
+    for token_send in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example",
+            crate::MarmotAppConfig::default().with_allow_loopback_blob_endpoints(true),
+        )
+        .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group = client
+            .create_group("generated file retention", &[])
+            .await
+            .unwrap();
+        let group_hex = hex::encode(group.as_slice());
+        drop(client);
+        let connection = fault_connection(&app);
+        let (url, puts, server) = upload_endpoint().await;
+        let source_dir = tempfile::tempdir().unwrap();
+        let plain = (0..(200 * 1024 + 3))
+            .map(|i| (i % 249) as u8)
+            .collect::<Vec<_>>();
+        let path = source_dir.path().join("generated.bin");
+        std::fs::write(&path, &plain).unwrap();
+        let request = crate::MediaFileUploadRequest {
+            attachments: vec![crate::MediaFileUploadAttachmentRequest {
+                source_path: path.to_string_lossy().into_owned(),
+                expected_size: Some(plain.len() as u64),
+                file_name: "generated.bin".into(),
+                media_type: "application/octet-stream".into(),
+                dim: None,
+                thumbhash: None,
+            }],
+            caption: None,
+            send: true,
+            blossom_server: Some(url.clone()),
+            message_tags: Vec::new(),
+        };
+        let runtime = crate::MarmotAppRuntime::new(app.clone());
+        let control = Arc::new(crate::MediaFileTransferControl::default());
+        let id = if token_send {
+            runtime
+                .upload_media_files_with_client_token(
+                    "alice",
+                    &group,
+                    request,
+                    control.clone(),
+                    "generated-file".into(),
+                )
+                .await
+                .unwrap()
+                .1
+                .unwrap()
+                .message_id_hex
+        } else {
+            runtime
+                .upload_media_files("alice", &group, request, control.clone())
+                .await
+                .unwrap()
+                .sent
+                .unwrap()
+                .message_ids[0]
+                .clone()
+        };
+        assert!(control.processed_bytes() >= plain.len() as u64);
+        let asset = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let source = runtime
+                    .timeline_message("alice", &group_hex, &id)
+                    .unwrap()
+                    .and_then(|row| row.source_message_id_hex);
+                if let Some(source) = source {
+                    let target = crate::AttachmentLocalTarget {
+                        message_id_hex: id.clone(),
+                        source_message_id_hex: source,
+                        attachment_index: 0,
+                    };
+                    if let Some(asset) = runtime
+                        .attachment_local_assets("alice", &group, vec![target])
+                        .await
+                        .unwrap()
+                        .remove(0)
+                    {
+                        break asset;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(asset.byte_count, plain.len() as u64);
+        let mut copied = Vec::new();
+        while copied.len() < plain.len() {
+            let chunk = runtime
+                .read_attachment_asset(
+                    "alice",
+                    asset.reference.clone(),
+                    copied.len() as u64,
+                    64 * 1024,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!chunk.is_empty());
+            copied.extend_from_slice(&chunk);
+        }
+        assert_eq!(copied, plain, "token={token_send}");
+        assert_eq!(puts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM outgoing_attachment_upload_bodies",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0,
+            "promotion consumed the staged body"
+        );
+        let staging = crate::media::file_transfer::media_staging_directory(&app, "alice");
+        assert_eq!(
+            std::fs::read_dir(&staging)
+                .map(|entries| entries.count())
+                .unwrap_or(0),
+            0,
+            "no private snapshot survives"
+        );
+        runtime.shutdown_and_close().await.unwrap();
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+}
+
+/// A cancelled control refuses before any worker or network work.
+#[tokio::test]
+async fn cancelled_file_upload_is_refused_without_upload_or_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        crate::MarmotAppConfig::default().with_allow_loopback_blob_endpoints(true),
+    )
+    .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = client.create_group("generated cancel", &[]).await.unwrap();
+    drop(client);
+    let (url, puts, server) = upload_endpoint().await;
+    let source_dir = tempfile::tempdir().unwrap();
+    let path = source_dir.path().join("generated.bin");
+    std::fs::write(&path, [9u8; 4096]).unwrap();
+    let runtime = crate::MarmotAppRuntime::new(app);
+    let control = Arc::new(crate::MediaFileTransferControl::default());
+    control.cancel();
+    let request = crate::MediaFileUploadRequest {
+        attachments: vec![crate::MediaFileUploadAttachmentRequest {
+            source_path: path.to_string_lossy().into_owned(),
+            expected_size: Some(4096),
+            file_name: "generated.bin".into(),
+            media_type: "application/octet-stream".into(),
+            dim: None,
+            thumbhash: None,
+        }],
+        caption: None,
+        send: true,
+        blossom_server: Some(url),
+        message_tags: Vec::new(),
+    };
+    assert!(
+        runtime
+            .upload_media_files_with_client_token(
+                "alice",
+                &group,
+                request.clone(),
+                control.clone(),
+                "generated-cancel".into(),
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        runtime
+            .upload_media_files("alice", &group, request, control)
+            .await
+            .is_err()
+    );
+    assert_eq!(puts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(
+        runtime
+            .local_send_status("alice", &group, "generated-cancel")
+            .unwrap()
+            .is_none(),
+        "nothing was admitted"
+    );
+    runtime.shutdown_and_close().await.unwrap();
+    server.abort();
+    let _ = server.await;
 }
 
 /// Real direct and durable-token sends remain confirmed when optional retention refuses or fails.

@@ -15,6 +15,7 @@ per feature.
 - [Integration documentation](#integration-documentation)
 - [Lifecycle and teardown](#lifecycle-and-teardown)
 - Feature notes: [runtime construction](#runtime-construction), [local sends](#local-sends),
+  [file-backed media upload](#file-backed-media-upload),
   [public event verification](#public-event-verification), [host performance stages](#host-performance-stages),
   [Markdown rendering](#markdown-rendering), [identity references and pseudonyms](#identity-references-and-pseudonyms),
   [KeyPackage inventory](#keypackage-inventory), [selected chat-list presentation](#selected-chat-list-presentation),
@@ -152,6 +153,17 @@ an explicit loopback relay policy and an optional host secret-store vtable.
 Existing constructors keep their public-only policy. Loopback broker access
 requires a separate publisher trust opt-in; neither permits private or
 link-local endpoints. Local insecure trust is intended only for tests.
+
+## File-backed media upload
+
+`marmot_upload_media_files` and its token-aware twin take borrowed
+`MarmotMediaFileUploadRequest` inputs with private regular-file paths instead of
+plaintext arrays. See the [shared contract](../marmot-uniffi/README.md#file-backed-media-upload).
+Calls block; run them off the UI thread. Strings and request arrays must remain
+valid until return. Create one `MarmotMediaFileTransferControl` per call, query or
+cancel it from another thread, and free it only after all calls on the handle
+have returned. Results use the existing upload/submission deep-free functions.
+No host path is included in published attachment metadata.
 
 ## Local sends
 

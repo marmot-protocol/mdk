@@ -14,6 +14,8 @@ use zeroize::Zeroizing;
 /// current transport also caps ciphertext at 512 MiB, including its AEAD overhead;
 /// transport-valid plaintext is therefore smaller. This is not a size negotiation.
 pub const MAX_RETAINED_ATTACHMENT_BYTES: usize = 512 * 1024 * 1024;
+/// File/reader paths remain below SQLite's row bound; legacy arrays stay512MiB.
+pub const MAX_RETAINED_FILE_ATTACHMENT_BYTES: u64 = 900 * 1024 * 1024;
 pub const MAX_ATTACHMENT_LOCAL_READ_BYTES: usize = 1024 * 1024;
 pub const ATTACHMENT_ACQUISITION_BATCH_LIMIT: usize = 64;
 const MAX_DESCRIPTOR_BYTES: usize = 16384;
@@ -636,58 +638,77 @@ impl SqliteAccountStorage {
         let now = u64_to_i64(now)?;
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            if !matches_store(&conn, &job.reference)? {
-                return Ok(AttachmentPublishResult::Superseded);
-            }
-            let valid: bool = conn
-                .query_row(
-                    &format!(
-                        "SELECT EXISTS(SELECT 1 FROM attachment_acquisition q
-                    WHERE token=?1 AND state=1 AND attempt=?2 AND due>?3 AND (permission_paused=0 OR body_completed=1)
-                    AND {SOURCE_MATCH} AND {ACCEPTED}
-                    AND (expires_at IS NULL OR expires_at>?3))"
-                    ),
-                    params![job.reference.token, job.attempt, now],
-                    |r| r.get(0),
-                )
-                .storage()?;
-            if !valid {
-                return Ok(AttachmentPublishResult::Superseded);
-            }
-            let used: u64 = conn
-                .query_row(
-                    "SELECT byte_count FROM attachment_retention_usage WHERE id=1",
-                    [],
-                    |r| nonnegative(r, 0),
-                )
-                .storage()?;
-            let partial_used: u64 = conn
-                .query_row(
-                    "SELECT reserved_bytes FROM attachment_partial_usage WHERE id=1",
-                    [],
-                    |r| nonnegative(r, 0),
-                )
-                .storage()?;
-            let own_partial: u64 = conn
-                .query_row(
-                    "SELECT coalesce((SELECT total FROM attachment_partial WHERE token=?1),0)",
-                    [&job.reference.token],
-                    |r| nonnegative(r, 0),
-                )
-                .storage()?;
-            if used
-                .saturating_add(partial_used.saturating_sub(own_partial))
-                .saturating_add(plaintext.len() as u64)
-                > byte_budget
+            if let Some(refused) =
+                publication_refusal(&conn, job, now, plaintext.len() as u64, byte_budget)?
             {
-                conn.execute("UPDATE attachment_acquisition SET body_completed=1,state=4,due=NULL,attempt=NULL WHERE token=?1 AND automatic_history=1", [&job.reference.token]).storage()?;
-                return Ok(AttachmentPublishResult::CapacityBlocked);
+                return Ok(refused);
             }
             conn.execute(
                 "INSERT INTO retained_attachment_bytes(token,bytes) VALUES(?1,?2)",
                 params![job.reference.token, plaintext],
             )
             .storage()?;
+            conn.execute(
+                "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL WHERE token=?1",
+                [&job.reference.token],
+            )
+            .storage()?;
+            Ok(AttachmentPublishResult::Published)
+        })
+    }
+
+    /// File-backed publication with the same store, attempt, source and quota
+    /// fences as [`Self::complete_attachment_acquisition`], in bounded memory:
+    /// a `zeroblob` tail value is filled in chunks of at most
+    /// [`ATTACHMENT_STAGING_CHUNK_BYTES`] and the parser digest is verified
+    /// before commit. Short, growing, unreadable, mismatched or cancelled input
+    /// rolls the reservation back. The reader must be authenticated plaintext.
+    pub fn complete_attachment_acquisition_from_reader(
+        &self,
+        job: &AttachmentAcquisition,
+        reader: &mut dyn std::io::Read,
+        len: u64,
+        now: u64,
+        byte_budget: u64,
+        cancelled: &dyn Fn() -> bool,
+    ) -> StorageResult<AttachmentPublishResult> {
+        if len > MAX_RETAINED_FILE_ATTACHMENT_BYTES {
+            return Err(invalid("retained attachment exceeds storage bound"));
+        }
+        let digest: [u8; 32] = job
+            .digest
+            .as_slice()
+            .try_into()
+            .map_err(|_| invalid("attachment plaintext digest mismatch"))?;
+        let now = u64_to_i64(now)?;
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if let Some(refused) = publication_refusal(&conn, job, now, len, byte_budget)? {
+                return Ok(refused);
+            }
+            conn.execute(
+                "INSERT INTO retained_attachment_bytes(token,byte_len,bytes) VALUES(?1,?2,zeroblob(?2))",
+                params![job.reference.token, u64_to_i64(len)?],
+            )
+            .storage()?;
+            let rowid: i64 = conn
+                .query_row(
+                    "SELECT rowid FROM retained_attachment_bytes WHERE token=?1",
+                    [&job.reference.token],
+                    |r| r.get(0),
+                )
+                .storage()?;
+            let mut blob = conn
+                .blob_open("main", "retained_attachment_bytes", "bytes", rowid, false)
+                .storage()?;
+            let mut source = AttachmentUploadSource {
+                reader,
+                len,
+                digest,
+            };
+            let mut buffer = Zeroizing::new(vec![0u8; ATTACHMENT_STAGING_CHUNK_BYTES]);
+            outgoing::write_verified_body(&mut blob, &mut source, &mut buffer, cancelled)?;
+            blob.close().storage()?;
             conn.execute(
                 "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL WHERE token=?1",
                 [&job.reference.token],
@@ -942,6 +963,66 @@ impl SqliteAccountStorage {
             .storage()
     }
 }
+
+/// Shared publication admission: store, attempt, lease, source, acceptance and
+/// expiry fences, then the retained+partial quota (excluding this job's own
+/// partial reservation). `Some` is the refusal to return without inserting.
+fn publication_refusal(
+    conn: &Connection,
+    job: &AttachmentAcquisition,
+    now: i64,
+    len: u64,
+    byte_budget: u64,
+) -> StorageResult<Option<AttachmentPublishResult>> {
+    if !matches_store(conn, &job.reference)? {
+        return Ok(Some(AttachmentPublishResult::Superseded));
+    }
+    let valid: bool = conn
+        .query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM attachment_acquisition q
+            WHERE token=?1 AND state=1 AND attempt=?2 AND due>?3 AND (permission_paused=0 OR body_completed=1)
+            AND {SOURCE_MATCH} AND {ACCEPTED}
+            AND (expires_at IS NULL OR expires_at>?3))"
+            ),
+            params![job.reference.token, job.attempt, now],
+            |r| r.get(0),
+        )
+        .storage()?;
+    if !valid {
+        return Ok(Some(AttachmentPublishResult::Superseded));
+    }
+    let used: u64 = conn
+        .query_row(
+            "SELECT byte_count FROM attachment_retention_usage WHERE id=1",
+            [],
+            |r| nonnegative(r, 0),
+        )
+        .storage()?;
+    let partial_used: u64 = conn
+        .query_row(
+            "SELECT reserved_bytes FROM attachment_partial_usage WHERE id=1",
+            [],
+            |r| nonnegative(r, 0),
+        )
+        .storage()?;
+    let own_partial: u64 = conn
+        .query_row(
+            "SELECT coalesce((SELECT total FROM attachment_partial WHERE token=?1),0)",
+            [&job.reference.token],
+            |r| nonnegative(r, 0),
+        )
+        .storage()?;
+    if used
+        .saturating_add(partial_used.saturating_sub(own_partial))
+        .saturating_add(len)
+        > byte_budget
+    {
+        conn.execute("UPDATE attachment_acquisition SET body_completed=1,state=4,due=NULL,attempt=NULL WHERE token=?1 AND automatic_history=1", [&job.reference.token]).storage()?;
+        return Ok(Some(AttachmentPublishResult::CapacityBlocked));
+    }
+    Ok(None)
+}
 #[cfg(test)]
 mod tests;
 
@@ -958,3 +1039,4 @@ pub use controls::{
 };
 
 mod outgoing;
+pub use outgoing::{ATTACHMENT_STAGING_CHUNK_BYTES, AttachmentUploadSource};

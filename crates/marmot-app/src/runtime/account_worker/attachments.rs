@@ -166,6 +166,11 @@ pub(super) fn schedule(
             return Ok(true);
         }
         admission.resumed = true;
+        // Private file-transfer snapshots cannot be deleted by RAII after a
+        // crash; sweep stale ones once per worker ownership (bounded, local).
+        crate::media::file_transfer::sweep_stale_media_staging(
+            &crate::media::file_transfer::media_staging_directory(&client.app, &client.state.label),
+        );
     }
     let expired = storage.prune_expired_attachment_acquisitions(now, 64)?;
     let host_managed = client.app.config.attachment_acquisition_mode
@@ -225,7 +230,7 @@ pub(super) fn schedule(
     for candidate in candidates {
         let explicit = storage.attachment_request_is_explicit(&candidate)?;
         let max = if explicit {
-            crate::media::MAX_ENCRYPTED_MEDIA_BLOB_BYTES
+            crate::MAX_FILE_MEDIA_CIPHERTEXT_BYTES
         } else {
             policy.transfer_limit
         };
@@ -360,7 +365,7 @@ pub(super) fn schedule(
             async move {
                 let finishing = resume.finishing.clone();
                 let result =
-                    finish_or_cancel(prepared.run_classified(resume), cancel, finishing).await;
+                    finish_or_cancel(prepared.run_acquisition(resume), cancel, finishing).await;
                 updates.send_modify(|_| {});
                 MediaHttpCompletion::Attachment {
                     job,
@@ -378,13 +383,13 @@ pub(super) fn schedule(
 
 /// Prefer a finished result over cancellation. Once verification starts its
 /// receipt, let that finite local step return the body to the publication owner.
-async fn finish_or_cancel<F, C>(
+async fn finish_or_cancel<F, C, T>(
     download: F,
     cancel: C,
     finishing: Arc<std::sync::atomic::AtomicBool>,
-) -> Result<MediaDownloadResult, AttachmentDownloadFailure>
+) -> Result<T, AttachmentDownloadFailure>
 where
-    F: std::future::Future<Output = Result<MediaDownloadResult, AttachmentDownloadFailure>>,
+    F: std::future::Future<Output = Result<T, AttachmentDownloadFailure>>,
     C: std::future::Future<Output = ()>,
 {
     tokio::pin!(download);
@@ -401,16 +406,35 @@ where
     }
 }
 
-pub(super) fn complete(
+pub(super) fn complete_acquired(
     client: &AppClient,
     job: &AttachmentAcquisition,
-    result: Result<MediaDownloadResult, AttachmentDownloadFailure>,
+    result: Result<crate::client::AcquiredMediaBody, AttachmentDownloadFailure>,
     byte_budget: u64,
 ) -> Result<(), AppError> {
     let storage = client.app.account_storage(&client.state.label)?;
     let now = crate::unix_now_seconds();
     match result {
-        Ok(result) => {
+        Ok(crate::client::AcquiredMediaBody::File(file)) => {
+            let policy = storage.attachment_download_policy(
+                &super::super::attachment_controls::default_policy(&client.app.config),
+            )?;
+            let mut reader = file.reader()?;
+            match storage.complete_attachment_acquisition_from_reader(
+                job,
+                &mut reader,
+                file.len,
+                now,
+                byte_budget.min(policy.retained_bytes),
+                &|| false,
+            ) {
+                Ok(AttachmentPublishResult::Published | AttachmentPublishResult::Superseded) => {}
+                _ => {
+                    storage.fail_attachment_acquisition(job, Some(retry_at(&storage, job, now)))?;
+                }
+            }
+        }
+        Ok(crate::client::AcquiredMediaBody::Memory(result)) => {
             let plaintext = zeroize::Zeroizing::new(result.plaintext);
             if job.verify_plaintext(&plaintext).is_err() {
                 storage.fail_attachment_acquisition(job, None)?;
@@ -436,8 +460,26 @@ pub(super) fn complete(
         Err(AttachmentDownloadFailure::Stop(_)) => {
             storage.fail_attachment_acquisition(job, None)?;
         }
+        Err(AttachmentDownloadFailure::FileRequired) => {
+            storage.fail_attachment_acquisition(job, None)?;
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn complete(
+    client: &AppClient,
+    job: &AttachmentAcquisition,
+    result: Result<MediaDownloadResult, AttachmentDownloadFailure>,
+    byte_budget: u64,
+) -> Result<(), AppError> {
+    complete_acquired(
+        client,
+        job,
+        result.map(crate::client::AcquiredMediaBody::Memory),
+        byte_budget,
+    )
 }
 
 #[cfg(test)]

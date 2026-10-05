@@ -1,11 +1,14 @@
 //! Encrypted-media upload/download/send/list commands.
 
+use std::sync::Arc;
+
 use marmot_app::AppMessageQuery;
 
 use crate::Marmot;
 use crate::conversions::{
-    MediaAttachmentReferenceFfi, MediaDownloadResultFfi, MediaRecordFfi, MediaUploadRequestFfi,
-    MediaUploadResultFfi, MessageTagFfi, SendSummaryFfi, group_id_from_hex, media_records_ffi,
+    MediaAttachmentReferenceFfi, MediaDownloadResultFfi, MediaFileTransferControlFfi,
+    MediaFileUploadRequestFfi, MediaRecordFfi, MediaUploadRequestFfi, MediaUploadResultFfi,
+    MessageTagFfi, SendSummaryFfi, group_id_from_hex, media_records_ffi,
 };
 use crate::errors::MarmotKitError;
 
@@ -152,6 +155,35 @@ impl Marmot {
         let upload = self
             .runtime
             .upload_media(&account_ref, &group_id, request.into())
+            .await
+            .map_err(media_reference_error)?;
+        upload.try_into().map_err(media_reference_error)
+    }
+
+    /// File-backed `upload_media`: each `source_path` is snapshotted and
+    /// encrypted into private temporary files with bounded buffers before the
+    /// first upload, so large attachments never cross the FFI as byte arrays.
+    /// Ordered server fallback re-sends the identical ciphertext. `control`
+    /// reports progress and cancels preparation, transfer and fallback; a
+    /// cancellation observed before publication returns an error and nothing
+    /// is published. The resulting references and sent message are identical
+    /// to `upload_media`'s.
+    pub async fn upload_media_files(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        request: MediaFileUploadRequestFfi,
+        control: Arc<MediaFileTransferControlFfi>,
+    ) -> Result<MediaUploadResultFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let upload = self
+            .runtime
+            .upload_media_files(
+                &account_ref,
+                &group_id,
+                request.into(),
+                control.inner.clone(),
+            )
             .await
             .map_err(media_reference_error)?;
         upload.try_into().map_err(media_reference_error)
