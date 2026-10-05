@@ -7,6 +7,13 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Added
+
+- Add `marmot_message_reactions` and the owned
+  `MarmotTimelineUserReactionList` root/free for complete exact-message details.
+  Existing record layouts are unchanged; the new symbols require matching
+  generated headers and native libraries.
+
 ## [0.12.0] - 2026-10-02
 
 Recompile against the matching `marmot.h` and library: several signatures and

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- `MarmotAppRuntime::message_reactions` returns complete local reaction details for one exact
+  account/group/message, with one effective entry per sender/emoji and no
+  conversation-preview cap. Missing, hidden, deleted, invalidated and
+  retention-pruned targets return no participants; blocked reactors are excluded.
+  The read performs no network work or conversation-history scan.
+
 ### Changed
 
 - `relay.damus.io` is no longer on the retired-relay denylist; the relay is
