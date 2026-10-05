@@ -56,6 +56,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   through recipient convergence, so members share reaction targets with the
   author. This is a native behavior fix with no binding signature or layout
   change; hosts must consume a matching newly published native artifact.
+  Sibling-device invitations and voluntary departures retain activity while
+  another device for that account remains a member.
 
 ## [0.12.0] - 2026-10-02
 

@@ -4274,6 +4274,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                             "cache replayed Add capabilities: {e}"
                         ))
                     })?;
+                let additions = group_activity::staged_additions(&staged)?;
                 let leavers = group_activity::staged_leavers(&mls_group, &staged);
                 mls_group
                     .merge_staged_commit(&provider, *staged)
@@ -4297,6 +4298,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                             sender_id
                                 .as_ref()
                                 .expect("authenticated sender checked above"),
+                            &additions,
                             &leavers,
                         ),
                     });

@@ -37,15 +37,15 @@ impl GroupActivitySnapshot {
         })
     }
 
-    /// Derive this commit's activity from its source and result trees.
-    /// Only validated SelfRemove senders override the committer as departure actors.
+    /// Diff components/account removals, retaining authenticated leaf additions and departures.
+    /// Adding or leaving a sibling device still creates activity while the account remains present.
     pub(super) fn changes(
         &self,
         after: &Self,
         committer: &MemberId,
+        additions: &[MemberId],
         leavers: &[MemberId],
     ) -> Vec<(MemberId, GroupStateChange)> {
-        let before_members: HashSet<_> = self.members.iter().collect();
         let after_members: HashSet<_> = after.members.iter().collect();
         let mut changes = crate::group_state_changes::admin_changes(&self.admins, &after.admins);
         changes.extend(crate::group_state_changes::profile_changes(
@@ -59,10 +59,8 @@ impl GroupActivitySnapshot {
             after.retention,
         ));
         changes.extend(
-            after
-                .members
+            additions
                 .iter()
-                .filter(|member| !before_members.contains(member))
                 .cloned()
                 .map(|member| GroupStateChange::MemberAdded { member }),
         );
@@ -70,29 +68,43 @@ impl GroupActivitySnapshot {
             .into_iter()
             .map(|change| (committer.clone(), change))
             .collect();
-        for member in self
-            .members
-            .iter()
-            .filter(|member| !after_members.contains(member))
-        {
-            attributed.push(if leavers.contains(member) {
-                (
-                    member.clone(),
-                    GroupStateChange::MemberLeft {
-                        member: member.clone(),
-                    },
-                )
-            } else {
-                (
+        attributed.extend(
+            leavers
+                .iter()
+                .cloned()
+                .map(|member| (member.clone(), GroupStateChange::MemberLeft { member })),
+        );
+        let mut removed_accounts = HashSet::new();
+        for member in &self.members {
+            if !after_members.contains(member)
+                && !leavers.contains(member)
+                && removed_accounts.insert(member)
+            {
+                attributed.push((
                     committer.clone(),
                     GroupStateChange::MemberRemoved {
                         member: member.clone(),
                     },
-                )
-            });
+                ));
+            }
         }
         attributed
     }
+}
+
+/// Preserve every authenticated Add, including a distinct leaf for an existing account.
+pub(super) fn staged_additions(
+    staged: &StagedCommit,
+) -> Result<Vec<MemberId>, super::OpenMlsProjectionError> {
+    staged
+        .add_proposals()
+        .map(|proposal| {
+            crate::identity::validated_member_id_of_leaf(
+                proposal.add_proposal().key_package().leaf_node(),
+            )
+        })
+        .collect::<Result<_, _>>()
+        .map_err(|error| super::OpenMlsProjectionError::Replay(error.to_string()))
 }
 
 /// Only a validated SelfRemove proposal authenticates voluntary departure.

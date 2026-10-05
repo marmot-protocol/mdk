@@ -36,6 +36,8 @@
   whose final values cancel. Each row keeps its own fork-withdrawal origin.
   The existing row-id formula and correctly attributed stored targets are
   unchanged; no account reset or destructive history migration is required.
+  Inviting or leaving a sibling device retains the shared activity target
+  even when another leaf for that account remains in the group.
 
 - When a member lookup does not complete and the member's known inbox relay
   list has no usable relays, the invite now fails with "known member inbox
