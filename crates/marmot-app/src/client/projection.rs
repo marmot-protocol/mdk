@@ -938,9 +938,8 @@ impl AppClient {
         effects: &marmot_account::AccountDeviceEffects,
     ) {
         // Gate on having published a commit: own send paths always carry a
-        // report, while reportless paths (e.g. convergence retry) re-emit the
-        // same changes unattributed. Those are already synthesized — attributed —
-        // on the inbound path, so skipping here avoids a duplicate, actor-less row.
+        // report. Reportless convergence effects are synthesized by the inbound
+        // projection path; skipping here avoids dispatching their updates twice.
         if effects.reports.is_empty() {
             return;
         }

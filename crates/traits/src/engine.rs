@@ -617,9 +617,10 @@ pub enum GroupEvent {
     /// SHOULD surface as a group system row (inner kind 1210). Synthesized
     /// locally on each client that applies the change, so the row is derived
     /// from authenticated state rather than a separately delivered message.
-    /// `actor` is the committing member, when attributable (it is `None` for
-    /// changes applied through a convergence reorg, where the committer cannot
-    /// be resolved cheaply).
+    /// `actor` is the authenticated committing member, or the authenticated
+    /// departing member for a SelfRemove proposal. Canonical replay resolves
+    /// actors against each commit's source tree; legacy unattributed changes
+    /// may still carry `None`.
     GroupStateChanged {
         group_id: GroupId,
         /// The epoch the group reached when this change was applied. Used as the
@@ -633,8 +634,8 @@ pub enum GroupEvent {
         /// it onto the synthesized kind-1210 system row so that, if the commit
         /// later loses a fork and is rolled back, the row can be invalidated by
         /// origin commit (one commit → many rows, 1:N). `None` for changes whose
-        /// origin commit is not resolvable cheaply (e.g. a convergence reorg that
-        /// re-derives state without replaying a single attributable commit).
+        /// origin commit is unavailable in legacy unattributed notifications.
+        /// Canonical apply stamps each replayed commit individually.
         origin_commit_id: Option<MessageId>,
     },
     /// A persisted group was skipped during session-open hydration. Hydration

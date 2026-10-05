@@ -50,6 +50,13 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 - Account onboarding can establish inbox-list absence from a completed read of
   freshly discovered outboxes even when a discovery indexer is unavailable.
 
+### Fixed
+
+- Authenticated group activities now preserve per-commit actor attribution
+  through recipient convergence, so members share reaction targets with the
+  author. This is a native behavior fix with no binding signature or layout
+  change; hosts must consume a matching newly published native artifact.
+
 ## [0.12.0] - 2026-10-02
 
 Recompile against the matching `marmot.h` and library: several signatures and

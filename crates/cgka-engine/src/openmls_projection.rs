@@ -46,6 +46,7 @@ use crate::convergence::BranchCandidate;
 #[path = "openmls_projection/tests.rs"]
 mod graph_tests;
 
+mod group_activity;
 mod resumable;
 pub(crate) use resumable::{
     CanonicalReplay, PeelReplay, ReplaySlice, candidate_peel_slice, canonicalize_stored_slice,
@@ -314,6 +315,8 @@ pub enum OpenMlsReplayObservation {
         priority: CommitOrderingPriority,
         committer: Vec<u8>,
         consumed_proposal_refs: Vec<String>,
+        /// Authenticated deltas for this exact commit, captured only during apply.
+        group_changes: Vec<(MemberId, cgka_traits::engine::GroupStateChange)>,
     },
     ApplicationProcessed {
         message_id: String,
@@ -1094,6 +1097,7 @@ fn materialize_openmls_candidate_paths_budgeted<S: StorageProvider>(
                 priority,
                 committer,
                 consumed_proposal_refs: commit_consumed_proposal_refs,
+                ..
             } = observation
             else {
                 continue;
@@ -3902,6 +3906,12 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 .ok_or(OpenMlsProjectionError::UnsupportedMessageKind(
                     projection.kind,
                 ))?;
+        let activity_before =
+            if projection.kind == OpenMlsContentKind::Commit && retain_replayed_anchors.is_some() {
+                Some(group_activity::GroupActivitySnapshot::capture(&mls_group)?)
+            } else {
+                None
+            };
         if projection.kind == OpenMlsContentKind::Application
             && let Some(stamp) = own_commits.application_stamp(&message.id)
         {
@@ -3969,6 +3979,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 priority: stamp.priority,
                 committer: stamp.committer.as_slice().to_vec(),
                 consumed_proposal_refs: stamp.consumed_proposal_refs.clone(),
+                group_changes: Vec::new(),
             });
             continue;
         }
@@ -4228,14 +4239,6 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     .map(|proposal| tls_hex(proposal.proposal_reference_ref()))
                     .collect::<Result<Vec<_>, _>>()?;
                 consumed_proposal_refs.sort();
-                observations.push(OpenMlsReplayObservation::CommitStaged {
-                    message_id: message_id.clone(),
-                    source_epoch,
-                    resulting_epoch,
-                    priority,
-                    committer,
-                    consumed_proposal_refs,
-                });
                 // Mirror direct ingest: the staged commit is the only public
                 // source for newly added members' KeyPackage capabilities.
                 // The outer canonicalization transaction rolls these writes
@@ -4246,11 +4249,30 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                             "cache replayed Add capabilities: {e}"
                         ))
                     })?;
+                let leavers = group_activity::staged_leavers(&mls_group, &staged);
                 mls_group
                     .merge_staged_commit(&provider, *staged)
                     .map_err(|e| {
                         OpenMlsProjectionError::Replay(format!("merge_staged_commit: {e:?}"))
                     })?;
+                observations.push(OpenMlsReplayObservation::CommitStaged {
+                    message_id: message_id.clone(),
+                    source_epoch,
+                    resulting_epoch,
+                    priority,
+                    committer,
+                    consumed_proposal_refs,
+                    group_changes: match activity_before.as_ref() {
+                        Some(before) => before.changes(
+                            &group_activity::GroupActivitySnapshot::capture(&mls_group)?,
+                            sender_id
+                                .as_ref()
+                                .expect("authenticated sender checked above"),
+                            &leavers,
+                        ),
+                        None => Vec::new(),
+                    },
+                });
                 epoch_authenticators.insert(
                     mls_group.epoch().as_u64(),
                     own_commit_post_merge_epoch_authenticator(&mls_group),

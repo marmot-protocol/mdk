@@ -290,6 +290,7 @@ impl ReferenceModelSubject {
             event_counts,
             received_payloads: window.received_payloads,
             added_members: window.added_members,
+            withdrawn_added_members: Vec::new(),
             removed_members: window.removed_members,
             epoch_changes: window.epoch_changes,
             app_invalidations: Vec::new(),

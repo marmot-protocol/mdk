@@ -29,6 +29,14 @@
 - The HPKE dependency now uses `libcrux-kem` 0.0.10, fixing malformed hybrid-key
   and short-seed panics (RUSTSEC-2026-0330 and RUSTSEC-2026-0331). A documented
   compatibility patch preserves the existing HPKE and OpenMLS versions.
+
+- Group-activity reaction targets now agree across authors and recipients.
+  Canonical replay retains each accepted commit's authenticated actor and
+  individual profile, admin, membership and timer changes, including batches
+  whose final values cancel. Each row keeps its own fork-withdrawal origin.
+  The existing row-id formula and correctly attributed stored targets are
+  unchanged; no account reset or destructive history migration is required.
+
 - When a member lookup does not complete and the member's known inbox relay
   list has no usable relays, the invite now fails with "known member inbox
   relay list has no usable relays and its refresh did not complete" instead

@@ -45,9 +45,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use cgka_traits::convergence_pass::{
     ConvergenceCutoffCause, ConvergencePassMember, ConvergencePassPhase, DurableConvergencePass,
 };
-use cgka_traits::engine::{
-    AppMessageInvalidationReason, GroupEvent, GroupStateChange, GroupStateInvalidationReason,
-};
+use cgka_traits::engine::{AppMessageInvalidationReason, GroupEvent, GroupStateInvalidationReason};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
@@ -159,10 +157,6 @@ pub(crate) fn normalize_convergence_pass_for_runtime(
     pass.absolute_deadline_monotonic_ms = now.monotonic_ms.saturating_add(absolute_remaining);
     true
 }
-
-/// Admin pubkeys, avatar component bytes, and message retention snapshotted on
-/// either side of a convergence apply, for unattributed group-state-change diffs.
-type ReorgComponentSnapshot = (Vec<[u8; 32]>, [Option<Vec<u8>>; 2], Option<u64>);
 
 enum FrozenPassVerificationError {
     Storage(StorageError),
@@ -1261,21 +1255,12 @@ impl<S: StorageProvider> Engine<S> {
         if pass.phase == ConvergencePassPhase::Completed {
             return Ok(settled_empty_result(previous_tip.0));
         }
-        // Pre-apply captures for the reorg diff, taken only once a pass is
-        // actually resolving. Capturing them before the Collecting/no-input
-        // early returns above paid a group-record read plus a full
-        // `MlsGroup::load` (via `reorg_component_snapshot`) on every scheduler
-        // poll of a not-yet-frozen pass, for a result those returns discard.
+        // Capture the roster only once a pass reaches canonical apply, for
+        // removed-copy reconciliation. Activities come from per-commit replay.
         let previous_group = self
             .storage
             .get_group(group_id)
-            .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-        // Pre-apply admin/avatar component snapshot, mirroring the direct
-        // inbound seam's before-state capture so the reorg path can emit the
-        // same profile/admin state-change events. Best-effort: a group whose
-        // MLS state isn't loadable just skips those diffs.
-        let previous_components = self.reorg_component_snapshot(group_id);
-        let previous_name = previous_group.name.clone();
+            .map_err(storage_projection_error)?;
         let max_retained_anchor_rewind = policy.convergence.max_rewind_commits;
         let retained_anchor_epoch = previous_tip
             .0
@@ -1587,8 +1572,6 @@ impl<S: StorageProvider> Engine<S> {
         // (prior id retained for the overlap window).
         self.reindex_transport_group_id(group_id);
         let origin_commit_id = single_accepted_commit_id(&result);
-        let origin_commit_actor =
-            single_accepted_commit_actor(&observations, origin_commit_id.as_ref());
 
         let terminalized = if let Some(selected_tip) = result.selected_tip {
             let selected_tip = EpochId(selected_tip);
@@ -1624,12 +1607,9 @@ impl<S: StorageProvider> Engine<S> {
                 self.emit_convergence_events(
                     group_id,
                     previous_group.members,
-                    &previous_name,
-                    previous_components,
                     previous_tip,
                     selected_tip,
-                    origin_commit_id,
-                    origin_commit_actor,
+                    &observations,
                 )?;
             }
             terminalized
@@ -1686,37 +1666,6 @@ impl<S: StorageProvider> Engine<S> {
         Ok(result)
     }
 
-    /// Best-effort load of the live MlsGroup's admin set, avatar component
-    /// bytes, and message-retention seconds for before/after diffing around a
-    /// convergence apply. `None` when the MLS state isn't materialized; the
-    /// caller skips those diffs rather than failing convergence over missing
-    /// presentation components.
-    fn reorg_component_snapshot(&self, group_id: &GroupId) -> Option<ReorgComponentSnapshot> {
-        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
-            &self.crypto,
-            self.storage.mls_storage(),
-        );
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mls_group = openmls::group::MlsGroup::load(
-            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
-                &provider,
-            ),
-            &mls_gid,
-        )
-        .ok()
-        .flatten()?;
-        let admins = crate::app_components::admins_of_group(&mls_group).unwrap_or_default();
-        let message_retention =
-            crate::app_components::message_retention_seconds_of_group(&mls_group)
-                .ok()
-                .flatten();
-        Some((
-            admins,
-            crate::message_processor::avatar_component_snapshot(&mls_group),
-            message_retention,
-        ))
-    }
-
     /// Whether the live OpenMLS group state records the local member as an
     /// active member: the group loads, is active, and its own leaf carries
     /// the engine's identity. Fail-closed (`false`) on any missing or
@@ -1749,17 +1698,13 @@ impl<S: StorageProvider> Engine<S> {
         credential.identity() == self.identity.self_id().as_slice()
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn emit_convergence_events(
         &mut self,
         group_id: &GroupId,
         previous_members: Vec<cgka_traits::group::Member>,
-        previous_name: &str,
-        previous_components: Option<ReorgComponentSnapshot>,
         previous_tip: EpochId,
         selected_tip: EpochId,
-        origin_commit_id: Option<MessageId>,
-        origin_commit_actor: Option<MemberId>,
+        observations: &[OpenMlsReplayObservation],
     ) -> Result<(), OpenMlsProjectionError> {
         if previous_tip != selected_tip {
             self.events_buf.push_back(GroupEvent::EpochChanged {
@@ -1773,56 +1718,30 @@ impl<S: StorageProvider> Engine<S> {
             .storage
             .get_group(group_id)
             .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-        // `origin_commit_id` is populated only when this convergence pass applied
-        // a single accepted commit, so the entire previous-tip → selected-tip
-        // component diff can be tombstoned with that commit if it later loses a
-        // fork (see `single_accepted_commit_id` + `emit_rolled_back_commits`).
-        // Message-retention rows also use `origin_commit_actor` in that same
-        // single-commit case so peers render the actor that changed the timer.
-        // When several commits were applied in one pass the delta cannot be
-        // split per-commit, so rows fall back to no origin commit and no actor.
-        // The previous-tip → selected-tip diff is net of commits the direct seam
-        // already applied (their effects are part of the "previous" snapshot),
-        // so changes already emitted there do not re-emit here as duplicates.
-        if let (
-            Some((before_admins, before_avatar, before_message_retention)),
-            Some((after_admins, after_avatar, after_message_retention)),
-        ) = (previous_components, self.reorg_component_snapshot(group_id))
-        {
-            for change in crate::group_state_changes::admin_changes(&before_admins, &after_admins) {
-                self.push_group_state_change(
-                    group_id,
-                    selected_tip,
-                    None,
-                    change,
-                    origin_commit_id.clone(),
+        // Each accepted replayed commit retains its own source-state delta.
+        // A net previous-tip -> final-tip diff loses intermediate changes and
+        // cannot supply either a shared target id or a fork-withdrawal link.
+        for observation in observations {
+            if let OpenMlsReplayObservation::CommitStaged {
+                message_id,
+                resulting_epoch,
+                group_changes,
+                ..
+            } = observation
+            {
+                let commit_id = MessageId::new(
+                    hex::decode(message_id)
+                        .map_err(|error| OpenMlsProjectionError::Decode(error.to_string()))?,
                 );
-            }
-            for change in crate::group_state_changes::profile_changes(
-                Some(previous_name),
-                Some(current_group.name.as_str()),
-                &before_avatar,
-                &after_avatar,
-            ) {
-                self.push_group_state_change(
-                    group_id,
-                    selected_tip,
-                    None,
-                    change,
-                    origin_commit_id.clone(),
-                );
-            }
-            for change in crate::group_state_changes::message_retention_changes(
-                before_message_retention,
-                after_message_retention,
-            ) {
-                self.push_group_state_change(
-                    group_id,
-                    selected_tip,
-                    origin_commit_actor.clone(),
-                    change,
-                    origin_commit_id.clone(),
-                );
+                for (actor, change) in group_changes {
+                    self.push_group_state_change(
+                        group_id,
+                        EpochId(*resulting_epoch),
+                        Some(actor.clone()),
+                        change.clone(),
+                        Some(commit_id.clone()),
+                    );
+                }
             }
         }
         // Captured before `current_group.members` is consumed below: gates the
@@ -1839,24 +1758,6 @@ impl<S: StorageProvider> Engine<S> {
             .map(|member| member.id.clone())
             .collect();
 
-        // Convergence reorg: we reach the canonical branch by replaying stored
-        // commits, so the committer that effected each membership delta is not
-        // resolved cheaply here. Emit the change unattributed (`actor: None`);
-        // the row still renders ("X was added") without a "by Y". The
-        // `origin_commit_id` link (when a single commit drove this pass) is
-        // independent of `actor` — it ties the row to its origin commit for
-        // fork-recovery tombstoning, not to a renderable committer.
-        for member in current_group.members {
-            if !previous_ids.contains(&member.id) {
-                self.push_group_state_change(
-                    group_id,
-                    selected_tip,
-                    None,
-                    GroupStateChange::MemberAdded { member: member.id },
-                    origin_commit_id.clone(),
-                );
-            }
-        }
         for member_id in previous_ids.difference(&current_ids) {
             if member_id == self.identity.self_id() {
                 self.clear_leave_request_state(group_id)
@@ -1887,15 +1788,6 @@ impl<S: StorageProvider> Engine<S> {
                 self.retire_deferred_peel_rows_for_terminal_group(group_id)
                     .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
             }
-            self.push_group_state_change(
-                group_id,
-                selected_tip,
-                None,
-                GroupStateChange::MemberRemoved {
-                    member: member_id.clone(),
-                },
-                origin_commit_id.clone(),
-            );
         }
         if current_ids.contains(self.identity.self_id()) {
             // The selected canonical branch records our membership, so a
@@ -2377,34 +2269,13 @@ fn invalidated_app_is_retryable(
 
 /// The single commit id this convergence pass applied, hex-decoded to a
 /// [`MessageId`], or `None` when the pass applied zero or several commits.
-///
-/// Convergence-synthesized group-state-change rows can only be attributed to a
-/// concrete origin commit when exactly one commit was accepted this pass — then
-/// the entire previous-tip → selected-tip diff is that commit's effect. With
-/// multiple accepted commits the per-commit attribution is ambiguous (the diff
-/// is their combined effect), so the rows use no origin commit and no actor.
+/// A terminal disband may use the sole accepted commit as its origin.
+/// Ordinary activity rows instead retain their per-commit replay provenance.
 fn single_accepted_commit_id(result: &CanonicalizationResult) -> Option<MessageId> {
     let [only_commit] = result.accepted_commits.as_slice() else {
         return None;
     };
     hex::decode(only_commit).ok().map(MessageId::new)
-}
-
-fn single_accepted_commit_actor(
-    observations: &[OpenMlsReplayObservation],
-    origin_commit_id: Option<&MessageId>,
-) -> Option<MemberId> {
-    let origin_commit_hex = hex::encode(origin_commit_id?.as_slice());
-    observations
-        .iter()
-        .find_map(|observation| match observation {
-            OpenMlsReplayObservation::CommitStaged {
-                message_id,
-                committer,
-                ..
-            } if message_id == &origin_commit_hex => Some(MemberId::new(committer.clone())),
-            _ => None,
-        })
 }
 
 /// Result returned for a group already in `Unrecoverable`: no canonical

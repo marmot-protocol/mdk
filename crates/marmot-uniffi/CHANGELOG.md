@@ -38,6 +38,13 @@
 - `retired_relay_hosts()` no longer includes `relay.damus.io`, and
   `classify_relay_endpoints` now reports it as `Allowed`.
 
+### Fixed
+
+- Authenticated group activities now preserve per-commit actor attribution
+  through recipient convergence, so members share reaction targets with the
+  author. This is a native behavior fix with no binding signature or layout
+  change; hosts must consume a matching newly published native artifact.
+
 ## 0.12.0 - 2026-10-02
 
 Regenerate Swift/Kotlin bindings with the matching native library. See the
