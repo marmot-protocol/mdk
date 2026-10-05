@@ -16,23 +16,19 @@ pub struct MarmotAttachmentHistoryVersion {
     inner: Arc<AttachmentHistoryVersion>,
 }
 impl From<Arc<AttachmentHistoryCursor>> for MarmotAttachmentHistoryCursor {
-    /// Transfer the shared cursor into an opaque C handle without exposing its seek key.
     fn from(inner: Arc<AttachmentHistoryCursor>) -> Self {
         Self { inner }
     }
 }
 impl From<Arc<AttachmentHistoryVersion>> for MarmotAttachmentHistoryVersion {
-    /// Retain the version behind an opaque handle for later refresh comparisons.
     fn from(inner: Arc<AttachmentHistoryVersion>) -> Self {
         Self { inner }
     }
 }
 impl CFree for MarmotAttachmentHistoryCursor {
-    /// No nested C allocations exist; dropping the enclosing box releases the Arc.
     unsafe fn free_in_place(&mut self) {}
 }
 impl CFree for MarmotAttachmentHistoryVersion {
-    /// The enclosing box owns the Arc, so no separate field deallocation is needed.
     unsafe fn free_in_place(&mut self) {}
 }
 c_enum! { MarmotAttachmentCategory from AttachmentCategoryFfi { Image, Video, Audio, File, Rejected, } }
@@ -60,7 +56,6 @@ pub struct MarmotAttachmentPage {
     pub has_more: bool,
 }
 impl From<AttachmentPageFfi> for MarmotAttachmentPage {
-    /// Allocate entries and paging handles owned together by the returned C page.
     fn from(value: AttachmentPageFfi) -> Self {
         let (entries, entries_len) = owned_vec(value.entries.into_iter().map(Into::into).collect());
         Self {
@@ -73,7 +68,6 @@ impl From<AttachmentPageFfi> for MarmotAttachmentPage {
     }
 }
 impl CFree for MarmotAttachmentPage {
-    /// Release every entry and both opaque handles owned by this page exactly once.
     unsafe fn free_in_place(&mut self) {
         unsafe {
             free_vec(self.entries, self.entries_len);
@@ -90,7 +84,6 @@ pub enum MarmotAttachmentPageRead {
     InvalidLimit,
 }
 impl From<AttachmentPageReadFfi> for MarmotAttachmentPageRead {
-    /// Keep restart and validation outcomes distinct while transferring successful page ownership.
     fn from(value: AttachmentPageReadFfi) -> Self {
         match value {
             AttachmentPageReadFfi::Page { page } => Self::Page { page: page.into() },
@@ -101,7 +94,6 @@ impl From<AttachmentPageReadFfi> for MarmotAttachmentPageRead {
     }
 }
 impl CFree for MarmotAttachmentPageRead {
-    /// Deep-free successful pages; failure variants contain no owned allocations.
     unsafe fn free_in_place(&mut self) {
         if let Self::Page { page } = self {
             unsafe { page.free_in_place() };

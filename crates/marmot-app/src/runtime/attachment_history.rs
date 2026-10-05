@@ -38,7 +38,6 @@ pub struct AttachmentEntry {
     pub attachment: MediaAttachmentOutcome,
 }
 impl std::fmt::Debug for AttachmentEntry {
-    /// Redact source identities and media locators when an entry enters diagnostics.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AttachmentEntry").finish_non_exhaustive()
     }
@@ -57,7 +56,6 @@ pub enum AttachmentPageRead {
     InvalidLimit,
 }
 
-/// Classify MIME types with the same categories used by attachment permissions.
 pub(crate) fn category(media_type: &str) -> AttachmentCategory {
     match storage_sqlite::AttachmentPermissionCategory::from_media_type(media_type) {
         storage_sqlite::AttachmentPermissionCategory::Image => AttachmentCategory::Image,
@@ -125,7 +123,7 @@ fn attachment_role(attachment: &MediaAttachmentOutcome, tags: &[Vec<String>]) ->
     }
     let mut seen = std::collections::HashSet::new();
     for tag in tags {
-        if tag.len() < 3
+        if !(3..=4).contains(&tag.len())
             || tag[0] != "emoji"
             || tag[1].is_empty()
             || tag[1].len() > 64
@@ -149,7 +147,6 @@ fn attachment_role(attachment: &MediaAttachmentOutcome, tags: &[Vec<String>]) ->
 }
 
 impl MarmotAppRuntime {
-    /// Run local reads off the caller thread, fencing account replacement and runtime shutdown.
     pub(super) async fn attachment_read<T: Send + 'static>(
         &self,
         account_ref: &str,

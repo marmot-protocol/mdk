@@ -442,6 +442,30 @@ fn attachment_roles_validate_definitions_without_changing_parser_outcomes() {
         ),
         (
             "image/png",
+            vec![vec!["emoji", "wave", url.as_str(), "30030:pubkey:set"]],
+            AttachmentRole::InlineEmoji,
+        ),
+        (
+            "image/png",
+            vec![vec![
+                "emoji",
+                "wave",
+                url.as_str(),
+                "30030:pubkey:set",
+                "extra",
+            ]],
+            AttachmentRole::Shared,
+        ),
+        (
+            "image/png",
+            vec![
+                vec!["emoji", "wave", "https://absent.example", "", "extra"],
+                vec!["emoji", "wave", url.as_str()],
+            ],
+            AttachmentRole::InlineEmoji,
+        ),
+        (
+            "image/png",
             vec![vec!["emoji", "bad code", url.as_str()]],
             AttachmentRole::Shared,
         ),

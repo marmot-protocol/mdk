@@ -43,7 +43,6 @@ pub enum AttachmentCategoryFfi {
     Rejected,
 }
 impl From<app::AttachmentCategory> for AttachmentCategoryFfi {
-    /// Preserve native MIME categories without reclassifying rejected slots in bindings.
     fn from(value: app::AttachmentCategory) -> Self {
         match value {
             app::AttachmentCategory::Image => Self::Image,
@@ -84,7 +83,6 @@ pub struct AttachmentEntryFfi {
     pub attachment: MediaAttachmentOutcomeFfi,
 }
 impl std::fmt::Debug for AttachmentEntryFfi {
-    /// Hide source identities and media locators from generated record diagnostics.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AttachmentEntryFfi").finish_non_exhaustive()
     }
@@ -120,7 +118,6 @@ pub enum AttachmentPageReadFfi {
     InvalidLimit,
 }
 impl From<app::AttachmentPageRead> for AttachmentPageReadFfi {
-    /// Preserve paging failures and wrap successful page handles without serializing cursors.
     fn from(value: app::AttachmentPageRead) -> Self {
         match value {
             app::AttachmentPageRead::Page(page) => Self::Page {

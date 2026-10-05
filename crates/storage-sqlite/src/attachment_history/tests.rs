@@ -266,7 +266,6 @@ fn page_work_is_bounded_even_with_large_hidden_history() {
     );
 }
 
-/// Rebuilds invalidate cursors even when only source emoji tags change; reopening preserves them.
 #[test]
 fn production_projection_rebuild_invalidation_expiry_and_encrypted_reopen() {
     use cgka_traits::app_event::AppMessageRetentionDecision;
