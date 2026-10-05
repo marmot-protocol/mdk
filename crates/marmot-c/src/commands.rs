@@ -1603,6 +1603,54 @@ pub unsafe extern "C" fn marmot_send_media_attachments(
     })
 }
 
+/// Admit a captured ordinary-media payload with its stable token. Consume the supplied
+/// draft only if its exact revision remains current; NULL requests no draft consumption.
+/// Free the result with marmot_local_send_acceptance_free.
+///
+/// # Safety
+/// Client and required strings must be valid; attachments must be readable for their
+/// length (NULL allowed at zero); an optional revision must remain live; out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_send_prepared_media_with_client_token(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    attachments: *const MarmotMediaAttachmentReference,
+    attachments_len: usize,
+    caption: *const c_char,
+    client_token: *const c_char,
+    consuming_draft: *const crate::types::conversation_window::MarmotMessageDraftRevision,
+    out: *mut *mut crate::types::local_submissions::MarmotLocalSendAcceptance,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let attachments = try_arg!(unsafe {
+            struct_array(attachments, attachments_len, |attachment| {
+                attachment.to_ffi()
+            })
+        });
+        let caption = try_arg!(unsafe { crate::memory::optional_str(caption) });
+        let client_token = try_arg!(unsafe { required_str(client_token) });
+        let consuming_draft = unsafe { consuming_draft.as_ref() }.map(|draft| draft.inner.clone());
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.send_prepared_media_with_client_token(
+                    account_ref,
+                    group_id_hex,
+                    attachments,
+                    caption,
+                    client_token,
+                    consuming_draft,
+                )),
+                out,
+            )
+        }
+    })
+}
+
 /// Send previously uploaded attachments as one kind-9 message that also
 /// carries application `tags` (for example NIP-30 `emoji` tags), each row
 /// a `(char **, len)` pair. imeta tags are rejected. Free with

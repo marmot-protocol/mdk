@@ -115,6 +115,38 @@ original token before uploading again. Media references remain epoch-bound and
 can be rejected if the group changes before engine acceptance. A rejected media
 submission needs freshly prepared references and a new token.
 
+## Captured ordinary-media drafts
+
+Use `send_prepared_media_with_client_token` after an upload-only call when the
+composer already persisted the ordinary-media draft. Capture the immutable
+caption, ordered upload inputs, stable token and eligible opaque draft revision
+before allowing a later composition to take ownership. Pass that same revision
+with the resulting references; do not reselect a draft after upload.
+
+Native admission records the payload and its pending projection in one
+transaction. If the captured revision is still current, its caption/reply and
+ordered media descriptors must describe the submitted snapshot, and that draft
+is consumed in the same transaction. A stale, cleared or newer draft is left
+unchanged and cannot replace the captured payload or reject admission. The
+ordinary-media method has no reply target; keep replied-media on its revisioned
+draft method. Whitespace-normalized captions are eligible for consumption.
+
+Keep the original token, references and revision for live retries. The cleanup
+revision participates in the token's request binding. A replay returns the
+original identity before examining current draft state and never consumes a
+later draft. After an interrupted return or restart, query `local_send_status`
+first; opaque revision objects are not host persistence records. Recover owned
+work instead of uploading again, recapturing cleanup authority or creating a new
+token. Acceptance is local ownership, not peer receipt.
+
+A null consumption revision is for composer-free sends or an original draft
+whose consumption eligibility was revoked by a newer composition. Never treat a
+failed draft read as proof that no persisted draft exists. Native draft
+notifications follow committed consumption; consumers should refresh their
+transient shelf and preserve fresh picker occurrences. Do not separately delete
+an accepted draft on delivery. Pair the additive Swift/Kotlin method and C
+function with their matching generated bindings, header and native library.
+
 ## Conversation windows and draft cost
 
 Return-to-latest can consume a coherent pre-publication checkpoint, including an

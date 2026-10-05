@@ -43,7 +43,7 @@ This is the current integration entry point for Swift/iOS, Swift/macOS and Kotli
 | [Chat lists](../../docs/marmot-architecture/further-context/chat-projections-native.md) | Bounded list windows, account attention, navigation and sequence handling. |
 | [Chat-list rows](CHAT-LIST-ROWS.md) | Selected previews, per-message expiry handling, live draft updates and row-action availability. |
 | [Conversation windows](CONVERSATION-WINDOW.md) | Initial unread/latest positioning, live snapshots, paging, drafts and cancellation. |
-| [Durable local sends](LOCAL-SENDS.md) | Early local acceptance, exact optimistic-bubble correlation and durable edits of pending local sends. |
+| [Durable local sends](LOCAL-SENDS.md) | Early local acceptance, exact optimistic-bubble correlation, captured-media draft consumption and durable edits of pending local sends. |
 | [Polls](POLLS.md) | Encrypted NIP-88 creation, replacement votes, bounded validation and deterministic timeline results. |
 | [Attachment history](ATTACHMENT-HISTORY.md) / [attachment access](ATTACHMENT-ACCESS.md) | Media discovery, local bytes, atomic interactive promotion, genuine outgoing retention, progress, policy and ownership, including [host-managed automatic downloads](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104) and Android WorkManager migration. |
 

@@ -120,6 +120,31 @@ impl Marmot {
             .into())
     }
 
+    /// Admit an immutable ordinary-media snapshot and consume only its unchanged captured draft.
+    /// Keep the original token/revision for live retries; recover ownership by token after restart.
+    pub async fn send_prepared_media_with_client_token(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        attachments: Vec<MediaAttachmentReferenceFfi>,
+        caption: Option<String>,
+        client_token: String,
+        consuming_draft: Option<Arc<MessageDraftRevisionFfi>>,
+    ) -> Result<LocalSendAcceptanceFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .submit_prepared_media_snapshot(
+                &account_ref,
+                &group_id_from_hex(&group_id_hex)?,
+                attachments.into_iter().map(Into::into).collect(),
+                caption,
+                client_token,
+                consuming_draft.map(|draft| draft.inner.clone()),
+            )
+            .await?
+            .into())
+    }
+
     /// Upload encrypted attachments, then admit a correlated message if send=true.
     /// Upload completion precedes durable message acceptance.
     pub async fn upload_media_with_client_token(

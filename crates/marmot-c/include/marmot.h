@@ -8352,6 +8352,25 @@ MarmotStatus marmot_send_media_attachments(const struct MarmotClient *client,
                                            struct MarmotSendSummary **out);
 
 /**
+ * Admit a captured ordinary-media payload with its stable token. Consume the supplied
+ * draft only if its exact revision remains current; NULL requests no draft consumption.
+ * Free the result with marmot_local_send_acceptance_free.
+ *
+ * # Safety
+ * Client and required strings must be valid; attachments must be readable for their
+ * length (NULL allowed at zero); an optional revision must remain live; out writable.
+ */
+MarmotStatus marmot_send_prepared_media_with_client_token(const struct MarmotClient *client,
+                                                          const char *account_ref,
+                                                          const char *group_id_hex,
+                                                          const struct MarmotMediaAttachmentReference *attachments,
+                                                          uintptr_t attachments_len,
+                                                          const char *caption,
+                                                          const char *client_token,
+                                                          const struct MarmotMessageDraftRevision *consuming_draft,
+                                                          struct MarmotLocalSendAcceptance **out);
+
+/**
  * Send previously uploaded attachments as one kind-9 message that also
  * carries application `tags` (for example NIP-30 `emoji` tags), each row
  * a `(char **, len)` pair. imeta tags are rejected. Free with

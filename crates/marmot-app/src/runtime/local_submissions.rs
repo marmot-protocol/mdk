@@ -1,5 +1,5 @@
 use super::*;
-use crate::local_submissions::LocalMessageRequest;
+use crate::local_submissions::{LocalDraftAdmission, LocalMessageRequest};
 
 impl MarmotAppRuntime {
     /// Upload first, then durably admit the resulting message when `send` is set.
@@ -131,6 +131,34 @@ impl MarmotAppRuntime {
         .await
     }
 
+    /// Admit the captured ordinary-media payload, consuming only its unchanged draft.
+    /// A newer or cleared draft never changes the payload or rejects admission.
+    /// Retain the original revision and token for live retries. After restart,
+    /// recover existing ownership by token before attempting another admission.
+    pub async fn submit_prepared_media_snapshot(
+        &self,
+        account: &str,
+        group: &GroupId,
+        attachments: Vec<MediaAttachmentReference>,
+        caption: Option<String>,
+        client_token: String,
+        consuming_draft: Option<crate::MessageDraftRevision>,
+    ) -> Result<crate::LocalSendAcceptance, AppError> {
+        self.submit_local_message(
+            account,
+            group,
+            client_token,
+            LocalMessageRequest {
+                content: caption.unwrap_or_default(),
+                reply_to: None,
+                attachments,
+            },
+            consuming_draft.map(LocalDraftAdmission::ConsumeIfCurrent),
+            None,
+        )
+        .await
+    }
+
     /// Persist local ownership and correlation before returning. Publication is
     /// independent of this future. Reusing a token with the same request returns
     /// the same identity unless its attempt was rejected before engine acceptance.
@@ -197,7 +225,7 @@ impl MarmotAppRuntime {
                 reply_to: None,
                 attachments,
             },
-            Some(revision),
+            Some(LocalDraftAdmission::Source(revision)),
             None,
         )
         .await
@@ -234,7 +262,7 @@ impl MarmotAppRuntime {
         group: &GroupId,
         token: String,
         request: LocalMessageRequest,
-        draft: Option<crate::MessageDraftRevision>,
+        draft: Option<LocalDraftAdmission>,
         edit_of_client_token: Option<String>,
     ) -> Result<crate::LocalSendAcceptance, AppError> {
         self.accounts.worker_commands(account).await?;
@@ -247,18 +275,33 @@ impl MarmotAppRuntime {
         // projection publication belong inside the same owned task.
         blocking_app_task(move || {
             shared.lifecycle().ensure_running()?;
-            let (accepted, update) = if let Some(original) = edit_of_client_token {
-                app.admit_local_message_with_edit_at(
+            let (accepted, update) = match (draft, edit_of_client_token) {
+                (Some(policy @ LocalDraftAdmission::ConsumeIfCurrent(_)), original) => app
+                    .admit_local_message_with_draft_policy_at(
+                        &account.label,
+                        &group,
+                        token,
+                        request,
+                        Some(policy),
+                        original,
+                        crate::unix_now_seconds(),
+                    )?,
+                (source, Some(original)) => app.admit_local_message_with_edit_at(
                     &account.label,
                     &group,
                     token,
                     request,
-                    draft,
+                    source.map(LocalDraftAdmission::into_revision),
                     Some(original),
                     crate::unix_now_seconds(),
-                )?
-            } else {
-                app.admit_local_message(&account.label, &group, token, request, draft)?
+                )?,
+                (source, None) => app.admit_local_message(
+                    &account.label,
+                    &group,
+                    token,
+                    request,
+                    source.map(LocalDraftAdmission::into_revision),
+                )?,
             };
             if let Some(update) = update {
                 account_worker::publish_app_runtime_projection_update(

@@ -8,7 +8,8 @@ use std::ffi::CString;
 use std::time::Instant;
 
 use marmot_c::commands::{
-    marmot_group_app_component, marmot_set_group_archived, marmot_update_app_component,
+    marmot_group_app_component, marmot_send_prepared_media_with_client_token,
+    marmot_set_group_archived, marmot_update_app_component,
 };
 use marmot_c::subscriptions::{
     MarmotEventsSubscription, marmot_events_subscription_free, marmot_events_subscription_next,
@@ -128,4 +129,40 @@ fn null_out_is_rejected_before_a_subscription_read_dequeues() {
     unsafe { marmot_events_subscription_free(sub) };
     unsafe { marmot_client_shutdown(client) };
     unsafe { marmot_client_free(client) };
+}
+
+#[test]
+fn prepared_media_snapshot_output_is_preflighted_before_any_input_is_used() {
+    unsafe {
+        assert_eq!(
+            marmot_send_prepared_media_with_client_token(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::dangling(),
+                usize::MAX,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::dangling(),
+                std::ptr::null_mut(),
+            ),
+            MarmotStatus::NullPointer
+        );
+        let mut out = std::ptr::dangling_mut();
+        assert_eq!(
+            marmot_send_prepared_media_with_client_token(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::dangling(),
+                usize::MAX,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::dangling(),
+                &raw mut out,
+            ),
+            MarmotStatus::NullPointer
+        );
+        assert!(out.is_null());
+    }
 }
