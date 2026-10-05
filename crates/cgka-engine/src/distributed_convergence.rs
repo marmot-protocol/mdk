@@ -1700,6 +1700,8 @@ impl<S: StorageProvider> Engine<S> {
         credential.identity() == self.identity.self_id().as_slice()
     }
 
+    /// Emit authenticated per-commit activity and reconcile local removal state.
+    /// Roster repairs change membership/send eligibility without fabricating invitations.
     fn emit_convergence_events(
         &mut self,
         group_id: &GroupId,

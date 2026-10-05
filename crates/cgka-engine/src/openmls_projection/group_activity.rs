@@ -16,6 +16,7 @@ pub(super) struct GroupActivitySnapshot {
 }
 
 impl GroupActivitySnapshot {
+    /// Decode the presentation state from one authenticated MLS tree; malformed components fail apply.
     pub(super) fn capture(group: &MlsGroup) -> Result<Self, super::OpenMlsProjectionError> {
         let map_error = |error: cgka_traits::EngineError| {
             super::OpenMlsProjectionError::Replay(error.to_string())
@@ -36,6 +37,8 @@ impl GroupActivitySnapshot {
         })
     }
 
+    /// Derive this commit's activity from its source and result trees.
+    /// Only validated SelfRemove senders override the committer as departure actors.
     pub(super) fn changes(
         &self,
         after: &Self,

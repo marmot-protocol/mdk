@@ -7,6 +7,7 @@ use marmot_account::AccountHome;
 use marmot_app::{MarmotApp, MarmotAppConfig, MarmotAppEvent, TimelineMessageQuery};
 use nostr_relay_builder::MockRelay;
 
+/// Open an isolated account home against the fixture relay without development settlement delays.
 fn open(dir: &tempfile::TempDir, relay: &str) -> MarmotApp {
     MarmotApp::with_relay_and_config(
         dir.path(),
@@ -18,6 +19,7 @@ fn open(dir: &tempfile::TempDir, relay: &str) -> MarmotApp {
     )
 }
 
+/// Prove member-visible add/retract updates and target stability across independent encrypted-store reopens.
 #[tokio::test]
 async fn members_share_real_activity_targets_and_reactions_after_reopen() {
     let relay = MockRelay::run().await.unwrap();

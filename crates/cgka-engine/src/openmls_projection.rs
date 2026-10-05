@@ -2668,6 +2668,8 @@ fn probe_candidate_path<S: StorageProvider>(
     }
 }
 
+/// Apply the selected stored branch with rollback protection and retain replay anchors.
+/// Returns the stable public replay observations; engine presentation deltas stay internal.
 pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -2684,6 +2686,8 @@ pub fn apply_openmls_canonicalization_result<S: StorageProvider>(
     .map(|output| output.observations)
 }
 
+/// Apply with the caller's profile-admission policy, preserving each new commit's activity.
+/// Prefixes represented by already-applied state or own checkpoints do not regenerate activity.
 pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -3292,6 +3296,8 @@ fn oldest_retained_epoch(retained_epoch: u64, max_retained_anchor_rewind: u64) -
     retained_epoch.saturating_sub(max_retained_anchor_rewind)
 }
 
+/// Atomically merge replay messages, refresh canonical group state and persist dispositions.
+/// Activity is returned only after successful apply, so candidate probes cannot publish it.
 fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -3875,6 +3881,9 @@ fn project_pending_canonicalization_messages(
     Ok(pending)
 }
 
+/// Authenticate messages against successive source trees for probe or canonical apply.
+/// `retain_replayed_anchors` enables durable apply and per-commit presentation deltas;
+/// probes omit both while still validating the complete candidate branch.
 fn process_openmls_messages_inner<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
