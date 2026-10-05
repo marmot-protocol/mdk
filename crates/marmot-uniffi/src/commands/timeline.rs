@@ -6,6 +6,59 @@ use crate::{Marmot, timeline_query_from_ffi};
 
 #[uniffi::export]
 impl Marmot {
+    /// Freeze every eligible locally stored kind-9 message in one account and chat.
+    /// The token refers to encrypted, disk-backed ids and must be released when
+    /// selection ends. This synchronous store operation must run off the UI thread.
+    pub fn create_message_selection_snapshot(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<crate::conversions::MessageSelectionSnapshotFfi, MarmotKitError> {
+        let group = crate::conversions::group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .create_message_selection_snapshot(&account_ref, &hex::encode(group.as_slice()))?
+            .into())
+    }
+
+    /// Read up to 200 frozen ids in canonical order. Current rows and action
+    /// permission must be revalidated before copy, forward, save, or delete.
+    pub fn message_selection_page(
+        &self,
+        account_ref: String,
+        token: String,
+        after_ordinal: Option<u64>,
+        limit: u32,
+    ) -> Result<crate::conversions::MessageSelectionPageFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .message_selection_page(&account_ref, &token, after_ordinal, limit as usize)?
+            .into())
+    }
+
+    /// Check whether one id belonged to the captured selection.
+    pub fn message_selection_contains(
+        &self,
+        account_ref: String,
+        token: String,
+        message_id_hex: String,
+    ) -> Result<bool, MarmotKitError> {
+        Ok(self
+            .runtime
+            .message_selection_contains(&account_ref, &token, &message_id_hex)?)
+    }
+
+    /// Release the transient disk-backed selection after close, account switch,
+    /// cancellation, or completion. Releasing twice is safe.
+    pub fn release_message_selection_snapshot(
+        &self,
+        account_ref: String,
+        token: String,
+    ) -> Result<(), MarmotKitError> {
+        Ok(self
+            .runtime
+            .release_message_selection_snapshot(&account_ref, &token)?)
+    }
     /// Complete effective reaction participants for one account/group/message.
     ///
     /// Unlike a conversation window's bounded reactor preview, this includes

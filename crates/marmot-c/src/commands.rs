@@ -86,6 +86,7 @@ use crate::types::relay::{
 use crate::types::telemetry::{
     MarmotAppPerformanceSnapshot, MarmotHostPerformanceOperation, MarmotHostPerformanceOutcome,
 };
+use crate::types::timeline::{MarmotMessageSelectionPage, MarmotMessageSelectionSnapshot};
 use crate::types::timeline::{
     MarmotPollType, MarmotPollVotePage, MarmotTimelineMessageQuery, MarmotTimelineMessageRecord,
     MarmotTimelinePage, MarmotTimelineUserReactionList,
@@ -1858,6 +1859,121 @@ pub unsafe extern "C" fn marmot_timeline_messages(
         let query = try_arg!(unsafe { borrowed(query) });
         let query = try_arg!(unsafe { query.to_ffi() });
         unsafe { deliver(client.marmot.timeline_messages(account_ref, query), out) }
+    })
+}
+
+/// Freeze every eligible visible chat message in this account and group.
+/// Run off the UI thread. Release the returned token with
+/// `marmot_release_message_selection_snapshot` and free this C record with
+/// `marmot_message_selection_snapshot_free`.
+/// # Safety
+/// Client and strings must be valid; `out` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_create_message_selection_snapshot(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    out: *mut *mut MarmotMessageSelectionSnapshot,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let group = try_arg!(unsafe { required_str(group_id_hex) });
+        unsafe {
+            deliver(
+                client
+                    .marmot
+                    .create_message_selection_snapshot(account, group),
+                out,
+            )
+        }
+    })
+}
+
+/// Read 1..=200 frozen ids from an account-private selection token.
+/// Free the result with `marmot_message_selection_page_free`.
+/// # Safety
+/// Client and strings must be valid; `out` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_message_selection_page(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    token: *const c_char,
+    has_after_ordinal: u8,
+    after_ordinal: u64,
+    limit: u32,
+    out: *mut *mut MarmotMessageSelectionPage,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let token = try_arg!(unsafe { required_str(token) });
+        if !(1..=200).contains(&limit) {
+            return MarmotStatus::InvalidArgument;
+        }
+        unsafe {
+            deliver(
+                client.marmot.message_selection_page(
+                    account,
+                    token,
+                    (has_after_ordinal != 0).then_some(after_ordinal),
+                    limit,
+                ),
+                out,
+            )
+        }
+    })
+}
+
+/// Test frozen membership without loading a message body; `*out` is 0 or 1.
+/// # Safety
+/// Client and strings must be valid; `out` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_message_selection_contains(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    token: *const c_char,
+    message_id_hex: *const c_char,
+    out: *mut u8,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let token = try_arg!(unsafe { required_str(token) });
+        let message_id = try_arg!(unsafe { required_str(message_id_hex) });
+        unsafe {
+            deliver_scalar(
+                client
+                    .marmot
+                    .message_selection_contains(account, token, message_id)
+                    .map(u8::from),
+                out,
+            )
+        }
+    })
+}
+
+/// Discard the encrypted, disk-backed selection; repeating is safe.
+/// # Safety
+/// Client and strings must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_release_message_selection_snapshot(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    token: *const c_char,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let token = try_arg!(unsafe { required_str(token) });
+        deliver_unit(
+            client
+                .marmot
+                .release_message_selection_snapshot(account, token),
+        )
     })
 }
 

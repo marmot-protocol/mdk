@@ -4876,6 +4876,61 @@ impl MarmotAppRuntime {
             .timeline_messages_with_query(&account.label, query)
     }
 
+    /// Capture an account-scoped, disk-backed full-conversation selection.
+    pub fn create_message_selection_snapshot(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+    ) -> Result<crate::MessageSelectionSnapshot, AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .create_message_selection_snapshot(&account.label, group_id_hex)
+    }
+
+    /// Read a bounded page from the frozen account-private selection.
+    pub fn message_selection_page(
+        &self,
+        account_ref: &str,
+        token: &str,
+        after_ordinal: Option<u64>,
+        limit: usize,
+    ) -> Result<crate::MessageSelectionPage, AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .message_selection_page(&account.label, token, after_ordinal, limit)
+    }
+
+    /// Check whether an id was captured without reading a body.
+    pub fn message_selection_contains(
+        &self,
+        account_ref: &str,
+        token: &str,
+        message_id_hex: &str,
+    ) -> Result<bool, AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .message_selection_contains(&account.label, token, message_id_hex)
+    }
+
+    /// Release the account-private selection when its UI owner ends.
+    pub fn release_message_selection_snapshot(
+        &self,
+        account_ref: &str,
+        token: &str,
+    ) -> Result<(), AppError> {
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .release_message_selection_snapshot(&account.label, token)
+    }
+
     pub fn message_edit_history(
         &self,
         account_ref: &str,

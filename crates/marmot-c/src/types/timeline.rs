@@ -3,14 +3,35 @@
 use std::ffi::c_char;
 
 use marmot_uniffi::conversions::{
-    DeletionSourceFfi, GroupSystemEventFfi, GroupSystemEventProvenanceFfi, PollOptionResultFfi,
-    PollProjectionFfi, PollTypeFfi, PollVoteFfi, PollVotePageFfi, RuntimeProjectionUpdateFfi,
-    TimelineEditHistoryPageFfi, TimelineEditSummaryFfi, TimelineEditVersionFfi,
-    TimelineMessageChangeFfi, TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
+    DeletionSourceFfi, GroupSystemEventFfi, GroupSystemEventProvenanceFfi, MessageSelectionPageFfi,
+    MessageSelectionSnapshotFfi, PollOptionResultFfi, PollProjectionFfi, PollTypeFfi, PollVoteFfi,
+    PollVotePageFfi, RuntimeProjectionUpdateFfi, TimelineEditHistoryPageFfi,
+    TimelineEditSummaryFfi, TimelineEditVersionFfi, TimelineMessageChangeFfi,
+    TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
     TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
     TimelineRemoveReasonFfi, TimelineReplyPreviewFfi, TimelineSubscriptionUpdateFfi,
     TimelineUpdateTriggerFfi, TimelineUserReactionFfi,
 };
+
+c_mirror! {
+    /// Account-private, disk-backed frozen message selection. Release the native
+    /// snapshot token separately when selection ends, then free this record.
+    MarmotMessageSelectionSnapshot from MessageSelectionSnapshotFfi,
+    free marmot_message_selection_snapshot_free {
+        str token,
+        copy count: u64,
+    }
+}
+
+c_mirror! {
+    /// Bounded ids in frozen canonical order. A present `next_ordinal` is the
+    /// cursor for the next page; a missing one means enumeration is complete.
+    MarmotMessageSelectionPage from MessageSelectionPageFfi,
+    free marmot_message_selection_page_free {
+        str_vec message_ids/message_ids_len,
+        opt_copy has_next_ordinal/next_ordinal: u64,
+    }
+}
 
 use super::chat_list::{MarmotChatListRow, MarmotChatListUpdateTrigger};
 use super::common::MarmotMessageTag;
@@ -446,6 +467,36 @@ c_mirror! {
 #[cfg(test)]
 mod edit_tests {
     use super::*;
+
+    #[test]
+    fn selection_snapshot_pages_preserve_cursor_and_deep_free_ids() {
+        #[cfg(feature = "alloc-audit")]
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let before = crate::memory::audit::live_allocations();
+        let snapshot = MarmotMessageSelectionSnapshot::from(MessageSelectionSnapshotFfi {
+            token: "opaque-token".into(),
+            count: 2,
+        });
+        let page = MarmotMessageSelectionPage::from(MessageSelectionPageFfi {
+            message_ids: vec!["first".into(), "second".into()],
+            next_ordinal: Some(2),
+        });
+        assert_eq!(snapshot.count, 2);
+        assert_eq!(page.message_ids_len, 2);
+        assert!(page.has_next_ordinal);
+        assert_eq!(page.next_ordinal, 2);
+        unsafe {
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*page.message_ids.add(1)).to_str(),
+                Ok("second")
+            );
+            marmot_message_selection_page_free(crate::memory::boxed(page));
+            marmot_message_selection_snapshot_free(crate::memory::boxed(snapshot));
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), before);
+    }
     /// The complete participant list owns and deep-frees every nested field, including empty lists.
     #[test]
     fn complete_reaction_list_deep_frees_all_participants() {

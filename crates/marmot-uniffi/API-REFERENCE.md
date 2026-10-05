@@ -2371,7 +2371,7 @@ pub fn message_reactions( &self, account_ref: String, group_id_hex: String, mess
 
 Read every effective user/emoji pair for an exact account/group/message. Use for reaction details, because conversation references contain only a bounded preview. Returns one local snapshot, ordered by timestamp/sender/emoji, with duplicate events collapsed to the latest pair. Blocked reactors and hidden, deleted, invalidated or retention-pruned targets are excluded. Run off the UI thread, refresh on installed conversation revisions, and discard results when the owning screen closes. No network work, localization or durable client cache is involved; records are caller-owned. See [conversation details](CONVERSATION-WINDOW.md#complete-reaction-details).
 
-[Source](src/commands/timeline.rs#L19)
+[Source](src/commands/timeline.rs#L72)
 
 
 ### `Marmot::poll_votes`
@@ -2391,7 +2391,7 @@ last vote's `voted_at` and `voter_account_id_hex` while `has_more_after` is true
 votes from former members are not bounded by the current group size. Re-read from the start when the poll row is
 reprojected, and run this synchronous query off the UI thread. See [Polls](POLLS.md).
 
-[Source](src/commands/timeline.rs#L83)
+[Source](src/commands/timeline.rs#L136)
 
 ### `Marmot::messages`
 
@@ -3238,6 +3238,54 @@ Read the process-wide app-performance snapshot for debug/diagnostics surfaces an
 <details>
 <summary>commands/timeline.rs</summary>
 
+### `Marmot::create_message_selection_snapshot`
+
+**Current.** Complete local message selection; run off the UI thread.
+
+```rust
+pub fn create_message_selection_snapshot( &self, account_ref: String, group_id_hex: String, ) -> Result<crate::conversions::MessageSelectionSnapshotFfi, MarmotKitError>
+```
+
+Capture eligible, visible kind-9 messages for one account and group in a single database transaction. The returned opaque token and count represent a frozen set: later arrivals are excluded. The encrypted account database holds only ids and order, not copied bodies or media. Release the token when selection ends, including after cancellation or errors.
+
+[Source](src/commands/timeline.rs#L12)
+
+### `Marmot::message_selection_page`
+
+**Current.** Bounded enumeration of a captured selection.
+
+```rust
+pub fn message_selection_page( &self, account_ref: String, token: String, after_ordinal: Option<u64>, limit: u32, ) -> Result<crate::conversions::MessageSelectionPageFfi, MarmotKitError>
+```
+
+Read 1 to 200 frozen ids in canonical conversation order. Pass `next_ordinal` from one page to the next; `None` means the set is exhausted. Fetch and revalidate each current row and action permission before performing a batch operation, because messages may have been deleted or invalidated since capture.
+
+[Source](src/commands/timeline.rs#L26)
+
+### `Marmot::message_selection_contains`
+
+**Current.** Check one captured id without loading a page or message body.
+
+```rust
+pub fn message_selection_contains( &self, account_ref: String, token: String, message_id_hex: String, ) -> Result<bool, MarmotKitError>
+```
+
+Use for selected-state checks when a row enters a bounded UI window. The token belongs to its account database; a missing id returns `false`.
+
+[Source](src/commands/timeline.rs#L40)
+
+### `Marmot::release_message_selection_snapshot`
+
+**Current.** End a transient selection.
+
+```rust
+pub fn release_message_selection_snapshot( &self, account_ref: String, token: String, ) -> Result<(), MarmotKitError>
+```
+
+Delete the token and its encrypted disk-backed ids. Calling it twice is safe. Hosts should release on close, Back, account or chat switch, and after completing or cancelling a batch action.
+
+[Source](src/commands/timeline.rs#L53)
+
 ### `Marmot::message_edit_history`
 
 **Current.**
@@ -3248,7 +3296,7 @@ pub fn message_edit_history( &self, account_ref: String, group_id_hex: String, t
 
 Accepted edit versions, oldest first within a latest-first page (1..=100). Supply both cursor fields from the first version to load older versions. Run this synchronous details query off the UI thread; screens already carry effective content.
 
-[Source](src/commands/timeline.rs#L41)
+[Source](src/commands/timeline.rs#L94)
 
 ### `Marmot::timeline_messages`
 
@@ -3260,7 +3308,7 @@ pub fn timeline_messages( &self, account_ref: String, query: TimelineMessageQuer
 
 Materialized conversation timeline for a group or account-wide tail.
 
-[Source](src/commands/timeline.rs#L128)
+[Source](src/commands/timeline.rs#L181)
 
 </details>
 

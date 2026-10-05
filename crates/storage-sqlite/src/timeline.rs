@@ -7,6 +7,7 @@ pub use capture::ConversationAccountSnapshot;
 mod edits;
 mod opening;
 mod presentation;
+mod selection;
 pub use edits::{TimelineEditHistoryPage, TimelineEditSummary, TimelineEditVersion};
 pub use opening::{
     ConversationAnchor, ConversationOpenAnchorOutcome, ConversationOpenError,
@@ -14,6 +15,7 @@ pub use opening::{
     ConversationOpenTarget, ConversationWindowQuery,
 };
 pub use presentation::ConversationPresentationPage;
+pub use selection::{MessageSelectionPage, MessageSelectionSnapshot};
 
 use crate::connection::CachedSql;
 use crate::group_system::AUTHENTICATED_TIMELINE_SYSTEM_SQL;

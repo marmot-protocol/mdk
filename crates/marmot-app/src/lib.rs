@@ -267,10 +267,10 @@ pub use relay_telemetry_export::{
 pub use storage_sqlite::{
     ChatConversationKind, ChatListAttachmentKind, ChatListAvatar, ChatListMessageDeliveryState,
     ChatListMessagePreview, ChatListQuery, ChatListRow, DeletionSource, ExistingDirectConversation,
-    MAX_TIMELINE_LIMIT, SelfMembership, TimelineEditHistoryPage, TimelineEditSummary,
-    TimelineEditVersion, TimelineMessageQuery, TimelineMessageRecord, TimelinePage,
-    TimelinePagination, TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
-    select_reusable_direct_conversation,
+    MAX_TIMELINE_LIMIT, MessageSelectionPage, MessageSelectionSnapshot, SelfMembership,
+    TimelineEditHistoryPage, TimelineEditSummary, TimelineEditVersion, TimelineMessageQuery,
+    TimelineMessageRecord, TimelinePage, TimelinePagination, TimelineReactionSummary,
+    TimelineReplyPreview, TimelineUserReaction, select_reusable_direct_conversation,
 };
 pub use transport_nostr_adapter::{
     DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics, RelayDeliverySpread,
@@ -3015,6 +3015,58 @@ impl MarmotApp {
         .entered();
         self.ensure_account_state(label)?;
         Ok(self.account_storage(label)?.message_timeline(query)?)
+    }
+
+    /// Capture the complete eligible local conversation as a disk-backed id snapshot.
+    /// Hosts keep the token transient and release it when selection mode ends.
+    pub fn create_message_selection_snapshot(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+    ) -> Result<MessageSelectionSnapshot, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .create_message_selection_snapshot(group_id_hex)?)
+    }
+
+    /// Page frozen ids in canonical display order without returning message bodies.
+    pub fn message_selection_page(
+        &self,
+        label: &str,
+        token: &str,
+        after_ordinal: Option<u64>,
+        limit: usize,
+    ) -> Result<MessageSelectionPage, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .message_selection_page(token, after_ordinal, limit)?)
+    }
+
+    /// Test one frozen id's membership without hydrating a record.
+    pub fn message_selection_contains(
+        &self,
+        label: &str,
+        token: &str,
+        message_id_hex: &str,
+    ) -> Result<bool, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .message_selection_contains(token, message_id_hex)?)
+    }
+
+    /// Release the account-private snapshot after selection ends or fails.
+    pub fn release_message_selection_snapshot(
+        &self,
+        label: &str,
+        token: &str,
+    ) -> Result<(), AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .release_message_selection_snapshot(token)?)
     }
 
     pub(crate) fn timeline_messages_by_wall_clock_with_query(

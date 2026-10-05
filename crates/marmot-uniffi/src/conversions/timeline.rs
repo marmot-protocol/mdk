@@ -2,11 +2,43 @@
 //! subscription-update FFI conversions.
 
 use marmot_app::{
-    AppGroupSystemEvent, AppProjectionUpdate, RuntimeProjectionUpdate,
-    RuntimeTimelineMessageUpdate, TimelineMessageChange, TimelineMessageRecord, TimelinePage,
-    TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview, TimelineUpdateTrigger,
-    TimelineUserReaction,
+    AppGroupSystemEvent, AppProjectionUpdate, MessageSelectionPage, MessageSelectionSnapshot,
+    RuntimeProjectionUpdate, RuntimeTimelineMessageUpdate, TimelineMessageChange,
+    TimelineMessageRecord, TimelinePage, TimelineReactionSummary, TimelineRemoveReason,
+    TimelineReplyPreview, TimelineUpdateTrigger, TimelineUserReaction,
 };
+
+/// Opaque account-private selection handle and its exact captured count.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MessageSelectionSnapshotFfi {
+    pub token: String,
+    pub count: u64,
+}
+
+impl From<MessageSelectionSnapshot> for MessageSelectionSnapshotFfi {
+    fn from(value: MessageSelectionSnapshot) -> Self {
+        Self {
+            token: value.token,
+            count: value.count,
+        }
+    }
+}
+
+/// A bounded page of frozen ids; use `next_ordinal` as the following cursor.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MessageSelectionPageFfi {
+    pub message_ids: Vec<String>,
+    pub next_ordinal: Option<u64>,
+}
+
+impl From<MessageSelectionPage> for MessageSelectionPageFfi {
+    fn from(value: MessageSelectionPage) -> Self {
+        Self {
+            message_ids: value.message_ids,
+            next_ordinal: value.next_ordinal,
+        }
+    }
+}
 
 use super::chat_list::{ChatListRowFfi, ChatListUpdateTriggerFfi};
 use super::common::{MessageTagFfi, markdown_content_tokens, message_tags_ffi};

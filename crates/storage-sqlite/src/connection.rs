@@ -911,6 +911,8 @@ pub struct SqliteAccountStorage {
     migration_duration: Duration,
     pub(crate) connection: SharedConnection,
     pub(crate) openmls: SqliteOpenMlsStorage,
+    /// Fences transient selection tokens to this opened account-store lifetime.
+    pub(crate) selection_nonce: Arc<String>,
 }
 
 #[deprecated(
@@ -1085,11 +1087,15 @@ impl SqliteAccountStorage {
         let migration_started = std::time::Instant::now();
         let migrations_applied = migrations::run_all(&mut connection)?;
         let migration_duration = migration_started.elapsed();
+        let selection_nonce: String = connection
+            .query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))
+            .storage()?;
         let connection = SharedConnection::new(connection);
         let openmls = SqliteOpenMlsStorage::new(connection.clone());
         Ok(Self {
             connection,
             openmls,
+            selection_nonce: Arc::new(selection_nonce),
             draft_commit_observer: Default::default(),
             migrations_applied,
             migration_duration,

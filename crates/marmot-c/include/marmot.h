@@ -3953,6 +3953,29 @@ typedef struct MarmotTimelinePage {
 } MarmotTimelinePage;
 
 /**
+ * Account-private, disk-backed frozen message selection. Release the native
+ * snapshot token separately when selection ends, then free this record.
+ */
+typedef struct MarmotMessageSelectionSnapshot {
+  char *token;
+  uint64_t count;
+} MarmotMessageSelectionSnapshot;
+
+/**
+ * Bounded ids in frozen canonical order. A present `next_ordinal` is the
+ * cursor for the next page; a missing one means enumeration is complete.
+ */
+typedef struct MarmotMessageSelectionPage {
+  char **message_ids;
+  uintptr_t message_ids_len;
+  bool has_next_ordinal;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t next_ordinal;
+} MarmotMessageSelectionPage;
+
+/**
  * Result of upserting a push registration.
  */
 typedef struct MarmotPushRegistrationSyncResult {
@@ -8463,6 +8486,53 @@ MarmotStatus marmot_timeline_messages(const struct MarmotClient *client,
                                       struct MarmotTimelinePage **out);
 
 /**
+ * Freeze every eligible visible chat message in this account and group.
+ * Run off the UI thread. Release the returned token with
+ * `marmot_release_message_selection_snapshot` and free this C record with
+ * `marmot_message_selection_snapshot_free`.
+ * # Safety
+ * Client and strings must be valid; `out` must be writable.
+ */
+MarmotStatus marmot_create_message_selection_snapshot(const struct MarmotClient *client,
+                                                      const char *account_ref,
+                                                      const char *group_id_hex,
+                                                      struct MarmotMessageSelectionSnapshot **out);
+
+/**
+ * Read 1..=200 frozen ids from an account-private selection token.
+ * Free the result with `marmot_message_selection_page_free`.
+ * # Safety
+ * Client and strings must be valid; `out` must be writable.
+ */
+MarmotStatus marmot_message_selection_page(const struct MarmotClient *client,
+                                           const char *account_ref,
+                                           const char *token,
+                                           uint8_t has_after_ordinal,
+                                           uint64_t after_ordinal,
+                                           uint32_t limit,
+                                           struct MarmotMessageSelectionPage **out);
+
+/**
+ * Test frozen membership without loading a message body; `*out` is 0 or 1.
+ * # Safety
+ * Client and strings must be valid; `out` must be writable.
+ */
+MarmotStatus marmot_message_selection_contains(const struct MarmotClient *client,
+                                               const char *account_ref,
+                                               const char *token,
+                                               const char *message_id_hex,
+                                               uint8_t *out);
+
+/**
+ * Discard the encrypted, disk-backed selection; repeating is safe.
+ * # Safety
+ * Client and strings must be valid.
+ */
+MarmotStatus marmot_release_message_selection_snapshot(const struct MarmotClient *client,
+                                                       const char *account_ref,
+                                                       const char *token);
+
+/**
  * Register (or update) the account's native push token and share it.
  * `platform` is a `MarmotPushPlatform` discriminant; out-of-range values
  * are rejected with `MARMOT_STATUS_INVALID_ARGUMENT`. Free with
@@ -11331,6 +11401,26 @@ void marmot_relay_endpoint_classification_list_free(struct MarmotRelayEndpointCl
  * this library.
  */
 void marmot_app_performance_snapshot_free(struct MarmotAppPerformanceSnapshot *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_message_selection_snapshot_free(struct MarmotMessageSelectionSnapshot *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_message_selection_page_free(struct MarmotMessageSelectionPage *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL

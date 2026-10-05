@@ -9,6 +9,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Add account-private message selection snapshot commands and the owned
+  `MarmotMessageSelectionSnapshot` / `MarmotMessageSelectionPage` records.
+  Callers page frozen ids without loading all message bodies, revalidate rows
+  before actions, release the token, and deep-free each returned C record.
+  New symbols and layouts require a matching generated header and library.
+
 - Add `marmot_message_reactions` and the owned
   `MarmotTimelineUserReactionList` root/free for complete exact-message details.
   Existing record layouts are unchanged; the new symbols require matching
