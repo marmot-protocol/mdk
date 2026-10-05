@@ -46,13 +46,12 @@ DOCUMENTED_INSTALL_CALLS = {
     "integrations/opencode/marmot/README.md": {"install-opencode-marmot.sh": 2},
     "integrations/pi/marmot/README.md": {"install-pi-marmot.sh": 2},
 }
-# Codex is intentionally absent: its helper definition and only invocation
-# share one fence, so it has no dependent copy-paste fence.
 SAME_SHELL_SURFACES = (
     "integrations/README.md",
     "integrations/hermes/marmot/README.md",
     "integrations/openclaw/marmot/README.md",
     "integrations/claude/marmot/README.md",
+    "integrations/codex/marmot/README.md",
     "integrations/opencode/marmot/README.md",
     "integrations/pi/marmot/README.md",
 )
@@ -60,7 +59,7 @@ SAME_SHELL_SURFACES = (
 
 def release_resolver_source(text: str) -> str | None:
     matches = re.findall(
-        r'base_url="\$\(python3 - <<\x27RELEASE\x27\n(.*?)\nRELEASE\n\)" \|\| exit 1',
+        r'if base_url="\$\(python3 - <<\x27RELEASE\x27\n(.*?)\nRELEASE\n\)" && test -n "\$base_url"; then',
         text,
         re.DOTALL,
     )
@@ -77,8 +76,13 @@ def evergreen_release_errors(text: str) -> list[str]:
         text,
     ):
         errors.append("install README must not pin a current WN Agent version")
-    if 'test -n "$base_url" || exit 1' not in text:
-        errors.append("release resolution must fail closed before installer execution")
+    if 'base_url=""' not in text or 'case "$installer_url" in' not in text:
+        errors.append("failed release resolution must clear the URL and prevent execution")
+    if '"$checksum_url" != "$installer_url.sha256"' not in text:
+        errors.append("checksum URL must match the selected immutable installer")
+    for block in re.findall(r"```sh\n(.*?)\n```", text, re.DOTALL):
+        if "install_verified() (" in block and re.search(r"^install_verified ", block, re.MULTILINE):
+            errors.append("helper-definition fence must not execute an installer")
     return errors
 
 

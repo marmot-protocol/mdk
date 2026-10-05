@@ -6,6 +6,9 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
+import re
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -70,8 +73,36 @@ class InstallExampleSha256GateTests(unittest.TestCase):
     def test_evergreen_gate_rejects_a_fixed_or_non_fail_closed_url(self):
         readme = (Path(__file__).resolve().parents[1] / "integrations/README.md").read_text()
         self.assertEqual(gate.evergreen_release_errors(readme), [])
-        self.assertTrue(gate.evergreen_release_errors(readme.replace(')" || exit 1', ')"', 1)))
+        self.assertTrue(gate.evergreen_release_errors(readme.replace(')" && test -n "$base_url"; then', ')"; then', 1)))
         self.assertTrue(gate.evergreen_release_errors(readme + '\nbase_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v1.0.0"'))
+
+    def test_failed_lookup_keeps_shell_alive_and_never_downloads(self):
+        readme = (Path(__file__).resolve().parents[1] / "integrations/README.md").read_text()
+        block = next(code for code in re.findall(r"```sh\n(.*?)\n```", readme, re.DOTALL)
+                     if "install_verified() (" in code)
+        with tempfile.TemporaryDirectory() as temp:
+            fake = Path(temp) / "python3"
+            fake.write_text("#!/bin/sh\nexit 1\n")
+            fake.chmod(0o700)
+            curl = Path(temp) / "curl"
+            marker = Path(temp) / "downloaded"
+            curl.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n")
+            curl.chmod(0o700)
+            script = block + '\ntest -z "$base_url" || exit 2\ninstall_verified "$base_url/install-codex-marmot.sh" "$base_url/install-codex-marmot.sh.sha256"\nresult=$?\n[ "$result" -ne 0 ] || exit 3\nprintf "shell-alive\\n"\n'
+            result = subprocess.run(["bash", "-c", script], text=True, capture_output=True,
+                                    env={**os.environ, "PATH": temp + ":" + os.environ["PATH"]})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("shell-alive", result.stdout)
+            self.assertFalse(marker.exists())
+
+    def test_definition_fences_never_execute_installers(self):
+        root = Path(__file__).resolve().parents[1]
+        for relative in gate.DOCUMENTED_INSTALL_CALLS:
+            text = (root / relative).read_text()
+            for block in re.findall(r"```sh\n(.*?)\n```", text, re.DOTALL):
+                if "install_verified() (" in block:
+                    with self.subTest(path=relative):
+                        self.assertIsNone(re.search(r"^install_verified ", block, re.MULTILINE))
 
     def test_rejects_download_to_shell_pipeline(self) -> None:
         text = "curl -fsSL https://example.test/install.sh | bash\n"

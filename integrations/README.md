@@ -56,7 +56,9 @@ For the default cohort, remove stale `MARMOT_RELEASE_REPO`, `MARMOT_RELEASE_TAG`
 `WN_AGENT_VERSION` and `WN_AGENT_SHA` overrides; the published installer defaults
 its companion assets to its own release. Explicit overrides are a custom install.
 For repeatable deployments, save the printed `base_url` and reuse that exact
-release rather than resolving again. Minimum host versions and pinned test
+release rather than resolving again. The release publisher is the trust anchor;
+the sibling checksum verifies downloaded bytes, not an independent endorsement.
+A reviewed numeric release URL can replace the resolved value for a pinned install. Minimum host versions and pinned test
 cohorts below describe compatibility, not a required MDK install version.
 
 ```sh
@@ -65,6 +67,14 @@ install_verified() (
   installer_url="$1"
   checksum_url="$2"
   shift 2
+  case "$installer_url" in
+    https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v*/install-*-marmot.sh) ;;
+    *) echo "error: resolve a WN Agent release before installing" >&2; exit 1 ;;
+  esac
+  if [ "$checksum_url" != "$installer_url.sha256" ]; then
+    echo "error: checksum must accompany the same release installer" >&2
+    exit 1
+  fi
   installer_script="${installer_url##*/}"
   tmpdir="$(mktemp -d)"
   trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
@@ -81,7 +91,7 @@ install_verified() (
   bash "$tmpdir/$installer_script" "$@"
 )
 
-base_url="$(python3 - <<'RELEASE'
+if base_url="$(python3 - <<'RELEASE'
 import json, re, urllib.request
 candidates = []
 for page in range(1, 11):
@@ -102,9 +112,12 @@ if not candidates:
 tag = max(candidates)[1]
 print(f"https://github.com/marmot-protocol/mdk/releases/download/{tag}")
 RELEASE
-)" || exit 1
-test -n "$base_url" || exit 1
-printf 'Selected WN Agent release: %s\n' "$base_url"
+)" && test -n "$base_url"; then
+  printf 'Selected WN Agent release: %s\n' "$base_url"
+else
+  base_url=""
+  printf '%s\n' 'error: release lookup failed; installation is unavailable until resolved' >&2
+fi
 ```
 
 ### Hermes
@@ -205,8 +218,9 @@ select a working directory under your home directory.
 
 ### Repeatable Agent Or CI Setup
 
-Use the immutable release URL and provide the authorized White Noise account
-explicitly. Terminal harnesses use the welcomer entry for both invitation and
+For repeatable CI, save the exact numeric release URL printed during a
+reviewed setup and set `base_url` to that saved URL instead of resolving latest
+again on every run. Provide the authorized White Noise account explicitly. Terminal harnesses use the welcomer entry for both invitation and
 prompt authorization. OpenClaw keeps those boundaries separate: `--allow-welcomer`
 is invite admission only, and inbound sender authorization is a distinct
 `senderPolicy` / `MARMOT_ALLOWED_USERS` configuration.
