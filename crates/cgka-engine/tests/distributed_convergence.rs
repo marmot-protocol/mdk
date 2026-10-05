@@ -10120,10 +10120,6 @@ fn route(msg: TransportMessage, group_id: &GroupId) -> TransportMessage {
     }
 }
 
-/// Content-derived dedup id of a group message (#238). Inbound / buffered
-/// group messages are stored and reported under SHA-256 of the recovered MLS
-/// bytes, not the outer transport id. Under the pass-through `MockPeeler` the
-/// recovered MLS bytes are exactly `msg.payload`.
 /// Shared reaction identity of the one authenticated rename in this event window.
 fn rename_activity_target(events: &[GroupEvent], group_id: &GroupId) -> String {
     let targets: Vec<_> = events
@@ -10160,6 +10156,10 @@ fn rename_activity_target(events: &[GroupEvent], group_id: &GroupId) -> String {
     targets.into_iter().next().unwrap()
 }
 
+/// Content-derived dedup id of a group message (#238). Inbound / buffered
+/// group messages are stored and reported under SHA-256 of the recovered MLS
+/// bytes, not the outer transport id. Under the pass-through `MockPeeler` the
+/// recovered MLS bytes are exactly `msg.payload`.
 fn content_id(msg: &TransportMessage) -> MessageId {
     MessageId::new(Sha256::digest(&msg.payload).to_vec())
 }
