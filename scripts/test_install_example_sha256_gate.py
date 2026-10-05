@@ -104,6 +104,33 @@ class InstallExampleSha256GateTests(unittest.TestCase):
                     with self.subTest(path=relative):
                         self.assertIsNone(re.search(r"^install_verified ", block, re.MULTILINE))
 
+    def test_unsafe_manual_installer_urls_never_download(self):
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / "downloaded"
+            curl = Path(temp) / "curl"
+            curl.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n")
+            curl.chmod(0o700)
+            for relative in gate.DOCUMENTED_INSTALL_CALLS:
+                block = gate.install_definition_block((root / relative).read_text())
+                helper = block.split("\nif base_url=", 1)[0]
+                for tag in ["v1/../../../../other/repo/releases/download/x", "v1.0.0-rc1", "vfoo", "v1.0.0\n"]:
+                    url = "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-" + tag + "/install-codex-marmot.sh"
+                    with self.subTest(path=relative, tag=tag):
+                        result = subprocess.run(["bash", "-c", helper + '\ninstall_verified "$1" "$1.sha256"', "fixture", url],
+                            text=True, capture_output=True,
+                            env={**os.environ, "PATH": temp + ":" + os.environ["PATH"]})
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertFalse(marker.exists())
+
+    def test_definition_fences_match_canonical_helper(self):
+        root = Path(__file__).resolve().parents[1]
+        canonical = gate.install_definition_block((root / "integrations/README.md").read_text())
+        self.assertIsNotNone(canonical)
+        for relative in gate.DOCUMENTED_INSTALL_CALLS:
+            with self.subTest(path=relative):
+                self.assertEqual(gate.install_definition_block((root / relative).read_text()), canonical)
+
     def test_rejects_download_to_shell_pipeline(self) -> None:
         text = "curl -fsSL https://example.test/install.sh | bash\n"
         self.assertTrue(gate.find_download_to_shell_pipelines(text))

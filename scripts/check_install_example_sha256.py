@@ -66,6 +66,12 @@ def release_resolver_source(text: str) -> str | None:
     return matches[0] if len(matches) == 1 else None
 
 
+def install_definition_block(text: str) -> str | None:
+    blocks = [block for block in re.findall(r"```sh\n(.*?)\n```", text, re.DOTALL)
+              if "install_verified() (" in block]
+    return blocks[0] if len(blocks) == 1 else None
+
+
 def evergreen_release_errors(text: str) -> list[str]:
     errors: list[str] = []
     source = release_resolver_source(text)
@@ -244,10 +250,15 @@ def repository_errors(root: Path) -> list[str]:
     canonical = release_resolver_source(
         (root / "integrations/README.md").read_text(encoding="utf-8")
     )
+    canonical_block = install_definition_block(
+        (root / "integrations/README.md").read_text(encoding="utf-8")
+    )
     for relative, installers in DOCUMENTED_INSTALL_CALLS.items():
         text = (root / relative).read_text(encoding="utf-8")
         for error in evergreen_release_errors(text):
             errors.append(f"{relative}: {error}")
+        if install_definition_block(text) != canonical_block:
+            errors.append(f"{relative}: installer helper differs from canonical quickstart")
         if release_resolver_source(text) != canonical:
             errors.append(f"{relative}: release resolver differs from canonical quickstart")
         for error in documented_surface_errors(text, installers):

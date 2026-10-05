@@ -289,9 +289,12 @@ install_verified() (
   checksum_url="$2"
   shift 2
   case "$installer_url" in
-    https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v*/install-*-marmot.sh) ;;
-    *) echo "error: resolve a WN Agent release before installing" >&2; exit 1 ;;
+    *[!a-zA-Z0-9:/._-]*) echo "error: invalid installer URL" >&2; exit 1 ;;
   esac
+  if ! printf '%s\n' "$installer_url" | LC_ALL=C grep -Eq '^https://github[.]com/marmot-protocol/mdk/releases/download/wn-agent-v[0-9]+[.][0-9]+[.][0-9]+/install-(hermes|openclaw|claude|codex|opencode|pi)-marmot[.]sh$'; then
+    echo "error: resolve a numeric WN Agent release before installing" >&2
+    exit 1
+  fi
   if [ "$checksum_url" != "$installer_url.sha256" ]; then
     echo "error: checksum must accompany the same release installer" >&2
     exit 1
@@ -299,8 +302,8 @@ install_verified() (
   installer_script="${installer_url##*/}"
   tmpdir="$(mktemp -d)"
   trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
-  curl -fsSL --connect-timeout 10 --max-time 180 "$installer_url" -o "$tmpdir/$installer_script"
-  curl -fsSL --connect-timeout 10 --max-time 180 "$checksum_url" -o "$tmpdir/$installer_script.sha256"
+  curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 180 "$installer_url" -o "$tmpdir/$installer_script"
+  curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 180 "$checksum_url" -o "$tmpdir/$installer_script.sha256"
   if command -v shasum >/dev/null 2>&1; then
     (cd "$tmpdir" && shasum -a 256 -c "$installer_script.sha256")
   elif command -v sha256sum >/dev/null 2>&1; then
