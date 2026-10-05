@@ -105,6 +105,10 @@ WN Agent releases are currently marked GitHub pre-releases; the resolver accepts
 published numeric tags and excludes draft releases and `-rc`/other suffixes.
 GitHub's repository-wide `/releases/latest` may select MDK or MarmotKit instead.
 Resolution or checksum failure stops installation; no unverified fallback runs.
+If lookup fails due to a GitHub API rate limit, offline networking or Python TLS
+certificates, fix that cause or set `base_url` to a reviewed numeric WN Agent
+release URL from the [release list](https://github.com/marmot-protocol/mdk/releases).
+Keep the checksum verification; do not fall back to an unverified script.
 For the default cohort, remove stale `MARMOT_RELEASE_REPO`, `MARMOT_RELEASE_TAG`,
 `WN_AGENT_VERSION` and `WN_AGENT_SHA` overrides; the published installer defaults
 its companion assets to its own release. Explicit overrides are a custom install.

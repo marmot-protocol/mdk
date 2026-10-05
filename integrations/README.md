@@ -52,6 +52,10 @@ WN Agent releases are currently marked GitHub pre-releases; the resolver accepts
 published numeric tags and excludes draft releases and `-rc`/other suffixes.
 GitHub's repository-wide `/releases/latest` may select MDK or MarmotKit instead.
 Resolution or checksum failure stops installation; no unverified fallback runs.
+If lookup fails due to a GitHub API rate limit, offline networking or Python TLS
+certificates, fix that cause or set `base_url` to a reviewed numeric WN Agent
+release URL from the [release list](https://github.com/marmot-protocol/mdk/releases).
+Keep the checksum verification; do not fall back to an unverified script.
 For the default cohort, remove stale `MARMOT_RELEASE_REPO`, `MARMOT_RELEASE_TAG`,
 `WN_AGENT_VERSION` and `WN_AGENT_SHA` overrides; the published installer defaults
 its companion assets to its own release. Explicit overrides are a custom install.
@@ -220,7 +224,10 @@ select a working directory under your home directory.
 
 For repeatable CI, save the exact numeric release URL printed during a
 reviewed setup and set `base_url` to that saved URL instead of resolving latest
-again on every run. Provide the authorized White Noise account explicitly. Terminal harnesses use the welcomer entry for both invitation and
+again on every run. Set `WN_AGENT_PINNED_BASE_URL` in the CI environment to that
+reviewed exact URL; the example clears a previously resolved value if the pin
+is missing, so the installer helper refuses it before any download.
+Provide the authorized White Noise account explicitly. Terminal harnesses use the welcomer entry for both invitation and
 prompt authorization. OpenClaw keeps those boundaries separate: `--allow-welcomer`
 is invite admission only, and inbound sender authorization is a distinct
 `senderPolicy` / `MARMOT_ALLOWED_USERS` configuration.
@@ -229,6 +236,7 @@ Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
 OWNER_NPUB=npub1...
+base_url="${WN_AGENT_PINNED_BASE_URL:-}"
 install_verified "$base_url/install-codex-marmot.sh" \
   "$base_url/install-codex-marmot.sh.sha256" \
   --yes --allow-welcomer "$OWNER_NPUB"
