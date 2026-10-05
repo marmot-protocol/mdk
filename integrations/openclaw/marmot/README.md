@@ -89,7 +89,9 @@ all other channel settings:
 This is a fragment to merge, not a replacement for the whole config file. Use
 a real hex key, not the `npub1...` form accepted by the installer. An explicit
 `senderPolicy` takes precedence over environment fallback; an invalid or empty
-policy fails closed. Keep open access an explicit operator choice. Reload only
+policy fails closed. For named channel accounts, put `senderPolicy` under
+`channels.marmot.accounts.<name>`; they do not inherit a root or sibling policy.
+Keep open access an explicit operator choice. Reload only
 the selected gateway using its existing supervisor; the installer does not
 restart it, and an additional foreground gateway is not a restart of an active
 managed instance.
@@ -208,6 +210,13 @@ the installers never opt into shared home/socket state silently.
 
 The installer prints restart guidance for your existing OpenClaw gateway. It
 does not restart OpenClaw automatically.
+
+The following manual example bootstraps a generated local identity. To reuse
+an existing identity instead, follow the connector's
+[identity import instructions](../../../crates/agent-connector/README.md#run-locally)
+before starting the daemon, then bootstrap with `--no-create` and
+`--account-id-hex` set to the verified imported account. Keep that same account
+in the OpenClaw channel configuration; do not place a secret key in it.
 
 For manual startup, keep `wn-agent` in terminal 1, using the confirmed
 home/socket and the daemon's separate outbound staging root:

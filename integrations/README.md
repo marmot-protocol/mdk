@@ -419,7 +419,7 @@ several integrations:
 
 The current Hermes, OpenClaw, and terminal-harness release installers are
 optimized for isolated defaults. They also expose `MARMOT_HOME`,
-`MARMOT_AGENT_SOCKET`, `MARMOT_AGENT_SERVICE_NAME`, and
+`MARMOT_AGENT_SOCKET`, `MARMOT_AGENT_LABEL`, `MARMOT_AGENT_SERVICE_NAME`, and
 `MARMOT_AGENT_LAUNCHD_LABEL` overrides for advanced layouts.
 
 If `wn-agent` and a host gateway run as different local users, keep the socket
