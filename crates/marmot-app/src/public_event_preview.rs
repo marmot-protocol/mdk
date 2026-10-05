@@ -138,7 +138,7 @@ pub struct PublicEventDeletion {
 /// reimported or closed meanwhile (a retry reads the current incarnation).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PublicEventCacheResult {
-    Present(PublicEventPreview),
+    Present(Box<PublicEventPreview>),
     AuthoritativeDeleted(PublicEventDeletion),
     Missing,
     Busy,
@@ -155,7 +155,7 @@ impl PublicEventCacheResult {
     #[cfg(test)]
     fn into_present(self) -> Option<PublicEventPreview> {
         match self {
-            Self::Present(preview) => Some(preview),
+            Self::Present(preview) => Some(*preview),
             _ => None,
         }
     }
@@ -1295,7 +1295,7 @@ impl PublicEventCache {
                 "UPDATE public_event_previews SET touched_at = ?2 WHERE cache_key = ?1",
                 params![key, i64_secs(now)],
             )?;
-            return Ok(PublicEventCacheResult::Present(stored.preview));
+            return Ok(PublicEventCacheResult::Present(Box::new(stored.preview)));
         }
         let tombstone = if key.starts_with("address:") {
             Self::coordinate_deletion(conn, provenance, key)?

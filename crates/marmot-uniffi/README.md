@@ -592,6 +592,9 @@ including duplicates, each with its canonical key and a state:
 | `Missing` | none | Nothing is known locally; resolve it. Never durable "not found". |
 | `Busy` | none | Account lifecycle work is running, or the account was removed, wiped, reimported or closed during the request; retry shortly. Never treat as a miss. |
 
+Run local reads on the host's I/O dispatcher to keep encrypted storage access and retained-evidence verification off
+the UI thread.
+
 The whole request is validated first, so an invalid reference or more than 16 references is an error. An immutable
 event ID needs no age-based refresh; a coordinate sets `refreshRecommended` after 15 minutes but keeps its content.
 Every payload carries `projectionVersion` (currently 1).

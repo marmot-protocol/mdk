@@ -71,7 +71,9 @@ pub enum RelayPolicyFfi {
 pub use commands::{
     CreateGroupOptionsFfi, InitialGroupImageFfi, LocalSendAcceptanceFfi, LocalSendStatusFfi,
     MediaUploadSubmissionFfi, MemberKeyPackagePrewarmSummaryFfi, OnboardingSubscription,
-    PreparedGroupImageUploadFfi, PreparedGroupImageUploadStateFfi, parse_media_imeta_tag,
+    PreparedGroupImageUploadFfi, PreparedGroupImageUploadStateFfi, PublicEventCacheKeyFfi,
+    PublicEventCacheKeyTypeFfi, PublicEventCacheReadFfi, PublicEventCacheStateFfi,
+    PublicEventDeletionFfi, PublicEventPreviewFfi, parse_media_imeta_tag,
     verify_public_nostr_event_json,
 };
 pub use conversions::{
@@ -600,8 +602,3 @@ mod tests {
         );
     }
 }
-
-pub use commands::{
-    PublicEventCacheKeyFfi, PublicEventCacheKeyTypeFfi, PublicEventCacheReadFfi,
-    PublicEventCacheStateFfi, PublicEventDeletionFfi, PublicEventPreviewFfi,
-};

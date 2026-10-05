@@ -472,7 +472,7 @@ mod tests {
         })
         .unwrap();
         let d = SingleLetterTag::from_char('d').unwrap();
-        assert!(replaceable.generic_tags.get(&d).is_none());
+        assert!(!replaceable.generic_tags.contains_key(&d));
         assert!(
             addressable
                 .generic_tags

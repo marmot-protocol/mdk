@@ -115,7 +115,7 @@ impl From<marmot_app::PublicEventCacheRead> for PublicEventCacheReadFfi {
         let (state, preview, deletion) = match value.result {
             CacheResult::Present(preview) => (
                 PublicEventCacheStateFfi::Present,
-                Some(preview.into()),
+                Some((*preview).into()),
                 None,
             ),
             CacheResult::AuthoritativeDeleted(deletion) => (
