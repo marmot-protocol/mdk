@@ -677,6 +677,7 @@ impl AccountHome {
             directory.join("onboarding-cancelled.json"),
         ) {
             Ok(()) => {
+                #[cfg(unix)]
                 fs::File::open(directory)?.sync_all()?;
                 Ok(())
             }
@@ -734,6 +735,7 @@ impl AccountHome {
             directory.join("onboarding.json"),
             directory.join("onboarding-cancelled.json"),
         )?;
+        #[cfg(unix)]
         fs::File::open(directory)?.sync_all()?;
         Ok(())
     }

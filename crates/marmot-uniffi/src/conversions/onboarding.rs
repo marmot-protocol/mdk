@@ -285,12 +285,16 @@ impl From<marmot_app::OnboardingSnapshot> for OnboardingSnapshotFfi {
 pub struct OnboardingOptionsFfi {
     pub default_relays: Vec<String>,
     pub discovery_relays: Vec<String>,
+    /// Recommended kind-10050 inbox relays. Empty uses `default_relays`.
+    #[uniffi(default = [])]
+    pub inbox_relays: Vec<String>,
 }
 impl From<marmot_app::OnboardingOptions> for OnboardingOptionsFfi {
     fn from(value: marmot_app::OnboardingOptions) -> Self {
         Self {
             default_relays: value.default_relays,
             discovery_relays: value.discovery_relays,
+            inbox_relays: value.inbox_relays,
         }
     }
 }
@@ -299,6 +303,7 @@ impl From<OnboardingOptionsFfi> for marmot_app::OnboardingOptions {
         Self {
             default_relays: value.default_relays,
             discovery_relays: value.discovery_relays,
+            inbox_relays: value.inbox_relays,
         }
     }
 }

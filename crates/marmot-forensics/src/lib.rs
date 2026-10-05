@@ -1,5 +1,5 @@
 pub mod audit;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod local_delivery;
 /// Opt-in v5 record contract written by new app audit sessions; v4 stays frozen.
 pub mod v5;

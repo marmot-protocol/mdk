@@ -89,7 +89,7 @@ pub use conversation_window::{
     ConversationPageDirection, ConversationWindowError, ConversationWindowHandle,
     ConversationWindowRevision, ConversationWindowSnapshot, RuntimeConversationWindowSubscription,
 };
-mod attachment_controls;
+pub(crate) mod attachment_controls;
 pub(crate) mod attachment_permission;
 pub use attachment_controls::{
     AttachmentControl, AttachmentDownloadPolicy, AttachmentTransferState, AttachmentTransferStatus,
@@ -1227,6 +1227,10 @@ pub struct AccountSetupRequest {
     pub import_nsec: Option<Zeroizing<String>>,
     pub default_relays: Vec<TransportEndpoint>,
     pub bootstrap_relays: Vec<TransportEndpoint>,
+    /// Relays for a published kind-10050 inbox list. Empty uses
+    /// `default_relays`, which otherwise declare both the NIP-65 and the
+    /// inbox list.
+    pub inbox_relays: Vec<TransportEndpoint>,
     /// Public directory indexers. Existing accounts use them for reads;
     /// generated accounts also copy relay lists and kind-0 metadata to them.
     pub discovery_relays: Vec<TransportEndpoint>,
@@ -1247,6 +1251,7 @@ impl std::fmt::Debug for AccountSetupRequest {
             )
             .field("default_relays", &self.default_relays)
             .field("bootstrap_relays", &self.bootstrap_relays)
+            .field("inbox_relays", &self.inbox_relays)
             .field("discovery_relays", &self.discovery_relays)
             .field(
                 "publish_missing_relay_lists",
@@ -1271,6 +1276,7 @@ impl AccountSetupRequest {
             import_nsec: None,
             default_relays: self.default_relays.clone(),
             bootstrap_relays: self.bootstrap_relays.clone(),
+            inbox_relays: self.inbox_relays.clone(),
             discovery_relays: self.discovery_relays.clone(),
             publish_missing_relay_lists: self.publish_missing_relay_lists,
             publish_initial_key_package: self.publish_initial_key_package,
@@ -1305,6 +1311,9 @@ pub enum AccountSetupReadiness {
 struct GeneratedAccountSetupContext {
     default_relays: Vec<String>,
     bootstrap_relays: Vec<String>,
+    // Absent from contexts persisted before separate inbox relays existed.
+    #[serde(default)]
+    inbox_relays: Vec<String>,
     discovery_relays: Vec<String>,
     publish_missing_relay_lists: bool,
     publish_initial_key_package: bool,
@@ -1320,6 +1329,11 @@ impl GeneratedAccountSetupContext {
                 .collect(),
             bootstrap_relays: request
                 .bootstrap_relays
+                .iter()
+                .map(|endpoint| endpoint.0.clone())
+                .collect(),
+            inbox_relays: request
+                .inbox_relays
                 .iter()
                 .map(|endpoint| endpoint.0.clone())
                 .collect(),
@@ -1345,6 +1359,12 @@ impl GeneratedAccountSetupContext {
                 .collect(),
             bootstrap_relays: self
                 .bootstrap_relays
+                .iter()
+                .cloned()
+                .map(TransportEndpoint)
+                .collect(),
+            inbox_relays: self
+                .inbox_relays
                 .iter()
                 .cloned()
                 .map(TransportEndpoint)
@@ -5486,7 +5506,8 @@ impl MarmotAppRuntime {
         let bootstrap = AccountRelayListBootstrap::new(
             effective_request.default_relays.clone(),
             effective_request.bootstrap_relays.clone(),
-        );
+        )
+        .with_inbox_relays(effective_request.inbox_relays.clone());
         if bootstrap.default_relays.is_empty() {
             return Err(AppError::MissingDefaultRelays);
         }
@@ -7900,6 +7921,7 @@ impl AccountManager {
             request.default_relays.clone(),
             request.bootstrap_relays.clone(),
         )
+        .with_inbox_relays(request.inbox_relays.clone())
         .with_indexer_relays(request.discovery_relays.clone());
         // Validate before advancing the durable publication phase. The
         // publisher validates again at its own action boundary because it is
@@ -8050,7 +8072,8 @@ impl AccountManager {
                 let bootstrap = AccountRelayListBootstrap::new(
                     request.default_relays.clone(),
                     request.bootstrap_relays.clone(),
-                );
+                )
+                .with_inbox_relays(request.inbox_relays.clone());
                 let current_status = if let Some(status) = recent_relay_lists {
                     status
                 } else {
@@ -8194,7 +8217,8 @@ impl AccountManager {
                 AccountRelayListBootstrap::new(
                     request.default_relays.clone(),
                     request.bootstrap_relays.clone(),
-                ),
+                )
+                .with_inbox_relays(request.inbox_relays.clone()),
             )
             .await
     }

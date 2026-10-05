@@ -203,6 +203,12 @@ mod migration_0096_account_delivery_spill;
 mod migration_0097_loss_created_at_bound;
 #[path = "migrations/0098_recovery_history_notices.rs"]
 mod migration_0098_recovery_history_notices;
+#[path = "migrations/0099_attachment_preparation_deferrals.rs"]
+mod migration_0099_attachment_preparation_deferrals;
+#[path = "migrations/0100_attachment_explicit_priority.rs"]
+mod migration_0100_attachment_explicit_priority;
+#[path = "migrations/0101_outgoing_attachment_uploads.rs"]
+mod migration_0101_outgoing_attachment_uploads;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -708,6 +714,21 @@ const MIGRATIONS: &[Migration] = &[
         version: 98,
         name: "0098_recovery_history_notices",
         apply: migration_0098_recovery_history_notices::apply,
+    },
+    Migration {
+        version: 99,
+        name: "0099_attachment_preparation_deferrals",
+        apply: migration_0099_attachment_preparation_deferrals::apply,
+    },
+    Migration {
+        version: 100,
+        name: "0100_attachment_explicit_priority",
+        apply: migration_0100_attachment_explicit_priority::apply,
+    },
+    Migration {
+        version: 101,
+        name: "0101_outgoing_attachment_uploads",
+        apply: migration_0101_outgoing_attachment_uploads::apply,
     },
 ];
 

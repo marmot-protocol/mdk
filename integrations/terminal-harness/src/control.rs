@@ -38,6 +38,21 @@ pub(crate) struct DownloadedMedia {
 // abort it before wn-agent can validate and return the result.
 const MIN_MEDIA_DOWNLOAD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(16 * 60);
 
+// Marmot uploads each attachment of a batch in turn. Every attachment tries up
+// to three Blossom servers, and each encrypted blob PUT may run for fifteen
+// minutes: 10 attachments x 3 servers x 15 minutes = 450 minutes. One extra
+// minute covers encryption, signing, and publishing the media message. The
+// connector holds the idempotency key across the whole send, so an early
+// harness timeout could only turn a slow success into a retry.
+const MEDIA_UPLOAD_SERVER_ATTEMPTS: u32 = 3;
+const MEDIA_BLOB_TRANSFER_TIMEOUT_SECS: u64 = 15 * 60;
+const MIN_MEDIA_SEND_RESPONSE_TIMEOUT: Duration = Duration::from_secs(
+    agent_control::MAX_MEDIA_UPLOAD_ATTACHMENTS as u64
+        * MEDIA_UPLOAD_SERVER_ATTEMPTS as u64
+        * MEDIA_BLOB_TRANSFER_TIMEOUT_SECS
+        + 60,
+);
+
 impl ControlClient {
     pub(crate) fn new(
         socket: PathBuf,
@@ -161,7 +176,7 @@ impl ControlClient {
                     group_id_hex: group_ref.to_owned(),
                     media,
                 },
-                self.media_download_response_timeout(),
+                self.response_timeout_at_least(MIN_MEDIA_DOWNLOAD_RESPONSE_TIMEOUT),
             )
             .await?
         {
@@ -229,7 +244,7 @@ impl ControlClient {
         idempotency_key: String,
     ) -> Result<()> {
         match self
-            .call(
+            .call_with_response_timeout(
                 "send_media",
                 AgentControlRequest::SendMedia {
                     account_id_hex: account_ref.to_owned(),
@@ -238,6 +253,7 @@ impl ControlClient {
                     caption,
                     idempotency_key: Some(idempotency_key),
                 },
+                self.response_timeout_at_least(MIN_MEDIA_SEND_RESPONSE_TIMEOUT),
             )
             .await?
         {
@@ -397,9 +413,10 @@ impl ControlClient {
         format!("{}-{}-{seq}", self.request_prefix, std::process::id())
     }
 
-    fn media_download_response_timeout(&self) -> Duration {
-        self.request_timeout
-            .max(MIN_MEDIA_DOWNLOAD_RESPONSE_TIMEOUT)
+    /// Response deadline for a long media operation. Connect and write keep
+    /// the ordinary request timeout; only the wait for the reply is extended.
+    fn response_timeout_at_least(&self, minimum: Duration) -> Duration {
+        self.request_timeout.max(minimum)
     }
 }
 
@@ -444,6 +461,7 @@ fn response_name(response: &AgentControlResponse) -> &'static str {
         AgentControlResponse::KeyPackagePublished { .. } => "key_package_published",
         AgentControlResponse::ProfilePublished { .. } => "profile_published",
         AgentControlResponse::ProfileLookup { .. } => "profile_lookup",
+        AgentControlResponse::RelayLists { .. } => "relay_lists",
         AgentControlResponse::FinalSent { .. } => "final_sent",
         AgentControlResponse::AppEventSent { .. } => "app_event_sent",
         AgentControlResponse::Allowlist { .. } => "allowlist",
@@ -503,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn media_download_response_has_a_separate_budget() {
+    fn media_responses_have_separate_budgets() {
         let client = ControlClient::new(
             PathBuf::from("/unused"),
             None,
@@ -511,21 +529,75 @@ mod tests {
             "wn-test",
         );
         assert_eq!(
-            client.media_download_response_timeout(),
+            client.response_timeout_at_least(MIN_MEDIA_DOWNLOAD_RESPONSE_TIMEOUT),
             Duration::from_secs(16 * 60)
+        );
+        assert_eq!(
+            client.response_timeout_at_least(MIN_MEDIA_SEND_RESPONSE_TIMEOUT),
+            Duration::from_secs(451 * 60)
         );
         assert_eq!(client.request_timeout, Duration::from_secs(30));
 
         let custom = ControlClient::new(
             PathBuf::from("/unused"),
             None,
-            Duration::from_secs(20 * 60),
+            Duration::from_secs(500 * 60),
             "wn-test",
         );
         assert_eq!(
-            custom.media_download_response_timeout(),
-            Duration::from_secs(20 * 60)
+            custom.response_timeout_at_least(MIN_MEDIA_DOWNLOAD_RESPONSE_TIMEOUT),
+            Duration::from_secs(500 * 60)
         );
+        assert_eq!(
+            custom.response_timeout_at_least(MIN_MEDIA_SEND_RESPONSE_TIMEOUT),
+            Duration::from_secs(500 * 60)
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_send_media_reply_can_outlast_ordinary_control_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let request: AgentControlEnvelope<AgentControlRequest> =
+                read_envelope(&mut reader).await.unwrap().unwrap();
+            assert!(matches!(
+                request.payload,
+                AgentControlRequest::SendMedia { .. }
+            ));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let response = AgentControlEnvelope::request(
+                request.id,
+                AgentControlResponse::FinalSent {
+                    message_ids_hex: vec!["message".to_owned()],
+                    maintenance_disposition: Default::default(),
+                },
+            );
+            write_frame(&mut write_half, &response).await.unwrap();
+        });
+
+        let client = ControlClient::new(socket, None, Duration::from_millis(500), "wn-test");
+        client
+            .send_artifacts(
+                "account",
+                "group",
+                vec![AgentControlMediaUpload {
+                    path: "/private/report.pdf".to_owned(),
+                    media_type: "application/pdf".to_owned(),
+                    file_name: "report.pdf".to_owned(),
+                    dim: None,
+                    thumbhash: None,
+                }],
+                None,
+                "stable-key".to_owned(),
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]

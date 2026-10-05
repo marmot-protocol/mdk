@@ -56,6 +56,17 @@ fn admit_demands(
     let demands = storage.attachment_worker_demands(DEMAND_BATCH)?;
     let more = demands.len() == DEMAND_BATCH;
     for demand in demands {
+        if storage.attachment_source_has_upload(
+            &demand.group_id_hex,
+            &demand.entry.message_id_hex,
+            demand.entry.attachment_index,
+        ).unwrap_or_else(|_| {
+            tracing::warn!(target: "marmot_app::runtime", method = "outgoing_retention_lookup", "optional outgoing retention lookup deferred");
+            false
+        }) {
+            storage.acknowledge_attachment_worker_demand(&demand)?;
+            continue;
+        }
         if let Some(epoch) = demand.entry.source_epoch
             && let Some(reference) = reference(&demand.entry.slot, epoch, loopback)
         {
@@ -87,18 +98,21 @@ async fn cancelled(
     permission: Option<super::super::attachment_permission::PermissionLease>,
 ) {
     loop {
-        if permission.as_ref().is_some_and(|p| !p.allowed()) {
-            return;
-        }
         let store = storage.clone();
         let current = job.clone();
         let active = tokio::task::spawn_blocking(move || {
-            store.attachment_transfer_is_active(&current, crate::unix_now_seconds())
+            Ok::<_, cgka_traits::StorageError>((
+                store.attachment_transfer_is_active(&current, crate::unix_now_seconds())?,
+                store.attachment_request_is_explicit(&current.reference)?,
+            ))
         })
         .await;
         // Failure to observe is not cancellation. The transfer deadline and
         // publication fence still bound work while a storage read is unavailable.
-        if matches!(active, Ok(Ok(false))) {
+        if matches!(active, Ok(Ok((false, _))))
+            || (permission.as_ref().is_some_and(|p| !p.allowed())
+                && !matches!(active, Ok(Ok((_, true)))))
+        {
             return;
         }
         tokio::select! {
@@ -137,6 +151,13 @@ pub(super) fn schedule(
     let now = crate::unix_now_seconds();
     // Abandoned ciphertext expires even after automatic acquisition is disabled.
     let partials = storage.prune_attachment_partials(now, 64)?;
+    let orphan_uploads = storage
+        .prune_attachment_uploads(now, 64)
+        .unwrap_or_else(|_| {
+            tracing::warn!(target: "marmot_app::runtime", method = "outgoing_retention_prune",
+            "optional outgoing retention cleanup deferred");
+            0
+        });
     let policy = storage.attachment_download_policy(
         &super::super::attachment_controls::default_policy(&client.app.config),
     )?;
@@ -150,6 +171,13 @@ pub(super) fn schedule(
     let host_managed = client.app.config.attachment_acquisition_mode
         == crate::AttachmentAcquisitionMode::HostManaged;
     let identity = storage.attachment_store_identity()?;
+    if storage
+        .recover_attachment_uploads(now, 32, policy.retained_bytes)
+        .is_err()
+    {
+        tracing::warn!(target: "marmot_app::runtime", method = "outgoing_retention_recovery",
+            "optional outgoing retention recovery deferred");
+    }
     let resumed = if policy.automatic {
         storage.resume_permitted_attachments(
             now,
@@ -171,7 +199,8 @@ pub(super) fn schedule(
                 client.app.config.allow_loopback_blob_endpoints,
             )?)
         || expired == 64
-        || partials == 64;
+        || partials == 64
+        || orphan_uploads == 64;
     // Metadata and expiry maintenance continue when disk or network slots are full.
     // Admission never evicts an acquired asset and never increments attempts while paused.
     if http.permits.available_permits() <= 1 {
@@ -255,16 +284,31 @@ pub(super) fn schedule(
             storage.finish_attachment_preparation(&candidate, now, None)?;
             continue;
         };
-        let prepared = match client.prepare_background_attachment_download(&group, reference, max) {
+        // Queued explicit work (Retry, download again) derives a missing
+        // source-epoch key from the retained anchor; automatic work reads only
+        // what projection and sync cached.
+        let prepared = if explicit {
+            client
+                .cache_attachment_source_epoch_secret(&group, &reference)
+                .and_then(|()| {
+                    client.prepare_background_attachment_download(&group, reference, max)
+                })
+        } else {
+            client.prepare_background_attachment_download(&group, reference, max)
+        };
+        let prepared = match prepared {
             Ok(Some(prepared)) => prepared,
-            // Local readiness is not a failed transfer. Defer only this candidate
-            // for one maintenance tick, preserving siblings and their attempts.
+            // Local readiness is not a failed transfer. Defer only this candidate,
+            // preserving siblings and their attempts. The deferral streak is
+            // bounded: material that never arrives fails the job, not the loop.
             Ok(None) | Err(_) => {
-                storage.finish_attachment_preparation(
-                    &candidate,
-                    now,
-                    Some(now.saturating_add(15)),
-                )?;
+                if storage.defer_attachment_preparation(&candidate, now)? {
+                    tracing::warn!(
+                        target: "marmot_app::runtime",
+                        method = "attachment_acquisition",
+                        "attachment decryption material stayed unavailable; acquisition failed"
+                    );
+                }
                 return Ok(more);
             }
         };
@@ -290,6 +334,7 @@ pub(super) fn schedule(
         };
         let byte_budget = policy.retained_bytes;
         let resume = crate::media::attachment_resume::AttachmentResume {
+            explicit_permission: Default::default(),
             storage: storage.clone(),
             job: job.clone(),
             ciphertext_digest,

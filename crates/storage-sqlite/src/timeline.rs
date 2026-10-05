@@ -894,6 +894,18 @@ impl SqliteAccountStorage {
         )
     }
 
+    /// Whether [`Self::clear_local_publish_failure`] would revive this row: a
+    /// primary-key probe on the same predicate, for callers that must check a
+    /// precondition of their own before clearing.
+    pub fn local_publish_failure_is_clearable(
+        &self,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> StorageResult<bool> {
+        let conn = self.lock()?;
+        local_publish_failure_is_clearable_tx(&conn, group_id_hex, message_id_hex)
+    }
+
     /// Clear the `local_publish_failed` retraction on one locally-sent row.
     ///
     /// This is the **only** revival path for an invalidated app event, and it
@@ -906,7 +918,9 @@ impl SqliteAccountStorage {
     /// so the send path calls this *after* re-recording: the fresh send intent
     /// is the evidence, only the local send path can produce one, and running
     /// last keeps the tombstone standing until the revival itself commits (see
-    /// `AppClient::record_send_intent_projection`).
+    /// `AppClient::record_send_intent_projection`). Publish finalization is the
+    /// other caller: a relay accepting the row's own fanout contradicts a
+    /// retraction the send path wrote before that fanout ran.
     ///
     /// The predicate is deliberately narrow, and every conjunct earns its place:
     ///
@@ -923,10 +937,12 @@ impl SqliteAccountStorage {
     ///
     /// The reason literal is shared, by design, with the terminal-group sweep
     /// ([`Self::invalidate_pending_sent_app_events_for_group`]), so reason alone
-    /// would not be a safe predicate anywhere the send intent is absent. That is
-    /// exactly why this is a primitive the send path calls explicitly and not a
-    /// carve-out in the upsert: replay seams re-record swept rows without ever
-    /// entering the send path, and an upsert-level carve-out would revive them.
+    /// would not be a safe predicate anywhere the send intent or a publish
+    /// acceptance is absent. That is exactly why this is a primitive those
+    /// callers invoke explicitly and not a carve-out in the upsert: replay seams
+    /// re-record swept rows without either, and an upsert-level carve-out would
+    /// revive them. Publish finalization also skips terminal groups, so a late
+    /// acceptance never overturns the sweep.
     ///
     /// Returns `None` when no row matched, so a caller can tell a real revival
     /// from a no-op without a second read.
@@ -937,19 +953,7 @@ impl SqliteAccountStorage {
     ) -> StorageResult<Option<TimelineProjectionUpdate>> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            if conn
-                .query_row_cached(
-                    &format!(
-                        "SELECT 1 FROM app_events
-                         WHERE {CLEARABLE_LOCAL_PUBLISH_FAILURE_PREDICATE}"
-                    ),
-                    params![group_id_hex, message_id_hex, LOCAL_PUBLISH_FAILED_REASON],
-                    |_| Ok(()),
-                )
-                .optional()
-                .storage()?
-                .is_none()
-            {
+            if !local_publish_failure_is_clearable_tx(&conn, group_id_hex, message_id_hex)? {
                 return Ok(None);
             }
             let Some((kind, tags)) =
@@ -2096,6 +2100,25 @@ pub(crate) fn upsert_message_timeline_projection_for_message_tx(
         upsert_agent_stream_start_tx(tx, &stream_start)?;
     }
     Ok(())
+}
+
+fn local_publish_failure_is_clearable_tx(
+    conn: &Connection,
+    group_id_hex: &str,
+    message_id_hex: &str,
+) -> StorageResult<bool> {
+    Ok(conn
+        .query_row_cached(
+            &format!(
+                "SELECT 1 FROM app_events
+                 WHERE {CLEARABLE_LOCAL_PUBLISH_FAILURE_PREDICATE}"
+            ),
+            params![group_id_hex, message_id_hex, LOCAL_PUBLISH_FAILED_REASON],
+            |_| Ok(()),
+        )
+        .optional()
+        .storage()?
+        .is_some())
 }
 
 fn raw_app_event_tx(

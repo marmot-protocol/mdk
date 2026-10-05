@@ -42,6 +42,8 @@ pub enum HarnessError {
     AttachmentInvalid,
     #[error("backend does not support this attachment type")]
     AttachmentUnsupported,
+    #[error("backend could not process an attachment and was stopped")]
+    AttachmentNotProcessed,
     #[error("backend does not expose the required attachment capability: {capability}")]
     AttachmentBackendCapabilityUnsupported { capability: &'static str },
     #[error("backend attachment capability probe failed: {capability}")]
@@ -83,6 +85,7 @@ impl HarnessError {
             Self::AttachmentBytesLimit => "attachment_bytes_limit",
             Self::AttachmentInvalid => "attachment_invalid",
             Self::AttachmentUnsupported => "attachment_unsupported",
+            Self::AttachmentNotProcessed => "attachment_not_processed",
             Self::AttachmentBackendCapabilityUnsupported { .. } => {
                 "attachment_backend_capability_unsupported"
             }

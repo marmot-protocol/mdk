@@ -115,7 +115,7 @@ install_verified() (
   bash "$tmpdir/$installer_script" "$@"
 )
 
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.11.0"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256"
 ```
@@ -132,7 +132,7 @@ repeated or given a comma-separated list to authorize multiple senders:
 Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.11.0"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256" \
   --yes \
@@ -148,7 +148,7 @@ with `--generate-identity`). To preserve an existing Nostr identity, place its
 Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.11.0"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256" \
   --yes \
@@ -178,7 +178,7 @@ To accept Marmot messages from any sender (explicit opt-in):
 Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.11.0"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256" \
   --yes --allow-all-users

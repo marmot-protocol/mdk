@@ -53,6 +53,11 @@ pub(crate) enum RewindSite {
     /// Ingest rewinds onto a retained anchor to read the retention policy that
     /// was authenticated at a delayed message's source epoch.
     RetentionSource,
+    /// The app, or canonical apply before it merges commits that could prune
+    /// the anchor, rewinds onto a retained anchor to derive the
+    /// encrypted-media exporter secret of a past epoch that a received media
+    /// message names.
+    EncryptedMediaSource,
     /// Authenticate delayed moderation policy outside any replay guard.
     ModerationSource,
     /// Hydration processes a stored proposal to decide whether it is a
@@ -70,9 +75,10 @@ pub(crate) enum RewindSite {
 }
 
 impl RewindSite {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::PastPeelContext,
         Self::RetentionSource,
+        Self::EncryptedMediaSource,
         Self::ModerationSource,
         Self::HydrateSelfRemove,
         Self::Replay,
@@ -86,6 +92,7 @@ impl RewindSite {
         match self {
             Self::PastPeelContext => "peel-restore-",
             Self::RetentionSource => "retention-restore-",
+            Self::EncryptedMediaSource => "encrypted-media-source-restore-",
             Self::ModerationSource => "moderation-source-restore-",
             Self::HydrateSelfRemove => "hydrate-selfremove-probe-",
             Self::Replay => "openmls-probe-",
@@ -311,6 +318,10 @@ mod tests {
             (
                 "retention-restore-81-a1b2c3d4e5f60718",
                 RewindSite::RetentionSource,
+            ),
+            (
+                "encrypted-media-source-restore-a1b2c3d4e5f60718",
+                RewindSite::EncryptedMediaSource,
             ),
             (
                 "hydrate-selfremove-probe-a1b2c3d4e5f60718",

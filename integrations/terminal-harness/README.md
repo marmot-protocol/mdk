@@ -40,6 +40,11 @@ Each backend provides a typed `ProcessSpec`, selects its prompt transport, and
 maps its strict decoder into the shared `ParsedEvent` vocabulary. The shared
 runner owns spawning, bounded stderr, stdout and total deadlines, reply-channel
 backpressure, first-session capture, and child termination and reaping.
+A decoder that sees the backend drop or replace an attachment it was given
+returns `ParsedEvent::AttachmentNotProcessed`. The runner then kills the
+process group at once and fails the turn without keeping the session id
+observed in that run. The backend may already have acted on the prompt before
+the decoder reports the failure.
 
 Claude Code, Codex, OpenCode, and Pi write prompt text to stdin. Backend-specific behavior
 belongs in those connector crates, not in this shared runtime.
@@ -116,6 +121,7 @@ All connectors:
 - preserve every inbound media reference in message order, download the complete batch through `wn-agent`, and expose one validated private staging copy per item at the backend boundary;
 - keep short connect/write and ordinary control-response deadlines, but allow a media-download response at least sixteen minutes so the runtime's fifteen-minute acquisition can finish before the connector deadline;
 - reject a complete attachment batch before backend invocation when any download, regular-file/ownership check, count limit, or aggregate-byte limit fails;
+- give backends `attachment_preflight::revalidate`, which re-opens a staged copy without following symlinks immediately before spawn and fails the batch on a relative or non-UTF-8 path, a non-regular file, or a size change;
 - remove batch copies after every terminal path and reconcile stale connector-owned batch directories on startup;
 - keep diagnostics free of identifiers, paths, prompts, attachment names, and backend output.
 
@@ -171,8 +177,9 @@ session epoch again. Observations from work started before that epoch boundary
 cannot restore the old session.
 
 On Unix, every backend invocation runs in its own process group. Timeout,
-cancellation, and failure cleanup terminate the whole group before reaping the
-direct child so backend-spawned descendants cannot outlive an interrupted turn.
+cancellation, an unprocessed attachment, and failure cleanup terminate the
+whole group before reaping the direct child so backend-spawned descendants
+cannot outlive an interrupted turn.
 Normal and nonzero leader exits also terminate remaining group members before
 reaping the leader. Exit observation retains the unreaped leader until this
 cleanup completes, preventing PID reuse from redirecting a later group signal.

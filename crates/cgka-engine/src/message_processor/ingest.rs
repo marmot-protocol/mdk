@@ -1524,6 +1524,15 @@ impl<S: StorageProvider> Engine<S> {
                 } else {
                     historical_source.map(|source| source.authority)
                 };
+                let encrypted_media_secret = if msg_epoch == current_epoch {
+                    crate::app_payload::encrypted_media_source_secret(
+                        &mls_group,
+                        &self.crypto,
+                        &app_event,
+                    )?
+                } else {
+                    None
+                };
                 let event = GroupEvent::MessageReceived {
                     group_id: group_id.clone(),
                     message_id: msg.id.clone(),
@@ -1534,6 +1543,7 @@ impl<S: StorageProvider> Engine<S> {
                     retention: retention_seconds.map(|seconds| {
                         AppMessageRetentionDecision::new(app_event.created_at, seconds)
                     }),
+                    encrypted_media_secret,
                 };
                 let previous = self.storage.get_message(&msg.id).ok();
                 self.storage.with_transaction(|storage| {
@@ -2611,63 +2621,55 @@ impl<S: StorageProvider> Engine<S> {
         source_epoch: EpochId,
         current_epoch: EpochId,
     ) -> Result<Option<Option<u64>>, EngineError> {
-        let snapshot_name = self
-            .storage
-            .list_group_snapshots(group_id)?
-            .into_iter()
-            .find(|name| {
-                retained_anchor_epoch_from_snapshot_name(name.as_str()) == Some(source_epoch.0)
-            });
-        let Some(snapshot_name) = snapshot_name else {
-            return Ok(None);
-        };
-
         let mut hasher = Sha256::new();
         hasher.update(b"cgka-engine-retention-restore/v1");
         hasher.update(group_id.as_slice());
         hasher.update(source_epoch.0.to_be_bytes());
         hasher.update(current_epoch.0.to_be_bytes());
-        let guard = SnapshotRollbackGuard::create_group_state(
+        crate::openmls_projection::with_retained_anchor_group(
             &self.storage,
-            group_id.clone(),
+            &self.crypto,
+            group_id,
+            source_epoch,
             RewindSite::RetentionSource,
             &format!(
                 "{}-{}",
                 current_epoch.0,
                 hex::encode(&hasher.finalize()[..8])
             ),
-        )?;
-        let resolved = match self
-            .storage
-            .rollback_group_state_to_snapshot(group_id, &snapshot_name)
-        {
-            Ok(()) => {
-                let provider =
-                    EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-                let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-                let historical_group = MlsGroup::load(
-                    <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
-                        &provider,
-                    ),
-                    &mls_gid,
-                )
-                .map_err(|error| {
-                    EngineError::Backend(format!("load retention source snapshot: {error:?}"))
-                })?
-                .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
-                if historical_group.epoch().as_u64() != source_epoch.0 {
-                    None
-                } else {
-                    Some(crate::app_components::message_retention_seconds_of_group(
-                        &historical_group,
-                    )?)
-                }
-            }
-            Err(StorageError::SnapshotMissing(_)) => None,
-            Err(error) => return Err(error.into()),
-        };
-        guard.commit()?;
-        Ok(resolved)
+            |historical_group, _| {
+                crate::app_components::message_retention_seconds_of_group(historical_group)
+                    .map(Some)
+            },
+        )
+    }
+
+    /// Derive the encrypted-media exporter secret of an epoch on this device's
+    /// canonical lineage from that epoch's retained anchor.
+    ///
+    /// OpenMLS exports only from the live epoch. Replay and live ingest attach
+    /// the secret to `MessageReceived` while the group sits at the source
+    /// epoch, and canonical apply derives it up front for late applications
+    /// it would otherwise prune; this serves the rest: a delayed message read
+    /// from retained past-epoch secrets outside a pass, and explicit downloads
+    /// of attachments whose key was never cached, while the epoch's anchor is
+    /// still retained.
+    ///
+    /// `Ok(None)` means no usable anchor: none retained for `epoch`, the
+    /// anchor restores a different epoch, or its own leaf is evicted.
+    pub fn retained_encrypted_media_exporter_secret(
+        &self,
+        group_id: &GroupId,
+        epoch: EpochId,
+    ) -> Result<Option<cgka_traits::SecretBytes>, EngineError> {
+        // A quarantined group's MLS state may load fine; never export it.
+        self.ensure_group_live(group_id)?;
+        crate::openmls_projection::retained_anchor_media_secret(
+            &self.storage,
+            &self.crypto,
+            group_id,
+            epoch,
+        )
     }
 
     pub(crate) fn available_past_peel_snapshots(

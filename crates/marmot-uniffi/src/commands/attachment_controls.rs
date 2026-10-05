@@ -95,6 +95,23 @@ impl Marmot {
             .control_attachment(&account_ref, reference, control.into())
             .await?)
     }
+    /// Idempotent explicit demand for the current source. Preserves active
+    /// attempts, retry budgets and backoff; does not recover cancelled/removed
+    /// or terminal work. Use control Retry or Download again for that intent.
+    pub async fn request_explicit_attachment(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        target: AttachmentLocalTargetFfi,
+    ) -> Result<Option<String>, MarmotKitError> {
+        let group = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .request_explicit_attachment(&account_ref, &group, target.into())
+            .await?
+            .map(|reference| reference.to_opaque()))
+    }
+
     pub async fn download_attachment_again(
         &self,
         account_ref: String,

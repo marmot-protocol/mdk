@@ -5893,6 +5893,8 @@ MarmotStatus marmot_create_identity(const struct MarmotClient *client,
                                     uintptr_t default_relays_len,
                                     const char *const *bootstrap_relays,
                                     uintptr_t bootstrap_relays_len,
+                                    const char *const *inbox_relays,
+                                    uintptr_t inbox_relays_len,
                                     struct MarmotAccountSummary **out);
 
 /**
@@ -5912,6 +5914,8 @@ MarmotStatus marmot_login(const struct MarmotClient *client,
                           uintptr_t default_relays_len,
                           const char *const *bootstrap_relays,
                           uintptr_t bootstrap_relays_len,
+                          const char *const *inbox_relays,
+                          uintptr_t inbox_relays_len,
                           struct MarmotAccountSummary **out);
 
 /**
@@ -5942,7 +5946,9 @@ MarmotStatus marmot_publish_relay_lists(const struct MarmotClient *client,
                                         const char *const *default_relays,
                                         uintptr_t default_relays_len,
                                         const char *const *bootstrap_relays,
-                                        uintptr_t bootstrap_relays_len);
+                                        uintptr_t bootstrap_relays_len,
+                                        const char *const *inbox_relays,
+                                        uintptr_t inbox_relays_len);
 
 /**
  * The account's NIP-65 relay list. Free with
@@ -7558,6 +7564,8 @@ MarmotStatus marmot_login_recovering_incomplete_setup(const struct MarmotClient 
                                                       const char *const *bootstrap_relays,
                                                       uintptr_t bootstrap_relays_len,
                                                       uint8_t acknowledge_possible_key_package_orphan,
+                                                      const char *const *inbox_relays,
+                                                      uintptr_t inbox_relays_len,
                                                       struct MarmotAccountSummary **out);
 
 /**
@@ -7800,6 +7808,8 @@ MarmotStatus marmot_create_identity_with_profile(const struct MarmotClient *clie
                                                  uintptr_t default_relays_len,
                                                  const char *const *bootstrap_relays,
                                                  uintptr_t bootstrap_relays_len,
+                                                 const char *const *inbox_relays,
+                                                 uintptr_t inbox_relays_len,
                                                  struct MarmotIdentityCreationResult **out);
 
 /**
@@ -8840,6 +8850,8 @@ MarmotStatus marmot_begin_onboarding(const struct MarmotClient *client,
                                      uintptr_t default_relays_len,
                                      const char *const *discovery_relays,
                                      uintptr_t discovery_relays_len,
+                                     const char *const *inbox_relays,
+                                     uintptr_t inbox_relays_len,
                                      struct MarmotOnboardingSnapshot **out);
 
 /**
@@ -11563,6 +11575,18 @@ MarmotStatus marmot_control_attachment(const struct MarmotClient *client,
                                        const char *reference,
                                        uint32_t control,
                                        bool *out);
+
+/**
+ * Join/promote the current slot without resetting retry budgets or backoff.
+ * Cancellation/removal require separate recovery; NULL result is unavailable.
+ * # Safety
+ * Client, strings and target must be live; out writable. Free returned string with marmot_string_free.
+ */
+MarmotStatus marmot_request_explicit_attachment(const struct MarmotClient *client,
+                                                const char *account_ref,
+                                                const char *group_id_hex,
+                                                const struct MarmotAttachmentLocalTarget *target,
+                                                char **out);
 
 /**
  * Explicitly request the current slot, including after cancellation/removal. NULL result is unavailable.

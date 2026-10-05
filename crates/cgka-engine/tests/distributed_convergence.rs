@@ -46,6 +46,8 @@ use std::sync::Arc;
 use storage_sqlite::SqliteAccountStorage;
 use tls_codec::Serialize as _;
 
+#[path = "distributed_convergence/encrypted_media_source_secret.rs"]
+mod encrypted_media_source_secret;
 #[path = "distributed_convergence/historical_application_sender.rs"]
 mod historical_application_sender;
 mod support;

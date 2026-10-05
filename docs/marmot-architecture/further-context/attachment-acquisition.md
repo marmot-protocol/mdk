@@ -163,7 +163,12 @@ one automatic transfer across all accounts in a runtime; each account has at mos
 pending permit request. A permit remains held through queued plaintext publication.
 At least one of the four per-account media slots is reserved for foreground work.
 Preparation reads projected group policy and retained source-epoch secrets; it never
-hydrates MLS state. Missing secrets wait for sync's existing secret-warming path.
+hydrates MLS state. Projecting a received media message caches the source-epoch secret
+that the engine captured while authenticating it. Replay and live ingest export it while
+the group sits at the source epoch; canonical apply derives it from the retained anchor of
+a late application's epoch before merging commits that could prune that anchor. For
+events without one, the secret is exported live or derived from the epoch's retained
+anchor (newest five epochs). Other missing secrets wait for sync's warm path.
 Invitation acceptance and canonical visibility are checked again at claim/publication.
 
 Starting Rust-configurable resource defaults (`AttachmentAcquisitionPolicy::default()`):
@@ -187,11 +192,16 @@ Unknown free space fails closed. These are resource limits, not an OS background
 entitlement or mobile throughput evidence.
 
 Network failures back off durably from 15 seconds to one hour. New durable ciphertext
-checkpoint progress resets the failure streak; replaying an existing prefix does not. Unavailable local
-policy/secrets defer one candidate for 15 seconds before claiming it; no transfer attempt
-is consumed and due siblings keep their deadlines. Integrity/decryption failures,
-publication digest mismatches and over-limit responses require explicit retry;
-locator failover still runs, and a remaining transient candidate keeps the attempt retryable.
+checkpoint progress resets the failure streak; replaying an existing prefix does not. Unavailable
+local policy/secrets defer one candidate before claiming it, backing off from 15 seconds; no
+transfer attempt is consumed and due siblings keep their deadlines. The sixth consecutive deferral
+(about eight minutes) fails the job until explicit retry, so source-epoch material that never
+arrives cannot keep it scheduled. Explicit work (Retry, download again) that finds no cached
+secret first derives it as the `DownloadMedia` command does, live or from the epoch's retained
+anchor, without hydrating; Retry therefore recovers rows projected before their source epoch was
+cached. Integrity/decryption failures, publication digest mismatches, over-limit
+responses and HTTP 404/410 require explicit retry; locator failover still runs, and a remaining
+transient candidate keeps the attempt retryable.
 Automatic transfers use three-minute leases around a two-minute transfer deadline.
 Explicit queued transfers retain the 15-minute media deadline with a 20-minute lease.
 A running automatic attempt promoted to explicit keeps its current deadline; subsequent

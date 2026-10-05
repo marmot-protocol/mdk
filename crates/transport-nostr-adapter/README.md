@@ -49,6 +49,13 @@ TransportPublishRequest -> NostrTransportAdapter -> NostrRelayClient
 `NostrRelayClient` is intentionally small so tests can use an in-memory client and production can use
 `NostrSdkRelayClient` behind the `sdk` feature.
 
+The SDK client retains idle WRITE-only publication connections for up to 60 seconds.
+History acquisition on the same client adds READ capability to a retained connection
+before issuing its request. The promoted connection keeps WRITE capability and is no
+longer eligible for idle publication eviction; request subscriptions still close when
+the acquisition finishes or is cancelled. Both publication paths preserve typed SDK
+acknowledgements, including the distinction between affirmative and duplicate ACKs.
+
 The app-runtime layer projects group subscriptions and group-message publish targets from
 `marmot.transport.nostr.routing.v1` and applies relay endpoint parsing/deduplication before subscription or publish.
 KeyPackage publish targets come from the user's kind `10002` NIP-65 relay list, and directory/profile discovery is
@@ -61,6 +68,11 @@ Adapter diagnostics are aggregate-only: counts, status buckets, method names, an
 include relay URLs, account ids, group ids, message ids, subscription ids, pubkeys, plaintext, ciphertext, or
 payload-derived values. Tracing uses explicit `target` and `method` fields such as
 `transport_nostr_adapter::adapter` / `publish`.
+
+`NostrTransportAdapter::publish_event_with_client` wraps the complete publication future.
+Direct and account-adapter sends share these counters. Endpoint fanout and authentication retries
+remain one logical attempt; dropping an in-flight publication records one cancellation.
+Account, endpoint-safety, and envelope validation stay outside this accounting boundary.
 
 ## Recovery maintenance sessions
 

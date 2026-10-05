@@ -74,6 +74,10 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
   - **Owns:** Source-epoch application attribution after removal, replacement leaf reuse, and rejoin; direct
     ingestion and buffered replay after restart, duplicate suppression, and forged replacement-author rejection.
 
+- **File:** `distributed_convergence/encrypted_media_source_secret.rs`
+  - **Owns:** A replayed media application carries its source-epoch encrypted-media secret on `MessageReceived`
+    even when the same pass advances past the anchor horizon and prunes that epoch's retained anchor.
+
 - **File:** `convergence_policy_pin.rs`
   - **Owns:** Default-build pinned v1 policy rejection (mdk#970). Run
     `just test-convergence-policy-pin` without `test-policy-overrides`; the broader integration

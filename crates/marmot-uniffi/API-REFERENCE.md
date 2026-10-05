@@ -115,24 +115,24 @@ Non-destructive sign-out: deactivate the account on this device and, when `delet
 **Current.**
 
 ```rust
-pub async fn create_identity( &self, default_relays: Vec<String>, bootstrap_relays: Vec<String>, ) -> Result<AccountSummaryFfi, MarmotKitError>
+pub async fn create_identity( &self, default_relays: Vec<String>, bootstrap_relays: Vec<String>, inbox_relays: Vec<String>, ) -> Result<AccountSummaryFfi, MarmotKitError>
 ```
 
-Compatibility entry point for creating a brand-new Nostr identity. This retains the historical terminal-success contract: relay lists and the initial KeyPackage are published when it returns. New callers may use `create_identity_with_profile` for the earlier local-ready boundary and an explicit readiness state. Public indexers receive best-effort copies of both relay lists and kind-0 metadata; KeyPackages remain on the advertised write relays.
+Compatibility entry point for creating a brand-new Nostr identity. This retains the historical terminal-success contract: relay lists and the initial KeyPackage are published when it returns. New callers may use `create_identity_with_profile` for the earlier local-ready boundary and an explicit readiness state. Public indexers receive best-effort copies of both relay lists and kind-0 metadata; KeyPackages remain on the advertised write relays. `inbox_relays` (default empty) sets the kind-10050 inbox list separately; empty declares `default_relays` in both lists.
 
-[Source](src/commands/account.rs#L113)
+[Source](src/commands/account.rs#L117)
 
 ### `Marmot::create_identity_with_profile`
 
 **Current.**
 
 ```rust
-pub async fn create_identity_with_profile( &self, default_relays: Vec<String>, bootstrap_relays: Vec<String>, ) -> Result<IdentityCreationResultFfi, MarmotKitError>
+pub async fn create_identity_with_profile( &self, default_relays: Vec<String>, bootstrap_relays: Vec<String>, inbox_relays: Vec<String>, ) -> Result<IdentityCreationResultFfi, MarmotKitError>
 ```
 
-Create a generated identity and return at durable local readiness with the exact locally persisted default profile. `readiness` remains the authority for whether relay publication has completed; `LocalReady` must not be presented as invite-receivable. Account setup sends best-effort copies of both relay lists and the default kind-0 profile to public indexers.
+Create a generated identity and return at durable local readiness with the exact locally persisted default profile. `readiness` remains the authority for whether relay publication has completed; `LocalReady` must not be presented as invite-receivable. Account setup sends best-effort copies of both relay lists and the default kind-0 profile to public indexers. `inbox_relays` (default empty) sets the kind-10050 inbox list separately; empty declares `default_relays` in both lists.
 
-[Source](src/commands/account.rs#L143)
+[Source](src/commands/account.rs#L153)
 
 ### `Marmot::account_setup_readiness`
 
@@ -144,19 +144,19 @@ pub fn account_setup_readiness( &self, account_ref: String, ) -> Result<AccountS
 
 Read setup readiness without performing network I/O.
 
-[Source](src/commands/account.rs#L176)
+[Source](src/commands/account.rs#L188)
 
 ### `Marmot::login`
 
 **Compatibility.** Prefer begin_onboarding for an interactive imported-account workflow.
 
 ```rust
-pub async fn login( &self, identity: String, default_relays: Vec<String>, bootstrap_relays: Vec<String>, ) -> Result<AccountSummaryFfi, MarmotKitError>
+pub async fn login( &self, identity: String, default_relays: Vec<String>, bootstrap_relays: Vec<String>, inbox_relays: Vec<String>, ) -> Result<AccountSummaryFfi, MarmotKitError>
 ```
 
-Log in with an existing identity. `identity` can be an `nsec` (private key) for a local-signing account, or an `npub` to track a public identity without local signing.
+Log in with an existing identity. `identity` can be an `nsec` (private key) for a local-signing account, or an `npub` to track a public identity without local signing. `inbox_relays` (default empty) sets the kind-10050 inbox list separately; empty declares `default_relays` in both lists.
 
-[Source](src/commands/account.rs#L186)
+[Source](src/commands/account.rs#L202)
 
 ### `Marmot::reset_incomplete_account_setup`
 
@@ -168,31 +168,31 @@ pub async fn reset_incomplete_account_setup( &self, nsec: String, acknowledge_po
 
 Remove only the legacy ambiguous partial-account shape so a subsequent `login` with the same nsec can recreate it. The acknowledgement is required because old local state cannot prove that no KeyPackage was exposed before its stable slot was lost.
 
-[Source](src/commands/account.rs#L221)
+[Source](src/commands/account.rs#L239)
 
 ### `Marmot::login_recovering_incomplete_setup`
 
 **Current.**
 
 ```rust
-pub async fn login_recovering_incomplete_setup( &self, nsec: String, default_relays: Vec<String>, bootstrap_relays: Vec<String>, acknowledge_possible_key_package_orphan: bool, ) -> Result<AccountSummaryFfi, MarmotKitError>
+pub async fn login_recovering_incomplete_setup( &self, nsec: String, default_relays: Vec<String>, bootstrap_relays: Vec<String>, acknowledge_possible_key_package_orphan: bool, inbox_relays: Vec<String>, ) -> Result<AccountSummaryFfi, MarmotKitError>
 ```
 
-Consent-gated one-call recovery for installations stranded before MDK had durable account-setup journals. This validates the same nsec, removes only the recognized ambiguous partial shape, preserves an existing account-id Keychain credential, and immediately retries login.
+Consent-gated one-call recovery for installations stranded before MDK had durable account-setup journals. This validates the same nsec, removes only the recognized ambiguous partial shape, preserves an existing account-id Keychain credential, and immediately retries login. `inbox_relays` (default empty) sets the kind-10050 inbox list separately; empty declares `default_relays` in both lists.
 
-[Source](src/commands/account.rs#L237)
+[Source](src/commands/account.rs#L259)
 
 ### `Marmot::login_external_signer`
 
 **Compatibility.** Prefer begin_external_signer_onboarding for an interactive imported-account workflow. **C:** not exposed; external-signer callback vtable is not implemented.
 
 ```rust
-pub async fn login_external_signer( &self, public_key: String, signer: std::sync::Arc<dyn ExternalAccountSignerFfi>, default_relays: Vec<String>, bootstrap_relays: Vec<String>, ) -> Result<AccountSummaryFfi, MarmotKitError>
+pub async fn login_external_signer( &self, public_key: String, signer: std::sync::Arc<dyn ExternalAccountSignerFfi>, default_relays: Vec<String>, bootstrap_relays: Vec<String>, inbox_relays: Vec<String>, ) -> Result<AccountSummaryFfi, MarmotKitError>
 ```
 
-Log in with an external account signer such as Amber/NIP-55.
+Log in with an external account signer such as Amber/NIP-55. `inbox_relays` (default empty) sets the kind-10050 inbox list separately; empty declares `default_relays` in both lists.
 
-[Source](src/commands/account.rs#L279)
+[Source](src/commands/account.rs#L307)
 
 ### `Marmot::register_external_signer`
 
@@ -204,7 +204,7 @@ pub async fn register_external_signer( &self, account_ref: String, signer: std::
 
 Re-register an external signer for an already-known external account.
 
-[Source](src/commands/account.rs#L315)
+[Source](src/commands/account.rs#L345)
 
 ### `Marmot::sign_in_account`
 
@@ -216,19 +216,19 @@ pub async fn sign_in_account( &self, account_ref: String, ) -> Result<AccountSum
 
 Re-activate a non-destructively signed-out local account. This clears the durable signed-out marker and starts the account worker again; relay list/key-package repair can still be driven by the existing publish commands after sign-in.
 
-[Source](src/commands/account.rs#L330)
+[Source](src/commands/account.rs#L360)
 
 ### `Marmot::publish_relay_lists`
 
 **Current.**
 
 ```rust
-pub async fn publish_relay_lists( &self, account_ref: String, default_relays: Vec<String>, bootstrap_relays: Vec<String>, ) -> Result<(), MarmotKitError>
+pub async fn publish_relay_lists( &self, account_ref: String, default_relays: Vec<String>, bootstrap_relays: Vec<String>, inbox_relays: Vec<String>, ) -> Result<(), MarmotKitError>
 ```
 
-Publish (or re-publish) the NIP-65 and inbox relay lists for `account_ref`. Each call writes fresh replaceable events to the account relays and schedules best-effort public indexer copies when eligible; call when the lists need publication rather than on every launch. Indexers are not advertised as account relays.
+Publish (or re-publish) the NIP-65 and inbox relay lists for `account_ref`. Each call writes fresh replaceable events to the account relays and schedules best-effort public indexer copies when eligible; call when the lists need publication rather than on every launch. Indexers are not advertised as account relays. `inbox_relays` (default empty) sets the kind-10050 inbox list separately; empty declares `default_relays` in both lists.
 
-[Source](src/commands/account.rs#L350)
+[Source](src/commands/account.rs#L384)
 
 ### `Marmot::account_nip65_relays`
 
@@ -240,7 +240,7 @@ pub fn account_nip65_relays(&self, account_ref: String) -> Result<Vec<String>, M
 
 Read the account NIP-65 relay list.
 
-[Source](src/commands/account.rs#L367)
+[Source](src/commands/account.rs#L403)
 
 ### `Marmot::account_inbox_relays`
 
@@ -252,7 +252,7 @@ pub fn account_inbox_relays(&self, account_ref: String) -> Result<Vec<String>, M
 
 Read the account inbox relay list.
 
-[Source](src/commands/account.rs#L371)
+[Source](src/commands/account.rs#L407)
 
 ### `Marmot::account_key_packages`
 
@@ -264,7 +264,7 @@ pub async fn account_key_packages( &self, account_ref: String, bootstrap_relays:
 
 List the local and relay-discovered Marmot KeyPackage publications for `account_ref`. Relay-backed rows are the current winner per addressable slot in the validated fetch window.
 
-[Source](src/commands/account.rs#L378)
+[Source](src/commands/account.rs#L414)
 
 ### `Marmot::local_account_key_packages`
 
@@ -276,7 +276,7 @@ pub fn local_account_key_packages( &self, account_ref: String, ) -> Result<Vec<c
 
 Local-storage KeyPackage inventory with typed durable provenance. Does not wait for network startup or issue a directory query. Synchronous SQLCipher I/O on the calling thread; keep it off a UI or main thread.
 
-[Source](src/commands/account.rs#L396)
+[Source](src/commands/account.rs#L432)
 
 ### `Marmot::refresh_account_key_packages`
 
@@ -288,7 +288,7 @@ pub async fn refresh_account_key_packages( &self, account_ref: String, bootstrap
 
 Fetch validated relay observations, then merge a fresh local snapshot. Empty `bootstrap_relays` remains network-enabled. On failure, keep the previously rendered local result.
 
-[Source](src/commands/account.rs#L411)
+[Source](src/commands/account.rs#L447)
 
 ### `Marmot::account_key_package_relay_events`
 
@@ -300,7 +300,7 @@ pub async fn account_key_package_relay_events( &self, account_ref: String, boots
 
 Observed relay history for `account_ref`: current and superseded kind-30443 events from one validated fetch window. Clients can pass a superseded event id and its source relays to the existing deletion API.
 
-[Source](src/commands/account.rs#L428)
+[Source](src/commands/account.rs#L464)
 
 ### `Marmot::publish_new_key_package`
 
@@ -312,7 +312,7 @@ pub async fn publish_new_key_package( &self, account_ref: String, ) -> Result<u6
 
 Publish a new fresh KeyPackage for `account_ref`.
 
-[Source](src/commands/account.rs#L443)
+[Source](src/commands/account.rs#L479)
 
 ### `Marmot::rotate_key_package`
 
@@ -324,7 +324,7 @@ pub async fn rotate_key_package(&self, account_ref: String) -> Result<u64, Marmo
 
 Rotate the account's KeyPackage: mint and publish a fresh one, superseding the current slot. This is the sanctioned repair for an epoch-stalled group. `publish_new_key_package` is the same operation under its legacy name.
 
-[Source](src/commands/account.rs#L454)
+[Source](src/commands/account.rs#L490)
 
 ### `Marmot::republish_key_package`
 
@@ -336,7 +336,7 @@ pub async fn republish_key_package(&self, account_ref: String) -> Result<u64, Ma
 
 Re-publish the latest cached KeyPackage when possible, otherwise publish a fresh one.
 
-[Source](src/commands/account.rs#L460)
+[Source](src/commands/account.rs#L496)
 
 ### `Marmot::delete_account_key_package`
 
@@ -348,7 +348,7 @@ pub async fn delete_account_key_package( &self, account_ref: String, event_id_he
 
 Publish a NIP-09 deletion for a KeyPackage event.
 
-[Source](src/commands/account.rs#L465)
+[Source](src/commands/account.rs#L501)
 
 ### `Marmot::set_account_nip65_relays`
 
@@ -360,7 +360,7 @@ pub async fn set_account_nip65_relays( &self, account_ref: String, relays: Vec<S
 
 Publish the account read/write relay selection to its operational relays and copy it to public indexers.
 
-[Source](src/commands/account.rs#L478)
+[Source](src/commands/account.rs#L514)
 
 ### `Marmot::set_account_inbox_relays`
 
@@ -372,7 +372,7 @@ pub async fn set_account_inbox_relays( &self, account_ref: String, relays: Vec<S
 
 Publish the account inbox relay selection to its operational relays and copy it to public indexers.
 
-[Source](src/commands/account.rs#L497)
+[Source](src/commands/account.rs#L533)
 
 ### `Marmot::account_follows`
 
@@ -384,7 +384,7 @@ pub fn account_follows(&self, account_ref: String) -> Result<Vec<String>, Marmot
 
 Return the complete locally cached kind-3 follow list for `account_ref` as canonical lowercase public-key hex strings.
 
-[Source](src/commands/account.rs#L525)
+[Source](src/commands/account.rs#L561)
 
 ### `Marmot::is_following`
 
@@ -396,7 +396,7 @@ pub fn is_following( &self, account_ref: String, user_ref: String, ) -> Result<b
 
 Return whether `account_ref` currently follows `user_ref`, using the same local cache as `Self::account_follows`. `user_ref` accepts npub, hex, `nostr:npub…`, and Marmot profile links.
 
-[Source](src/commands/account.rs#L532)
+[Source](src/commands/account.rs#L568)
 
 ### `Marmot::follow_user`
 
@@ -408,7 +408,7 @@ pub async fn follow_user( &self, account_ref: String, user_ref: String, ) -> Res
 
 Follow `user_ref` while preserving every other entry in the account's current kind-3 contact list. Returns the complete updated list.
 
-[Source](src/commands/account.rs#L550)
+[Source](src/commands/account.rs#L586)
 
 ### `Marmot::unfollow_user`
 
@@ -420,7 +420,7 @@ pub async fn unfollow_user( &self, account_ref: String, user_ref: String, ) -> R
 
 Unfollow `user_ref` while preserving every other entry in the account's current kind-3 contact list. Returns the complete updated list.
 
-[Source](src/commands/account.rs#L564)
+[Source](src/commands/account.rs#L600)
 
 ### `Marmot::reveal_nsec`
 
@@ -432,7 +432,7 @@ pub fn reveal_nsec(&self, account_ref: String) -> Result<String, MarmotKitError>
 
 Export the active account's raw private key in canonical `nsec1...` bech32 form for an in-app key-backup display (mdk#543).
 
-[Source](src/commands/account.rs#L588)
+[Source](src/commands/account.rs#L624)
 
 ### `Marmot::export_encrypted_secret_key`
 
@@ -444,7 +444,7 @@ pub fn export_encrypted_secret_key( &self, account_ref: String, passphrase: Stri
 
 Export the active account's private key as a password-encrypted NIP-49 `ncryptsec1...` bech32 backup string (mdk#544).
 
-[Source](src/commands/account.rs#L605)
+[Source](src/commands/account.rs#L641)
 
 ### `Marmot::publish_user_profile`
 
@@ -456,7 +456,7 @@ pub async fn publish_user_profile( &self, account_ref: String, profile: UserProf
 
 Publish Nostr kind:0 metadata with explicit caller-supplied relay overrides. Most app clients should use `publish_user_profile_using_account_relays` so relay selection remains owned by MDK. This override remains for diagnostics, tests, and specialized clients. Public indexers receive a best-effort copy of the same event.
 
-[Source](src/commands/account.rs#L627)
+[Source](src/commands/account.rs#L663)
 
 ### `Marmot::publish_user_profile_using_account_relays`
 
@@ -468,7 +468,7 @@ pub async fn publish_user_profile_using_account_relays( &self, account_ref: Stri
 
 Publish Nostr kind:0 metadata using one coherent snapshot of the selected account's MDK-owned relay configuration. Public indexers receive a best-effort copy of the same event.
 
-[Source](src/commands/account.rs#L656)
+[Source](src/commands/account.rs#L692)
 
 ### `Marmot::upload_profile_image`
 
@@ -480,7 +480,7 @@ pub async fn upload_profile_image( &self, account_ref: String, data: Vec<u8>, me
 
 Upload a public raster profile image to Blossom with the account's signer. The returned HTTPS URL can be published as kind:0 `picture`.
 
-[Source](src/commands/account.rs#L674)
+[Source](src/commands/account.rs#L710)
 
 ### `Marmot::download_profile_image`
 
@@ -492,7 +492,7 @@ pub async fn download_profile_image( &self, url: String, max_bytes: u64, ) -> Re
 
 Fetch one untrusted kind:0 profile `picture` URL with MDK dial-safe HTTPS policy, address pinning, and bounded streaming.
 
-[Source](src/commands/account.rs#L689)
+[Source](src/commands/account.rs#L725)
 
 </details>
 
@@ -605,6 +605,16 @@ Validate and persist acquisition policy; disabling automatic work preserves expl
 
 [Source](src/commands/attachment_controls.rs#L74)
 
+### `Marmot::request_explicit_attachment`
+
+```rust
+pub async fn request_explicit_attachment( &self, account_ref: String, group_id_hex: String, target: AttachmentLocalTargetFfi, ) -> Result<Option<String>, MarmotKitError>
+```
+
+Join a current source or promote automatic demand to explicit priority without resetting retry budgets or scheduled backoff. Use this for ordinary interactive demand; reserve `control_attachment(Retry)` and `download_attachment_again` for deliberate recovery. A returned opaque reference does not promise readiness: inspect transfer state and prefer local assets first. Active attempts retain their original size limit and deadline; promotion changes subsequent admission, not the existing transport budget. Cancelled, removed, exhausted and failed sources are not rearmed.
+
+[Source](src/commands/attachment_controls.rs#L101)
+
 ### `Marmot::control_attachment`
 
 **Current.**
@@ -627,7 +637,7 @@ pub async fn download_attachment_again( &self, account_ref: String, group_id_hex
 
 Queue explicit acquisition for a current original source slot, clearing removal/cancellation; no reference means unavailable or obsolete.
 
-[Source](src/commands/attachment_controls.rs#L98)
+[Source](src/commands/attachment_controls.rs#L115)
 
 ### `Marmot::attachment_transfer_snapshot`
 
@@ -639,7 +649,7 @@ pub async fn attachment_transfer_snapshot( &self, account_ref: String, group_id_
 
 Read bounded transfer state for up to 64 source slots in one group without requesting a transfer.
 
-[Source](src/commands/attachment_controls.rs#L111)
+[Source](src/commands/attachment_controls.rs#L128)
 
 ### `Marmot::subscribe_attachment_transfers`
 
@@ -651,7 +661,7 @@ pub async fn subscribe_attachment_transfers( &self, account_ref: String, group_i
 
 Observe initial transfer state and coalesced complete replacements for bounded source slots; observation does not request a transfer.
 
-[Source](src/commands/attachment_controls.rs#L133)
+[Source](src/commands/attachment_controls.rs#L150)
 
 </details>
 
@@ -934,6 +944,7 @@ pub fn set_chat_muted( &self, account_ref: String, group_id_hex: String, muted_u
 ```
 
 Mute one chat until an absolute Unix epoch millisecond timestamp, or indefinitely when `muted_until_ms` is `None`.
+Ordinary notification updates stay suppressed, while direct mentions of the receiving account reach subscriptions with `NotificationUpdateFfi.is_mention = true`; blocked senders remain suppressed. Hosts apply their own notification permission and channel settings.
 
 [Source](src/commands/chat_list.rs#L202)
 

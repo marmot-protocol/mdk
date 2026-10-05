@@ -46,7 +46,7 @@ use crate::ids::{admin_pubkey_from_account_id_hex, admin_pubkey_from_member_id};
 use crate::media::{
     BlossomHttpTransport, DEFAULT_BLOSSOM_SERVER_URLS, EncryptedMediaVersion, MediaOperationPolicy,
     download_encrypted_media_with_transport, fetch_group_image_with_transport,
-    is_loopback_http_endpoint, prepare_group_image_upload, upload_encrypted_media,
+    is_loopback_http_endpoint, prepare_group_image_upload, upload_encrypted_media_retaining,
     upload_group_image, upload_prepared_group_image,
 };
 use crate::messages::{
@@ -80,6 +80,8 @@ mod receipts;
 pub(crate) mod recovery;
 mod retention;
 mod sync;
+#[cfg(test)]
+mod upload_cleanup_tests;
 
 use epoch_stall::EpochStallDetector;
 use push::notification_trigger_for_intent;
@@ -152,11 +154,14 @@ pub(crate) struct EncryptedMediaUploadHttp {
     allowed_locator_kinds: Vec<String>,
     allow_loopback_http: bool,
     transport: BlossomHttpTransport,
+    retention_app: MarmotApp,
+    retention_account: String,
+    retention_group: GroupId,
 }
 
 impl EncryptedMediaUploadHttp {
-    pub(crate) async fn run(self) -> Result<MediaUploadResult, AppError> {
-        upload_encrypted_media(
+    pub(crate) async fn run(self) -> Result<(MediaUploadResult, Vec<Vec<u8>>), AppError> {
+        let (result, plaintext) = upload_encrypted_media_retaining(
             self.request,
             self.source_epoch,
             self.media_secret.as_ref(),
@@ -169,7 +174,27 @@ impl EncryptedMediaUploadHttp {
             },
             &self.transport,
         )
+        .await?;
+        let descriptors = result.clone();
+        let upload_tokens = tokio::task::spawn_blocking(move || {
+            stage_uploaded_media(
+                &self.retention_app,
+                &self.retention_account,
+                &self.retention_group,
+                self.source_epoch,
+                &descriptors,
+                &plaintext,
+            )
+        })
         .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_else(|| {
+            tracing::warn!(target: "marmot_app::media", method = "outgoing_retention_stage",
+                "optional outgoing retention unavailable");
+            Vec::new()
+        });
+        Ok((result, upload_tokens))
     }
 }
 
@@ -180,6 +205,84 @@ pub(crate) struct EncryptedMediaUploadFinish {
     should_send: bool,
     caption: Option<String>,
     message_tags: Vec<Vec<String>>,
+}
+
+/// Preserve the primary upload/admission failure when orphan cleanup also fails.
+/// Cleanup diagnostics contain no error text, identities or attachment data;
+/// the bounded orphan sweep can retry cleanup after storage becomes available.
+pub(crate) fn preserve_encrypted_media_upload_error(
+    error: AppError,
+    cleanup: Result<(), AppError>,
+) -> AppError {
+    if cleanup.is_err() {
+        tracing::warn!(
+            target: "marmot_app::media",
+            method = "outgoing_attachment_cleanup",
+            "failed upload staging cleanup deferred"
+        );
+    }
+    error
+}
+
+/// Stage and bind one successful HTTP batch atomically. Refusal affects
+/// local retention only; publication and upload completion remain independent.
+fn stage_uploaded_media(
+    app: &MarmotApp,
+    account: &str,
+    group: &GroupId,
+    source_epoch: u64,
+    result: &MediaUploadResult,
+    plaintext: &[SecretBytes],
+) -> Result<Vec<Vec<u8>>, AppError> {
+    let storage = app.account_storage(account)?;
+    let now = crate::unix_now_seconds();
+    if storage.prune_attachment_uploads(now, 64).is_err() {
+        tracing::warn!(target: "marmot_app::media", method = "outgoing_retention_prune",
+                "optional outgoing retention cleanup deferred");
+    }
+    if plaintext.len() != result.attachments.len() {
+        return Err(AppError::InvalidEncryptedMedia(
+            "outgoing retention buffer unavailable".into(),
+        ));
+    }
+    let policy = storage.attachment_download_policy(
+        &crate::runtime::attachment_controls::default_policy(&app.config),
+    )?;
+    let bytes = plaintext
+        .iter()
+        .map(|bytes| bytes.as_slice())
+        .collect::<Vec<_>>();
+    let total = bytes.iter().map(|b| b.len() as u64).sum::<u64>();
+    if fs4::available_space(app.account_dir(account)).unwrap_or(0)
+        < policy.disk_reserve.saturating_add(total.saturating_mul(4))
+    {
+        return Err(AppError::InvalidEncryptedMedia(
+            "outgoing retention disk reserve unavailable".into(),
+        ));
+    }
+    let slots = result
+        .attachments
+        .iter()
+        .map(|a| {
+            Ok((
+                serde_json::to_value(a.reference.imeta_tag()).map_err(|_| {
+                    AppError::InvalidEncryptedMedia("invalid upload descriptor".into())
+                })?,
+                crate::media::media_hash_from_reference(&a.reference)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+        let tokens = storage.stage_attachment_uploads(
+            &hex::encode(group.as_slice()),
+            source_epoch,
+            &bytes,
+            now,
+            policy.retained_bytes,
+        )?;
+        storage.bind_attachment_uploads(&tokens, &slots)?;
+        Ok::<_, AppError>(tokens)
+    })
 }
 
 pub(crate) struct EncryptedMediaDownloadHttp {
@@ -4322,8 +4425,8 @@ impl AppClient {
     ///
     /// Split out of `send_app_event_with_local_projection` so the ordering is
     /// exercisable against a given batch of effects. An aggregate effects batch
-    /// can contain an accepted or retained current send plus an unrelated
-    /// sibling failure; that sibling must not retract an already-delivered row.
+    /// can contain an accepted, unresolved, or durably queued current send plus
+    /// an unrelated sibling failure; that sibling must not retract the row.
     /// The caller keeps the local-projection retraction, which needs the send's
     /// own locals.
     pub(crate) async fn observe_recovery_evidence_then_gate_send_publish(
@@ -4349,12 +4452,26 @@ impl AppClient {
                 );
             }
         }
+        // Every attempted application fanout lands in exactly one of the
+        // published, unresolved, or failed lists. A send in none of them was
+        // never fanned out: unsettled convergence or an in-flight publication
+        // made the engine queue it durably, and the queued-outbound drain
+        // publishes it later. An unrelated failure in the same batch is not
+        // evidence about that intent, so it must not retract the row.
+        let current_send_failed = effects
+            .failed_app_messages
+            .iter()
+            .any(|failed| failed.group_id == *group_id && failed.app_event_id == app_event_id);
         let current_send_is_retained =
             effects.published_app_messages.iter().any(|published| {
                 published.group_id == *group_id && published.app_event_id == app_event_id
             }) || effects.unresolved_app_messages.iter().any(|unresolved| {
                 unresolved.group_id == *group_id && unresolved.app_event_id == app_event_id
-            });
+            }) || (!current_send_failed
+                && effects
+                    .queued
+                    .iter()
+                    .any(|queued| queued.group_id == *group_id));
         if current_send_is_retained {
             return Ok(());
         }
@@ -4837,6 +4954,8 @@ impl AppClient {
         )
     }
 
+    /// Upload independently of optional retention; local staging happens only
+    /// after PUT succeeds and cannot reject a send under quota or disk pressure.
     pub async fn upload_media(
         &mut self,
         group_id: &GroupId,
@@ -4845,8 +4964,9 @@ impl AppClient {
         let (http, finish) = self
             .prepare_encrypted_media_upload(group_id, request)
             .await?;
-        let result = http.run().await?;
-        self.finish_encrypted_media_upload(finish, result).await
+        let (result, upload_tokens) = http.run().await?;
+        self.finish_encrypted_media_upload(finish, result, upload_tokens)
+            .await
     }
 
     /// Cheap exclusive-client setup for an encrypted-media upload. The returned
@@ -4908,6 +5028,7 @@ impl AppClient {
         let message_tags = request.message_tags.clone();
         let should_send = request.send;
         let caption = request.caption.clone();
+        crate::media::validate_media_upload_batch(&request.attachments)?;
         Ok((
             EncryptedMediaUploadHttp {
                 request,
@@ -4919,6 +5040,9 @@ impl AppClient {
                 allowed_locator_kinds: policy.allowed_locator_kinds,
                 allow_loopback_http: allow_loopback,
                 transport: self.blossom_http_transport.clone(),
+                retention_app: self.app.clone(),
+                retention_account: self.state.label.clone(),
+                retention_group: group_id.clone(),
             },
             EncryptedMediaUploadFinish {
                 group_id: group_id.clone(),
@@ -4931,10 +5055,12 @@ impl AppClient {
         ))
     }
 
+    /// Complete successful HTTP independently of best-effort local retention.
     pub(crate) async fn finish_encrypted_media_upload(
         &mut self,
         finish: EncryptedMediaUploadFinish,
         mut result: MediaUploadResult,
+        upload_tokens: Vec<Vec<u8>>,
     ) -> Result<MediaUploadResult, AppError> {
         if !finish.should_send {
             return Ok(result);
@@ -4944,14 +5070,32 @@ impl AppClient {
             .iter()
             .map(|attachment| attachment.reference.clone())
             .collect();
-        let summary = self
+        let summary = match self
             .send_tagged_media(
                 &finish.group_id,
                 attachments,
-                finish.caption,
-                finish.message_tags,
+                finish.caption.clone(),
+                finish.message_tags.clone(),
             )
-            .await?;
+            .await
+        {
+            Ok(summary) => summary,
+            Err(error) => {
+                // Committed pending/canonical sources protect staging even if optional
+                // owner protection failed. The storage
+                // fence preserves accepted sends even if their host wait fails.
+                return Err(preserve_encrypted_media_upload_error(
+                    error,
+                    self.app
+                        .account_storage(&self.state.label)
+                        .and_then(|storage| {
+                            storage
+                                .abandon_attachment_uploads(&upload_tokens)
+                                .map_err(AppError::from)
+                        }),
+                ));
+            }
+        };
         // The post-publish projection now durably references this source
         // epoch. Persist again so a prior final-reference retirement cannot
         // suppress the secret needed by the newly retained message.
@@ -4988,8 +5132,10 @@ impl AppClient {
             .await
     }
 
-    /// Storage-only preparation for automatic work. Secret warming belongs to
-    /// sync; missing/retired epoch material cannot trigger engine hydration here.
+    /// Storage-only preparation for automatic work. Received-message projection
+    /// caches each message's source-epoch secret and sync warms current epochs;
+    /// missing/retired epoch material cannot trigger engine hydration here.
+    /// Queued explicit work first calls `cache_attachment_source_epoch_secret`.
     pub(crate) fn prepare_background_attachment_download(
         &self,
         group_id: &GroupId,
@@ -5031,6 +5177,22 @@ impl AppClient {
                 .clone()
                 .with_download_limit(max_bytes),
         }))
+    }
+
+    /// Cache `reference`'s source-epoch secret, exported live or derived from
+    /// the epoch's retained anchor, as the `DownloadMedia` command does. Queued
+    /// explicit work (Retry, download again) needs this for references projected
+    /// before their source epoch was cached. Reads live engine state only: an
+    /// unhydrated group errors instead of hydrating.
+    pub(crate) fn cache_attachment_source_epoch_secret(
+        &self,
+        group_id: &GroupId,
+        reference: &MediaAttachmentReference,
+    ) -> Result<(), AppError> {
+        self.ensure_group(group_id)?;
+        let component_id = EncryptedMediaVersion::parse(&reference.version)?.component_id();
+        self.encrypted_media_secret_for_epoch(group_id, reference.source_epoch, component_id)?;
+        Ok(())
     }
 
     pub(crate) async fn prepare_encrypted_media_download(
@@ -5654,7 +5816,7 @@ impl AppClient {
     }
 
     fn encrypted_media_secret_for_epoch(
-        &mut self,
+        &self,
         group_id: &GroupId,
         source_epoch: u64,
         component_id: u16,
@@ -5674,16 +5836,11 @@ impl AppClient {
         {
             return Ok(SecretBytes::new(secret));
         }
-        let (epoch, secret) = self.runtime.exporter_secret_with_epoch(
-            group_id,
-            GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
-            32,
-        )?;
-        if epoch.0 == source_epoch {
+        if let Some(secret) = self.exportable_encrypted_media_secret(group_id, source_epoch)? {
             self.remember_encrypted_media_epoch_secret_for_component(
                 group_id,
                 component_id,
-                epoch.0,
+                source_epoch,
                 secret.as_ref(),
             )?;
             if let Some(secret) =
@@ -5716,6 +5873,105 @@ impl AppClient {
             32,
         )?;
         self.remember_encrypted_media_epoch_secret(group_id, epoch.0, secret.as_ref())
+    }
+
+    /// Cache the exporter secret a received media message's attachments are
+    /// keyed to. The message names its source epoch, which the group may have
+    /// left before the message is projected: a convergence pass merges the
+    /// commits it adopts before its replayed applications are drained, and a
+    /// delayed message is read from retained past-epoch secrets. Caching the
+    /// then-current epoch instead leaves every such attachment unreadable.
+    /// The engine captures the secret while it authenticates the message at
+    /// its source epoch (`carried_secret`), because a pass advancing past the
+    /// anchor horizon prunes that epoch's anchor before this runs; deriving it
+    /// here is only the fallback for events that carry none.
+    fn remember_received_encrypted_media_secret(
+        &self,
+        group_id: &GroupId,
+        source_epoch: u64,
+        tags: &[Vec<String>],
+        carried_secret: Option<&cgka_traits::EncryptedMediaSecret>,
+    ) -> Result<(), AppError> {
+        let allow_loopback = self.app.allow_loopback_blob_endpoints();
+        let mut component_ids = Vec::new();
+        for tag in tags
+            .iter()
+            .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
+        {
+            let Ok(reference) = crate::media::media_attachment_from_imeta_tag(
+                tag,
+                Some(source_epoch),
+                allow_loopback,
+            ) else {
+                continue;
+            };
+            let Ok(version) = EncryptedMediaVersion::parse(&reference.version) else {
+                continue;
+            };
+            let component_id = version.component_id();
+            if !component_ids.contains(&component_id)
+                && self
+                    .cached_encrypted_media_epoch_secret(group_id, component_id, source_epoch)?
+                    .is_none()
+            {
+                component_ids.push(component_id);
+            }
+        }
+        if component_ids.is_empty() {
+            return Ok(());
+        }
+        let derived;
+        let secret: &[u8] = match carried_secret {
+            Some(secret) => secret.as_bytes(),
+            None => {
+                derived = self
+                    .exportable_encrypted_media_secret(group_id, source_epoch)?
+                    .ok_or_else(|| {
+                        AppError::InvalidEncryptedMedia(format!(
+                            "encrypted media secret unavailable for epoch {source_epoch}"
+                        ))
+                    })?;
+                derived.as_slice()
+            }
+        };
+        for component_id in component_ids {
+            self.remember_encrypted_media_epoch_secret_for_component(
+                group_id,
+                component_id,
+                source_epoch,
+                secret,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The group's encrypted-media exporter secret at `source_epoch`: exported
+    /// live while that epoch is current, otherwise derived from the epoch's
+    /// retained anchor. `None` once the epoch has left the anchor horizon.
+    /// A failed live export still consults the anchor; its error surfaces only
+    /// when the anchor yields no secret either.
+    fn exportable_encrypted_media_secret(
+        &self,
+        group_id: &GroupId,
+        source_epoch: u64,
+    ) -> Result<Option<SecretBytes>, AppError> {
+        let live_error = match self.runtime.exporter_secret_with_epoch(
+            group_id,
+            GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
+            32,
+        ) {
+            Ok((epoch, secret)) if epoch.0 == source_epoch => return Ok(Some(secret)),
+            Ok(_) => None,
+            Err(error) => Some(error),
+        };
+        let retained = self
+            .runtime
+            .retained_encrypted_media_exporter_secret(group_id, cgka_traits::EpochId(source_epoch));
+        match (retained, live_error) {
+            (Ok(Some(secret)), _) => Ok(Some(secret)),
+            (_, Some(live_error)) => Err(live_error.into()),
+            (retained, None) => Ok(retained?),
+        }
     }
 }
 

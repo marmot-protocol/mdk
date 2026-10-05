@@ -160,11 +160,14 @@ impl LocalAuditDelivery {
         if !name.starts_with("audit-") || !name.ends_with(".jsonl") {
             return Err(invalid("unexpected recorder file name"));
         }
+        #[cfg(unix)]
         fs_private::prepare_directory_path(
             state_dir.as_ref(),
             0o700,
             fs_private::ExistingDirectoryMode::Enforce,
         )?;
+        #[cfg(not(unix))]
+        fs_private::create_dir_all_private(state_dir.as_ref())?;
         let state_path = state_dir.as_ref().join("local-delivery.json");
         // Rename is the state commit point. A leftover staging file came from
         // an interrupted pre-commit write and can be discarded on restart.
@@ -246,7 +249,7 @@ impl LocalAuditDelivery {
                 if len < prepared.end {
                     self.state.journals[index].observed_len =
                         self.state.journals[index].observed_len.max(prepared.end);
-                    file.sync_all()?;
+                    sync_source(&file)?;
                     self.record_gap(
                         index,
                         prepared.start,
@@ -260,7 +263,7 @@ impl LocalAuditDelivery {
                 }
                 let bytes = read_range(&mut file, prepared.start, prepared.end)?;
                 if digest(&bytes) != prepared.digest {
-                    file.sync_all()?;
+                    sync_source(&file)?;
                     self.record_gap(
                         index,
                         prepared.start,
@@ -291,7 +294,7 @@ impl LocalAuditDelivery {
                     if self.is_active(index) {
                         return Ok(Preparation::Step(DeliveryStep::WaitingForWriter));
                     }
-                    file.sync_all()?;
+                    sync_source(&file)?;
                     self.record_gap(index, line_start, end, GapReason::TornTail)?;
                     return Ok(Preparation::Step(DeliveryStep::Gap));
                 }
@@ -299,7 +302,7 @@ impl LocalAuditDelivery {
                     if !bodies.is_empty() {
                         break;
                     }
-                    file.sync_all()?;
+                    sync_source(&file)?;
                     self.record_gap(index, line_start, end, GapReason::OversizedLine)?;
                     return Ok(Preparation::Step(DeliveryStep::Gap));
                 }
@@ -307,7 +310,7 @@ impl LocalAuditDelivery {
                     if !bodies.is_empty() {
                         break;
                     }
-                    file.sync_all()?;
+                    sync_source(&file)?;
                     self.record_gap(index, line_start, end, GapReason::InvalidRecord)?;
                     return Ok(Preparation::Step(DeliveryStep::Gap));
                 }
@@ -323,7 +326,7 @@ impl LocalAuditDelivery {
             let end = start + bytes.len() as u64;
             // The recorder flushes but does not fsync. A local prepared claim
             // must establish that boundary before publication and send.
-            file.sync_all()?;
+            sync_source(&file)?;
             let prepared = Prepared {
                 start,
                 end,
@@ -474,9 +477,8 @@ impl LocalAuditDelivery {
             }
             result => result?,
         };
-        let meta = file.metadata()?;
-        let (device, inode) = file_identity(&meta);
-        let len = meta.len();
+        let (device, inode) = file_identity(&file)?;
+        let len = file.metadata()?.len();
         if device != j.device || inode != j.inode {
             return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
@@ -517,21 +519,20 @@ impl LocalAuditDelivery {
         let mut source_identities = std::collections::HashSet::new();
         for path in paths.into_iter().filter(|path| path != &self.active) {
             let file = open_source(&path)?;
-            if source_identities.insert(file_identity(&file.metadata()?)) {
+            if source_identities.insert(file_identity(&file)?) {
                 sources.push((path, file));
             }
         }
         if let Some(file) = active_file
-            && source_identities.insert(file_identity(&file.metadata()?))
+            && source_identities.insert(file_identity(&file)?)
         {
             sources.push((self.active.clone(), file));
         }
         let mut seen = vec![false; self.state.journals.len()];
         let mut changed = false;
         for (path, mut file) in sources {
-            let meta = file.metadata()?;
-            let (device, inode) = file_identity(&meta);
-            let len = meta.len();
+            let (device, inode) = file_identity(&file)?;
+            let len = file.metadata()?.len();
             let fp_len = (len as usize).min(FINGERPRINT_BYTES) as u8;
             let fp = fingerprint(&mut file, fp_len as usize)?;
             let name = path
@@ -654,8 +655,7 @@ impl LocalAuditDelivery {
             return Err(error);
         }
         drop(file);
-        fs::rename(&temp, &self.state_path)?;
-        File::open(self.state_path.parent().unwrap_or(Path::new(".")))?.sync_all()
+        commit_rename(&temp, &self.state_path)
     }
 }
 
@@ -806,6 +806,13 @@ fn open_source(path: &Path) -> io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
+    #[cfg(windows)]
+    {
+        // Open a symlink itself (like O_NOFOLLOW); the is_file check rejects it.
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
     let file = options.open(path)?;
     if !file.metadata()?.is_file() {
         return Err(invalid("source is not a regular file"));
@@ -834,9 +841,120 @@ fn load_state(path: &Path, destination: &str, active_name: &str) -> io::Result<S
     Ok(state)
 }
 
-fn file_identity(meta: &fs::Metadata) -> (u64, u64) {
+/// Flush a source's bytes before publishing a range that depends on them.
+#[cfg(unix)]
+fn sync_source(file: &File) -> io::Result<()> {
+    file.sync_all()
+}
+
+/// FlushFileBuffers needs write access, which the read-only source handle
+/// lacks. Reopen the same file object (not the path, so a concurrent rotation
+/// cannot swap it) with write access for the flush only.
+#[cfg(windows)]
+fn sync_source(file: &File) -> io::Result<()> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    unsafe extern "system" {
+        fn ReOpenFile(
+            file: *mut std::ffi::c_void,
+            access: u32,
+            share: u32,
+            flags: u32,
+        ) -> *mut std::ffi::c_void;
+    }
+    // SAFETY: the source handle is valid for the call; ReOpenFile returns a
+    // new owned handle, which `File` closes on drop.
+    let handle = unsafe {
+        ReOpenFile(
+            file.as_raw_handle().cast(),
+            GENERIC_WRITE,
+            FILE_SHARE_ALL,
+            0,
+        )
+    };
+    if handle as isize == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    unsafe { File::from_raw_handle(handle.cast()) }.sync_all()
+}
+
+#[cfg(unix)]
+fn file_identity(file: &File) -> io::Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
-    (meta.dev(), meta.ino())
+    let meta = file.metadata()?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+/// Volume serial and 64-bit file index, the Windows analogue of dev/inode.
+/// NTFS file indexes are unique per volume; ReFS may need the 128-bit
+/// FILE_ID_INFO instead, which the journal's u64 inode field cannot hold.
+#[cfg(windows)]
+fn file_identity(file: &File) -> io::Result<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct ByHandleFileInformation {
+        attributes: u32,
+        times: [u32; 6],
+        volume_serial: u32,
+        size_high: u32,
+        size_low: u32,
+        links: u32,
+        index_high: u32,
+        index_low: u32,
+    }
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(
+            file: *mut std::ffi::c_void,
+            info: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+    let mut info = ByHandleFileInformation::default();
+    // SAFETY: the handle is owned by `file` and outlives the call; `info`
+    // matches BY_HANDLE_FILE_INFORMATION's layout.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let index = (u64::from(info.index_high) << 32) | u64::from(info.index_low);
+    Ok((u64::from(info.volume_serial), index))
+}
+
+/// Replace `target` with the fully synced `temp`; this is the cursor's
+/// commit point, so the rename itself must be durable before returning.
+#[cfg(unix)]
+fn commit_rename(temp: &Path, target: &Path) -> io::Result<()> {
+    fs::rename(temp, target)?;
+    File::open(target.parent().unwrap_or(Path::new(".")))?.sync_all()
+}
+
+/// Windows cannot fsync a directory; MOVEFILE_WRITE_THROUGH returns only
+/// after the rename is flushed to disk.
+#[cfg(windows)]
+fn commit_rename(temp: &Path, target: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    unsafe extern "system" {
+        fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
+    }
+    let wide = |path: &Path| -> Vec<u16> {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    };
+    let (from, to) = (wide(temp), wide(target));
+    // SAFETY: both buffers are NUL-terminated UTF-16 paths that outlive the call.
+    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), flags) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn fingerprint(file: &mut File, len: usize) -> io::Result<String> {
@@ -1256,7 +1374,7 @@ mod tests {
         // match the replacement after a real recorder clear to model reuse.
         recorder.rotate().unwrap();
         record(&recorder, "new_generation");
-        let identity = file_identity(&fs::metadata(&active).unwrap());
+        let identity = file_identity(&File::open(&active).unwrap()).unwrap();
         worker.state.journals[0].device = identity.0;
         worker.state.journals[0].inode = identity.1;
         worker.publish().unwrap();

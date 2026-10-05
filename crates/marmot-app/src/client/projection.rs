@@ -53,7 +53,9 @@ impl AppClient {
     /// Only the pre-publish projection clears. The post-publish one runs on a
     /// row this call already revived, and anything that invalidated it *during*
     /// the send — the terminal-group sweep, a convergence withdrawal — is a
-    /// verdict the send flow has no evidence to overturn.
+    /// verdict the send flow has no evidence to overturn. The one later
+    /// revival is publish finalization's, on a relay acceptance of the row's
+    /// own fanout (`revive_published_local_send`).
     pub(crate) fn record_send_intent_projection(
         &self,
         group_id: &GroupId,
@@ -705,18 +707,23 @@ impl AppClient {
         for published in &effects.published_app_messages {
             let group_id_hex = hex::encode(published.group_id.as_slice());
             let source_message_id_hex = hex::encode(published.message_id.as_slice());
-            let finalized = self.app.finalize_account_app_event_source_retention(
-                &self.state.label,
-                &group_id_hex,
-                &published.app_event_id,
-                Some(source_message_id_hex.as_str()),
-                published.source_epoch.0,
-                published.retention,
-                published.authority,
-            );
+            let finalized = (|| {
+                let finalized = self.app.finalize_account_app_event_source_retention(
+                    &self.state.label,
+                    &group_id_hex,
+                    &published.app_event_id,
+                    Some(source_message_id_hex.as_str()),
+                    published.source_epoch.0,
+                    published.retention,
+                    published.authority,
+                )?;
+                // Revive after the source write, so the revival reprojects the
+                // finalized row and its update supersedes the finalize update.
+                let revived = self.revive_published_local_send(published, &group_id_hex)?;
+                Ok::<_, AppError>(finalized.into_iter().chain(revived))
+            })();
             match finalized {
-                Ok(Some(update)) => updates.push(update),
-                Ok(None) => {}
+                Ok(row_updates) => updates.extend(row_updates),
                 Err(error) => {
                     // Keep the accepted fanouts durable until projection can
                     // be repaired. Replaying them does not publish again.
@@ -763,6 +770,52 @@ impl AppClient {
             );
         }
         Ok(updates)
+    }
+
+    /// Clear a `local_publish_failed` tombstone on an own send that a relay
+    /// has since accepted.
+    ///
+    /// The send path can retract a row whose intent survives it: an error after
+    /// the fanout was accepted, or a durably queued intent that a later drain
+    /// publishes. Without this, the group receives the message while the
+    /// sender's row stays `failed` forever, and typed rows such as polls lose
+    /// their projection. A relay acceptance is evidence the upsert never has,
+    /// like the fresh send intent in [`Self::record_send_intent_projection`].
+    ///
+    /// A terminal group keeps its sweep's verdict: the terminal-group sweep
+    /// writes the same reason, and nothing about a late acceptance reopens a
+    /// disbanded or removed copy. Convergence withdrawals carry other reasons
+    /// and the storage predicate never clears them.
+    ///
+    /// The group is read only when a tombstone is there to clear, and a read
+    /// error propagates: a seeded, quarantined or busy copy decides nothing,
+    /// and the caller's projection-error path keeps the accepted fanout for a
+    /// replay that revives the row without publishing again. Acknowledging it
+    /// instead would delete the only evidence the revival needs.
+    fn revive_published_local_send(
+        &self,
+        published: &marmot_account::PublishedApplicationMessage,
+        group_id_hex: &str,
+    ) -> Result<Option<crate::AppProjectionUpdate>, AppError> {
+        if !self
+            .app
+            .account_storage(&self.state.label)?
+            .local_publish_failure_is_clearable(group_id_hex, &published.app_event_id)?
+        {
+            return Ok(None);
+        }
+        if self
+            .runtime
+            .group_record(&published.group_id)?
+            .is_terminal()
+        {
+            return Ok(None);
+        }
+        self.app.clear_timeline_local_publish_failure(
+            &self.state.label,
+            group_id_hex,
+            &published.app_event_id,
+        )
     }
 
     /// Invalidates local projections for application messages whose durable

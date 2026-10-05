@@ -38,7 +38,7 @@ Choose the runtime you already use:
 | Pi | Terminal harness | Repository and coding tasks through Pi |
 
 The guided installers prompt on the terminal for the White Noise account that
-may invite and message the agent. They install release `wn-agent-v0.11.0`, create
+may invite and message the agent. They install release `wn-agent-v0.12.0`, create
 an isolated White Noise identity for the selected connector, and start same-user
 services where supported. Download each installer with its adjacent checksum,
 verify it, and only then execute the local file:
@@ -65,7 +65,7 @@ install_verified() (
   bash "$tmpdir/$installer_script" "$@"
 )
 
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.11.0"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
 ```
 
 ### Hermes
@@ -320,9 +320,11 @@ Each integration also makes its own activation decision:
   `always` activation for prompt messages from explicitly allowed senders, and
   have no profile onboarding or live-preview behavior. Their shared runtime
   validates and privately stages bounded ordered attachment batches. `wn-codex`
-  maps image batches to ordered Codex image inputs; `wn-claude`, `wn-opencode`, and `wn-pi`
-  reject every non-empty batch, including its accompanying text, before spawning
-  their backends.
+  maps image batches to ordered Codex image inputs; `wn-opencode` passes each
+  file as an ordered `opencode run --file` argument; `wn-pi` passes each image
+  or UTF-8 text file as an ordered `@file` operand and rejects the whole batch
+  before spawning Pi if any file is another type; `wn-claude` rejects every
+  non-empty batch, including its accompanying text, before spawning its backend.
 
 Because activation is per integration, there is no global "claim this message"
 lease in shared-account deployments. If several integrations subscribe to the

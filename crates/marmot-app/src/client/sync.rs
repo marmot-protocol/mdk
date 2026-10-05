@@ -255,6 +255,18 @@ fn event_source_message_id_hex(event: &cgka_traits::engine::GroupEvent, fallback
     }
 }
 
+fn event_encrypted_media_secret(
+    event: &cgka_traits::engine::GroupEvent,
+) -> Option<&cgka_traits::EncryptedMediaSecret> {
+    match event {
+        cgka_traits::engine::GroupEvent::MessageReceived {
+            encrypted_media_secret,
+            ..
+        } => encrypted_media_secret.as_ref(),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 pub(super) enum TransportReconciliationWork {
     Inbox(Vec<cgka_traits::TransportEndpoint>),
@@ -1776,8 +1788,12 @@ impl AppClient {
                 None,
                 self.app.allow_loopback_blob_endpoints(),
             ) {
-                match self.project_received_message(message, group_metadata.as_ref(), &mut summary)
-                {
+                match self.project_received_message(
+                    message,
+                    event_encrypted_media_secret(event),
+                    group_metadata.as_ref(),
+                    &mut summary,
+                ) {
                     Ok(Some(gossip_message_id)) => {
                         gossip_message_ids.insert(gossip_message_id);
                     }
@@ -4861,6 +4877,7 @@ impl AppClient {
     fn project_received_message(
         &mut self,
         message: crate::ReceivedMessage,
+        carried_media_secret: Option<&cgka_traits::EncryptedMediaSecret>,
         group_metadata: Option<&cgka_traits::Group>,
         summary: &mut SyncSummary,
     ) -> Result<Option<String>, AppError> {
@@ -4936,7 +4953,12 @@ impl AppClient {
         )?;
         if retains_encrypted_media
             && self
-                .remember_current_encrypted_media_secret(&message.group_id)
+                .remember_received_encrypted_media_secret(
+                    &message.group_id,
+                    message.source_epoch,
+                    &message.tags,
+                    carried_media_secret,
+                )
                 .is_err()
         {
             tracing::warn!(
@@ -5417,9 +5439,12 @@ impl AppClient {
                 source_received_at,
                 event_outer_transport_at,
                 self.app.allow_loopback_blob_endpoints(),
-            ) && let Some(gossip_message_id) =
-                self.project_received_message(message, group_metadata.as_ref(), summary)?
-            {
+            ) && let Some(gossip_message_id) = self.project_received_message(
+                message,
+                event_encrypted_media_secret(event),
+                group_metadata.as_ref(),
+                summary,
+            )? {
                 gossip_message_ids.insert(gossip_message_id);
             }
             let updated_group =
@@ -6652,6 +6677,7 @@ mod tests {
                     epoch: client.runtime.group_record(&group_id).unwrap().epoch,
                     payload,
                     retention: None,
+                    encrypted_media_secret: None,
                 });
         }
         // A corrupt sender profile must not lose any already-ingested message,

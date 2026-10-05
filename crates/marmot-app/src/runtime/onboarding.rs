@@ -216,14 +216,28 @@ pub struct OnboardingSnapshot {
     #[serde(default)]
     pub cancellation_pending: bool,
 }
-/// Hosts pass the same default relay set used by account creation. Discovery
+/// Hosts pass the same default relay sets used by account creation. Discovery
 /// relays are independent indexers. They are not advertised as account relays;
 /// generated-account setup may send public relay lists and profile metadata
 /// to them for discovery.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OnboardingOptions {
     pub default_relays: Vec<String>,
     pub discovery_relays: Vec<String>,
+    /// Recommended relays for the kind-10050 inbox list. Empty uses
+    /// `default_relays`, which otherwise serve both relay-list steps.
+    #[serde(default)]
+    pub inbox_relays: Vec<String>,
+}
+impl OnboardingOptions {
+    /// The recommended relays for a relay-list step.
+    fn defaults_for(&self, step: OnboardingStep) -> &[String] {
+        if step == OnboardingStep::InboxRelays && !self.inbox_relays.is_empty() {
+            &self.inbox_relays
+        } else {
+            &self.default_relays
+        }
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct OnboardingCheckpoint {
@@ -243,6 +257,10 @@ struct OnboardingCheckpoint {
     setup_cleanup_pending: bool,
     #[serde(default)]
     attempt_start_revision: u64,
+    // A host-selected discovery set is used as given, without public indexers,
+    // so a host can still look past an unreachable indexer.
+    #[serde(default)]
+    explicit_discovery: bool,
 }
 
 pub struct OnboardingSubscription {
@@ -332,6 +350,7 @@ impl OnboardingCheckpoint {
             single_device_acknowledged: false,
             setup_cleanup_pending: false,
             attempt_start_revision: 0,
+            explicit_discovery: false,
         }
     }
     fn new_attempt(
@@ -1090,8 +1109,12 @@ impl AccountManager {
         }))
     }
     fn validate_onboarding_options(&self, options: &OnboardingOptions) -> Result<(), AppError> {
-        for endpoints in [&options.default_relays, &options.discovery_relays] {
-            if endpoints.is_empty()
+        for (endpoints, required) in [
+            (&options.default_relays, true),
+            (&options.discovery_relays, true),
+            (&options.inbox_relays, false),
+        ] {
+            if (required && endpoints.is_empty())
                 || endpoints.len() > MAX_RELAYS
                 || self
                     .app
@@ -1526,9 +1549,11 @@ impl AccountManager {
         let options = OnboardingOptions {
             default_relays: c.options.default_relays.clone(),
             discovery_relays,
+            inbox_relays: c.options.inbox_relays.clone(),
         };
         self.validate_onboarding_options(&options)?;
         c.options = options;
+        c.explicit_discovery = true;
         c.snapshot.proposal = None;
         for index in 0..STEP_COUNT {
             if c.snapshot.steps[index].status != OnboardingStatus::Skipped {
@@ -1607,6 +1632,13 @@ impl AccountManager {
         let classifications = self.app.relay_plane.classify_relay_endpoints(endpoints);
         let mut failures = Vec::new();
         let mut seen = HashSet::new();
+        // Public indexers are dialed on top of the cap, so they never take a
+        // host or declared relay's slot and are never dropped themselves.
+        let indexers: HashSet<String> = default_directory_discovery_relays()
+            .iter()
+            .map(|endpoint| relay_key(&endpoint.0))
+            .collect();
+        let mut capped = 0;
         for c in classifications {
             // Retain Tor declarations, but never send them to the direct dialer.
             if is_onion_relay(&c.endpoint) {
@@ -1636,9 +1668,14 @@ impl AccountManager {
             if !seen.insert(url) {
                 continue;
             }
-            if seen.len() > MAX_RELAYS {
-                failures.push(finding(OnboardingIssue::TooManyRelays));
-                break;
+            if !indexers.contains(&relay_key(&endpoint)) {
+                capped += 1;
+                if capped > MAX_RELAYS {
+                    if capped == MAX_RELAYS + 1 {
+                        failures.push(finding(OnboardingIssue::TooManyRelays));
+                    }
+                    continue;
+                }
             }
             let plane = self.app.relay_plane.clone();
             let signer = signer.clone();
@@ -1717,11 +1754,27 @@ impl AccountManager {
         c: &OnboardingCheckpoint,
         step: OnboardingStep,
     ) -> Vec<String> {
+        // KeyPackages live on the account's own relays, not on indexers.
+        let indexers = if step == OnboardingStep::SingleDevice || c.explicit_discovery {
+            Vec::new()
+        } else {
+            default_directory_discovery_relays()
+        };
+        self.onboarding_sources_with(c, step, &indexers).await
+    }
+    async fn onboarding_sources_with(
+        &self,
+        c: &OnboardingCheckpoint,
+        step: OnboardingStep,
+        indexers: &[TransportEndpoint],
+    ) -> Vec<String> {
         let mut sources = c.options.discovery_relays.clone();
         let list = if let Some(event) = &c.records[OnboardingStep::Relays.index()] {
             Some(event.clone())
         } else if step.optional() {
-            self.inspect_onboarding_relays(&c.snapshot.account_id_hex, 10002, sources.clone())
+            let mut lookup = sources.clone();
+            append_public_indexers(&mut lookup, &c.options, indexers);
+            self.inspect_onboarding_relays(&c.snapshot.account_id_hex, 10002, lookup)
                 .await
                 .0
                 .into_iter()
@@ -1742,6 +1795,9 @@ impl AccountManager {
                 }
             }
         }
+        // Indexers come after the host's discovery relays and the account's
+        // declared relays, and are dialed outside the inspection cap.
+        append_public_indexers(&mut sources, &c.options, indexers);
         sources
     }
     async fn check_onboarding_step(
@@ -1870,7 +1926,7 @@ impl AccountManager {
                     }
                     let defaults = c
                         .options
-                        .default_relays
+                        .defaults_for(step)
                         .iter()
                         .map(|relay| relay_key(relay))
                         .collect::<HashSet<_>>();
@@ -1966,7 +2022,7 @@ impl AccountManager {
                 .as_ref()
                 .map(raw_relay_keys)
                 .unwrap_or_default();
-            for relay in &c.options.default_relays {
+            for relay in c.options.defaults_for(step) {
                 let url = relay_key(relay);
                 if inherited.contains(&url) || known.contains_key(&url) {
                     continue;
@@ -2171,17 +2227,23 @@ impl AccountManager {
                 self.inspect_onboarding_relays(
                     &c.snapshot.account_id_hex,
                     proposal.step.kind(),
-                    sources,
+                    sources.clone(),
                 ),
             )
             .await?;
         self.require_live_onboarding_attempt(&c)?;
-        // Every configured source must finish: a timeout may hide a newer record.
-        // Unreachable user-declared hints cannot establish absence either.
+        // Every configured source, including each searched public indexer, must
+        // finish: a timeout may hide a newer record. Unreachable user-declared
+        // hints cannot establish absence either.
+        let indexers: HashSet<String> = default_directory_discovery_relays()
+            .iter()
+            .map(|endpoint| relay_key(&endpoint.0))
+            .collect();
         if completed.is_empty()
             || c.options
                 .discovery_relays
                 .iter()
+                .chain(sources.iter().filter(|s| indexers.contains(&relay_key(s))))
                 .any(|endpoint| !completed.contains(&relay_key(endpoint)))
             || (records.is_empty() && !failures.is_empty())
         {
@@ -2283,11 +2345,14 @@ impl AccountManager {
         if self.require_live_onboarding_attempt(c).is_err() {
             return Ok(false);
         }
+        // Repairs publish where they did before indexers were searched: the
+        // host's discovery relays and the account's declared relays. Indexers
+        // pick up replaceable records from those relays themselves.
         let mut endpoints = self
             .await_while_onboarding_live(
                 &c.snapshot.account_id_hex,
                 c.attempt(),
-                self.onboarding_sources(c, proposal.step),
+                self.onboarding_sources_with(c, proposal.step, &[]),
             )
             .await?;
         endpoints.extend(
@@ -2373,6 +2438,41 @@ fn is_onion_relay(endpoint: &str) -> bool {
             && url
                 .domain()
                 .is_some_and(|host| host.trim_end_matches('.').ends_with(".onion"))
+    })
+}
+
+/// Imported identities usually publish their profile and relay lists on
+/// general-purpose relays, not on the host's messaging relays. Search the
+/// public indexers as well, so absence on the host's relays is never read as a
+/// missing record that invites a defaults-only replacement. Inspection dials
+/// indexers outside its relay cap. Loopback (development) routes stay
+/// hermetic, as they do for public indexer copies.
+fn append_public_indexers(
+    sources: &mut Vec<String>,
+    options: &OnboardingOptions,
+    indexers: &[TransportEndpoint],
+) {
+    let loopback = options
+        .default_relays
+        .iter()
+        .chain(&options.discovery_relays)
+        .chain(&options.inbox_relays)
+        .any(|endpoint| is_loopback_relay(endpoint));
+    if loopback {
+        return;
+    }
+    let mut known: HashSet<String> = sources.iter().map(|source| relay_key(source)).collect();
+    for indexer in indexers {
+        if known.insert(relay_key(&indexer.0)) {
+            sources.push(indexer.0.clone());
+        }
+    }
+}
+
+fn is_loopback_relay(endpoint: &str) -> bool {
+    url::Url::parse(endpoint).ok().is_some_and(|url| {
+        url.host()
+            .is_some_and(cgka_traits::app_components::is_loopback_host)
     })
 }
 

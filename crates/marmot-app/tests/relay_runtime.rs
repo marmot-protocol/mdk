@@ -33,7 +33,7 @@ use nostr_relay_builder::prelude::{
 };
 use nostr_relay_builder::{LocalRelay, MockRelay, RelayBuilder};
 use nostr_sdk::prelude::{
-    Client as NostrSdkClient, EventBuilder, FinalizeEvent, Keys, Kind, Tag,
+    Client as NostrSdkClient, EventBuilder, Filter, FinalizeEvent, Keys, Kind, Tag,
     Timestamp as NostrTimestamp,
 };
 use sha2::{Digest, Sha256};
@@ -189,6 +189,353 @@ async fn active_group_send_timings() {
             runtime.shutdown_and_close().await.unwrap();
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "send latency and connection reuse diagnostic"]
+async fn send_connection_reuse() {
+    // Warm-up plus thirty messages and pushes exceed the mock's 60-event
+    // budget once group setup uses the same persistent connection.
+    let relay = LocalRelay::new(RelayBuilder::default().rate_limit(
+        nostr_relay_builder::builder::RateLimit {
+            notes_per_minute: 1_000,
+            ..Default::default()
+        },
+    ));
+    relay.run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let relay_addr = relay_url
+        .strip_prefix("ws://")
+        .unwrap()
+        .trim_end_matches('/')
+        .to_owned();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let connections = Arc::new(AtomicUsize::new(0));
+    let accepts = connections.clone();
+    // Optional setup delay isolates the cost of reconnecting. No delay by default.
+    let setup_ms = std::env::var("SEND_CONNECT_MS")
+        .unwrap_or_default()
+        .parse::<u64>()
+        .unwrap_or(0);
+    let proxy = tokio::spawn(async move {
+        let mut peers = tokio::task::JoinSet::new();
+        loop {
+            let (mut downstream, _) = listener.accept().await.unwrap();
+            downstream.set_nodelay(true).unwrap();
+            accepts.fetch_add(1, Ordering::SeqCst);
+            let addr = relay_addr.clone();
+            peers.spawn(async move {
+                let mut upstream = TcpStream::connect(addr).await.unwrap();
+                upstream.set_nodelay(true).unwrap();
+                sleep(Duration::from_millis(setup_ms)).await;
+                tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await
+            });
+        }
+    });
+    let urls = std::env::var("SEND_RELAYS")
+        .map(|value| value.split(",").map(str::to_owned).collect::<Vec<_>>())
+        .unwrap_or_else(|_| vec![url]);
+    let mut config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    config.usage_diagnostics_silent = true;
+    let mut runtimes = Vec::new();
+    let mut homes = Vec::new();
+    let mut accounts = Vec::new();
+    for _ in 0..2 {
+        let home = tempfile::tempdir().unwrap();
+        let runtime = MarmotAppRuntime::new(MarmotApp::with_relays_and_config(
+            home.path(),
+            urls.clone(),
+            config.clone(),
+        ));
+        let account = create_network_ready_identity(
+            &runtime,
+            AccountSetupRequest {
+                default_relays: urls.iter().map(|url| endpoint(url)).collect(),
+                bootstrap_relays: urls.iter().map(|url| endpoint(url)).collect(),
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            },
+        )
+        .await;
+        accounts.push(account.account.account_id_hex);
+        homes.push(home);
+        runtimes.push(runtime);
+    }
+    let group = runtimes[0]
+        .create_group(&accounts[0], "socket reuse", &accounts[1..], None)
+        .await
+        .unwrap();
+    accept_group_invite_retrying_busy(&runtimes[1], &accounts[1], &group)
+        .await
+        .unwrap();
+    let push_server = Keys::generate();
+    if std::env::var_os("SEND_PUSH").is_some() {
+        runtimes[1]
+            .set_native_push_enabled(&accounts[1], true)
+            .await
+            .unwrap();
+        runtimes[1]
+            .upsert_push_registration(
+                &accounts[1],
+                PushPlatform::Fcm,
+                "latency-test-token",
+                &push_server.public_key().to_hex(),
+                Some(urls[0].clone()),
+            )
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if runtimes[0]
+                    .group_push_debug_info(&accounts[0], &group)
+                    .await
+                    .unwrap()
+                    .active_token_count
+                    == 1
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("sender receives peer push token");
+    }
+    sleep(Duration::from_secs(2)).await;
+    let mut received = runtimes[1].subscribe();
+    let mut before = connections.load(Ordering::SeqCst);
+    let mut samples = Vec::new();
+    for index in 0..=30 {
+        let text = format!("connection probe {index}");
+        let started = Instant::now();
+        let sent = runtimes[0]
+            .send_message(&accounts[0], &group, text.clone().into_bytes())
+            .await
+            .unwrap();
+        assert!(
+            sent.published > 0,
+            "send must obtain a relay acknowledgement"
+        );
+        let caller_ms = started.elapsed().as_secs_f64() * 1000.0;
+        wait_for_event(&mut received, |event| {
+            matches!(event,
+                MarmotAppEvent::MessageReceived(message)
+                    if message.account_id_hex == accounts[1] && message.message.group_id == group
+                        && message.message.plaintext == text
+            )
+        })
+        .await;
+        if index == 0 {
+            // The anonymous WRITE pool is intentionally separate from receive
+            // subscriptions. Warm its socket before measuring retained reuse.
+            before = connections.load(Ordering::SeqCst);
+            continue;
+        }
+        samples.push(caller_ms);
+        eprintln!(
+            "send_sample={index} caller_ms={caller_ms:.3} received_ms={:.3}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    samples.sort_by(f64::total_cmp);
+    let opened = std::env::var_os("SEND_RELAYS")
+        .is_none()
+        .then(|| connections.load(Ordering::SeqCst) - before);
+    let p95_index = (samples.len() * 95).div_ceil(100) - 1;
+    eprintln!(
+        "send_summary setup_ms={setup_ms} samples={} caller_mean_ms={:.3} caller_p95_ms={:.3} caller_max_ms={:.3} new_connections={opened:?}",
+        samples.len(),
+        samples.iter().sum::<f64>() / samples.len() as f64,
+        samples[p95_index],
+        samples.last().unwrap()
+    );
+    if std::env::var_os("SEND_PUSH").is_some() {
+        let client = NostrSdkClient::builder().build();
+        client.add_relay(&urls[0]).await.unwrap();
+        client.connect().await;
+        let events = client
+            .fetch_events(nostr_sdk::prelude::ReqTarget::single(
+                &urls[0],
+                [Filter::new()
+                    .kind(Kind::GiftWrap)
+                    .pubkey(push_server.public_key())],
+            ))
+            .timeout(Duration::from_secs(5))
+            .await
+            .unwrap();
+        // Convergence can re-publish retained messages and emit extra wakes.
+        // Token-only envelopes do not identify their originating message.
+        let minimum_triggers = samples.len() + 1;
+        let observed_triggers = events.len();
+        assert!(
+            observed_triggers >= minimum_triggers,
+            "expected at least {minimum_triggers} triggers, got {observed_triggers}"
+        );
+        for event in events {
+            let gift = nostr::nips::nip59::extract_rumor(&push_server, &event).unwrap();
+            assert_eq!(gift.rumor.kind, Kind::Custom(446));
+            assert_eq!(
+                BASE64_STANDARD.decode(&gift.rumor.content).unwrap().len(),
+                marmot_app::PUSH_ENCRYPTED_TOKEN_LEN,
+                "each trigger carries the peer's single encrypted token"
+            );
+        }
+        eprintln!("push_summary minimum={minimum_triggers} verified={observed_triggers}");
+        client.shutdown().await;
+    }
+    for runtime in runtimes {
+        runtime.shutdown_and_close().await.unwrap();
+    }
+    proxy.abort();
+}
+
+#[tokio::test]
+async fn publish_socket_isolation() {
+    use cgka_traits::{
+        MemberId, TransportAccountActivation, TransportAdapter, TransportPublishRequest,
+        TransportPublishTarget,
+    };
+    use marmot_app::MarmotRelayPlane;
+    use nostr_relay_builder::builder::{RelayBuilderNip42, RelayBuilderNip42Mode};
+
+    #[derive(Clone, Debug, Default)]
+    struct ConnectionAudit {
+        reads: Arc<Mutex<Vec<SocketAddr>>>,
+        writes: Arc<Mutex<Vec<SocketAddr>>>,
+    }
+
+    impl QueryPolicy for ConnectionAudit {
+        fn admit_query<'a>(
+            &'a self,
+            _: &'a nostr_relay_builder::prelude::Filter,
+            addr: &'a SocketAddr,
+        ) -> BoxedFuture<'a, PolicyResult> {
+            Box::pin(async move {
+                self.reads.lock().await.push(*addr);
+                PolicyResult::Accept
+            })
+        }
+    }
+
+    impl WritePolicy for ConnectionAudit {
+        fn admit_event<'a>(
+            &'a self,
+            event: &'a nostr_relay_builder::prelude::Event,
+            addr: &'a SocketAddr,
+        ) -> BoxedFuture<'a, PolicyResult> {
+            Box::pin(async move {
+                if event.kind == OldKind::MlsGroupMessage {
+                    self.writes.lock().await.push(*addr);
+                }
+                PolicyResult::Accept
+            })
+        }
+    }
+
+    let audit = ConnectionAudit::default();
+    let relay = LocalRelay::new(
+        RelayBuilder::default()
+            .nip42(RelayBuilderNip42 {
+                mode: RelayBuilderNip42Mode::Read,
+            })
+            .query_policy(audit.clone())
+            .write_policy(audit.clone()),
+    );
+    relay.run().await.unwrap();
+    let endpoint = TransportEndpoint(relay.url().await.to_string());
+    let plane = MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(30), true);
+    let first = Keys::generate();
+    let account = MemberId::new(first.public_key().to_bytes().to_vec());
+    plane
+        .set_transport_signer(&account, Arc::new(first))
+        .await
+        .unwrap();
+    // Neither account publisher can rescue an accidental public send through
+    // the signer-bound path. The receive socket must authenticate for REQs.
+    let fallback = NostrSdkRelayClient::new(NostrSdkClient::builder().build());
+    fallback.client().shutdown().await;
+    let adapter = plane.account_adapter(account.clone(), Arc::new(fallback.clone()));
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![endpoint.clone()],
+            group_subscriptions: Vec::new(),
+            since: None,
+        })
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        while audit.reads.lock().await.is_empty() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("receive socket must issue its authenticated subscription");
+
+    let request = |account_id, content: &str| {
+        let event = EventBuilder::new(Kind::MlsGroupMessage, content)
+            .tags([Tag::custom("h", [hex::encode([0xD4; 32])])])
+            .finalize(&Keys::generate())
+            .unwrap();
+        TransportPublishRequest {
+            account_id,
+            message: NostrTransportEvent::from_nostr_event(&event)
+                .unwrap()
+                .to_transport_message()
+                .unwrap(),
+            target: TransportPublishTarget::Group {
+                group_id: GroupId::new(vec![0xC3; 32]),
+                transport_group_id: vec![0xD4; 32],
+                endpoints: vec![endpoint.clone()],
+            },
+            required_acks: 1,
+        }
+    };
+    let publish = async |adapter: &marmot_app::MarmotRelayPlaneAccountAdapter, account, content| {
+        let request = request(account, content);
+        let report = timeout(Duration::from_secs(5), adapter.publish(request.clone()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(report.met_required_acks());
+        assert_eq!(report.message_id, request.message.id);
+    };
+    publish(&adapter, account.clone(), "first").await;
+    publish(&adapter.clone(), account.clone(), "clone").await;
+    let second = Keys::generate();
+    let second_id = MemberId::new(second.public_key().to_bytes().to_vec());
+    let second_adapter = plane.account_adapter(second_id.clone(), Arc::new(fallback));
+    plane
+        .set_transport_signer(&second_id, Arc::new(second))
+        .await
+        .unwrap();
+    publish(&second_adapter, second_id.clone(), "second account").await;
+    second_adapter.deactivate_account(&second_id).await.unwrap();
+    publish(&adapter, account.clone(), "first after switch").await;
+    plane.shutdown().await;
+    publish(&adapter, account, "receive pool shut down").await;
+
+    let reads = audit.reads.lock().await;
+    let writes = audit.writes.lock().await;
+    assert_eq!(writes.len(), 5);
+    assert!(
+        writes.iter().all(|peer| !reads.contains(peer)),
+        "group writes must never use an authenticated receive socket"
+    );
+    assert_eq!(
+        writes[0], writes[1],
+        "adapter clones reuse the anonymous socket"
+    );
+    assert_ne!(writes[0], writes[2], "accounts own independent publishers");
+    assert_eq!(
+        writes[0], writes[3],
+        "account switches do not replace its publisher"
+    );
+    assert_eq!(
+        writes[0], writes[4],
+        "receive shutdown does not replace its publisher"
+    );
 }
 
 async fn mock_relay() -> (MockRelay, String) {
@@ -708,6 +1055,18 @@ async fn deletion_rejecting_app(dir: &tempfile::TempDir) -> (LocalRelay, MarmotA
 struct MockBlossom {
     url: String,
     blobs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    ledger: Arc<BlossomLedger>,
+}
+
+/// Independent fixture counters; never infer HTTP activity from app progress.
+#[derive(Default)]
+struct BlossomLedger {
+    puts: AtomicUsize,
+    gets: AtomicUsize,
+    heads: AtomicUsize,
+    uploaded_bytes: AtomicUsize,
+    response_bytes: AtomicUsize,
+    deny_reads: AtomicBool,
 }
 
 struct CapturedAuditUpload {
@@ -857,6 +1216,7 @@ impl MockBlossom {
     }
 }
 
+/// Serve encrypted generated fixtures with independent request and byte counters.
 async fn mock_blossom() -> MockBlossom {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -864,6 +1224,8 @@ async fn mock_blossom() -> MockBlossom {
     let blobs = Arc::new(Mutex::new(HashMap::<String, Vec<u8>>::new()));
     let server_blobs = blobs.clone();
     let server_url = url.clone();
+    let ledger = Arc::new(BlossomLedger::default());
+    let server_ledger = ledger.clone();
     tokio::spawn(async move {
         loop {
             let Ok((mut stream, _peer)) = listener.accept().await else {
@@ -871,6 +1233,7 @@ async fn mock_blossom() -> MockBlossom {
             };
             let blobs = server_blobs.clone();
             let server_url = server_url.clone();
+            let ledger = server_ledger.clone();
             tokio::spawn(async move {
                 let mut request = Vec::new();
                 let mut buffer = [0_u8; 4096];
@@ -918,6 +1281,10 @@ async fn mock_blossom() -> MockBlossom {
                 let body = request[header_end..header_end + content_length].to_vec();
                 match (method.as_str(), path.as_str()) {
                     ("PUT", "/upload") => {
+                        ledger.puts.fetch_add(1, Ordering::SeqCst);
+                        ledger
+                            .uploaded_bytes
+                            .fetch_add(body.len(), Ordering::SeqCst);
                         assert!(
                             authorization
                                 .as_deref()
@@ -946,6 +1313,11 @@ async fn mock_blossom() -> MockBlossom {
                         .await;
                     }
                     ("GET", blob_path) => {
+                        ledger.gets.fetch_add(1, Ordering::SeqCst);
+                        if ledger.deny_reads.load(Ordering::SeqCst) {
+                            write_http_response(&mut stream, 410, "text/plain", b"denied").await;
+                            return;
+                        }
                         let hash = blob_path
                             .trim_start_matches('/')
                             .split_once('.')
@@ -953,6 +1325,9 @@ async fn mock_blossom() -> MockBlossom {
                             .unwrap_or_else(|| blob_path.trim_start_matches('/'));
                         let blob = blobs.lock().await.get(hash).cloned();
                         if let Some(blob) = blob {
+                            ledger
+                                .response_bytes
+                                .fetch_add(blob.len(), Ordering::SeqCst);
                             write_http_response(
                                 &mut stream,
                                 200,
@@ -964,6 +1339,10 @@ async fn mock_blossom() -> MockBlossom {
                             write_http_response(&mut stream, 404, "text/plain", b"not found").await;
                         }
                     }
+                    ("HEAD", _) => {
+                        ledger.heads.fetch_add(1, Ordering::SeqCst);
+                        write_http_response(&mut stream, 410, "text/plain", b"denied").await;
+                    }
                     _ => {
                         write_http_response(&mut stream, 404, "text/plain", b"not found").await;
                     }
@@ -971,7 +1350,7 @@ async fn mock_blossom() -> MockBlossom {
             });
         }
     });
-    MockBlossom { url, blobs }
+    MockBlossom { url, blobs, ledger }
 }
 
 async fn write_http_response(
@@ -1315,6 +1694,7 @@ async fn import_with_stalled_discovery_endpoint_completes_within_the_advisory_ca
             import_nsec: Some(zeroize::Zeroizing::new(secret)),
             default_relays: vec![endpoint(&url)],
             bootstrap_relays: vec![endpoint(&url)],
+            inbox_relays: Vec::new(),
             discovery_relays: vec![endpoint(&url), endpoint(&stall_url)],
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
@@ -1535,6 +1915,7 @@ async fn failed_reactivation_key_package_publish_restores_signed_out_retry() {
         import_nsec: Some(zeroize::Zeroizing::new(secret.to_owned())),
         default_relays: vec![endpoint(&url)],
         bootstrap_relays: vec![endpoint(&url)],
+        inbox_relays: Vec::new(),
         discovery_relays: vec![endpoint(&url)],
         publish_missing_relay_lists: true,
         publish_initial_key_package: true,
@@ -1595,6 +1976,7 @@ async fn failed_external_signer_reactivation_restores_signed_out_retry() {
     let setup = || AccountSetupRequest {
         default_relays: vec![endpoint(&url)],
         bootstrap_relays: vec![endpoint(&url)],
+        inbox_relays: Vec::new(),
         discovery_relays: vec![endpoint(&url)],
         publish_missing_relay_lists: true,
         publish_initial_key_package: true,
@@ -5189,6 +5571,137 @@ async fn unauthorized_remove_and_self_demotion_send_no_wake() {
     runtime.shutdown().await;
 }
 
+/// Live relay delivery retains direct mentions through durable and timed mute while blocks still apply.
+#[tokio::test]
+async fn live_muted_chat_notifies_direct_mentions_but_not_ordinary_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    let alice_id = alice.account.account_id_hex;
+    let bob_id = bob.account.account_id_hex;
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "muted mention",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    let group_hex = hex::encode(group_id.as_slice());
+    app.set_local_notifications_enabled(&bob_id, true).unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    let mut subscription = runtime.subscribe_notifications().unwrap();
+    runtime.set_chat_muted(&bob_id, &group_hex, None).unwrap();
+
+    runtime
+        .send_message(&alice_id, &group_id, b"ordinary muted message".to_vec())
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    assert!(
+        timeout(Duration::from_millis(600), subscription.recv())
+            .await
+            .is_err(),
+        "ordinary messages in the muted chat must not reach the live collector"
+    );
+
+    let bob_npub = marmot_app::npub_for_account_id(&bob_id).unwrap();
+    runtime
+        .send_message(
+            &alice_id,
+            &group_id,
+            format!("hello @{bob_npub}").into_bytes(),
+        )
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    let mention = wait_for_notification(&mut subscription, |update| {
+        update.account_id_hex == bob_id && update.is_mention
+    })
+    .await;
+    assert!(matches!(mention.trigger, NotificationTrigger::NewMessage));
+
+    runtime.block_user(&bob_id, &alice_id).await.unwrap();
+    runtime
+        .send_message(
+            &alice_id,
+            &group_id,
+            format!("blocked @{bob_npub}").into_bytes(),
+        )
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    assert!(
+        timeout(Duration::from_millis(600), subscription.recv())
+            .await
+            .is_err(),
+        "blocked senders must not regain alerts through the mention exception"
+    );
+
+    runtime.unblock_user(&bob_id, &alice_id).await.unwrap();
+    runtime.clear_chat_muted(&bob_id, &group_hex).unwrap();
+    runtime
+        .send_message(&alice_id, &group_id, b"ordinary after unmute".to_vec())
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    let unmuted = wait_for_notification(&mut subscription, |update| {
+        update.account_id_hex == bob_id
+            && update.preview_text.as_deref() == Some("ordinary after unmute")
+    })
+    .await;
+    assert!(!unmuted.is_mention);
+
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 86_400_000;
+    runtime
+        .set_chat_muted(&bob_id, &group_hex, Some(expires_at))
+        .unwrap();
+    runtime
+        .send_message(&alice_id, &group_id, b"ordinary during timed mute".to_vec())
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    assert!(
+        timeout(Duration::from_millis(600), subscription.recv())
+            .await
+            .is_err(),
+        "timed mute must still silence ordinary messages"
+    );
+    runtime
+        .send_message(
+            &alice_id,
+            &group_id,
+            format!("timed mute @{bob_npub}").into_bytes(),
+        )
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    let timed_mention = wait_for_notification(&mut subscription, |update| {
+        update.account_id_hex == bob_id && update.is_mention
+    })
+    .await;
+    assert!(matches!(
+        timed_mention.trigger,
+        NotificationTrigger::NewMessage
+    ));
+
+    runtime.shutdown().await;
+}
+
+/// Foreground and cold wake consumers share one typed mention identity even while the chat is muted.
 #[tokio::test]
 async fn concurrent_wake_collection_and_foreground_subscription_share_notification_key() {
     let dir = tempfile::tempdir().unwrap();
@@ -5218,6 +5731,10 @@ async fn concurrent_wake_collection_and_foreground_subscription_share_notificati
 
     let mut subscription = runtime.subscribe_notifications().unwrap();
     let bob_ref = bob.account.account_id_hex.clone();
+    let bob_npub = marmot_app::npub_for_account_id(&bob_ref).unwrap();
+    runtime
+        .set_chat_muted(&bob_ref, &hex::encode(group_id.as_slice()), None)
+        .unwrap();
 
     let runtime_for_wake = runtime.clone();
     let wake_handle = tokio::spawn(async move {
@@ -5231,7 +5748,7 @@ async fn concurrent_wake_collection_and_foreground_subscription_share_notificati
         .send_message(
             &alice.account.account_id_hex,
             &group_id,
-            b"hello over both consumers".to_vec(),
+            format!("hello @{bob_npub} over both consumers").into_bytes(),
         )
         .await
         .unwrap();
@@ -5259,6 +5776,16 @@ async fn concurrent_wake_collection_and_foreground_subscription_share_notificati
         .filter(|update| update.account_ref == bob_ref)
         .map(|update| update.notification_key.clone())
         .collect();
+    assert!(
+        wake.notifications
+            .iter()
+            .any(|update| update.account_ref == bob_ref && update.is_mention)
+    );
+    assert!(
+        subscription_updates
+            .iter()
+            .any(|update| update.account_ref == bob_ref && update.is_mention)
+    );
     assert!(
         !wake_keys.is_empty(),
         "wake collection should produce at least one update"
@@ -6030,6 +6557,9 @@ async fn app_runtime_declines_pending_invite_by_leaving_and_archiving() {
     })
     .await;
 
+    // Drain the leave's remaining projection work before comparing the full
+    // durable row across a rejected stale acceptance.
+    runtime.catch_up_accounts().await.unwrap();
     let reloaded = app.group(&bob_label, &group_id_hex).unwrap().unwrap();
     assert_eq!(reloaded.self_membership, SelfMembership::Left);
     assert!(!reloaded.pending_confirmation);
@@ -9146,6 +9676,7 @@ async fn existing_login_preserves_outbox_only_inbox(external_signer: bool, stale
     let request = AccountSetupRequest {
         default_relays: vec![endpoint(&discovery_url)],
         bootstrap_relays: vec![endpoint(&discovery_url)],
+        inbox_relays: Vec::new(),
         discovery_relays: vec![endpoint(&discovery_url)],
         publish_missing_relay_lists: true,
         publish_initial_key_package: false,
@@ -9256,7 +9787,7 @@ async fn import_ignores_retired_published_routes_without_rewriting_relay_lists()
         &publisher_home,
         "publisher",
         &relay_url,
-        "wss://relay.damus.io",
+        "wss://relay.nostr.band",
         test_unix_now_seconds(),
     )
     .await;
@@ -9273,6 +9804,7 @@ async fn import_ignores_retired_published_routes_without_rewriting_relay_lists()
             import_nsec: Some(zeroize::Zeroizing::new(secret_nsec)),
             default_relays: vec![endpoint(&relay_url)],
             bootstrap_relays: vec![endpoint(&relay_url)],
+            inbox_relays: Vec::new(),
             discovery_relays: vec![endpoint(&relay_url)],
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
@@ -9284,11 +9816,11 @@ async fn import_ignores_retired_published_routes_without_rewriting_relay_lists()
     assert!(imported.relay_lists.complete);
     assert_eq!(
         imported.relay_lists.nip65.relays,
-        vec!["wss://relay.damus.io"]
+        vec!["wss://relay.nostr.band"]
     );
     assert_eq!(
         imported.relay_lists.inbox.relays,
-        vec!["wss://relay.damus.io"]
+        vec!["wss://relay.nostr.band"]
     );
     assert!(imported.key_package_bytes.is_some());
     assert_eq!(
@@ -9337,6 +9869,7 @@ async fn external_signer_login_ignores_retired_routes_without_rewriting_relay_li
             AccountSetupRequest {
                 default_relays: vec![endpoint(&relay_url)],
                 bootstrap_relays: vec![endpoint(&relay_url)],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![endpoint(&relay_url)],
                 publish_missing_relay_lists: true,
                 publish_initial_key_package: true,
@@ -9388,7 +9921,7 @@ async fn remote_key_package_fetch_falls_back_when_published_outbox_is_retired() 
         &publisher_home,
         &created.account.label,
         &relay_url,
-        "wss://relay.damus.io",
+        "wss://relay.nostr.band",
         test_unix_now_seconds() + 1,
     )
     .await;
@@ -9409,7 +9942,7 @@ async fn remote_key_package_fetch_falls_back_when_published_outbox_is_retired() 
 
     assert_eq!(
         fetched.relay_lists.nip65.relays,
-        vec!["wss://relay.damus.io"]
+        vec!["wss://relay.nostr.band"]
     );
     assert_eq!(
         fetched.key_package.bytes().len(),
@@ -9442,7 +9975,7 @@ async fn relay_list_edits_reject_retired_endpoints_in_every_input_role() {
             "alice",
             AccountRelayListBootstrap::new(
                 vec![endpoint(&seed_url)],
-                vec![endpoint("wss://relay.damus.io")],
+                vec![endpoint("wss://relay.nostr.band")],
             ),
         )
         .await;
@@ -9466,7 +9999,7 @@ async fn relay_list_edits_reject_retired_endpoints_in_every_input_role() {
         .publish_account_nip65_relay_set(
             "alice",
             vec![endpoint(&seed_url)],
-            vec![endpoint("wss://relay.damus.io")],
+            vec![endpoint("wss://relay.nostr.band")],
             vec![endpoint(&seed_url)],
         )
         .await;
@@ -10113,6 +10646,96 @@ async fn account_publishes_route_to_own_nip65_not_bootstrap() {
     );
 }
 
+async fn assert_published_relay_lists(
+    app: &MarmotApp,
+    account_id_hex: &str,
+    route: &str,
+    nip65: &str,
+    inbox: &str,
+) {
+    let status = app
+        .fetch_account_relay_list_status_for_account_id(account_id_hex, vec![endpoint(route)])
+        .await
+        .unwrap();
+    assert_eq!(status.nip65.relays, vec![nip65.to_owned()]);
+    assert_eq!(status.inbox.relays, vec![inbox.to_owned()]);
+}
+
+#[tokio::test]
+async fn generated_account_declares_separate_inbox_relays() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, url) = mock_relay().await;
+    let (_inbox_relay, inbox_url) = mock_relay().await;
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let created = runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            inbox_relays: vec![endpoint(&inbox_url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(created.relay_lists.nip65.relays, vec![url.clone()]);
+    assert_eq!(created.relay_lists.inbox.relays, vec![inbox_url.clone()]);
+    assert_published_relay_lists(
+        &app,
+        &created.account.account_id_hex,
+        &url,
+        &url,
+        &inbox_url,
+    )
+    .await;
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn imported_account_publishes_missing_lists_with_separate_inbox_relays() {
+    use nostr::prelude::ToBech32;
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, url) = mock_relay().await;
+    let (_inbox_relay, inbox_url) = mock_relay().await;
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let keys = Keys::generate();
+    let imported = runtime
+        .create_or_import_account(AccountSetupRequest {
+            import_nsec: Some(zeroize::Zeroizing::new(
+                keys.secret_key().to_bech32().unwrap(),
+            )),
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            inbox_relays: vec![endpoint(&inbox_url)],
+            discovery_relays: vec![endpoint(&url)],
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: false,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(imported.relay_lists.nip65.relays, vec![url.clone()]);
+    assert_eq!(imported.relay_lists.inbox.relays, vec![inbox_url.clone()]);
+    assert_published_relay_lists(
+        &app,
+        &imported.account.account_id_hex,
+        &url,
+        &url,
+        &inbox_url,
+    )
+    .await;
+    runtime.shutdown().await;
+}
+
 #[tokio::test]
 async fn account_owned_profile_publish_uses_the_selected_accounts_relay_configuration() {
     let dir = tempfile::tempdir().unwrap();
@@ -10455,6 +11078,7 @@ async fn app_runtime_sign_out_and_wipe_removes_external_signer_account() {
             AccountSetupRequest {
                 default_relays: vec![endpoint(&url)],
                 bootstrap_relays: vec![endpoint(&url)],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![endpoint(&url)],
                 publish_missing_relay_lists: true,
                 publish_initial_key_package: true,
@@ -10571,6 +11195,7 @@ async fn app_runtime_wipe_drops_external_signer_registration() {
             AccountSetupRequest {
                 default_relays: vec![endpoint(&url)],
                 bootstrap_relays: vec![endpoint(&url)],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![endpoint(&url)],
                 publish_missing_relay_lists: true,
                 publish_initial_key_package: true,
@@ -10616,6 +11241,7 @@ async fn app_runtime_sign_out_keeps_external_signer_registration() {
             AccountSetupRequest {
                 default_relays: vec![endpoint(&url)],
                 bootstrap_relays: vec![endpoint(&url)],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![endpoint(&url)],
                 publish_missing_relay_lists: true,
                 publish_initial_key_package: true,
@@ -10899,6 +11525,7 @@ async fn app_runtime_sign_out_succeeds_for_external_signer_account() {
             AccountSetupRequest {
                 default_relays: vec![endpoint(&url)],
                 bootstrap_relays: vec![endpoint(&url)],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![endpoint(&url)],
                 publish_missing_relay_lists: true,
                 publish_initial_key_package: true,
@@ -12517,6 +13144,7 @@ async fn outbox_resolved_inbox_survives_restart_and_delivers_exact_welcome() {
     let setup = AccountSetupRequest {
         default_relays: vec![endpoint(&discovery_url)],
         bootstrap_relays: vec![endpoint(&discovery_url)],
+        inbox_relays: Vec::new(),
         discovery_relays: vec![endpoint(&discovery_url)],
         publish_missing_relay_lists: true,
         publish_initial_key_package: true,
@@ -12575,6 +13203,7 @@ async fn outbox_resolved_inbox_survives_restart_and_delivers_exact_welcome() {
             import_nsec: Some(zeroize::Zeroizing::new(carol_nsec)),
             default_relays: vec![endpoint(&discovery_url)],
             bootstrap_relays: vec![endpoint(&discovery_url)],
+            inbox_relays: Vec::new(),
             discovery_relays: vec![endpoint(&discovery_url)],
             publish_missing_relay_lists: true,
             publish_initial_key_package: false,
@@ -12680,6 +13309,7 @@ async fn independent_sender_outbox_invite_survives_restart(stale_discovery: bool
             import_nsec: Some(zeroize::Zeroizing::new(carol_nsec.clone())),
             default_relays: vec![endpoint(&receiver_setup_url)],
             bootstrap_relays: vec![endpoint(&receiver_setup_url)],
+            inbox_relays: Vec::new(),
             discovery_relays: vec![endpoint(&receiver_setup_url)],
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
@@ -12740,6 +13370,7 @@ async fn independent_sender_outbox_invite_survives_restart(stale_discovery: bool
             import_nsec: Some(zeroize::Zeroizing::new(carol_nsec)),
             default_relays: vec![endpoint(&discovery_url)],
             bootstrap_relays: vec![endpoint(&discovery_url)],
+            inbox_relays: Vec::new(),
             discovery_relays: vec![endpoint(&discovery_url)],
             publish_missing_relay_lists: true,
             publish_initial_key_package: false,
@@ -12768,6 +13399,7 @@ async fn independent_sender_outbox_invite_survives_restart(stale_discovery: bool
     let sender_setup = AccountSetupRequest {
         default_relays: vec![endpoint(&discovery_url)],
         bootstrap_relays: vec![endpoint(&discovery_url)],
+        inbox_relays: Vec::new(),
         discovery_relays: vec![endpoint(&discovery_url)],
         publish_missing_relay_lists: true,
         publish_initial_key_package: true,
@@ -13233,6 +13865,7 @@ async fn assert_required_discovery_failure_does_not_publish_defaults(external_si
     let request = AccountSetupRequest {
         default_relays: vec![endpoint(&bootstrap_url)],
         bootstrap_relays: vec![endpoint(&bootstrap_url)],
+        inbox_relays: Vec::new(),
         discovery_relays: vec![endpoint(&discovery_url)],
         publish_missing_relay_lists: true,
         publish_initial_key_package: false,
@@ -13337,6 +13970,7 @@ async fn partial_outbox_failure_does_not_publish_defaults(external_signer: bool)
     let request = AccountSetupRequest {
         default_relays: vec![endpoint(&healthy_url)],
         bootstrap_relays: vec![endpoint(&discovery_url)],
+        inbox_relays: Vec::new(),
         discovery_relays: vec![endpoint(&discovery_url)],
         publish_missing_relay_lists: true,
         publish_initial_key_package: false,
@@ -13444,6 +14078,7 @@ async fn newer_discovery_inbox_survives_older_outbox(external_signer: bool, empt
     let request = AccountSetupRequest {
         default_relays: vec![endpoint(&discovery_url)],
         bootstrap_relays: vec![endpoint(&discovery_url)],
+        inbox_relays: Vec::new(),
         discovery_relays: vec![endpoint(&discovery_url)],
         publish_missing_relay_lists: true,
         publish_initial_key_package: false,
@@ -13548,6 +14183,7 @@ async fn explicit_empty_outbox_metadata_never_publishes_defaults(external_signer
         let request = AccountSetupRequest {
             default_relays: vec![endpoint(&url)],
             bootstrap_relays: vec![endpoint(&url)],
+            inbox_relays: Vec::new(),
             discovery_relays: vec![endpoint(&url)],
             publish_missing_relay_lists: true,
             publish_initial_key_package: false,
@@ -13628,6 +14264,7 @@ async fn outbox_acceptance_closed_multi_author_queries_fall_back_per_member() {
                 )),
                 default_relays: vec![endpoint(&outbox_url)],
                 bootstrap_relays: vec![endpoint(&outbox_url)],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![endpoint(&outbox_url)],
                 publish_missing_relay_lists: true,
                 publish_initial_key_package: true,
@@ -13706,6 +14343,7 @@ async fn onboarding_fixture() -> (
             zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             marmot_app::OnboardingOptions {
                 default_relays: vec![url.clone()],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
             },
         )
@@ -13968,6 +14606,7 @@ async fn onboarding_external_signer_uses_the_same_gate_and_workflow() {
             TestExternalAccountSigner { keys: keys.clone() },
             marmot_app::OnboardingOptions {
                 default_relays: vec![url.clone()],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
             },
         )
@@ -13994,6 +14633,7 @@ async fn onboarding_external_signer_uses_the_same_gate_and_workflow() {
             TestExternalAccountSigner { keys },
             marmot_app::OnboardingOptions {
                 default_relays: vec![url.clone()],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![url],
             },
         )
@@ -14023,6 +14663,7 @@ async fn onboarding_cancellation_retains_external_signer_for_explicit_sign_in() 
             TestExternalAccountSigner { keys },
             marmot_app::OnboardingOptions {
                 default_relays: vec![url.clone()],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![url],
             },
         )
@@ -14078,6 +14719,7 @@ async fn onboarding_access_restricted_query_is_not_a_missing_record() {
             zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             marmot_app::OnboardingOptions {
                 default_relays: vec![url.clone()],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![url],
             },
         )
@@ -14119,6 +14761,7 @@ async fn onboarding_key_package_rejection_retains_identity_until_confirmed_retry
             zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             marmot_app::OnboardingOptions {
                 default_relays: vec![url.clone()],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
             },
         )
@@ -14290,6 +14933,7 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
             zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             OnboardingOptions {
                 default_relays: vec![url.clone()],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
             },
         )
@@ -14387,6 +15031,7 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
             zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             OnboardingOptions {
                 default_relays: vec![url.clone()],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
             },
         )
@@ -14450,6 +15095,7 @@ async fn onboarding_single_device_unknown_discovery_still_offers_explicit_contin
             zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             marmot_app::OnboardingOptions {
                 default_relays: vec![url.clone()],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
             },
         )
@@ -14500,6 +15146,7 @@ async fn onboarding_contains_corruption_and_preserves_legacy_account_and_cancel_
         .account;
     let options = || marmot_app::OnboardingOptions {
         default_relays: vec![url.clone()],
+        inbox_relays: Vec::new(),
         discovery_relays: vec![url.clone()],
     };
     assert!(
@@ -14604,6 +15251,7 @@ async fn onboarding_cancelled_new_identity_can_resume_through_legacy_login() {
             zeroize::Zeroizing::new(secret.clone()),
             marmot_app::OnboardingOptions {
                 default_relays: vec![url.clone()],
+                inbox_relays: Vec::new(),
                 discovery_relays: vec![url.clone()],
             },
         )
@@ -15731,3 +16379,6 @@ async fn offline_member_recovers_dismissal_label_after_admin_demotion() {
     bob.shutdown().await;
     carol.shutdown().await;
 }
+
+#[path = "relay_runtime/attachment_retention.rs"]
+mod attachment_retention;

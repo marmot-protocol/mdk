@@ -254,20 +254,39 @@ fn kind_446_content_is_bounded_to_32_encrypted_tokens() {
     );
 }
 
-#[test]
-fn kind_446_trigger_chunks_split_33_encrypted_tokens() {
-    let tokens =
-        vec![vec![7_u8; PUSH_ENCRYPTED_TOKEN_LEN]; PUSH_MAX_NOTIFICATION_TRIGGER_TOKENS + 1];
-    let chunks = notification_trigger_chunks(&tokens).collect::<Vec<_>>();
-    assert_eq!(
-        chunks.iter().map(|chunk| chunk.len()).collect::<Vec<_>>(),
-        vec![PUSH_MAX_NOTIFICATION_TRIGGER_TOKENS, 1]
-    );
-    assert!(
-        chunks
-            .into_iter()
-            .all(|chunk| build_notification_rumor_content(chunk).is_ok())
-    );
+#[tokio::test]
+async fn push_chunks_round_trip_at_wire_size_boundary() {
+    let server = Keys::generate();
+    let tokens = (0..20)
+        .map(|index| vec![index as u8; PUSH_ENCRYPTED_TOKEN_LEN])
+        .collect::<Vec<_>>();
+    let oversized = build_notification_gift_wrap(&server.public_key().to_hex(), &tokens)
+        .await
+        .unwrap()
+        .to_verified_nostr_event()
+        .unwrap();
+    assert!(serde_json::to_vec(&oversized).unwrap().len() > 65_536);
+
+    let mut received = Vec::new();
+    let mut chunk_sizes = Vec::new();
+    for chunk in notification_trigger_chunks(&tokens) {
+        let wrap = build_notification_gift_wrap(&server.public_key().to_hex(), chunk)
+            .await
+            .unwrap();
+        let event = wrap.to_verified_nostr_event().unwrap();
+        assert!(serde_json::to_vec(&event).unwrap().len() <= 65_536);
+        let gift = nostr::nips::nip59::extract_rumor(&server, &event).unwrap();
+        assert_eq!(
+            gift.rumor.kind,
+            Kind::Custom(KIND_MARMOT_NOTIFICATION_RUMOR as u16)
+        );
+        let content = BASE64_STANDARD.decode(gift.rumor.content).unwrap();
+        assert_eq!(content.len() % PUSH_ENCRYPTED_TOKEN_LEN, 0);
+        chunk_sizes.push(content.len() / PUSH_ENCRYPTED_TOKEN_LEN);
+        received.extend(content);
+    }
+    assert_eq!(chunk_sizes, [19, 1]);
+    assert_eq!(received, tokens.concat());
 }
 
 #[tokio::test]
@@ -980,6 +999,73 @@ fn mention_notification_suppresses_self_mentions() {
 
     assert!(notification_is_mention(&message, &receiver, false));
     assert!(!notification_is_mention(&message, &receiver, true));
+}
+
+/// A muted live event emits only the receiver's typed chat mention; unmute restores ordinary traffic.
+#[test]
+fn muted_chat_live_event_resolver_emits_only_direct_mentions() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(dir.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let receiver = account.account_id_hex;
+    let other = nostr::prelude::Keys::generate().public_key().to_hex();
+    let sender = "bb".repeat(32);
+    let group = "ee".repeat(32);
+    let mut resolver = NotificationResolver::default();
+    seed_group_state_resolver(
+        &mut resolver,
+        "alice",
+        &receiver,
+        &group,
+        Some(&sender),
+        true,
+        true,
+    );
+
+    let mut cases = vec![
+        ("ordinary", received_chat("hi", vec![]), false),
+        (
+            "own mention",
+            received_chat("hi", vec![vec!["p".to_owned(), receiver.clone()]]),
+            true,
+        ),
+        (
+            "other account mention",
+            received_chat("hi", vec![vec!["p".to_owned(), other]]),
+            false,
+        ),
+    ];
+    let mut self_mention = received_chat("hi", vec![vec!["p".to_owned(), receiver.clone()]]);
+    self_mention.sender = receiver.clone();
+    cases.push(("self mention", self_mention, false));
+
+    for (name, message, expected) in cases {
+        let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+            account_id_hex: receiver.clone(),
+            account_label: "alice".to_owned(),
+            message,
+        });
+        let update = notification_update_from_event_cached(&app, &mut resolver, &event).unwrap();
+        assert_eq!(update.is_some(), expected, "{name}");
+        if let Some(update) = update {
+            assert!(update.is_mention, "{name}");
+        }
+    }
+
+    resolver
+        .chat_muted
+        .insert(("alice".to_owned(), group), false);
+    let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+        account_id_hex: receiver,
+        account_label: "alice".to_owned(),
+        message: received_chat("ordinary after unmute", vec![]),
+    });
+    assert!(
+        notification_update_from_event_cached(&app, &mut resolver, &event)
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]

@@ -45,7 +45,7 @@ This is the current integration entry point for Swift/iOS, Swift/macOS and Kotli
 | [Conversation windows](CONVERSATION-WINDOW.md) | Initial unread/latest positioning, live snapshots, paging, drafts and cancellation. |
 | [Durable local sends](LOCAL-SENDS.md) | Early local acceptance, exact optimistic-bubble correlation and durable edits of pending local sends. |
 | [Polls](POLLS.md) | Encrypted NIP-88 creation, replacement votes, bounded validation and deterministic timeline results. |
-| [Attachment history](ATTACHMENT-HISTORY.md) / [attachment access](ATTACHMENT-ACCESS.md) | Media discovery, local bytes, acquisition, progress, policy and ownership, including [host-managed automatic downloads](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104) and Android WorkManager migration. |
+| [Attachment history](ATTACHMENT-HISTORY.md) / [attachment access](ATTACHMENT-ACCESS.md) | Media discovery, local bytes, atomic interactive promotion, genuine outgoing retention, progress, policy and ownership, including [host-managed automatic downloads](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104) and Android WorkManager migration. |
 
 ### What MDK owns and what the host owns
 
@@ -285,9 +285,9 @@ Imported identities can use the durable preflight API instead of `login`:
 
 1. Call `begin_onboarding(nsec, options)` or
    `begin_external_signer_onboarding(public_key, signer, options)`. Supply the
-   same `default_relays` as new-account creation and a separate set of trusted
-   `discovery_relays`. These methods return a persisted account and snapshot
-   before fetching or publishing Nostr records.
+   same `default_relays` (and optional `inbox_relays`) as new-account creation
+   and a separate set of trusted `discovery_relays`. These methods return a
+   persisted account and snapshot before fetching or publishing Nostr records.
 2. Display the snapshot steps in their returned order (profile, follows, general
    relays, inbox relays, single-device notice, KeyPackage). Use step identities,
    not enum discriminants, as positions. Subscribe with `subscribe_onboarding`, read its initial

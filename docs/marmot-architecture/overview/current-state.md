@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-27
+updated: 2026-10-02
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -49,6 +49,15 @@ C8-C2 adds durable source demand (migration 84), bounded background acquisition 
 for accepted conversations. C8-C3 adds protected ciphertext checkpoints and validated HTTP Range resume across interruption.
 C8-D1 exposes local retained-asset metadata (up to 64 source slots) and verified byte ranges (up to 1 MiB)
 through Rust, UniFFI and C, with no network or engine prerequisite. C8-D2 adds durable cancellation/retry/removal and policy, bounded progress streams, and enables automatic acquisition with the approved limits. Frozen runtimes skip transfers; pending invitations defer attachments. See the [C8 audit and sequence](../further-context/attachment-acquisition.md).
+
+Attachment explicit demand now atomically joins/promotes native work without resetting
+retry budgets, backoff or active deadlines; migration 100 retains tapped-file priority.
+Migration 101 optionally stages genuine outgoing bytes after successful HTTP upload.
+Core source projection commits before independent canonical promotion; retention failure
+cannot reject sending or block incoming acquisition. Pending-source protection, shared
+quota, corruption quarantine and rotating local recovery survive restart. Android artifact adoption,
+presentation-cache failure flows and device qualification remain pending; see the
+[attachment access contract](../../../crates/marmot-uniffi/ATTACHMENT-ACCESS.md).
 
 C5 M1 adds a read-only storage conversation opener: bounded canonical history and retained read state in one
 snapshot, first-unread/latest selection, and scoped anchor recovery after physical removal. Dirty read projections

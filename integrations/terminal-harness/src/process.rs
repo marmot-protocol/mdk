@@ -214,6 +214,10 @@ pub enum ParsedEvent {
         /// Sanitized error classification.
         summary: String,
     },
+    /// The backend dropped or replaced an attachment it was given. The runner kills the
+    /// process group at once, before the backend can act on the altered prompt, and fails
+    /// the turn without retaining the session observed in this run.
+    AttachmentNotProcessed,
     /// A valid event that has no durable connector effect.
     Ignored,
 }
@@ -245,6 +249,7 @@ impl fmt::Debug for ParsedEvent {
                 .field("session_present", &session_id.is_some())
                 .field("summary_len", &summary.len())
                 .finish(),
+            Self::AttachmentNotProcessed => formatter.write_str("AttachmentNotProcessed"),
             Self::Ignored => formatter.write_str("Ignored"),
         }
     }
@@ -421,6 +426,12 @@ where
                             error_summary = Some(summary);
                         }
                         no_side_effects_proven = true;
+                    }
+                    Ok(ParsedEvent::AttachmentNotProcessed) => {
+                        // The session now holds a turn built on the altered prompt.
+                        // Never offer it for resume; failure cleanup kills the group.
+                        observed_session = None;
+                        return Err(HarnessError::AttachmentNotProcessed);
                     }
                     Ok(ParsedEvent::Ignored) => {}
                     Err(_) => debug!(

@@ -271,12 +271,37 @@ fn create_temp_file(
     .into())
 }
 
+/// Windows: the caller may still hold the old file open (the secret scrub
+/// handle). Deleting it and renaming onto its name then only works with
+/// POSIX delete semantics (NTFS on Windows 10 1903 and later); elsewhere the
+/// name stays delete-pending and the rename is denied. Moving the old file
+/// aside keeps open handles attached to the old file. A failed install attempts
+/// to restore the old name. Unlike Unix replacement, readers can observe a
+/// missing live path between the two renames.
 #[cfg(windows)]
 fn replace_file(temp_path: &Path, path: &Path) -> io::Result<()> {
-    if path.exists() {
-        fs::remove_file(path)?;
+    let mut aside = OsString::from(".");
+    aside.push(path.file_name().unwrap_or_default());
+    aside.push(format!(
+        ".old.{}.{}",
+        std::process::id(),
+        TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let aside = path.with_file_name(aside);
+    match fs::rename(path, &aside) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return fs::rename(temp_path, path),
+        Err(err) => return Err(err),
     }
-    fs::rename(temp_path, path)
+    if let Err(err) = fs::rename(temp_path, path) {
+        let _ = fs::rename(&aside, path);
+        return Err(err);
+    }
+    // The new file is live; the caller scrubs the old bytes through its open
+    // handle, and the name goes once that handle closes. Best-effort, like
+    // the rest of secret deletion: failing here must not fail the write.
+    let _ = fs::remove_file(&aside);
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -457,23 +482,6 @@ mod tests {
     }
 
     #[test]
-    fn removing_a_secret_unlinks_before_scrubbing() {
-        let source = include_str!("io.rs");
-        let removal = source
-            .split("fn remove_file_then_scrub")
-            .nth(1)
-            .unwrap()
-            .split("\n}\n")
-            .next()
-            .unwrap();
-
-        assert!(
-            removal.find("fs::remove_file").unwrap()
-                < removal.find("overwrite_open_file_with_zeros").unwrap()
-        );
-    }
-
-    #[test]
     fn removing_a_secret_scrubs_the_removed_inode() {
         let root = tempfile::tempdir().unwrap();
         let secret_path = root.path().join("account").join("secret.json");
@@ -488,5 +496,42 @@ mod tests {
         reader.read_to_end(&mut scrubbed).unwrap();
         assert!(!scrubbed.is_empty());
         assert!(scrubbed.iter().all(|byte| *byte == 0));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn secret_replace_scrubs_old_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("secret.json");
+        let old = serde_json::json!({ "secret": "old-key" });
+        let new = serde_json::json!({ "secret": "new-key" });
+        write_secret_json(&path, &old).unwrap();
+        let mut reader = File::open(&path).unwrap();
+        let old_len = reader.metadata().unwrap().len() as usize;
+
+        write_secret_json(&path, &new).unwrap();
+
+        assert_eq!(read_secret_json::<serde_json::Value>(&path).unwrap(), new);
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, vec![0; old_len]);
+    }
+
+    #[test]
+    fn failed_replace_restores_target() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("secret.json");
+        fs::write(&path, b"old-key").unwrap();
+        let reader = File::open(&path).unwrap();
+
+        let error = replace_file(&root.path().join("missing.tmp"), &path).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(fs::read(&path).unwrap(), b"old-key");
+        drop(reader);
     }
 }

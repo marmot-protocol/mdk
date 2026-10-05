@@ -1,4 +1,3 @@
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -6,6 +5,7 @@ use marmot_terminal_harness::{
     ApprovalSupport, ArtifactOutputRequest, ArtifactSupport, Attachment, Backend, ExecutionProfile,
     ExecutionSupport, HarnessError, Invocation, IsolationSupport, Outcome, ParsedEvent,
     PromptTransport, RunFailure, RunnerEvent,
+    attachment_preflight::{is_utf8_text, revalidate},
     process::{EnvironmentChange, ProcessSpec, run_jsonl_process},
     read_artifact_output_manifest,
 };
@@ -232,45 +232,15 @@ fn prepare_attachments(
     attachments
         .iter()
         .map(|attachment| {
-            let staged_path = attachment
-                .path
-                .to_str()
-                .ok_or(HarnessError::AttachmentInvalid)?
-                .to_owned();
-            let mut options = std::fs::OpenOptions::new();
-            options.read(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-            }
-            let file = options
-                .open(&attachment.path)
-                .map_err(|_| HarnessError::AttachmentInvalid)?;
-            let metadata = file
-                .metadata()
-                .map_err(|_| HarnessError::AttachmentInvalid)?;
-            if !metadata.file_type().is_file() || metadata.len() != attachment.size_bytes {
-                return Err(HarnessError::AttachmentInvalid);
-            }
-            let read_limit = attachment
-                .size_bytes
-                .checked_add(1)
-                .ok_or(HarnessError::AttachmentInvalid)?;
-            let mut bytes = Vec::new();
-            file.take(read_limit)
-                .read_to_end(&mut bytes)
-                .map_err(|_| HarnessError::AttachmentInvalid)?;
-            if u64::try_from(bytes.len()).ok() != Some(attachment.size_bytes) {
-                return Err(HarnessError::AttachmentInvalid);
-            }
+            let revalidated = revalidate(attachment)?;
+            let bytes = revalidated.bytes;
             let native_image = has_supported_image_signature(&bytes);
             if !native_image && !is_supported_staged_file(&bytes) {
                 return Err(HarnessError::AttachmentUnsupported);
             }
             Ok(PreparedAttachment {
                 source: attachment,
-                staged_path,
+                staged_path: revalidated.staged_path,
                 native_image,
             })
         })
@@ -286,11 +256,7 @@ fn has_supported_image_signature(header: &[u8]) -> bool {
 }
 
 fn is_supported_staged_file(bytes: &[u8]) -> bool {
-    is_pdf(bytes) || is_audio(bytes) || is_archive(bytes) || is_text(bytes)
-}
-
-fn is_text(bytes: &[u8]) -> bool {
-    std::str::from_utf8(bytes).is_ok_and(|text| !text.contains('\0'))
+    is_pdf(bytes) || is_audio(bytes) || is_archive(bytes) || is_utf8_text(bytes)
 }
 
 fn is_pdf(bytes: &[u8]) -> bool {
@@ -1057,92 +1023,6 @@ mod tests {
 
         assert!(matches!(failure.error, HarnessError::AttachmentUnsupported));
         assert!(!marker.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn attachment_preflight_rejects_unsafe_missing_and_non_utf8_paths() {
-        use std::os::unix::ffi::OsStringExt;
-        use std::os::unix::fs::symlink;
-
-        let root = tempfile::tempdir().unwrap();
-        let source = root.path().join("source.txt");
-        let link = root.path().join("link.txt");
-        fs::write(&source, b"source").unwrap();
-        symlink(&source, &link).unwrap();
-        let linked = Attachment {
-            path: link,
-            media_type: "text/plain".to_owned(),
-            file_name: "link.txt".to_owned(),
-            size_bytes: 6,
-        };
-        assert!(matches!(
-            prepare_attachments(&[linked]),
-            Err(HarnessError::AttachmentInvalid)
-        ));
-
-        let mut changed = attachment(&source, "text/plain", "source.txt");
-        changed.size_bytes += 1;
-        assert!(matches!(
-            prepare_attachments(&[changed]),
-            Err(HarnessError::AttachmentInvalid)
-        ));
-
-        let missing = Attachment {
-            path: root.path().join("missing.txt"),
-            media_type: "text/plain".to_owned(),
-            file_name: "missing.txt".to_owned(),
-            size_bytes: 1,
-        };
-        assert!(matches!(
-            prepare_attachments(&[missing]),
-            Err(HarnessError::AttachmentInvalid)
-        ));
-
-        let directory = Attachment {
-            path: root.path().to_path_buf(),
-            media_type: "application/octet-stream".to_owned(),
-            file_name: "directory".to_owned(),
-            size_bytes: fs::metadata(root.path()).unwrap().len(),
-        };
-        assert!(matches!(
-            prepare_attachments(&[directory]),
-            Err(HarnessError::AttachmentInvalid)
-        ));
-
-        let fifo = root.path().join("pipe");
-        let status = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let fifo_attachment = Attachment {
-            path: fifo,
-            media_type: "application/octet-stream".to_owned(),
-            file_name: "pipe".to_owned(),
-            size_bytes: 0,
-        };
-        assert!(matches!(
-            prepare_attachments(&[fifo_attachment]),
-            Err(HarnessError::AttachmentInvalid)
-        ));
-
-        let non_utf8_path = root
-            .path()
-            .join(std::ffi::OsString::from_vec(b"bad-\xff".to_vec()));
-        match fs::write(&non_utf8_path, b"data") {
-            Ok(()) => {
-                let non_utf8 = attachment(&non_utf8_path, "application/octet-stream", "opaque.bin");
-                assert!(matches!(
-                    prepare_attachments(&[non_utf8]),
-                    Err(HarnessError::AttachmentInvalid)
-                ));
-            }
-            Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
-                // Filesystems such as APFS reject non-UTF-8 names during setup.
-            }
-            Err(error) => panic!("non-UTF-8 attachment fixture creation failed: {error}"),
-        }
     }
 
     #[test]

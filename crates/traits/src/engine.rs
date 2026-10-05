@@ -522,6 +522,40 @@ pub enum GroupHydrationQuarantineReason {
     PendingCommitRecoveryFailed,
 }
 
+/// Encrypted-media exporter secret carried on [`GroupEvent::MessageReceived`].
+/// Wiped on drop and redacted from `Debug`, since events are routinely logged
+/// in tests and diagnostics.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EncryptedMediaSecret(SecretBytes);
+
+impl EncryptedMediaSecret {
+    pub fn new(secret: SecretBytes) -> Self {
+        Self(secret)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+impl std::fmt::Debug for EncryptedMediaSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("EncryptedMediaSecret([REDACTED])")
+    }
+}
+
+impl Serialize for EncryptedMediaSecret {
+    fn serialize<Ser: serde::Serializer>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error> {
+        self.0.as_slice().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for EncryptedMediaSecret {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Vec::<u8>::deserialize(deserializer).map(|bytes| Self(SecretBytes::new(bytes)))
+    }
+}
+
 /// Ordered, decrypted output the application should render / act on.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupEvent {
@@ -563,6 +597,14 @@ pub enum GroupEvent {
         retention: Option<AppMessageRetentionDecision>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         authority: Option<crate::app_event::AppMessageAuthority>,
+        /// Encrypted-media exporter secret of the source epoch, captured while
+        /// that epoch was live for a chat message that references attachments.
+        /// A convergence pass can advance past the source epoch and prune its
+        /// retained anchor before this event is drained, so the app caches this
+        /// instead of deriving the secret afterwards. `None` means the caller
+        /// must derive it (live or retained export) if it still can.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_media_secret: Option<EncryptedMediaSecret>,
     },
     AppMessageInvalidated {
         group_id: GroupId,

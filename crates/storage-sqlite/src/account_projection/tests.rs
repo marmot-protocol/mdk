@@ -3198,6 +3198,7 @@ fn failed_resurrection_projection_save_retains_local_deletion_frontier() {
         epoch: EpochId(0),
         payload: b"fresh chat".to_vec(),
         retention: None,
+        encrypted_media_secret: None,
     };
     store.put_pending_application_event(&pending_event).unwrap();
     store

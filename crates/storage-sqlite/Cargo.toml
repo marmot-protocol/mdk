@@ -29,3 +29,5 @@ tracing-subscriber.workspace = true
 extensions-draft = ["openmls_traits/extensions-draft"]
 storage-format-benchmarks = []
 test-conformance-replay = []
+# Copy in-memory test databases from one migrated template per process.
+test-migrated-template = ["rusqlite/backup"]

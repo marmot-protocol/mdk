@@ -2485,6 +2485,61 @@ fn native_attachment_retry_and_retention_failures_do_not_acquire_host_limits() {
 }
 
 #[test]
+fn attachment_preparation_deferral_backs_off_then_fails_until_explicit_retry() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "one");
+    let asset = request(&store, "one");
+    let status = |store: &SqliteAccountStorage| {
+        store
+            .attachment_acquisition_status(&asset)
+            .unwrap()
+            .unwrap()
+    };
+    let mut now = 11;
+    for delay in [15, 30, 60, 120, 240] {
+        assert!(!store.defer_attachment_preparation(&asset, now).unwrap());
+        let deferred = status(&store);
+        assert_eq!(deferred.state, AttachmentAcquisitionState::RetryScheduled);
+        assert_eq!(deferred.due, Some(now + delay));
+        assert_eq!(deferred.attempts, 0, "deferral is not a transfer attempt");
+        // A job that is not yet due is left untouched.
+        assert!(
+            !store
+                .defer_attachment_preparation(&asset, now + delay - 1)
+                .unwrap()
+        );
+        assert_eq!(status(&store).due, Some(now + delay));
+        now += delay;
+    }
+    assert!(store.defer_attachment_preparation(&asset, now).unwrap());
+    assert_eq!(status(&store).state, AttachmentAcquisitionState::Blocked);
+    assert_eq!(
+        transfer(&store, "one", true).state,
+        AttachmentTransferState::Failed
+    );
+    assert_eq!(request(&store, "one"), asset);
+    assert!(
+        store
+            .due_attachment_acquisitions(u32::MAX.into(), 64)
+            .unwrap()
+            .is_empty()
+    );
+    // Explicit retry starts a fresh window; a claim also ends the streak.
+    assert!(store.explicitly_retry_attachment(&asset, now).unwrap());
+    for _ in 0..(MAX_PREPARATION_DEFERRALS - 1) {
+        assert!(!store.defer_attachment_preparation(&asset, now).unwrap());
+        now = status(&store).due.unwrap();
+    }
+    let job = store
+        .claim_attachment_acquisition(&asset, now, now + 100)
+        .unwrap()
+        .unwrap();
+    assert!(store.fail_attachment_acquisition(&job, Some(now)).unwrap());
+    assert!(!store.defer_attachment_preparation(&asset, now).unwrap());
+    assert_eq!(status(&store).due, Some(now + 15));
+}
+
+#[test]
 fn automatic_transport_budget_counts_each_attempt_and_keeps_size_cause_visible() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     seed(&store, "one");
@@ -2675,3 +2730,6 @@ fn attachment_idle_permission_resume_is_read_only() {
         0
     );
 }
+
+mod outgoing;
+mod promotion;

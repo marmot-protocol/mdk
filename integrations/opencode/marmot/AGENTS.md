@@ -8,11 +8,13 @@ Read `README.md`, `../../AGENTS.md`, and `../../terminal-harness/AGENTS.md` firs
 - A dedicated **control-plane-only** harness. `wn-agent` owns the Marmot account, MLS state, Nostr transport, durable
   sends, and allowlist-backed invite handling; this crate only speaks `marmot.agent-control.v2` over the local Unix
   socket and runs `opencode`.
-- Every text-only message from an allowed sender is treated as a prompt. This is intentionally a pure harness, not a
-  gateway plugin with mention activation, backend attachment support, profile onboarding, or live previews. For a
-  non-empty attachment batch, the shared harness enforces its count/aggregate-byte limits and stages the complete
-  batch, then the default backend contract rejects the whole turn before OpenCode is spawned; accompanying text is
-  not forwarded.
+- Every message from an allowed sender is treated as a prompt. This is intentionally a pure harness, not a gateway
+  plugin with mention activation, profile onboarding, or live previews.
+- Attachment batches map to one `opencode run` with ordered `--file <absolute staged path>` pairs after all other
+  options, then `--`. `prepare_attachments` revalidates each staged copy and mirrors the OpenCode Read tool's
+  classification (`README.md#inbound-attachments`); any file OpenCode would not deliver as its own content fails the
+  whole turn before spawn. Re-check `run.ts`, `session/prompt.ts`, `tool/read.ts`, and `util/media.ts` when raising
+  the supported OpenCode version.
 - No QUIC, crypto, relay, or MLS logic here.
 - Split large opencode text events into byte-budgeted Marmot messages. Keep the default below the Marmot message cap:
   `WN_OPENCODE_MAX_REPLY_BYTES=30000`.

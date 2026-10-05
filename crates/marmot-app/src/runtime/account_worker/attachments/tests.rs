@@ -186,13 +186,17 @@ fn context() -> (MediaHttpContext, mpsc::UnboundedReceiver<MediaHttpDone>) {
 /// Count loopback response bytes once, then prove the retained asset survives a client restart.
 #[tokio::test]
 async fn attachment_worker_downloads_without_engine_group_or_screen_and_retains_through_restart() {
-    download_without_engine_and_retain(false, "received").await;
-    download_without_engine_and_retain(true, "received").await;
-    download_without_engine_and_retain(false, "sent").await;
+    download_without_engine_and_retain(false, "received", false).await;
+    download_without_engine_and_retain(true, "received", false).await;
+    download_without_engine_and_retain(false, "sent", false).await;
 }
 
 /// Exercise received or sent-source rows without a second HTTP body on local re-open.
-async fn download_without_engine_and_retain(explicit: bool, direction: &str) {
+async fn download_without_engine_and_retain(
+    explicit: bool,
+    direction: &str,
+    outgoing_faults: bool,
+) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (mut reference, ciphertext) =
         crate::media::tests::attachment_worker_fixture(b"retained worker bytes");
@@ -286,6 +290,74 @@ async fn download_without_engine_and_retain(explicit: bool, direction: &str) {
         !storage.attachment_worker_demands(32).unwrap().is_empty(),
         "accepted source demand"
     );
+    if explicit && direction == "sent" {
+        let connection = retention_fault_connection(&app);
+        // A pending sibling keeps the shared quarantine marker alive through Retry.
+        storage
+            .record_app_event(&StoredAppEvent {
+                group_id_hex: GROUP.into(),
+                message_id_hex: "55".repeat(32),
+                source_message_id_hex: None,
+                source_epoch: None,
+                direction: "sent".into(),
+                sender: "33".repeat(32),
+                plaintext: String::new(),
+                kind: 9,
+                tags: vec![reference.imeta_tag()],
+                recorded_at: 10,
+                received_at: 10,
+                origin_commit_id: None,
+                moderation_grant: false,
+            })
+            .unwrap();
+        let tokens = storage
+            .stage_attachment_uploads(GROUP, 3, &[b"retained worker bytes"], 10, 1_000_000)
+            .unwrap();
+        storage
+            .bind_attachment_uploads(
+                &tokens,
+                &[(
+                    serde_json::to_value(reference.imeta_tag()).unwrap(),
+                    crate::media::media_hash_from_reference(&reference).unwrap(),
+                )],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE outgoing_attachment_uploads SET bytes=x'00' WHERE token=?1",
+                [&tokens[0]],
+            )
+            .unwrap();
+        assert_eq!(
+            storage
+                .promote_attachment_uploads(
+                    GROUP,
+                    &"11".repeat(32),
+                    crate::unix_now_seconds(),
+                    1_000_000
+                )
+                .unwrap(),
+            0
+        );
+    }
+    let _fault_connection = outgoing_faults.then(|| {
+        let connection = retention_fault_connection(&app);
+        let tag = reference.imeta_tag();
+        storage.record_app_event(&StoredAppEvent {
+            group_id_hex: GROUP.into(), message_id_hex: "55".repeat(32),
+            source_message_id_hex: Some("66".repeat(32)), source_epoch: Some(3),
+            direction: "sent".into(), sender: "33".repeat(32), plaintext: String::new(),
+            kind: 9, tags: vec![tag.clone()], recorded_at: 10, received_at: 10,
+            origin_commit_id: None, moderation_grant: false,
+        }).unwrap();
+        let tokens = storage.stage_attachment_uploads(GROUP,3,&[b"retained worker bytes"],10,1_000_000).unwrap();
+        storage.bind_attachment_uploads(&tokens,&[(serde_json::to_value(tag).unwrap(),crate::media::media_hash_from_reference(&reference).unwrap())]).unwrap();
+        storage.protect_attachment_uploads(GROUP,&"55".repeat(32),&[reference.imeta_tag()]).unwrap();
+        storage.stage_attachment_uploads(GROUP,3,&[b"orphan"],0,1_000_000).unwrap();
+        connection.execute_batch(&format!("CREATE TRIGGER fail_outgoing_prune BEFORE DELETE ON outgoing_attachment_uploads WHEN OLD.slot_json IS NULL BEGIN SELECT RAISE(ABORT,'generated prune fault'); END;
+        CREATE TRIGGER fail_outgoing_promotion BEFORE INSERT ON retained_attachment_bytes WHEN EXISTS(SELECT 1 FROM attachment_acquisition q WHERE q.token=NEW.token AND q.message_id_hex='{}') BEGIN SELECT RAISE(ABORT,'generated promotion fault'); END;", "55".repeat(32))).unwrap();
+        connection
+    });
     let policy = client.app.config.attachment_acquisition.take();
     schedule(&client, &shared, &http, &mut admission).unwrap();
     assert!(!admission.is_waiting(), "disabled automatic work");
@@ -298,9 +370,10 @@ async fn download_without_engine_and_retain(explicit: bool, direction: &str) {
     );
     client.app.config.cursor_persistence = crate::CursorPersistence::Advance;
     schedule(&client, &shared, &http, &mut admission).unwrap();
-    assert!(
+    assert_eq!(
         admission.is_waiting(),
-        "eligible job must queue for global capacity"
+        !(explicit && direction == "sent"),
+        "automatic work must not fetch a quarantined outgoing body"
     );
     if explicit {
         // Pure explicit work must retain native retry behavior in HostManaged,
@@ -308,10 +381,19 @@ async fn download_without_engine_and_retain(explicit: bool, direction: &str) {
         client.app.config.attachment_acquisition_mode =
             crate::AttachmentAcquisitionMode::HostManaged;
         let now = crate::unix_now_seconds();
-        let asset = storage
-            .attachment_transfer_candidates(now, 1, true)
-            .unwrap()
-            .remove(0);
+        let asset = if direction == "sent" {
+            storage
+                .attachment_transfer_status(GROUP, &"11".repeat(32), &"22".repeat(32), 0, now, true)
+                .unwrap()
+                .unwrap()
+                .reference
+                .unwrap()
+        } else {
+            storage
+                .attachment_transfer_candidates(now, 1, true)
+                .unwrap()
+                .remove(0)
+        };
         storage.explicitly_retry_attachment(&asset, now).unwrap();
         let mut policy =
             super::super::super::attachment_controls::default_policy(&client.app.config);
@@ -322,6 +404,13 @@ async fn download_without_engine_and_retain(explicit: bool, direction: &str) {
         storage
             .set_attachment_download_policy(&policy, now)
             .unwrap();
+    }
+    if explicit && direction == "sent" {
+        schedule(&client, &shared, &http, &mut admission).unwrap();
+        assert!(
+            admission.is_waiting(),
+            "deliberate Retry survives quarantine recovery and enters HTTP admission"
+        );
     }
     admission.ready().await;
     schedule(&client, &shared, &http, &mut admission).unwrap();
@@ -346,10 +435,12 @@ async fn download_without_engine_and_retain(explicit: bool, direction: &str) {
         };
         // A receipt on an opted-in job forbids any further automatic attempt.
         // This pure explicit job must not have acquired that contract.
-        assert!(
+        assert_eq!(
             storage
                 .begin_attachment_network_attempt(job, crate::unix_now_seconds())
-                .unwrap()
+                .unwrap(),
+            direction != "sent",
+            "a deliberately retried outgoing receipt remains single-body; pure explicit received work keeps its existing contract"
         );
     }
     complete_media_http(&mut client, done, &shared, &http).await;
@@ -485,6 +576,231 @@ async fn attachment_missing_secret_does_not_claim_or_back_off_a_page_of_siblings
     }
     assert!(completions.try_recv().is_err());
     assert_eq!(shared.attachment_transfer.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn attachment_missing_secret_deferral_is_bounded_and_explicit_retry_readmits() {
+    let (_dir, client, storage, reference) = offline_fixture().await;
+    assert!(
+        client
+            .prepare_background_attachment_download(&GroupId::new(vec![0xab; 16]), reference, 1024)
+            .unwrap()
+            .is_none()
+    );
+    let now = crate::unix_now_seconds();
+    // Earlier worker ticks already found the source-epoch material missing.
+    let mut at = now - 10_000;
+    admit_demands(&storage, at, false).unwrap();
+    let asset = storage
+        .due_attachment_acquisitions(at, 1)
+        .unwrap()
+        .remove(0);
+    for _ in 0..5 {
+        assert!(!storage.defer_attachment_preparation(&asset, at).unwrap());
+        at = storage
+            .attachment_acquisition_status(&asset)
+            .unwrap()
+            .unwrap()
+            .due
+            .unwrap();
+    }
+    assert!(at <= now);
+    let shared = RuntimeSharedServices::default();
+    let (http, mut completions) = context();
+    let mut admission = Admission::default();
+    schedule(&client, &shared, &http, &mut admission).unwrap();
+    admission.ready().await;
+    schedule(&client, &shared, &http, &mut admission).unwrap();
+    let status = storage
+        .attachment_acquisition_status(&asset)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        status.state,
+        storage_sqlite::AttachmentAcquisitionState::Blocked
+    );
+    assert_eq!(status.attempts, 0);
+    assert!(status.due.is_none());
+    let transfer = || {
+        storage
+            .attachment_transfer_status(GROUP, &"11".repeat(32), &"22".repeat(32), 0, now, true)
+            .unwrap()
+            .unwrap()
+            .state
+    };
+    assert_eq!(transfer(), storage_sqlite::AttachmentTransferState::Failed);
+    assert!(completions.try_recv().is_err());
+    assert!(storage.explicitly_retry_attachment(&asset, now).unwrap());
+    assert_eq!(transfer(), storage_sqlite::AttachmentTransferState::Queued);
+}
+
+/// Rows projected before projection cached the source epoch's key stay
+/// uncached. Retry must derive it from the epoch's retained anchor rather than
+/// repeat the same six misses and fail again.
+#[test]
+fn attachment_explicit_retry_derives_an_uncached_source_epoch_key() {
+    crate::tests::run_composed_app_runtime_test("attachment-retry-anchor", || async {
+        use cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY;
+        use cgka_traits::engine::SendIntent;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example",
+            MarmotAppConfig {
+                attachment_acquisition: Some(crate::AttachmentAcquisitionPolicy::default()),
+                allow_loopback_blob_endpoints: true,
+                ..Default::default()
+            },
+        )
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let group_id = client.create_group("retry media", &[]).await.unwrap();
+        let group_hex = hex::encode(group_id.as_slice());
+        // Group creation caches its founding epoch; the source epoch is the
+        // next one, and the group has left it by the time the row exists.
+        let self_update = SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        };
+        client.runtime.send(self_update.clone()).await.unwrap();
+        let (source_epoch, secret) = client
+            .runtime
+            .exporter_secret_with_epoch(&group_id, GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY, 32)
+            .unwrap();
+        client.runtime.send(self_update).await.unwrap();
+
+        let (mut reference, ciphertext) =
+            crate::media::tests::attachment_worker_fixture_with_secret(
+                b"anchored bytes",
+                secret.as_ref(),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        reference.source_epoch = source_epoch.0;
+        reference.locators = vec![crate::MediaLocator {
+            kind: "blossom-v1".into(),
+            value: format!("{base_url}/{}", reference.ciphertext_sha256),
+        }];
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        ciphertext.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.write_all(&ciphertext).await.unwrap();
+        });
+        // No fallback dial may leave the loopback server.
+        client
+            .state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id_hex == group_hex)
+            .unwrap()
+            .encrypted_media
+            .default_blob_endpoints = vec![crate::AppBlobEndpoint {
+            locator_kind: "blossom-v1".into(),
+            base_url,
+        }];
+        storage
+            .record_app_event(&StoredAppEvent {
+                group_id_hex: group_hex.clone(),
+                message_id_hex: "11".repeat(32),
+                source_message_id_hex: Some("22".repeat(32)),
+                source_epoch: Some(source_epoch.0),
+                direction: "received".into(),
+                sender: "33".repeat(32),
+                plaintext: String::new(),
+                kind: 9,
+                tags: vec![vec![
+                    "imeta".into(),
+                    format!("v {}", reference.version),
+                    format!("locator blossom-v1 {}", reference.locators[0].value),
+                    format!("ciphertext_sha256 {}", reference.ciphertext_sha256),
+                    format!("plaintext_sha256 {}", reference.plaintext_sha256),
+                    format!("nonce {}", reference.nonce_hex),
+                    format!("m {}", reference.media_type),
+                    format!("filename {}", reference.file_name),
+                ]],
+                recorded_at: 10,
+                received_at: 10,
+                origin_commit_id: None,
+                moderation_grant: false,
+            })
+            .unwrap();
+
+        // Automatic work only reads the cache: five earlier misses, then the
+        // sixth in this pass fails the job.
+        let now = crate::unix_now_seconds();
+        let mut at = now - 10_000;
+        admit_demands(&storage, at, true).unwrap();
+        let asset = storage
+            .due_attachment_acquisitions(at, 1)
+            .unwrap()
+            .remove(0);
+        for _ in 0..5 {
+            assert!(!storage.defer_attachment_preparation(&asset, at).unwrap());
+            at = storage
+                .attachment_acquisition_status(&asset)
+                .unwrap()
+                .unwrap()
+                .due
+                .unwrap();
+        }
+        let shared = RuntimeSharedServices::default();
+        let (http, mut completions) = context();
+        let mut admission = Admission::default();
+        schedule(&client, &shared, &http, &mut admission).unwrap();
+        admission.ready().await;
+        schedule(&client, &shared, &http, &mut admission).unwrap();
+        let transfer = || {
+            storage
+                .attachment_transfer_status(
+                    &group_hex,
+                    &"11".repeat(32),
+                    &"22".repeat(32),
+                    0,
+                    crate::unix_now_seconds(),
+                    true,
+                )
+                .unwrap()
+                .unwrap()
+                .state
+        };
+        assert_eq!(transfer(), storage_sqlite::AttachmentTransferState::Failed);
+        assert!(completions.try_recv().is_err());
+
+        assert!(storage.explicitly_retry_attachment(&asset, now).unwrap());
+        schedule(&client, &shared, &http, &mut admission).unwrap();
+        admission.ready().await;
+        schedule(&client, &shared, &http, &mut admission).unwrap();
+        let done = tokio::time::timeout(Duration::from_secs(10), completions.recv())
+            .await
+            .expect("Retry must start the transfer")
+            .unwrap();
+        server.await.unwrap();
+        complete_media_http(&mut client, done, &shared, &http).await;
+        assert_eq!(transfer(), storage_sqlite::AttachmentTransferState::Ready);
+        assert_eq!(
+            &*storage
+                .read_retained_attachment(&asset, crate::unix_now_seconds(), 0, 100)
+                .unwrap()
+                .unwrap(),
+            b"anchored bytes"
+        );
+    });
 }
 
 #[tokio::test]
@@ -875,4 +1191,232 @@ async fn attachment_host_managed_requires_demand_and_fences_permission_generatio
             .state,
         storage_sqlite::AttachmentTransferState::PolicyBlocked
     );
+}
+
+/// Explicit promotion detaches automatic permission while retaining the same
+/// transport lease; later deliberate cancellation still stops that attempt.
+#[tokio::test]
+async fn promoted_attempt_survives_automatic_revocation_without_extending_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig {
+            attachment_acquisition_mode: crate::AttachmentAcquisitionMode::HostManaged,
+            ..Default::default()
+        },
+    );
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    let generation = runtime
+        .begin_attachment_permission_update("alice")
+        .await
+        .unwrap();
+    assert!(
+        runtime
+            .set_attachment_automatic_permission(
+                "alice",
+                generation,
+                crate::AttachmentAutomaticPermission {
+                    images: true,
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap()
+    );
+    let storage = app.account_storage("alice").unwrap();
+    let (mut reference, _) = crate::media::tests::attachment_worker_fixture(b"promotion bytes");
+    reference.locators = vec![crate::MediaLocator {
+        kind: "blossom-v1".into(),
+        value: format!("https://blob.example/{}", reference.ciphertext_sha256),
+    }];
+    seed(&storage, &reference, false);
+    let now = crate::unix_now_seconds();
+    let selected = storage
+        .attachment_history_page(GROUP, 1, None)
+        .unwrap()
+        .entries
+        .remove(0);
+    let storage_sqlite::AttachmentDemand::Requested(asset) = storage
+        .request_attachment_acquisition(
+            GROUP,
+            &selected,
+            crate::media::media_hash_from_reference(&reference).unwrap(),
+            now,
+        )
+        .unwrap()
+    else {
+        panic!("request")
+    };
+    let job = storage
+        .claim_attachment_acquisition(&asset, now, now + 180)
+        .unwrap()
+        .unwrap();
+    let deadline = storage
+        .attachment_acquisition_status(&asset)
+        .unwrap()
+        .unwrap()
+        .due;
+    let identity = storage.attachment_store_identity().unwrap();
+    let permission = runtime
+        .shared
+        .attachment_permissions
+        .lease(&identity, "image/png")
+        .unwrap();
+    assert!(storage.promote_attachment_demand(&asset, now).unwrap());
+    runtime
+        .begin_attachment_permission_update("alice")
+        .await
+        .unwrap();
+    assert!(!permission.allowed());
+    let (_, updates) = watch::channel(());
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            cancelled(storage.clone(), job.clone(), updates, Some(permission))
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        storage
+            .attachment_acquisition_status(&asset)
+            .unwrap()
+            .unwrap()
+            .due,
+        deadline
+    );
+    storage.cancel_attachment_acquisition(&asset).unwrap();
+    let (_, updates) = watch::channel(());
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        cancelled(storage, job, updates, None),
+    )
+    .await
+    .unwrap();
+}
+
+/// Keep the real incoming GET and verified local read independent of outgoing SQL failures.
+#[tokio::test]
+async fn attachment_worker_downloads_despite_outgoing_maintenance_failures() {
+    download_without_engine_and_retain(false, "received", true).await;
+}
+
+/// Open a second encrypted connection only to inject deterministic test faults.
+fn retention_fault_connection(app: &MarmotApp) -> rusqlite::Connection {
+    let path = app.account_storage_path("alice");
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let key = app
+        .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    connection
+}
+
+/// Every core source entry point must commit despite a deterministic optional byte-write failure.
+#[tokio::test]
+async fn outgoing_retention_failure_preserves_all_source_projection_paths() {
+    let (_dir, client, storage, reference) = offline_fixture().await;
+    let connection = retention_fault_connection(&client.app);
+    let token = storage
+        .stage_attachment_uploads(GROUP, 3, &[b"retained worker bytes"], 10, 1_000_000)
+        .unwrap();
+    storage
+        .bind_attachment_uploads(
+            &token,
+            &[(
+                serde_json::to_value(reference.imeta_tag()).unwrap(),
+                crate::media::media_hash_from_reference(&reference).unwrap(),
+            )],
+        )
+        .unwrap();
+    connection.execute_batch("CREATE TRIGGER fail_optional_bytes BEFORE INSERT ON retained_attachment_bytes BEGIN SELECT RAISE(ABORT,'generated optional retention fault'); END;").unwrap();
+    let mut message = crate::AppMessageProjection {
+        authority: None,
+        message_id_hex: "55".repeat(32),
+        source_message_id_hex: Some("66".repeat(32)),
+        direction: "sent".into(),
+        group_id_hex: GROUP.into(),
+        sender: "33".repeat(32),
+        plaintext: "accepted".into(),
+        kind: 9,
+        tags: vec![reference.imeta_tag()],
+        source_epoch: Some(3),
+        retention: None,
+        recorded_at: Some(10),
+        origin_commit_id: None,
+        moderation_grant: false,
+    };
+    client
+        .app
+        .record_account_app_event_at("alice", &message, 10)
+        .unwrap();
+    message.message_id_hex = "77".repeat(32);
+    message.source_message_id_hex = None;
+    message.source_epoch = None;
+    client
+        .app
+        .record_account_app_event_refreshing_moderation_grant("alice", &message)
+        .unwrap();
+    client
+        .app
+        .finalize_account_app_event_source_retention(
+            "alice",
+            GROUP,
+            &message.message_id_hex,
+            Some(&"88".repeat(32)),
+            3,
+            crate::AppMessageRetentionDecision::new(10, 0),
+            None,
+        )
+        .unwrap();
+    let rows: i64 = connection.query_row("SELECT count(*) FROM app_events WHERE direction='sent' AND source_message_id_hex IS NOT NULL",[],|row|row.get(0)).unwrap();
+    assert_eq!(
+        rows, 2,
+        "both confirmed sources survive the retention fault"
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM retained_attachment_bytes",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM chat_list_rows WHERE group_id_hex=?1",
+                [GROUP],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap()
+            > 0
+    );
+    connection
+        .execute_batch("DROP TRIGGER fail_optional_bytes")
+        .unwrap();
+    assert!(
+        storage
+            .recover_attachment_uploads(11, 64, 1_000_000)
+            .unwrap()
+            > 0
+    );
+}
+
+/// Deliberate Retry may fetch a replacement even when a pending sibling holds a quarantine marker.
+#[tokio::test]
+async fn attachment_worker_quarantined_outgoing_retry_downloads_once_and_retains() {
+    download_without_engine_and_retain(true, "sent", false).await;
 }

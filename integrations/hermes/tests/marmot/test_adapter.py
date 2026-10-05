@@ -781,6 +781,115 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         # An empty value the caller does name is a clear, and is sent as one.
         self.assertEqual(requests[2].get("about"), "")
 
+    async def test_account_relay_lists_writes_typed_read_request(self):
+        requests = []
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "relay_lists",
+                    "account_id_hex": request["account_id_hex"],
+                    "relay_lists": {
+                        "nip65": {
+                            "relays": ["wss://write.example"],
+                            "read_relays": ["wss://read.example", "wss://write.example"],
+                            "write_relays": ["wss://write.example"],
+                            "created_at": 1700000000,
+                        },
+                        "inbox": {
+                            "relays": ["wss://inbox.example"],
+                            "read_relays": [],
+                            "write_relays": [],
+                            "created_at": 0,
+                        },
+                    },
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+        response = await client.account_relay_lists("11" * 32)
+
+        self.assertEqual(requests[0]["type"], "account_relay_lists")
+        self.assertEqual(requests[0]["account_id_hex"], "11" * 32)
+        self.assertEqual(response["relay_lists"]["nip65"]["write_relays"], ["wss://write.example"])
+
+    async def test_account_relay_list_edits_omit_a_direction_the_caller_does_not_name(self):
+        requests = []
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "relay_lists",
+                    "account_id_hex": request["account_id_hex"],
+                    "relay_lists": {
+                        "nip65": {"relays": [], "read_relays": [], "write_relays": [], "created_at": 1},
+                        "inbox": {"relays": [], "read_relays": [], "write_relays": [], "created_at": 1},
+                    },
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+
+        await client.account_relay_list_add("11" * 32, "nip65", "wss://relay.example")
+        await client.account_relay_list_remove(
+            "11" * 32, "nip65", "wss://relay.example", direction="read"
+        )
+
+        self.assertEqual(requests[0]["type"], "account_relay_list_add")
+        self.assertEqual(requests[0]["relay_type"], "nip65")
+        self.assertEqual(requests[0]["url"], "wss://relay.example")
+        # An omitted direction keeps the connector's default instead of being
+        # sent as an empty string the connector would have to interpret.
+        self.assertNotIn("direction", requests[0])
+        self.assertEqual(requests[1]["type"], "account_relay_list_remove")
+        self.assertEqual(requests[1]["direction"], "read")
+
+    async def test_account_relay_list_edit_rejects_invalid_type_and_direction(self):
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+        with self.assertRaises(self.adapter.AgentControlError) as raised:
+            await client.account_relay_list_add("11" * 32, "dm", "wss://relay.example")
+        self.assertEqual(raised.exception.code, "invalid_relay_type")
+        with self.assertRaises(self.adapter.AgentControlError) as raised:
+            await client.account_relay_list_add(
+                "11" * 32, "nip65", "wss://relay.example", direction="inbound"
+            )
+        self.assertEqual(raised.exception.code, "invalid_relay_direction")
+
+    async def test_account_relay_lists_rejects_a_malformed_response(self):
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "relay_lists",
+                    "account_id_hex": request["account_id_hex"],
+                    "relay_lists": {"nip65": {"relays": "wss://relay.example"}},
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+        with self.assertRaises(self.adapter.AgentControlError) as raised:
+            await client.account_relay_lists("11" * 32)
+        self.assertEqual(raised.exception.code, "protocol_error")
+
     async def test_send_agent_operation_event_writes_typed_operation_request(self):
         requests = []
 

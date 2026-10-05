@@ -564,6 +564,7 @@ impl MessageStorage for SqliteAccountStorage {
                 payload,
                 authority,
                 retention,
+                ..
             } = event
             {
                 if authority.is_none()
@@ -1639,6 +1640,7 @@ mod tests {
             epoch: EpochId(0),
             payload: b"authenticated chat".to_vec(),
             retention: None,
+            encrypted_media_secret: None,
         }
     }
 

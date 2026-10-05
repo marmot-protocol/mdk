@@ -699,6 +699,9 @@ pub struct AccountRelayListBootstrap {
     /// Publication-only copies of public directory records. Never advertised
     /// as NIP-65 write relays or used for KeyPackage publication.
     pub indexer_relays: Vec<TransportEndpoint>,
+    /// Relays declared in the kind-10050 inbox list. Empty declares
+    /// `default_relays`, so one list still serves both kinds.
+    pub inbox_relays: Vec<TransportEndpoint>,
 }
 
 impl AccountRelayListBootstrap {
@@ -715,12 +718,34 @@ impl AccountRelayListBootstrap {
             default_relays,
             bootstrap_relays,
             indexer_relays: Vec::new(),
+            inbox_relays: Vec::new(),
         }
     }
 
     pub fn with_indexer_relays(mut self, indexer_relays: Vec<TransportEndpoint>) -> Self {
         self.indexer_relays = indexer_relays;
         self
+    }
+
+    pub fn with_inbox_relays(mut self, inbox_relays: Vec<TransportEndpoint>) -> Self {
+        self.inbox_relays = inbox_relays;
+        self
+    }
+
+    /// The relays a published kind-10050 inbox list declares.
+    pub fn inbox_declaration(&self) -> &[TransportEndpoint] {
+        if self.inbox_relays.is_empty() {
+            &self.default_relays
+        } else {
+            &self.inbox_relays
+        }
+    }
+
+    fn declared_relays(&self, list_kind: NostrAccountRelayListKind) -> Vec<TransportEndpoint> {
+        match list_kind {
+            NostrAccountRelayListKind::Nip65 => self.default_relays.clone(),
+            NostrAccountRelayListKind::Inbox => self.inbox_declaration().to_vec(),
+        }
     }
 }
 
@@ -2088,11 +2113,17 @@ impl MarmotApp {
             &account.account_id_hex,
             publish_endpoints_from_bootstrap(&bootstrap),
         );
+        let declared_relays = bootstrap
+            .default_relays
+            .iter()
+            .chain(&bootstrap.inbox_relays)
+            .cloned()
+            .collect::<Vec<_>>();
         let indexer_endpoints = self.public_indexer_publish_endpoints(
             &bootstrap.indexer_relays,
             &endpoints,
             &endpoints,
-            &bootstrap.default_relays,
+            &declared_relays,
         );
 
         let mut requests = Vec::with_capacity(4);
@@ -2105,7 +2136,7 @@ impl MarmotApp {
                 event: NostrAccountRelayListPublication {
                     account_id: account_id.clone(),
                     list_kind,
-                    relays: bootstrap.default_relays.clone(),
+                    relays: bootstrap.declared_relays(list_kind),
                     publish_endpoints: endpoints.clone(),
                 }
                 .to_event()?,
@@ -2205,7 +2236,11 @@ impl MarmotApp {
             inbox: AccountRelayListState {
                 kind: KIND_MARMOT_INBOX_RELAY_LIST,
                 created_at: requests[1].event.created_at,
-                relays,
+                relays: bootstrap
+                    .inbox_declaration()
+                    .iter()
+                    .map(|endpoint| endpoint.0.clone())
+                    .collect(),
                 read_relays: Vec::new(),
                 write_relays: Vec::new(),
             },
@@ -2590,12 +2625,18 @@ impl MarmotApp {
             bootstrap
                 .default_relays
                 .iter()
+                .chain(&bootstrap.inbox_relays)
                 .chain(&relays.read_relays)
                 .chain(&relays.write_relays)
                 .cloned()
                 .collect::<Vec<_>>()
         } else {
-            bootstrap.default_relays.clone()
+            bootstrap
+                .default_relays
+                .iter()
+                .chain(&bootstrap.inbox_relays)
+                .cloned()
+                .collect::<Vec<_>>()
         };
         let indexer_endpoints = self.public_indexer_publish_endpoints(
             &bootstrap.indexer_relays,
@@ -2620,7 +2661,7 @@ impl MarmotApp {
                 NostrAccountRelayListPublication {
                     account_id: account_id.clone(),
                     list_kind: *list_kind,
-                    relays: bootstrap.default_relays.clone(),
+                    relays: bootstrap.declared_relays(*list_kind),
                     publish_endpoints: endpoints.clone(),
                 }
                 .to_event()?
@@ -2700,7 +2741,7 @@ impl MarmotApp {
                         kind: KIND_MARMOT_INBOX_RELAY_LIST,
                         created_at: request.event.created_at,
                         relays: bootstrap
-                            .default_relays
+                            .inbox_declaration()
                             .iter()
                             .map(|endpoint| endpoint.0.clone())
                             .collect(),
@@ -2754,6 +2795,10 @@ impl MarmotApp {
             (
                 bootstrap.default_relays.as_slice(),
                 "account relay-list declaration",
+            ),
+            (
+                bootstrap.inbox_relays.as_slice(),
+                "account inbox relay-list declaration",
             ),
             (
                 bootstrap.bootstrap_relays.as_slice(),
@@ -6093,6 +6138,8 @@ impl MarmotApp {
         self.record_account_app_event_at(label, message, unix_now_seconds())
     }
 
+    /// Commit source projection atomically; optional outgoing retention runs
+    /// after the outermost commit and cannot reject accepted publication.
     pub(crate) fn record_account_app_event_at(
         &self,
         label: &str,
@@ -6108,6 +6155,14 @@ impl MarmotApp {
                 message.retention,
                 message.authority,
             )?;
+            if message.direction == "sent" {
+                storage.retain_attachment_uploads_after_commit(
+                    &message.group_id_hex,
+                    &message.message_id_hex,
+                    received_at,
+                    runtime::attachment_controls::default_policy(&self.config).retained_bytes,
+                );
+            }
             self.app_projection_update(label, storage_update)
         })
     }
@@ -6127,10 +6182,20 @@ impl MarmotApp {
                 message.retention,
                 message.authority,
             )?;
+            if message.direction == "sent" {
+                storage.retain_attachment_uploads_after_commit(
+                    &message.group_id_hex,
+                    &message.message_id_hex,
+                    now,
+                    runtime::attachment_controls::default_policy(&self.config).retained_bytes,
+                );
+            }
             self.app_projection_update(label, storage_update)
         })
     }
 
+    /// Finalize accepted source authority and retry outgoing byte promotion even
+    /// when retention metadata was already committed by an earlier fanout pass.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn finalize_account_app_event_source_retention(
         &self,
@@ -6161,6 +6226,12 @@ impl MarmotApp {
                 source_epoch,
                 retention,
             )?;
+            storage.retain_attachment_uploads_after_commit(
+                group_id_hex,
+                message_id_hex,
+                unix_now_seconds(),
+                runtime::attachment_controls::default_policy(&self.config).retained_bytes,
+            );
             retention_update
                 .or(authority_update)
                 .map(|update| self.app_projection_update(label, update))
@@ -6205,15 +6276,17 @@ impl MarmotApp {
 
     /// Clear a `local_publish_failed` retraction on one locally-sent row, so a
     /// fresh send intent for an id a failed send already retracted starts from a
-    /// live pending row instead of a permanent tombstone.
+    /// live pending row instead of a permanent tombstone, and so a retracted
+    /// send that a relay later accepted stops claiming it reached no one.
     ///
     /// An exact retained-event retry reuses the failed send's id; identical
     /// independently authored chat messages within one second also share an id.
     /// `record_app_event`'s upsert keeps
     /// invalidation terminal, so the revival has to be explicit and has to carry
-    /// evidence — and the send intent is the evidence. Only this path can
-    /// produce one: replay seams (`observe_drained_session_events`, backfill,
-    /// rejoin reprocessing) re-record rows without ever entering a send.
+    /// evidence. Two callers hold some: the send path holds a fresh send intent,
+    /// and publish finalization holds a relay acceptance of the row's own
+    /// fanout. Replay seams (`observe_drained_session_events`, backfill, rejoin
+    /// reprocessing) re-record rows without either and never call this.
     pub(crate) fn clear_timeline_local_publish_failure(
         &self,
         label: &str,

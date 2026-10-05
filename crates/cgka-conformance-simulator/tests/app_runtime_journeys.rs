@@ -1,7 +1,12 @@
 //! Public-runtime acceptance tests: real local Nostr relay and per-client SQLCipher.
 //! Run serially in release mode for production-policy evidence; see APP_PATH_COVERAGE.md.
 
-use std::{collections::BTreeMap, error::Error, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    path::Path,
+    time::Duration,
+};
 
 use cgka_conformance_simulator::{
     AppRuntimeHarness, AppRuntimeObservationV1, ConvergenceSubject, ScenarioStep,
@@ -37,6 +42,9 @@ struct RecoveryProgress {
     completed_pass: Option<usize>,
     expected: usize,
     observed: BTreeMap<String, usize>,
+    /// Distinct backlog events the relay delivered on bob's connections
+    /// since reconnecting.
+    acquired: usize,
     restarts: usize,
 }
 
@@ -391,6 +399,19 @@ async fn large_backlog(
         .map(|c| (c.clone(), payloads.clone()))
         .collect::<BTreeMap<_, _>>();
     save(out, "expected.json", &expected)?;
+    // Bob reconnects on fresh relay connections; the others keep theirs.
+    let reconnect_sessions = subject
+        .relay_traffic(&[u64::MAX, u64::MAX], false)
+        .await?
+        .iter()
+        .map(|relay| relay.next_session)
+        .collect::<Vec<_>>();
+    let backlog_ids = subject
+        .relay_publication_ids()
+        .await?
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect::<BTreeSet<_>>();
     recovery_progress.phase = "reconnect";
     subject
         .set_online("bob", true)
@@ -434,15 +455,34 @@ async fn large_backlog(
                 )
             })
             .collect();
+        // Comparison fetches a bounded batch of missing events per pass in
+        // event-id order, so the commits bob needs can arrive last. Until
+        // then he decrypts nothing, yet each pass still acquires backlog.
+        recovery_progress.acquired = subject
+            .relay_traffic(&reconnect_sessions, true)
+            .await
+            .map_err(|error| format!("repair pass {pass}, relay traffic: {error}"))?
+            .iter()
+            .flat_map(|relay| relay.events.keys())
+            .filter(|id| backlog_ids.contains(*id))
+            .collect::<BTreeSet<_>>()
+            .len();
         save_recovery_checkpoint(out, recovery_progress, &observations, recovered)?;
         eprintln!(
-            "repair_pass={pass} observed={} expected=1024 complete={recovered}",
-            bob.application.visible_plaintexts.len()
+            "repair_pass={pass} observed={} expected=1024 acquired={} complete={recovered}",
+            bob.application.visible_plaintexts.len(),
+            recovery_progress.acquired
         );
         if recovered {
             break;
         }
-        let progress = (bob.protocol.epoch, bob.application.visible_plaintexts.len());
+        // Acquisition counts toward progress but is bounded by the backlog,
+        // so a recipient holding every event still has to decrypt it.
+        let progress = (
+            bob.protocol.epoch,
+            bob.application.visible_plaintexts.len(),
+            recovery_progress.acquired,
+        );
         unchanged = if previous == Some(progress) {
             unchanged + 1
         } else {

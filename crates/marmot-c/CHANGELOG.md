@@ -7,8 +7,27 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-02
+
+Recompile against the matching `marmot.h` and library: several signatures and
+record layouts changed. See the [client upgrade guide](../../docs/integration/0.12.0.md).
+
 ### Added
 
+- `marmot_group_app_component` / `marmot_group_app_component_free` and
+  `marmot_update_app_component` read and admin-update optional
+  application-owned group components. `MARMOT_STATUS_INVALID_APP_COMPONENT`
+  (95) reports invalid ids, required components and oversized state. (#1929)
+
+- `marmot_request_explicit_attachment` joins/promotes eligible attachment demand without resetting retry budgets, backoff or active deadlines. Requires the matching header and library; deliberate Retry/Download again remain separate operations.
+
+- `marmot_create_identity`, `marmot_create_identity_with_profile`,
+  `marmot_login`, `marmot_login_recovering_incomplete_setup`,
+  `marmot_publish_relay_lists` and `marmot_begin_onboarding` take a trailing
+  `inbox_relays`/`inbox_relays_len` array that sets the kind-10050 inbox list
+  separately from `default_relays`. Pass `NULL, 0` to keep declaring
+  `default_relays` in both lists. The signatures changed: recompile against the
+  matching header and library.
 - `marmot_poll_votes` returns a `MarmotPollVotePage` of each voter's effective
   poll selection, 1..=100 per page with a `(voted_at, voter)` cursor; all pages
   sum to the `MarmotPollProjection` tally. Free it with
@@ -24,6 +43,14 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   NIP-30 reaction's image is listed under it by `marmot_list_media`. Kind-9
   conversation rows also keep NIP-30 `emoji` tags. Requires the matching
   regenerated header and library.
+
+### Changed
+
+- `marmot_set_chat_muted` now allows direct mentions of the receiving account
+  through the durable mute in notification subscriptions. Ordinary traffic
+  stays silent and blocked senders remain suppressed; C hosts still apply
+  their own notification permission, channel, and foreground policy. No C ABI
+  layout changes. (marmot-protocol/whitenoise-android#2984)
 
 
 ## [0.11.0] - 2026-09-29
@@ -362,7 +389,8 @@ downgrade is unsupported. See the [cohort upgrade notes](../cli/CHANGELOG.md#092
   just a local account's. Both return `MarmotAccountRelayLists`.
   ([#1605](https://github.com/marmot-protocol/mdk/pull/1605))
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.11.0...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.12.0...HEAD
+[0.12.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.11.0...marmotc-v0.12.0
 [0.11.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.10.4...marmotc-v0.11.0
 [0.9.20]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.9.19...marmotc-v0.9.20
 [0.9.16]: https://github.com/marmot-protocol/mdk/releases/tag/marmotc-v0.9.16

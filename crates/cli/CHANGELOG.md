@@ -9,6 +9,59 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed
+
+- `relay.damus.io` is no longer a retired relay host. The relay is still
+  operating, so relay lists, invites and `wn` commands accept it again.
+  `relay.nostr.band` remains retired.
+
+### Fixed
+
+- A sent message the engine queued while the group was converging is no longer
+  marked failed when an unrelated publish in the same batch fails, and a sent
+  row already marked failed revives once a relay accepts its fanout. Before,
+  other members received the message while the sender's row stayed failed
+  forever, and a sender's poll showed no projection.
+
+## [0.12.0] - 2026-10-02
+
+Update generated Swift/Kotlin bindings, native libraries and C headers together. Account storage advances through
+migration 101; back up before upgrade because downgrade is unsupported. See the
+[release notes](../../docs/release/0.12.0.md) and the
+[client upgrade guide](../../docs/integration/0.12.0.md).
+
+### Added
+
+- WN Agent's control protocol adds `group_profile_update`, letting an agent
+  whose account is a current group admin rename a group or change its
+  description. Omitted fields are kept, an empty string clears, and a lost
+  admin role returns `not_group_admin`. Hermes registers it as the
+  `marmot_group_profile` tool. (#2096)
+- `account_publish_profile` accepts optional `about`, `picture`, `nip05` and
+  `lud16`. (#1969)
+
+### Changed
+
+- `account_publish_profile` now merges the request into the account's
+  currently published kind:0 profile instead of replacing it, so fields the
+  request does not name (avatar, about text, banner, unknown keys) survive.
+  A relay read error fails the publish rather than writing a partial profile.
+  (#1969)
+- A muted chat stays quiet for ordinary messages, but a direct mention of the
+  receiving account remains eligible for notification; blocked senders stay
+  suppressed. (#2143)
+
+### Fixed
+
+- Files sent to an agent no longer fail local validation on the first try:
+  `wn-agent` flushes the decrypted file before returning its path. (#2106)
+- Files sent by an agent no longer stay downloading forever on recipients'
+  devices. (#2106)
+- `wn-opencode` passes attachments to OpenCode with `--file`, and `wn-pi`
+  passes images and UTF-8 text with `@<path>` (Pi 0.79.6 or later); both
+  reject a turn whose attachment the harness cannot read. Large `send_artifacts`
+  uploads no longer time out waiting for the `send_media` reply. (#1925,
+  #1926, #2104)
 ## [0.11.0] - 2026-09-29
 
 Update generated Swift/Kotlin bindings, native libraries and C headers together. Account storage advances through
@@ -2682,7 +2735,8 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/marmot-protocol/mdk/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/marmot-protocol/mdk/compare/v0.10.4...v0.11.0
 [0.10.4]: https://github.com/marmot-protocol/mdk/compare/v0.10.3...v0.10.4
 [0.10.3]: https://github.com/marmot-protocol/mdk/compare/v0.10.2...v0.10.3

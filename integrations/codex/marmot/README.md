@@ -64,7 +64,7 @@ install_verified() (
   bash "$tmpdir/$installer_script" "$@"
 )
 
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.11.0"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
 install_verified "$base_url/install-codex-marmot.sh" \
   "$base_url/install-codex-marmot.sh.sha256" \
   --yes --allow-welcomer npub1...
@@ -141,7 +141,7 @@ instruction alive across thread resets and Codex-side context compaction.
 | `MARMOT_HARNESS_EXECUTION_PROFILE` | `inherit` | Shared `inherit`, `autonomous`, or `unrestricted` execution policy |
 | `WN_CODEX_IDLE_TIMEOUT_SECS` | `120` | Presentation-idle interval before liveness is reported as unknown; does not stop the invocation |
 | `WN_CODEX_TIMEOUT_SECS` | `3600` | Total invocation cap |
-| `WN_CODEX_REQUEST_TIMEOUT_SECS` | `30` | Control connect/write and ordinary response timeout; inbound media-download responses have a sixteen-minute minimum |
+| `WN_CODEX_REQUEST_TIMEOUT_SECS` | `30` | Control connect/write and ordinary response timeout. Inbound media-download responses wait at least 16 minutes. Artifact `send_media` responses wait at least 451 minutes: 10 attachments, 3 Blossom servers each, 15 minutes per upload, plus 1 minute |
 | `WN_CODEX_MAX_REPLY_BYTES` | `30000` | Durable reply chunk limit |
 | `WN_CODEX_MAX_PENDING_PER_GROUP` | `4` | Per-group prompt queue limit |
 | `WN_CODEX_MAX_ATTACHMENTS` | `8` | Maximum inbound files in one turn |

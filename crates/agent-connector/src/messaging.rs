@@ -732,6 +732,10 @@ impl AgentConnector {
             .await?;
         use tokio::io::AsyncWriteExt as _;
         file.write_all(&result.plaintext).await?;
+        // tokio's `write_all` hands the last chunk to a blocking task and
+        // returns early; flush so the file is complete before the agent,
+        // which checks its length against `size_bytes`, receives the path.
+        file.flush().await?;
         Ok(AgentControlResponse::MediaDownloaded {
             path: path.to_string_lossy().into_owned(),
             media_type: result.media_type,

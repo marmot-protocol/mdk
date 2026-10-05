@@ -35,7 +35,7 @@ const MAX_MODE: u32 = 0o7777;
 /// exits, including abrupt termination. Callers must keep the lock file at a
 /// stable path for its full lifetime: unlinking or replacing the file would
 /// allow a second process to lock a different inode under the same pathname.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Debug)]
 pub struct PrivateExclusiveFileLease {
     _file: std::fs::File,
@@ -61,6 +61,95 @@ pub fn try_acquire_private_exclusive_file_lease(
         .open(path)
         .map_err(|error| io_context("open private lease file", path, error))?;
     finish_private_exclusive_file_lease(file, path, libc::LOCK_EX | libc::LOCK_NB)
+}
+
+/// Windows counterpart of the Unix lease: `LockFileEx` with
+/// `LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY` over the whole file.
+/// Like `flock`, the OS releases the lock when the handle closes or the
+/// process exits, and a second holder gets [`io::ErrorKind::WouldBlock`].
+/// The file is opened without following a final symlink or junction.
+#[cfg(windows)]
+pub fn try_acquire_private_exclusive_file_lease(
+    path: &Path,
+) -> io::Result<PrivateExclusiveFileLease> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x1;
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x2;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+
+    #[repr(C)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        event: *mut std::ffi::c_void,
+    }
+    unsafe extern "system" {
+        fn LockFileEx(
+            file: *mut std::ffi::c_void,
+            flags: u32,
+            reserved: u32,
+            bytes_low: u32,
+            bytes_high: u32,
+            overlapped: *mut Overlapped,
+        ) -> i32;
+    }
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| io_context("open private lease file", path, error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| io_context("read private lease file metadata", path, error))?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "validate private lease file at {}: target must be a regular file",
+                path.display()
+            ),
+        ));
+    }
+    let mut overlapped = Overlapped {
+        internal: 0,
+        internal_high: 0,
+        offset: 0,
+        offset_high: 0,
+        event: std::ptr::null_mut(),
+    };
+    let flags = LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY;
+    // SAFETY: the handle is owned by `file` and outlives the call; the
+    // OVERLAPPED is zeroed (offset 0) and the handle is synchronous.
+    let locked = unsafe {
+        LockFileEx(
+            file.as_raw_handle().cast(),
+            flags,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if locked == 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION) {
+            return Err(io_context(
+                "acquire private lease",
+                path,
+                io::Error::from(io::ErrorKind::WouldBlock),
+            ));
+        }
+        return Err(io_context("acquire private lease", path, error));
+    }
+    Ok(PrivateExclusiveFileLease { _file: file })
 }
 
 #[cfg(unix)]
@@ -725,7 +814,7 @@ fn resolve_platform_directory_aliases(
     Ok(Some(resolved))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn io_context(operation: &str, path: &Path, error: io::Error) -> io::Error {
     io::Error::new(
         error.kind(),
@@ -1072,6 +1161,21 @@ mod tests {
         for input in ["", "8", "abc", "077777", "0o", "6 00", "-600", "0x600"] {
             assert!(parse_octal_mode(input).is_err(), "input {input:?}");
         }
+    }
+
+    // Same contract on flock and LockFileEx: a second holder (another open
+    // file, as another process would have) is refused without waiting, and
+    // dropping the owner releases the lease.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn exclusive_lease_is_busy_until_the_owner_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner.lock");
+        let owner = try_acquire_private_exclusive_file_lease(&path).unwrap();
+        let error = try_acquire_private_exclusive_file_lease(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+        drop(owner);
+        try_acquire_private_exclusive_file_lease(&path).unwrap();
     }
 }
 

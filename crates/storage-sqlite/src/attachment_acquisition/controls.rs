@@ -65,10 +65,10 @@ pub struct AttachmentTransferFrame {
 
 impl SqliteAccountStorage {
     /// Pause automatic network work without invalidating verified publication.
-    /// Interrupted claims are refunded once; actual HTTP attempts remain charged.
+    /// A live claim stays charged until its interrupted owner settles; promotion
+    /// before settlement cannot refund a still-running attempt.
     pub fn pause_automatic_attachments(&self, now: u64) -> StorageResult<()> {
         self.lock()?.execute("UPDATE attachment_acquisition SET
-            acquisition_attempts=max(0,acquisition_attempts-CASE WHEN state=1 THEN 1 ELSE 0 END),
             retry_not_before=CASE WHEN state=1 THEN ?1+15 ELSE COALESCE(due,retry_not_before) END,
             due=CASE WHEN state=1 THEN due ELSE NULL END,
             state=CASE WHEN state=1 THEN 1 ELSE 5 END,permission_paused=1
@@ -158,9 +158,9 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             if !partial::valid_attempt(&conn, job, now)? { return Ok(false); }
-            Ok(conn.execute("UPDATE attachment_acquisition SET network_attempts=min(network_attempts+automatic_history,2147483647)
+            Ok(conn.execute(&format!("UPDATE attachment_acquisition AS q SET network_attempts=min(network_attempts+automatic_history,2147483647)
                 WHERE token=?1 AND (automatic_history=0 OR body_completed=0) AND cancelled=0
-                AND (automatic_history=0 OR network_attempts<64) AND permission_paused=0 AND (explicit_request=1 OR COALESCE((SELECT automatic FROM attachment_download_policy WHERE id=1),1)=1)",
+                AND (automatic_history=0 OR network_attempts<64) AND permission_paused=0 AND (explicit_request=1 OR COALESCE((SELECT automatic FROM attachment_download_policy WHERE id=1),1)=1) AND {}",super::outgoing::STAGED_UPLOAD_MATCH),
                 [&job.reference.token]).storage()? == 1)
         })
     }
@@ -224,6 +224,9 @@ impl SqliteAccountStorage {
                 now,
                 automatic,
             )?;
+            if self.attachment_source_has_upload(group,&selected.message_id_hex,selected.attachment_index)? {
+                return Ok((status,false));
+            }
             // Existing state (including cancellation, loss of bytes and retry
             // deadlines) wins over demand and is never reset by a screen render.
             if status.as_ref().is_none_or(|s| {
@@ -354,6 +357,109 @@ impl SqliteAccountStorage {
             WHERE token=?1 AND state<>3",[&reference.token]).storage()?==1)
     }
 
+    /// Upgrade live demand without resetting retry budgets, backoff or an active
+    /// lease. Only permission-paused work may be readmitted, at its existing
+    /// backoff deadline. Cancellation, removal, completed bodies and exhausted
+    /// budgets require a deliberate recovery action instead.
+    pub fn promote_attachment_demand(
+        &self,
+        reference: &AttachmentAssetRef,
+        now: u64,
+    ) -> StorageResult<bool> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if !matches_store(&conn, reference)? {
+                return Ok(false);
+            }
+            Ok(conn
+                .execute(
+                    &format!(
+                        "UPDATE attachment_acquisition AS q SET
+                    explicit_request=1,priority_at=?2,permission_paused=0,
+                    state=CASE WHEN state=5 THEN 0 ELSE state END,
+                    due=CASE WHEN state=5 THEN max(?2,retry_not_before) ELSE due END
+                    WHERE token=?1 AND explicit_request=0 AND cancelled=0
+                    AND (state IN (0,1,2) OR (state=5 AND permission_paused=1))
+                    AND body_completed=0 AND size_blocked_max IS NULL
+                    AND (state=1 OR automatic_history=0 OR (acquisition_attempts<4 AND network_attempts<64))
+                    AND {SOURCE_MATCH} AND {ACCEPTED}
+                    AND (expires_at IS NULL OR expires_at>?2)
+                    AND NOT EXISTS(SELECT 1 FROM attachment_removal_suppression r
+                        WHERE r.group_id_hex=q.group_id_hex AND r.message_id_hex=q.message_id_hex
+                        AND r.attachment_index=q.attachment_index)"
+                    ),
+                    params![reference.token, u64_to_i64(now)?],
+                )
+                .storage()?
+                == 1)
+        })
+    }
+
+    /// Source validation, initial admission and explicit promotion share one
+    /// transaction. Existing demand bypasses ordinary readmission, preserving
+    /// backoff and terminal suppression. Ready bytes remain local-only.
+    pub fn request_explicit_attachment(
+        &self,
+        group: &str,
+        selected: &crate::AttachmentHistoryEntry,
+        digest: [u8; 32],
+        now: u64,
+    ) -> StorageResult<AttachmentDemand> {
+        let index = u32::try_from(selected.attachment_index)
+            .map_err(|_| invalid("invalid attachment index"))?;
+        self.connection.with_transaction(|| {
+            let current = self.attachment_control_entry(
+                group,
+                &selected.message_id_hex,
+                &selected.source_message_id_hex,
+                index,
+                now,
+            )?;
+            if !current.is_some_and(|entry| {
+                entry.slot == selected.slot && entry.source_epoch == selected.source_epoch
+            }) {
+                return Ok(AttachmentDemand::Unavailable);
+            }
+            let conn = self.lock()?;
+            let suppressed: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM attachment_removal_suppression
+                    WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3)",
+                    params![group, selected.message_id_hex, index],
+                    |row| row.get(0),
+                )
+                .storage()?;
+            if suppressed {
+                return Ok(AttachmentDemand::Suppressed);
+            }
+            let reference = conn
+                .query_row(
+                    "SELECT token FROM attachment_acquisition WHERE group_id_hex=?1
+                    AND message_id_hex=?2 AND attachment_index=?3",
+                    params![group, selected.message_id_hex, index],
+                    |row| row.get(0),
+                )
+                .optional()
+                .storage()?
+                .map(|token| {
+                    Ok::<_, StorageError>(AttachmentAssetRef {
+                        store_epoch: epoch(&conn)?,
+                        token,
+                    })
+                })
+                .transpose()?;
+            drop(conn);
+            let demand = match reference {
+                Some(reference) => AttachmentDemand::Requested(reference),
+                None => self.request_attachment_acquisition(group, selected, digest, now)?,
+            };
+            if let AttachmentDemand::Requested(reference) = &demand {
+                self.promote_attachment_demand(reference, now)?;
+            }
+            Ok(demand)
+        })
+    }
+
     /// Explicit retry also admits a queued automatic job while automatic work is disabled.
     pub fn explicitly_retry_attachment(
         &self,
@@ -363,7 +469,7 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn=self.lock()?;
             if !matches_store(&conn,reference)? {return Ok(false);}
-            Ok(conn.execute(&format!("UPDATE attachment_acquisition AS q SET cancelled=0,state=CASE WHEN state=1 THEN 1 ELSE 0 END,due=CASE WHEN state=1 THEN due ELSE ?2 END,attempt=CASE WHEN state=1 THEN attempt ELSE NULL END,explicit_request=1,size_blocked_max=NULL,permission_paused=0,retry_not_before=0,acquisition_attempts=CASE WHEN state=1 THEN acquisition_attempts ELSE 0 END,network_attempts=CASE WHEN state=1 THEN network_attempts ELSE 0 END,body_completed=CASE WHEN state=1 THEN body_completed ELSE 0 END
+            Ok(conn.execute(&format!("UPDATE attachment_acquisition AS q SET cancelled=0,state=CASE WHEN state=1 THEN 1 ELSE 0 END,due=CASE WHEN state=1 THEN due ELSE ?2 END,attempt=CASE WHEN state=1 THEN attempt ELSE NULL END,explicit_request=1,size_blocked_max=NULL,permission_paused=0,retry_not_before=0,preparation_deferrals=0,acquisition_attempts=CASE WHEN state=1 THEN acquisition_attempts ELSE 0 END,network_attempts=CASE WHEN state=1 THEN network_attempts ELSE 0 END,body_completed=CASE WHEN state=1 THEN body_completed ELSE 0 END
                 WHERE token=?1 AND (state IN(0,1,2,4,5) OR (state=3 AND NOT EXISTS(SELECT 1 FROM retained_attachment_bytes b WHERE b.token=q.token))) AND {SOURCE_MATCH} AND {ACCEPTED} AND (expires_at IS NULL OR expires_at>?2)"),
                 params![reference.token,u64_to_i64(now)?]).storage()?==1)
         })
@@ -403,9 +509,10 @@ impl SqliteAccountStorage {
             ("attachment_acquisition_priority", " AND explicit_request=1")
         };
         let sql = format!(
-            "SELECT token FROM attachment_acquisition INDEXED BY {index}
-            WHERE due IS NOT NULL AND due<=?1 AND cancelled=0{explicit_filter}
-            ORDER BY explicit_request DESC,priority_at DESC,due,token LIMIT ?2"
+            "SELECT token FROM attachment_acquisition AS q INDEXED BY {index}
+            WHERE due IS NOT NULL AND due<=?1 AND cancelled=0{explicit_filter} AND {}
+            ORDER BY explicit_request DESC,priority_at DESC,due,token LIMIT ?2",
+            super::outgoing::STAGED_UPLOAD_MATCH
         );
         let mut stmt = conn.prepare(&sql).storage()?;
         stmt.query_map(params![u64_to_i64(now)?, limit as i64], |r| {

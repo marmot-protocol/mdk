@@ -23,9 +23,9 @@ pub const MARMOT_ROOT_RUNTIME_LOCK_FILE: &str = ".marmot-runtime.lock";
 /// is released.
 #[derive(Debug)]
 pub struct MarmotRootRuntimeLease {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     _lease: fs_private::PrivateExclusiveFileLease,
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     _unsupported: (),
 }
 
@@ -64,7 +64,22 @@ impl MarmotRootRuntimeLease {
             }
         }
 
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let path = root.join(MARMOT_ROOT_RUNTIME_LOCK_FILE);
+            match fs_private::try_acquire_private_exclusive_file_lease(&path) {
+                Ok(lease) => Ok(Self { _lease: lease }),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    Err(AppError::RuntimeBusy)
+                }
+                Err(error) => Err(AppError::Io(io::Error::new(
+                    error.kind(),
+                    format!("acquire Marmot root runtime lease: {error}"),
+                ))),
+            }
+        }
+
+        #[cfg(not(any(unix, windows)))]
         {
             Err(AppError::Io(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -74,13 +89,15 @@ impl MarmotRootRuntimeLease {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod tests {
     use super::*;
     use crate::{MarmotApp, MarmotAppConfig};
     use marmot_account::AccountHome;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(unix)]
     #[test]
     fn root_lease_creates_a_private_root_and_lock_file() {
         let parent = tempfile::tempdir().unwrap();
@@ -123,6 +140,7 @@ mod tests {
         drop(MarmotRootRuntimeLease::try_acquire(root.path()).unwrap());
     }
 
+    #[cfg(unix)]
     #[test]
     fn root_lease_preserves_an_existing_shared_root_mode() {
         let root = tempfile::tempdir().unwrap();
@@ -141,6 +159,7 @@ mod tests {
         drop(lease);
     }
 
+    #[cfg(unix)]
     #[test]
     fn root_lease_rejects_symlink_root_and_lock_file() {
         use std::os::unix::fs::symlink;

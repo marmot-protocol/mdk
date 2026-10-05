@@ -763,12 +763,15 @@ impl MarmotApp {
                         || (attempted_outbox.contains(index) && !completed_outbox.contains(index)))
             })
             .map(|index| {
-                (
-                    index,
-                    AppError::RelayDirectory(
-                        "relay-list absence was not authoritatively established".to_owned(),
-                    ),
-                )
+                // The known list may be a stale cache or partial snapshot, so a
+                // retry can still find usable relays; name it without claiming
+                // a verdict. Completed lookups report MissingMemberInboxRoute.
+                let message = if targets[index].relay_lists.inbox.relays.is_empty() {
+                    "relay-list absence was not authoritatively established"
+                } else {
+                    "known member inbox relay list has no usable relays and its refresh did not complete"
+                };
+                (index, AppError::RelayDirectory(message.to_owned()))
             })
             .collect();
         RelayListResolution { completed, errors }

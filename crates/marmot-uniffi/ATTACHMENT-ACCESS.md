@@ -100,6 +100,31 @@ Obsolete references return false; obsolete/unavailable slots return no reference
 cannot download attachments before acceptance. These commands persist intent without waiting for
 network readiness; acquisition needs an active, non-frozen account runtime.
 
+HTTP 404 or 410 means that locator cannot serve the blob: when every candidate locator is
+missing or otherwise permanently unusable, the job reports `Failed` at once. Other 4xx, 5xx,
+timeouts and connection failures stay retryable. When the group's decryption key for the
+attachment's source epoch is not available locally, the job waits as `RetryScheduled` without
+spending an attempt (15 seconds, doubling) and reports `Failed` on the sixth consecutive miss,
+about eight minutes after the first. Disk-reserve and retained-quota pressure still defer without
+that limit. `Failed` survives restart and repeated demand; render a download action. Explicit
+work (Retry, download-again) starts a fresh window and derives a missing key from the group's
+retained MLS state for that epoch (the newest five epochs), so Retry recovers attachments whose
+key was never cached.
+
+### Ordinary interactive demand
+
+Prefer local assets first. On a missing retained source, `requestExplicitAttachment`
+(`marmot_request_explicit_attachment` in C) atomically creates demand or upgrades a
+live automatic job. Repeated taps preserve retry budgets, scheduled backoff, partial
+progress and the current HTTP owner. The returned reference is intent, not readiness;
+observe transfer state. A queued tap receives native explicit priority at the next
+allowed admission opportunity. Migration 100 preserves that priority through source
+reprojection. Promotion does not preempt another transfer, extend an active automatic
+attempt's two-minute deadline, or increase its original size ceiling. Subsequent
+explicit admission uses the existing explicit limits. Permission-paused readmission
+respects `max(now, retry_not_before)`. Cancelled/removed/failed/exhausted work requires
+its deliberate Retry or Download again action. Observation alone conveys no intent.
+
 `attachmentDownloadPolicy` / `setAttachmentDownloadPolicy` read/write a durable per-account
 policy. In `NativeAutomatic` mode automatic acquisition defaults on: 2 GiB retained quota, 256 MiB free-disk reserve plus
 SQLite/WAL headroom, 64 MiB automatic ciphertext ceiling, one runtime-wide acquisition at a time.
@@ -239,3 +264,40 @@ C adds three corresponding `marmot_*` functions and the acquisition-mode field o
 header/library; returned automatic-request records use
 `marmot_automatic_attachment_request_free`, and generation strings use
 `marmot_string_free`. C permission inputs are borrowed boolean integers.
+
+## Genuine outgoing retention
+
+Migration 101 attempts private staging in the encrypted per-account database after a
+successful HTTP upload. Retention shares the existing byte quota and checks free-disk
+reserve and SQLite/WAL headroom, without evicting retained assets. Quota, disk, staging
+capacity or storage failures skip optional retention; they cannot reject the upload
+or prevent sending. Existing upload file/count/aggregate limits remain unchanged.
+The optional store accepts at most 256 outstanding staged uploads.
+
+Staging and binding to exact successful imeta descriptors commit together. Pending
+sends protect staged bytes without creating a readable source. Core message projection,
+confirmation and chat-list updates commit before optional ownership and promotion run.
+The callback waits for the outermost transaction; retention failures do not roll back
+an accepted message. Direct and token-based sends share this path. Original source
+identity remains authoritative through optimistic-to-confirmed reconciliation.
+
+An exclusive staged body moves into canonical retention without additional quota,
+even after the budget is lowered. Copies for shared source slots require capacity.
+Bounded rotating local recovery follows confirmed source descriptors as well as owner
+rows, preserving crash recovery when optional owner registration fails. Known unadmitted
+failures release staging; live pending/canonical sources protect it during cleanup and
+past the seven-day orphan TTL. Rejected, invalidated, expired, cancelled or removed
+sources cannot pin a satisfied sibling's reservation.
+
+Proven length/digest corruption clears the poisoned body and records unavailable
+completion for its eligible sources, preventing automatic reacquisition. SQL and I/O
+failures keep bytes retryable. Outgoing maintenance failures do not block incoming
+acquisition. Account/group deletion releases account-scoped staging; visibility,
+cancellation and removal fences still apply before canonical promotion.
+
+Once retained, local reads need neither automatic downloads nor a relay worker and
+survive process restart. Clients must adopt a matching reviewed artifact and qualify
+presentation-cache and device lifecycle paths. Native fixture results belong to the
+[implementation PR evidence](https://github.com/marmot-protocol/mdk/pull/2142#issuecomment-5946856165);
+they do not qualify Android artifact adoption or physical-device behavior. Large-send
+streaming remains separate work.
