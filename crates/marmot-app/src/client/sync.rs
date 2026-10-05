@@ -786,9 +786,20 @@ impl AppClient {
             None => {
                 if self.runtime.has_pending_convergence_inputs(group_id)? {
                     Ok(ConvergenceScheduleState::PendingUnopenable)
+                } else if self.runtime.has_queued_outbound_intents(group_id)?
+                    && !self
+                        .runtime
+                        .queued_outbound_intents_blocked_by_fanouts(group_id)?
+                {
+                    // Restarted queued sends must get their ordinary wake even
+                    // when secondary replication retains a longer retry cutoff.
+                    // The drain uses the same durable publication safety gate.
+                    Ok(ConvergenceScheduleState::PendingOutbound {
+                        retry_after_ms: None,
+                    })
                 } else if self.runtime.has_pending_outbound_fanouts(group_id)? {
-                    // Fanout retry is a barrier to staging more outbound work,
-                    // including a due SelfRemove and queued local mutations.
+                    // Required publication and pending MLS still gate queued
+                    // sends. Other local mutations retain fanout precedence.
                     Ok(ConvergenceScheduleState::PendingOutbound {
                         retry_after_ms: self.runtime.outbound_fanout_retry_delay_ms(group_id)?,
                     })
@@ -9344,6 +9355,9 @@ mod tests {
         assert_eq!(buffered, ingested);
     }
 }
+
+#[cfg(test)]
+mod queued_outbound_schedule_tests;
 
 #[cfg(test)]
 mod full_history_tests;

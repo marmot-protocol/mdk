@@ -246,6 +246,11 @@ impl MarmotAppRuntime {
         // The task outlives cancellation of the host's wait. Wakeup and
         // projection publication belong inside the same owned task.
         blocking_app_task(move || {
+            // This blocking task owns only its account's admission gate. The
+            // worker cannot select a commit before timing registration; other
+            // accounts never wait for this database. Global map locks stay short.
+            let gate = shared.local_submission_gate(&account.account_id_hex);
+            let admission = gate.blocking_lock();
             shared.lifecycle().ensure_running()?;
             let (accepted, update) = if let Some(original) = edit_of_client_token {
                 app.admit_local_message_with_edit_at(
@@ -260,6 +265,23 @@ impl MarmotAppRuntime {
             } else {
                 app.admit_local_message(&account.label, &group, token, request, draft)?
             };
+            if update.is_some() {
+                let mut queue = shared
+                    .local_submission_queue
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // Shutdown sets stopping before clearing under this same map
+                // lock. Recheck here so no admission can register after clear.
+                if !shared.lifecycle().is_stopping() {
+                    queue.admitted(
+                        &account.account_id_hex,
+                        &hex::encode(group.as_slice()),
+                        &accepted.message_id_hex,
+                        &shared.app_performance_telemetry(),
+                    );
+                }
+            }
+            drop(admission);
             if let Some(update) = update {
                 account_worker::publish_app_runtime_projection_update(
                     &events,

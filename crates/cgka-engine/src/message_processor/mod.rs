@@ -16,6 +16,34 @@ mod ingest;
 mod send;
 mod store;
 
+/// Closed, aggregate-only explanations for retaining outbound work.
+#[derive(Clone, Copy)]
+enum OutboundQueueReason {
+    ResolvingLocalPublish,
+    ConvergencePending,
+    ForegroundBudgetExhausted,
+    SelfRemoveAutoCommit,
+    ExplicitQueueRequest,
+}
+
+impl OutboundQueueReason {
+    fn trace(self) {
+        let reason = match self {
+            Self::ResolvingLocalPublish => "resolving_local_publish",
+            Self::ConvergencePending => "convergence_pending",
+            Self::ForegroundBudgetExhausted => "foreground_budget_exhausted",
+            Self::SelfRemoveAutoCommit => "self_remove_auto_commit",
+            Self::ExplicitQueueRequest => "explicit_queue_request",
+        };
+        tracing::debug!(
+            target: "cgka_engine::message_processor",
+            method = "queue_outbound_intent",
+            queue_reason = reason,
+            "outbound intent durably queued"
+        );
+    }
+}
+
 pub(crate) use ingest::avatar_component_snapshot;
 pub(crate) use store::fail_deferred_peel_rows_in_terminal_group;
 #[cfg(feature = "test-conformance-snapshot")]
@@ -843,10 +871,7 @@ impl<S: StorageProvider> Engine<S> {
         if matches!(&intent, SendIntent::Disband { .. }) {
             return self.do_request_disband(group_id);
         }
-        if self
-            .should_queue_outbound_intent(&group_id, &intent)
-            .await?
-        {
+        if let Some(reason) = self.outbound_queue_reason(&group_id, &intent).await? {
             // Retention re-encrypts the payload under the drain-time epoch.
             // A payload pinned to one epoch (an encrypted-media reference,
             // whose key the recipient derives from the delivering message's
@@ -861,7 +886,9 @@ impl<S: StorageProvider> Engine<S> {
                     expected: *expected,
                 });
             }
-            return self.queue_outbound_intent(group_id, intent, 0);
+            let queued = self.queue_outbound_intent(group_id, intent, 0)?;
+            reason.trace();
+            return Ok(queued);
         }
 
         let prepare_started = Instant::now();
@@ -909,7 +936,9 @@ impl<S: StorageProvider> Engine<S> {
                 },
             ));
         }
-        self.queue_outbound_intent(group_id, intent, 0)
+        let queued = self.queue_outbound_intent(group_id, intent, 0)?;
+        OutboundQueueReason::ExplicitQueueRequest.trace();
+        Ok(queued)
     }
 
     fn validate_send_acceptance(&mut self, intent: &SendIntent) -> Result<GroupId, EngineError> {
@@ -1117,6 +1146,28 @@ impl<S: StorageProvider> Engine<S> {
                 Err(error) => return Err(error),
             };
             let pauses_for_pending_publish = matches!(result, SendResult::GroupEvolution { .. });
+            // The queued path bypasses the public send entry point. Record
+            // preparation only once a real transport artifact exists, using
+            // the same logical identity retained in the queued payload.
+            if self.recorder.is_enabled()
+                && let SendResult::ApplicationMessage {
+                    group_id,
+                    app_event_id,
+                    ..
+                } = &result
+            {
+                self.audit_group_with_context(
+                    group_id,
+                    marmot_forensics::AuditEventContext {
+                        operation_id: Some(marmot_forensics::application_send_operation_id(
+                            group_id.as_slice(),
+                            app_event_id,
+                        )),
+                        ..Default::default()
+                    },
+                    crate::audit_helpers::send_outcome_event("app_message".into(), &result),
+                );
+            }
             match &result {
                 SendResult::ApplicationMessage { msg, .. } | SendResult::Proposal { msg } => {
                     self.queued_intent_by_message
@@ -1231,11 +1282,11 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
-    async fn should_queue_outbound_intent(
+    async fn outbound_queue_reason(
         &mut self,
         group_id: &GroupId,
         intent: &SendIntent,
-    ) -> Result<bool, EngineError> {
+    ) -> Result<Option<OutboundQueueReason>, EngineError> {
         if let Some(state) = self.epoch_manager.state(group_id)
             && !state.is_stable()
         {
@@ -1258,8 +1309,9 @@ impl<S: StorageProvider> Engine<S> {
             // because `is_resolving_local_publish` does not match them — the
             // same shape as the `Stable`-only re-check in
             // `converge_and_drain_queued_outbound_intents`.
-            return Ok(matches!(intent, SendIntent::AppMessage { .. })
-                && state.is_resolving_local_publish());
+            return Ok((matches!(intent, SendIntent::AppMessage { .. })
+                && state.is_resolving_local_publish())
+            .then_some(OutboundQueueReason::ResolvingLocalPublish));
         }
 
         let now_ms = self.convergence_now_ms();
@@ -1282,11 +1334,16 @@ impl<S: StorageProvider> Engine<S> {
             .await?
         {
             AdvanceConvergenceStatus::Settled => {}
-            AdvanceConvergenceStatus::Pending
-            | AdvanceConvergenceStatus::ForegroundBudgetExhausted => return Ok(true),
+            AdvanceConvergenceStatus::Pending => {
+                return Ok(Some(OutboundQueueReason::ConvergencePending));
+            }
+            AdvanceConvergenceStatus::ForegroundBudgetExhausted => {
+                return Ok(Some(OutboundQueueReason::ForegroundBudgetExhausted));
+            }
         }
         self.stage_due_self_remove_auto_commit(group_id, now_ms)
             .await
+            .map(|staged| staged.then_some(OutboundQueueReason::SelfRemoveAutoCommit))
     }
 
     /// Settle authenticated input and give current-fingerprint deferred rows

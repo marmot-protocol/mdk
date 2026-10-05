@@ -39,8 +39,25 @@ point, show network progress separately, and let later relay events refresh or r
 received during initial catch-up are deferred and replayed in order once the live client is ready. While an owned
 comparison's network request runs outside the worker, an empty deferred queue permits both direct sends and durable
 local submissions to use the live client. Durable submissions retain the same completion, retry and projection path
-as steady-state sends; they do not bypass an earlier deferred command. Inline activation and other startup maintenance
-can still delay sends.
+as steady-state sends; they do not bypass an earlier deferred command. Automatic push-registration gossip after startup
+or a receive/recovery pass arms the durable retry timer rather than awaiting the gossip batch before servicing sends.
+Inline activation, KeyPackage maintenance, explicit push commands and a running scheduled push retry can still delay
+sends.
+
+Engine-queued sends receive an ordinary worker wakeup when their group's required publication acknowledgements and
+MLS confirmation are complete, even if a secondary relay still has a later replication retry scheduled. The runtime
+keeps the original relay event and retry deadline. Unmet required acknowledgements and pending MLS confirmation keep
+their publication barrier.
+
+For new durable admissions in the current runtime, `send_queue` and `outbound_message_queue_wait` measure the interval
+from the committed admission to its first worker execution. Execution and publication remain separate measurements.
+Repeated tokens and completion retries do not restart that observation. The private correlation map is bounded to
+1,024 observations per runtime; capacity omissions and shutdown cancellation count as cancelled observations, without
+a successful queue-duration sample. A retained admission can remain observed across sign-out within the same runtime.
+Permanent account removal cancels its remaining observations. Admission and selection use per-account gates;
+observing a send does not add a cross-account database lock.
+Rows restored in a new runtime have no original monotonic admission instant and produce no fabricated queue-duration
+sample. These measurements do not include host rendering or every subsequent engine/retry wait.
 
 **Per-account worker isolation.** A failed account open does not discard a sibling that reached local readiness.
 

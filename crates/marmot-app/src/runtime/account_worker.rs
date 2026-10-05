@@ -1739,13 +1739,10 @@ async fn run_app_runtime_account_worker(
         client.has_pending_runtime_group_subscription_refresh(),
         &command_tx,
     );
-    // Automatic gossip is best-effort network work. Run it only after startup
-    // callers have received their deferred responses so a degraded relay cannot
-    // extend account-open latency.
-    let push_work_pending = client
-        .retry_pending_push_registration_shares_best_effort()
-        .await;
-    scheduled_push_retry.schedule_after_attempt(push_work_pending, &command_tx);
+    // Automatic gossip must not postpone the first durable drain behind
+    // unrelated network I/O. The durable outbox arms the existing retry timer;
+    // explicit registration and departure commands retain their own semantics.
+    scheduled_push_retry.observe_pending(client.has_pending_push_registration_work(), &command_tx);
     publish_client_pending_applied_summary(&mut client, &events, &account_id_hex, &account_label);
 
     // #637: mutations replayed during deferred startup (e.g. a queued SendMessage
@@ -5960,8 +5957,29 @@ async fn publish_next_local_submission(
     account_id_hex: &str,
     account_label: &str,
 ) -> Option<Duration> {
-    let storage = app.account_storage(account_label).ok()?;
-    let submission = storage.next_local_submission().ok()??;
+    let (submission, queued) = {
+        // Account-local admission may be waiting on storage. Do not park this
+        // executor thread or the worker's shutdown/read serving behind it.
+        let gate = shared.local_submission_gate(account_id_hex);
+        let Ok(_admission) = gate.try_lock() else {
+            return Some(Duration::from_millis(100));
+        };
+        let storage = app.account_storage(account_label).ok()?;
+        let submission = storage.next_local_submission().ok()??;
+        let queued = shared
+            .local_submission_queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take(
+                account_id_hex,
+                &submission.group_id_hex,
+                &submission.message_id_hex,
+            );
+        (submission, queued)
+    };
+    if let Some(queued) = queued {
+        queued.finish(&shared.app_performance_telemetry());
+    }
     let execution = shared
         .app_performance_telemetry()
         .observe(RuntimeOp::SendExecution);
@@ -6636,8 +6654,8 @@ fn retry_delay_for_attempt(attempt: u32) -> Duration {
 
 /// Finish the original Receive arm after its recovery outcome is reported.
 /// The same tail runs immediately for inline/deferred work or when the owned
-/// comparison joins; the push retry always reads the client's current durable
-/// intent rather than storing a delivery-specific snapshot in the network job.
+/// comparison joins; automatic push work schedules from the current durable
+/// intent instead of awaiting an unrelated gossip batch on the receive path.
 struct ReceiveTailContext<'a> {
     events: &'a broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &'a str,
@@ -6657,12 +6675,10 @@ async fn finish_receive_after_recovery(
         context.shared.schedule_audit_log_tracker_update("receive");
     }
     if retry_push_registration {
-        let pending = client
-            .retry_pending_push_registration_shares_best_effort()
-            .await;
-        context
-            .scheduled_push_retry
-            .schedule_after_attempt(pending, context.command_tx);
+        context.scheduled_push_retry.observe_pending(
+            client.has_pending_push_registration_work(),
+            context.command_tx,
+        );
         publish_client_pending_applied_summary(
             client,
             context.events,
@@ -7224,6 +7240,8 @@ mod tests {
 
     #[cfg(feature = "test-policy-overrides")]
     mod integrated_recovery_acceptance_tests;
+    #[cfg(feature = "test-policy-overrides")]
+    mod local_submission_queue_tests;
     #[cfg(feature = "test-policy-overrides")]
     mod receive_comparison_resume_tests;
     mod resource_bounds_tests;
@@ -9568,6 +9586,89 @@ mod tests {
 
         scheduled.schedule_after_attempt(false, &commands);
         assert!(!scheduled.is_armed());
+    }
+
+    #[tokio::test]
+    async fn receive_tail_schedules_pending_push_gossip_without_awaiting_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = app.client(&account.label).await.unwrap();
+        client.create_group("push retry", &[]).await.unwrap();
+        app.set_native_push_enabled(&account.label, true).unwrap();
+        app.upsert_push_registration(
+            &account.label,
+            crate::PushPlatform::Fcm,
+            "synthetic-token",
+            &nostr::prelude::Keys::generate().public_key().to_hex(),
+            None,
+        )
+        .unwrap();
+        assert!(client.has_pending_push_registration_work());
+        let shared = RuntimeSharedServices::default();
+        let (events, _) = broadcast::channel(8);
+        let (commands, mut received) = mpsc::channel(2);
+        let mut scheduled = ScheduledPushRegistrationRetry::new();
+        relay.block_next_publish();
+        let responsive = {
+            let mut tail = std::pin::pin!(finish_receive_after_recovery(
+                &mut client,
+                ReceiveTailContext {
+                    events: &events,
+                    account_id_hex: &account.account_id_hex,
+                    account_label: &account.label,
+                    shared: &shared,
+                    scheduled_push_retry: &mut scheduled,
+                    command_tx: &commands,
+                },
+                false,
+                true,
+            ));
+            let responsive = timeout(Duration::from_secs(1), tail.as_mut()).await.is_ok();
+            if !responsive {
+                // A regression must release the held engine step before dropping it.
+                relay.release_publish();
+                tail.as_mut().await;
+            }
+            responsive
+        };
+        assert!(
+            responsive,
+            "automatic receive gossip cannot occupy the account owner"
+        );
+        assert!(scheduled.is_armed());
+        assert!(client.has_pending_push_registration_work());
+        let AccountWorkerCommand::RetryPushRegistration { respond } =
+            received.recv().await.unwrap()
+        else {
+            panic!("durable pending work must enqueue its bounded retry")
+        };
+        let retry = tokio::spawn(async move {
+            let pending = client
+                .retry_pending_push_registration_shares_best_effort()
+                .await;
+            let _ = respond.send(pending);
+            pending
+        });
+        timeout(Duration::from_secs(2), relay.wait_for_blocked_publish())
+            .await
+            .expect("network publication starts only on the scheduled retry");
+        relay.release_publish();
+        assert!(
+            !timeout(Duration::from_secs(2), retry)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert!(
+            !app.has_pending_push_registration_work(&account.label)
+                .unwrap()
+        );
+        scheduled.disarm();
     }
 
     #[tokio::test]

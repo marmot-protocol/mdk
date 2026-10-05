@@ -2504,13 +2504,16 @@ where
         let (mut output, blocked_groups) = self
             .resume_outbound_fanouts_for_group(Some(group_id))
             .await?;
-        // An older deferred transport fanout blocks only newly queued
-        // outbound intents. Convergence inputs must still settle: otherwise a
-        // permanently unavailable relay can wedge epoch progression and fork
-        // healing forever. Any protocol effects produced by settlement remain
-        // observable while the queued-intent drain stays ordered behind the
-        // frozen fanout.
-        let effects = if blocked_groups.contains(group_id) {
+        // Keep exact-event retries in their original order, but do not make
+        // engine-queued sends wait for secondary replication after quorum and
+        // MLS confirmation. Foreground sends already use that same boundary.
+        // Inspect the remaining durable state, including newer fanouts skipped
+        // behind the oldest retry, so an unresolved publication stays a barrier.
+        let queued_intents_blocked = blocked_groups.contains(group_id)
+            && self.queued_outbound_intents_blocked_by_fanouts(group_id)?;
+        // Required publication barriers must not prevent inbound convergence
+        // from settling, even while the corresponding relay is unavailable.
+        let effects = if queued_intents_blocked {
             self.session.advance_convergence_inputs(group_id).await?
         } else {
             self.session.advance_convergence(group_id).await?
@@ -2525,6 +2528,30 @@ where
 
     pub fn has_queued_outbound_intents(&self, group_id: &GroupId) -> AccountResult<bool> {
         Ok(self.session.has_queued_outbound_intents(group_id)?)
+    }
+
+    /// Whether retained publications still prevent staging queued sends.
+    ///
+    /// Pending MLS confirmation and outstanding targets below required quorum
+    /// are barriers; secondary replication after quorum is not. This inspects
+    /// every retained fanout, including newer work behind an older retry. It
+    /// does not establish that convergence inputs or other engine gates cleared.
+    /// Unhydrated or unavailable group state is an error, never an empty outbox.
+    pub fn queued_outbound_intents_blocked_by_fanouts(
+        &self,
+        group_id: &GroupId,
+    ) -> AccountResult<bool> {
+        self.session.group_record(group_id)?;
+        Ok(self
+            .session
+            .outbound_fanouts_for_group(group_id)?
+            .iter()
+            .any(|fanout| {
+                let outcome = fanout.outcome();
+                matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+                    || (outcome.outstanding_targets > 0
+                        && outcome.accepted_targets < fanout.request().required_acks.max(1))
+            }))
     }
 
     pub fn has_pending_outbound_fanouts(&self, group_id: &GroupId) -> AccountResult<bool> {
@@ -4016,8 +4043,17 @@ where
         mut fanout: OutboundFanout,
         output: &mut AccountDeviceEffects,
         queue: &mut VecDeque<PublishWork>,
-        context: Option<AuditEventContext>,
+        mut context: Option<AuditEventContext>,
     ) -> AccountResult<PublishStatus> {
+        // Durable application identity connects first publication and exact
+        // retries to the same logical send, including after process restart.
+        if let Some(application) = fanout.application_message() {
+            context.get_or_insert_with(Default::default).operation_id =
+                Some(marmot_forensics::application_send_operation_id(
+                    application.group_id.as_slice(),
+                    &application.app_event_id,
+                ));
+        }
         let outcome = fanout.outcome();
         // A receipt persisted before cancellation can still be below quorum.
         // Finish that pass before releasing its Welcome continuation. Once a
