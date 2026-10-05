@@ -34,8 +34,9 @@ use crate::convergence_input::{
 };
 use crate::engine::Engine;
 use crate::openmls_projection::{
-    OpenMlsContentKind, OpenMlsProjectionError, OpenMlsReplayObservation, ReplayProfilePolicy,
-    StoredCanonicalizationOptions, apply_openmls_canonicalization_result_with_profile_policy,
+    AppliedGroupChanges, OpenMlsContentKind, OpenMlsProjectionError, OpenMlsReplayObservation,
+    ReplayProfilePolicy, StoredCanonicalizationOptions,
+    apply_openmls_canonicalization_result_with_profile_policy,
     canonicalize_stored_openmls_messages_with_profile_policy,
     openmls_canonicalization_dispositions, project_mls_message,
     retain_current_group_epoch_snapshot, retire_stale_convergence_deferred_commits,
@@ -1518,8 +1519,8 @@ impl<S: StorageProvider> Engine<S> {
             Vec::new()
         };
         let pre_apply_commit_states = self.pre_apply_commit_states(&result)?;
-        let (observations, application_events) = self.storage.with_transaction(|storage| {
-            let observations = apply_openmls_canonicalization_result_with_profile_policy(
+        let (group_changes, application_events) = self.storage.with_transaction(|storage| {
+            let output = apply_openmls_canonicalization_result_with_profile_policy(
                 storage,
                 group_id,
                 &result,
@@ -1527,13 +1528,14 @@ impl<S: StorageProvider> Engine<S> {
                 replay_profile_policy,
             )?;
             storage.put_convergence_pass(&completed_pass)?;
-            let application_events = Self::application_replay_events(group_id, &observations)?;
+            let application_events =
+                Self::application_replay_events(group_id, &output.observations)?;
             for event in &application_events {
                 storage
                     .put_pending_application_event(event)
                     .map_err(storage_projection_error)?;
             }
-            Ok::<_, OpenMlsProjectionError>((observations, application_events))
+            Ok::<_, OpenMlsProjectionError>((output.group_changes, application_events))
         })?;
         // mdk#1472: completing the pass opens the gate that held queued
         // outbound intents. A drain that ran before the settle consumed the
@@ -1609,7 +1611,7 @@ impl<S: StorageProvider> Engine<S> {
                     previous_group.members,
                     previous_tip,
                     selected_tip,
-                    &observations,
+                    &group_changes,
                 )?;
             }
             terminalized
@@ -1704,7 +1706,7 @@ impl<S: StorageProvider> Engine<S> {
         previous_members: Vec<cgka_traits::group::Member>,
         previous_tip: EpochId,
         selected_tip: EpochId,
-        observations: &[OpenMlsReplayObservation],
+        group_changes: &[AppliedGroupChanges],
     ) -> Result<(), OpenMlsProjectionError> {
         if previous_tip != selected_tip {
             self.events_buf.push_back(GroupEvent::EpochChanged {
@@ -1721,27 +1723,15 @@ impl<S: StorageProvider> Engine<S> {
         // Each accepted replayed commit retains its own source-state delta.
         // A net previous-tip -> final-tip diff loses intermediate changes and
         // cannot supply either a shared target id or a fork-withdrawal link.
-        for observation in observations {
-            if let OpenMlsReplayObservation::CommitStaged {
-                message_id,
-                resulting_epoch,
-                group_changes,
-                ..
-            } = observation
-            {
-                let commit_id = MessageId::new(
-                    hex::decode(message_id)
-                        .map_err(|error| OpenMlsProjectionError::Decode(error.to_string()))?,
+        for commit in group_changes {
+            for (actor, change) in &commit.changes {
+                self.push_group_state_change(
+                    group_id,
+                    commit.resulting_epoch,
+                    Some(actor.clone()),
+                    change.clone(),
+                    Some(commit.commit_id.clone()),
                 );
-                for (actor, change) in group_changes {
-                    self.push_group_state_change(
-                        group_id,
-                        EpochId(*resulting_epoch),
-                        Some(actor.clone()),
-                        change.clone(),
-                        Some(commit_id.clone()),
-                    );
-                }
             }
         }
         // Captured before `current_group.members` is consumed below: gates the

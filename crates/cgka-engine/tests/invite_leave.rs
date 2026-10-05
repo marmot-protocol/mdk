@@ -51,10 +51,8 @@ async fn advance_selfremove_auto_commit<E: CgkaEngine>(engine: &mut E, group_id:
 }
 
 /// True if `events` contains a `GroupStateChanged` departure (removed or left)
-/// for `member`. Accepts either variant because the leave/removed distinction
-/// is path-dependent: the direct inbound seam classifies a SelfRemove as
-/// `MemberLeft`, while a convergence reorg surfaces it as an unattributed
-/// `MemberRemoved`.
+/// for `member` across generic removal/recovery flows. SelfRemove attribution
+/// and target parity are checked strictly in `selfremove_full_flow_with_auto_commit`.
 fn emits_departure_of(events: &[cgka_traits::engine::GroupEvent], member: &MemberId) -> bool {
     events.iter().any(|event| {
         matches!(
@@ -3258,6 +3256,7 @@ async fn selfremove_full_flow_with_auto_commit() {
         },
         ..proposal
     };
+    carol.ingest(routed.clone()).await.unwrap();
     let outcome = alice.ingest(routed).await.unwrap();
     assert!(matches!(outcome, IngestOutcome::Processed));
     let alice_events = alice.drain_events();
@@ -3328,6 +3327,56 @@ async fn selfremove_full_flow_with_auto_commit() {
         "alice should emit a departure for bob after confirm; got {alice_events:?}"
     );
 
+    // Own publication and both recipient seams must identify the same
+    // authenticated voluntary departure, including its reaction target.
+    let leaver = bob.self_id();
+    let departure_target = |events: &[cgka_traits::engine::GroupEvent]| {
+        let departures: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                cgka_traits::engine::GroupEvent::GroupStateChanged {
+                    epoch,
+                    actor,
+                    change,
+                    origin_commit_id,
+                    ..
+                } if matches!(change,
+                    cgka_traits::engine::GroupStateChange::MemberLeft { member }
+                    | cgka_traits::engine::GroupStateChange::MemberRemoved { member }
+                    if member == &leaver
+                ) =>
+                {
+                    assert_eq!(actor.as_ref(), Some(&leaver));
+                    assert_eq!(
+                        change,
+                        &cgka_traits::engine::GroupStateChange::MemberLeft {
+                            member: leaver.clone()
+                        }
+                    );
+                    let material = cgka_traits::app_event::group_system_event_material(
+                        &group_id,
+                        epoch.0,
+                        actor.as_ref(),
+                        change,
+                    )
+                    .unwrap();
+                    Some((
+                        material.message_id_hex,
+                        origin_commit_id.clone().expect("departure origin"),
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            departures.len(),
+            1,
+            "one authenticated departure: {events:?}"
+        );
+        departures.into_iter().next().unwrap()
+    };
+    let author_target = departure_target(&alice_events);
+
     // Bob ingests alice's commit — his epoch advances and he sees himself
     // removed. The engine retains his (tombstoned) local group state on removal
     // so the convergence artifacts needed to invalidate a losing removal branch
@@ -3340,6 +3389,15 @@ async fn selfremove_full_flow_with_auto_commit() {
         },
         ..commit
     };
+    carol.ingest(routed.clone()).await.unwrap();
+    converge_buffered_commit(&mut carol, &group_id);
+    // Publication uses the transport alias; canonical recipient replay uses
+    // the content alias. Neither alias participates in the reaction target ID.
+    assert_eq!(author_target.1, routed.id);
+    let recipient_origin = content_id(&routed);
+    let carol_target = departure_target(&carol.drain_events());
+    assert_eq!(carol_target.0, author_target.0);
+    assert_eq!(carol_target.1, recipient_origin);
     let outcome = bob.ingest(routed).await.unwrap();
     assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
     converge_buffered_commit(&mut bob, &group_id);
@@ -3349,6 +3407,9 @@ async fn selfremove_full_flow_with_auto_commit() {
         emits_departure_of(&bob_events, &bob.self_id()),
         "bob should emit a departure for himself; got {bob_events:?}"
     );
+    let bob_target = departure_target(&bob_events);
+    assert_eq!(bob_target.0, author_target.0);
+    assert_eq!(bob_target.1, recipient_origin);
 }
 
 #[tokio::test]
