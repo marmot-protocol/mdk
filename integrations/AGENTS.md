@@ -175,10 +175,15 @@ just pi-installer-test
 
 When editing install examples in any integration README, `integrations/README.md`,
 or `release.md`, also run the doc gates. They count `install_verified` calls per
-file, require download -> `.sha256` -> verify -> execute ordering, require a
-"same shell" note before dependent fences, and pin exactly one current-release
-`base_url` in `integrations/README.md`. Edit prose around installer fences, not
-the fences themselves.
+file, require download -> `.sha256` -> verify -> execute ordering and a
+"same shell" note before dependent fences. Install READMEs resolve the latest
+published numeric `wn-agent-v*` cohort once with the identical bounded resolver
+from `integrations/README.md`; resolution errors stop installation. Each install
+then uses the selected immutable URL for installer, checksum and assets.
+`release.md` and release notes retain their exact-version provenance. Do not
+replace these checks with a mutable download alias or mix release cohorts.
+Minimum runtime versions and pinned compatibility evidence are distinct from
+an evergreen install default.
 
 ```sh
 just install-example-sha256-gate

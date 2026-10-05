@@ -8,6 +8,8 @@ explain topology, identities, and sharing for operators.
 ## Contents
 
 - [Get Started: White Noise + Agents](#get-started-white-noise--agents)
+- [Recommended chat setup](#recommended-chat-setup)
+- [Connector capabilities](#connector-capabilities)
 - [First-install verification](#first-install-verification)
 - [How The Connectors Fit Together](#how-the-connectors-fit-together)
 - [Default Install Topology](#default-install-topology)
@@ -32,17 +34,30 @@ Choose the runtime you already use:
 | Runtime | Connector style | Best fit |
 | --- | --- | --- |
 | Hermes | Gateway plugin | Rich chat history, reactions, media, and live previews |
-| OpenClaw | Channel plugin | Rich gateway routing, media, and live previews |
+| OpenClaw | Channel plugin | Gateway routing, history and media |
 | Claude Code | Terminal harness | Repository and coding tasks through Claude Code |
 | Codex | Terminal harness | Repository and coding tasks through Codex |
 | OpenCode | Terminal harness | Repository and coding tasks through OpenCode |
 | Pi | Terminal harness | Repository and coding tasks through Pi |
 
 The guided installers prompt on the terminal for the White Noise account that
-may invite and message the agent. They install release `wn-agent-v0.12.0`, create
+may invite and message the agent. They install the latest published WN Agent release, create
 an isolated White Noise identity for the selected connector, and start same-user
 services where supported. Download each installer with its adjacent checksum,
 verify it, and only then execute the local file:
+
+The example below requires Python 3 and resolves the latest published
+`wn-agent-v*` release once, then uses its immutable URL for all downloads.
+WN Agent releases are currently marked GitHub pre-releases; the resolver accepts
+published numeric tags and excludes draft releases and `-rc`/other suffixes.
+GitHub's repository-wide `/releases/latest` may select MDK or MarmotKit instead.
+Resolution or checksum failure stops installation; no unverified fallback runs.
+For the default cohort, remove stale `MARMOT_RELEASE_REPO`, `MARMOT_RELEASE_TAG`,
+`WN_AGENT_VERSION` and `WN_AGENT_SHA` overrides; the published installer defaults
+its companion assets to its own release. Explicit overrides are a custom install.
+For repeatable deployments, save the printed `base_url` and reuse that exact
+release rather than resolving again. Minimum host versions and pinned test
+cohorts below describe compatibility, not a required MDK install version.
 
 ```sh
 install_verified() (
@@ -53,8 +68,8 @@ install_verified() (
   installer_script="${installer_url##*/}"
   tmpdir="$(mktemp -d)"
   trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
-  curl -fsSL "$installer_url" -o "$tmpdir/$installer_script"
-  curl -fsSL "$checksum_url" -o "$tmpdir/$installer_script.sha256"
+  curl -fsSL --connect-timeout 10 --max-time 180 "$installer_url" -o "$tmpdir/$installer_script"
+  curl -fsSL --connect-timeout 10 --max-time 180 "$checksum_url" -o "$tmpdir/$installer_script.sha256"
   if command -v shasum >/dev/null 2>&1; then
     (cd "$tmpdir" && shasum -a 256 -c "$installer_script.sha256")
   elif command -v sha256sum >/dev/null 2>&1; then
@@ -66,7 +81,30 @@ install_verified() (
   bash "$tmpdir/$installer_script" "$@"
 )
 
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
+base_url="$(python3 - <<'RELEASE'
+import json, re, urllib.request
+candidates = []
+for page in range(1, 11):
+    url = f"https://api.github.com/repos/marmot-protocol/mdk/releases?per_page=100&page={page}"
+    with urllib.request.urlopen(url, timeout=30) as response:
+        releases = json.load(response)
+    for release in releases:
+        tag = release["tag_name"]
+        match = re.fullmatch(r"wn-agent-v([0-9]+)\.([0-9]+)\.([0-9]+)", tag)
+        if match and not release["draft"] and release["published_at"]:
+            candidates.append((tuple(map(int, match.groups())), tag))
+    if len(releases) < 100:
+        break
+else:
+    raise SystemExit("Release listing exceeded 1000 entries; choose a reviewed tag explicitly")
+if not candidates:
+    raise SystemExit("No published WN Agent release found")
+tag = max(candidates)[1]
+print(f"https://github.com/marmot-protocol/mdk/releases/download/{tag}")
+RELEASE
+)" || exit 1
+test -n "$base_url" || exit 1
+printf 'Selected WN Agent release: %s\n' "$base_url"
 ```
 
 ### Hermes
@@ -201,9 +239,131 @@ before running it.
 Use each connector's README for existing-identity imports, shared deployments,
 execution profiles, manual service control, and development workflows.
 
+## Recommended chat setup
+
+For a personal agent chat, the recommended setup is a dedicated group/DM with
+**the agent promoted to group admin** so it can maintain a useful task title.
+The phone owner performs the promotion through White Noise's group management.
+Group admin carries real membership/profile authority; keep the human owner as
+an admin too. This is recommended for trusted agents, not an automatic grant
+in every shared group. Admin status does not authorize new senders or grant
+backend tools. Ordinary messages and reactions do not require admin status.
+
+Before installation, settle the few choices that change the setup:
+
+- Which runtime/profile and existing account should this chat use? Default to
+  the selected runtime's isolated connector identity; reuse an identity only
+  when requested.
+- Which phone account may invite and prompt it, and which project directory
+  should terminal-harness work start in?
+- Is this a trusted personal agent chat with admin/title management? Recommend
+  yes; keep a shared group member-only unless its owner chooses otherwise.
+- Which files are needed, and is generated-file delivery supported/configured?
+  Keep the selected runtime's existing permissions as the execution default.
+
+Use answers already supplied in the installation prompt; ask only for missing
+choices. A supplied npub is public authorization information, not a secret
+identity import. Summarize the concrete setup plan for the prompt's approval
+step. Do not repeatedly ask for choices that have already been made.
+
+### Suggested agent chat instructions
+
+The following is a suggested instruction block to add to the selected agent's
+normal profile/project instructions. It is not installed automatically by the
+connector, and a terminal session's `/goal` alone cannot expose missing tools:
+
+> Work in the current White Noise conversation. Keep its title a short,
+> findable description of the accepted task, optionally with one project emoji.
+> Rename only on a real topic change; keep the title during status questions,
+> retries and completion. Read the current title first, preserve the current
+> chat binding, and read back an update. Never put secrets or personal details
+> in a title. After an uncertain write, inspect before retrying.
+>
+> Use real message reactions for progress: 👀 when an actionable request is
+> accepted, ✅ after the requested result is completed and verified, ⏸️ when a
+> real user decision is required, and ❌ on terminal failure. Replace your own
+> earlier progress reaction rather than stacking it; do not send the emoji as
+> a separate chat message. React to the triggering message in this chat. A
+> planned change, queued build or draft is not a completed result. Emoji-only
+> user messages are context, not blanket approval for a destructive action.
+>
+> Read the selected connector's setup and capability guide. Use only tools and
+> file paths authorized for this deployment. Keep follow-up messages attached
+> to the unfinished task unless the user changes it. Report the verified result
+> concisely, with a link or delivered file when appropriate. If a required
+> title, reaction or file tool is missing, explain that limitation rather than
+> pretending the action worked.
+
+### Check the tools before promising the experience
+
+- **Hermes:** `marmot_group_profile` updates a name/description as an admin;
+  `marmot_reaction` adds/removes a message reaction. The optional presence
+  policy and model-issued reactions need one consistent owner so they do not
+  compete. See [the Hermes guide](hermes/marmot/README.md#what-you-can-do).
+- **OpenClaw:** the normal `message` tool supports `react` with an emoji,
+  target message id and chat target; `remove: true` removes it. There is no
+  registered Marmot group-rename action today. Admin status alone does not add
+  that action. Title management requires a separately configured, trusted local
+  `group_profile_update` tool/helper.
+- **Claude Code, Codex, OpenCode and Pi:** shared harness commands handle chat
+  sessions, workdirs and goals; they do not register title or reaction tools.
+  A deployment may expose a trusted local helper to the backend using
+  `group_info`, `group_profile_update`, `send_reaction` and `remove_reaction`
+  from the [agent-control protocol](../crates/agent-control/README.md).
+  Bind it to the selected connector account and actual chat, with access only
+  through the authorized local socket. Do not guess a chat from its display
+  name, copy control secrets into prompts, or start a second daemon/CLI writer
+  against the same account home. Without that helper, ordinary replies work
+  but automated titles/reactions remain unavailable.
+
+### Acceptance check on the phone
+
+1. Invite the bootstrapped agent from the authorized phone account and grant
+   admin in the intended chat when title management is selected.
+2. Select the project for a terminal harness, then send a small ordinary model
+   request. Verify the response lands in that same chat.
+3. If title/reaction tools are configured, verify a meaningful task title and
+   a 👀 → ✅ transition on the request, without a duplicate emoji message. Make
+   a new request to verify session continuity; a status question should keep
+   the task title. Never mark a missing helper or rejected admin change as passed.
+4. Test one required file type and generated-file return if supported. Check
+   [the capability guide](#connector-capabilities) before choosing the test.
+5. Report which runtime/profile, connector identity, services and chat were
+   verified, and list remaining phone/tool checks explicitly. A service start,
+   local `/status` reply or readiness probe alone is not this acceptance check.
+
+## Connector capabilities
+
+All six connectors provide encrypted White Noise conversations with an agent
+runtime you already use. The runtime supplies the model, tools and permissions;
+`wn-agent` supplies Marmot identity, encrypted transport and durable delivery.
+Choose by the features you need:
+
+| Connector | Conversation and controls | Files |
+| --- | --- | --- |
+| [Hermes](hermes/marmot/README.md#what-you-can-do) | DM/group activation; history, quotes, reactions, own-message deletion, admin group profile updates; optional live previews/presence/approval reactions | Inbound media; image/document/video/voice sends with approved-root staging |
+| [OpenClaw](openclaw/marmot/README.md#what-you-can-do) | Gateway routing; DM/group activation; history, quotes, quiet changes, own-message deletion, reactions, consent-based public profile naming; current inbound turns are final-only | Host-authorized inbound/outbound media via normal message tool |
+| [Claude Code](claude/marmot/README.md#what-you-can-do) | Per-chat session/project/goal; shared chat and recovery commands; text replies | Text-only; no attachments or generated-file return |
+| [Codex](codex/marmot/README.md#what-you-can-do) | Per-chat thread/project/goal; shared chat and recovery commands; completed text replies | Native images and supported staged files; opt-in generated-file return with exact grants |
+| [OpenCode](opencode/marmot/README.md#what-you-can-do) | Per-chat session/project/goal; shared chat and recovery commands; text-event replies | Supported images/PDFs/text; no generated-file return |
+| [Pi](pi/marmot/README.md#what-you-can-do) | Per-chat session/project/goal; shared chat and recovery commands; completed text replies | Supported images/text; no generated-file return |
+
+For terminal harnesses, start with `/cd src/my-project`, send an ordinary request,
+then use `/status`, `/goal <instruction>` or `/new` as needed. The complete
+[chat-command reference](terminal-harness/README.md#chat-commands) explains
+recovery, session resets and slash escaping. These harnesses do not add gateway
+mention activation, reaction tools or live previews.
+
+For gateway plugins, ask in the current chat and use the runtime's registered
+Marmot tools and media-delivery contract. A file accepted by a connector is not
+a promise that the selected model can interpret it. Voice/audio upload shares
+the group's configured media endpoint and limits; personal kind-10063 discovery
+is not yet implemented. Each linked guide explains opt-ins, restrictions and
+verification steps; installing another connector does not inherit its features.
+
 ## First-install verification
 
-Agents following a copied White Noise prompt should use the connector's
+For a copied White Noise installation prompt, use the connector's
 [first-install checklist](../crates/agent-connector/README.md#first-installation-from-a-white-noise-prompt)
 and the selected runtime's guide. Resolve the actual runtime/profile home,
 choose one owner for each connector socket/service, verify the downloaded

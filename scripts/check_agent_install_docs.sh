@@ -32,12 +32,13 @@ base_url = (
     "https://github.com/marmot-protocol/mdk/releases/download/"
     f"wn-agent-v{version}"
 )
-if quickstart.count(f'base_url="{base_url}"') != 1:
-    print(
-        "error: integrations/README.md must define exactly one immutable current-release base_url "
-        f"({base_url})",
-        file=sys.stderr,
-    )
+# Quickstarts follow the latest published WN Agent cohort; release.md remains
+# the exact-version release record. Preserve immutable download/checksum pairing.
+sys.path.insert(0, str(Path("scripts").resolve()))
+from check_install_example_sha256 import evergreen_release_errors
+errors = evergreen_release_errors(quickstart)
+if errors:
+    print("error: integrations/README.md: " + "; ".join(errors), file=sys.stderr)
     raise SystemExit(1)
 if release_guide.count(f'base_url="{base_url}"') != 1:
     print(
@@ -85,4 +86,4 @@ if [ -n "$stale_versioned_urls" ]; then
     exit 1
 fi
 
-echo "agent install documentation matches wn-agent-v$workspace_version"
+echo "agent install documentation: evergreen README selection and exact release records are valid"

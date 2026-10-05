@@ -17,6 +17,7 @@ with `codex exec resume --json <thread-id> -`.
 
 ## Contents
 
+- [What you can do](#what-you-can-do)
 - [First-install checklist](#first-install-checklist)
 - [Install (Codex Already Installed)](#install-codex-already-installed)
 - [Manual Setup](#manual-setup)
@@ -25,6 +26,38 @@ with `codex exec resume --json <thread-id> -`.
 - [Inbound attachments](#inbound-attachments)
 - [Security Notes](#security-notes)
 - [Development](#development)
+
+## What you can do
+
+For task titles and progress reactions, use the shared
+[recommended chat setup](../../README.md#recommended-chat-setup), including
+admin promotion, the suggested instruction block and the phone acceptance test.
+This harness does not register title/reaction tools. For that experience,
+configure and verify a trusted helper available to the backend; admin promotion
+or a `/goal` instruction alone is insufficient.
+
+- **Work through Codex from your phone.** Send a prompt from an authorized
+  White Noise account and use the backend's configured model and tools.
+  Every allowed message activates the harness; mentioning the agent is not required.
+- **Choose a project for this chat.** Send `/cd src/my-project`, then an ordinary
+  request such as `Explain the failing test`. The path must resolve beneath the
+  service user's home. This selects a working directory, not a sandbox.
+- **Continue or reset the conversation.** Codex creates a separate thread for each chat and resumes that thread on later prompts. Completed assistant messages reach the phone; reasoning, tool/command output and partial events do not.
+  `/new` resets the backend session while retaining the project.
+- **Keep a standing instruction.** `/goal Run the affected tests after edits`
+  applies to later prompts in this chat; `/goal clear` removes it. This stores
+  instructions for future turns, not a scheduler or a background task.
+- **Inspect and recover a turn.** `/help`, `/status` and `/pwd` report local
+  chat settings. After a reported recovery barrier, inspect side effects before
+  `/retry-last`, or use `/discard-last` to proceed without replaying that turn.
+  See [Chat Commands](#chat-commands) for all commands and slash escaping.
+- **Know the file contract.** Images use native CLI image inputs; other supported files use a staged-file manifest and normal file tools. Native audio/PDF interpretation is not guaranteed. Generated-file return is available only through opt-in, exact chat/root grants and a completion manifest. See [Configuration](#configuration) and [Inbound attachments](#inbound-attachments).
+
+Tool access, credentials and model choices come from the backend's native
+configuration and the [execution profile](../../terminal-harness/README.md#execution-profiles).
+The harness does not implement mention activation, reaction/profile management
+or live previews. An interactive backend's slash commands are not automatically
+available through this chat; shared harness commands are handled locally.
 
 ## First-install checklist
 
@@ -66,6 +99,19 @@ the current guided install command and the steps to finish in White Noise.
 
 For noninteractive setup, provide the allowed inviter and prompt sender:
 
+The example below requires Python 3 and resolves the latest published
+`wn-agent-v*` release once, then uses its immutable URL for all downloads.
+WN Agent releases are currently marked GitHub pre-releases; the resolver accepts
+published numeric tags and excludes draft releases and `-rc`/other suffixes.
+GitHub's repository-wide `/releases/latest` may select MDK or MarmotKit instead.
+Resolution or checksum failure stops installation; no unverified fallback runs.
+For the default cohort, remove stale `MARMOT_RELEASE_REPO`, `MARMOT_RELEASE_TAG`,
+`WN_AGENT_VERSION` and `WN_AGENT_SHA` overrides; the published installer defaults
+its companion assets to its own release. Explicit overrides are a custom install.
+For repeatable deployments, save the printed `base_url` and reuse that exact
+release rather than resolving again. Minimum host versions and pinned test
+cohorts below describe compatibility, not a required MDK install version.
+
 ```sh
 install_verified() (
   set -eu
@@ -75,8 +121,8 @@ install_verified() (
   installer_script="${installer_url##*/}"
   tmpdir="$(mktemp -d)"
   trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
-  curl -fsSL "$installer_url" -o "$tmpdir/$installer_script"
-  curl -fsSL "$checksum_url" -o "$tmpdir/$installer_script.sha256"
+  curl -fsSL --connect-timeout 10 --max-time 180 "$installer_url" -o "$tmpdir/$installer_script"
+  curl -fsSL --connect-timeout 10 --max-time 180 "$checksum_url" -o "$tmpdir/$installer_script.sha256"
   if command -v shasum >/dev/null 2>&1; then
     (cd "$tmpdir" && shasum -a 256 -c "$installer_script.sha256")
   elif command -v sha256sum >/dev/null 2>&1; then
@@ -88,7 +134,30 @@ install_verified() (
   bash "$tmpdir/$installer_script" "$@"
 )
 
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
+base_url="$(python3 - <<'RELEASE'
+import json, re, urllib.request
+candidates = []
+for page in range(1, 11):
+    url = f"https://api.github.com/repos/marmot-protocol/mdk/releases?per_page=100&page={page}"
+    with urllib.request.urlopen(url, timeout=30) as response:
+        releases = json.load(response)
+    for release in releases:
+        tag = release["tag_name"]
+        match = re.fullmatch(r"wn-agent-v([0-9]+)\.([0-9]+)\.([0-9]+)", tag)
+        if match and not release["draft"] and release["published_at"]:
+            candidates.append((tuple(map(int, match.groups())), tag))
+    if len(releases) < 100:
+        break
+else:
+    raise SystemExit("Release listing exceeded 1000 entries; choose a reviewed tag explicitly")
+if not candidates:
+    raise SystemExit("No published WN Agent release found")
+tag = max(candidates)[1]
+print(f"https://github.com/marmot-protocol/mdk/releases/download/{tag}")
+RELEASE
+)" || exit 1
+test -n "$base_url" || exit 1
+printf 'Selected WN Agent release: %s\n' "$base_url"
 install_verified "$base_url/install-codex-marmot.sh" \
   "$base_url/install-codex-marmot.sh.sha256" \
   --yes --allow-welcomer npub1...

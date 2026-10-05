@@ -3,14 +3,76 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import check_install_example_sha256 as gate
 
 
 class InstallExampleSha256GateTests(unittest.TestCase):
+    def resolve_fixture(self, pages: list[list[dict]]) -> tuple[str, int]:
+        readme = (Path(__file__).resolve().parents[1] / "integrations/README.md").read_text()
+        source = gate.release_resolver_source(readme)
+        self.assertIsNotNone(source)
+        calls = []
+
+        def fetch(url, timeout):
+            self.assertEqual(timeout, 30)
+            self.assertTrue(url.startswith("https://api.github.com/repos/marmot-protocol/mdk/releases?per_page=100&page="))
+            page = int(url.rsplit("=", 1)[1])
+            calls.append(page)
+            return io.StringIO(json.dumps(pages[page - 1]))
+
+        output = io.StringIO()
+        with patch("urllib.request.urlopen", side_effect=fetch), contextlib.redirect_stdout(output):
+            exec(compile(source, "README release resolver", "exec"), {})
+        return output.getvalue().strip(), len(calls)
+
+    @staticmethod
+    def release(tag, draft=False, published=True):
+        return {"tag_name": tag, "draft": draft, "prerelease": True,
+                "published_at": "2026-01-01T00:00:00Z" if published else None}
+
+    def test_latest_resolver_chooses_numeric_cohort_and_excludes_unpublished(self):
+        output, calls = self.resolve_fixture([[self.release("wn-agent-v1.9.0"),
+            self.release("v99.0.0"), self.release("marmotkit-v99.0.0"),
+            self.release("wn-agent-v1.10.0"), self.release("wn-agent-v2.0.0-rc1"),
+            self.release("wn-agent-v3.0.0", draft=True),
+            self.release("wn-agent-v4.0.0", published=False)]])
+        self.assertEqual(output, "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v1.10.0")
+        self.assertEqual(calls, 1)
+
+    def test_latest_resolver_paginates_past_other_release_families(self):
+        output, calls = self.resolve_fixture([[self.release("v1.0.0")] * 100,
+                                             [self.release("wn-agent-v2.0.0")]])
+        self.assertTrue(output.endswith("/wn-agent-v2.0.0"))
+        self.assertEqual(calls, 2)
+
+    def test_latest_resolver_fails_without_matching_release(self):
+        with self.assertRaisesRegex(SystemExit, "No published"):
+            self.resolve_fixture([[self.release("v1.0.0")]])
+
+    def test_latest_resolver_fails_if_listing_cannot_be_completed(self):
+        with self.assertRaisesRegex(SystemExit, "exceeded 1000"):
+            self.resolve_fixture([[self.release("wn-agent-v1.0.0")] * 100] * 10)
+
+    def test_latest_resolver_network_failure_has_no_fallback(self):
+        source = gate.release_resolver_source((Path(__file__).resolve().parents[1] / "integrations/README.md").read_text())
+        with patch("urllib.request.urlopen", side_effect=OSError("offline")):
+            with self.assertRaisesRegex(OSError, "offline"):
+                exec(compile(source, "README release resolver", "exec"), {})
+
+    def test_evergreen_gate_rejects_a_fixed_or_non_fail_closed_url(self):
+        readme = (Path(__file__).resolve().parents[1] / "integrations/README.md").read_text()
+        self.assertEqual(gate.evergreen_release_errors(readme), [])
+        self.assertTrue(gate.evergreen_release_errors(readme.replace(')" || exit 1', ')"', 1)))
+        self.assertTrue(gate.evergreen_release_errors(readme + '\nbase_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v1.0.0"'))
+
     def test_rejects_download_to_shell_pipeline(self) -> None:
         text = "curl -fsSL https://example.test/install.sh | bash\n"
         self.assertTrue(gate.find_download_to_shell_pipelines(text))

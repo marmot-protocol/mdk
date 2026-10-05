@@ -58,6 +58,30 @@ SAME_SHELL_SURFACES = (
 )
 
 
+def release_resolver_source(text: str) -> str | None:
+    matches = re.findall(
+        r'base_url="\$\(python3 - <<\x27RELEASE\x27\n(.*?)\nRELEASE\n\)" \|\| exit 1',
+        text,
+        re.DOTALL,
+    )
+    return matches[0] if len(matches) == 1 else None
+
+
+def evergreen_release_errors(text: str) -> list[str]:
+    errors: list[str] = []
+    source = release_resolver_source(text)
+    if source is None:
+        errors.append("expected exactly one bounded latest WN Agent release resolver")
+    if re.search(
+        r'base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v[0-9]',
+        text,
+    ):
+        errors.append("install README must not pin a current WN Agent version")
+    if 'test -n "$base_url" || exit 1' not in text:
+        errors.append("release resolution must fail closed before installer execution")
+    return errors
+
+
 def find_download_to_shell_pipelines(text: str) -> list[str]:
     """Return curl/wget commands whose bytes are piped directly to a shell."""
     logical_lines = text.replace("\\\n", " ").splitlines()
@@ -213,8 +237,15 @@ def repository_errors(root: Path) -> list[str]:
         if len(hits) > allowed:
             errors.extend(hits[allowed:])
 
+    canonical = release_resolver_source(
+        (root / "integrations/README.md").read_text(encoding="utf-8")
+    )
     for relative, installers in DOCUMENTED_INSTALL_CALLS.items():
         text = (root / relative).read_text(encoding="utf-8")
+        for error in evergreen_release_errors(text):
+            errors.append(f"{relative}: {error}")
+        if release_resolver_source(text) != canonical:
+            errors.append(f"{relative}: release resolver differs from canonical quickstart")
         for error in documented_surface_errors(text, installers):
             errors.append(f"{relative}: {error}")
 

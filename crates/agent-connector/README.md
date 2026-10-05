@@ -59,20 +59,25 @@ Agent-facing wire types live in [`agent-control`](../agent-control) and stream c
 
 ## First installation from a White Noise prompt
 
-White Noise's copied installation prompt links to this README. If you are an
-agent following that prompt, read the selected runtime's guide as well: the
+The [recommended chat setup](../../integrations/README.md#recommended-chat-setup)
+covers the trusted-agent admin default, task titles, progress reactions,
+missing preference questions and a complete phone acceptance checklist.
+
+White Noise's copied installation prompt links to this README. Installation
+also requires the selected runtime's guide: the
 [quickstart](../../integrations/README.md#get-started-white-noise--agents) links
 Hermes, OpenClaw, Claude Code, Codex, OpenCode and Pi. Installing `wn-agent`
 alone does not connect the model runtime or start its gateway/harness.
 The detailed preflight is [Hermes profile selection](../../integrations/hermes/marmot/README.md#first-install-and-profile-selection),
 [OpenClaw instance selection](../../integrations/openclaw/marmot/README.md#first-install-checklist),
 or the [terminal-harness installation guide](../../integrations/terminal-harness/README.md#first-installation-and-verification)
-with each backend's checklist. Read that selected path before changing files.
+with each backend's checklist. Compare the [connector capabilities](../../integrations/README.md#connector-capabilities)
+to select the runtime that supports the required chat and file workflow.
 
-Before changing anything, explain the connector's local account/socket/service,
-which runtime configuration will change, how the supplied **public** phone
-`npub` will be authorized, and the proposed verification. Obtain the approval
-requested by the install prompt. The phone's npub is an inviter/sender identity,
+The setup plan identifies the connector's local account/socket/service, the
+runtime configuration being changed, the supplied **public** phone `npub`
+authorization and the verification steps. The installation prompt includes an
+approval step for that plan. The phone's npub is an inviter/sender identity,
 not the agent's identity and never a secret key to import.
 
 1. **Identify the runtime and its real state home.** Confirm its version,

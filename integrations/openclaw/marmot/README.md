@@ -19,6 +19,7 @@ the Python Hermes plugin in [`../../hermes/marmot/`](../../hermes/marmot).
 
 ## Contents
 
+- [What you can do](#what-you-can-do)
 - [First-install checklist](#first-install-checklist)
 - [Install (release)](#install-release)
 - [Dev setup](#dev-setup)
@@ -27,6 +28,44 @@ the Python Hermes plugin in [`../../hermes/marmot/`](../../hermes/marmot).
 - [How it works](#how-it-works)
 - [Local gateway harness](#local-gateway-harness)
 - [Tests](#tests)
+
+## What you can do
+
+For task titles and progress reactions, use the shared
+[recommended chat setup](../../README.md#recommended-chat-setup), including
+admin promotion, the suggested instruction block and the phone acceptance test.
+The message tool supplies reactions; automated group titles need a configured
+local helper because this plugin does not register a rename action.
+
+- **Use your configured OpenClaw agent from White Noise.** Authorized prompts
+  reach the gateway's model/tools and replies return to that conversation.
+  Effective DMs activate automatically; multi-party groups use mentions or
+  configured triggers unless `groupActivation: "always"` is selected.
+- **Continue a group conversation.** Routing uses the full Marmot group id;
+  distinct groups have independent FIFO dispatch. Reply quotes, recent history
+  and quiet edit/delete/reaction/group changes supply context. `marmot_history`
+  reads exact messages or pages older history.
+- **Exchange files.** Received media is downloaded into the host's media path;
+  actual interpretation depends on the model. Send files with OpenClaw's normal
+  `message` tool media/attachment fields from an authorized workspace/store.
+  Source authorization and connector staging authorization are separate checks.
+  See [first file verification](#verify-text-and-files-separately).
+- **Reply, react and retract own messages.** Normal assistant replies
+  need no manual target. Explicit `message` sends target the MLS group id (a DM
+  is also a group); the registered delete action retracts a prior own message. `message(action: "react",
+  emoji: "👀", messageId: <id>, to: <group-id>)` adds a reaction; `remove: true`
+  removes it. Use the exact target from the active conversation.
+- **Publish an account display name with consent.** Profile-name onboarding
+  asks before publishing a public Nostr name and remembers the answer.
+- **Inspect channel readiness.** Healthy channel status requires the inbound
+  subscription, invitation-policy reconciliation and a valid sender policy.
+  A socket alone does not show that a sender can invoke the model.
+
+The full settings and behavior contracts are in [Configuration](#configuration)
+and [How it works](#how-it-works). Inbound turns currently deliver completed
+answers only: live-preview primitives are tested but are not wired into that
+turn path. Models, tools, routing policies and permissions remain OpenClaw-owned.
+There is no connector setting for a personal Blossom server list today.
 
 ## First-install checklist
 
@@ -128,6 +167,19 @@ Prerequisites:
   same `wn-agent-v*` release: the plugin calls `stream_finish` with no fallback
   for older connectors.
 
+The example below requires Python 3 and resolves the latest published
+`wn-agent-v*` release once, then uses its immutable URL for all downloads.
+WN Agent releases are currently marked GitHub pre-releases; the resolver accepts
+published numeric tags and excludes draft releases and `-rc`/other suffixes.
+GitHub's repository-wide `/releases/latest` may select MDK or MarmotKit instead.
+Resolution or checksum failure stops installation; no unverified fallback runs.
+For the default cohort, remove stale `MARMOT_RELEASE_REPO`, `MARMOT_RELEASE_TAG`,
+`WN_AGENT_VERSION` and `WN_AGENT_SHA` overrides; the published installer defaults
+its companion assets to its own release. Explicit overrides are a custom install.
+For repeatable deployments, save the printed `base_url` and reuse that exact
+release rather than resolving again. Minimum host versions and pinned test
+cohorts below describe compatibility, not a required MDK install version.
+
 ```sh
 install_verified() (
   set -eu
@@ -137,8 +189,8 @@ install_verified() (
   installer_script="${installer_url##*/}"
   tmpdir="$(mktemp -d)"
   trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
-  curl -fsSL "$installer_url" -o "$tmpdir/$installer_script"
-  curl -fsSL "$checksum_url" -o "$tmpdir/$installer_script.sha256"
+  curl -fsSL --connect-timeout 10 --max-time 180 "$installer_url" -o "$tmpdir/$installer_script"
+  curl -fsSL --connect-timeout 10 --max-time 180 "$checksum_url" -o "$tmpdir/$installer_script.sha256"
   if command -v shasum >/dev/null 2>&1; then
     (cd "$tmpdir" && shasum -a 256 -c "$installer_script.sha256")
   elif command -v sha256sum >/dev/null 2>&1; then
@@ -150,7 +202,30 @@ install_verified() (
   bash "$tmpdir/$installer_script" "$@"
 )
 
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
+base_url="$(python3 - <<'RELEASE'
+import json, re, urllib.request
+candidates = []
+for page in range(1, 11):
+    url = f"https://api.github.com/repos/marmot-protocol/mdk/releases?per_page=100&page={page}"
+    with urllib.request.urlopen(url, timeout=30) as response:
+        releases = json.load(response)
+    for release in releases:
+        tag = release["tag_name"]
+        match = re.fullmatch(r"wn-agent-v([0-9]+)\.([0-9]+)\.([0-9]+)", tag)
+        if match and not release["draft"] and release["published_at"]:
+            candidates.append((tuple(map(int, match.groups())), tag))
+    if len(releases) < 100:
+        break
+else:
+    raise SystemExit("Release listing exceeded 1000 entries; choose a reviewed tag explicitly")
+if not candidates:
+    raise SystemExit("No published WN Agent release found")
+tag = max(candidates)[1]
+print(f"https://github.com/marmot-protocol/mdk/releases/download/{tag}")
+RELEASE
+)" || exit 1
+test -n "$base_url" || exit 1
+printf 'Selected WN Agent release: %s\n' "$base_url"
 install_verified "$base_url/install-openclaw-marmot.sh" \
   "$base_url/install-openclaw-marmot.sh.sha256"
 ```
@@ -170,7 +245,7 @@ an `npub` or raw hex public key:
 Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
+# Reuse the resolved base_url from the same shell above.
 install_verified "$base_url/install-openclaw-marmot.sh" \
   "$base_url/install-openclaw-marmot.sh.sha256" \
   --yes --allow-welcomer npub1...
@@ -184,7 +259,7 @@ with `--generate-identity`). To preserve an existing Nostr identity, place its
 Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
+# Reuse the resolved base_url from the same shell above.
 install_verified "$base_url/install-openclaw-marmot.sh" \
   "$base_url/install-openclaw-marmot.sh.sha256" \
   --yes \

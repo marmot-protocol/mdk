@@ -9,6 +9,7 @@ For the current guided install, runtime chooser, and steps to finish in White No
 
 ## Contents
 
+- [What you can do](#what-you-can-do)
 - [First install and profile selection](#first-install-and-profile-selection)
 - [Source Install (Exact Commit)](#source-install-exact-commit)
 - [Release Install (Hermes Already Installed)](#release-install-hermes-already-installed)
@@ -19,6 +20,44 @@ For the current guided install, runtime chooser, and steps to finish in White No
 - [Approval reactions (opt in)](#approval-reactions-opt-in)
 - [Optional presence reactions](#optional-presence-reactions)
 - [Inbound durability boundary](#inbound-durability-boundary)
+
+## What you can do
+
+For task titles and progress reactions, use the shared
+[recommended chat setup](../../README.md#recommended-chat-setup), including
+admin promotion, the suggested instruction block and the phone acceptance test.
+This plugin supplies the group-profile and reaction tools; enable the chosen
+chat policy in the actual Hermes profile and verify it on the phone.
+
+- **Chat privately with your configured Hermes agent.** Replies use the current
+  White Noise conversation; effective DMs activate automatically, while group
+  mentions or configured triggers control multi-party activation. Sender
+  authorization still applies. See [activation](#group-activation-multi-party-groups).
+- **Follow a conversation and its history.** Recent messages, reply quotes,
+  reactions and deletion state accompany a turn. `marmot_history` reads an exact
+  message or older pages; [quiet ambient continuity](#quiet-ambient-continuity)
+  carries relevant changes into a later turn without triggering a reply.
+- **Send and receive files.** The adapter has explicit image, document, video
+  and voice send methods; the host decides how received media reaches its model.
+  Return a generated file using [approved-root MEDIA staging](#sending-a-generated-file).
+  [Endpoint and voice-note limits](#upload-endpoints-and-voice-notes) apply to audio too.
+- **Manage messages and group presentation.** `marmot_reaction` adds/removes
+  reactions; `delete_marmot_message` retracts a prior own message.
+  `marmot_group_profile` changes a group's name/description only as a current
+  admin. Tool arguments, history cursors and limits are in [Behavior](#behavior).
+- **Show progress when configured.** Live previews are transient; the completed
+  answer is durable. Explicit host delivery context can route commentary to
+  agent activity. Preview configuration and final-delivery rules are in
+  [Behavior](#behavior), and [presence reactions](#optional-presence-reactions)
+  and [approval reactions](#approval-reactions-opt-in) are opt-in features.
+- **Check installation health.** `marmot_status` and the
+  [installation doctor](#installation-doctor) diagnose local wiring; a phone
+  round trip remains the delivery test. Public profile-name onboarding asks for
+  consent before publication.
+
+Models, repository tools, automation, credentials and execution permissions
+come from the selected Hermes profile. The connector does not grant a new tool
+permission or a self-hosted media preference merely because a sender is allowed.
 
 ## First install and profile selection
 
@@ -222,6 +261,19 @@ its candidate capability API.
 
 Verified install (the helper also forwards any installer arguments after the two URLs):
 
+The example below requires Python 3 and resolves the latest published
+`wn-agent-v*` release once, then uses its immutable URL for all downloads.
+WN Agent releases are currently marked GitHub pre-releases; the resolver accepts
+published numeric tags and excludes draft releases and `-rc`/other suffixes.
+GitHub's repository-wide `/releases/latest` may select MDK or MarmotKit instead.
+Resolution or checksum failure stops installation; no unverified fallback runs.
+For the default cohort, remove stale `MARMOT_RELEASE_REPO`, `MARMOT_RELEASE_TAG`,
+`WN_AGENT_VERSION` and `WN_AGENT_SHA` overrides; the published installer defaults
+its companion assets to its own release. Explicit overrides are a custom install.
+For repeatable deployments, save the printed `base_url` and reuse that exact
+release rather than resolving again. Minimum host versions and pinned test
+cohorts below describe compatibility, not a required MDK install version.
+
 ```sh
 install_verified() (
   set -eu
@@ -231,8 +283,8 @@ install_verified() (
   installer_script="${installer_url##*/}"
   tmpdir="$(mktemp -d)"
   trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
-  curl -fsSL "$installer_url" -o "$tmpdir/$installer_script"
-  curl -fsSL "$checksum_url" -o "$tmpdir/$installer_script.sha256"
+  curl -fsSL --connect-timeout 10 --max-time 180 "$installer_url" -o "$tmpdir/$installer_script"
+  curl -fsSL --connect-timeout 10 --max-time 180 "$checksum_url" -o "$tmpdir/$installer_script.sha256"
   if command -v shasum >/dev/null 2>&1; then
     (cd "$tmpdir" && shasum -a 256 -c "$installer_script.sha256")
   elif command -v sha256sum >/dev/null 2>&1; then
@@ -244,7 +296,30 @@ install_verified() (
   bash "$tmpdir/$installer_script" "$@"
 )
 
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
+base_url="$(python3 - <<'RELEASE'
+import json, re, urllib.request
+candidates = []
+for page in range(1, 11):
+    url = f"https://api.github.com/repos/marmot-protocol/mdk/releases?per_page=100&page={page}"
+    with urllib.request.urlopen(url, timeout=30) as response:
+        releases = json.load(response)
+    for release in releases:
+        tag = release["tag_name"]
+        match = re.fullmatch(r"wn-agent-v([0-9]+)\.([0-9]+)\.([0-9]+)", tag)
+        if match and not release["draft"] and release["published_at"]:
+            candidates.append((tuple(map(int, match.groups())), tag))
+    if len(releases) < 100:
+        break
+else:
+    raise SystemExit("Release listing exceeded 1000 entries; choose a reviewed tag explicitly")
+if not candidates:
+    raise SystemExit("No published WN Agent release found")
+tag = max(candidates)[1]
+print(f"https://github.com/marmot-protocol/mdk/releases/download/{tag}")
+RELEASE
+)" || exit 1
+test -n "$base_url" || exit 1
+printf 'Selected WN Agent release: %s\n' "$base_url"
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256"
 ```
@@ -261,7 +336,7 @@ repeated or given a comma-separated list to authorize multiple senders:
 Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
+# Reuse the resolved base_url from the same shell above.
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256" \
   --yes \
@@ -277,7 +352,7 @@ with `--generate-identity`). To preserve an existing Nostr identity, place its
 Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
+# Reuse the resolved base_url from the same shell above.
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256" \
   --yes \
@@ -307,7 +382,7 @@ To accept Marmot messages from any sender (explicit opt-in):
 Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
+# Reuse the resolved base_url from the same shell above.
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256" \
   --yes --allow-all-users
