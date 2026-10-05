@@ -5,8 +5,8 @@
 use super::*;
 use nostr_relay_builder::prelude::{
     Backend, BoxedFuture, DatabaseError, DatabaseEventStatus, Event, EventId, Events,
-    Filter as RelayFilter, MemoryDatabase, MemoryDatabaseOptions, NostrDatabase, PolicyResult,
-    QueryPolicy, SaveEventStatus, SingleLetterTag, Timestamp as RelayTimestamp,
+    Filter as RelayFilter, Kind as RelayKind, MemoryDatabase, MemoryDatabaseOptions, NostrDatabase,
+    PolicyResult, QueryPolicy, SaveEventStatus, SingleLetterTag, Timestamp as RelayTimestamp,
 };
 use nostr_relay_builder::{LocalRelay, RelayBuilder};
 use nostr_sdk::prelude::{
@@ -249,7 +249,11 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     );
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
-    let healthy_relay = LocalRelay::new(RelayBuilder::default());
+    let healthy_database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
+        events: true,
+        max_events: Some(256),
+    });
+    let healthy_relay = LocalRelay::new(RelayBuilder::default().database(healthy_database.clone()));
     healthy_relay.run().await.unwrap();
     let healthy_url = healthy_relay.url().await.to_string();
     let dir = tempfile::tempdir().unwrap();
@@ -536,6 +540,74 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     .await
     .expect("healthy-group send finishes before the held recovery request")
     .expect("healthy-group send succeeds");
+    let local_token = "startup-healthy-durable-send";
+    let accepted = timeout(
+        Duration::from_secs(2),
+        reopened.submit_text(
+            &alice.label,
+            &groups[1],
+            "durable send while recovering".into(),
+            local_token.into(),
+        ),
+    )
+    .await
+    .expect("durable acceptance remains available during startup recovery")
+    .expect("healthy-group durable submission is accepted");
+    let published = timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(crate::LocalSendStatus::Completed(summary)) = reopened
+                .local_send_status(&alice.label, &groups[1], local_token)
+                .unwrap()
+            {
+                break summary;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("healthy-group durable send completes before the held recovery request");
+    assert_eq!(
+        published.accept_disposition,
+        cgka_traits::SendAcceptDisposition::Published
+    );
+    assert_eq!(published.published, 1);
+    assert_eq!(published.message_ids, vec![accepted.message_id_hex.clone()]);
+    let source_id = reopened_app
+        .account_storage(&alice.label)
+        .unwrap()
+        .timeline_message(&hex::encode(groups[1].as_slice()), &accepted.message_id_hex)
+        .unwrap()
+        .unwrap()
+        .source_message_id_hex
+        .expect("published durable send has a transport source");
+    assert!(
+        healthy_database
+            .event_by_id(&EventId::from_hex(&source_id).unwrap())
+            .await
+            .unwrap()
+            .is_some(),
+        "the healthy relay stores this exact send before recovery is released"
+    );
+    let repeated = reopened
+        .submit_text(
+            &alice.label,
+            &groups[1],
+            "durable send while recovering".into(),
+            local_token.into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted.message_id_hex, repeated.message_id_hex);
+    assert_eq!(
+        reopened_app
+            .messages(&alice.label)
+            .unwrap()
+            .iter()
+            .filter(|message| message.plaintext == "durable send while recovering")
+            .count(),
+        1,
+        "repeated durable admission keeps one canonical message"
+    );
     assert_eq!(gate.active.load(Ordering::SeqCst), 1);
     assert_eq!(activity.active_jobs.load(Ordering::SeqCst), 1);
     assert_eq!(activity.active_requests.load(Ordering::SeqCst), 1);
@@ -563,17 +635,75 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
             respond: ordered_respond,
         })
         .unwrap();
+    // This snapshot read is answered behind the two earlier commands, proving
+    // that the worker processed them into the deferred FIFO before admission.
+    timeout(
+        Duration::from_secs(2),
+        reopened.group_mls_state(&alice.label, &groups[1]),
+    )
+    .await
+    .expect("startup snapshot read crosses the established deferred barrier")
+    .unwrap();
     assert!(
-        timeout(Duration::from_millis(100), &mut ordered_answer)
-            .await
-            .is_err(),
+        matches!(
+            ordered_answer.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ),
         "a status behind a startup CatchUp barrier stays in FIFO"
     );
     assert!(
-        timeout(Duration::from_millis(100), &mut catch_up_answer)
-            .await
-            .is_err(),
+        matches!(
+            catch_up_answer.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ),
         "coalesced CatchUp waits for the initial comparison"
+    );
+    let relay_before_deferred = healthy_database
+        .query(RelayFilter::new().kind(RelayKind::MlsGroupMessage))
+        .await
+        .unwrap()
+        .iter()
+        .map(|event| event.id)
+        .collect::<HashSet<_>>();
+    let deferred_token = "startup-fifo-durable-send";
+    reopened
+        .submit_text(
+            &alice.label,
+            &groups[1],
+            "durable send behind startup barrier".into(),
+            deferred_token.into(),
+        )
+        .await
+        .unwrap();
+    sleep(Duration::from_millis(100)).await;
+    // A send stuck inside publication could still appear Queued. Require the
+    // serialized worker to answer again while the recovery request stays held.
+    timeout(
+        Duration::from_secs(2),
+        reopened.group_mls_state(&alice.label, &groups[1]),
+    )
+    .await
+    .expect("a deferred durable send does not occupy the worker")
+    .unwrap();
+    assert!(
+        matches!(
+            reopened
+                .local_send_status(&alice.label, &groups[1], deferred_token)
+                .unwrap(),
+            Some(crate::LocalSendStatus::Queued)
+        ),
+        "durable sends cannot bypass the deferred startup FIFO"
+    );
+    let relay_after_deferred = healthy_database
+        .query(RelayFilter::new().kind(RelayKind::MlsGroupMessage))
+        .await
+        .unwrap()
+        .iter()
+        .map(|event| event.id)
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        relay_after_deferred, relay_before_deferred,
+        "no deferred send reaches the relay while the startup barrier is held"
     );
     let mut bob_client = reopened_app.client(&bob.label).await.unwrap();
     bob_client
@@ -705,6 +835,24 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
         .await
         .expect("startup joins after release")
         .unwrap();
+    let published = timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(crate::LocalSendStatus::Completed(summary)) = reopened
+                .local_send_status(&alice.label, &groups[1], deferred_token)
+                .unwrap()
+            {
+                break summary;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("deferred durable send completes after startup FIFO replay");
+    assert_eq!(
+        published.accept_disposition,
+        cgka_traits::SendAcceptDisposition::Published
+    );
+    assert_eq!(published.published, 1);
     // The gap may start its own comparison straight away; the held job
     // itself is gone.
     timeout(Duration::from_secs(45), async {

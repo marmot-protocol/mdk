@@ -36,7 +36,11 @@ so CLI, TUI, and native surfaces never open the databases directly.
 worker-routed local reads are available. Relay activation, group-subscription registration, shared-directory
 synchronization, and initial catch-up continue asynchronously. Hosts should render local chat projections at that
 point, show network progress separately, and let later relay events refresh or reorder rows. Mutating worker commands
-received during initial catch-up are deferred and replayed in order once the live client is ready.
+received during initial catch-up are deferred and replayed in order once the live client is ready. While an owned
+comparison's network request runs outside the worker, an empty deferred queue permits both direct sends and durable
+local submissions to use the live client. Durable submissions retain the same completion, retry and projection path
+as steady-state sends; they do not bypass an earlier deferred command. Inline activation and other startup maintenance
+can still delay sends.
 
 **Per-account worker isolation.** A failed account open does not discard a sibling that reached local readiness.
 

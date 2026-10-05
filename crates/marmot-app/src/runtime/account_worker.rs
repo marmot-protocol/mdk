@@ -1211,6 +1211,9 @@ async fn run_app_runtime_account_worker(
     // join the startup FIFO. During an off-worker comparison the worker can
     // serve eligible live commands without passing ownership of `client` to
     // the network job. Deferred commands replay in arrival order after catch-up.
+    let mut local_submission_wakeups = shared.local_submission_wakeups.subscribe();
+    let mut local_submission_due = true;
+    let mut local_submission_retry_at = TokioInstant::now();
     let sync_started_at = Instant::now();
     let startup_stage_telemetry = shared.app_performance_telemetry();
     let mut startup_explicit_shutdown = false;
@@ -1475,6 +1478,21 @@ async fn run_app_runtime_account_worker(
                                         &app,
                                         &account_label,
                                     ),
+                                }
+                            }
+                            _ = local_submission_wakeups.changed() => {
+                                local_submission_due = true;
+                            }
+                            _ = tokio::time::sleep_until(local_submission_retry_at),
+                                if local_submission_due && deferred.is_empty() && !lifecycle.is_stopping() => {
+                                let retry = publish_next_local_submission(
+                                    &mut client, &app, &shared, &events,
+                                    &account_id_hex, &account_label,
+                                ).await;
+                                local_submission_due = retry.is_some();
+                                if let Some(delay) = retry {
+                                    local_submission_retry_at = TokioInstant::now() + delay;
+                                    schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
                                 }
                             }
                         }
@@ -1746,9 +1764,6 @@ async fn run_app_runtime_account_worker(
     let mut legacy_message_promotion = LegacyMessagePromotionSchedule::new();
     let mut presentation_maintenance = super::presentation::PresentationMaintenance::default();
     let mut presentation_wakeups = app.presentation_signals.subscribe_work();
-    let mut local_submission_wakeups = shared.local_submission_wakeups.subscribe();
-    let mut local_submission_due = true;
-    let mut local_submission_retry_at = TokioInstant::now();
     let mut presentation_due = true;
     let mut avatar_due = true;
     let mut attachment_due = true;
@@ -2628,31 +2643,13 @@ async fn run_app_runtime_account_worker(
             }
             _ = local_submission_wakeups.changed() => { local_submission_due = true; }
             _ = tokio::time::sleep_until(local_submission_retry_at), if local_submission_due => {
-                local_submission_due = false;
-                if let Ok(storage) = app.account_storage(&account_label)
-                    && let Ok(Some(submission)) = storage.next_local_submission()
-                {
-                    let execution = shared.app_performance_telemetry().observe(RuntimeOp::SendExecution);
-                    let started = Instant::now();
-                    client.send_telemetry = Some(shared.app_performance_telemetry());
-                    let result = client.publish_local_submission(&submission, |update| {
-                        publish_app_runtime_projection_update(&events, &account_id_hex, &account_label, update);
-                    }).await;
-                    client.send_telemetry = None;
-                    execution.finish_app(&result);
-                    shared.app_performance_telemetry().record(AppPerformanceOperation::OutboundMessageSend, started.elapsed(), result.is_ok());
-                    // A failed completion write must not strand later app-owned
-                    // rows until maintenance. Bound retries too: a pre-engine
-                    // failure can leave this same row at the head of the queue.
-                    let finished = app.finish_local_message(&account_label, &submission, &result);
-                    local_submission_due = true;
-                    local_submission_retry_at = TokioInstant::now()
-                        + if finished.is_err() { Duration::from_millis(100) } else { Duration::ZERO };
-                    if let Ok(Some(update)) = finished {
-                        publish_app_runtime_projection_update(&events, &account_id_hex, &account_label, update);
-                    }
-                    publish_client_pending_projection_updates(&mut client, &events, &account_id_hex, &account_label);
-                    publish_client_pending_applied_summary(&mut client, &events, &account_id_hex, &account_label);
+                let retry = publish_next_local_submission(
+                    &mut client, &app, &shared, &events,
+                    &account_id_hex, &account_label,
+                ).await;
+                local_submission_due = retry.is_some();
+                if let Some(delay) = retry {
+                    local_submission_retry_at = TokioInstant::now() + delay;
                     schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
                 }
             }
@@ -5951,6 +5948,51 @@ fn group_recovery_after_hydration(
         .session_mut()
         .ensure_group_hydrated(group_id)?;
     client.group_recovery_status(group_id)
+}
+
+/// Publishes one durable submission under the account owner and returns its next drain delay.
+/// Startup and steady state use the same completion, retry and projection boundary.
+async fn publish_next_local_submission(
+    client: &mut AppClient,
+    app: &MarmotApp,
+    shared: &RuntimeSharedServices,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+) -> Option<Duration> {
+    let storage = app.account_storage(account_label).ok()?;
+    let submission = storage.next_local_submission().ok()??;
+    let execution = shared
+        .app_performance_telemetry()
+        .observe(RuntimeOp::SendExecution);
+    let started = Instant::now();
+    client.send_telemetry = Some(shared.app_performance_telemetry());
+    let result = client
+        .publish_local_submission(&submission, |update| {
+            publish_app_runtime_projection_update(events, account_id_hex, account_label, update);
+        })
+        .await;
+    client.send_telemetry = None;
+    execution.finish_app(&result);
+    shared.app_performance_telemetry().record(
+        AppPerformanceOperation::OutboundMessageSend,
+        started.elapsed(),
+        result.is_ok(),
+    );
+    // A failed completion write must not strand later app-owned rows until
+    // maintenance; bound retries when this row remains at the queue's head.
+    let finished = app.finish_local_message(account_label, &submission, &result);
+    let retry = if finished.is_err() {
+        Duration::from_millis(100)
+    } else {
+        Duration::ZERO
+    };
+    if let Ok(Some(update)) = finished {
+        publish_app_runtime_projection_update(events, account_id_hex, account_label, update);
+    }
+    publish_client_pending_projection_updates(client, events, account_id_hex, account_label);
+    publish_client_pending_applied_summary(client, events, account_id_hex, account_label);
+    Some(retry)
 }
 
 #[allow(clippy::too_many_arguments)]
