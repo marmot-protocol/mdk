@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT_PATH = Path(__file__).with_name("test_real_hermes_plugin.py")
@@ -15,6 +16,12 @@ SPEC.loader.exec_module(PROBE)
 
 
 class SourceInstallCapabilityTests(unittest.TestCase):
+    def test_local_fixture_scan_confirmation_is_explicit(self):
+        with mock.patch.object(sys, "argv", [str(SCRIPT_PATH)]):
+            self.assertFalse(PROBE._parse_args().accept_reviewed_local_plugin_caution)
+        with mock.patch.object(sys, "argv", [str(SCRIPT_PATH), "--accept-reviewed-local-plugin-caution"]):
+            self.assertTrue(PROBE._parse_args().accept_reviewed_local_plugin_caution)
+
     def test_plugin_only_artifact_contains_and_imports_inbound_spool(self):
         mdk_source = Path(__file__).resolve().parents[4]
         mdk_ref = subprocess.check_output(

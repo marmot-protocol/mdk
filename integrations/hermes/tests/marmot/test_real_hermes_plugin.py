@@ -30,6 +30,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mdk-source", type=Path)
     parser.add_argument("--mdk-ref")
     parser.add_argument(
+        "--accept-reviewed-local-plugin-caution",
+        action="store_true",
+        help=(
+            "Accept caution findings for the pinned local fixture in this isolated "
+            "test home; dangerous verdicts still block."
+        ),
+    )
+    parser.add_argument(
         "--internal-mode",
         choices=("busy-crash-child", "busy-crash-probe"),
     )
@@ -680,7 +688,12 @@ def main() -> int:
         )
         if supports_subdirectories and "ref" in install_parameters:
             identifier = f"file://{mdk_source}#integrations/hermes/marmot"
-            cmd_install(identifier, force=False, enable=False, ref=resolved_ref)
+            cmd_install(
+                identifier,
+                force=args.accept_reviewed_local_plugin_caution,
+                enable=False,
+                ref=resolved_ref,
+            )
             source_install_mode = "monorepo"
         elif supports_subdirectories:
             # Hermes 0.19.0 supports local monorepo subdirectories but has no
@@ -689,7 +702,7 @@ def main() -> int:
             pinned_source = _pinned_source_checkout(mdk_source, resolved_ref, home)
             cmd_install(
                 f"file://{pinned_source}#integrations/hermes/marmot",
-                force=False,
+                force=args.accept_reviewed_local_plugin_caution,
                 enable=False,
             )
             source_install_mode = "monorepo"
@@ -698,7 +711,11 @@ def main() -> int:
             # independently of whether they expose --ref. Avoid passing a URL
             # fragment through to git clone as a literal path.
             plugin_source = _plugin_only_repository(mdk_source, resolved_ref, home)
-            cmd_install(f"file://{plugin_source}", force=False, enable=False)
+            cmd_install(
+                f"file://{plugin_source}",
+                force=args.accept_reviewed_local_plugin_caution,
+                enable=False,
+            )
             source_install_mode = "plugin-only"
 
         if (

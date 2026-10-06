@@ -405,6 +405,7 @@ jobs:
             --hermes-source "$HERMES_MARMOT_DEV_ROOT/hermes-agent" \
             --mdk-source "$GITHUB_WORKSPACE" \
             --mdk-ref "$GITHUB_SHA" \
+            --accept-reviewed-local-plugin-caution \
             --expect-source-install-mode "${{ matrix.expected_source_install_mode }}"
 
   openclaw-host-compat:
