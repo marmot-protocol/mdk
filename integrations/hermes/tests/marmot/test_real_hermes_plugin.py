@@ -25,17 +25,25 @@ import time
 from unittest import mock
 
 
+# Observed in the real-host CI scan of this local plugin fixture. New pattern
+# classes require inspection before this test can confirm installation.
+KNOWN_LOCAL_PLUGIN_CAUTION_PATTERNS = frozenset({
+    "agent_config_ref", "git_clone", "path_traversal", "path_traversal_deep",
+    "python_subprocess",
+})
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--hermes-source", type=Path)
     parser.add_argument("--mdk-source", type=Path)
     parser.add_argument("--mdk-ref")
     parser.add_argument(
-        "--accept-reviewed-local-plugin-caution",
+        "--accept-known-local-plugin-caution",
         action="store_true",
         help=(
-            "Confirm an observed caution for the pinned local fixture in this isolated "
-            "test home after checking that this host blocks dangerous verdicts."
+            "Accept only known scanner pattern ids for the pinned local fixture in "
+            "this isolated test home after checking dangerous-verdict enforcement."
         ),
     )
     parser.add_argument(
@@ -65,12 +73,13 @@ def _local_plugin_install_force(plugins_cmd_module, plugin_dir: Path, *, accept_
     except blocked as error:
         result = error.scan_result
         verdict = getattr(result, "verdict", None)
+        patterns = {finding.pattern_id for finding in result.findings} if result is not None else set()
         print(json.dumps({
             "plugin_scan_verdict": verdict,
-            "plugin_scan_patterns": sorted({finding.pattern_id for finding in result.findings})
-            if result is not None else [],
+            "plugin_scan_patterns": sorted(patterns),
         }))
-        if verdict != "caution" or not accept_caution:
+        if (verdict != "caution" or not accept_caution or not patterns
+                or not patterns.issubset(KNOWN_LOCAL_PLUGIN_CAUTION_PATTERNS)):
             raise
     else:
         if result is None or getattr(result, "verdict", None) != "safe":
@@ -737,7 +746,7 @@ def main() -> int:
             scan_source = plugin_source
         install_force = _local_plugin_install_force(
             plugins_cmd_module, scan_source,
-            accept_caution=args.accept_reviewed_local_plugin_caution,
+            accept_caution=args.accept_known_local_plugin_caution,
         )
         if supports_subdirectories and "ref" in install_parameters:
             # The archive-backed scan checkout has a fixture-only commit id.
