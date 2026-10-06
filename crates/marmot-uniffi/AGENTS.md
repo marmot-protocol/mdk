@@ -14,6 +14,8 @@ UniFFI bindings (MarmotKit) for the Marmot app runtime. For integration concepts
 - `kotlin-support/`: hand-written `MarmotAndroid` and keyring JNI shim copied next to generated Kotlin.
 - `tests/`: Rust smoke tests plus the Swift/Kotlin sources driven by the `*-smoke.sh` scripts.
 
+Expose `marmot-app` behavior through bindings, following [MDK's host boundary](../../docs/marmot-architecture/overview/app-core-boundary.md#host-app-boundary).
+
 ## Scope
 
 - Own the UniFFI export surface over `marmot-app` for Swift (iOS and macOS) and Kotlin (Android) consumers.
