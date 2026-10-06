@@ -841,11 +841,17 @@ impl<S: StorageProvider> Engine<S> {
         } else {
             self.storage.put_message(&record)?;
         }
+        // A rewrite that keeps the state (e.g. a deferred-peel retry that
+        // still cannot peel, restamped at the new epoch) is no transition.
+        let previous_state = previous.map(|record| record.state);
+        if previous_state == Some(state) {
+            return Ok(());
+        }
         self.audit_group(
             group_id,
             crate::audit_helpers::message_state_transition_event(
                 id_hex,
-                previous.map(|record| record.state),
+                previous_state,
                 state,
                 Some(epochs.reported),
                 "persist",

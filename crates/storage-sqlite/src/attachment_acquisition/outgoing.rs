@@ -148,7 +148,7 @@ impl SqliteAccountStorage {
                 AND (a.retention_expires_at IS NULL OR a.retention_expires_at>?3)
                 AND NOT EXISTS(SELECT 1 FROM attachment_removal_suppression r WHERE r.group_id_hex=h.group_id_hex AND r.message_id_hex=h.message_id_hex AND r.attachment_index=h.attachment_index)
                 ORDER BY h.attachment_index,u.token").storage()?;
-            let rows=stmt.query_map(params![group,message,u64_to_i64(now)?],|r|Ok((crate::AttachmentHistoryEntry {
+            let rows=stmt.query_map(params![group,message,u64_to_i64(now)?],|r|Ok((crate::AttachmentHistoryEntry { emoji_tags: Vec::new(),
                 message_id_hex:r.get(0)?,attachment_index:r.get::<_,u32>(1)? as usize,source_message_id_hex:r.get(2)?,source_epoch:Some(nonnegative(r,3)?),sender:r.get(4)?,timeline_at:nonnegative(r,5)?,received_at:nonnegative(r,6)?,slot:serde_json::from_str(&r.get::<_,String>(7)?).map_err(|_|rusqlite::Error::InvalidQuery)?,
             },r.get::<_,Vec<u8>>(8)?,r.get::<_,Vec<u8>>(9)?,nonnegative(r,10)?,r.get::<_,bool>(11)?))).storage()?.collect::<Result<Vec<_>,_>>().storage()?;
             drop(stmt);drop(conn);
