@@ -63,6 +63,7 @@ impl ConnectorError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::AccountHome(_) => "account_home_error",
+            Self::App(AppError::InvalidEditTarget) => "invalid_edit_target",
             Self::App(AppError::ReactionNotFound) => "reaction_not_found",
             Self::App(AppError::MediaUploadTimedOut) => "media_upload_timeout",
             Self::App(AppError::AgentStreamPublisher(_)) => "stream_error",
@@ -84,7 +85,6 @@ impl ConnectorError {
             Self::Io(_) => "io_error",
             Self::DebugControlsDisabled => "debug_controls_disabled",
             Self::Unauthorized => "unauthorized",
-            Self::App(AppError::InvalidEditTarget) => "invalid_edit_target",
             Self::UnsafeControlPlaneConfig(_) => "unsafe_control_plane_config",
             Self::Stream(_) => "stream_error",
             Self::InvalidGroupCreate(_) => "invalid_group_create",

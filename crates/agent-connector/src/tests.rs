@@ -5562,6 +5562,17 @@ fn delivered_inbound_cursor_dedups_and_evicts_oldest() {
     assert!(cursor.contains("d"));
 }
 
+#[test]
+fn invalid_edit_target_has_a_distinct_non_retryable_contract() {
+    let error = ConnectorError::App(marmot_app::AppError::InvalidEditTarget);
+    assert_eq!(error.code(), "invalid_edit_target");
+    assert_eq!(
+        error.client_message(),
+        "target must be an available self-authored chat message"
+    );
+    assert!(!error.retryable());
+}
+
 #[tokio::test]
 async fn connector_edit_dispatch_preserves_typed_eligibility_errors() {
     let dir = tempfile::tempdir().unwrap();
