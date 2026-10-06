@@ -38,6 +38,11 @@
   unchanged; no account reset or destructive history migration is required.
   Inviting or leaving a sibling device retains the shared activity target
   even when another leaf for that account remains in the group.
+  Departures reconcile the canonical local device before disabling participation
+  or pending sends, and preserve push destinations for surviving leaves.
+  A superseded removal restores app membership and unread counts without
+  inventing an invitation, including after reopen, while preserving local
+  archive choices and outstanding leave intent.
 
 - When a member lookup does not complete and the member's known inbox relay
   list has no usable relays, the invite now fails with "known member inbox

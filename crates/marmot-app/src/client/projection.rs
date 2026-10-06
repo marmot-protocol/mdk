@@ -499,6 +499,9 @@ impl AppClient {
             self.mark_group_projection_dirty_hex(id);
         }
         for group_id in live_group_ids {
+            // Reopen repairs a lost removal-withdrawal announcement from the
+            // canonical local leaf, including after the migration backfill ran.
+            changed |= self.reconcile_canonical_self_membership(&group_id)?;
             let group_id_hex = hex::encode(group_id.as_slice());
             if !projected.contains(group_id_hex.as_str()) {
                 if self

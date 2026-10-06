@@ -58,6 +58,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   change; hosts must consume a matching newly published native artifact.
   Sibling-device invitations and voluntary departures retain activity while
   another device for that account remains a member.
+  Surviving devices retain participation, pending sends and push destinations;
+  removal rollback restores app membership and unread counts through reopen,
+  preserving local archive choices and outstanding leave intent.
 
 ## [0.12.0] - 2026-10-02
 

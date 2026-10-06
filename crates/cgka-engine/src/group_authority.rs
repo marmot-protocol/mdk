@@ -2,7 +2,14 @@
 //! presentation data; mutation entry points still validate current authority.
 use cgka_traits::app_components::GROUP_LIFECYCLE_COMPONENT_ID;
 use cgka_traits::storage::StorageProvider;
-use cgka_traits::{EngineError, EpochId, GroupId, GroupLifecycleState};
+use cgka_traits::{EngineError, EpochId, GroupId, GroupLifecycleState, MemberId};
+
+/// Canonical device membership, distinct from staged account roster projections.
+/// Leaf indexes identify which device owns a notification destination.
+pub struct CanonicalGroupMembership {
+    pub local_leaf_active: bool,
+    pub member_leaves: Vec<(u32, MemberId)>,
+}
 
 use crate::Engine;
 
@@ -43,6 +50,43 @@ pub struct GroupAuthoritySnapshot {
 }
 
 impl<S: StorageProvider> Engine<S> {
+    /// Read authenticated canonical leaves without treating a sibling as this device.
+    /// Pending commits do not change these facts until they merge.
+    pub fn canonical_group_membership(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<CanonicalGroupMembership, EngineError> {
+        self.ensure_group_live(group_id)?;
+        self.storage.with_read_snapshot(|storage| {
+            let terminal = storage.get_group(group_id)?.is_terminal();
+            self.with_mls_group(group_id, |group| {
+                let member_leaves = group
+                    .members()
+                    .map(|member| {
+                        let credential =
+                            openmls::prelude::BasicCredential::try_from(member.credential)
+                                .map_err(|_| {
+                                    EngineError::Backend("invalid member credential".into())
+                                })?;
+                        Ok((
+                            member.index.u32(),
+                            MemberId::new(credential.identity().to_vec()),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, EngineError>>()?;
+                let local_leaf_active = !terminal
+                    && group.is_active()
+                    && member_leaves.iter().any(|(index, member)| {
+                        *index == group.own_leaf_index().u32() && member == self.identity.self_id()
+                    });
+                Ok(CanonicalGroupMembership {
+                    local_leaf_active,
+                    member_leaves,
+                })
+            })
+        })
+    }
+
     /// Capture compact authority from the live, validated engine within one
     /// backend read snapshot. Reuse the engine's existing MLS cache; derive
     /// scalars and read lifecycle/disband gates on every capture. No network,
@@ -145,6 +189,33 @@ mod tests {
             engine.confirm_published(pending).await.unwrap();
         }
         (engine, group)
+    }
+
+    #[tokio::test]
+    async fn canonical_membership_ignores_staged_roster_and_honors_terminal_copy() {
+        let (engine, group) = fixture().await;
+        let canonical = engine.canonical_group_membership(&group).unwrap();
+        assert!(canonical.local_leaf_active);
+        assert_eq!(canonical.member_leaves.len(), 1);
+        assert_eq!(canonical.member_leaves[0].1, engine.self_id());
+        let mut record = engine.storage.get_group(&group).unwrap();
+        record.members.clear();
+        engine.storage.put_group(&record).unwrap();
+        assert!(!engine.group_authority(&group).unwrap().facts.is_member);
+        assert!(
+            engine
+                .canonical_group_membership(&group)
+                .unwrap()
+                .local_leaf_active
+        );
+        record.removed = true;
+        engine.storage.put_group(&record).unwrap();
+        assert!(
+            !engine
+                .canonical_group_membership(&group)
+                .unwrap()
+                .local_leaf_active
+        );
     }
 
     #[tokio::test]

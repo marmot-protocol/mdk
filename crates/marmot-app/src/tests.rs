@@ -1,3 +1,5 @@
+#[cfg(feature = "test-policy-overrides")]
+mod canonical_membership;
 mod draft_lifecycle;
 mod group_lookup;
 mod key_package_inventory;
@@ -10,7 +12,6 @@ use super::*;
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use cgka_traits::Timestamp;
 use cgka_traits::app_event::{
     AGENT_ACTIVITY_STATUS_TAG, AGENT_OPERATION_NAME_TAG, AGENT_OPERATION_STATUS_TAG,
     AGENT_OPERATION_TYPE_TAG, EVENT_REF_TAG, GROUP_SYSTEM_TYPE_TAG,
@@ -22,6 +23,7 @@ use cgka_traits::app_event::{
     STREAM_TAG, STREAM_TYPE_TAG,
 };
 use cgka_traits::storage::{DisbandCandidate, DisbandCandidateStorage};
+use cgka_traits::{GroupStorage as _, Timestamp};
 use marmot_account::AccountHomeError;
 use nostr_sdk::prelude::{
     EventBuilder, FinalizeEvent, Keys, Kind, Tag, Timestamp as NostrTimestamp,
@@ -15192,6 +15194,12 @@ async fn a_drained_self_departure_and_rejoin_move_stored_self_membership() {
         .create_group("drained membership", &[])
         .await
         .unwrap();
+    // Projection-seam fixture: the engine has already made this copy terminal.
+    // Real authenticated sibling and rollback flows live in canonical_membership.
+    let storage = app.account_storage("alice").unwrap();
+    let mut terminal = storage.get_group(&group_id).unwrap();
+    terminal.removed = true;
+    storage.put_group(&terminal).unwrap();
     let group_id_hex = hex::encode(group_id.as_slice());
     assert_eq!(
         app.stored_group_self_membership("alice", &group_id_hex)
@@ -15222,6 +15230,8 @@ async fn a_drained_self_departure_and_rejoin_move_stored_self_membership() {
         "a drained self-eviction must record how the account left"
     );
 
+    terminal.removed = false;
+    storage.put_group(&terminal).unwrap();
     let rejoin = marmot_account::AccountDeviceEffects {
         events: vec![cgka_traits::engine::GroupEvent::GroupJoined {
             group_id: group_id.clone(),
@@ -15243,12 +15253,9 @@ async fn a_drained_self_departure_and_rejoin_move_stored_self_membership() {
     );
 }
 
-/// Distributed convergence can supersede a removal of this device: the winning
-/// branch keeps us in the group, the engine clears the terminal marker, and the
-/// roster diff reports the local account as `MemberAdded`. That arrival is a
-/// membership transition like any other, so the projection must follow it back
-/// to `Member` — otherwise the healed group keeps its unread suppressed and
-/// renders as departed forever, with no later join event to correct it.
+/// A genuine self arrival restores a removed projection only when the engine
+/// has cleared its terminal marker. This projection fixture does not model a
+/// rollback: canonical_membership exercises real withdrawals without MemberAdded.
 #[tokio::test]
 async fn a_self_member_added_restores_stored_self_membership_after_a_removal() {
     let dir = tempfile::tempdir().unwrap();
@@ -15263,6 +15270,12 @@ async fn a_self_member_added_restores_stored_self_membership_after_a_removal() {
         .create_group("superseded removal", &[])
         .await
         .unwrap();
+    // Projection-seam fixture: the engine has already made this copy terminal.
+    // Real authenticated sibling and rollback flows live in canonical_membership.
+    let storage = app.account_storage("alice").unwrap();
+    let mut terminal = storage.get_group(&group_id).unwrap();
+    terminal.removed = true;
+    storage.put_group(&terminal).unwrap();
     let group_id_hex = hex::encode(group_id.as_slice());
     let state_change = |change| marmot_account::AccountDeviceEffects {
         events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
@@ -15290,6 +15303,8 @@ async fn a_self_member_added_restores_stored_self_membership_after_a_removal() {
         Some(SelfMembership::Removed),
     );
 
+    terminal.removed = false;
+    storage.put_group(&terminal).unwrap();
     client
         .observe_drained_session_events(&state_change(
             cgka_traits::engine::GroupStateChange::MemberAdded { member: local },
@@ -15319,6 +15334,12 @@ async fn a_self_member_added_clears_a_preserved_voluntary_left() {
         .with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
     let group_id = client.create_group("superseded leave", &[]).await.unwrap();
+    // Projection-seam fixture: the engine has already made this copy terminal.
+    // Real authenticated sibling and rollback flows live in canonical_membership.
+    let storage = app.account_storage("alice").unwrap();
+    let mut terminal = storage.get_group(&group_id).unwrap();
+    terminal.removed = true;
+    storage.put_group(&terminal).unwrap();
     let group_id_hex = hex::encode(group_id.as_slice());
     let state_change = |change| marmot_account::AccountDeviceEffects {
         events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
@@ -15346,6 +15367,8 @@ async fn a_self_member_added_clears_a_preserved_voluntary_left() {
         Some(SelfMembership::Left),
     );
 
+    terminal.removed = false;
+    storage.put_group(&terminal).unwrap();
     client
         .observe_drained_session_events(&state_change(
             cgka_traits::engine::GroupStateChange::MemberAdded { member: local },
@@ -15374,6 +15397,12 @@ async fn a_peer_member_added_leaves_stored_self_membership_alone() {
         MarmotApp::with_relay(dir.path(), "wss://peer-added.example").with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
     let group_id = client.create_group("peer added", &[]).await.unwrap();
+    // Projection-seam fixture: the engine has already made this copy terminal.
+    // Real authenticated sibling and rollback flows live in canonical_membership.
+    let storage = app.account_storage("alice").unwrap();
+    let mut terminal = storage.get_group(&group_id).unwrap();
+    terminal.removed = true;
+    storage.put_group(&terminal).unwrap();
     let group_id_hex = hex::encode(group_id.as_slice());
     let state_change = |change| marmot_account::AccountDeviceEffects {
         events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
@@ -15431,6 +15460,12 @@ async fn a_self_departure_marks_transport_routes_dirty() {
         .with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
     let group_id = client.create_group("routes dirty", &[]).await.unwrap();
+    // Projection-seam fixture: the engine has already made this copy terminal.
+    // Real authenticated sibling and rollback flows live in canonical_membership.
+    let storage = app.account_storage("alice").unwrap();
+    let mut terminal = storage.get_group(&group_id).unwrap();
+    terminal.removed = true;
+    storage.put_group(&terminal).unwrap();
     let departure = |change| cgka_traits::engine::GroupEvent::GroupStateChanged {
         group_id: group_id.clone(),
         epoch: cgka_traits::EpochId(1),
@@ -15642,6 +15677,11 @@ async fn replaying_a_drained_batch_the_seam_already_applied_is_a_no_op() {
         .with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
     let group_id = client.create_group("drained replay", &[]).await.unwrap();
+    // The replay fixture represents an already terminal canonical copy.
+    let storage = app.account_storage("alice").unwrap();
+    let mut terminal = storage.get_group(&group_id).unwrap();
+    terminal.removed = true;
+    storage.put_group(&terminal).unwrap();
     let group_id_hex = hex::encode(group_id.as_slice());
 
     app.upsert_push_registration(

@@ -5171,12 +5171,17 @@ impl AppClient {
         &self,
         event: &cgka_traits::engine::GroupEvent,
         local_account_id_hex: &str,
+        local_leaf_active: bool,
         summary: &mut SyncSummary,
     ) -> Result<(), AppError> {
         if let cgka_traits::engine::GroupEvent::GroupStateChanged {
             group_id, change, ..
         } = event
             && terminates_local_outbound_queue(change, local_account_id_hex)
+            && (matches!(
+                change,
+                cgka_traits::engine::GroupStateChange::GroupDisbanded
+            ) || !local_leaf_active)
             && let Some(projection_update) = self.app.invalidate_timeline_pending_sends_for_group(
                 &self.state.label,
                 &hex::encode(group_id.as_slice()),
@@ -5219,6 +5224,7 @@ impl AppClient {
         summary: &mut SyncSummary,
     ) -> Result<bool, AppError> {
         let mut routes_dirty = false;
+        let mut local_leaf_active = true;
         // Timeline invalidation dispatch: `AppMessageInvalidated` withdraws
         // the delivered source row; `GroupStateInvalidated` withdraws every
         // kind-1210 system row stamped with the superseded commit's
@@ -5241,11 +5247,45 @@ impl AppClient {
         {
             let group_id_hex = hex::encode(group_id.as_slice());
             let member_id_hex = hex::encode(member.as_slice());
-            let _ = self.app.remove_group_push_tokens_for_member(
-                &self.state.label,
-                &group_id_hex,
-                &member_id_hex,
-            );
+            let canonical = self
+                .runtime
+                .session()
+                .canonical_group_membership(group_id)?;
+            local_leaf_active = canonical.local_leaf_active;
+            if !canonical
+                .member_leaves
+                .iter()
+                .any(|(_, active)| active == member)
+            {
+                self.app.remove_group_push_tokens_for_member(
+                    &self.state.label,
+                    &group_id_hex,
+                    &member_id_hex,
+                )?;
+            } else {
+                // Account identity alone cannot distinguish sibling devices.
+                // Remove only destinations whose authenticated leaf disappeared.
+                let storage = self.app.account_storage(&self.state.label)?;
+                for token in self
+                    .app
+                    .group_push_tokens(&self.state.label, &group_id_hex)?
+                {
+                    if token.member_id_hex == member_id_hex
+                        && !canonical
+                            .member_leaves
+                            .iter()
+                            .any(|(index, active)| *index == token.leaf_index && active == member)
+                    {
+                        storage.remove_group_push_token(
+                            &group_id_hex,
+                            &member_id_hex,
+                            token.platform.platform_byte(),
+                            &token.token_fingerprint,
+                            &token.server_pubkey_hex,
+                        )?;
+                    }
+                }
+            }
             // Only the local account leaving / being removed suppresses our
             // own unread aggregate for the group; a peer departure must not.
             // The recorded membership distinguishes a voluntary `Left` from
@@ -5256,7 +5296,7 @@ impl AppClient {
             // silently leaving the flag stale would keep
             // `account_unread_total()` returning an inflated badge after a
             // self-removal that sync otherwise reports as successful.
-            if member_id_hex.eq_ignore_ascii_case(local_account_id_hex) {
+            if member_id_hex.eq_ignore_ascii_case(local_account_id_hex) && !local_leaf_active {
                 self.app
                     .set_group_self_membership(&self.state.label, &group_id_hex, membership)?;
                 // Terminal for this device's copy, so its transport routes are
@@ -5284,38 +5324,111 @@ impl AppClient {
                 .app
                 .remove_stale_group_push_tokens(&self.state.label, &group_id_hex, &[]);
         }
-        self.invalidate_terminal_pending_sends(event, local_account_id_hex, summary)?;
-        // The local account arriving in a group restores its membership so the
-        // group's unread count stops being suppressed. A (re-)join or create is
-        // one such arrival; a roster diff that reports this device as
-        // `MemberAdded` is the other, and it is the only signal a convergence
-        // branch which supersedes our removal ever emits. Same source-of-truth
-        // write as the departure path above: propagate the error rather than
-        // swallow it. Writing `Member` also clears a preserved voluntary
-        // `Left`, which is the intended mdk#1746 behavior on a re-add.
+        self.invalidate_terminal_pending_sends(
+            event,
+            local_account_id_hex,
+            local_leaf_active,
+            summary,
+        )?;
+        // Explicit arrivals preserve their existing admission semantics.
         if let Some(group_id) = self_arrival_group(event, local_account_id_hex) {
-            let group_id_hex = hex::encode(group_id.as_slice());
-            let restored = self
-                .app
-                .account_storage(&self.state.label)?
-                .restore_group_self_membership(&group_id_hex)?;
-            if restored {
-                // Keep the worker's next projection save aligned with the same durable
-                // arrival; otherwise its old archive intent would undo this transition.
-                if let Some(group) = self
-                    .state
-                    .groups
-                    .iter_mut()
-                    .find(|g| g.group_id_hex == group_id_hex)
-                {
-                    group.archived = false;
-                    group.self_membership = SelfMembership::Member;
-                }
-                self.mark_group_projection_dirty(group_id);
-            }
-            self.app.presentation_signals.wake();
+            routes_dirty |= if matches!(
+                event,
+                cgka_traits::engine::GroupEvent::GroupStateChanged { .. }
+            ) {
+                self.reconcile_canonical_self_membership(group_id)?
+            } else {
+                self.restore_projected_self_membership(group_id, true)?
+            };
+        } else if matches!(
+            event,
+            cgka_traits::engine::GroupEvent::EpochChanged { .. }
+                | cgka_traits::engine::GroupEvent::CommitRolledBack { .. }
+                | cgka_traits::engine::GroupEvent::GroupStateInvalidated { .. }
+                | cgka_traits::engine::GroupEvent::GroupStateRevalidated { .. }
+        ) && let Some(group_id) = event_group_id(event)
+        {
+            routes_dirty |= self.reconcile_canonical_self_membership(group_id)?;
         }
         Ok(routes_dirty)
+    }
+
+    /// Restore departed projections from canonical local-device state, without a timeline invitation.
+    /// An outstanding local leave remains a departure intent even before its proposal merges.
+    pub(crate) fn reconcile_canonical_self_membership(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        if !matches!(
+            self.app
+                .stored_group_self_membership(&self.state.label, &group_id_hex)?,
+            Some(SelfMembership::Left | SelfMembership::Removed)
+        ) || self.has_local_group_deletion_frontier(group_id)?
+            || self
+                .runtime
+                .session()
+                .leave_in_progress(group_id)
+                .map_err(cgka_session::SessionError::from)?
+            || self.runtime.group_record(group_id)?.is_terminal()
+        {
+            return Ok(false);
+        }
+        if self
+            .runtime
+            .session()
+            .canonical_group_membership(group_id)?
+            .local_leaf_active
+        {
+            self.restore_projected_self_membership(group_id, false)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Commit membership restoration and keep the next worker save from undoing it.
+    fn restore_projected_self_membership(
+        &mut self,
+        group_id: &GroupId,
+        unarchive: bool,
+    ) -> Result<bool, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let storage = self.app.account_storage(&self.state.label)?;
+        let restored = if unarchive {
+            storage.restore_group_self_membership(&group_id_hex)?
+        } else {
+            let departed = matches!(
+                storage.group_self_membership(&group_id_hex)?,
+                Some(
+                    storage_sqlite::SelfMembership::Left | storage_sqlite::SelfMembership::Removed
+                )
+            );
+            if departed {
+                // A rollback repairs membership only; the user's archive
+                // choice predates it and must survive the repair.
+                storage.set_group_self_membership(
+                    &group_id_hex,
+                    storage_sqlite::SelfMembership::Member,
+                )?;
+            }
+            departed
+        };
+        if restored {
+            if let Some(group) = self
+                .state
+                .groups
+                .iter_mut()
+                .find(|g| g.group_id_hex == group_id_hex)
+            {
+                if unarchive {
+                    group.archived = false;
+                }
+                group.self_membership = SelfMembership::Member;
+            }
+            self.mark_group_projection_dirty(group_id);
+        }
+        self.app.presentation_signals.wake();
+        Ok(restored)
     }
 
     fn display_names_for_events(
@@ -5616,10 +5729,8 @@ fn member_departure(
 /// returning the group it rejoined. The mirror of [`member_departure`]: a
 /// welcome-driven `GroupJoined` and a local `GroupCreated` are arrivals by
 /// construction, and a `GroupStateChanged` roster diff is one only when the
-/// added member is this device — the case distributed convergence produces when
-/// the winning branch supersedes a removal of us (the engine pins that emission
-/// in `superseded_self_removal_clears_removed_marker_and_restores_send`). Returns
-/// `None` otherwise, so a peer being added changes nothing locally.
+/// added account is ours. Convergence restoration instead reads canonical local
+/// membership; it does not fabricate an invitation to signal a roster repair.
 fn self_arrival_group<'a>(
     event: &'a cgka_traits::engine::GroupEvent,
     local_account_id_hex: &str,
