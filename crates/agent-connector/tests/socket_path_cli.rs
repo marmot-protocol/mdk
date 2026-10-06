@@ -10,10 +10,12 @@ fn socket_path_too_long_cli_reports_actionable_error_without_private_path() {
     let short_temp_base = std::fs::canonicalize("/tmp").unwrap();
     let root = tempfile::tempdir_in(short_temp_base).unwrap();
     let probe = root.path().join("x").join("wn-agent.sock");
-    let overflow = root.path().join("x".repeat(200)).join("wn-agent.sock");
-    let limit = fs_private::validate_private_unix_socket_path(&overflow)
-        .unwrap_err()
-        .max_path_bytes;
+    let limit = (1..=256)
+        .take_while(|bytes| {
+            std::os::unix::net::SocketAddr::from_pathname("x".repeat(*bytes)).is_ok()
+        })
+        .last()
+        .unwrap();
     // The final address fits exactly even if the child has a different PID width.
     // Only the private staging overhead makes startup fail.
     let parent_len = 1 + limit - probe.as_os_str().as_bytes().len();

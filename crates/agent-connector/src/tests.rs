@@ -1229,10 +1229,12 @@ async fn connector_socket_bind_reports_overlong_staging_path_before_creating_par
 
     let dir = tempfile::tempdir_in("/tmp").unwrap();
     let probe = dir.path().join("x").join("wn-agent.sock");
-    let overflow = dir.path().join("x".repeat(200)).join("wn-agent.sock");
-    let limit = fs_private::validate_private_unix_socket_path(&overflow)
-        .unwrap_err()
-        .max_path_bytes;
+    let limit = (1..=256)
+        .take_while(|bytes| {
+            std::os::unix::net::SocketAddr::from_pathname("x".repeat(*bytes)).is_ok()
+        })
+        .last()
+        .unwrap();
     let parent_len = 1 + limit - probe.as_os_str().as_bytes().len();
     let socket = dir
         .path()
@@ -1267,10 +1269,12 @@ async fn management_socket_can_exceed_the_budget_while_regular_control_still_fit
         .join("x")
         .join("dev")
         .join("usage-diagnostics.sock");
-    let limit =
-        fs_private::validate_private_unix_socket_path(&dir.path().join("x".repeat(200)).join("s"))
-            .unwrap_err()
-            .max_path_bytes;
+    let limit = (1..=256)
+        .take_while(|bytes| {
+            std::os::unix::net::SocketAddr::from_pathname("x".repeat(*bytes)).is_ok()
+        })
+        .last()
+        .unwrap();
     let staged_len = fs_private::socket_staging_dir(&probe)
         .join("usage-diagnostics.sock")
         .as_os_str()

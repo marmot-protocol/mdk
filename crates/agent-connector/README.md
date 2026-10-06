@@ -75,34 +75,12 @@ By default the control socket is `<home>/dev/wn-agent.sock`, here:
 ~/.marmot-agent/dev/wn-agent.sock
 ```
 
-Unix socket addresses have a platform byte limit (107 bytes on Linux, 103 on
-macOS). The private bind also uses a staging address next to the final socket:
-`<parent>/.sock.<pid>.<filename>/<filename>`. Both addresses must fit, so a final
-path below the limit can still be too long after staging. Startup reports
-`socket_path_too_long` before creating socket directories in this case, without
-logging the path. Use a shorter `--home` or an explicit shorter `--socket` path
-inside an appropriately private directory; do not relax its permissions.
-
-For the default `<home>/dev/wn-agent.sock`, let `H` be the encoded byte length of
-the home path without a trailing slash and `P` the number of decimal PID digits.
-The final address uses `H + 18` bytes; the staging address uses `H + 39 + P`.
-Therefore the home budget is `107 - 39 - P` bytes on Linux and `103 - 39 - P`
-on macOS. With a seven-digit PID, that is at most 61 and 57 bytes respectively.
-Count the expanded path (not a literal `~`) in bytes rather than characters;
-non-ASCII components can consume multiple bytes per character. A custom
-`--socket` changes this calculation: measure both its final address and
-`<parent>/.sock.<pid>.<filename>/<filename>` against the platform limit.
-
-That budget covers the regular control socket only. The daemon also binds the
-owner-only `<home>/dev/usage-diagnostics.sock` management socket. Its final
-address uses `H + 27` bytes and its staging address uses `H + 57 + P`, so a home
-that supports both sockets must fit `107 - 57 - P` bytes on Linux or
-`103 - 57 - P` on macOS (43 and 39 bytes with a seven-digit PID). A custom
-`--socket` does not move this management socket. If its bind fails, regular
-control continues and startup warns that local diagnostics controls are
-unavailable; usage-diagnostics commands cannot change a running daemon's
-consent through that missing socket. Use a shorter private home to retain
-those controls; do not relax permissions or automatically enable diagnostics.
+If startup reports `socket_path_too_long`, use a shorter `--home` or a shorter
+`--socket` path inside a private directory. The private bind needs more room than
+the final socket address alone. A custom `--socket` does not move the local
+usage-diagnostics socket: use a shorter home if those controls are unavailable.
+Regular control continues when the optional diagnostics socket cannot bind.
+Keep the existing directory and socket permissions.
 
 In another terminal, create or reuse the local agent account and print the phone invite details:
 
