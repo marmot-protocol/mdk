@@ -471,6 +471,9 @@ impl MarmotApp {
         let mutation_lock = self.sticker_mutation_lock(&context.label);
         let _guard = mutation_lock.lock().await;
         fetch_pack_into_storage(self, &context, &parsed.coordinate, &parsed.relay_hints).await?;
+        context
+            .storage
+            .prune_uninstalled_sticker_discovery(MAX_DISCOVERY_PACKS)?;
         app_pack_for_context(&context, &parsed.coordinate)
     }
 
@@ -825,6 +828,9 @@ fn ingest_pack_events(storage: &SqliteAppStorage, events: Vec<Event>) -> Result<
             updated += 1;
         }
     }
+    storage
+        .prune_uninstalled_sticker_discovery(MAX_DISCOVERY_PACKS)
+        .map_err(AppError::Storage)?;
     Ok(updated)
 }
 
