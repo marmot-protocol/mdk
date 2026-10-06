@@ -5309,10 +5309,27 @@ impl AppClient {
     /// publishes each committed update immediately; other callers receive the
     /// updates once in the ordinary summary. The finalizer still owns guarded
     /// failed-row revival and durable fanout acknowledgement.
+    #[cfg(test)]
     pub(crate) async fn advance_convergence_with_projection_progress(
         &mut self,
         group_id: &cgka_traits::GroupId,
         on_update: Option<std::sync::Arc<dyn Fn(crate::AppProjectionUpdate) + Send + Sync>>,
+    ) -> Result<SyncSummary, AppError> {
+        self.advance_convergence_with_projection_progress_and_yield(
+            group_id,
+            on_update,
+            std::future::pending(),
+        )
+        .await
+    }
+
+    /// Preserve publication finalization while allowing the owner to interrupt
+    /// already-confirmed secondary retry waits for durable foreground work.
+    pub(crate) async fn advance_convergence_with_projection_progress_and_yield(
+        &mut self,
+        group_id: &cgka_traits::GroupId,
+        on_update: Option<std::sync::Arc<dyn Fn(crate::AppProjectionUpdate) + Send + Sync>>,
+        yield_requested: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> Result<SyncSummary, AppError> {
         if self.is_group_forgotten(group_id)? {
             return Ok(SyncSummary::default());
@@ -5371,7 +5388,11 @@ impl AppClient {
         // unchanged group set requires no account-wide refresh per group.
         let effects = self
             .runtime
-            .advance_convergence_with_publication_progress(group_id, observe)
+            .advance_convergence_with_publication_progress_and_yield(
+                group_id,
+                observe,
+                yield_requested,
+            )
             .await;
         let progress_updates = std::mem::take(&mut *buffered.lock().unwrap());
         let effects = match effects {

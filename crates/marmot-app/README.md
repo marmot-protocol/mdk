@@ -49,6 +49,12 @@ MLS confirmation are complete, even if a secondary relay still has a later repli
 keeps the original relay event and retry deadline. Unmet required acknowledgements and pending MLS confirmation keep
 their publication barrier.
 
+A new same-account durable admission also lets the managed worker yield a scheduled secondary retry that is already
+waiting on a relay. This applies only after required acknowledgements and MLS confirmation are complete. Unfinished
+attempts remain conservatively recorded as possibly exposed and retry their exact saved bytes after backoff. The
+worker finishes its current local effects before servicing the new send; required publication and confirmation work
+is not cancelled.
+
 For new durable admissions in the current runtime, `send_queue` and `outbound_message_queue_wait` measure the interval
 from the committed admission to its first worker execution. Execution and publication remain separate measurements.
 Repeated tokens and completion retries do not restart that observation. The private correlation map is bounded to

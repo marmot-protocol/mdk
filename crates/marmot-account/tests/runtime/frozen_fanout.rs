@@ -1998,3 +1998,209 @@ async fn invite_quorum_survives_restart() {
         assert!(resumed.session().outbound_fanouts().unwrap().is_empty());
     }
 }
+
+/// Foreground pressure can interrupt confirmed replication, never an unmet quorum.
+#[tokio::test]
+async fn secondary_retry_yield_preserves_exact_fanout_and_required_quorum() {
+    for required_acks in [1, 2] {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SqlCipherKey::new("secondary retry yield key").unwrap();
+        let path = dir.path().join("alice.sqlite");
+        let mut alice = session(&path, &key, b"secondary-yield-alice");
+        let mut bob = session(dir.path().join("bob.sqlite"), &key, b"secondary-yield-bob");
+        let created = alice
+            .create_group(CreateGroupRequest {
+                name: "secondary yield".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let group = created.group_id;
+        let pending = match created.effects.publish[0] {
+            PublishWork::GroupCreated { pending, .. } => pending,
+            _ => panic!("group creation required"),
+        };
+        alice.confirm_published(pending).await.unwrap();
+        let slow = TransportEndpoint("wss://yield-slow.example".into());
+        let fast = TransportEndpoint("wss://yield-fast.example".into());
+        let routing = StaticTransportRouting::new(vec![])
+            .required_acks(required_acks)
+            .with_inbox_route(
+                bob.self_id(),
+                vec![
+                    TransportEndpoint("wss://yield-welcome-one.example".into()),
+                    TransportEndpoint("wss://yield-welcome-two.example".into()),
+                ],
+            )
+            .with_group_route(
+                group.clone(),
+                group.as_slice().to_vec(),
+                vec![slow.clone(), fast],
+            );
+        let adapter = RecordingAdapter::default();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *adapter.inner.endpoint_gate.lock().unwrap() = Some((slow.clone(), gate.clone()));
+        let wall = Arc::new(TestWallClock::new(100_000));
+        let mut runtime = AccountDeviceRuntime::new(
+            alice,
+            adapter.clone(),
+            routing.clone(),
+            RecordingKeyPackages::default(),
+        )
+        .with_maintenance_sources(
+            wall.clone(),
+            Arc::new(TestMonotonicClock::default()),
+            Arc::new(TestRandom::new(0)),
+        );
+        {
+            let send = runtime.send(SendIntent::Invite {
+                group_id: group.clone(),
+                key_packages: vec![bob.fresh_key_package().await.unwrap()],
+                initial_admins: vec![],
+            });
+            tokio::pin!(send);
+            if required_acks == 2 {
+                wait_for_publish_count(send.as_mut(), &adapter, 2).await;
+            } else {
+                tokio::time::timeout(Duration::from_secs(10), send)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+        }
+        let original = runtime
+            .session()
+            .outbound_fanouts_for_group(&group)
+            .unwrap()
+            .remove(0);
+        assert_eq!(original.outcome().accepted_targets, 1);
+        assert_eq!(
+            matches!(original.mls_state(), FanoutMlsState::Pending(_)),
+            required_acks == 2
+        );
+        wall.set(100_031);
+        let (request_yield, requested) = tokio::sync::oneshot::channel();
+        {
+            let retry = runtime.advance_convergence_with_publication_progress_and_yield(
+                &group,
+                Arc::new(|_, _| {}),
+                async {
+                    let _ = requested.await;
+                },
+            );
+            tokio::pin!(retry);
+            wait_for_publish_count(
+                retry.as_mut(),
+                &adapter,
+                if required_acks == 1 { 4 } else { 3 },
+            )
+            .await;
+            request_yield.send(()).unwrap();
+            if required_acks == 2 {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(30), retry.as_mut())
+                        .await
+                        .is_err(),
+                    "foreground work cannot cancel the second required ACK or pending MLS"
+                );
+                gate.add_permits(1);
+            }
+            tokio::time::timeout(Duration::from_secs(2), retry)
+                .await
+                .expect("confirmed secondary retry must yield while its ACK is withheld")
+                .unwrap();
+        }
+        let attempts = adapter.publishes();
+        let retried = &attempts[if required_acks == 1 { 3 } else { 2 }];
+        assert_eq!(retried.message, original.request().message);
+        assert_eq!(retried.target.endpoints(), std::slice::from_ref(&slow));
+        assert_eq!(
+            attempts
+                .iter()
+                .filter(|attempt| matches!(
+                    attempt.message.envelope,
+                    TransportEnvelope::Welcome { .. }
+                ))
+                .count(),
+            1,
+            "required confirmation must release its Welcome exactly once despite foreground pressure"
+        );
+        if required_acks == 1 {
+            let retained = runtime
+                .session()
+                .outbound_fanouts_for_group(&group)
+                .unwrap()
+                .remove(0);
+            assert_eq!(retained.request(), original.request());
+            assert_eq!(retained.outcome().accepted_targets, 1);
+            assert_eq!(
+                retained.target_status(0),
+                Some(FanoutTargetStatus::PossiblyExposed)
+            );
+            let delay = runtime
+                .outbound_fanout_retry_delay_ms(&group)
+                .unwrap()
+                .unwrap();
+            assert!(delay >= 30_000);
+            drop(runtime);
+            runtime = AccountDeviceRuntime::new(
+                session(&path, &key, b"secondary-yield-alice"),
+                adapter.clone(),
+                routing,
+                RecordingKeyPackages::default(),
+            )
+            .with_maintenance_sources(
+                wall.clone(),
+                Arc::new(TestMonotonicClock::default()),
+                Arc::new(TestRandom::new(0)),
+            );
+            assert_eq!(
+                runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+                Some(delay)
+            );
+            wall.set(100_031 + delay.div_ceil(1_000));
+            runtime
+                .advance_convergence_with_publication_progress_and_yield(
+                    &group,
+                    Arc::new(|_, _| {}),
+                    std::future::ready(()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                adapter.publishes().len(),
+                4,
+                "already-ready pressure must not start another attempt"
+            );
+            assert_eq!(
+                runtime.outbound_fanout_retry_delay_ms(&group).unwrap(),
+                Some(0),
+                "skipped attempts must not move the retry deadline"
+            );
+            gate.add_permits(1);
+            runtime.advance_convergence(&group).await.unwrap();
+            assert_eq!(
+                adapter.publishes().len(),
+                5,
+                "a fresh quiet pass must resume replication"
+            );
+            assert_eq!(adapter.publishes()[4].message, original.request().message);
+            assert_eq!(
+                adapter.publishes()[4].target.endpoints(),
+                std::slice::from_ref(&slow)
+            );
+        }
+        assert!(
+            runtime
+                .session()
+                .outbound_fanouts_for_group(&group)
+                .unwrap()
+                .is_empty(),
+            "replication must finish after foreground pressure ends"
+        );
+    }
+}

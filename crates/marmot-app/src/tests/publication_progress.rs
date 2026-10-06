@@ -528,3 +528,126 @@ async fn queued_publication_updates_live_window_before_later_publish_finishes() 
             .is_none()
     );
 }
+
+/// A due, confirmed replica retry cannot retain the owner while a new durable send waits.
+#[tokio::test]
+async fn durable_send_interrupts_due_secondary_retry_and_updates_live_window() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://progress.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = client_on_app_relay_plane(&app, "alice").await;
+    let group = client
+        .create_group_with_options(
+            "secondary retry progress",
+            &[],
+            AppCreateGroupOptions {
+                relays: Some(vec![
+                    "wss://index.example".to_owned(),
+                    "wss://progress.example".to_owned(),
+                ]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    drop(client);
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    let mut window = runtime
+        .open_conversation_window("alice", &group, Default::default())
+        .await
+        .unwrap();
+    while window.snapshot.presentation.header.epoch.is_none() {
+        window.snapshot = tokio::time::timeout(Duration::from_secs(5), window.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    relay
+        .block_indexer_publish
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let first = runtime
+        .submit_text(
+            "alice",
+            &group,
+            "confirmed before retry".to_owned(),
+            "secondary-first".to_owned(),
+        )
+        .await
+        .unwrap();
+    let original_source = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = window.recv().await.unwrap().unwrap();
+            if let Some(source) = snapshot
+                .page
+                .page()
+                .messages
+                .iter()
+                .find(|row| row.message_id_hex == first.message_id_hex)
+                .and_then(|row| row.source_message_id_hex.clone())
+            {
+                break source;
+            }
+        }
+    })
+    .await
+    .expect("initial publication must reach quorum with secondary ACK withheld");
+    // Consume the initial attempt's notification. The next notification proves
+    // the ordinary persisted retry deadline has actually elapsed and its ACK
+    // wait is in flight, reproducing the device overlap without policy overrides.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        relay.indexer_publish_started.notified(),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(40),
+        relay.indexer_publish_started.notified(),
+    )
+    .await
+    .expect("confirmed secondary retry must start on its normal deadline");
+    let attempts_before = relay.attempted_events.lock().unwrap().len();
+    assert_eq!(
+        relay.attempted_events.lock().unwrap().last().unwrap().id,
+        original_source,
+        "the held operation must be the exact already-accepted publication's retry"
+    );
+    let accepted = runtime
+        .submit_text(
+            "alice",
+            &group,
+            "foreground during secondary retry".to_owned(),
+            "secondary-foreground".to_owned(),
+        )
+        .await
+        .unwrap();
+    let observed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let snapshot = window.recv().await.unwrap().unwrap();
+            if snapshot.page.page().messages.iter().any(|row| {
+                row.message_id_hex == accepted.message_id_hex && row.source_message_id_hex.is_some()
+            }) {
+                break snapshot;
+            }
+        }
+    })
+    .await;
+    // Release even on RED so neither a relay hold nor shutdown hides the failure.
+    relay
+        .block_indexer_publish
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    relay.indexer_publish_release.notify_waiters();
+    runtime.shutdown_and_close().await.unwrap();
+    let observed = observed.expect(
+        "new durable send must publish and project while the old secondary ACK remains withheld",
+    );
+    assert!(observed.presentation.header.capabilities.can_send);
+    assert!(relay.attempted_events.lock().unwrap().len() > attempts_before);
+}

@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::{GroupId, MessageId, SecretBytes};
+use futures::FutureExt;
 use marmot_account::{AccountHomeError, AccountSetupKind, AccountSetupPhase, AccountSetupState};
 use marmot_forensics::EpochBackfillExecutionSeam;
 use rand::RngCore;
@@ -2090,6 +2091,13 @@ async fn run_app_runtime_account_worker(
             _ = scheduled_convergence.timer.as_mut(), if !scheduled_convergence_held_for_test(&account_id_hex) => {
                 yield_to_convergence = false;
                 let Some(group_id) = scheduled_convergence.take_ready() else { continue };
+                let secondary_retry_yield = wait_for_local_submission_or_shutdown(
+                    app.clone(),
+                    account_label.clone(),
+                    shared.local_submission_gate(&account_id_hex),
+                    shared.local_submission_wakeups.subscribe(),
+                    lifecycle.subscribe_shutdown(),
+                ).boxed().shared();
                 let mut phase = Some(shared.app_performance_telemetry().observe(RuntimeOp::WorkerConvergence));
                 // Recovery owns the live client, but member/roster reads can
                 // use the last committed snapshot while its relay I/O waits.
@@ -2120,7 +2128,9 @@ async fn run_app_runtime_account_worker(
                                 let on_publication = Arc::new(move |update| {
                                     progress_sink.publish(update);
                                 });
-                                let result = client.advance_convergence_with_projection_progress(&group_id, Some(on_publication)).await;
+                                let result = client.advance_convergence_with_projection_progress_and_yield(
+                                    &group_id, Some(on_publication), secondary_retry_yield,
+                                ).await;
                                 record_runtime_publication(
                                     &client,
                                     marmot_forensics::v5::RuntimePublicationCategory::ProjectionUpdate,
@@ -5959,6 +5969,44 @@ fn group_recovery_after_hydration(
         .session_mut()
         .ensure_group_hydrated(group_id)?;
     client.group_recovery_status(group_id)
+}
+
+/// Observe committed same-account work before waiting on its coalesced signal.
+/// The receiver is created before this future's first queue check, so an admission
+/// racing the check cannot be lost. Other accounts' wakes do not preempt this owner.
+async fn wait_for_local_submission_or_shutdown(
+    app: MarmotApp,
+    account_label: String,
+    admission_gate: Arc<tokio::sync::Mutex<()>>,
+    mut wakeups: watch::Receiver<()>,
+    mut stopping: watch::Receiver<bool>,
+) {
+    loop {
+        if *stopping.borrow() {
+            return;
+        }
+        // Storage failure also yields optional network work. The normal owner
+        // retains error handling; this observer must never reopen after shutdown.
+        {
+            let Ok(_admission) = admission_gate.try_lock() else {
+                // Admission owns this account's storage; never park the owner
+                // behind it merely to decide whether optional work can wait.
+                return;
+            };
+            if !app
+                .account_storage(&account_label)
+                .and_then(|storage| storage.next_local_submission().map_err(Into::into))
+                .is_ok_and(|submission| submission.is_none())
+            {
+                return;
+            }
+        }
+        tokio::select! {
+            biased;
+            _ = wait_for_runtime_shutdown(&mut stopping) => return,
+            result = wakeups.changed() => if result.is_err() { return; },
+        }
+    }
 }
 
 /// Publishes one durable submission under the account owner and returns its next drain delay.

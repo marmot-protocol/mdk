@@ -92,8 +92,12 @@ longer blocks new engine-queued application sends. This uses the same publicatio
 An unmet quorum or pending MLS confirmation still blocks the queued drain, including obligations behind an older
 completed-quorum event. Incoming convergence can settle while that publication barrier remains.
 
-Retry scheduling and exact-event durability are unchanged. A due retry still awaits its relay attempt before the
-convergence pass; this is not a guarantee of zero network delay or universal per-relay FIFO delivery.
+Ordinary lower-level convergence calls still await due relay attempts. Owners using
+`advance_convergence_with_publication_progress_and_yield` can supply a signal that ends optional secondary waits
+after required acknowledgements and MLS confirmation. The signal remains latched for that pass; a later quiet pass
+can resume replication. A cancelled attempt keeps its exact bytes and targets, conservative exposure state, and
+ordinary retry backoff. An attempt skipped before starting keeps its existing deadline. This does not cancel engine
+steps, bypass required publication barriers, or guarantee zero network delay or universal per-relay FIFO delivery.
 
 ## What it does not do
 

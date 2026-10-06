@@ -393,12 +393,18 @@ impl MaintenanceActivity {
 }
 type PublicationProgressObserver =
     Arc<dyn Fn(&AccountDeviceSession, &PublishedApplicationMessage) + Send + Sync>;
-type PublicationProgressSlot = Arc<std::sync::Mutex<Option<PublicationProgressObserver>>>;
+type SecondaryRetryYield = futures::future::Shared<futures::future::BoxFuture<'static, ()>>;
+#[derive(Clone)]
+struct PublicationProgress {
+    observe: PublicationProgressObserver,
+    secondary_retry_yield: SecondaryRetryYield,
+}
+type PublicationProgressSlot = Arc<std::sync::Mutex<Option<PublicationProgress>>>;
 
 /// Restore the previous observer even when the owning convergence future is dropped.
 struct PublicationProgressGuard {
     slot: PublicationProgressSlot,
-    previous: Option<PublicationProgressObserver>,
+    previous: Option<PublicationProgress>,
 }
 
 impl Drop for PublicationProgressGuard {
@@ -2522,11 +2528,32 @@ where
         group_id: &GroupId,
         observe: PublicationProgressObserver,
     ) -> AccountResult<AccountDeviceEffects> {
+        self.advance_convergence_with_publication_progress_and_yield(
+            group_id,
+            observe,
+            std::future::pending(),
+        )
+        .await
+    }
+
+    /// Yield only dispensable secondary relay waits when the owner has foreground work.
+    /// The signal is latched for this pass. Below-quorum publications and pending MLS
+    /// confirmation remain mandatory; cancelled secondary attempts retain exact bytes
+    /// and conservative exposure evidence through the ordinary durable retry path.
+    pub async fn advance_convergence_with_publication_progress_and_yield(
+        &mut self,
+        group_id: &GroupId,
+        observe: PublicationProgressObserver,
+        yield_requested: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> AccountResult<AccountDeviceEffects> {
         let slot = self.publication_progress.clone();
         let previous = slot
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .replace(observe);
+            .replace(PublicationProgress {
+                observe,
+                secondary_retry_yield: yield_requested.boxed().shared(),
+            });
         let _guard = PublicationProgressGuard { slot, previous };
         self.advance_convergence(group_id).await
     }
@@ -2885,7 +2912,7 @@ where
             .unwrap_or_else(|error| error.into_inner())
             .clone();
         if let Some(observer) = observer {
-            observer(
+            (observer.observe)(
                 &self.session,
                 output
                     .published_app_messages
@@ -4137,10 +4164,26 @@ where
         }
         let endpoints = fanout.request().target.endpoints().to_vec();
         let now_ms = self.wall_clock.now().0.saturating_mul(1_000);
+        let secondary_retry_yield = (fanout.outcome().accepted_targets
+            >= fanout.request().required_acks.max(1)
+            && !matches!(fanout.mls_state(), FanoutMlsState::Pending(_)))
+        .then(|| {
+            self.publication_progress
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .map(|progress| progress.secondary_retry_yield.clone())
+        })
+        .flatten();
+        let yield_before_attempt = secondary_retry_yield
+            .as_ref()
+            .is_some_and(|signal| signal.clone().now_or_never().is_some());
         let due = fanout
             .outstanding_target_indexes()
             .into_iter()
-            .filter(|&index| frozen_fanout_target_retry_due(&fanout, index, now_ms))
+            .filter(|&index| {
+                !yield_before_attempt && frozen_fanout_target_retry_due(&fanout, index, now_ms)
+            })
             .collect::<Vec<_>>();
         let attempted_any = !due.is_empty();
         if !due.is_empty() {
@@ -4163,8 +4206,8 @@ where
             let account_id = fanout.request().account_id.clone();
             let mut accepted = fanout.outcome().accepted_targets;
             let ack_goal = fanout.request().required_acks.max(1);
-            // A retry after confirmation must finish its outstanding attempts;
-            // otherwise an already-met quorum would cancel every retry.
+            // An already-met quorum alone must not cancel every retry. Only
+            // explicit foreground pressure may interrupt this secondary tail.
             let finish_retries = accepted >= ack_goal;
             let mut attempts = due
                 .iter()
@@ -4188,6 +4231,16 @@ where
                 // exact-event retry, including after cancellation or restart.
                 let next = if accepted >= ack_goal && !finish_retries {
                     attempts.next().now_or_never().flatten()
+                } else if let Some(signal) = &secondary_retry_yield {
+                    // Only relay futures are cancelled. No engine transaction or
+                    // confirmation future is dropped, and ready receipts win ties.
+                    let next = attempts.next().fuse();
+                    let requested = signal.clone().fuse();
+                    futures::pin_mut!(next, requested);
+                    futures::select_biased! {
+                        result = next => result,
+                        () = requested => None,
+                    }
                 } else {
                     attempts.next().await
                 };
