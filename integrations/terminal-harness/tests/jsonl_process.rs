@@ -76,6 +76,48 @@ fn process_spec(
 }
 
 #[tokio::test]
+async fn concurrent_group_profile_routes_are_process_local_and_never_enter_argv() {
+    use marmot_terminal_harness::{GroupProfileContext, with_group_profile_context};
+    let root = tempfile::tempdir().unwrap();
+    let script = executable_script(
+        root.path(),
+        "control-route",
+        r#"#!/bin/sh
+test "$#" -eq 0 || exit 1
+test "$MARMOT_AGENT_AUTH_TOKEN" = "test-token" || exit 2
+test -z "${MARMOT_AGENT_AUTH_TOKEN_FILE:-}" || exit 3
+test "$MARMOT_GROUP_PROFILE_TIMEOUT_SECS" = "30" || exit 4
+cat >/dev/null
+printf '{"type":"text","text":"%s:%s"}\n' "$MARMOT_ACCOUNT_ID_HEX" "$MARMOT_GROUP_ID_HEX"
+"#,
+    );
+    let run = |account: &str, group: &str| {
+        let context = GroupProfileContext {
+            socket: root.path().join("private.sock"),
+            auth_token: Some("test-token".into()),
+            account_id_hex: account.into(),
+            group_id_hex: group.into(),
+            request_timeout: Duration::from_secs(30),
+        };
+        let spec = process_spec(
+            &script,
+            root.path(),
+            PromptTransport::Stdin("prompt".into()),
+        );
+        async move {
+            let (tx, mut rx) = mpsc::channel(4);
+            let result =
+                with_group_profile_context(context, run_jsonl_process(spec, tx, parse_event)).await;
+            assert_eq!(result.unwrap().exit_code, Some(0));
+            rx.recv().await.unwrap()
+        }
+    };
+    let (first, second) = tokio::join!(run("account-a", "group-a"), run("account-b", "group-b"));
+    assert_eq!(first, RunnerEvent::Text("account-a:group-a".into()));
+    assert_eq!(second, RunnerEvent::Text("account-b:group-b".into()));
+}
+
+#[tokio::test]
 async fn shared_runner_supports_stdin_and_delimited_argument_prompts() {
     let _permit = process_test_permit().await;
     let root = tempfile::tempdir().unwrap();
