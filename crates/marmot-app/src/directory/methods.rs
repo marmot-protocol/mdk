@@ -244,6 +244,7 @@ impl MarmotApp {
         let mut records = first.records;
         let first_observed =
             fresh_relay_list_status_from_records(&account_id_hex, records.clone(), freshness).value;
+        let observed_outboxes = first_observed.nip65.created_at > 0;
         let first_hop = merge_relay_list_status(cached.clone(), first_observed);
         let outbox_relays = self.retain_safe_discovered_endpoints(
             first_hop
@@ -266,7 +267,11 @@ impl MarmotApp {
                 .await
             {
                 Ok(second) => {
-                    complete &= second.complete;
+                    // Once freshly observed NIP-65 metadata identifies the
+                    // account's outboxes, their completed read establishes inbox
+                    // absence; an unavailable discovery indexer cannot veto it.
+                    // Cached-only outboxes may be stale and prove nothing.
+                    complete = second.complete && (complete || observed_outboxes);
                     records.extend(second.records);
                 }
                 Err(_) => complete = false,

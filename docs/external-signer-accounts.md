@@ -20,11 +20,17 @@ account worker only after the client registers a signer callback for the account
 Public/tracked accounts have both flags set to `false`.
 
 An external account stores only public account metadata plus device-local
-database unlock material. The `.external-sqlcipher-secret` file is local
-SQLCipher key material for opening this device's account database. It is not the
-Nostr private key and cannot sign Nostr events. It is protected at the app
-sandbox/filesystem-permission tier, not by the external signer or hardware
-keystore.
+database unlock material. A random SQLCipher key goes through the configured
+`SecretStore` under the reserved `.external-sqlcipher/<account label>` credential,
+with a SHA-256 identifier derived from that label. It is not the user's Nostr
+private key and does not change the account's signing flags. Its storage protection
+is the host's secret-store policy: an encrypted vault, a keychain, or the default
+local-file backend.
+
+An existing `.external-sqlcipher-secret` file is migrated on first open. MDK
+verifies the secret-store write before scrubbing and removing the old file. If an
+existing database has neither credential, opening fails rather than generating a
+different key and losing access to the database.
 
 ## Client Flow
 
@@ -39,6 +45,18 @@ For an existing external signer account after app/process restart, clients must
 call `registerExternalSigner` before expecting the account to publish, decrypt,
 receive welcomes, or start its worker. MDK lists the account before the callback
 is registered, but runtime work remains paused until registration succeeds.
+
+Registration activates the worker and can request a fresh account-identity proof.
+Keep it off the UI thread. Start local accounts first, then connect and register
+each external account independently so an unavailable signer does not hold up
+other accounts. Replacing a callback updates the existing per-account signer slot;
+SDK clients and workers keep the same pinned identity.
+
+The C binding provides a concrete NIP-46 adapter through `marmot_nip46_*` session
+functions. It accepts bunker links or client-initiated pairing, uses signed
+kind-24133 events with NIP-44 v2 transport, and pins the user key separately from
+the bunker and client communication keys. See the
+[C session lifecycle](../crates/marmot-c/README.md#nip-46-accounts).
 
 If a reversibly signed-out external account logs in again through
 `loginExternalSigner`, MDK clears the signed-out marker after setup succeeds and

@@ -1193,6 +1193,12 @@ typedef struct MarmotMessageDraftRevision MarmotMessageDraftRevision;
 typedef struct MarmotMessagesSubscription MarmotMessagesSubscription;
 
 /**
+ * Opaque per-account remote signer. Free before its creating client. Cancellation
+ * is thread-safe; free must not race an in-flight call on this handle.
+ */
+typedef struct MarmotNip46Session MarmotNip46Session;
+
+/**
  * Opaque handle to the notification pipeline: local-notification
  * updates produced by the runtime.
  */
@@ -9188,6 +9194,97 @@ MarmotStatus marmot_report_message(const struct MarmotClient *client,
  * Input is borrowed and never retained.
  */
 MarmotStatus marmot_verify_public_nostr_event_json(const char *event_json, uint8_t *out);
+
+/**
+ * Create an offline session from a bunker URI, client pairing config, or durable
+ * export. The creating client must outlive the session. Client communication keys
+ * remain session-local; persist them through the host's encrypted vault export.
+ * # Safety
+ * Client and config must be valid for the call; out must be writable.
+ */
+MarmotStatus marmot_nip46_new(const struct MarmotClient *client,
+                              const char *config_json,
+                              struct MarmotNip46Session **out);
+
+/**
+ * Get the pairing URI without network IO. Treat this string as a credential.
+ * # Safety
+ * Session must be live; out writable. Free string with marmot_string_free.
+ */
+MarmotStatus marmot_nip46_uri(const struct MarmotNip46Session *session, char **out);
+
+/**
+ * Connect, pin get_public_key, and adopt policy-checked switch_relays. Run off UI.
+ * # Safety
+ * Session must be live; out writable. Returned user hex uses marmot_string_free.
+ */
+MarmotStatus marmot_nip46_connect(const struct MarmotNip46Session *session, char **out);
+
+/**
+ * Export restart credentials. Store ONLY in an encrypted vault; never log them.
+ * # Safety
+ * Session must be live; out writable. Free with marmot_string_free.
+ */
+MarmotStatus marmot_nip46_export(const struct MarmotNip46Session *session, char **out);
+
+/**
+ * Set up an external account using the verified stable signer instance.
+ * inbox_relays sets kind-10050 independently; NULL/0 uses default_relays.
+ * # Safety
+ * All pointers must be valid for the call; relay arrays follow ordinary C ABI
+ * str-array ownership. Out summary is freed with marmot_account_summary_free.
+ */
+MarmotStatus marmot_nip46_login(const struct MarmotClient *client,
+                                const struct MarmotNip46Session *session,
+                                const char *const *default_relays,
+                                uintptr_t default_len,
+                                const char *const *bootstrap_relays,
+                                uintptr_t bootstrap_len,
+                                const char *const *inbox_relays,
+                                uintptr_t inbox_len,
+                                struct MarmotAccountSummary **out);
+
+/**
+ * Attach a pinned signer and activate its MDK worker. Identity lookup itself
+ * is offline, but worker activation requests a fresh identity proof. Restore
+ * handles before client_start, then run each account's connect/register on an
+ * independent background worker after local startup; never run this on UI.
+ * # Safety
+ * Client, account_ref and session must be live and belong to the same client.
+ */
+MarmotStatus marmot_nip46_register(const struct MarmotClient *client,
+                                   const char *account_ref,
+                                   const struct MarmotNip46Session *session);
+
+/**
+ * Nonblocking state snapshot; no session keys or signer request payloads.
+ * # Safety
+ * Session must be live; out writable. Free with marmot_string_free.
+ */
+MarmotStatus marmot_nip46_state(const struct MarmotNip46Session *session, char **out);
+
+/**
+ * Permanently interrupt pending requests, including synchronous proof callbacks.
+ * # Safety
+ * Session must be NULL or live; may race other operations, but not free.
+ */
+void marmot_nip46_cancel(const struct MarmotNip46Session *session);
+
+/**
+ * Bounded courtesy logout. Local session keys are cleared even on timeout or
+ * cancellation. Complete MDK signout first; delete the vault export regardless.
+ * # Safety
+ * Session must be live.
+ */
+MarmotStatus marmot_nip46_logout(const struct MarmotNip46Session *session);
+
+/**
+ * Cancel and release transport without remote logout. Vault credentials remain
+ * usable after restart. Registered callbacks become cancelled, never dangling.
+ * # Safety
+ * Session must be NULL or uniquely owned and no other call may be in flight.
+ */
+void marmot_nip46_free(struct MarmotNip46Session *session);
 
 /**
  * Free a value of this type returned by this library. NULL

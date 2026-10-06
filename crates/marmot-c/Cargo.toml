@@ -24,10 +24,15 @@ tokio = { workspace = true, features = ["io-util", "net", "rt-multi-thread", "ti
 libc.workspace = true
 # Holds a host-supplied secret-key hex only as long as the boundary needs it.
 zeroize.workspace = true
+nostr = { workspace = true, features = ["nip46"] }
+nostr-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 keyring-core.workspace = true
-nostr.workspace = true
 nostr-relay-builder.workspace = true
 transport-quic-broker.workspace = true
