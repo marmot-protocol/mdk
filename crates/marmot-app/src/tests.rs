@@ -15267,28 +15267,27 @@ async fn a_peer_member_added_leaves_stored_self_membership_alone() {
     let group_id = client.create_group("peer added", &[]).await.unwrap();
     let group_id_hex = hex::encode(group_id.as_slice());
     let state_change = |change| marmot_account::AccountDeviceEffects {
-        events: vec![
-            cgka_traits::engine::GroupEvent::GroupStateChanged {
-                group_id: group_id.clone(),
-                epoch: cgka_traits::EpochId(1),
-                actor: None,
-                change,
-                origin_commit_id: None,
-            },
-            cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated {
-                group_id: group_id.clone(),
-                voluntary: false,
-            },
-        ],
+        events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(1),
+            actor: None,
+            change,
+            origin_commit_id: None,
+        }],
         ..Default::default()
     };
 
+    let mut departure = state_change(cgka_traits::engine::GroupStateChange::MemberRemoved {
+        member: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+    });
+    departure
+        .events
+        .push(cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated {
+            group_id: group_id.clone(),
+            voluntary: false,
+        });
     client
-        .observe_drained_session_events(&state_change(
-            cgka_traits::engine::GroupStateChange::MemberRemoved {
-                member: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
-            },
-        ))
+        .observe_drained_session_events(&departure)
         .await
         .unwrap();
     client

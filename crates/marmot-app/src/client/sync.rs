@@ -952,8 +952,15 @@ impl AppClient {
         // Foreground send preflight can settle unrelated retained commits.
         // Their membership decisions are already canonical even if the
         // requested command's publication fails or emits no report.
-        self.observe_native_membership_effects(effects).await?;
-        fail_if_publish_failed(effects)
+        let publish_result = fail_if_publish_failed(effects);
+        if publish_result.is_err() {
+            self.observe_failed_publish_effects_best_effort(effects)
+                .await;
+        } else {
+            self.observe_native_membership_effects_best_effort(effects)
+                .await;
+        }
+        publish_result
     }
 
     /// Observe native device facts at command/maintenance boundaries that
@@ -984,6 +991,44 @@ impl AppClient {
         }
         self.observe_send_applied_effects(&native).await?;
         self.save_state_with_pending_local_group_deletion_frontier_clears()
+    }
+
+    /// Native decisions are already canonical. Projection and route refresh
+    /// failures retain a retry edge without changing the command's publish result.
+    async fn observe_native_membership_effects_best_effort(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) {
+        if let Err(error) = self.observe_native_membership_effects(effects).await {
+            self.pending_runtime_group_subscription_refresh = true;
+            tracing::warn!(
+                target: "marmot_app::client",
+                method = "observe_native_membership_effects",
+                error_kind = error.privacy_safe_kind(),
+                "native membership projection deferred"
+            );
+        }
+    }
+
+    /// An unrelated publish failure cannot discard committed activity or
+    /// withdrawal events. Project the full batch before returning that failure.
+    async fn observe_failed_publish_effects_best_effort(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) {
+        let result = self
+            .observe_send_applied_effects(effects)
+            .await
+            .and_then(|()| self.save_state_with_pending_local_group_deletion_frontier_clears());
+        if let Err(error) = result {
+            self.pending_runtime_group_subscription_refresh = true;
+            tracing::warn!(
+                target: "marmot_app::client",
+                method = "observe_failed_publish_effects",
+                error_kind = error.privacy_safe_kind(),
+                "committed projection deferred after publication failure"
+            );
+        }
     }
 
     pub(crate) async fn sync_runtime_groups(&mut self) -> Result<(), AppError> {
@@ -1743,7 +1788,8 @@ impl AppClient {
         if let Err(error) = fail_if_publish_failed(effects) {
             self.pending_projection_updates.extend(finalize_updates);
             self.pending_projection_updates.extend(failed_updates);
-            self.observe_native_membership_effects(effects).await?;
+            self.observe_failed_publish_effects_best_effort(effects)
+                .await;
             return Err(error);
         }
         summary.projection_updates.extend(finalize_updates);
@@ -1977,11 +2023,13 @@ impl AppClient {
                 source_received_at,
             )
             .await?;
+        // Projection has already applied. Preserve its subscriber updates even
+        // if the following transport rebuild fails and is retried separately.
+        self.pending_applied_sync_summary.merge(summary);
         let routes_changed = self.refresh_group_routes()?.routing_changed;
         if routes_dirty || routes_changed {
             self.sync_runtime_groups().await?;
         }
-        self.pending_applied_sync_summary.merge(summary);
         Ok(())
     }
 
@@ -4760,7 +4808,8 @@ impl AppClient {
         if let Err(error) = fail_if_publish_failed(effects) {
             self.pending_projection_updates.extend(finalize_updates);
             self.pending_projection_updates.extend(failed_updates);
-            self.observe_native_membership_effects(effects).await?;
+            self.observe_failed_publish_effects_best_effort(effects)
+                .await;
             return Err(error);
         }
         let publish_new_message_notification =
@@ -6183,6 +6232,151 @@ mod runtime_group_subscription_refresh_tests {
                 .unwrap()
         );
         assert!(!client.has_pending_runtime_group_subscription_refresh());
+    }
+
+    /// Secondary route failures preserve command success and primary publication
+    /// errors, including committed activity and buffered subscriber updates.
+    #[tokio::test]
+    async fn canonical_publish_result_survives_native_route_refresh_failure() {
+        use crate::AppError;
+        use cgka_traits::engine::{GroupEvent, GroupStateChange};
+
+        enum Seam {
+            Command,
+            Drain,
+            Retry,
+        }
+        for (seam, failed) in [
+            (Seam::Command, false),
+            (Seam::Command, true),
+            (Seam::Drain, true),
+            (Seam::Retry, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let account = AccountHome::open(dir.path())
+                .create_account("alice")
+                .unwrap();
+            let relay = Arc::new(ScriptedPushRelayClient::default());
+            let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+                .with_test_relay_client(relay.clone());
+            let mut client = app.client("alice").await.unwrap();
+            client.prepare_transport().await.unwrap();
+            let telemetry = AppPerformanceTelemetry::default();
+            let created = client
+                .create_group_with_options_and_telemetry(
+                    "command observation",
+                    &[],
+                    crate::AppCreateGroupOptions::default(),
+                    &telemetry,
+                )
+                .await
+                .unwrap();
+            client
+                .create_group_with_options_and_telemetry(
+                    "pending install",
+                    &[],
+                    crate::AppCreateGroupOptions::default(),
+                    &telemetry,
+                )
+                .await
+                .unwrap();
+            let group = created.group_id;
+            let group_hex = hex::encode(group.as_slice());
+            // Explicit projection fixture: force the post-canonical observer's
+            // rebuild, independently of the requested command's publication.
+            let mut effects = marmot_account::AccountDeviceEffects {
+                events: vec![GroupEvent::LocalGroupCopyTerminated {
+                    group_id: group.clone(),
+                    voluntary: true,
+                }],
+                ..Default::default()
+            };
+            if failed {
+                effects.events.push(GroupEvent::GroupStateChanged {
+                    group_id: group.clone(),
+                    epoch: cgka_traits::EpochId(1),
+                    actor: Some(cgka_traits::MemberId::new(
+                        hex::decode(&account.account_id_hex).unwrap(),
+                    )),
+                    change: GroupStateChange::GroupRenamed {
+                        name: "committed before unrelated failure".into(),
+                        previous_name: None,
+                    },
+                    origin_commit_id: Some(cgka_traits::MessageId::new(vec![0x73; 32])),
+                });
+                effects.failures.push(marmot_account::PublishFailure {
+                    message_id: cgka_traits::MessageId::new(vec![0x74; 32]),
+                    reason: "primary publication failure".into(),
+                });
+            }
+            relay.fail_next_subscribe();
+            let result = match seam {
+                Seam::Command => {
+                    client
+                        .observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+                        .await
+                }
+                Seam::Drain => client
+                    .observe_drained_session_events(&effects)
+                    .await
+                    .map(|_| ()),
+                Seam::Retry => client
+                    .observe_convergence_retry_effects(&group, &effects)
+                    .await
+                    .map(|_| ()),
+            };
+            if failed {
+                assert!(
+                    matches!(result, Err(AppError::Publish(ref reason)) if reason == "primary publication failure")
+                );
+            } else {
+                result.expect("an observation failure must not fail a successful publication");
+            }
+            assert!(client.has_pending_runtime_group_subscription_refresh());
+            assert_eq!(
+                app.stored_group_self_membership("alice", &group_hex)
+                    .unwrap(),
+                Some(crate::SelfMembership::Left)
+            );
+            let buffered = client.take_pending_applied_sync_summary();
+            assert!(
+                buffered
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, GroupEvent::LocalGroupCopyTerminated { .. })),
+                "already applied subscriber updates must survive the failed rebuild"
+            );
+            let rows = app
+                .timeline_messages_with_query(
+                    "alice",
+                    crate::TimelineMessageQuery {
+                        group_id_hex: Some(group_hex.clone()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .messages;
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row
+                        .group_system
+                        .as_ref()
+                        .is_some_and(|event| event.system_type == "group_renamed"))
+                    .count(),
+                usize::from(failed)
+            );
+            let before = relay.subscription_count();
+            client
+                .retry_pending_runtime_group_subscription_refresh()
+                .await
+                .unwrap();
+            assert!(!client.has_pending_runtime_group_subscription_refresh());
+            assert!(relay.subscription_count() > before);
+            client
+                .save_state_with_pending_local_group_deletion_frontier_clears()
+                .unwrap();
+            assert!(client.pending_group_projection_updates.is_empty());
+        }
     }
 
     /// The drained seam's subscription rebuild owes the same retry edge.

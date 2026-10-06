@@ -46,7 +46,10 @@
   Manual convergence retries observe the same native effects as scheduled
   convergence, including reportless membership changes and leaf-token cleanup.
   Group commands and maintenance also observe native membership decisions
-  produced while settling retained commits.
+  produced while settling retained commits. Secondary projection or route-refresh
+  failures preserve the canonical publish result and keep route retries armed.
+  Drained and retried batches retain committed activity even when an unrelated
+  publication fails.
   Rust consumers must handle the three new non-timeline `GroupEvent` variants.
   Existing row IDs and correctly attributed stored rows remain unchanged;
   no account reset or destructive history migration is required.

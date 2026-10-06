@@ -4054,6 +4054,13 @@ async fn convergence_pass_that_replaces_the_own_commit_withdraws_it_exactly_once
         "fixture must make the inbound sibling commit the ordering winner"
     );
     let competing_id = MessageId::new(Sha256::digest(&f.competing.payload).to_vec());
+    let departed_leaf = local
+        .canonical_group_membership(&f.group_id)
+        .unwrap()
+        .member_leaves
+        .into_iter()
+        .find(|leaf| leaf.member == f.own_invitee)
+        .expect("the abandoned invitee has an authenticated leaf");
     drop(local);
     let mut local = reopen_legacy_client(&f.local_seed, f.local_storage.clone());
 
@@ -4157,10 +4164,19 @@ async fn convergence_pass_that_replaces_the_own_commit_withdraws_it_exactly_once
         ),
         "the withdrawal must name the own commit at its source epoch: {events:?}"
     );
+    assert!(
+        events.iter().any(|event| matches!(event,
+            GroupEvent::GroupMemberLeavesRemoved { group_id, epoch, leaves, departed_members }
+                if group_id == &f.group_id && *epoch == EpochId(2)
+                    && leaves == &vec![departed_leaf.clone()]
+                    && departed_members == &vec![f.own_invitee.clone()]
+        )),
+        "the abandoned branch's invitee loses its leaf without a fake removal activity: {events:?}"
+    );
     assert_eq!(
         events.len(),
-        3,
-        "the settling pass must emit the authenticated invitation and own-commit withdrawal pair: {events:?}"
+        4,
+        "the settling pass must emit the authenticated invitation, native leaf cleanup and own-commit withdrawal pair: {events:?}"
     );
 
     // Dispositions: the winning sibling becomes canonical; the displaced own
