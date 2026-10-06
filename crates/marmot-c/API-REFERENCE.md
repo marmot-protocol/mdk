@@ -5017,6 +5017,18 @@ on delivery. See [local sends](../marmot-uniffi/LOCAL-SENDS.md).
 
 [Header contract](include/marmot.h#L10476)
 
+### `marmot_send_prepared_media_with_client_token`
+
+```c
+MarmotStatus marmot_send_prepared_media_with_client_token(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const struct MarmotMediaAttachmentReference *attachments, uintptr_t attachments_len, const char *caption, const char *client_token, const struct MarmotMessageDraftRevision *consuming_draft, struct MarmotLocalSendAcceptance **out);
+```
+
+Admit the immutable ordinary-media snapshot with its stable token. The optional original draft revision is borrowed from its live selected-draft owner; only an exact unchanged revision is consumed in the admission transaction. A newer or cleared draft is preserved. Keep the original token, references and revision for live retry, and query local token status after interruption before another upload or admission.
+
+Required strings and the ordered attachment array are borrowed; caption and consumption revision may be NULL. The output is validated and cleared before inputs or mutation. Free the owned acceptance with `marmot_local_send_acceptance_free`. Use this additive function with matching regenerated headers and libraries. See [shared captured-media contract](../marmot-uniffi/LOCAL-SENDS.md#captured-ordinary-media-drafts) and [method guidance](../marmot-uniffi/API-REFERENCE.md#marmotsend_prepared_media_with_client_token).
+
+[Header contract](include/marmot.h#L8363)
+
 ### `marmot_send_text_with_client_token`
 
 ```c
@@ -5108,22 +5120,5 @@ MarmotStatus marmot_set_audit_otlp_config_v5(const struct MarmotClient *client, 
 Configure or disable the dedicated v5 OTLP sender in memory. To enable, supply a stable destination identity, HTTPS `/v1/logs` endpoint, and bearer token; exact loopback development endpoints require `allow_loopback_dev`. To disable, set `enabled` false. The returned copy omits the token and is freed with `marmot_audit_otlp_config_v5_free`. This does not enable audit recording or alter the legacy v4 endpoint.
 
 [Header contract](include/marmot.h#L8296)
-
-</details>
-
-<details>
-<summary>New exports — complete and organize before merging</summary>
-
-### `marmot_send_prepared_media_with_client_token`
-
-```c
-MarmotStatus marmot_send_prepared_media_with_client_token(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const struct MarmotMediaAttachmentReference *attachments, uintptr_t attachments_len, const char *caption, const char *client_token, const struct MarmotMessageDraftRevision *consuming_draft, struct MarmotLocalSendAcceptance **out);
-```
-
-Admit the immutable ordinary-media snapshot with its stable token. The optional original draft revision is borrowed from its live selected-draft owner; only an exact unchanged revision is consumed in the admission transaction. A newer or cleared draft is preserved. Keep the original token, references and revision for live retry, and query local token status after interruption before another upload or admission.
-
-Required strings and the ordered attachment array are borrowed; caption and consumption revision may be NULL. The output is validated and cleared before inputs or mutation. Free the owned acceptance with `marmot_local_send_acceptance_free`. Use this additive function with matching regenerated headers and libraries. See [shared captured-media contract](../marmot-uniffi/LOCAL-SENDS.md#captured-ordinary-media-drafts) and [method guidance](../marmot-uniffi/API-REFERENCE.md#marmotsend_prepared_media_with_client_token).
-
-[Header contract](include/marmot.h#L8363)
 
 </details>
