@@ -4543,8 +4543,9 @@ fn secure_prune_scrubs_retained_edit_copies_before_reprojection() {
     }
 }
 
-/// A leaf departure keeps sibling destinations and account tombstones. Losing
-/// the final leaf clears all account records, including stale unknown indexes.
+/// A leaf departure keeps a rejoined device's identical token at its new leaf
+/// and account tombstones. Losing the final leaf clears all account records,
+/// including stale unknown indexes.
 #[test]
 fn leaf_cleanup_preserves_sibling_tombstones_until_account_departure() {
     let store = SqliteAccountStorage::in_memory().unwrap();
@@ -4553,9 +4554,9 @@ fn leaf_cleanup_preserves_sibling_tombstones_until_account_departure() {
     let first = push_token(&g, &m, 100, "first");
     let mut sibling = first.clone();
     sibling.leaf_index = 1;
-    sibling.token_fingerprint = "sibling".into();
     store.apply_group_push_token(&first).unwrap();
     store.apply_group_push_token(&sibling).unwrap();
+    assert_eq!(store.group_push_tokens(&g).unwrap().len(), 2);
     store
         .apply_group_push_token_tombstone(&g, &m, 2, 1, &"dd".repeat(32), 500, "withdrawn", 500)
         .unwrap();
@@ -4565,6 +4566,7 @@ fn leaf_cleanup_preserves_sibling_tombstones_until_account_departure() {
     let tokens = store.group_push_tokens(&g).unwrap();
     assert_eq!(tokens.len(), 1);
     assert_eq!(tokens[0].leaf_index, 1);
+    assert_eq!(tokens[0].token_fingerprint, first.token_fingerprint);
     let mut old = push_token(&g, &m, 100, "old");
     old.leaf_index = 2;
     old.server_pubkey_hex = "dd".repeat(32);

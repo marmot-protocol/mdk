@@ -110,6 +110,17 @@ fn can_send(client: &AppClient, group: &GroupId) -> bool {
 /// A real sibling SelfRemove must not terminate the surviving device's projection.
 #[tokio::test]
 async fn sibling_selfremove_preserves_surviving_app_device_after_reopen() {
+    sibling_selfremove_through_author_command(false).await;
+}
+
+/// A group command can confirm a retained sibling departure before its own
+/// profile update; the command must observe those native effects as well.
+#[tokio::test]
+async fn own_group_command_observes_retained_sibling_departure() {
+    sibling_selfremove_through_author_command(true).await;
+}
+
+async fn sibling_selfremove_through_author_command(profile_command: bool) {
     let dir = tempfile::tempdir().unwrap();
     let sibling_dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -169,8 +180,9 @@ async fn sibling_selfremove_preserves_surviving_app_device_after_reopen() {
     assert_ne!(surviving_leaf, departing_leaf);
     for leaf in [surviving_leaf, departing_leaf] {
         let mut token = drained_seam_push_token(&group_hex, &bob.account_id_hex, leaf);
-        token.token_fingerprint = format!("device-{leaf}");
+        token.token_fingerprint = "same-device-token".into();
         app.upsert_group_push_token("bob", &token).unwrap();
+        app.upsert_group_push_token("alice", &token).unwrap();
     }
     relay.fail_publishes_as_unavailable();
     bob_client
@@ -219,7 +231,21 @@ async fn sibling_selfremove_preserves_surviving_app_device_after_reopen() {
         .unwrap()
         .unwrap();
     tokio::time::sleep(Duration::from_millis(delay + 1)).await;
-    alice.retry_group_convergence(&group).await.unwrap();
+    if profile_command {
+        alice
+            .update_group_profile(&group, Some("after departure"), None)
+            .await
+            .unwrap();
+    } else {
+        alice.retry_group_convergence(&group).await.unwrap();
+    }
+    let author_tokens = app.group_push_tokens("alice", &group_hex).unwrap();
+    assert_eq!(
+        author_tokens.len(),
+        1,
+        "the public command must observe the author's leaf cleanup"
+    );
+    assert_eq!(author_tokens[0].leaf_index, surviving_leaf);
     deliver_new(&mut bob_client, &relay, &mut bob_cursor).await;
     bob_client.sync().await.unwrap();
     bob_client.retry_group_convergence(&group).await.unwrap();
@@ -337,7 +363,26 @@ async fn sibling_selfremove_preserves_surviving_app_device_after_reopen() {
 /// scheduler-driven rollback test; the engine retained-history test owns that proof.
 #[tokio::test]
 async fn termination_then_restoration_preserves_failed_sends_and_archive() {
-    for archived in [false, true] {
+    #[derive(Clone, Copy)]
+    enum Observer {
+        Drained,
+        Retry,
+        Command,
+        Maintenance,
+    }
+    for (archived, seam, failed) in [
+        (false, Observer::Drained, false),
+        (true, Observer::Drained, false),
+        (false, Observer::Retry, false),
+        (true, Observer::Retry, false),
+        (false, Observer::Command, false),
+        (true, Observer::Command, false),
+        (false, Observer::Maintenance, false),
+        (true, Observer::Maintenance, false),
+        (true, Observer::Drained, true),
+        (true, Observer::Retry, true),
+        (true, Observer::Command, true),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
         let account = home.create_account("alice").unwrap();
@@ -366,7 +411,7 @@ async fn termination_then_restoration_preserves_failed_sends_and_archive() {
             },
         )
         .unwrap();
-        let effects = marmot_account::AccountDeviceEffects {
+        let mut effects = marmot_account::AccountDeviceEffects {
             events: vec![
                 GroupEvent::LocalGroupCopyTerminated {
                     group_id: group.clone(),
@@ -378,10 +423,32 @@ async fn termination_then_restoration_preserves_failed_sends_and_archive() {
             ],
             ..Default::default()
         };
-        client
-            .observe_drained_session_events(&effects)
-            .await
-            .unwrap();
+        if failed {
+            effects.failures.push(marmot_account::PublishFailure {
+                message_id: MessageId::new(vec![0xef; 32]),
+                reason: "unrelated publication failed".into(),
+            });
+        }
+        let result = match seam {
+            Observer::Drained => client
+                .observe_drained_session_events(&effects)
+                .await
+                .map(|_| ()),
+            Observer::Retry => client
+                .observe_convergence_retry_effects(&group, &effects)
+                .await
+                .map(|_| ()),
+            Observer::Command => {
+                client
+                    .observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+                    .await
+            }
+            Observer::Maintenance => client
+                .finish_maintenance_effects(&effects)
+                .await
+                .map(|_| ()),
+        };
+        assert_eq!(result.is_err(), failed);
         assert_eq!(
             app.stored_group_self_membership("alice", &group_hex)
                 .unwrap(),
@@ -409,6 +476,8 @@ async fn termination_then_restoration_preserves_failed_sends_and_archive() {
             Some("local_publish_failed")
         );
         // Replay stays absolute and must not create any kind-1210 invitation.
+        // The unrelated publication is not retried by this native-event replay.
+        effects.failures.clear();
         client
             .observe_drained_session_events(&effects)
             .await

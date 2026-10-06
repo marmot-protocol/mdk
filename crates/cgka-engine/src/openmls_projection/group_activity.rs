@@ -14,8 +14,8 @@ pub(crate) struct GroupActivitySnapshot {
 }
 
 impl GroupActivitySnapshot {
-    /// Read display components independently. Unknown encodings omit only their own delta;
-    /// protocol validation, rather than presentation extraction, decides whether a commit applies.
+    /// Read display components independently. Unknown encodings never veto protocol apply;
+    /// the shared derivation can still render a later authenticated repair of those components.
     pub(crate) fn capture(group: &MlsGroup) -> Self {
         Self {
             name: crate::app_components::group_profile_of_group(group)
@@ -46,12 +46,17 @@ impl GroupActivitySnapshot {
     ) -> Vec<(MemberId, GroupStateChange)> {
         let after_members: HashSet<_> = after.members.iter().collect();
         let mut changes = Vec::new();
-        if let (Some(before), Some(after)) = (&self.admins, &after.admins) {
-            changes.extend(crate::group_state_changes::admin_changes(before, after));
+        // Unknown before-state uses the historical author fallback. An unknown
+        // after-state cannot support a display claim, so omit only that delta.
+        if let Some(after) = &after.admins {
+            changes.extend(crate::group_state_changes::admin_changes(
+                self.admins.as_deref().unwrap_or_default(),
+                after,
+            ));
         }
-        if let (Some(before_name), Some(after_name)) = (&self.name, &after.name) {
+        if let Some(after_name) = &after.name {
             changes.extend(crate::group_state_changes::profile_changes(
-                Some(before_name),
+                self.name.as_deref(),
                 Some(after_name),
                 &self.avatar,
                 &after.avatar,
@@ -135,6 +140,48 @@ mod tests {
     };
     use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendResult};
     use cgka_traits::storage::StorageProvider;
+
+    /// A valid repair has the same author/recipient target even when its old
+    /// display state is undecodable. Unknown resulting state never invents rows.
+    #[test]
+    fn shared_decoder_preserves_authenticated_display_repairs() {
+        let actor = MemberId::new(vec![1; 32]);
+        let before = GroupActivitySnapshot {
+            name: None,
+            admins: None,
+            avatar: [None, None],
+            retention: None,
+            members: vec![actor.clone()],
+        };
+        let after = GroupActivitySnapshot {
+            name: Some("repaired".into()),
+            admins: Some(vec![[2; 32]]),
+            avatar: [None, None],
+            retention: Some(Some(60)),
+            members: vec![actor.clone()],
+        };
+        assert_eq!(
+            before.changes(&after, &actor, &[], &[]),
+            vec![
+                (
+                    actor.clone(),
+                    GroupStateChange::AdminAdded {
+                        member: MemberId::new(vec![2; 32])
+                    }
+                ),
+                (
+                    actor.clone(),
+                    GroupStateChange::GroupRenamed {
+                        name: "repaired".into(),
+                        previous_name: None
+                    }
+                ),
+            ]
+        );
+        // Retention activity requires a numeric old value; do not invent zero
+        // when only the previous encoding is unknown.
+        assert!(after.changes(&before, &actor, &[], &[]).is_empty());
+    }
 
     /// Existing legacy state can contain unknown display encodings even though
     /// its next MLS self-update is valid. Capture must not veto that update.
@@ -244,6 +291,41 @@ mod tests {
             vec![(
                 engine.identity.self_id().clone(),
                 GroupStateChange::MemberAdded { member: added }
+            )]
+        );
+
+        // Drive a real validated AppDataUpdate repairing the legacy profile.
+        // This is the same staging helper the author uses, rather than a
+        // fabricated before/after name pair.
+        engine
+            .stage_commit_with_app_data_updates(
+                &mut group,
+                &provider,
+                vec![],
+                vec![],
+                vec![Proposal::AppDataUpdate(Box::new(
+                    openmls::prelude::AppDataUpdateProposal::update(
+                        GROUP_PROFILE_COMPONENT_ID,
+                        crate::app_components::encode_group_profile("repaired", "").unwrap(),
+                    ),
+                ))],
+                "legacy_profile_repair_test",
+            )
+            .unwrap();
+        group.merge_pending_commit(&provider).unwrap();
+        assert_eq!(
+            after.changes(
+                &GroupActivitySnapshot::capture(&group),
+                engine.identity.self_id(),
+                &[],
+                &[],
+            ),
+            vec![(
+                engine.identity.self_id().clone(),
+                GroupStateChange::GroupRenamed {
+                    name: "repaired".into(),
+                    previous_name: None,
+                },
             )]
         );
     }

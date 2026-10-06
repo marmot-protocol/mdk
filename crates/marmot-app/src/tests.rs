@@ -15378,6 +15378,8 @@ async fn a_self_departure_marks_transport_routes_dirty() {
 /// The arm also sets `routes_dirty`, which this test does not assert: the
 /// teardown it forces belongs to `refresh_group_routes`, which clears a
 /// disbanded group's subscriptions outright. This test pins the push sweep.
+/// The batch starts with a buffered departure after the engine's terminal
+/// guard already prevents live membership queries; projection must still finish.
 #[tokio::test]
 async fn a_drained_disband_performs_the_terminal_push_sweep() {
     let dir = tempfile::tempdir().unwrap();
@@ -15403,14 +15405,49 @@ async fn a_drained_disband_performs_the_terminal_push_sweep() {
     app.upsert_group_push_token("alice", &drained_seam_push_token(&group_id_hex, &peer, 1))
         .unwrap();
 
+    // Model the post-settlement projection seam, rather than re-driving MLS
+    // convergence: live membership is no longer queryable when this batch runs.
+    make_group_terminal(&client, &group_id, true);
+    let storage = app.account_storage("alice").unwrap();
+    let terminal = storage.get_group(&group_id).unwrap();
+    storage.delete_group(&group_id).unwrap();
+    storage.put_group(&terminal).unwrap();
+    drop(client);
+    let mut client = app.client("alice").await.unwrap();
+    assert!(
+        client
+            .runtime
+            .session()
+            .canonical_group_membership(&group_id)
+            .is_err()
+    );
+    let departed = MemberId::new(hex::decode(&peer).unwrap());
     let effects = marmot_account::AccountDeviceEffects {
-        events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
-            group_id: group_id.clone(),
-            epoch: cgka_traits::EpochId(1),
-            actor: None,
-            change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
-            origin_commit_id: None,
-        }],
+        events: vec![
+            cgka_traits::engine::GroupEvent::GroupMemberLeavesRemoved {
+                group_id: group_id.clone(),
+                epoch: cgka_traits::EpochId(1),
+                leaves: vec![cgka_traits::engine::GroupMemberLeaf {
+                    member: departed.clone(),
+                    leaf_index: 1,
+                }],
+                departed_members: vec![departed.clone()],
+            },
+            cgka_traits::engine::GroupEvent::GroupStateChanged {
+                group_id: group_id.clone(),
+                epoch: cgka_traits::EpochId(1),
+                actor: None,
+                change: cgka_traits::engine::GroupStateChange::MemberLeft { member: departed },
+                origin_commit_id: None,
+            },
+            cgka_traits::engine::GroupEvent::GroupStateChanged {
+                group_id: group_id.clone(),
+                epoch: cgka_traits::EpochId(2),
+                actor: None,
+                change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
+                origin_commit_id: None,
+            },
+        ],
         ..Default::default()
     };
     client
@@ -17851,6 +17888,7 @@ async fn a_resource_refusal_for_a_terminal_group_arms_no_recovery() {
     );
     client
         .observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+        .await
         .expect("a clean refusal pass must not fail");
 
     assert!(
@@ -18267,6 +18305,7 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
         }
         MixedPublishObservation::Retry => client
             .observe_convergence_retry_effects(&group_id, &effects)
+            .await
             .map(|_| SyncSummary::default()),
     };
     if matches!(observation, MixedPublishObservation::DirectSend) {
@@ -18594,7 +18633,9 @@ async fn a_publish_failure_during_a_convergence_retry_still_arms_recovery() {
     assert_eq!(audit_rows_of_kind(&app, "epoch_stall_backfill_armed"), 0);
 
     let effects = a_refusal_riding_a_rolled_back_publish(&group_id);
-    let result = client.observe_convergence_retry_effects(&group_id, &effects);
+    let result = client
+        .observe_convergence_retry_effects(&group_id, &effects)
+        .await;
 
     assert!(
         result.is_err(),
@@ -18971,6 +19012,7 @@ async fn the_arming_publish_gate_classifies_exactly_as_the_bare_publish_check() 
         let bare = crate::groups::fail_if_publish_failed(&effects).map_err(|err| err.to_string());
         let armed = client
             .observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await
             .map_err(|err| err.to_string());
         assert_eq!(
             armed, bare,
@@ -19069,6 +19111,7 @@ async fn a_convergence_reorg_ends_the_unrecovered_arm_run() {
     // Convergence then resolves a fork this device was on the wrong side of.
     client
         .observe_recovery_evidence_then_fail_if_publish_failed(&a_convergence_reorg(&group_id, 9))
+        .await
         .expect("a batch carrying only a convergence reorg passes the publish gate");
 
     // Without the reorg this third arm is the run's escalating one
@@ -19192,6 +19235,7 @@ async fn a_confirmed_local_publish_reports_its_epoch_passage_through_the_publish
     // The device then commits and the publish confirms, 10 -> 11.
     client
         .observe_recovery_evidence_then_fail_if_publish_failed(&an_epoch_passage(&group_id, 10, 11))
+        .await
         .expect("a batch carrying only an epoch passage clears the publish gate");
 
     // One epoch per arm is a limp, so that confirm alone does not end the run —

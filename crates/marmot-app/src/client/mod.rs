@@ -1197,7 +1197,11 @@ impl AppClient {
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<crate::MaintenanceRunSummary, AppError> {
-        let result = self.observe_recovery_evidence_then_summarize_maintenance(effects);
+        self.observe_recovery_evidence(effects);
+        let result = self
+            .observe_native_membership_effects(effects)
+            .await
+            .and_then(|()| self.observe_recovery_evidence_then_summarize_maintenance(effects));
         self.recover_superseded_invites_best_effort().await;
         result
     }
@@ -2645,6 +2649,7 @@ impl AppClient {
             // `&mut self`.
             Ok(effects) => self
                 .observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+                .await
                 .map(|()| effects),
             Err(error) => Err(error),
         };
@@ -2764,7 +2769,8 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -2836,7 +2842,8 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -3163,7 +3170,8 @@ impl AppClient {
                     audit_context.clone(),
                 )
                 .await?;
-            self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+            self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+                .await?;
             Ok::<_, AppError>(effects)
         }
         .await
@@ -3590,7 +3598,8 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -3659,7 +3668,8 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -3717,7 +3727,8 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -3788,7 +3799,8 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -3832,7 +3844,8 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -5284,7 +5297,8 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         let summary = send_summary_from_effects(&effects);
@@ -5540,36 +5554,25 @@ impl AppClient {
         self.sync_runtime_groups().await?;
         let effects = self.runtime.advance_convergence(group_id).await?;
         self.observe_convergence_retry_effects(group_id, &effects)
+            .await
     }
 
     /// Project one convergence retry's effects, split from the advance itself so
     /// the projection is exercisable against a given batch of effects.
-    pub(crate) fn observe_convergence_retry_effects(
+    pub(crate) async fn observe_convergence_retry_effects(
         &mut self,
         group_id: &GroupId,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<SendSummary, AppError> {
-        // Observe before the publish gate, for the reason spelled out in
-        // `observe_drained_session_events`.
-        self.observe_recovery_evidence(effects);
-        self.remember_published_reports(effects);
-        // This is the path that releases sends the engine had retained, so its
-        // finalize updates carry the pending -> delivered flip for each of them.
-        // Buffer these updates for the account worker, as the direct send path
-        // does for sibling completions and deferred source repairs. Dropping
-        // them leaves subscribers pending even though storage is delivered.
-        let finalize_updates = self.finalize_published_app_message_source_retention(effects)?;
-        self.pending_projection_updates.extend(finalize_updates);
-        let failed_updates = self.invalidate_failed_app_message_projections(effects, None)?;
-        self.pending_projection_updates.extend(failed_updates);
-        // A manual retry can complete one frozen fanout while another publish
-        // in the same convergence batch fails. Finalize that success before
-        // surfacing the unrelated failure because its fanout is already gone.
-        fail_if_publish_failed(effects)?;
-        self.refresh_group(group_id);
-        self.prune_plaintext_retention_for_group(group_id)?;
-        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(effects);
+        // Manual and scheduled retries consume the same one-shot native events.
+        // Reuse their complete observer, including reportless membership effects,
+        // source finalization, route refresh, and persistence before broadcasting.
+        let mut summary = self
+            .observe_scheduled_convergence_effects(group_id, effects)
+            .await?;
+        self.pending_projection_updates
+            .extend(std::mem::take(&mut summary.projection_updates));
+        self.pending_applied_sync_summary.merge(summary);
         Ok(send_summary_from_effects(effects))
     }
 
@@ -5635,7 +5638,8 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         let group_metadata = self.runtime.group_record(group_id).ok();
@@ -6608,7 +6612,8 @@ impl AppClient {
                 // same gate, so no publishing seam reaches the bare check.
                 recover_post_canonical_result(
                     "classify_founding_welcome_publish",
-                    self.observe_recovery_evidence_then_fail_if_publish_failed(&effects),
+                    self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+                        .await,
                 );
                 recover_post_canonical_result(
                     "record_founding_welcome_delivery_failures",

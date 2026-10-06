@@ -939,7 +939,7 @@ impl AppClient {
     /// worker wake. Remember their engine-provided scheduling edge here so all
     /// direct send operations (messages and group-state changes alike) retry
     /// automatically after temporary transport loss.
-    pub(crate) fn observe_recovery_evidence_then_fail_if_publish_failed(
+    pub(crate) async fn observe_recovery_evidence_then_fail_if_publish_failed(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<(), AppError> {
@@ -949,7 +949,41 @@ impl AppClient {
         self.remember_pending_convergence_groups(effects);
         let failed_updates = self.invalidate_failed_app_message_projections(effects, None)?;
         self.pending_projection_updates.extend(failed_updates);
+        // Foreground send preflight can settle unrelated retained commits.
+        // Their membership decisions are already canonical even if the
+        // requested command's publication fails or emits no report.
+        self.observe_native_membership_effects(effects).await?;
         fail_if_publish_failed(effects)
+    }
+
+    /// Observe native device facts at command/maintenance boundaries that
+    /// otherwise synthesize only their own timeline rows. Preserve event order
+    /// and reuse route refresh and subscriber buffering from the full observer.
+    pub(crate) async fn observe_native_membership_effects(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<(), AppError> {
+        let native = marmot_account::AccountDeviceEffects {
+            events: effects
+                .events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated { .. }
+                            | cgka_traits::engine::GroupEvent::LocalGroupCopyRestored { .. }
+                            | cgka_traits::engine::GroupEvent::GroupMemberLeavesRemoved { .. }
+                    )
+                })
+                .cloned()
+                .collect(),
+            ..Default::default()
+        };
+        if native.events.is_empty() {
+            return Ok(());
+        }
+        self.observe_send_applied_effects(&native).await?;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()
     }
 
     pub(crate) async fn sync_runtime_groups(&mut self) -> Result<(), AppError> {
@@ -1709,6 +1743,7 @@ impl AppClient {
         if let Err(error) = fail_if_publish_failed(effects) {
             self.pending_projection_updates.extend(finalize_updates);
             self.pending_projection_updates.extend(failed_updates);
+            self.observe_native_membership_effects(effects).await?;
             return Err(error);
         }
         summary.projection_updates.extend(finalize_updates);
@@ -4725,6 +4760,7 @@ impl AppClient {
         if let Err(error) = fail_if_publish_failed(effects) {
             self.pending_projection_updates.extend(finalize_updates);
             self.pending_projection_updates.extend(failed_updates);
+            self.observe_native_membership_effects(effects).await?;
             return Err(error);
         }
         let publish_new_message_notification =

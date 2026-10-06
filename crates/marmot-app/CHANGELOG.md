@@ -35,12 +35,18 @@
   use the same activity derivation. Account membership rows describe first-leaf
   arrival and last-leaf departure; sibling-only changes create no misleading
   account invitation or departure. Display-component decoding no longer blocks
-  otherwise valid legacy MLS evolution.
+  otherwise valid legacy MLS evolution. Valid profile repairs retain rename
+  activity with an unknown previous name; unreadable resulting components
+  produce no invented display values.
   Device-local termination/restoration effects drive participation and pending-send
   cleanup independently of timeline activity. Push cleanup follows actual leaf
   transitions, preserves surviving destinations and clears tombstones only for
   departed accounts. Restoration preserves archive choices and outstanding leave
   intent; reopen repairs terminal projections from durable removal markers.
+  Manual convergence retries observe the same native effects as scheduled
+  convergence, including reportless membership changes and leaf-token cleanup.
+  Group commands and maintenance also observe native membership decisions
+  produced while settling retained commits.
   Rust consumers must handle the three new non-timeline `GroupEvent` variants.
   Existing row IDs and correctly attributed stored rows remain unchanged;
   no account reset or destructive history migration is required.
