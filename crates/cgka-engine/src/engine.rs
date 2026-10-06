@@ -107,17 +107,6 @@ pub(crate) fn hydration_quarantine_group_digest(group_id: &GroupId) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// OpenMLS-backed CGKA engine. Construct via [`EngineBuilder`].
-/// A group-state change effected by a locally staged commit, buffered until
-/// publish confirmation merges that commit. `actor` attributes the change: for
-/// our own invite/remove/profile commits it is the local member; for an
-/// auto-committed peer SelfRemove it is the leaving member, not us.
-#[derive(Clone)]
-pub(crate) struct PendingGroupStateChange {
-    pub(crate) actor: Option<MemberId>,
-    pub(crate) change: GroupStateChange,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct ScheduledSelfRemoveAutoCommit {
     pub(crate) group_id: GroupId,
@@ -164,13 +153,6 @@ pub struct Engine<S: StorageProvider> {
     /// internal signal lets the account scheduler reset its quiet window
     /// without exposing proposals as user-visible group events.
     pub(crate) valid_proposal_groups: HashSet<GroupId>,
-    /// Group-state changes effected by a locally staged commit, with the actor
-    /// to attribute each to. Buffered here because publish-before-apply defers
-    /// the OpenMLS merge: the `GroupEvent::GroupStateChanged` events are emitted
-    /// in `do_confirm_published`, once the pending commit is actually merged,
-    /// and dropped in `do_publish_failed`.
-    pub(crate) pending_state_changes: HashMap<PendingStateRef, Vec<PendingGroupStateChange>>,
-
     /// MessageIds the engine has ingested. Backs the typed duplicate exclusion.
     ///
     /// Bounded hot-process cache behind storage-backed duplicate evidence:
@@ -631,7 +613,6 @@ impl<S: StorageProvider> EngineBuilder<S> {
             auto_publish_buf: VecDeque::new(),
             auto_proposal_buf: VecDeque::new(),
             valid_proposal_groups: HashSet::new(),
-            pending_state_changes: HashMap::new(),
             seen_message_ids: BoundedIdSet::with_capacity(DEDUP_CACHE_CAPACITY),
             retryable_unpersisted_ingest_id: None,
             last_ingest_left_object_unpersisted: false,
@@ -3119,8 +3100,6 @@ impl<S: StorageProvider> Engine<S> {
             .retain(|_, (group, _)| group != group_id);
         self.pending_origin_commits
             .retain(|reference, _| !pending.contains(reference));
-        self.pending_state_changes
-            .retain(|reference, _| !pending.contains(reference));
         self.auto_publish_buf
             .retain(|work| !pending.contains(&work.pending));
         self.auto_proposal_buf.retain(|message| {
@@ -3129,7 +3108,14 @@ impl<S: StorageProvider> Engine<S> {
                 if routes.contains(transport_group_id) || transport_group_id == group_id.as_slice())
         });
         self.events_buf.retain(|event| match event {
-            GroupEvent::GroupCreated { group_id: group }
+            GroupEvent::LocalGroupCopyTerminated {
+                group_id: group, ..
+            }
+            | GroupEvent::LocalGroupCopyRestored { group_id: group }
+            | GroupEvent::GroupMemberLeavesRemoved {
+                group_id: group, ..
+            }
+            | GroupEvent::GroupCreated { group_id: group }
             | GroupEvent::GroupJoined {
                 group_id: group, ..
             }

@@ -34,8 +34,9 @@ the default.
 - Provides compact `group_authority` reads and `with_group_authority_snapshot` for composing host-owned persisted
   reads with current engine facts on this session's store. The callback is synchronous and read-only; unhydrated groups
   return `GroupNotHydrated`. It does not serve a frozen startup snapshot or start relay work.
-- Provides `canonical_group_membership` for device-scoped reconciliation: authenticated leaf indexes and account
+- Provides `canonical_group_membership` for startup reconciliation: authenticated leaf indexes and account
   identities, plus whether this device's own leaf is active. Pending roster projections do not replace those facts.
+  Live termination and token cleanup use immutable engine effects captured at apply, rather than this reader.
 - Offers `promote_legacy_message_rows` for host-scheduled, bounded promotion of legacy stored rows after readiness.
 
 It does **not** do account key derivation, recovery, or key rotation; relay sync, network publish, or transport

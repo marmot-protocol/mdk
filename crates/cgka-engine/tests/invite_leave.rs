@@ -576,7 +576,7 @@ fn converge_buffered_commit(engine: &mut Engine<SqliteAccountStorage>, group_id:
 
 // ── Invite ──────────────────────────────────────────────────────────────────
 
-/// Separate device keys share invitation, partial-leave and account-removal targets.
+/// Account activity ignores sibling-only changes; device effects still terminate the departing copy.
 #[tokio::test]
 async fn sibling_device_membership_preserves_activity_targets() {
     use cgka_traits::engine::{GroupEvent, GroupStateChange};
@@ -671,10 +671,9 @@ async fn sibling_device_membership_preserves_activity_targets() {
         let added = GroupStateChange::MemberAdded {
             member: bob.self_id(),
         };
-        assert_eq!(
-            target(alice.drain_events(), &added, &alice.self_id()),
-            target(bob.drain_events(), &added, &alice.self_id()),
-        );
+        for events in [alice.drain_events(), bob.drain_events()] {
+            assert!(!events.iter().any(|event| matches!(event, GroupEvent::GroupStateChanged { change, .. } if change == &added)), "a sibling invitation is not an account arrival: {events:?}");
+        }
 
         if !voluntary_leave {
             let SendResult::GroupEvolution { msg, pending, .. } = alice
@@ -719,7 +718,27 @@ async fn sibling_device_membership_preserves_activity_targets() {
         let mut publications = alice.drain_auto_publish();
         assert_eq!(publications.len(), 1);
         let publication = publications.remove(0);
+        assert!(
+            alice
+                .members(&group_id)
+                .unwrap()
+                .iter()
+                .any(|member| member.id == bob.self_id()),
+            "pending sibling SelfRemove keeps the account's surviving leaf"
+        );
         alice.confirm_published(publication.pending).await.unwrap();
+        bob_sibling
+            .ingest(route_group_commit(publication.msg.clone(), &group_id))
+            .await
+            .unwrap();
+        converge_buffered_commit(&mut bob_sibling, &group_id);
+        assert!(bob_sibling.group_record(&group_id).unwrap().removed);
+        assert!(
+            bob_sibling
+                .drain_events()
+                .iter()
+                .any(|event| matches!(event, GroupEvent::LocalGroupCopyTerminated { .. }))
+        );
         bob.ingest(route_group_commit(publication.msg, &group_id))
             .await
             .unwrap();
@@ -727,10 +746,9 @@ async fn sibling_device_membership_preserves_activity_targets() {
         let left = GroupStateChange::MemberLeft {
             member: bob.self_id(),
         };
-        assert_eq!(
-            target(alice.drain_events(), &left, &bob.self_id()),
-            target(bob.drain_events(), &left, &bob.self_id()),
-        );
+        for events in [alice.drain_events(), bob.drain_events()] {
+            assert!(!events.iter().any(|event| matches!(event, GroupEvent::GroupStateChanged { change, .. } if change == &left)), "a sibling departure is not an account departure: {events:?}");
+        }
         // The departure names the account, while its other device remains a member.
         let members = bob.members(&group_id).unwrap();
         assert_eq!(members.len(), 2);

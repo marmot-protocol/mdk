@@ -3226,6 +3226,27 @@ impl SqliteAccountStorage {
         })
     }
 
+    /// Remove destinations for departed device leaves in one transaction. A
+    /// surviving sibling keeps the account's anti-resurrection tombstones.
+    pub fn remove_group_push_tokens_for_leaves(
+        &self,
+        group_id_hex: &str,
+        leaves: &[(String, u32)],
+        departed_members: &[String],
+    ) -> StorageResult<()> {
+        self.connection.with_transaction(|| -> StorageResult<()> {
+            let conn = self.lock()?;
+            for (member, index) in leaves {
+                conn.execute_cached("DELETE FROM group_push_tokens WHERE group_id_hex = ?1 AND member_id_hex = ?2 AND leaf_index = ?3", params![group_id_hex, member, i64::from(*index)]).storage()?;
+            }
+            for member in departed_members {
+                conn.execute_cached("DELETE FROM group_push_tokens WHERE group_id_hex = ?1 AND member_id_hex = ?2", params![group_id_hex, member]).storage()?;
+                conn.execute_cached("DELETE FROM group_push_token_tombstones WHERE group_id_hex = ?1 AND member_id_hex = ?2", params![group_id_hex, member]).storage()?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn remove_stale_group_push_tokens(
         &self,
         group_id_hex: &str,

@@ -2881,7 +2881,8 @@ where
         let changed_groups = events
             .iter()
             .filter_map(|event| match event {
-                GroupEvent::EpochChanged { group_id, .. } => Some(group_id.clone()),
+                GroupEvent::EpochChanged { group_id, .. }
+                | GroupEvent::LocalGroupCopyTerminated { group_id, .. } => Some(group_id.clone()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -2893,11 +2894,16 @@ where
             }
             unique_changed_groups.push(group_id.clone());
             let self_id = self.session.self_id();
-            let local_member_present = self
-                .session
-                .members(&group_id)?
-                .iter()
-                .any(|member| member.id == self_id);
+            // A surviving sibling keeps the account in the roster, but it
+            // cannot supply this copy's removed local leaf for rotation.
+            let terminated = events.iter().any(|event| matches!(event, GroupEvent::LocalGroupCopyTerminated { group_id: id, .. } if id == &group_id));
+            let local_member_present = !terminated
+                && !self.session.group_record(&group_id)?.is_terminal()
+                && self
+                    .session
+                    .members(&group_id)?
+                    .iter()
+                    .any(|member| member.id == self_id);
             if !local_member_present {
                 for mut obligation in self.session.maintenance_obligations_for_group(&group_id)? {
                     if matches!(

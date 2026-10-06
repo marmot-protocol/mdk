@@ -52,15 +52,21 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Fixed
 
-- Authenticated group activities now preserve per-commit actor attribution
-  through recipient convergence, so members share reaction targets with the
-  author. This is a native behavior fix with no binding signature or layout
-  change; hosts must consume a matching newly published native artifact.
-  Sibling-device invitations and voluntary departures retain activity while
-  another device for that account remains a member.
-  Surviving devices retain participation, pending sends and push destinations;
-  removal rollback restores app membership and unread counts through reopen,
-  preserving local archive choices and outstanding leave intent.
+- Group-activity reaction targets retain each accepted commit's authenticated
+  actor, source-state delta and fork-withdrawal origin. Authors and recipients
+  use the same activity derivation. Account membership rows describe first-leaf
+  arrival and last-leaf departure; sibling-only changes create no misleading
+  account invitation or departure. Display-component decoding no longer blocks
+  otherwise valid legacy MLS evolution.
+  Device-local termination/restoration effects drive participation and pending-send
+  cleanup independently of timeline activity. Push cleanup follows actual leaf
+  transitions, preserves surviving destinations and clears tombstones only for
+  departed accounts. Restoration preserves archive choices and outstanding leave
+  intent; reopen repairs terminal projections from durable removal markers.
+  The event surface adds `LocalGroupCopyTerminated`, `LocalGroupCopyRestored`,
+  and `GroupMemberLeavesRemoved`; update exhaustive host event handling and
+  consume matching newly generated bindings/headers and native libraries.
+  Existing C event discriminants and system-row ID formulas are unchanged.
 
 ## [0.12.0] - 2026-10-02
 

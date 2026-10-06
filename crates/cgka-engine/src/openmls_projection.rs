@@ -46,7 +46,7 @@ use crate::convergence::BranchCandidate;
 #[path = "openmls_projection/tests.rs"]
 mod graph_tests;
 
-mod group_activity;
+pub(crate) mod group_activity;
 mod resumable;
 pub(crate) use resumable::{
     CanonicalReplay, PeelReplay, ReplaySlice, candidate_peel_slice, canonicalize_stored_slice,
@@ -3932,12 +3932,6 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 .ok_or(OpenMlsProjectionError::UnsupportedMessageKind(
                     projection.kind,
                 ))?;
-        let activity_before =
-            if projection.kind == OpenMlsContentKind::Commit && retain_replayed_anchors.is_some() {
-                Some(group_activity::GroupActivitySnapshot::capture(&mls_group)?)
-            } else {
-                None
-            };
         if projection.kind == OpenMlsContentKind::Application
             && let Some(stamp) = own_commits.application_stamp(&message.id)
         {
@@ -4191,12 +4185,11 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         "commit has no authenticated member leaf".into(),
                     ));
                 };
-                let priority = crate::app_components::commit_ordering_priority_for_staged(&staged);
-                let committer = sender_id
+                let sender = sender_id
                     .as_ref()
-                    .expect("checked above")
-                    .as_slice()
-                    .to_vec();
+                    .expect("authenticated sender checked above");
+                let priority = crate::app_components::commit_ordering_priority_for_staged(&staged);
+                let committer = sender.as_slice().to_vec();
                 // foundation/identity.md: deferred commits replayed during
                 // convergence are an inbound credential ingress too. Reject
                 // commits that introduce or mutate a member LeafNode whose
@@ -4209,7 +4202,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     crate::account_identity_proof::validate_staged_commit_account_identity_proofs(
                         &staged,
                         &mls_group,
-                        &sender_id.clone().expect("checked above"),
+                        sender,
                         mls_group.ciphersuite(),
                     )
                 {
@@ -4249,9 +4242,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                             &message.payload,
                         ),
                         commit_digest: projection.message_digest,
-                        actor: sender_id
-                            .clone()
-                            .expect("authenticated sender checked above"),
+                        actor: sender.clone(),
                         local_was_committer_leaf: committer_index == mls_group.own_leaf_index(),
                         former_members: crate::disband::deduplicated_roster(&marmot_members(
                             &mls_group,
@@ -4274,6 +4265,8 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                             "cache replayed Add capabilities: {e}"
                         ))
                     })?;
+                let activity_before = retain_replayed_anchors
+                    .map(|_| group_activity::GroupActivitySnapshot::capture(&mls_group));
                 let additions = group_activity::staged_additions(&staged)?;
                 let leavers = group_activity::staged_leavers(&mls_group, &staged);
                 mls_group
@@ -4294,10 +4287,8 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         commit_id: message.id.clone(),
                         resulting_epoch: EpochId(resulting_epoch),
                         changes: before.changes(
-                            &group_activity::GroupActivitySnapshot::capture(&mls_group)?,
-                            sender_id
-                                .as_ref()
-                                .expect("authenticated sender checked above"),
+                            &group_activity::GroupActivitySnapshot::capture(&mls_group),
+                            sender,
                             &additions,
                             &leavers,
                         ),

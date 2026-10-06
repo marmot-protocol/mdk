@@ -15,7 +15,10 @@ use super::timeline::RuntimeProjectionUpdateFfi;
 /// firehose can surface it without re-listing all variants at the call site.
 fn group_id_from_event(event: &GroupEvent) -> &GroupId {
     match event {
-        GroupEvent::GroupCreated { group_id }
+        GroupEvent::LocalGroupCopyTerminated { group_id, .. }
+        | GroupEvent::LocalGroupCopyRestored { group_id }
+        | GroupEvent::GroupMemberLeavesRemoved { group_id, .. }
+        | GroupEvent::GroupCreated { group_id }
         | GroupEvent::GroupJoined { group_id, .. }
         | GroupEvent::TransportObjectResourceRefused { group_id, .. }
         | GroupEvent::MessageReceived { group_id, .. }
@@ -196,6 +199,13 @@ pub enum GroupEventKindFfi {
     GroupHydrationRecovered {
         recovered_epoch: u64,
     },
+    LocalGroupCopyTerminated {
+        voluntary: bool,
+    },
+    LocalGroupCopyRestored,
+    GroupMemberLeavesRemoved {
+        epoch: u64,
+    },
 }
 
 /// Stable, low-cardinality tag for a [`GroupStateChange`] — surfaced to FFI in
@@ -251,6 +261,13 @@ fn inbound_resource_limit_tag(resource: &InboundResourceLimit) -> &'static str {
 impl From<GroupEvent> for GroupEventKindFfi {
     fn from(event: GroupEvent) -> Self {
         match event {
+            GroupEvent::LocalGroupCopyTerminated { voluntary, .. } => {
+                Self::LocalGroupCopyTerminated { voluntary }
+            }
+            GroupEvent::LocalGroupCopyRestored { .. } => Self::LocalGroupCopyRestored,
+            GroupEvent::GroupMemberLeavesRemoved { epoch, .. } => {
+                Self::GroupMemberLeavesRemoved { epoch: epoch.0 }
+            }
             GroupEvent::GroupCreated { .. } => Self::GroupCreated,
             GroupEvent::GroupJoined {
                 via_welcome,

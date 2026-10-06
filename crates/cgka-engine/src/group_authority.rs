@@ -4,14 +4,14 @@ use cgka_traits::app_components::GROUP_LIFECYCLE_COMPONENT_ID;
 use cgka_traits::storage::StorageProvider;
 use cgka_traits::{EngineError, EpochId, GroupId, GroupLifecycleState, MemberId};
 
+use crate::Engine;
+
 /// Canonical device membership, distinct from staged account roster projections.
 /// Leaf indexes identify which device owns a notification destination.
 pub struct CanonicalGroupMembership {
     pub local_leaf_active: bool,
-    pub member_leaves: Vec<(u32, MemberId)>,
+    pub member_leaves: Vec<cgka_traits::engine::GroupMemberLeaf>,
 }
-
-use crate::Engine;
 
 /// Compact membership/capability scalars. No roster, administrator list,
 /// unsupported-member identities, profile strings or MLS secrets escape.
@@ -68,17 +68,14 @@ impl<S: StorageProvider> Engine<S> {
                                 .map_err(|_| {
                                     EngineError::Backend("invalid member credential".into())
                                 })?;
-                        Ok((
-                            member.index.u32(),
-                            MemberId::new(credential.identity().to_vec()),
-                        ))
+                        Ok(cgka_traits::engine::GroupMemberLeaf {
+                            leaf_index: member.index.u32(),
+                            member: MemberId::new(credential.identity().to_vec()),
+                        })
                     })
                     .collect::<Result<Vec<_>, EngineError>>()?;
                 let local_leaf_active = !terminal
-                    && group.is_active()
-                    && member_leaves.iter().any(|(index, member)| {
-                        *index == group.own_leaf_index().u32() && member == self.identity.self_id()
-                    });
+                    && crate::identity::local_leaf_is_active(group, self.identity.self_id());
                 Ok(CanonicalGroupMembership {
                     local_leaf_active,
                     member_leaves,
@@ -197,7 +194,7 @@ mod tests {
         let canonical = engine.canonical_group_membership(&group).unwrap();
         assert!(canonical.local_leaf_active);
         assert_eq!(canonical.member_leaves.len(), 1);
-        assert_eq!(canonical.member_leaves[0].1, engine.self_id());
+        assert_eq!(canonical.member_leaves[0].member, engine.self_id());
         let mut record = engine.storage.get_group(&group).unwrap();
         record.members.clear();
         engine.storage.put_group(&record).unwrap();

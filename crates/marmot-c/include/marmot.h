@@ -4595,6 +4595,9 @@ typedef enum MarmotGroupEventKind_Tag {
   MARMOT_GROUP_EVENT_KIND_GROUP_UNRECOVERABLE,
   MARMOT_GROUP_EVENT_KIND_PENDING_COMMIT_RECOVERED,
   MARMOT_GROUP_EVENT_KIND_GROUP_HYDRATION_RECOVERED,
+  MARMOT_GROUP_EVENT_KIND_LOCAL_GROUP_COPY_TERMINATED,
+  MARMOT_GROUP_EVENT_KIND_LOCAL_GROUP_COPY_RESTORED,
+  MARMOT_GROUP_EVENT_KIND_GROUP_MEMBER_LEAVES_REMOVED,
 } MarmotGroupEventKind_Tag;
 
 typedef struct MarmotGroupEventKind_GroupJoined_Body {
@@ -4670,6 +4673,14 @@ typedef struct MarmotGroupEventKind_GroupHydrationRecovered_Body {
   uint64_t recovered_epoch;
 } MarmotGroupEventKind_GroupHydrationRecovered_Body;
 
+typedef struct MarmotGroupEventKind_LocalGroupCopyTerminated_Body {
+  bool voluntary;
+} MarmotGroupEventKind_LocalGroupCopyTerminated_Body;
+
+typedef struct MarmotGroupEventKind_GroupMemberLeavesRemoved_Body {
+  uint64_t epoch;
+} MarmotGroupEventKind_GroupMemberLeavesRemoved_Body;
+
 typedef struct MarmotGroupEventKind {
   MarmotGroupEventKind_Tag tag;
   union {
@@ -4685,6 +4696,8 @@ typedef struct MarmotGroupEventKind {
     MarmotGroupEventKind_GroupStateRevalidated_Body GROUP_STATE_REVALIDATED;
     MarmotGroupEventKind_PendingCommitRecovered_Body PENDING_COMMIT_RECOVERED;
     MarmotGroupEventKind_GroupHydrationRecovered_Body GROUP_HYDRATION_RECOVERED;
+    MarmotGroupEventKind_LocalGroupCopyTerminated_Body LOCAL_GROUP_COPY_TERMINATED;
+    MarmotGroupEventKind_GroupMemberLeavesRemoved_Body GROUP_MEMBER_LEAVES_REMOVED;
   };
 } MarmotGroupEventKind;
 

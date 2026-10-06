@@ -3723,16 +3723,26 @@ impl MarmotApp {
         Ok(())
     }
 
-    pub(crate) fn remove_group_push_tokens_for_member(
+    /// Apply immutable engine leaf-departure facts through the account-scoped storage boundary.
+    pub(crate) fn remove_group_push_tokens_for_leaves(
         &self,
         account_ref: &str,
         group_id_hex: &str,
-        member_id_hex: &str,
+        leaves: &[cgka_traits::engine::GroupMemberLeaf],
+        departed_members: &[MemberId],
     ) -> Result<(), AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
+        let leaves = leaves
+            .iter()
+            .map(|leaf| (hex::encode(leaf.member.as_slice()), leaf.leaf_index))
+            .collect::<Vec<_>>();
+        let departed_members = departed_members
+            .iter()
+            .map(|member| hex::encode(member.as_slice()))
+            .collect::<Vec<_>>();
         self.account_storage(&account.label)?
-            .remove_group_push_tokens_for_member(group_id_hex, member_id_hex)?;
+            .remove_group_push_tokens_for_leaves(group_id_hex, &leaves, &departed_members)?;
         Ok(())
     }
 

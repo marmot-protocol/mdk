@@ -4542,3 +4542,46 @@ fn secure_prune_scrubs_retained_edit_copies_before_reprojection() {
         }
     }
 }
+
+/// A leaf departure keeps sibling destinations and account tombstones. Losing
+/// the final leaf clears all account records, including stale unknown indexes.
+#[test]
+fn leaf_cleanup_preserves_sibling_tombstones_until_account_departure() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let g = "aa".repeat(32);
+    let m = "bb".repeat(32);
+    let first = push_token(&g, &m, 100, "first");
+    let mut sibling = first.clone();
+    sibling.leaf_index = 1;
+    sibling.token_fingerprint = "sibling".into();
+    store.apply_group_push_token(&first).unwrap();
+    store.apply_group_push_token(&sibling).unwrap();
+    store
+        .apply_group_push_token_tombstone(&g, &m, 2, 1, &"dd".repeat(32), 500, "withdrawn", 500)
+        .unwrap();
+    store
+        .remove_group_push_tokens_for_leaves(&g, &[(m.clone(), 0)], &[])
+        .unwrap();
+    let tokens = store.group_push_tokens(&g).unwrap();
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(tokens[0].leaf_index, 1);
+    let mut old = push_token(&g, &m, 100, "old");
+    old.leaf_index = 2;
+    old.server_pubkey_hex = "dd".repeat(32);
+    assert!(
+        !store.apply_group_push_token(&old).unwrap(),
+        "surviving account retains anti-resurrection evidence"
+    );
+    let mut stale = sibling.clone();
+    stale.leaf_index = 99;
+    stale.token_fingerprint = "stale".into();
+    store.apply_group_push_token(&stale).unwrap();
+    store
+        .remove_group_push_tokens_for_leaves(&g, &[(m.clone(), 1)], std::slice::from_ref(&m))
+        .unwrap();
+    assert!(store.group_push_tokens(&g).unwrap().is_empty());
+    assert!(
+        store.apply_group_push_token(&old).unwrap(),
+        "full account departure clears its tombstones"
+    );
+}

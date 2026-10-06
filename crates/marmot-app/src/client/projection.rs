@@ -567,6 +567,33 @@ impl AppClient {
         if self.refresh_group_routes()?.state_pruned {
             self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         }
+        // A marker/queue transaction can outlive its in-memory announcement.
+        // Repair from durable terminal records even after the one-time backfill.
+        let groups = self
+            .state
+            .groups
+            .iter()
+            .map(|group| group.group_id_hex.clone())
+            .collect::<Vec<_>>();
+        for group_id_hex in groups {
+            let Ok(bytes) = hex::decode(&group_id_hex) else {
+                continue;
+            };
+            let group_id = GroupId::new(bytes);
+            let Ok(record) = self.runtime.group_record(&group_id) else {
+                continue;
+            };
+            if record.removed && record.disbanded.is_none() {
+                let event = cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated {
+                    group_id,
+                    voluntary: false,
+                };
+                let mut summary = crate::SyncSummary::default();
+                self.observe_event_projection_effects(&event, "", &mut summary)?;
+                self.pending_projection_updates
+                    .extend(summary.projection_updates);
+            }
+        }
         self.reconcile_disband_drafts();
         self.backfill_self_membership_once()?;
         self.backfill_direct_conversation_members_once()

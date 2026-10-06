@@ -623,13 +623,8 @@ fn capture_pending_work_snapshot_from<S: StorageProvider>(
         valid_proposal_schedule_signals: usize::from(
             engine.valid_proposal_groups.contains(group_id),
         ),
-        pending_state_changes: engine
-            .pending_state_changes
-            .keys()
-            .filter(|pending| {
-                engine.epoch_manager.group_for_pending(**pending).as_ref() == Some(group_id)
-            })
-            .count(),
+        // Retained in the diagnostic schema; activity is derived on confirm now.
+        pending_state_changes: 0,
         pending_leave_requests: usize::from(engine.leave_requests.contains_key(group_id)),
         scheduled_self_remove_auto_commits: engine
             .scheduled_self_remove_auto_commits
@@ -826,7 +821,10 @@ fn event_group_id(event: &cgka_traits::engine::GroupEvent) -> &GroupId {
     use cgka_traits::engine::GroupEvent;
 
     match event {
-        GroupEvent::GroupCreated { group_id }
+        GroupEvent::LocalGroupCopyTerminated { group_id, .. }
+        | GroupEvent::LocalGroupCopyRestored { group_id }
+        | GroupEvent::GroupMemberLeavesRemoved { group_id, .. }
+        | GroupEvent::GroupCreated { group_id }
         | GroupEvent::GroupJoined { group_id, .. }
         | GroupEvent::TransportObjectResourceRefused { group_id, .. }
         | GroupEvent::MessageReceived { group_id, .. }

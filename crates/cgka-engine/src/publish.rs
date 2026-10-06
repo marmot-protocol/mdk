@@ -97,6 +97,18 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
             .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
         let has_pending_commit = mls_group.pending_commit().is_some();
+        let previous_membership = self.canonical_membership_snapshot(&group_id)?;
+        let activity_before =
+            crate::openmls_projection::group_activity::GroupActivitySnapshot::capture(&mls_group);
+        let (additions, leavers) = if let Some(staged) = mls_group.pending_commit() {
+            (
+                crate::openmls_projection::group_activity::staged_additions(staged)
+                    .map_err(|error| EngineError::Backend(error.to_string()))?,
+                crate::openmls_projection::group_activity::staged_leavers(&mls_group, staged),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         // Snapshot the pre-commit epoch as a fork-recovery anchor. Done outside
         // the durable transaction below; the write is keyed by epoch and
@@ -342,21 +354,28 @@ impl<S: StorageProvider> Engine<S> {
         };
         self.events_buf.push_back(event.clone());
         if kind == crate::epoch_manager::PendingKind::Disband {
-            self.pending_state_changes.remove(&pending);
             self.schedule_pending_convergence_group(&replay_group_id);
             return Ok(event);
         }
-        if let Some(changes) = self.pending_state_changes.remove(&pending) {
-            for pending_change in changes {
+        if kind == crate::epoch_manager::PendingKind::GroupEvolution {
+            for (actor, change) in activity_before.changes(
+                &crate::openmls_projection::group_activity::GroupActivitySnapshot::capture(
+                    &mls_group,
+                ),
+                self.identity.self_id(),
+                &additions,
+                &leavers,
+            ) {
                 self.push_group_state_change(
                     &replay_group_id,
                     new_epoch,
-                    pending_change.actor,
-                    pending_change.change,
+                    Some(actor),
+                    change,
                     origin_commit_id.clone(),
                 );
             }
         }
+        self.emit_canonical_membership_effects(&replay_group_id, &previous_membership)?;
         self.replay_buffered_messages(&replay_group_id).await?;
         Ok(event)
     }
@@ -519,7 +538,6 @@ impl<S: StorageProvider> Engine<S> {
                 Some(crate::audit_helpers::pending_kind_str(kind)),
             ),
         );
-        self.pending_state_changes.remove(&pending);
         if kind == crate::epoch_manager::PendingKind::Disband {
             self.schedule_pending_convergence_group(&group_id);
         }

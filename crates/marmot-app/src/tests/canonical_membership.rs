@@ -2,8 +2,7 @@
 
 use super::*;
 use crate::conversation_presentation::ConversationAuthority;
-use cgka_traits::engine::{GroupEvent, GroupStateChange, SendIntent};
-use cgka_traits::{CgkaEngine as _, MessageStorage as _};
+use cgka_traits::engine::{GroupEvent, SendIntent};
 
 fn app_at(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClient>) -> MarmotApp {
     MarmotApp::with_relay_and_config(
@@ -55,21 +54,6 @@ async fn deliver_new(client: &mut AppClient, relay: &ScriptedPushRelayClient, cu
             .unwrap();
     }
     *cursor = events.len();
-}
-
-/// Deliver publication echoes and settle real post-join maintenance before forking.
-async fn settle_group(
-    clients: &mut [(&mut AppClient, &mut usize)],
-    relay: &ScriptedPushRelayClient,
-    group: &GroupId,
-) {
-    for _ in 0..2 {
-        for (client, cursor) in clients.iter_mut() {
-            deliver_new(client, relay, cursor).await;
-            client.sync().await.unwrap();
-            client.retry_group_convergence(group).await.unwrap();
-        }
-    }
 }
 
 /// Attach the real published KeyPackage event needed by the Welcome wrapper.
@@ -216,6 +200,16 @@ async fn sibling_selfremove_preserves_surviving_app_device_after_reopen() {
         .put_outbound_fanout(&fanout)
         .unwrap();
     relay.allow_publishes();
+    sibling
+        .app
+        .upsert_push_registration(
+            "bob",
+            PushPlatform::Fcm,
+            "departing-device-token",
+            &nostr::prelude::Keys::generate().public_key().to_hex(),
+            None,
+        )
+        .unwrap();
     sibling.leave_group(&group).await.unwrap();
     deliver_new(&mut alice, &relay, &mut alice_cursor).await;
     alice.sync().await.unwrap();
@@ -253,12 +247,33 @@ async fn sibling_selfremove_preserves_surviving_app_device_after_reopen() {
             .find(|row| row.plaintext == "retained sibling send")
             .unwrap();
         assert_eq!(held.invalidation_status, None);
-        assert!(rows.iter().any(|row| {
+        assert!(!rows.iter().any(|row| {
             row.group_system
                 .as_ref()
                 .is_some_and(|event| event.system_type == "member_left")
         }));
     };
+    deliver_new(&mut sibling, &relay, &mut sibling_cursor).await;
+    sibling.sync().await.unwrap();
+    sibling.retry_group_convergence(&group).await.unwrap();
+    assert!(sibling.runtime.group_record(&group).unwrap().removed);
+    assert!(!can_send(&sibling, &group));
+    assert_eq!(
+        sibling
+            .app
+            .stored_group_self_membership("bob", &group_hex)
+            .unwrap(),
+        Some(SelfMembership::Left)
+    );
+    assert!(!sibling.runtime.has_queued_outbound_intents(&group).unwrap());
+    assert!(
+        sibling
+            .app
+            .pending_push_registration_removals("bob")
+            .unwrap()
+            .is_empty(),
+        "termination must not enqueue an unsendable removal rumor"
+    );
     assert_held(&app);
     assert!(
         !bob_client
@@ -317,312 +332,99 @@ async fn sibling_selfremove_preserves_surviving_app_device_after_reopen() {
     assert_held(&reopened);
 }
 
-/// A real losing removal restores app participation without a fabricated self invitation.
+/// Explicit projection-seam regression: a termination consumed after the engine
+/// already restored its tree must still withdraw purged sends. This is not a
+/// scheduler-driven rollback test; the engine retained-history test owns that proof.
 #[tokio::test]
-async fn losing_removal_restores_app_membership_unread_and_reopen() {
-    losing_removal_restores_membership(false, false).await;
-}
-
-/// Open repairs a canonical rollback whose application announcement was not projected.
-#[tokio::test]
-async fn reopen_repairs_unobserved_removal_withdrawal() {
-    losing_removal_restores_membership(true, false).await;
-}
-
-/// Canonical membership repair must preserve an independent local archive choice.
-#[tokio::test]
-async fn removal_withdrawal_preserves_local_archive() {
-    losing_removal_restores_membership(false, true).await;
-}
-
-async fn losing_removal_restores_membership(reopen_before_observation: bool, archived: bool) {
-    let dir = tempfile::tempdir().unwrap();
-    let home = AccountHome::open(dir.path());
-    home.create_account("alice").unwrap();
-    let bob = home.create_account("bob").unwrap();
-    let carol = home.create_account("carol").unwrap();
-    let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = app_at(&dir, relay.clone());
-    for account in [&bob, &carol] {
-        remember_test_member_inbox(&app, &account.account_id_hex, "wss://relay.example");
-    }
-    let mut bob_client = app.client("bob").await.unwrap();
-    let mut carol_client = app.client("carol").await.unwrap();
-    bob_client.publish_key_package().await.unwrap();
-    bob_client.sync().await.unwrap();
-    carol_client.publish_key_package().await.unwrap();
-    carol_client.sync().await.unwrap();
-    let mut alice = app.client("alice").await.unwrap();
-    let mut alice_cursor = 0;
-    let mut bob_cursor = 0;
-    let group = alice
-        .create_group("before fork", &[&bob.account_id_hex])
-        .await
-        .unwrap();
-    let mut carol_cursor = 0;
-    let kp = published_key_package(&mut carol_client, &relay).await;
-    let effects = alice
-        .runtime
-        .send(SendIntent::Invite {
-            group_id: group.clone(),
-            key_packages: vec![kp],
-            initial_admins: vec![MemberId::new(hex::decode(&carol.account_id_hex).unwrap())],
-        })
-        .await
-        .unwrap();
-    alice
-        .observe_drained_session_events(&effects)
-        .await
-        .unwrap();
-    deliver_new(&mut bob_client, &relay, &mut bob_cursor).await;
-    deliver_new(&mut carol_client, &relay, &mut carol_cursor).await;
-    bob_client.sync().await.unwrap();
-    carol_client.sync().await.unwrap();
-    bob_client.accept_group_invite(&group).unwrap();
-    carol_client.accept_group_invite(&group).unwrap();
-    settle_group(
-        &mut [
-            (&mut alice, &mut alice_cursor),
-            (&mut bob_client, &mut bob_cursor),
-            (&mut carol_client, &mut carol_cursor),
-        ],
-        &relay,
-        &group,
-    )
-    .await;
-    app.initialize_chat_read_state("bob", &hex::encode(group.as_slice()))
-        .unwrap();
-    // A genuine retained chat makes unread eligibility observable before,
-    // during and after the removal; group-system activities alone do not count.
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    carol_client
-        .send(&group, b"unread before removal")
-        .await
-        .unwrap();
-    settle_group(
-        &mut [
-            (&mut alice, &mut alice_cursor),
-            (&mut bob_client, &mut bob_cursor),
-            (&mut carol_client, &mut carol_cursor),
-        ],
-        &relay,
-        &group,
-    )
-    .await;
-    assert!(
-        app.timeline_messages_with_query(
-            "bob",
-            TimelineMessageQuery {
-                group_id_hex: Some(hex::encode(group.as_slice())),
-                ..Default::default()
-            }
+async fn termination_then_restoration_preserves_failed_sends_and_archive() {
+    for archived in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AccountHome::open(dir.path());
+        let account = home.create_account("alice").unwrap();
+        let app = app_at(&dir, Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group = client.create_group("effect batch", &[]).await.unwrap();
+        let group_hex = hex::encode(group.as_slice());
+        client.set_group_archived(&group, archived).unwrap();
+        app.record_account_app_event(
+            "alice",
+            &AppMessageProjection {
+                authority: None,
+                message_id_hex: "held".into(),
+                source_message_id_hex: None,
+                direction: "sent".into(),
+                group_id_hex: group_hex.clone(),
+                sender: account.account_id_hex.clone(),
+                plaintext: "held send".into(),
+                kind: MARMOT_APP_EVENT_KIND_CHAT,
+                tags: Vec::new(),
+                source_epoch: Some(1),
+                retention: None,
+                recorded_at: Some(11),
+                origin_commit_id: None,
+                moderation_grant: false,
+            },
         )
-        .unwrap()
-        .messages
-        .iter()
-        .any(|row| row.plaintext == "unread before removal"),
-        "fixture must deliver the genuine chat"
-    );
-    // Direct AppClients do not run the managed worker's chat-list refresh.
-    // Materialize the genuinely received chat using that same normal selector.
-    app.refresh_chat_list_row("bob", &hex::encode(group.as_slice()))
         .unwrap();
-    let unread = || {
-        app.account_unread_summary()
-            .unwrap()
-            .into_iter()
-            .find(|summary| summary.account_id_hex == bob.account_id_hex)
-            .unwrap()
-            .unread_count
-    };
-    let original_unread = unread();
-    assert!(
-        original_unread > 0,
-        "fixture must contain a real unread chat"
-    );
-    let group_hex = hex::encode(group.as_slice());
-    if archived {
-        bob_client.set_group_archived(&group, true).unwrap();
-    }
-    // Equal-depth privileged forks choose the smaller authenticated committer.
-    let alice_id = app
-        .account_home()
-        .account(&alice.state.label)
-        .unwrap()
-        .account_id_hex;
-    let carol_id = app
-        .account_home()
-        .account(&carol_client.state.label)
-        .unwrap()
-        .account_id_hex;
-    if alice_id < carol_id {
-        std::mem::swap(&mut alice, &mut carol_client);
-    }
-    assert_eq!(
-        alice.runtime.group_record(&group).unwrap().epoch,
-        carol_client.runtime.group_record(&group).unwrap().epoch
-    );
-    let bob_leaf = bob_client.runtime.session().own_leaf_index(&group).unwrap();
-    app.upsert_group_push_token(
-        "bob",
-        &drained_seam_push_token(&group_hex, &bob.account_id_hex, bob_leaf),
-    )
-    .unwrap();
-    alice
-        .remove_members(&group, &[&bob.account_id_hex])
-        .await
-        .unwrap();
-    deliver_new(&mut bob_client, &relay, &mut bob_cursor).await;
-    bob_client.sync().await.unwrap();
-    bob_client.retry_group_convergence(&group).await.unwrap();
-    assert!(bob_client.runtime.group_record(&group).unwrap().removed);
-    assert_eq!(
-        app.stored_group_self_membership("bob", &group_hex).unwrap(),
-        Some(SelfMembership::Removed)
-    );
-    assert!(!can_send(&bob_client, &group));
-    assert_eq!(unread(), 0, "terminal membership suppresses account unread");
-    assert!(
-        app.group_push_tokens("bob", &group_hex).unwrap().is_empty(),
-        "full account removal still clears its notification destinations"
-    );
-    // The other admin stayed on the common source epoch. Retain its genuine
-    // winning commit at the stored-history replay seam: live input on an
-    // already evicted copy is intentionally quarantined as SelfEvicted.
-    let effects = carol_client
-        .runtime
-        .send(SendIntent::UpdateGroupData {
-            group_id: group.clone(),
-            name: Some("winning rename".into()),
-            description: None,
-        })
-        .await
-        .unwrap();
-    let commit_id = effects
-        .events
-        .iter()
-        .find_map(|event| match event {
-            GroupEvent::GroupStateChanged {
-                origin_commit_id: Some(id),
-                ..
-            } => Some(id.clone()),
-            _ => None,
-        })
-        .expect("real rename emits its content commit id");
-    carol_client
-        .observe_drained_session_events(&effects)
-        .await
-        .unwrap();
-    let mut retained = app
-        .account_storage(&carol_client.state.label)
-        .unwrap()
-        .get_message(&commit_id)
-        .unwrap();
-    // Receive the exact MLS bytes, without the author's local own-commit
-    // checkpoint stamp: that snapshot belongs only to the author device.
-    let wire = cgka_traits::message::StoredMessagePayload::decode(&retained.payload)
-        .unwrap()
-        .as_openmls_wire()
-        .unwrap()
-        .clone();
-    retained.payload = cgka_traits::message::StoredMessagePayload::openmls_wire(wire)
-        .encode()
-        .unwrap();
-    retained.state = cgka_traits::message::MessageState::Created;
-    app.account_storage("bob")
-        .unwrap()
-        .put_message(&retained)
-        .unwrap();
-    // Use the same retained-message convergence entry point as the engine's
-    // superseded-removal contract test. The account scheduler intentionally
-    // declines to advance a terminal copy; no synthetic app event is injected.
-    let signer = app.account_signer_for_summary(&bob).unwrap();
-    let mut replay = cgka_engine::EngineBuilder::new(app.account_storage("bob").unwrap())
-        .identity(hex::decode(&bob.account_id_hex).unwrap())
-        .account_identity_proof_signer(signer.as_proof_signer())
-        .feature_registry(app_feature_registry())
-        .supported_app_components(app.supported_app_component_ids())
-        .peeler(Box::new(
-            NostrMlsPeeler::new().with_welcome_signer_arc(signer.as_nostr_signer()),
-        ))
-        .build()
-        .unwrap();
-    replay.hydrate_all_stored_groups().unwrap();
-    replay.drain_events();
-    replay
-        .converge_stored_openmls_messages_at(&group, 1_000_000)
-        .unwrap();
-    replay
-        .converge_stored_openmls_messages_at(&group, u64::MAX)
-        .unwrap();
-    assert!(
-        !app.account_storage("bob")
-            .unwrap()
-            .get_group(&group)
-            .unwrap()
-            .removed,
-        "winning rename must restore canonical membership"
-    );
-    let events = replay.drain_events();
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, GroupEvent::GroupStateInvalidated { .. })),
-        "real convergence must withdraw the removal"
-    );
-    assert!(!events.iter().any(|event| matches!(event,
-        GroupEvent::GroupStateChanged { change: GroupStateChange::MemberAdded { member }, .. }
-        if hex::encode(member.as_slice()) == bob.account_id_hex)));
-    drop(replay);
-    if reopen_before_observation {
-        assert_eq!(
-            app.stored_group_self_membership("bob", &group_hex).unwrap(),
-            Some(SelfMembership::Removed)
-        );
-        drop(bob_client);
-        bob_client = app.client("bob").await.unwrap();
-    } else {
-        bob_client
-            .observe_drained_session_events(&marmot_account::AccountDeviceEffects {
-                events,
-                ..Default::default()
-            })
+        let effects = marmot_account::AccountDeviceEffects {
+            events: vec![
+                GroupEvent::LocalGroupCopyTerminated {
+                    group_id: group.clone(),
+                    voluntary: false,
+                },
+                GroupEvent::LocalGroupCopyRestored {
+                    group_id: group.clone(),
+                },
+            ],
+            ..Default::default()
+        };
+        client
+            .observe_drained_session_events(&effects)
             .await
             .unwrap();
+        assert_eq!(
+            app.stored_group_self_membership("alice", &group_hex)
+                .unwrap(),
+            Some(SelfMembership::Member)
+        );
+        assert_eq!(
+            app.group("alice", &group_hex).unwrap().unwrap().archived,
+            archived
+        );
+        let row = app
+            .timeline_messages_with_query(
+                "alice",
+                TimelineMessageQuery {
+                    group_id_hex: Some(group_hex.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .messages
+            .into_iter()
+            .find(|row| row.message_id_hex == "held")
+            .unwrap();
+        assert_eq!(
+            row.invalidation_status.as_deref(),
+            Some("local_publish_failed")
+        );
+        // Replay stays absolute and must not create any kind-1210 invitation.
+        client
+            .observe_drained_session_events(&effects)
+            .await
+            .unwrap();
+        assert!(
+            app.timeline_messages_with_query(
+                "alice",
+                TimelineMessageQuery {
+                    group_id_hex: Some(group_hex),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .messages
+            .iter()
+            .all(|row| row.group_system.is_none())
+        );
     }
-    assert_eq!(
-        app.stored_group_self_membership("bob", &group_hex).unwrap(),
-        Some(SelfMembership::Member)
-    );
-    assert!(can_send(&bob_client, &group));
-    assert_eq!(
-        unread(),
-        if archived { 0 } else { original_unread },
-        "restored membership respects retained unread and local archive intent"
-    );
-    assert_eq!(
-        app.group("bob", &group_hex).unwrap().unwrap().archived,
-        archived
-    );
-    bob_client
-        .send(&group, b"restored member can send")
-        .await
-        .unwrap();
-    drop(bob_client);
-    drop(alice);
-    drop(carol_client);
-    drop(app);
-    let reopened = app_at(&dir, relay);
-    let client = reopened.client("bob").await.unwrap();
-    assert!(can_send(&client, &group));
-    assert_eq!(
-        reopened.group("bob", &group_hex).unwrap().unwrap().archived,
-        archived
-    );
-    assert_eq!(
-        reopened
-            .stored_group_self_membership("bob", &group_hex)
-            .unwrap(),
-        Some(SelfMembership::Member)
-    );
 }

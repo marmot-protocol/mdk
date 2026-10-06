@@ -10,7 +10,7 @@ use super::store::RowEpochs;
 use super::{DeferredPeelPayloadPreparationError, content_dedup_id, route_wrapped_group_message};
 use crate::engine::{Engine, ScheduledSelfRemoveAutoCommit};
 use crate::group_lifecycle::{self};
-use crate::identity::{member_id_of_processed_message, member_id_of_sender};
+use crate::identity::member_id_of_processed_message;
 use crate::openmls_projection::{
     CandidateBranchPeel, CandidateBranchPeelContext, OpenMlsContentKind, project_mls_message,
     retained_anchor_epoch_from_snapshot_name,
@@ -1895,10 +1895,6 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
 
-        let auto_removed: Vec<MemberId> = queued_proposals
-            .iter()
-            .filter_map(|queued| member_id_of_sender(queued.sender(), mls_group))
-            .collect();
         let auto_proposal_kind = "self_remove".to_string();
 
         let is_stable = self
@@ -2007,10 +2003,26 @@ impl<S: StorageProvider> Engine<S> {
         // recoverable than a failed write here (both leave the state machine
         // pending at N+1 with no matching durable record), so both funnel
         // through the same compensation.
+        let removed_leaf_keys = staged_commit
+            .queued_proposals()
+            .filter_map(|proposal| {
+                if !matches!(proposal.proposal(), openmls::prelude::Proposal::SelfRemove) {
+                    return None;
+                }
+                let openmls::prelude::Sender::Member(index) = proposal.sender() else {
+                    return None;
+                };
+                mls_group
+                    .members()
+                    .find(|member| member.index == *index)
+                    .map(|member| member.signature_key)
+            })
+            .collect::<Vec<_>>();
         let projection = self.storage.get_group(group_id).and_then(|mut g| {
             g.epoch = new_epoch;
+            // A staged device departure must preserve the other leaves of its account.
             g.members
-                .retain(|member| !auto_removed.iter().any(|id| id == &member.id));
+                .retain(|member| !removed_leaf_keys.contains(&member.credential));
             self.storage.put_group(&g)
         });
         if let Err(err) = projection {
@@ -2041,18 +2053,6 @@ impl<S: StorageProvider> Engine<S> {
             return Err(err.into());
         }
         self.track_pending_origin_commit(pending_ref, wrapped.id.clone());
-        let auto_changes = auto_removed
-            .iter()
-            .cloned()
-            .map(|member| {
-                let change = GroupStateChange::MemberLeft {
-                    member: member.clone(),
-                };
-                let actor = Some(member);
-                crate::engine::PendingGroupStateChange { actor, change }
-            })
-            .collect();
-        self.pending_state_changes.insert(pending_ref, auto_changes);
         self.auto_publish_buf.push_back(AutoPublish {
             msg: wrapped,
             pending: pending_ref,
@@ -2119,7 +2119,17 @@ impl<S: StorageProvider> Engine<S> {
         } else {
             (None, GroupStateChange::MemberRemoved { member })
         };
-        self.push_group_state_change(group_id, epoch, actor, change, None);
+        let canonical_members = self.with_mls_group(group_id, |mls_group| {
+            Ok(crate::group_lifecycle::marmot_members(mls_group))
+        })?;
+        // Losing this device does not imply that its account's sibling leaves
+        // left too. Only an account-wide departure belongs in timeline history.
+        if !canonical_members
+            .iter()
+            .any(|active| &active.id == self.identity.self_id())
+        {
+            self.push_group_state_change(group_id, epoch, actor, change, None);
+        }
         // Marker + roster reconciliation in one durable write: a removed copy
         // must not keep presenting self as a member, so roster-gated callers
         // (`members()`, hydrate restore checks, backfill) cannot disagree with
@@ -2127,14 +2137,13 @@ impl<S: StorageProvider> Engine<S> {
         // the post-removal roster; this reconciles the pathological copy whose
         // roster was never mirrored.
         group.removed = true;
-        let self_id = self.identity.self_id().clone();
-        group.members.retain(|member| member.id != self_id);
+        group.members = canonical_members;
         self.storage.put_group(&group)?;
         // A removed copy must never publish: drop any outbound intents that
         // were durably queued before the removal was realized, instead of
         // leaving them to re-fail through the removed-copy send gate on every
         // later drain.
-        self.discard_queued_outbound_intents_for_removed_group(group_id)?;
+        self.discard_queued_outbound_intents_with_termination(group_id, true)?;
         // Same for retained inbound work: see
         // `retire_deferred_peel_rows_for_terminal_group` for why no later
         // sweep can reach these rows.

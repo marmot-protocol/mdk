@@ -74,12 +74,24 @@ pub enum MarmotGroupEventKind {
     GroupHydrationRecovered {
         recovered_epoch: u64,
     },
+    LocalGroupCopyTerminated {
+        voluntary: bool,
+    },
+    LocalGroupCopyRestored,
+    GroupMemberLeavesRemoved {
+        epoch: u64,
+    },
 }
 
 impl From<GroupEventKindFfi> for MarmotGroupEventKind {
     fn from(value: GroupEventKindFfi) -> Self {
         use GroupEventKindFfi as F;
         match value {
+            F::LocalGroupCopyTerminated { voluntary } => {
+                Self::LocalGroupCopyTerminated { voluntary }
+            }
+            F::LocalGroupCopyRestored => Self::LocalGroupCopyRestored,
+            F::GroupMemberLeavesRemoved { epoch } => Self::GroupMemberLeavesRemoved { epoch },
             F::GroupCreated => Self::GroupCreated,
             F::GroupJoined {
                 via_welcome_hex,
@@ -164,7 +176,10 @@ impl CFree for MarmotGroupEventKind {
     unsafe fn free_in_place(&mut self) {
         unsafe {
             match self {
-                Self::GroupCreated
+                Self::LocalGroupCopyTerminated { .. }
+                | Self::LocalGroupCopyRestored
+                | Self::GroupMemberLeavesRemoved { .. }
+                | Self::GroupCreated
                 | Self::GroupHydrationQuarantined { .. }
                 | Self::EpochChanged { .. }
                 | Self::GroupUnrecoverable

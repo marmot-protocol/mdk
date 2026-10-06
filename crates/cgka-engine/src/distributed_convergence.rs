@@ -1256,12 +1256,6 @@ impl<S: StorageProvider> Engine<S> {
         if pass.phase == ConvergencePassPhase::Completed {
             return Ok(settled_empty_result(previous_tip.0));
         }
-        // Capture the roster only once a pass reaches canonical apply, for
-        // removed-copy reconciliation. Activities come from per-commit replay.
-        let previous_group = self
-            .storage
-            .get_group(group_id)
-            .map_err(storage_projection_error)?;
         let max_retained_anchor_rewind = policy.convergence.max_rewind_commits;
         let retained_anchor_epoch = previous_tip
             .0
@@ -1519,6 +1513,16 @@ impl<S: StorageProvider> Engine<S> {
             Vec::new()
         };
         let pre_apply_commit_states = self.pre_apply_commit_states(&result)?;
+        // Capture the actual source tree only after selection finishes. Yielded,
+        // rejected and app-only passes must not pay for a membership snapshot.
+        let previous_membership = if result.selected_tip.is_some() {
+            Some(
+                self.canonical_membership_snapshot(group_id)
+                    .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?,
+            )
+        } else {
+            None
+        };
         let (group_changes, application_events) = self.storage.with_transaction(|storage| {
             let output = apply_openmls_canonicalization_result_with_profile_policy(
                 storage,
@@ -1608,7 +1612,9 @@ impl<S: StorageProvider> Engine<S> {
             if !terminalized {
                 self.emit_convergence_events(
                     group_id,
-                    previous_group.members,
+                    previous_membership
+                        .as_ref()
+                        .expect("selected branch captured its source membership"),
                     previous_tip,
                     selected_tip,
                     &group_changes,
@@ -1668,44 +1674,12 @@ impl<S: StorageProvider> Engine<S> {
         Ok(result)
     }
 
-    /// Whether the live OpenMLS group state records the local member as an
-    /// active member: the group loads, is active, and its own leaf carries
-    /// the engine's identity. Fail-closed (`false`) on any missing or
-    /// unreadable state, so callers gating a safety-relevant transition on
-    /// canonical membership never act on a copy MLS itself would refuse.
-    fn self_leaf_is_active_in_mls(&self, group_id: &GroupId) -> bool {
-        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
-            &self.crypto,
-            self.storage.mls_storage(),
-        );
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let Ok(Some(mls_group)) = openmls::group::MlsGroup::load(
-            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
-                &provider,
-            ),
-            &mls_gid,
-        ) else {
-            return false;
-        };
-        if !mls_group.is_active() {
-            return false;
-        }
-        let Some(leaf) = mls_group.own_leaf_node() else {
-            return false;
-        };
-        let Ok(credential) = openmls::prelude::BasicCredential::try_from(leaf.credential().clone())
-        else {
-            return false;
-        };
-        credential.identity() == self.identity.self_id().as_slice()
-    }
-
     /// Emit authenticated per-commit activity and reconcile local removal state.
     /// Roster repairs change membership/send eligibility without fabricating invitations.
     fn emit_convergence_events(
         &mut self,
         group_id: &GroupId,
-        previous_members: Vec<cgka_traits::group::Member>,
+        previous_membership: &crate::membership_effects::MembershipSnapshot,
         previous_tip: EpochId,
         selected_tip: EpochId,
         group_changes: &[AppliedGroupChanges],
@@ -1718,10 +1692,6 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
 
-        let current_group = self
-            .storage
-            .get_group(group_id)
-            .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
         // Each accepted replayed commit retains its own source-state delta.
         // A net previous-tip -> final-tip diff loses intermediate changes and
         // cannot supply either a shared target id or a fork-withdrawal link.
@@ -1736,78 +1706,17 @@ impl<S: StorageProvider> Engine<S> {
                 );
             }
         }
-        // Captured before `current_group.members` is consumed below: gates the
-        // removed-marker reconciliation so the common (not-removed) path pays
-        // no extra storage read.
-        let group_record_was_removed = current_group.removed;
-        let previous_ids: HashSet<MemberId> = previous_members
-            .iter()
-            .map(|member| member.id.clone())
-            .collect();
-        let current_ids: HashSet<MemberId> = current_group
-            .members
-            .iter()
-            .map(|member| member.id.clone())
-            .collect();
-
-        for member_id in previous_ids.difference(&current_ids) {
-            if member_id == self.identity.self_id() {
-                self.clear_leave_request_state(group_id)
-                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-                // The canonical branch removed our own leaf: mark the local
-                // copy removed (member-departure.md, "Realizing removal") in
-                // the same pass that emits the self-removed notification
-                // below, so the marker and the notification stay coupled and
-                // later `SelfEvicted` input does not re-emit it.
-                let mut group = self
-                    .storage
-                    .get_group(group_id)
-                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-                if !group.removed {
-                    group.removed = true;
-                    self.storage
-                        .put_group(&group)
-                        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-                }
-                // The copy just became removed: purge queued outbound intents
-                // so later drains do not re-fail them forever against the
-                // removed-copy send gate.
-                self.discard_queued_outbound_intents_for_removed_group(group_id)
-                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-                // Same for retained inbound rows: see
-                // `retire_deferred_peel_rows_for_terminal_group` for why no
-                // later sweep can reach them.
-                self.retire_deferred_peel_rows_for_terminal_group(group_id)
-                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-            }
-        }
-        if current_ids.contains(self.identity.self_id()) {
-            // The selected canonical branch records our membership, so a
-            // surviving `removed` marker must clear (module docs, "Removed-
-            // marker lifecycle"; marmot-protocol/marmot#220). Gated on the
-            // record snapshot loaded above (no extra read on the common
-            // not-removed path) AND on the live MLS state carrying our
-            // active leaf, so the heal stays derivable from canonical MLS
-            // state even if the record roster were ever stale.
-            if group_record_was_removed && self.self_leaf_is_active_in_mls(group_id) {
-                let mut group = self
-                    .storage
-                    .get_group(group_id)
-                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-                if group.removed {
-                    group.removed = false;
-                    self.storage
-                        .put_group(&group)
-                        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-                    // Privacy-safe breadcrumb: aggregate signal only, no
-                    // group/member ids (observability.md).
-                    tracing::info!(
-                        target: "cgka_engine::distributed_convergence",
-                        method = "emit_convergence_events",
-                        "cleared removed marker: selected canonical branch records local membership"
-                    );
-                }
-            }
+        self.emit_canonical_membership_effects(group_id, previous_membership)
+            .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?;
+        if self
+            .with_mls_group(group_id, |group| {
+                Ok(crate::identity::local_leaf_is_active(
+                    group,
+                    self.identity.self_id(),
+                ))
+            })
+            .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?
+        {
             if self
                 .load_leave_request_state(group_id)
                 .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?

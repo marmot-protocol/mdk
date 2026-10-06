@@ -3429,23 +3429,54 @@ impl<S: StorageProvider> Engine<S> {
     /// — e.g. one accepted mid-convergence just before the removal was
     /// realized — is terminally unsendable: leaving it queued would make every
     /// later drain re-fail it through the removed-copy send gate forever. The
-    /// discard is silent toward the app (the self-removed notification already
-    /// carries the user-facing signal); each dropped intent leaves a forensic
+    /// marker and queue deletion commit together; a device-local termination
+    /// effect tells app projections to withdraw pending work. Each intent leaves a forensic
     /// `Rejection` audit row plus an aggregate trace line. Returns the number
     /// discarded.
     pub(crate) fn discard_queued_outbound_intents_for_removed_group(
         &mut self,
         group_id: &GroupId,
     ) -> Result<usize, EngineError> {
+        self.discard_queued_outbound_intents_with_termination(group_id, false)
+    }
+
+    /// Announce a new local termination even with an empty queue; steady-state
+    /// terminal advances must remain silent so they cannot re-arm app work.
+    pub(crate) fn discard_queued_outbound_intents_with_termination(
+        &mut self,
+        group_id: &GroupId,
+        announce_transition: bool,
+    ) -> Result<usize, EngineError> {
         self.drop_self_remove_auto_commit_schedules_for_group(group_id);
         self.invalidate_deferred_peel_candidate_cache(group_id);
-        self.storage.delete_deferred_peel_generation(group_id)?;
-        let queued = self.storage.list_queued_outbound_intents(group_id)?;
+        let voluntary = self.load_leave_request_state(group_id)?.is_some();
+        let (queued, disbanded, newly_removed) =
+            self.storage
+                .with_transaction(|storage| -> Result<_, EngineError> {
+                    let mut record = storage.get_group(group_id)?;
+                    let newly_removed = !record.removed;
+                    if record.disbanded.is_none() {
+                        record.removed = true;
+                        storage.put_group(&record)?;
+                    }
+                    storage.delete_deferred_peel_generation(group_id)?;
+                    let queued = storage.list_queued_outbound_intents(group_id)?;
+                    for intent in &queued {
+                        storage.delete_queued_outbound_intent(&intent.id)?;
+                    }
+                    Ok((queued, record.disbanded.is_some(), newly_removed))
+                })?;
+        if !disbanded && (announce_transition || newly_removed || !queued.is_empty()) {
+            self.events_buf
+                .push_back(cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated {
+                    group_id: group_id.clone(),
+                    voluntary,
+                });
+        }
         if queued.is_empty() {
             return Ok(0);
         }
         for record in &queued {
-            self.storage.delete_queued_outbound_intent(&record.id)?;
             self.audit_group(
                 group_id,
                 marmot_forensics::AuditEventKind::Rejection {

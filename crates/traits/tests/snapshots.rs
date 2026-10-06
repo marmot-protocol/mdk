@@ -685,6 +685,29 @@ fn snapshot_send_results() {
 #[test]
 fn snapshot_group_events() {
     insta::assert_json_snapshot!(
+        "event_local_group_copy_terminated",
+        GroupEvent::LocalGroupCopyTerminated {
+            group_id: gid(),
+            voluntary: true
+        }
+    );
+    insta::assert_json_snapshot!(
+        "event_local_group_copy_restored",
+        GroupEvent::LocalGroupCopyRestored { group_id: gid() }
+    );
+    insta::assert_json_snapshot!(
+        "event_group_member_leaves_removed",
+        GroupEvent::GroupMemberLeavesRemoved {
+            group_id: gid(),
+            epoch: EpochId(7),
+            leaves: vec![cgka_traits::engine::GroupMemberLeaf {
+                member: mem_id(),
+                leaf_index: 3
+            }],
+            departed_members: vec![mem_id()],
+        }
+    );
+    insta::assert_json_snapshot!(
         "event_group_created",
         GroupEvent::GroupCreated { group_id: gid() }
     );

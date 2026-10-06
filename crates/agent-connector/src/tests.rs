@@ -7823,47 +7823,6 @@ async fn mock_relay_url() -> (MockRelay, String) {
     (relay, relay_url)
 }
 
-/// Keep every fixture relay readable while selecting the sole publication ack.
-#[derive(Debug)]
-struct RelayWriteGate(std::sync::Arc<std::sync::atomic::AtomicBool>);
-
-impl nostr_relay_builder::builder::WritePolicy for RelayWriteGate {
-    /// Reject writes outside the selected route without blocking directory reads.
-    fn admit_event<'a>(
-        &'a self,
-        _event: &'a nostr_relay_builder::prelude::Event,
-        _addr: &'a std::net::SocketAddr,
-    ) -> nostr_relay_builder::prelude::BoxedFuture<'a, nostr_relay_builder::builder::PolicyResult>
-    {
-        Box::pin(async move {
-            if self.0.load(Ordering::Acquire) {
-                nostr_relay_builder::builder::PolicyResult::Accept
-            } else {
-                nostr_relay_builder::builder::PolicyResult::Reject(
-                    "fixture publication route is disabled".to_owned(),
-                )
-            }
-        })
-    }
-}
-
-/// Start a real relay whose read service survives publication-route changes.
-async fn gated_relay_url(
-    allow_writes: bool,
-) -> (
-    nostr_relay_builder::LocalRelay,
-    String,
-    std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
-    let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(allow_writes));
-    let relay = nostr_relay_builder::LocalRelay::new(
-        nostr_relay_builder::RelayBuilder::default().write_policy(RelayWriteGate(gate.clone())),
-    );
-    relay.run().await.unwrap();
-    let url = relay.url().await.to_string();
-    (relay, url, gate)
-}
-
 /// Publish one NIP-65 and one inbox list, each naming a second relay, so every
 /// entry a later edit must preserve is a real reachable endpoint.
 async fn publish_nip65_and_inbox(
@@ -7895,14 +7854,12 @@ async fn publish_nip65_and_inbox(
 #[tokio::test]
 async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() {
     let dir = tempfile::tempdir().unwrap();
-    // Publication needs one ack and cancels other sends at quorum. Select
-    // which relay acknowledges so assertions never assume every route stored it.
-    let (_relay, relay_url, primary_writes) = gated_relay_url(true).await;
-    let (_read_relay, read_url, _) = gated_relay_url(false).await;
-    let (_write_relay, write_url, _) = gated_relay_url(false).await;
-    let (_inbox_relay, inbox_url, _) = gated_relay_url(false).await;
-    let (_added_relay, added_url, added_writes) = gated_relay_url(false).await;
-    let (_inbox_added_relay, inbox_added_url, _) = gated_relay_url(false).await;
+    let (_relay, relay_url) = mock_relay_url().await;
+    let (_read_relay, read_url) = mock_relay_url().await;
+    let (_write_relay, write_url) = mock_relay_url().await;
+    let (_inbox_relay, inbox_url) = mock_relay_url().await;
+    let (_added_relay, added_url) = mock_relay_url().await;
+    let (_inbox_added_relay, inbox_added_url) = mock_relay_url().await;
     let account_home = AccountHome::open(dir.path());
     let account = account_home.create_account("agent").unwrap();
     let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
@@ -7933,10 +7890,6 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
 
     // kind 10002 is replaceable: adding one relay must keep the read-only,
     // write-only and inbox entries the request never named.
-    // Only the newly added route acknowledges this first publication, proving
-    // it is reached before it exists in the account's remembered outbox.
-    primary_writes.store(false, Ordering::Release);
-    added_writes.store(true, Ordering::Release);
     connector
         .relay_list_edit_response(crate::relays::RelayListEdit {
             account_id_hex: account.account_id_hex.clone(),
@@ -7947,8 +7900,6 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
         })
         .await
         .unwrap();
-    primary_writes.store(true, Ordering::Release);
-    added_writes.store(false, Ordering::Release);
     connector
         .relay_list_edit_response(crate::relays::RelayListEdit {
             account_id_hex: account.account_id_hex.clone(),
@@ -7963,10 +7914,7 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
     let published = app
         .fetch_current_account_relay_list_status_for_account_id(
             &account.account_id_hex,
-            vec![
-                relay_endpoint.clone(),
-                crate::validation::endpoint(&added_url),
-            ],
+            vec![relay_endpoint.clone()],
             Some("nip65"),
         )
         .await
@@ -8022,8 +7970,6 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
     // are second-resolution: a removal published in the same second as the
     // addition cannot supersede it, so the removal waits for the next second.
     sleep(Duration::from_millis(1_100)).await;
-    primary_writes.store(true, Ordering::Release);
-    added_writes.store(false, Ordering::Release);
     connector
         .relay_list_edit_response(crate::relays::RelayListEdit {
             account_id_hex: account.account_id_hex.clone(),

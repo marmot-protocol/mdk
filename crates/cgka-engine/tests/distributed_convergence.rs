@@ -2148,6 +2148,7 @@ async fn superseded_self_removal_clears_removed_marker_and_restores_send() {
         )),
         "a superseded removal must not create a new invitation: {events:?}"
     );
+    assert!(events.iter().any(|event| matches!(event, GroupEvent::LocalGroupCopyRestored { group_id: g } if g == &group_id)));
     assert_eq!(rename_activity_target(&events, &group_id), author_target);
 
     // Send eligibility is restored: the intent the removed-copy gate rejected
