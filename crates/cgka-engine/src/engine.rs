@@ -115,6 +115,8 @@ pub(crate) struct ScheduledSelfRemoveAutoCommit {
     pub(crate) due_at_ms: u64,
 }
 
+/// Coordinates authenticated group evolution, durable replay and native events
+/// over the caller-provided storage backend and transport peeler.
 pub struct Engine<S: StorageProvider> {
     pub(crate) storage: S,
     pub(crate) crypto: RustCrypto,
@@ -1637,9 +1639,10 @@ impl<S: StorageProvider> Engine<S> {
     ///
     /// A settle commits the guard durably, but the live `GroupDisbanded` it
     /// emits only reaches the application through a later drain that can drop
-    /// the whole batch without a crash — `observe_drained_session_events` runs
-    /// `fail_if_publish_failed(effects)?` before it projects any event. A
-    /// settle-time marker could therefore suppress an announcement the
+    /// the whole batch on a projection failure or process death. App-side
+    /// session retries preserve drained batches after unrelated publish failures,
+    /// but do not durably acknowledge native state events. A settle-time marker
+    /// could therefore suppress an announcement the
     /// application never received. Marking at replay time instead guarantees
     /// live delivery plus exactly one belt-and-braces replay, then silence.
     ///
@@ -1649,8 +1652,8 @@ impl<S: StorageProvider> Engine<S> {
     /// *account open* — before any drain exists to consume the event it
     /// announces. The window in which the replay can be lost is therefore
     /// `[account open, first successful drained projection]`: it spans app
-    /// startup, and **one** process death (or one drained batch that fails its
-    /// publish gate) is enough to close it with the event unprojected. That is
+    /// startup, and **one** process death is enough to close it with the event
+    /// unprojected. That is
     /// wider than a same-drain window, which is exactly why the consequences
     /// below have to be reconciled from durable state rather than from this
     /// event.

@@ -4587,3 +4587,106 @@ fn leaf_cleanup_preserves_sibling_tombstones_until_account_departure() {
         "full account departure clears its tombstones"
     );
 }
+
+/// Hydration reconciles exact account/leaf pairs atomically and keeps sibling
+/// tombstones, even when a native departure announcement was lost.
+#[test]
+fn canonical_push_leaf_reconciliation_is_atomic_and_account_scoped() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let g = "aa".repeat(32);
+    let m = "bb".repeat(32);
+    let peer = "cc".repeat(32);
+    let other_group = "ee".repeat(32);
+    let departed = push_token(&g, &m, 100, "departed");
+    let mut sibling = departed.clone();
+    sibling.leaf_index = 1;
+    let peer_token = push_token(&g, &peer, 100, "peer");
+    let other_token = push_token(&other_group, &m, 100, "other");
+    for token in [&departed, &sibling, &peer_token, &other_token] {
+        store.apply_group_push_token(token).unwrap();
+    }
+    let mut old = push_token(&g, &m, 100, "old");
+    old.leaf_index = 2;
+    old.server_pubkey_hex = "dd".repeat(32);
+    store
+        .apply_group_push_token_tombstone(
+            &g,
+            &m,
+            2,
+            1,
+            &old.server_pubkey_hex,
+            500,
+            "withdrawn",
+            500,
+        )
+        .unwrap();
+    store
+        .apply_group_push_token_tombstone(
+            &g,
+            &peer,
+            2,
+            1,
+            &old.server_pubkey_hex,
+            500,
+            "peer-withdrawn",
+            500,
+        )
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TEMP TRIGGER fail_leaf_reconcile BEFORE DELETE ON group_push_token_tombstones
+         BEGIN SELECT RAISE(FAIL, 'injected tombstone cleanup failure'); END;",
+        )
+        .unwrap();
+    let roster = [(m.clone(), 1)];
+    assert!(
+        store
+            .reconcile_group_push_token_leaves(&g, &roster)
+            .is_err()
+    );
+    assert_eq!(
+        store.group_push_tokens(&g).unwrap().len(),
+        3,
+        "token deletes roll back with tombstones"
+    );
+    store
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_leaf_reconcile")
+        .unwrap();
+    assert_eq!(
+        store
+            .reconcile_group_push_token_leaves(&g, &roster)
+            .unwrap(),
+        2
+    );
+    assert_eq!(store.group_push_tokens(&g).unwrap(), vec![sibling]);
+    assert_eq!(
+        store.group_push_tokens(&other_group).unwrap(),
+        vec![other_token]
+    );
+    assert!(
+        !store.apply_group_push_token(&old).unwrap(),
+        "surviving sibling retains tombstones"
+    );
+    let mut old_peer = old.clone();
+    old_peer.member_id_hex = peer;
+    assert!(
+        store.apply_group_push_token(&old_peer).unwrap(),
+        "fully departed account drops tombstones"
+    );
+    assert_eq!(
+        store
+            .reconcile_group_push_token_leaves(&g, &roster)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .reconcile_group_push_token_leaves(&g, &roster)
+            .unwrap(),
+        0
+    );
+}

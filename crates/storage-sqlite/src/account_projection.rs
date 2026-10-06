@@ -3247,6 +3247,42 @@ impl SqliteAccountStorage {
         })
     }
 
+    /// Repair missed leaf-departure cleanup from a hydrated canonical roster.
+    /// Retain account-scoped anti-resurrection tombstones while any sibling lives.
+    pub fn reconcile_group_push_token_leaves(
+        &self,
+        group_id_hex: &str,
+        active_leaves: &[(String, u32)],
+    ) -> StorageResult<usize> {
+        let roster = serde_json::to_string(active_leaves)
+            .map_err(|error| StorageError::Serialization(error.to_string()))?;
+        self.connection
+            .with_transaction(|| -> StorageResult<usize> {
+                let conn = self.lock()?;
+                let removed = conn
+                    .execute_cached(
+                        "DELETE FROM group_push_tokens
+                 WHERE group_id_hex = ?1 AND NOT EXISTS (
+                     SELECT 1 FROM json_each(?2) AS leaf
+                     WHERE json_extract(leaf.value, '$[0]') = member_id_hex
+                       AND json_extract(leaf.value, '$[1]') = leaf_index
+                 )",
+                        params![group_id_hex, roster],
+                    )
+                    .storage()?;
+                conn.execute_cached(
+                    "DELETE FROM group_push_token_tombstones
+                 WHERE group_id_hex = ?1 AND NOT EXISTS (
+                     SELECT 1 FROM json_each(?2) AS leaf
+                     WHERE json_extract(leaf.value, '$[0]') = member_id_hex
+                 )",
+                    params![group_id_hex, roster],
+                )
+                .storage()?;
+                Ok(removed)
+            })
+    }
+
     pub fn remove_stale_group_push_tokens(
         &self,
         group_id_hex: &str,

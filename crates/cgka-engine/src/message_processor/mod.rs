@@ -3429,10 +3429,11 @@ impl<S: StorageProvider> Engine<S> {
     /// — e.g. one accepted mid-convergence just before the removal was
     /// realized — is terminally unsendable: leaving it queued would make every
     /// later drain re-fail it through the removed-copy send gate forever. The
-    /// marker and queue deletion commit together; a device-local termination
-    /// effect tells app projections to withdraw pending work. Each intent leaves a forensic
-    /// `Rejection` audit row plus an aggregate trace line. Returns the number
-    /// discarded.
+    /// marker and queue deletion commit together. A newly removed copy or a
+    /// nonempty discarded queue emits device-local termination so the app can
+    /// withdraw pending work; an already removed empty copy remains silent.
+    /// Each discarded intent leaves a forensic `Rejection` audit row plus an
+    /// aggregate trace line. Returns the number discarded.
     pub(crate) fn discard_queued_outbound_intents_for_removed_group(
         &mut self,
         group_id: &GroupId,

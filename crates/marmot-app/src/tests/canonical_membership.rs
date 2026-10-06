@@ -659,6 +659,14 @@ async fn sibling_selfremove_through_author_command(profile_command: bool) {
             None,
         )
         .unwrap();
+    let peer_token = drained_seam_push_token(
+        &group_hex,
+        &home.account("alice").unwrap().account_id_hex,
+        alice.runtime.own_leaf_index(&group).unwrap(),
+    );
+    sibling_app
+        .upsert_group_push_token("bob", &peer_token)
+        .unwrap();
     sibling.leave_group(&group).await.unwrap();
     deliver_new(&mut alice, &relay, &mut alice_cursor).await;
     alice.sync().await.unwrap();
@@ -737,6 +745,42 @@ async fn sibling_selfremove_through_author_command(profile_command: bool) {
             .is_empty(),
         "termination must not enqueue an unsendable removal rumor"
     );
+    assert_eq!(
+        sibling_app.group_push_tokens("bob", &group_hex).unwrap(),
+        vec![peer_token]
+    );
+    if !profile_command {
+        // The durable terminal marker survives an app-projection write failure.
+        // Eager open stays usable and retains the repair for its bounded retry.
+        drop(sibling);
+        let path = sibling_app.account_storage_path("bob");
+        let keys = sibling_app.account_home().load_signing_keys("bob").unwrap();
+        let key = sibling_app
+            .sqlcipher_key("bob", &keys, &path, SqlcipherDatabaseKind::Session)
+            .unwrap();
+        let connection = rusqlite::Connection::open(path).unwrap();
+        storage_sqlite::open_hardened_sqlcipher(
+            &connection,
+            &key,
+            storage_sqlite::SqlCipherHardening::cipher_only(),
+        )
+        .unwrap();
+        connection.execute_batch("CREATE TRIGGER fail_terminal_repair BEFORE UPDATE OF self_membership ON account_groups
+            BEGIN SELECT RAISE(FAIL, 'injected terminal repair failure'); END;").unwrap();
+        let mut recovered = sibling_app
+            .client("bob")
+            .await
+            .expect("terminal repair does not abort eager open");
+        assert!(recovered.has_pending_runtime_group_subscription_refresh());
+        connection
+            .execute_batch("DROP TRIGGER fail_terminal_repair")
+            .unwrap();
+        recovered
+            .retry_pending_runtime_group_subscription_refresh()
+            .await
+            .unwrap();
+        assert!(!recovered.has_pending_runtime_group_subscription_refresh());
+    }
     assert_held(&app);
     assert!(
         !bob_client
@@ -764,11 +808,26 @@ async fn sibling_selfremove_through_author_command(profile_command: bool) {
         .unwrap()
         .contains(&group_hex)
     );
+    let stale = drained_seam_push_token(&group_hex, &bob.account_id_hex, departing_leaf);
+    app.upsert_group_push_token("bob", &stale).unwrap();
+    assert_eq!(app.group_push_tokens("bob", &group_hex).unwrap().len(), 2);
     drop(bob_client);
     drop(alice);
     drop(app);
-    let reopened = app_at(&dir, relay);
-    let client = reopened.client("bob").await.unwrap();
+    let reopened = app_at(&dir, relay.clone());
+    let client = if profile_command {
+        let plane = MarmotRelayPlane::new(None, relay);
+        let mut client = reopened
+            .local_client_with_relay_plane_and_hydration("bob", &plane, None, true, None)
+            .await
+            .unwrap();
+        crate::runtime::account_worker::drain_deferred_hydration(&mut client)
+            .await
+            .unwrap();
+        client
+    } else {
+        reopened.client("bob").await.unwrap()
+    };
     assert!(can_send(&client, &group));
     assert!(
         !client
@@ -788,10 +847,9 @@ async fn sibling_selfremove_through_author_command(profile_command: bool) {
             .unwrap()
             .contains(&group_hex)
     );
-    assert_eq!(
-        reopened.group_push_tokens("bob", &group_hex).unwrap()[0].leaf_index,
-        surviving_leaf
-    );
+    let repaired = reopened.group_push_tokens("bob", &group_hex).unwrap();
+    assert_eq!(repaired.len(), 1, "hydration repairs missed leaf cleanup");
+    assert_eq!(repaired[0].leaf_index, surviving_leaf);
     assert_held(&reopened);
 }
 
@@ -915,6 +973,25 @@ async fn termination_then_restoration_preserves_failed_sends_and_archive() {
         let group = client.create_group("effect batch", &[]).await.unwrap();
         let group_hex = hex::encode(group.as_slice());
         client.set_group_archived(&group, archived).unwrap();
+        let peer = nostr::prelude::Keys::generate().public_key().to_hex();
+        let peer_token = drained_seam_push_token(&group_hex, &peer, 7);
+        app.upsert_group_push_token("alice", &peer_token).unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let mut withdrawn = peer_token.clone();
+        withdrawn.leaf_index = 8;
+        storage
+            .apply_group_push_token_tombstone(
+                &group_hex,
+                &peer,
+                8,
+                withdrawn.platform.platform_byte(),
+                &withdrawn.server_pubkey_hex,
+                withdrawn.owner_ts + 1,
+                "peer-withdrawal",
+                500,
+            )
+            .unwrap();
+
         app.record_account_app_event(
             "alice",
             &AppMessageProjection {
@@ -973,6 +1050,17 @@ async fn termination_then_restoration_preserves_failed_sends_and_archive() {
                 .map(|_| ()),
         };
         assert_eq!(result.is_err(), failed);
+        assert_eq!(
+            app.group_push_tokens("alice", &group_hex).unwrap(),
+            vec![peer_token]
+        );
+        assert!(
+            !storage
+                .apply_group_push_token(&account_group_push_token_from_app(&withdrawn))
+                .unwrap(),
+            "termination/restoration must preserve peers' anti-resurrection evidence"
+        );
+
         assert_eq!(
             app.stored_group_self_membership("alice", &group_hex)
                 .unwrap(),
@@ -1058,4 +1146,227 @@ async fn maintenance_counts_one_recovery_transition() {
         .collect();
     assert_eq!(transitions.len(), 1);
     assert_eq!(transitions[0]["props"]["count_bucket"], "1");
+}
+
+/// A storage failure after the first native event retains the whole drained
+/// batch. Retrying projects the tail without changing the primary publish result.
+#[tokio::test]
+async fn partial_native_projection_retries_without_republishing() {
+    for failed_publish in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = app_at(&dir, relay.clone());
+        let mut client = app.client("alice").await.unwrap();
+        client.prepare_transport().await.unwrap();
+        let group = client.create_group("projection retry", &[]).await.unwrap();
+        let group_hex = hex::encode(group.as_slice());
+        client.take_pending_applied_sync_summary();
+        let path = app.account_storage_path("alice");
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let key = app
+            .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
+            .unwrap();
+        let connection = rusqlite::Connection::open(path).unwrap();
+        storage_sqlite::open_hardened_sqlcipher(
+            &connection,
+            &key,
+            storage_sqlite::SqlCipherHardening::cipher_only(),
+        )
+        .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_restoration BEFORE UPDATE OF self_membership ON account_groups
+             WHEN OLD.self_membership = 'removed' AND NEW.self_membership = 'member'
+             BEGIN SELECT RAISE(FAIL, 'injected restoration failure'); END;",
+            )
+            .unwrap();
+        let mut effects = marmot_account::AccountDeviceEffects {
+            events: vec![
+                GroupEvent::LocalGroupCopyTerminated {
+                    group_id: group.clone(),
+                    voluntary: false,
+                },
+                GroupEvent::LocalGroupCopyRestored {
+                    group_id: group.clone(),
+                },
+                GroupEvent::GroupStateChanged {
+                    group_id: group.clone(),
+                    epoch: cgka_traits::EpochId(1),
+                    actor: Some(MemberId::new(hex::decode(&account.account_id_hex).unwrap())),
+                    change: cgka_traits::GroupStateChange::GroupRenamed {
+                        name: "committed tail".into(),
+                        previous_name: None,
+                    },
+                    origin_commit_id: Some(MessageId::new(vec![0xe3; 32])),
+                },
+            ],
+            ..Default::default()
+        };
+        if failed_publish {
+            effects.failures.push(marmot_account::PublishFailure {
+                message_id: MessageId::new(vec![0xe4; 32]),
+                reason: "primary failure".into(),
+            });
+        }
+        let publications = relay.published_events.lock().unwrap().len();
+        let result = client
+            .observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await;
+        if failed_publish {
+            assert!(
+                matches!(result, Err(AppError::Publish(reason)) if reason == "primary failure")
+            );
+        } else {
+            result.unwrap();
+        }
+        assert_eq!(
+            app.stored_group_self_membership("alice", &group_hex)
+                .unwrap(),
+            Some(SelfMembership::Removed)
+        );
+        assert!(client.has_pending_runtime_group_subscription_refresh());
+        assert_eq!(client.pending_applied_effects.len(), 1);
+        assert!(
+            client
+                .take_pending_applied_sync_summary()
+                .projection_updates
+                .is_empty()
+        );
+        assert!(
+            client
+                .retry_pending_runtime_group_subscription_refresh()
+                .await
+                .is_err()
+        );
+        assert_eq!(client.pending_applied_effects.len(), 1);
+        connection
+            .execute_batch("DROP TRIGGER fail_restoration")
+            .unwrap();
+        client
+            .retry_pending_runtime_group_subscription_refresh()
+            .await
+            .unwrap();
+        assert_eq!(
+            app.stored_group_self_membership("alice", &group_hex)
+                .unwrap(),
+            Some(SelfMembership::Member)
+        );
+        assert!(!client.has_pending_runtime_group_subscription_refresh());
+        assert!(client.pending_applied_effects.is_empty());
+        let summary = client.take_pending_applied_sync_summary();
+        if failed_publish {
+            assert_eq!(
+                summary
+                    .projection_updates
+                    .iter()
+                    .flat_map(|u| &u.timeline_messages)
+                    .filter(|row| row.group_system.is_some())
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            relay.published_events.lock().unwrap().len(),
+            publications,
+            "projection retry must not republish"
+        );
+        client
+            .retry_pending_runtime_group_subscription_refresh()
+            .await
+            .unwrap();
+        assert!(
+            client
+                .take_pending_applied_sync_summary()
+                .projection_updates
+                .is_empty()
+        );
+    }
+}
+
+/// Failure in the row-synthesis tail must retain the earlier successful write
+/// and retry the remaining row with its original observation timestamp.
+#[tokio::test]
+async fn committed_activity_tail_retries_after_storage_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = app_at(&dir, relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    client.prepare_transport().await.unwrap();
+    let group = client.create_group("row retry", &[]).await.unwrap();
+    client.take_pending_applied_sync_summary();
+    let path = app.account_storage_path("alice");
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let key = app
+        .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_activity_tail BEFORE INSERT ON app_events
+         WHEN NEW.kind = 1210 AND (SELECT COUNT(*) FROM app_events WHERE kind = 1210) > 0
+         BEGIN SELECT RAISE(FAIL, 'injected activity tail failure'); END;",
+        )
+        .unwrap();
+    let effects = marmot_account::AccountDeviceEffects {
+        events: (2..=3)
+            .map(|epoch| GroupEvent::GroupStateChanged {
+                group_id: group.clone(),
+                epoch: cgka_traits::EpochId(epoch),
+                actor: Some(MemberId::new(hex::decode(&account.account_id_hex).unwrap())),
+                change: cgka_traits::GroupStateChange::GroupRenamed {
+                    name: format!("rename {epoch}"),
+                    previous_name: None,
+                },
+                origin_commit_id: Some(MessageId::new(vec![epoch as u8; 32])),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let publications = relay.published_events.lock().unwrap().len();
+    client
+        .observe_send_applied_effects_best_effort(&effects)
+        .await;
+    assert!(client.has_pending_runtime_group_subscription_refresh());
+    assert_eq!(client.pending_applied_effects.len(), 1);
+    let count = || {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM app_events WHERE kind = 1210",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(count(), 1, "first row committed before failure");
+    connection
+        .execute_batch("DROP TRIGGER fail_activity_tail")
+        .unwrap();
+    client
+        .retry_pending_runtime_group_subscription_refresh()
+        .await
+        .unwrap();
+    assert_eq!(count(), 2);
+    assert!(client.pending_applied_effects.is_empty());
+    let summary = client.take_pending_applied_sync_summary();
+    let ids = summary
+        .projection_updates
+        .iter()
+        .flat_map(|u| &u.timeline_messages)
+        .filter(|row| row.group_system.is_some())
+        .map(|row| &row.message_id_hex)
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(ids.len(), 2, "subscribers receive both committed rows");
+    assert_eq!(relay.published_events.lock().unwrap().len(), publications);
 }

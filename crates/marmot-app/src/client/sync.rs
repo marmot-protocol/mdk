@@ -674,6 +674,14 @@ impl StagedSyncError {
     }
 }
 
+/// Session-owned retry input for a committed batch whose app projection failed.
+/// Durable membership and push state are independently reconciled on reopen.
+#[derive(Clone)]
+pub(crate) struct PendingAppliedEffects {
+    effects: marmot_account::AccountDeviceEffects,
+    received_at: u64,
+}
+
 impl AppClient {
     /// Persist a host connectivity-restored edge into every exact fanout whose
     /// prior attempt was proven unavailable, then schedule its group for an
@@ -1336,7 +1344,7 @@ impl AppClient {
     }
 
     pub(crate) fn has_pending_runtime_group_subscription_refresh(&self) -> bool {
-        self.pending_runtime_group_subscription_refresh
+        self.pending_runtime_group_subscription_refresh || !self.pending_applied_effects.is_empty()
     }
 
     /// Retry an ordinary group-subscription rebuild that was deliberately
@@ -1346,9 +1354,13 @@ impl AppClient {
     pub(crate) async fn retry_pending_runtime_group_subscription_refresh(
         &mut self,
     ) -> Result<bool, AppError> {
-        if !self.pending_runtime_group_subscription_refresh {
+        if !self.has_pending_runtime_group_subscription_refresh() {
             return Ok(false);
         }
+        self.pending_runtime_group_subscription_refresh = true;
+        self.retry_applied_effect_projections().await?;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        self.refresh_group_routes()?;
         if let Err(error) = self.sync_runtime_groups().await {
             if error.is_account_not_active() {
                 // An unexpected notification consumer exit or overlapping
@@ -1809,11 +1821,6 @@ impl AppClient {
         // below rather than a copy of it. The durable writes that must not
         // depend on that one replay arriving are reconciled from the guard rows
         // instead, by `sweep_terminal_groups_from_guards` at account open.
-        let local_account_id_hex = self
-            .app
-            .account_home()
-            .account(&self.state.label)?
-            .account_id_hex;
         let local_group_deletion_frontiers =
             self.local_group_deletion_frontiers_at_batch_start(effects)?;
         let mut routes_dirty = false;
@@ -1911,8 +1918,7 @@ impl AppClient {
                     marmot_forensics::v5::UpdateCause::RetainedEventReplay,
                 );
             }
-            let projected =
-                self.observe_event_projection_effects(event, &local_account_id_hex, &mut summary);
+            let projected = self.observe_event_projection_effects(event, &mut summary);
             match projected {
                 Ok(dirty) => routes_dirty |= dirty,
                 Err(error) => {
@@ -2010,27 +2016,47 @@ impl AppClient {
         if effects.events.is_empty() {
             return Ok(());
         }
-        let mut summary = SyncSummary::default();
-        // Synthetic source identity: these events have no single inbound
-        // transport message (see `drain_pending_session_events`).
-        let source_message_id_hex = String::new();
-        let source_received_at = unix_now_seconds();
-        let routes_dirty = self
-            .observe_account_device_effects(
-                effects,
-                &mut summary,
-                &source_message_id_hex,
-                source_received_at,
-            )
-            .await?;
-        // Projection has already applied. Preserve its subscriber updates even
-        // if the following transport rebuild fails and is retried separately.
-        self.pending_applied_sync_summary.merge(summary);
+        self.retain_applied_effects(effects);
+        let routes_dirty = self.retry_applied_effect_projections().await?;
         let routes_changed = self.refresh_group_routes()?.routing_changed;
         if routes_dirty || routes_changed {
             self.sync_runtime_groups().await?;
         }
         Ok(())
+    }
+
+    /// Retain drained native events until every app storage projection succeeds.
+    pub(crate) fn retain_applied_effects(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) {
+        self.pending_applied_effects
+            .push_back(PendingAppliedEffects {
+                effects: effects.clone(),
+                received_at: unix_now_seconds(),
+            });
+    }
+
+    /// Replay committed batches in order without repeating engine work or
+    /// publication. Projection writes are idempotent; subscriber summaries are
+    /// released once the entire batch has projected, before fallible routing.
+    async fn retry_applied_effect_projections(&mut self) -> Result<bool, AppError> {
+        let mut routes_dirty = false;
+        while let Some(pending) = self.pending_applied_effects.front().cloned() {
+            let mut summary = SyncSummary::default();
+            routes_dirty |= self
+                .observe_account_device_effects(
+                    &pending.effects,
+                    &mut summary,
+                    "",
+                    pending.received_at,
+                    true,
+                )
+                .await?;
+            self.pending_applied_sync_summary.merge(summary);
+            self.pending_applied_effects.pop_front();
+        }
+        Ok(routes_dirty)
     }
 
     /// Best-effort wrapper over [`Self::observe_send_applied_effects`] for the
@@ -2042,6 +2068,7 @@ impl AppClient {
         effects: &marmot_account::AccountDeviceEffects,
     ) {
         if let Err(_err) = self.observe_send_applied_effects(effects).await {
+            self.pending_runtime_group_subscription_refresh = true;
             tracing::warn!(
                 target: "marmot_app::messages",
                 method = "observe_send_applied_effects",
@@ -3148,6 +3175,7 @@ impl AppClient {
                 summary,
                 &source_message_id_hex,
                 source_received_at,
+                false,
             )
             .await
         {
@@ -4840,6 +4868,7 @@ impl AppClient {
                 &mut summary,
                 &source_message_id_hex,
                 source_received_at,
+                false,
             )
             .await?;
         let routes_changed = self.refresh_group_routes()?.routing_changed;
@@ -4974,23 +5003,16 @@ impl AppClient {
                 })
                 .and_then(|profile| {
                     self.runtime
-                        .members(&message.group_id)
+                        .session()
+                        .canonical_group_membership(&message.group_id)
                         .map_err(AppError::from)
-                        .map(|members| {
-                            (
-                                profile,
-                                members
-                                    .into_iter()
-                                    .map(|member| hex::encode(member.id.as_slice()))
-                                    .collect::<Vec<_>>(),
-                            )
-                        })
+                        .map(|membership| (profile, membership.member_leaves))
                 })
-                .and_then(|(profile, active_member_ids)| {
+                .and_then(|(profile, active_leaves)| {
                     self.app.ingest_push_gossip_message(
                         &self.state.label,
                         &message,
-                        &active_member_ids,
+                        &active_leaves,
                         profile,
                     )
                 });
@@ -5295,7 +5317,6 @@ impl AppClient {
     pub(crate) fn observe_event_projection_effects(
         &mut self,
         event: &cgka_traits::engine::GroupEvent,
-        _local_account_id_hex: &str,
         summary: &mut SyncSummary,
     ) -> Result<bool, AppError> {
         let mut routes_dirty = false;
@@ -5355,8 +5376,8 @@ impl AppClient {
                 // A terminated copy cannot publish a new removal rumor.
                 // Voluntary leave drains it while MLS is active; peers use
                 // their own authenticated leaf-departure effect for cleanup.
-                self.app
-                    .remove_stale_group_push_tokens(&self.state.label, &group_id_hex, &[])?;
+                // Native leaf-departure effects own token cleanup. A local
+                // termination alone says nothing about surviving peer leaves.
                 routes_dirty = true;
             }
             // Engine restoration respects independent deletion and leave intent.
@@ -5526,6 +5547,7 @@ impl AppClient {
         summary: &mut SyncSummary,
         source_message_id_hex: &str,
         source_received_at: u64,
+        retry_projection_writes: bool,
     ) -> Result<bool, AppError> {
         let started = Instant::now();
         let result = self
@@ -5534,6 +5556,7 @@ impl AppClient {
                 summary,
                 source_message_id_hex,
                 source_received_at,
+                retry_projection_writes,
             )
             .await;
         if let Err(error) = &result {
@@ -5548,17 +5571,10 @@ impl AppClient {
         summary: &mut SyncSummary,
         source_message_id_hex: &str,
         source_received_at: u64,
+        retry_projection_writes: bool,
     ) -> Result<bool, AppError> {
         let display_names = self.display_names_for_events(&effects.events);
         self.note_superseded_intent_reports(effects);
-        // MLS member ids in this design are the Nostr account pubkey hex, so a
-        // membership change whose subject matches the local account id hex is
-        // the local account leaving / being removed (or, for joins, returning).
-        let local_account_id_hex = self
-            .app
-            .account_home()
-            .account(&self.state.label)?
-            .account_id_hex;
         let mut routes_dirty = false;
         // #760: collect push-gossip ids and strip them from `summary.messages` in
         // ONE pass after the loop. The previous per-message `retain` was O(n) per
@@ -5640,8 +5656,7 @@ impl AppClient {
             {
                 probe.projected(event, marmot_forensics::v5::UpdateCause::WelcomeJoin);
             }
-            routes_dirty |=
-                self.observe_event_projection_effects(event, &local_account_id_hex, summary)?;
+            routes_dirty |= self.observe_event_projection_effects(event, summary)?;
             if self.state.groups.len() != before {
                 routes_dirty = true;
             }
@@ -5673,7 +5688,11 @@ impl AppClient {
         }
         // Synthesize durable kind-1210 system rows from authenticated state
         // changes (peer commits, auto-commits, and scheduled convergence).
-        let system_updates = self.project_group_system_rows(&effects.events, source_received_at);
+        let system_updates = if retry_projection_writes {
+            self.try_project_group_system_rows(&effects.events, source_received_at)?
+        } else {
+            self.project_group_system_rows(&effects.events, source_received_at)
+        };
         summary.projection_updates.extend(system_updates);
         Ok(routes_dirty)
     }
@@ -6884,6 +6903,7 @@ mod tests {
                             &mut SyncSummary::default(),
                             &sources["released message 2"],
                             unix_now_seconds(),
+                            false,
                         )
                         .await
                         .unwrap();

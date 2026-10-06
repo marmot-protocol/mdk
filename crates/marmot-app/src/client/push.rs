@@ -677,20 +677,22 @@ impl AppClient {
     }
 
     pub(crate) fn cleanup_stale_push_tokens_best_effort(&self, group_id: &GroupId) {
-        let Ok(account) = self.app.account_home().account(&self.state.label) else {
+        // An unreadable/quarantined group is not an empty roster.
+        let Ok(membership) = self.runtime.session().canonical_group_membership(group_id) else {
             return;
         };
-        let Ok(members) = self.runtime.members(group_id) else {
-            return;
-        };
-        let active_members = members
-            .into_iter()
-            .map(|member| hex::encode(member.id.as_slice()))
-            .collect::<Vec<_>>();
-        let group_id_hex = hex::encode(group_id.as_slice());
-        let _ =
-            self.app
-                .remove_stale_group_push_tokens(&account.label, &group_id_hex, &active_members);
+        if self
+            .app
+            .reconcile_group_push_token_leaves(
+                &self.state.label,
+                &hex::encode(group_id.as_slice()),
+                &membership.member_leaves,
+            )
+            .is_err()
+        {
+            tracing::warn!(target: "marmot_app::push", error_code = "leaf_reconciliation_failed",
+                "failed to reconcile canonical push destinations");
+        }
     }
 }
 

@@ -47,7 +47,14 @@
   convergence, including reportless membership changes and leaf-token cleanup.
   Group commands and maintenance also observe native membership decisions
   produced while settling retained commits. Secondary projection or route-refresh
-  failures preserve the canonical publish result and keep route retries armed.
+  failures preserve the canonical publish result. Failed outbound/native
+  projection batches remain in the session retry queue until their writes succeed;
+  route rebuilds use the same bounded worker retry. This queue is not durable.
+  Local termination preserves peer push records and tombstones. Late gossip
+  cannot re-add an absent account/leaf pair; hydrated open reconciles missed leaf
+  cleanup without treating unreadable groups as empty rosters.
+  A pass ending in disband retains preceding commits' activity before the terminal
+  row, without emitting the closing commit's incidental member removals.
   Drained and retried batches retain committed activity even when an unrelated
   publication fails.
   Rust consumers must handle the three new non-timeline `GroupEvent` variants.

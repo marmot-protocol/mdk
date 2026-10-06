@@ -12993,7 +12993,10 @@ fn ingest_applies_owner_signed_transitive_448_and_drops_spoof() {
     app.ingest_push_gossip_message(
         "alice",
         &message(honest, &relayer),
-        &[owner_id.clone(), relayer.clone()],
+        &[cgka_traits::engine::GroupMemberLeaf {
+            member: cgka_traits::MemberId::new(owner.public_key().to_bytes().to_vec()),
+            leaf_index: 1,
+        }],
         cgka_traits::group::ProtocolProfile::Current,
     )
     .unwrap();
@@ -13009,13 +13012,42 @@ fn ingest_applies_owner_signed_transitive_448_and_drops_spoof() {
     app.ingest_push_gossip_message(
         "alice",
         &message(spoof, &relayer),
-        &[owner_id.clone(), relayer, attacker.public_key().to_hex()],
+        &[cgka_traits::engine::GroupMemberLeaf {
+            member: cgka_traits::MemberId::new(owner.public_key().to_bytes().to_vec()),
+            leaf_index: 1,
+        }],
         cgka_traits::group::ProtocolProfile::Current,
     )
     .unwrap();
     let stored = app.group_push_tokens("alice", &group_id_hex).unwrap();
     assert_eq!(stored.len(), 1, "spoofed record is dropped");
     assert_eq!(stored[0].owner_ts, 1000, "victim's original stamp survives");
+
+    // The same valid owner still has another device, but leaf 1 departed.
+    // Neither a late list in the same pass nor a later delivery may re-add it.
+    app.account_storage("alice")
+        .unwrap()
+        .remove_group_push_tokens_for_leaves(&group_id_hex, &[(owner_id.clone(), 1)], &[])
+        .unwrap();
+    for (owner_ts, kind) in [(3000, 447), (4000, 448)] {
+        let mut late = message(gossip_content(&owner, &owner_id, owner_ts), &relayer);
+        late.kind = kind;
+        app.ingest_push_gossip_message(
+            "alice",
+            &late,
+            &[cgka_traits::engine::GroupMemberLeaf {
+                member: cgka_traits::MemberId::new(owner.public_key().to_bytes().to_vec()),
+                leaf_index: 2,
+            }],
+            cgka_traits::group::ProtocolProfile::Current,
+        )
+        .unwrap();
+        assert!(
+            app.group_push_tokens("alice", &group_id_hex)
+                .unwrap()
+                .is_empty()
+        );
+    }
 }
 
 #[tokio::test]
@@ -15319,7 +15351,7 @@ async fn a_peer_member_added_leaves_stored_self_membership_alone() {
 #[tokio::test]
 async fn a_self_departure_marks_transport_routes_dirty() {
     let dir = tempfile::tempdir().unwrap();
-    let account = AccountHome::open(dir.path())
+    AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -15336,7 +15368,6 @@ async fn a_self_departure_marks_transport_routes_dirty() {
     };
     let member = |account_id_hex: &str| MemberId::new(hex::decode(account_id_hex).unwrap());
     let peer = nostr::prelude::Keys::generate().public_key().to_hex();
-    let local = account.account_id_hex.as_str();
     let mut summary = SyncSummary::default();
 
     for (label, voluntary) in [("an eviction", false), ("a voluntary leave", true)] {
@@ -15347,7 +15378,6 @@ async fn a_self_departure_marks_transport_routes_dirty() {
                         group_id: group_id.clone(),
                         voluntary
                     },
-                    local,
                     &mut summary,
                 )
                 .unwrap(),
@@ -15360,7 +15390,6 @@ async fn a_self_departure_marks_transport_routes_dirty() {
                 &departure(cgka_traits::engine::GroupStateChange::MemberRemoved {
                     member: member(&peer),
                 }),
-                local,
                 &mut summary,
             )
             .unwrap(),

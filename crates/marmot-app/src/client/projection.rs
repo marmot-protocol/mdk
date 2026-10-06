@@ -499,6 +499,7 @@ impl AppClient {
             self.mark_group_projection_dirty_hex(id);
         }
         for group_id in live_group_ids {
+            self.cleanup_stale_push_tokens_best_effort(&group_id);
             // Reopen repairs a lost removal-withdrawal announcement from the
             // canonical local leaf, including after the migration backfill ran.
             changed |= self.reconcile_canonical_self_membership(&group_id)?;
@@ -589,7 +590,20 @@ impl AppClient {
                     voluntary: false,
                 };
                 let mut summary = crate::SyncSummary::default();
-                self.observe_event_projection_effects(&event, "", &mut summary)?;
+                if self
+                    .observe_event_projection_effects(&event, &mut summary)
+                    .is_err()
+                {
+                    // The durable terminal record repairs this again on reopen;
+                    // retain the event for the session worker's bounded retry too.
+                    self.retain_applied_effects(&marmot_account::AccountDeviceEffects {
+                        events: vec![event],
+                        ..Default::default()
+                    });
+                    tracing::warn!(target: "marmot_app::groups",
+                        error_code = "terminal_projection_reconciliation_failed",
+                        "retained terminal projection for retry");
+                }
                 self.pending_projection_updates
                     .extend(summary.projection_updates);
             }
@@ -1037,6 +1051,35 @@ impl AppClient {
         events: &[cgka_traits::engine::GroupEvent],
         recorded_at: u64,
     ) -> Vec<crate::AppProjectionUpdate> {
+        let mut updates = Vec::new();
+        if self
+            .project_group_system_rows_into(events, recorded_at, &mut updates, false)
+            .is_err()
+        {
+            tracing::warn!(target: "marmot_app::groups",
+                error_code = "projection_apply_failed", "failed to project group system row");
+        }
+        updates
+    }
+
+    /// Project an entire committed batch, retaining storage failures for retry.
+    pub(crate) fn try_project_group_system_rows(
+        &self,
+        events: &[cgka_traits::engine::GroupEvent],
+        recorded_at: u64,
+    ) -> Result<Vec<crate::AppProjectionUpdate>, AppError> {
+        let mut updates = Vec::new();
+        self.project_group_system_rows_into(events, recorded_at, &mut updates, true)?;
+        Ok(updates)
+    }
+
+    fn project_group_system_rows_into(
+        &self,
+        events: &[cgka_traits::engine::GroupEvent],
+        recorded_at: u64,
+        updates: &mut Vec<crate::AppProjectionUpdate>,
+        retry_projection_writes: bool,
+    ) -> Result<(), AppError> {
         // Last verdict wins, per commit. `true` = withdrawn, `false` = revalidated.
         let mut final_verdict: std::collections::HashMap<&[u8], bool> =
             std::collections::HashMap::new();
@@ -1061,7 +1104,6 @@ impl AppClient {
             .into_iter()
             .filter_map(|(commit_id, withdrawn)| withdrawn.then_some(commit_id))
             .collect();
-        let mut updates = Vec::new();
         for event in events {
             if let cgka_traits::engine::GroupEvent::GroupStateChanged {
                 group_id,
@@ -1106,18 +1148,13 @@ impl AppClient {
                     recorded_at,
                 ) {
                     Ok(update) => updates.push(update),
-                    Err(_err) => {
-                        tracing::warn!(
-                            target: "marmot_app::groups",
-                            method = "project_group_system_rows",
-                            error_code = "projection_apply_failed",
-                            "failed to project group system row",
-                        );
-                    }
+                    Err(error) if retry_projection_writes => return Err(error),
+                    Err(_) => tracing::warn!(target: "marmot_app::groups",
+                        error_code = "projection_apply_failed", "failed to project group system row"),
                 }
             }
         }
-        updates
+        Ok(())
     }
 
     pub(crate) fn nostr_routing_for_group(

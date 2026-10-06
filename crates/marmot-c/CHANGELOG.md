@@ -50,27 +50,13 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 - Account onboarding can establish inbox-list absence from a completed read of
   freshly discovered outboxes even when a discovery indexer is unavailable.
 
-- Group-activity reaction targets retain each accepted commit's authenticated
-  actor, source-state delta and fork-withdrawal origin. Authors and recipients
-  use the same activity derivation. Account membership rows describe first-leaf
-  arrival and last-leaf departure; sibling-only changes create no misleading
-  account invitation or departure. Display-component decoding no longer blocks
-  otherwise valid legacy MLS evolution. Valid profile repairs retain rename
-  activity with an unknown previous name; unreadable resulting components
-  produce no invented display values.
-  Device-local termination/restoration effects drive participation and pending-send
-  cleanup independently of timeline activity. Push cleanup follows actual leaf
-  transitions, preserves surviving destinations and clears tombstones only for
-  departed accounts. Restoration preserves archive choices and outstanding leave
-  intent; reopen repairs terminal projections from durable removal markers.
-  Manual convergence retries observe the same native effects as scheduled
-  convergence, including reportless membership changes and leaf-token cleanup.
-  Group commands and maintenance also observe native membership decisions
-  produced while settling retained commits.
-  The event surface adds `LocalGroupCopyTerminated`, `LocalGroupCopyRestored`,
-  and `GroupMemberLeavesRemoved`; update exhaustive host event handling and
-  consume matching newly generated bindings/headers and native libraries.
-  Existing C event discriminants and system-row ID formulas are unchanged.
+- Group activity preserves per-commit reaction targets across author and peer
+  replay, including before disband. The C event surface appends local-copy
+  termination/restoration and removed-device-leaf events; existing discriminants
+  remain unchanged. Recompile with the matching header and native library and
+  handle the new event kinds. Restoration describes native retained-history
+  repair, not automatic scheduler restoration of removed copies. See
+  `marmot-app`'s Unreleased fixes for projection and push-token behavior.
 
 ## [0.12.0] - 2026-10-02
 

@@ -1607,6 +1607,7 @@ impl<S: StorageProvider> Engine<S> {
                     group_id,
                     &result.accepted_commits,
                     origin_commit_id.as_ref(),
+                    &group_changes,
                 )
                 .map_err(|error| OpenMlsProjectionError::Storage(error.to_string()))?;
             if !terminalized {
@@ -1626,6 +1627,7 @@ impl<S: StorageProvider> Engine<S> {
                 group_id,
                 &result.accepted_commits,
                 origin_commit_id.as_ref(),
+                &group_changes,
             )
             .map_err(|error| OpenMlsProjectionError::Storage(error.to_string()))?
         };
@@ -1674,6 +1676,29 @@ impl<S: StorageProvider> Engine<S> {
         Ok(result)
     }
 
+    /// Emit immutable commit deltas without reading live MLS state, including
+    /// earlier commits in a pass whose closing commit deleted that state.
+    pub(super) fn emit_applied_group_changes<'a>(
+        &mut self,
+        group_id: &GroupId,
+        group_changes: impl IntoIterator<Item = &'a AppliedGroupChanges>,
+    ) {
+        // Each accepted replayed commit retains its own source-state delta.
+        // A net previous-tip -> final-tip diff loses intermediate changes and
+        // cannot supply either a shared target id or a fork-withdrawal link.
+        for commit in group_changes {
+            for (actor, change) in &commit.changes {
+                self.push_group_state_change(
+                    group_id,
+                    commit.resulting_epoch,
+                    Some(actor.clone()),
+                    change.clone(),
+                    Some(commit.commit_id.clone()),
+                );
+            }
+        }
+    }
+
     /// Emit authenticated per-commit activity and reconcile local removal state.
     /// Roster repairs change membership/send eligibility without fabricating invitations.
     fn emit_convergence_events(
@@ -1692,20 +1717,7 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
 
-        // Each accepted replayed commit retains its own source-state delta.
-        // A net previous-tip -> final-tip diff loses intermediate changes and
-        // cannot supply either a shared target id or a fork-withdrawal link.
-        for commit in group_changes {
-            for (actor, change) in &commit.changes {
-                self.push_group_state_change(
-                    group_id,
-                    commit.resulting_epoch,
-                    Some(actor.clone()),
-                    change.clone(),
-                    Some(commit.commit_id.clone()),
-                );
-            }
-        }
+        self.emit_applied_group_changes(group_id, group_changes);
         self.emit_canonical_membership_effects(group_id, previous_membership)
             .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?;
         if self
