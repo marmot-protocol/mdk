@@ -37,8 +37,9 @@ For task titles and progress reactions, use the shared
 [recommended chat setup](../../README.md#recommended-chat-setup), including
 admin promotion and the phone acceptance test. Agent policy is in
 [the integration instructions](../../AGENTS.md#suggested-agent-chat-instructions).
-The message tool supplies reactions; automated group titles need a configured
-local helper because this plugin does not register a rename action.
+The registered `marmot_group_profile` tool updates the group name/description
+when the account is an admin; the normal message tool supplies reactions.
+Verify both tools in the installed release. See [Admin group profile tool](#admin-group-profile-tool).
 
 - **Use your configured OpenClaw agent from White Noise.** Authorized prompts
   reach the gateway's model/tools and replies return to that conversation.

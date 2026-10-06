@@ -24,9 +24,12 @@ storage, QUIC previews, or backend-specific CLI semantics.
 ## First installation and verification
 
 For admin promotion, task titles and progress reactions, see the
-[recommended chat setup](../README.md#recommended-chat-setup). The shared harness
-does not register these tools or install that suggested instruction block;
-verify a trusted backend-accessible helper before promising those features.
+[recommended chat setup](../README.md#recommended-chat-setup). Every ordinary turn
+provides the shared `wn-agent group-profile` route for admin name/description
+updates. Verify the installed command, backend PATH and authorized socket access;
+see [Admin group profile updates](#admin-group-profile-updates). Progress reactions
+need a separately configured tool. The suggested instruction block is not
+installed automatically.
 
 Use the [checksum-verified quickstart](../README.md#get-started-white-noise--agents)
 for the selected runtime. Claude Code, Codex, OpenCode and Pi share this setup

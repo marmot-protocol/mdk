@@ -312,21 +312,20 @@ configuration and the acceptance check below.
   `marmot_reaction` adds/removes a message reaction. The optional presence
   policy and model-issued reactions need one consistent owner so they do not
   compete. See [the Hermes guide](hermes/marmot/README.md#what-you-can-do).
-- **OpenClaw:** the normal `message` tool supports `react` with an emoji,
-  target message id and chat target; `remove: true` removes it. There is no
-  registered Marmot group-rename action today. Admin status alone does not add
-  that action. Title management requires a separately configured, trusted local
-  `group_profile_update` tool/helper.
-- **Claude Code, Codex, OpenCode and Pi:** shared harness commands handle chat
-  sessions, workdirs and goals; they do not register title or reaction tools.
-  A deployment may expose a trusted local helper to the backend using
-  `group_info`, `group_profile_update`, `send_reaction` and `remove_reaction`
-  from the [agent-control protocol](../crates/agent-control/README.md).
-  Bind it to the selected connector account and actual chat, with access only
-  through the authorized local socket. Do not guess a chat from its display
-  name, copy control secrets into prompts, or start a second daemon/CLI writer
-  against the same account home. Without that helper, ordinary replies work
-  but automated titles/reactions remain unavailable.
+- **OpenClaw:** `marmot_group_profile` updates the group name or description
+  when the account is an admin. The normal `message` tool supports `react` with
+  an emoji, target message id and chat target; `remove: true` removes it.
+- **Claude Code, Codex, OpenCode and Pi:** each ordinary turn supplies the
+  shared `wn-agent group-profile` route for admin name/description updates.
+  The backend needs `wn-agent` on its PATH and shell/sandbox permission to reach
+  the selected connector's local socket. See the
+  [admin profile guide](terminal-harness/README.md#admin-group-profile-updates).
+  Harnesses do not provide a built-in reaction tool. A deployment that needs
+  progress reactions must separately configure and verify that capability.
+  Bind every operation to the actual conversation and connector account; never
+  guess a chat from its name, put control secrets in prompts, or start a second
+  writer against the same account home. Verify the installed release exposes
+  the documented command/tool before promising title updates.
 
 ### Acceptance check on the phone
 
@@ -337,7 +336,7 @@ configuration and the acceptance check below.
 3. If title/reaction tools are configured, verify a meaningful task title and
    a 👀 → ✅ transition on the request, without a duplicate emoji message. Make
    a new request to verify session continuity; a status question should keep
-   the task title. Never mark a missing helper or rejected admin change as passed.
+   the task title. Never mark an unavailable command/tool or rejected admin change as passed.
 4. Test one required file type and generated-file return if supported. Check
    [the capability guide](#connector-capabilities) before choosing the test.
 5. Report which runtime/profile, connector identity, services and chat were
@@ -354,11 +353,11 @@ Choose by the features you need:
 | Connector | Conversation and controls | Files |
 | --- | --- | --- |
 | [Hermes](hermes/marmot/README.md#what-you-can-do) | DM/group activation; history, quotes, reactions, own-message deletion, admin group profile updates; optional live previews/presence/approval reactions | Inbound media; image/document/video/voice sends with approved-root staging |
-| [OpenClaw](openclaw/marmot/README.md#what-you-can-do) | Gateway routing; DM/group activation; history, quotes, quiet changes, own-message deletion, reactions, consent-based public profile naming; current inbound turns are final-only | Host-authorized inbound/outbound media via normal message tool |
-| [Claude Code](claude/marmot/README.md#what-you-can-do) | Per-chat session/project/goal; shared chat and recovery commands; text replies | Text-only; no attachments or generated-file return |
-| [Codex](codex/marmot/README.md#what-you-can-do) | Per-chat thread/project/goal; shared chat and recovery commands; completed text replies | Native images and supported staged files; opt-in generated-file return with exact grants |
-| [OpenCode](opencode/marmot/README.md#what-you-can-do) | Per-chat session/project/goal; shared chat and recovery commands; text-event replies | Supported images/PDFs/text; no generated-file return |
-| [Pi](pi/marmot/README.md#what-you-can-do) | Per-chat session/project/goal; shared chat and recovery commands; completed text replies | Supported images/text; no generated-file return |
+| [OpenClaw](openclaw/marmot/README.md#what-you-can-do) | Gateway routing; DM/group activation; history, quotes, quiet changes, own-message deletion, reactions, admin group profile updates, consent-based public profile naming; current inbound turns are final-only | Host-authorized inbound/outbound media via normal message tool |
+| [Claude Code](claude/marmot/README.md#what-you-can-do) | Per-chat session/project/goal; shared chat and recovery commands; admin group profile updates; text replies | Text-only; no attachments or generated-file return |
+| [Codex](codex/marmot/README.md#what-you-can-do) | Per-chat thread/project/goal; shared chat and recovery commands; admin group profile updates; completed text replies | Native images and supported staged files; opt-in generated-file return with exact grants |
+| [OpenCode](opencode/marmot/README.md#what-you-can-do) | Per-chat session/project/goal; shared chat and recovery commands; admin group profile updates; text-event replies | Supported images/PDFs/text; no generated-file return |
+| [Pi](pi/marmot/README.md#what-you-can-do) | Per-chat session/project/goal; shared chat and recovery commands; admin group profile updates; completed text replies | Supported images/text; no generated-file return |
 
 For terminal harnesses, start with `/cd src/my-project`, send an ordinary request,
 then use `/status`, `/goal <instruction>` or `/new` as needed. The complete

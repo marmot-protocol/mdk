@@ -26,9 +26,11 @@ For task titles and progress reactions, use the shared
 [recommended chat setup](../../README.md#recommended-chat-setup), including
 admin promotion and the phone acceptance test. Agent policy is in
 [the integration instructions](../../AGENTS.md#suggested-agent-chat-instructions).
-This harness does not register title/reaction tools. For that experience,
-configure and verify a trusted helper available to the backend; admin promotion
-or a `/goal` instruction alone is insufficient.
+Each ordinary turn exposes the shared `wn-agent group-profile` route for
+admin name/description updates. Verify that the installed release includes it,
+`wn-agent` is on the backend's PATH, and the backend's shell/sandbox policy permits
+access to the connector socket. See [Admin group profile updates](#admin-group-profile-updates).
+Progress reactions require a separately configured tool; the harness has none built in.
 
 - **Work through Pi from your phone.** Send a prompt from an authorized
   White Noise account and use the backend's configured model and tools.
@@ -44,7 +46,7 @@ commands share the [terminal-harness command guide](../../terminal-harness/READM
 
 Tool access, credentials and model choices come from the backend's native
 configuration and the [execution profile](../../terminal-harness/README.md#execution-profiles).
-The harness does not implement mention activation, reaction/profile management
+The harness does not implement mention activation, reaction tools
 or live previews. An interactive backend's slash commands are not automatically
 available through this chat; shared harness commands are handled locally.
 
