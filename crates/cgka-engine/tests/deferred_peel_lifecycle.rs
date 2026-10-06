@@ -1644,6 +1644,74 @@ async fn deferred_peel_retries_after_epoch_advance() {
     );
 }
 
+/// A sweep retry that still cannot peel restamps the row at the new epoch;
+/// that rewrite must not reach the forensic trail as a
+/// `peel_deferred -> peel_deferred` transition. Every stuck row would
+/// otherwise log one such row per epoch advance.
+#[tokio::test]
+async fn deferred_peel_redeferral_records_no_self_transition() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let audit_path = dir.path().join("audit.jsonl");
+    let recorder = marmot_forensics::JsonlRecorder::open(&audit_path, "carol".into()).unwrap();
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let peeler = CountingEpochGatePeeler::new();
+    let mut carol = EngineBuilder::new(storage.clone())
+        .legacy_compatibility_profile()
+        .identity(pad32(b"carol"))
+        .account_identity_proof_signer(proof_signer(b"carol"))
+        .peeler(Box::new(peeler.clone()))
+        .recorder(Box::new(recorder))
+        .build()
+        .unwrap();
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
+    let (mut alice, mut carol, carol_storage, carol_peeler, group_id, commit2, _commit3) =
+        carol_behind_two_epochs_with((carol, storage, peeler)).await;
+
+    // Epoch-3 content stays unpeelable while carol never sees commit3.
+    let stuck_app = send_app(&mut alice, &group_id, "forever ahead").await;
+    assert!(matches!(
+        carol.ingest(stuck_app.clone()).await.unwrap(),
+        IngestOutcome::TransportDeferred { .. }
+    ));
+    let attempts_before = carol_peeler.attempts_for(&stuck_app.id);
+
+    // commit2 advances carol to epoch 2; the sweep re-defers the row there.
+    carol.ingest(commit2).await.unwrap();
+    carol
+        .converge_and_drain_queued_outbound_intents(&group_id, 1_000_000)
+        .await
+        .unwrap();
+    assert!(carol_peeler.attempts_for(&stuck_app.id) > attempts_before);
+    let record = carol_storage.get_message(&stuck_app.id).unwrap();
+    assert_eq!(record.state, MessageState::PeelDeferred);
+    assert_eq!(record.epoch, EpochId(2), "the retry restamped the row");
+
+    drop(carol);
+    let stuck_hex = hex::encode(stuck_app.id.as_slice());
+    let self_transitions = std::fs::read_to_string(&audit_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<marmot_forensics::AuditEvent>(line).unwrap())
+        .filter(|event| {
+            matches!(
+                &event.kind,
+                marmot_forensics::AuditEventKind::MessageStateChanged {
+                    msg_id,
+                    previous_state: Some(previous),
+                    new_state,
+                    ..
+                } if *msg_id == stuck_hex && previous == new_state
+            )
+        })
+        .count();
+    assert_eq!(self_transitions, 0);
+}
+
 /// A row that exhausts its retry budget is resource-refused and released
 /// without poisoning same-id redelivery as a terminal duplicate.
 #[tokio::test]

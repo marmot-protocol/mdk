@@ -24,6 +24,11 @@
     presentation. Do not log or include it in diagnostic reports. Localize the
     typed variants rather than parsing their display text. Non-invitation
     directory APIs retain their existing error behavior.
+- Attachment history adds `AttachmentRoleFfi` and the required, defaultless
+  `AttachmentEntryFfi.role` field. Regenerate Swift/Kotlin bindings with the
+  matching native library and update host record constructors and fixtures.
+  Gallery clients can exclude `InlineEmoji`; preserve slots and continue paging
+  after filtered pages as described in [the handoff](ATTACHMENT-HISTORY.md).
 
 ### Added
 

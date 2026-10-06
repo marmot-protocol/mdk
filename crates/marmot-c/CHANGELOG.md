@@ -18,6 +18,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   Existing record layouts are unchanged; the new symbols require matching
   generated headers and native libraries.
 
+### Changed
+
+- `MarmotAttachmentEntry` adds `role: MarmotAttachmentRole` (`Shared` or
+  `InlineEmoji`) for gallery filtering without changing slot or acquisition identity.
+  This changes the record layout; rebuild clients with the matching header/library.
+
 ## [0.12.0] - 2026-10-02
 
 Recompile against the matching `marmot.h` and library: several signatures and

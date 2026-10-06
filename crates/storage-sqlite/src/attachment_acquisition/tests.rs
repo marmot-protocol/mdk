@@ -42,9 +42,11 @@ fn source(message: &str) -> StoredAppEvent {
         moderation_grant: false,
     }
 }
+/// Build the acquisition descriptor without gallery-only source metadata.
 fn selected(message: &str) -> crate::AttachmentHistoryEntry {
     let event = source(message);
     crate::AttachmentHistoryEntry {
+        emoji_tags: Vec::new(),
         message_id_hex: message.into(),
         attachment_index: 0,
         source_message_id_hex: event.source_message_id_hex.unwrap(),
