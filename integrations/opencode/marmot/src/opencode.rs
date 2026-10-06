@@ -3,8 +3,8 @@ use std::path::Path;
 use async_trait::async_trait;
 use marmot_terminal_harness::{
     ApprovalSupport, Attachment, Backend, ExecutionProfile, ExecutionSupport, HarnessError,
-    Invocation, IsolationSupport, Outcome, ParsedEvent, PromptTransport, Result, RunFailure,
-    RunnerEvent,
+    Invocation, IsolationSupport, ModelSelection, Outcome, ParsedEvent, PromptTransport, Result,
+    RunFailure, RunnerEvent,
     attachment_preflight::{is_utf8_text, revalidate},
     process::{EnvironmentChange, ProcessSpec, run_jsonl_process},
 };
@@ -15,10 +15,33 @@ use tokio::sync::mpsc;
 pub(crate) struct OpencodeBackend {
     pub(crate) bin: String,
     pub(crate) execution_profile: ExecutionProfile,
+    pub(crate) models: ModelSelection,
 }
 
 #[async_trait]
 impl Backend for OpencodeBackend {
+    fn model_selection(&self) -> Option<&ModelSelection> {
+        Some(&self.models)
+    }
+
+    async fn run_with_model(
+        &self,
+        invocation: Invocation,
+        attachments: Vec<Attachment>,
+        model: Option<String>,
+        tx: mpsc::Sender<RunnerEvent>,
+    ) -> std::result::Result<Outcome, RunFailure> {
+        run_with_bin_and_model(
+            &self.bin,
+            self.execution_profile,
+            invocation,
+            &attachments,
+            model.as_deref(),
+            tx,
+        )
+        .await
+    }
+
     fn execution_support(&self) -> ExecutionSupport {
         ExecutionSupport {
             approvals: match self.execution_profile {
@@ -99,6 +122,17 @@ async fn run_with_bin(
     attachments: &[Attachment],
     tx: mpsc::Sender<RunnerEvent>,
 ) -> std::result::Result<Outcome, RunFailure> {
+    run_with_bin_and_model(bin, execution_profile, invocation, attachments, None, tx).await
+}
+
+async fn run_with_bin_and_model(
+    bin: &str,
+    execution_profile: ExecutionProfile,
+    invocation: Invocation,
+    attachments: &[Attachment],
+    model: Option<&str>,
+    tx: mpsc::Sender<RunnerEvent>,
+) -> std::result::Result<Outcome, RunFailure> {
     let Invocation {
         timeout,
         idle_timeout,
@@ -125,7 +159,7 @@ async fn run_with_bin(
     run_jsonl_process(
         ProcessSpec {
             executable: bin.to_owned(),
-            args: build_run_args(session_id.as_deref(), execution_profile, &files),
+            args: build_model_run_args(session_id.as_deref(), execution_profile, &files, model),
             cwd,
             environment,
             prompt: PromptTransport::Stdin(prompt),
@@ -142,10 +176,20 @@ async fn run_with_bin(
 
 /// Builds `opencode run` argv. Staged files follow every option as repeated `--file <path>`
 /// pairs, then `--` ends option parsing; the prompt itself is written to stdin.
+#[cfg(test)]
 fn build_run_args(
     session_id: Option<&str>,
     execution_profile: ExecutionProfile,
     files: &[String],
+) -> Vec<String> {
+    build_model_run_args(session_id, execution_profile, files, None)
+}
+
+fn build_model_run_args(
+    session_id: Option<&str>,
+    execution_profile: ExecutionProfile,
+    files: &[String],
+    model: Option<&str>,
 ) -> Vec<String> {
     let mut args = vec!["run".to_owned(), "--format".to_owned(), "json".to_owned()];
     if matches!(
@@ -159,6 +203,11 @@ fn build_run_args(
     {
         args.push("--session".to_owned());
         args.push(session_id.to_owned());
+    }
+    // All options, including model, must precede attachment operands and `--`.
+    if let Some(model) = model {
+        args.push("--model".to_owned());
+        args.push(model.to_owned());
     }
     if !files.is_empty() {
         for file in files {
@@ -333,6 +382,36 @@ mod tests {
         assert_eq!(
             build_run_args(Some("ses_123"), ExecutionProfile::Inherit, &[]),
             vec!["run", "--format", "json", "--session", "ses_123"]
+        );
+    }
+
+    #[test]
+    fn model_selection_preserves_session_and_ordered_file_arguments() {
+        assert_eq!(
+            build_model_run_args(
+                Some("ses_existing"),
+                ExecutionProfile::Autonomous,
+                &[
+                    "/private/first.txt".to_owned(),
+                    "/private/second.png".to_owned()
+                ],
+                Some("venice/deepseek-v4-1-flash")
+            ),
+            vec![
+                "run",
+                "--format",
+                "json",
+                "--auto",
+                "--session",
+                "ses_existing",
+                "--model",
+                "venice/deepseek-v4-1-flash",
+                "--file",
+                "/private/first.txt",
+                "--file",
+                "/private/second.png",
+                "--"
+            ]
         );
     }
 

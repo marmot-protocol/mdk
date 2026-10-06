@@ -146,6 +146,7 @@ never reaches the backend:
 | `/help` | List these commands. |
 | `/status` | Report backend name, workdir, session state, execution profile, and goal. |
 | `/pwd` | Report the selected working directory as a `$HOME`-relative path. |
+| `/model [alias\|provider/model#variant\|default]` | Show or change this chat's model without resetting its session. OpenCode only; see its [model configuration](../opencode/marmot/README.md#model-selection). |
 | `/cd <path>` | Select a working directory under `$HOME` and start a new session epoch. |
 | `/new` | End the active backend session and keep the workdir. |
 | `/reset-session` | Same as `/new`. |

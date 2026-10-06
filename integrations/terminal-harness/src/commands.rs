@@ -13,7 +13,9 @@ pub(crate) enum ChatCommand {
     /// Report this lane's working directory.
     Pwd,
     /// Select a working directory and start a new session epoch.
-    Cd { path: String },
+    Cd {
+        path: String,
+    },
     /// End the active backend session while retaining the workdir.
     NewSession,
     /// Retry the durable recovery record owned by PR #1568.
@@ -25,7 +27,15 @@ pub(crate) enum ChatCommand {
     /// Remove the stored standing goal.
     GoalClear,
     /// Replace the stored standing goal.
-    GoalSet { text: String },
+    GoalSet {
+        text: String,
+    },
+    /// Report or change this chat's backend model without resetting its session.
+    ModelShow,
+    ModelDefault,
+    ModelSet {
+        value: String,
+    },
 }
 
 /// How one inbound message body is routed before backend invocation.
@@ -46,6 +56,10 @@ const RESERVED: &[(&str, &str)] = &[
     ("help", "list these commands"),
     ("status", "show this chat's workdir, session, and goal"),
     ("pwd", "show this chat's working directory"),
+    (
+        "model",
+        "`/model` shows selection and aliases; `/model <alias|provider/model#variant>` sets it; `/model default` inherits the default (supported backends only)",
+    ),
     (
         "cd",
         "`/cd <path>` selects a working directory under $HOME and starts a new session",
@@ -129,6 +143,7 @@ pub(crate) fn route(text: &str) -> Routed {
         ),
         "cd" => route_cd(args),
         "goal" => route_goal(args),
+        "model" => route_model(args),
         _ => Routed::Prompt(text.to_owned()),
     }
 }
@@ -158,6 +173,25 @@ fn route_goal(args: &str) -> Routed {
     }
     Routed::Command(ChatCommand::GoalSet {
         text: text.to_owned(),
+    })
+}
+
+fn route_model(args: &str) -> Routed {
+    let value = args.trim();
+    if value.is_empty() {
+        return Routed::Command(ChatCommand::ModelShow);
+    }
+    if value == "default" {
+        return Routed::Command(ChatCommand::ModelDefault);
+    }
+    if value.len() > 512
+        || value.split_whitespace().count() != 1
+        || value.chars().any(char::is_control)
+    {
+        return Routed::Usage("Use `/model <alias|provider/model#variant>` or `/model default`.");
+    }
+    Routed::Command(ChatCommand::ModelSet {
+        value: value.to_owned(),
     })
 }
 
@@ -308,6 +342,30 @@ mod tests {
             Routed::Command(ChatCommand::GoalSet {
                 text: "ship the connector".to_owned()
             })
+        );
+    }
+
+    #[test]
+    fn model_commands_never_fall_through_to_workdir_selection() {
+        assert_eq!(route("/model"), Routed::Command(ChatCommand::ModelShow));
+        assert_eq!(
+            route("/model default"),
+            Routed::Command(ChatCommand::ModelDefault)
+        );
+        assert_eq!(
+            route("/model deepseek"),
+            Routed::Command(ChatCommand::ModelSet {
+                value: "deepseek".to_owned()
+            })
+        );
+        assert!(matches!(route("/model deepseek extra"), Routed::Usage(_)));
+        assert!(matches!(
+            route("/model venice/model\u{0}"),
+            Routed::Usage(_)
+        ));
+        assert_eq!(
+            route("//model deepseek"),
+            Routed::Literal("/model deepseek".to_owned())
         );
     }
 

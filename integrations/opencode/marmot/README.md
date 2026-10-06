@@ -130,6 +130,8 @@ Configure with environment variables:
 | `WN_OPENCODE_ADMIN_HEX` | unset | Legacy alias for `WN_OPENCODE_ALLOWED_SENDERS_HEX` |
 | `WN_OPENCODE_ACCOUNT_ID_HEX` | sole local account | Specific `wn-agent` account to use; required when several local-signing accounts exist |
 | `WN_OPENCODE_BIN` | `opencode` | OpenCode binary or executable path |
+| `WN_OPENCODE_MODEL` | unset | Optional default `provider/model#variant`, passed via `--model` |
+| `WN_OPENCODE_MODEL_ALIASES_JSON` | `{}` | JSON object mapping chat aliases to qualified model ids |
 | `MARMOT_HARNESS_EXECUTION_PROFILE` | `inherit` | Shared `inherit`, `autonomous`, or `unrestricted` execution policy |
 | `WN_OPENCODE_IDLE_TIMEOUT_SECS` | `120` | Presentation-idle interval before liveness is reported as unknown; does not stop the invocation |
 | `WN_OPENCODE_TIMEOUT_SECS` | `3600` | Total invocation policy limit; ongoing output does not reset it |
@@ -181,6 +183,44 @@ canonicalization. Picker-looking messages with invalid segments are rejected
 and are not forwarded to OpenCode as prompts.
 
 ## Chat Commands
+
+### Model selection
+
+`/model` shows this chat's selection and the operator-configured aliases.
+`/model <alias|provider/model#variant>` selects the model for subsequent prompts;
+`/model default` removes the chat override. The existing OpenCode session is
+retained, including when switching providers. `/new` and `/cd` retain the model
+selection. It is stored privately per Marmot group and survives harness restarts.
+An unknown alias or malformed id leaves the current selection unchanged.
+
+Configure aliases in the harness environment (not OpenCode's config):
+
+```sh
+export WN_OPENCODE_MODEL_ALIASES_JSON='{"deepseek":"venice/deepseek-v4-1-flash","sol":"venice/openai-gpt-61-sol"}'
+# Optional connector-wide default; otherwise OpenCode resolves its own default.
+export WN_OPENCODE_MODEL='venice/deepseek-v4-1-flash'
+```
+
+Then `/model deepseek` resolves to `venice/deepseek-v4-1-flash`. Models and
+credentials must already be available to OpenCode. The harness validates syntax,
+not the provider catalogue or model capabilities; an unavailable model fails the
+turn rather than silently selecting another. With no explicit connector default
+and no chat override, the harness omits `--model` and leaves default/resumed-model
+resolution to OpenCode. `/model default` does not force a resumed OpenCode session
+to forget its own last model. To force a specific model, select it explicitly.
+
+For installed services, set these values in the service environment as well as
+the private `dev/wn-opencode.env` used for manual runs, then reload/restart the
+harness. The installer currently materializes macOS environment values directly
+in the LaunchAgent plist; it does not source the env file. On Linux, use a systemd
+user-unit drop-in. Re-running the release installer can replace its generated
+files, so preserve your additions when upgrading.
+
+**Compatibility:** `/model` is now reserved across terminal harnesses. Select a
+directory named `model` with `/cd model`, or use `//model` for literal prompt text.
+Only OpenCode opts into model selection; other backends return an unavailable reply.
+Model-changing commands use the existing per-group FIFO and wait behind active
+turns or recovery barriers. `/model` inspection remains available during recovery.
 
 `opencode run` does not expand OpenCode's interactive slash commands. The shared
 harness answers its own reserved commands before OpenCode is invoked; send
