@@ -40,6 +40,9 @@
 
 ### Fixed
 
+- Android binding preflight consumes the complete installed-target list,
+  preventing false missing-target failures from an early pipe exit.
+
 - Group-activity reaction targets retain each accepted commit's authenticated
   actor, source-state delta and fork-withdrawal origin. Authors and recipients
   use the same activity derivation. Account membership rows describe first-leaf

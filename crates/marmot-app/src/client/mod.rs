@@ -1197,11 +1197,13 @@ impl AppClient {
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<crate::MaintenanceRunSummary, AppError> {
-        self.observe_recovery_evidence(effects);
+        // Observe once before fallible summary reads, then dispatch native facts
+        // even when those reads fail. Re-observing would double-count recovery.
+        let summary = self.observe_recovery_evidence_then_summarize_maintenance(effects);
         let result = self
             .observe_native_membership_effects(effects)
             .await
-            .and_then(|()| self.observe_recovery_evidence_then_summarize_maintenance(effects));
+            .and(summary);
         self.recover_superseded_invites_best_effort().await;
         result
     }

@@ -497,3 +497,41 @@ async fn termination_then_restoration_preserves_failed_sends_and_archive() {
         );
     }
 }
+
+/// The maintenance boundary observes each native recovery transition once,
+/// even though summary construction and membership projection are separate.
+#[cfg(feature = "product-analytics-export")]
+#[tokio::test]
+async fn maintenance_counts_one_recovery_transition() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let mut app = app_at(&dir, Arc::new(ScriptedPushRelayClient::default()));
+    app.product_analytics = crate::product_analytics::test_product_collector();
+    let runtime = app.runtime();
+    runtime.set_usage_diagnostics_consent(true).unwrap();
+    let mut client = app.client("alice").await.unwrap();
+    let group = client
+        .create_group("maintenance observation", &[])
+        .await
+        .unwrap();
+    let effects = marmot_account::AccountDeviceEffects {
+        events: vec![GroupEvent::PendingCommitRecovered {
+            group_id: group,
+            recovered_epoch: cgka_traits::EpochId(1),
+        }],
+        ..Default::default()
+    };
+    client.finish_maintenance_effects(&effects).await.unwrap();
+    let payloads = app.product_analytics.test_payloads();
+    let transitions: Vec<_> = payloads
+        .iter()
+        .filter(|event| {
+            event["eventName"] == "mdk_recovery_summary"
+                && event["props"]["operation"] == "pending_commit"
+        })
+        .collect();
+    assert_eq!(transitions.len(), 1);
+    assert_eq!(transitions[0]["props"]["count_bucket"], "1");
+}

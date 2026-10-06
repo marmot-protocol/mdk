@@ -591,8 +591,13 @@ class ReleaseProfileTests(unittest.TestCase):
         (crate / "kotlin-support/io/crates/keyring").mkdir(parents=True)
         write_executable(
             bin_dir / "rustup",
-            "#!/bin/sh\nprintf '%s\\n' aarch64-linux-android armv7-linux-androideabi "
-            "i686-linux-android x86_64-linux-android\n",
+            # More than a pipe buffer makes an early consumer exit fail the
+            # producer deterministically, rather than intermittently skipping
+            # the intended missing-Kotlin assertion under pipefail.
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "sys.stdout.write('aarch64-linux-android\\narmv7-linux-androideabi\\n"
+            "i686-linux-android\\nx86_64-linux-android\\n' + 'unused-target\\n' * 10000)\n",
         )
         write_executable(
             bin_dir / "cargo",
