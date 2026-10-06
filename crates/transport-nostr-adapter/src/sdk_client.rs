@@ -3083,7 +3083,11 @@ async fn event_for_publish_with_signer(
         .custom_created_at(NostrTimestamp::from_secs(event.created_at))
         .finalize_async(signer)
         .await
-        .map_err(|_| TransportAdapterError::Publish("sign event failed".to_owned()))
+        // Signer text can carry relay URLs or remote detail, and this Display
+        // reaches upper-layer logs.
+        .map_err(|_| {
+            TransportAdapterError::Publish(format!("sign event failed for kind {}", event.kind))
+        })
 }
 
 fn parse_endpoints(
