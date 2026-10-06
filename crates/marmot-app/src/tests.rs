@@ -1,8 +1,8 @@
 mod draft_lifecycle;
 mod group_lookup;
+mod invite_diagnostics;
 mod key_package_inventory;
 mod key_package_selection;
-mod invite_diagnostics;
 mod message_journeys;
 mod report_backfill;
 mod user_blocks;

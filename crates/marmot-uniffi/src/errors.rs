@@ -475,10 +475,12 @@ impl From<&AppError> for MarmotKitError {
             AppError::IdentityKeyMismatch => Self::InvalidIdentity {
                 details: "public identity does not match the imported private key".into(),
             },
-            AppError::ObsoleteKeyPackage(account) => Self::ObsoleteKeyPackage { account },
-            AppError::MemberDiscoveryIncomplete(account) => {
-                Self::MemberDiscoveryIncomplete { account }
-            }
+            AppError::ObsoleteKeyPackage(account) => Self::ObsoleteKeyPackage {
+                account: account.clone(),
+            },
+            AppError::MemberDiscoveryIncomplete(account) => Self::MemberDiscoveryIncomplete {
+                account: account.clone(),
+            },
             AppError::InvalidKeyPackageEvent(details) => Self::InvalidKeyPackageEvent {
                 details: details.clone(),
             },
