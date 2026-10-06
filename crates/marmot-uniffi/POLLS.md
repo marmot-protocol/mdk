@@ -7,9 +7,9 @@ application messages. Poll and vote data never become public relay-query metadat
 Use `createPoll` with a question, two through ten option labels, `singleChoice` or `multipleChoice`, and an optional Unix
 seconds deadline. MDK assigns stable option ids in display order (`"0"` through `"9"`). Questions are limited to 1024
 UTF-8 bytes, labels to 256 bytes, and deadlines to at most 30 days after creation. Empty, whitespace-padded, control, and
-bidirectional-override text is rejected. Poll creation follows MDK's canonical conversation classification: a named
-conversation is a group even with two members, while an unnamed two-member conversation is direct and cannot create
-a poll. An already-accepted open poll remains votable if the conversation is later classified as direct.
+bidirectional-override text is rejected. Polls can be created and voted in direct and group conversations, using the
+same membership, application-message admission, payload validation and retention rules as other messages.
+Changing a conversation's name or membership classification does not disable an existing open poll.
 
 Use `castPollVote` with the poll event id and the complete selected option-id list. It is a replacement, not a delta:
 send one id for single choice and one through ten unique ids for multiple choice. The poll must already be a valid local

@@ -21,6 +21,8 @@ pub struct AttachmentHistoryEntry {
     pub received_at: u64,
     /// The original imeta array, or a malformed value. A corrupt container is null.
     pub slot: serde_json::Value,
+    /// Only emoji tag arrays from this source message; never the message body or album.
+    pub emoji_tags: Vec<Vec<String>>,
 }
 
 /// Opaque account/group version. Compare for equality, never interpret as a count.
@@ -115,13 +117,21 @@ fn nonnegative(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
     u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
 }
 
+/// Seek the slot index and point-read only emoji metadata for the bounded result rows.
 fn page_sql(cursor: bool) -> String {
     let seek = if cursor {
         format!(" AND ({KEY_COLUMNS}) < (?3,?4,?5,?6,?7,?8)")
     } else {
         String::new()
     };
-    format!("SELECT {KEY_COLUMNS},attachment_index,source_message_id_hex,source_epoch,sender,timeline_at,received_at,slot_json
+    format!("SELECT {KEY_COLUMNS},attachment_index,source_message_id_hex,source_epoch,sender,timeline_at,received_at,slot_json,
+        (SELECT json_group_array(json(e.value)) FROM message_timeline t,
+            json_each(CASE WHEN json_valid(t.tags_json) THEN
+                CASE WHEN json_type(t.tags_json)='array' THEN t.tags_json ELSE '[]' END
+                ELSE '[]' END) e
+         WHERE t.group_id_hex=attachment_history.group_id_hex
+           AND t.message_id_hex=attachment_history.message_id_hex
+           AND CASE WHEN e.type='array' THEN json_extract(e.value,'$[0]')='emoji' ELSE 0 END)
         FROM attachment_history INDEXED BY idx_attachment_history_page
         WHERE group_id_hex=?1 AND visible=1{seek}
         ORDER BY order_class DESC,order_primary DESC,order_phase DESC,order_at DESC,message_id_hex DESC,attachment_order DESC
@@ -248,6 +258,13 @@ impl SqliteAccountStorage {
                         sender: r.get(9)?,
                         timeline_at: nonnegative(r, 10)?,
                         received_at: nonnegative(r, 11)?,
+                        emoji_tags: serde_json::from_str::<Vec<serde_json::Value>>(
+                            &r.get::<_, String>(13)?,
+                        )
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|tag| serde_json::from_value(tag).ok())
+                        .collect(),
                         slot: serde_json::from_str(&json).map_err(|_| {
                             rusqlite::Error::FromSqlConversionFailure(
                                 12,
