@@ -740,7 +740,9 @@ def main() -> int:
             accept_caution=args.accept_reviewed_local_plugin_caution,
         )
         if supports_subdirectories and "ref" in install_parameters:
-            identifier = f"file://{pinned_source}#integrations/hermes/marmot"
+            # The archive-backed scan checkout has a fixture-only commit id.
+            # Ref-capable hosts must fetch the requested id from the original Git source.
+            identifier = f"file://{mdk_source}#integrations/hermes/marmot"
             cmd_install(
                 identifier,
                 force=install_force,
