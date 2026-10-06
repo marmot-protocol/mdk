@@ -219,6 +219,10 @@ mod migration_0104_file_attachment_retention;
 mod migration_0105_file_attachment_partials;
 #[path = "migrations/0106_retained_attachment_chunks.rs"]
 mod migration_0106_retained_attachment_chunks;
+#[path = "migrations/0107_sonar_stickers.rs"]
+mod migration_0107_sonar_stickers;
+#[path = "migrations/0108_sticker_asset_history.rs"]
+mod migration_0108_sticker_asset_history;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -764,6 +768,16 @@ const MIGRATIONS: &[Migration] = &[
         version: 106,
         name: "0106_retained_attachment_chunks",
         apply: migration_0106_retained_attachment_chunks::apply,
+    },
+    Migration {
+        version: 107,
+        name: "0107_sonar_stickers",
+        apply: migration_0107_sonar_stickers::apply,
+    },
+    Migration {
+        version: 108,
+        name: "0108_sticker_asset_history",
+        apply: migration_0108_sticker_asset_history::apply,
     },
 ];
 
