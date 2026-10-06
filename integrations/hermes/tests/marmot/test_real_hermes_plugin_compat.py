@@ -28,6 +28,7 @@ class SourceInstallCapabilityTests(unittest.TestCase):
             def __init__(self, result):
                 self.scan_result = result
 
+        retained_scans = []
         for verdict, consent, expected in (
             ("safe", False, False), ("safe", True, False),
             ("caution", False, None), ("caution", True, True),
@@ -35,13 +36,14 @@ class SourceInstallCapabilityTests(unittest.TestCase):
         ):
             with self.subTest(verdict=verdict, consent=consent):
                 guard = types.ModuleType("tools.plugin_guard")
-                guard.scan_plugin = lambda *a, **kw: types.SimpleNamespace(
+                guard.scan_plugin = lambda *a, verdict=verdict, **kw: types.SimpleNamespace(
                     verdict=verdict, findings=[types.SimpleNamespace(pattern_id="python_subprocess")])
-                def scan(*a, force, **kw):
+                def scan(*a, force, guard=guard, **kw):
                     result = guard.scan_plugin()
-                    if result.verdict == "dangerous" or result.verdict == "caution" and not force:
+                    if result.verdict == "dangerous" or (result.verdict == "caution" and not force):
                         raise Blocked(result)
                     return result
+                retained_scans.append((verdict, guard.scan_plugin, scan))
                 command = types.SimpleNamespace(_scan_plugin_tree=scan, PluginScanBlocked=Blocked)
                 with mock.patch.dict(sys.modules, {"tools.plugin_guard": guard}):
                     if expected is None:
@@ -50,6 +52,15 @@ class SourceInstallCapabilityTests(unittest.TestCase):
                     else:
                         self.assertIs(PROBE._local_plugin_install_force(
                             command, Path("fixture"), accept_caution=consent), expected)
+
+        for expected_verdict, scan_plugin, scan in retained_scans:
+            with self.subTest(retained_verdict=expected_verdict):
+                self.assertEqual(scan_plugin().verdict, expected_verdict)
+                if expected_verdict == "dangerous":
+                    with self.assertRaises(Blocked):
+                        scan(force=True)
+                else:
+                    self.assertEqual(scan(force=True).verdict, expected_verdict)
 
     def test_scan_preflight_rejects_unknown_or_empty_caution_findings(self):
         class Blocked(Exception):
