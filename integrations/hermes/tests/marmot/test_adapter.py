@@ -4264,7 +4264,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         adapter._inbound_spool_wakeup.set()
         key = adapter._debounce_key(first)
         try:
-            await retry_checked.wait()
+            await asyncio.wait_for(retry_checked.wait(), timeout=60)
             # The real retry pass cannot claim either debounce-owned row.
             self.assertEqual(await adapter._inbound_spool_call(adapter._inbound_spool.due), [])
             self.assertEqual(adapter.events, [])
@@ -4272,10 +4272,10 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
             timer.cancel()
             await asyncio.gather(timer, return_exceptions=True)
             # Exercise the real coalescing/admission path once both sources
-            # are in the same live batch. The test-process watchdog bounds a
-            # stuck test; individual durable writes are not latency assertions.
+            # are in the same live batch; generous wait bounds catch a stuck
+            # fixture without imposing the old per-write latency assertion.
             await adapter._flush_debounced(key)
-            await adapter._inbound_queue.join()
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=60)
             self.assertEqual([message.text for message in adapter.events], ["first\nsecond"])
             self.assertEqual(
                 "unresolved",
@@ -8609,7 +8609,9 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
             record = await original_call(adapter._inbound_spool.get, event["message_id_hex"])
             self.assertEqual("pending", record.state)
             await adapter._try_admit_spooled(event["message_id_hex"], ignore_backoff=True)
-            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+            # Dispatch also claims the ambient SQLite journal and persists the
+            # spool outcome. Bound a hang, not contended runner disk latency.
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=5)
             self.assertEqual(["durable"], [message.text for message in adapter.events])
         finally:
             release.set()
@@ -8743,13 +8745,13 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         retry = asyncio.create_task(adapter._run_inbound_spool_retry_loop())
         try:
             adapter._inbound_spool_wakeup.set()
-            await failed_once.wait()
+            await asyncio.wait_for(failed_once.wait(), timeout=60)
             self.assertFalse(retry.done())
             adapter._inbound_spool_wakeup.set()
             # Exercise real storage without imposing a per-write latency SLA;
-            # the bounded test-process watchdog owns hangs, not a 5 s IO race.
-            await delivered.wait()
-            await adapter._inbound_queue.join()
+            # generous wait bounds catch a stuck fixture without a 5 s IO race.
+            await asyncio.wait_for(delivered.wait(), timeout=60)
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=60)
             self.assertEqual([item.text for item in adapter.events], ["durable"])
             self.assertEqual({}, adapter._debounce_release_pending)
             self.assertFalse(retry.done())
