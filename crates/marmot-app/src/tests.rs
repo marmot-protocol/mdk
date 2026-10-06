@@ -18163,15 +18163,30 @@ async fn invite_recovery_failure_preserves_committed_effects_and_results() {
             !storage.automatic_recovery_failed(&group_id).unwrap(),
             "committed health evidence must clear the warning"
         );
-        // Successful scheduled convergence persists the dirty projections;
-        // maintenance and failed convergence leave them queued for the worker.
-        if maintenance || failed_publish {
+        // Maintenance leaves the warning checkpoint queued for the worker.
+        // Both scheduled paths persist it; the failed-publish observer also
+        // buffers the committed join before preserving the primary error.
+        if maintenance {
             assert!(
                 client
                     .pending_group_projection_updates
                     .contains(&hex::encode(group_id.as_slice())),
                 "the warning projection must remain queued"
             );
+        } else {
+            assert!(
+                client.pending_group_projection_updates.is_empty(),
+                "scheduled convergence must checkpoint the cleared warning"
+            );
+            if failed_publish {
+                assert!(
+                    client
+                        .take_pending_applied_sync_summary()
+                        .joined_groups
+                        .contains(&group_id),
+                    "the committed join must reach subscribers despite the publish error"
+                );
+            }
         }
     }
 }

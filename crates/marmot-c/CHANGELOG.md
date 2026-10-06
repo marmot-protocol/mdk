@@ -50,8 +50,6 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 - Account onboarding can establish inbox-list absence from a completed read of
   freshly discovered outboxes even when a discovery indexer is unavailable.
 
-### Fixed
-
 - Group-activity reaction targets retain each accepted commit's authenticated
   actor, source-state delta and fork-withdrawal origin. Authors and recipients
   use the same activity derivation. Account membership rows describe first-leaf
