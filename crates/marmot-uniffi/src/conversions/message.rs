@@ -3,9 +3,11 @@
 use marmot_app::{
     AppMessageRecord, ReceivedMessage, RetentionSweepGroupOutcome, RetentionSweepReport,
     RetentionSweepStatus, RuntimeMessageReceived, RuntimeMessageUpdate, SecureDeleteExpiredResult,
+    sticker_ref_from_tags,
 };
 
 use super::common::{MessageTagFfi, markdown_content_tokens, message_tags_ffi};
+use crate::conversions::StickerRefFfi;
 use crate::markdown::MarkdownDocumentFfi;
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -20,6 +22,7 @@ pub struct AppMessageRecordFfi {
     pub kind: u64,
     /// Nostr `tags` of the inner Marmot app event.
     pub tags: Vec<MessageTagFfi>,
+    pub sticker: Option<StickerRefFfi>,
     pub source_epoch: Option<u64>,
     /// `None` means no recoverable source-epoch decision (legacy/safe retain).
     /// `Some(0)` means retention was explicitly disabled.
@@ -34,6 +37,7 @@ pub struct AppMessageRecordFfi {
 impl From<AppMessageRecord> for AppMessageRecordFfi {
     fn from(value: AppMessageRecord) -> Self {
         let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
+        let sticker = sticker_ref_from_tags(value.kind, &value.tags).map(Into::into);
         Self {
             message_id_hex: value.message_id_hex,
             direction: value.direction,
@@ -43,6 +47,7 @@ impl From<AppMessageRecord> for AppMessageRecordFfi {
             content_tokens,
             kind: value.kind,
             tags: message_tags_ffi(value.tags),
+            sticker,
             source_epoch: value.source_epoch,
             retention_seconds: value.retention.map(|decision| decision.retention_seconds),
             retention_expires_at: value.retention.and_then(|decision| decision.expires_at),
@@ -142,6 +147,7 @@ pub struct ReceivedMessageFfi {
     pub kind: u64,
     /// Nostr `tags` of the inner Marmot app event.
     pub tags: Vec<MessageTagFfi>,
+    pub sticker: Option<StickerRefFfi>,
     pub source_epoch: u64,
     /// `None` means the engine could not recover the historical source policy.
     pub retention_seconds: Option<u64>,
@@ -154,6 +160,7 @@ pub struct ReceivedMessageFfi {
 
 impl From<&ReceivedMessage> for ReceivedMessageFfi {
     fn from(value: &ReceivedMessage) -> Self {
+        let sticker = sticker_ref_from_tags(value.kind, &value.tags).map(Into::into);
         Self {
             message_id_hex: value.message_id_hex.clone(),
             group_id_hex: hex::encode(value.group_id.as_slice()),
@@ -163,6 +170,7 @@ impl From<&ReceivedMessage> for ReceivedMessageFfi {
             content_tokens: markdown_content_tokens(value.kind, &value.plaintext),
             kind: value.kind,
             tags: message_tags_ffi(value.tags.clone()),
+            sticker,
             source_epoch: value.source_epoch,
             retention_seconds: value.retention.map(|decision| decision.retention_seconds),
             retention_expires_at: value.retention.and_then(|decision| decision.expires_at),

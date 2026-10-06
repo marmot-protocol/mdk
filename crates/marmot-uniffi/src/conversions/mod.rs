@@ -39,6 +39,7 @@ mod notification;
 mod onboarding;
 mod push;
 mod relay;
+mod sticker;
 mod telemetry;
 mod timeline;
 
@@ -63,6 +64,7 @@ pub use notification::*;
 pub use onboarding::*;
 pub use push::*;
 pub use relay::*;
+pub use sticker::*;
 pub use telemetry::*;
 pub use timeline::*;
 
@@ -530,6 +532,7 @@ mod tests {
                 sender: "bb".repeat(32),
                 plaintext: "parent text".to_owned(),
                 kind: 9,
+                tags: Vec::new(),
                 source_epoch: None,
                 media: None,
                 agent_text_stream: None,
