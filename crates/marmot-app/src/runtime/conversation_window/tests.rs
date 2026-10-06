@@ -2258,3 +2258,169 @@ async fn publication_checkpoint_refreshes_epoch_and_dirty_rows_without_reviving_
     drop(cold);
     f.close().await;
 }
+
+/// Exercise the production actor with a continuously ready checkpoint watch,
+/// so timer postponement cannot be mistaken for a slow producer or relay.
+async fn assert_hot_checkpoints_do_not_postpone_refresh(prior_not_ready: bool) {
+    let f = Fixture::new(5).await;
+    let initial = f.open(ConversationOpenTarget::Latest, 50).await.snapshot;
+    let worker = f.runtime.accounts.workers.lock().await[&f.account]
+        .commands
+        .clone();
+    let query = ConversationWindowQuery {
+        opening: ConversationOpenQuery {
+            target: ConversationOpenTarget::Latest,
+            limit: 50,
+        },
+        before_anchor: None,
+    };
+    let epoch = f.store.chat_presentation_version().unwrap().store_epoch;
+    f.add(99);
+    let (respond, response) = oneshot::channel();
+    worker
+        .send(AccountWorkerCommand::CaptureConversation {
+            queued: None,
+            group_id: f.group.clone(),
+            query: query.clone(),
+            store_epoch: epoch.clone(),
+            observer: None,
+            respond,
+        })
+        .await
+        .unwrap();
+    let checkpoint = response.await.unwrap().unwrap();
+    assert!(checkpoint.authority.is_some());
+    assert!(
+        checkpoint
+            .account
+            .page
+            .page()
+            .messages
+            .iter()
+            .any(|row| row.message_id_hex == id(99))
+    );
+    assert!(
+        !initial
+            .page
+            .page()
+            .messages
+            .iter()
+            .any(|row| row.message_id_hex == id(99))
+    );
+    let capture = Arc::new(SendCapture::new(
+        f.group.clone(),
+        epoch.clone(),
+        query.clone(),
+    ));
+    let telemetry = f.runtime.shared.app_performance_telemetry().clone();
+    let not_ready_count = || {
+        telemetry
+            .snapshot()
+            .runtime_operations
+            .iter()
+            .find(|sample| sample.operation == RuntimeOp::ConversationCaptureQueue)
+            .unwrap()
+            .not_ready
+    };
+    let before_not_ready = not_ready_count();
+    f.mode.store(1, Ordering::SeqCst);
+    let reader = Reader {
+        telemetry: telemetry.clone(),
+        authority_ready: None,
+        send_ready: None,
+        app: f.app.clone(),
+        label: "alice".into(),
+        account_id: f.account.clone(),
+        group: f.group.clone(),
+        store_epoch: epoch,
+        worker: watch::channel(Some(Ok(worker))).1,
+        send_capture: capture.clone(),
+    };
+    let sources = Sources {
+        avatars: f.app.presentation_signals.avatars.subscribe(),
+        events: f.runtime.events.subscribe(),
+        profiles: f.app.presentation_signals.profile_updates.subscribe(),
+        presentation: f.app.presentation_signals.updates.subscribe(),
+        drafts: f.app.presentation_signals.drafts.subscribe(),
+        stopping: f.runtime.shared.lifecycle().subscribe_shutdown(),
+    };
+    let resets = f.app.presentation_signals.account_resets.subscribe();
+    let (commands, command_rx) = mpsc::channel(8);
+    let (updates, mut changes) = watch::channel(Ok(initial.clone()));
+    let actor = tokio::spawn(run(
+        reader, query, initial, sources, resets, command_rx, updates,
+    ));
+    if prior_not_ready {
+        timeout(Duration::from_secs(3), async {
+            while not_ready_count() == before_not_ready {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the actor must receive NotReady before checkpoint production");
+        // A quiet unavailable owner must not turn into a busy read loop.
+        let captures = f.captures.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(f.captures.load(Ordering::SeqCst), captures);
+    }
+    let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let produced = Arc::new(AtomicUsize::new(0));
+    let producer_stop = stopping.clone();
+    let producer_count = produced.clone();
+    let producer = tokio::spawn(async move {
+        while !producer_stop.load(Ordering::SeqCst) {
+            // Follow the real producer's bounded replacement and generation
+            // contract; authority/account rows came from one production read.
+            {
+                let mut state = capture.state.lock().unwrap();
+                state.generation += 1;
+                state.pending = Some(checkpoint.clone());
+                state.latest = None;
+            }
+            capture.changed.send_replace(());
+            producer_count.fetch_add(1, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+        }
+    });
+    let observed = timeout(Duration::from_millis(250), async {
+        loop {
+            changes.changed().await.unwrap();
+            let snapshot = changes.borrow_and_update().clone().unwrap();
+            if snapshot
+                .page
+                .page()
+                .messages
+                .iter()
+                .any(|row| row.message_id_hex == id(99))
+            {
+                break snapshot;
+            }
+        }
+    })
+    .await;
+    let produced_before_stop = produced.load(Ordering::SeqCst);
+    stopping.store(true, Ordering::SeqCst);
+    producer.await.unwrap();
+    drop(commands);
+    drop(changes);
+    actor.await.unwrap();
+    f.close().await;
+    assert!(
+        produced_before_stop > 100,
+        "the checkpoint watch stayed hot throughout the observation"
+    );
+    let observed = observed
+        .expect("a continuing checkpoint producer must not postpone a ready refresh until quiet");
+    assert!(observed.presentation.header.epoch.is_some());
+    assert!(observed.presentation.header.capabilities.can_send);
+}
+
+#[tokio::test]
+async fn hot_checkpoints_do_not_postpone_not_ready_retry() {
+    assert_hot_checkpoints_do_not_postpone_refresh(true).await;
+}
+
+#[tokio::test]
+async fn hot_checkpoints_do_not_postpone_normal_refresh() {
+    assert_hot_checkpoints_do_not_postpone_refresh(false).await;
+}

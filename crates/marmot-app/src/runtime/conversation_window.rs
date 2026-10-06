@@ -26,6 +26,7 @@ pub use storage_sqlite::{
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+const REFRESH_DELAY: Duration = Duration::from_millis(10);
 // Before first authority, a busy worker may enrich the local window later.
 // Bound that display wait, not the lifetime of an established window command.
 const AUTHORITY_WAIT: Duration = Duration::from_millis(50);
@@ -1128,7 +1129,9 @@ async fn run(
     let mut dirty = true; // enrich the initial local snapshot without delaying it
     let mut authority_pending = false;
     let mut failed = false;
-    let mut retry_delayed = false;
+    // A dirty interval owns one deadline. Repeated checkpoint notifications
+    // may advance it but cannot debounce a usable snapshot until a burst ends.
+    let mut refresh_at = tokio::time::Instant::now() + REFRESH_DELAY;
     let mut last_good_position = position.clone();
     // First published sequence showing the viewport the latest command moved to.
     // A move kept through a quiet failure takes effect when a retry publishes it.
@@ -1143,14 +1146,37 @@ async fn run(
             _ = updates.closed() => return,
             _ = std::future::ready(()), if deferred_command.is_some() => deferred_command.take(),
             command = commands.recv() => { let Some(command) = command else { return; }; Some(command) },
-            _ = send_updates.changed() => { dirty = true; continue; },
-            result = worker_updates.changed(), if worker_updates_open => {
-                if result.is_err() { worker_updates_open = false; }
-                else { dirty = true; }
+            // A ready refresh outranks hot watches, while lifecycle and
+            // explicit viewport commands retain their existing priority.
+            _ = tokio::time::sleep_until(refresh_at), if dirty || authority_pending => None,
+            _ = send_updates.changed() => {
+                let checkpoint_ready = {
+                    let state = reader.send_capture.state.lock().unwrap_or_else(|e| e.into_inner());
+                    state.query == position && state.pending.is_some()
+                };
+                let next = tokio::time::Instant::now() + REFRESH_DELAY;
+                if !dirty && !authority_pending { refresh_at = next; }
+                else if checkpoint_ready { refresh_at = refresh_at.min(next); }
+                dirty = true;
                 continue;
             },
-            _ = tokio::time::sleep(if retry_delayed || (authority_pending && !dirty) { RETRY_DELAY } else { Duration::from_millis(10) }), if dirty || authority_pending => None,
-            _ = sources.invalidated(&reader, &current), if !dirty => { dirty = true; continue; },
+            result = worker_updates.changed(), if worker_updates_open => {
+                if result.is_err() { worker_updates_open = false; }
+                else {
+                    if !dirty {
+                        let next = tokio::time::Instant::now() + REFRESH_DELAY;
+                        refresh_at = if authority_pending { refresh_at.min(next) } else { next };
+                    }
+                    dirty = true;
+                }
+                continue;
+            },
+            _ = sources.invalidated(&reader, &current), if !dirty => {
+                let next = tokio::time::Instant::now() + REFRESH_DELAY;
+                refresh_at = if authority_pending { refresh_at.min(next) } else { next };
+                dirty = true;
+                continue;
+            },
         };
         let next = match command
             .as_ref()
@@ -1238,7 +1264,12 @@ async fn run(
                 // finitely many checkpoints, each before a transport wait.
                 dirty = checkpoint;
                 failed = false;
-                retry_delayed = false;
+                refresh_at = tokio::time::Instant::now()
+                    + if authority_pending && !dirty {
+                        RETRY_DELAY
+                    } else {
+                        REFRESH_DELAY
+                    };
             }
             Err(error) => {
                 let terminal = error.terminal();
@@ -1264,7 +1295,7 @@ async fn run(
                     position = last_good_position.clone();
                     dirty = true;
                     failed = true;
-                    retry_delayed = true;
+                    refresh_at = tokio::time::Instant::now() + RETRY_DELAY;
                 }
                 if terminal {
                     if let Some(observation) = reader.authority_ready.take() {
@@ -1282,7 +1313,7 @@ async fn run(
                     // Quiet NotReady retries must not suppress a later real
                     // storage error that the receiver has not yet seen.
                     failed |= !waiting;
-                    retry_delayed = true;
+                    refresh_at = tokio::time::Instant::now() + RETRY_DELAY;
                 }
             }
         }
