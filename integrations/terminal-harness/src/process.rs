@@ -276,6 +276,7 @@ where
         idle_timeout,
     } = spec;
     let mut command = Command::new(executable);
+    crate::group_profile::configure_command(&mut command);
     command
         .args(args)
         .current_dir(cwd)
