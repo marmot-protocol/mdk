@@ -6,6 +6,7 @@ mod commands;
 mod config;
 mod control;
 mod error;
+mod group_profile;
 pub mod process;
 mod repo_picker;
 mod store;
@@ -28,6 +29,7 @@ pub use artifacts::{
 pub use bridge::run;
 pub use config::{ConfigSpec, ExecutionProfile, LoadedConfig, load_config_with};
 pub use error::{HarnessError, Result};
+pub use group_profile::{GroupProfileContext, with_group_profile_context};
 pub use process::{ParsedEvent, PromptTransport};
 
 /// Default maximum byte length for one Marmot reply chunk.

@@ -28,6 +28,7 @@ Supported integrations, all speaking the same [`agent-control`](../agent-control
 - [Group profile updates](#group-profile-updates)
 - [Control plane security](#control-plane-security)
 - [Usage and diagnostics](#usage-and-diagnostics)
+- [Portable admin profile command](#portable-admin-profile-command)
 - [Release installs](#release-installs)
 
 ## Names and versions
@@ -214,6 +215,19 @@ plane; do not expose the Unix socket over TCP.
 active daemon handles updates on a separate owner-only local socket; the agent-control protocol cannot grant consent.
 The agent root has its own permission, independent from White Noise. See the
 [host and operator contract](../../docs/marmot-architecture/usage-diagnostics.md).
+
+## Portable admin profile command
+
+`wn-agent group-profile` accepts one bounded JSON object on stdin with `name`,
+`description`, or both and prints a JSON result. It requires an explicit
+`MARMOT_AGENT_SOCKET`, `MARMOT_ACCOUNT_ID_HEX` and `MARMOT_GROUP_ID_HEX`; token
+or token-file authentication uses the common connector environment.
+`MARMOT_GROUP_PROFILE_TIMEOUT_SECS` defaults to 30 and accepts 1 through 300.
+The four terminal harnesses supply this route per turn. The command does not
+auto-select accounts or start another daemon. It preserves the protocol
+operation's omission/clear semantics, UTF-8 limits and current-admin check.
+Only a matching response with nonempty valid commit ids is success. An
+unconfirmed transport or protocol outcome is unknown, never an automatic retry.
 
 ## Release installs
 
