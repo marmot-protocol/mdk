@@ -56,6 +56,443 @@ async fn deliver_new(client: &mut AppClient, relay: &ScriptedPushRelayClient, cu
     *cursor = events.len();
 }
 
+/// Delay only app projection, retaining every native effect from the owning runtime.
+fn collect_effects(
+    batch: &mut marmot_account::AccountDeviceEffects,
+    mut effects: marmot_account::AccountDeviceEffects,
+) {
+    macro_rules! append {
+        ($($field:ident),+ $(,)?) => {
+            $(batch.$field.append(&mut effects.$field);)+
+        };
+    }
+    append!(
+        events,
+        queued,
+        pending_convergence,
+        reports,
+        fanout,
+        failures,
+        unresolved_publishes,
+        unresolved_app_messages,
+        failed_app_messages,
+        published_app_messages,
+        welcome_failures,
+        superseded_intents,
+        pending,
+    );
+    if effects.maintenance_disposition
+        == cgka_traits::SendMaintenanceDisposition::PostJoinRotationPendingRetryable
+    {
+        batch.maintenance_disposition = effects.maintenance_disposition;
+    }
+}
+
+/// Feed signed relay deliveries to this client's own runtime, delaying app projection.
+async fn collect_new_deliveries(
+    client: &mut AppClient,
+    relay: &ScriptedPushRelayClient,
+    cursor: &mut usize,
+    batch: &mut marmot_account::AccountDeviceEffects,
+) {
+    let events = relay.published_events.lock().unwrap().clone();
+    let account = client
+        .app
+        .account_home()
+        .account(&client.state.label)
+        .unwrap();
+    for event in &events[*cursor..] {
+        let plane = match event.kind {
+            1059 if event.tags.iter().any(|tag| {
+                tag.first().is_some_and(|v| v == "p") && tag.get(1) == Some(&account.account_id_hex)
+            }) =>
+            {
+                cgka_traits::TransportDeliveryPlane::AccountInbox
+            }
+            transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE => {
+                cgka_traits::TransportDeliveryPlane::Group
+            }
+            _ => continue,
+        };
+        let ingested = client
+            .runtime
+            .ingest_delivery(cgka_traits::TransportDelivery {
+                account_id: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+                group_id_hint: None,
+                message: event.to_transport_message().unwrap(),
+                received_at: cgka_traits::Timestamp(unix_now_seconds()),
+                source: cgka_traits::TransportDeliverySource {
+                    transport: cgka_traits::transport::TransportSource("nostr".into()),
+                    plane,
+                    endpoint: None,
+                    subscription_id: None,
+                    wire: None,
+                },
+            })
+            .await
+            .unwrap();
+        collect_effects(batch, ingested.effects);
+    }
+    *cursor = events.len();
+}
+
+/// Real departure and disband settlement can outpace projection in a single
+/// collected batch. Neither history projection nor cleanup may require live MLS.
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
+async fn real_departure_then_disband_projects_after_mls_deletion() {
+    use cgka_traits::engine::GroupStateChange;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob_account = home.create_account("bob").unwrap();
+    let carol_account = home.create_account("carol").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = app_at(&dir, relay.clone());
+    for peer in [&bob_account, &carol_account] {
+        remember_test_member_inbox(&app, &peer.account_id_hex, "wss://relay.example");
+    }
+    let mut bob = app.client("bob").await.unwrap();
+    let mut carol = app.client("carol").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+    carol.publish_key_package().await.unwrap();
+    let mut alice = app.client("alice").await.unwrap();
+    let group = alice
+        .create_group(
+            "collected closure",
+            &[&bob_account.account_id_hex, &carol_account.account_id_hex],
+        )
+        .await
+        .unwrap();
+    let group_hex = hex::encode(group.as_slice());
+    let mut alice_cursor = 0;
+    let mut bob_cursor = 0;
+    let mut carol_cursor = 0;
+    deliver_new(&mut bob, &relay, &mut bob_cursor).await;
+    deliver_new(&mut carol, &relay, &mut carol_cursor).await;
+    bob.sync().await.unwrap();
+    carol.sync().await.unwrap();
+    bob.accept_group_invite(&group).unwrap();
+    carol.accept_group_invite(&group).unwrap();
+    assert!(installed_group_routes(&carol, &group) > 0);
+
+    // Share genuine signed token events while both members still belong.
+    for label in ["alice", "bob", "carol"] {
+        app.set_native_push_enabled(label, true).unwrap();
+    }
+    let server = nostr::prelude::Keys::generate().public_key().to_hex();
+    alice
+        .upsert_and_share_push_registration(PushPlatform::Fcm, "alice-token", &server, None)
+        .await
+        .unwrap();
+    bob.upsert_and_share_push_registration(PushPlatform::Fcm, "bob-token", &server, None)
+        .await
+        .unwrap();
+    carol
+        .upsert_and_share_push_registration(PushPlatform::Fcm, "carol-token", &server, None)
+        .await
+        .unwrap();
+    deliver_new(&mut carol, &relay, &mut carol_cursor).await;
+    carol.sync().await.unwrap();
+    let tokens = app.group_push_tokens("carol", &group_hex).unwrap();
+    assert!(
+        tokens
+            .iter()
+            .any(|token| token.member_id_hex == bob_account.account_id_hex)
+    );
+    assert!(
+        tokens
+            .iter()
+            .any(|token| token.member_id_hex != bob_account.account_id_hex)
+    );
+
+    bob.leave_group(&group).await.unwrap();
+    deliver_new(&mut alice, &relay, &mut alice_cursor).await;
+    alice.sync().await.unwrap();
+    let delay = alice
+        .runtime
+        .scheduled_self_remove_auto_commit_delay_ms(&group)
+        .unwrap()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(delay + 1)).await;
+    alice.retry_group_convergence(&group).await.unwrap();
+
+    let mut batch = marmot_account::AccountDeviceEffects::default();
+    collect_new_deliveries(&mut carol, &relay, &mut carol_cursor, &mut batch).await;
+    collect_effects(
+        &mut batch,
+        carol.runtime.advance_convergence(&group).await.unwrap(),
+    );
+    let bob_member = MemberId::new(hex::decode(&bob_account.account_id_hex).unwrap());
+    let departure = batch.events.iter().position(|event| matches!(event,
+        GroupEvent::GroupStateChanged { change: GroupStateChange::MemberLeft { member }, .. }
+            if member == &bob_member
+    )).expect("actual retained departure must be applied before disband");
+    assert!(batch.events.iter().any(|event| matches!(event,
+        GroupEvent::GroupMemberLeavesRemoved { departed_members, .. }
+            if departed_members.contains(&bob_member)
+    )));
+
+    alice.disband_group(&group).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            alice.retry_group_convergence(&group).await.unwrap();
+            collect_new_deliveries(&mut carol, &relay, &mut carol_cursor, &mut batch).await;
+            collect_effects(
+                &mut batch,
+                carol.runtime.advance_convergence(&group).await.unwrap(),
+            );
+            if carol
+                .runtime
+                .group_record(&group)
+                .unwrap()
+                .disbanded
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("real disband must settle");
+    let disband = batch
+        .events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                GroupEvent::GroupStateChanged {
+                    change: GroupStateChange::GroupDisbanded,
+                    ..
+                }
+            )
+        })
+        .expect("actual settlement must emit disband");
+    assert!(departure < disband);
+    assert!(
+        carol
+            .runtime
+            .session()
+            .canonical_group_membership(&group)
+            .is_err(),
+        "settlement must actually delete live MLS before app projection"
+    );
+
+    carol.observe_drained_session_events(&batch).await.unwrap();
+    carol.refresh_group_routes().unwrap();
+    carol
+        .save_state_with_pending_local_group_deletion_frontier_clears()
+        .unwrap();
+    let assert_projection = |app: &MarmotApp, client: &AppClient| {
+        let rows = app
+            .timeline_messages_with_query(
+                "carol",
+                TimelineMessageQuery {
+                    group_id_hex: Some(group_hex.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .messages;
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row
+                    .group_system
+                    .as_ref()
+                    .is_some_and(|event| event.system_type == "member_left"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row
+                    .group_system
+                    .as_ref()
+                    .is_some_and(|event| event.system_type == "group_disbanded"))
+                .count(),
+            1
+        );
+        assert!(
+            app.group_push_tokens("carol", &group_hex)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            app.pending_push_registration_removals("carol")
+                .unwrap()
+                .iter()
+                .any(|(group, _)| group == &group_hex)
+        );
+        assert_eq!(installed_group_routes(client, &group), 0);
+        assert!(app.group("carol", &group_hex).unwrap().unwrap().disbanded);
+    };
+    assert_projection(&app, &carol);
+    // Replaying the same genuine batch cannot duplicate history or reinstall routes.
+    carol.observe_drained_session_events(&batch).await.unwrap();
+    carol.refresh_group_routes().unwrap();
+    assert_projection(&app, &carol);
+    drop(carol);
+    let reopened = app.client("carol").await.unwrap();
+    assert_projection(&app, &reopened);
+}
+
+/// Document the real runtime's terminal boundary: late competing commits cannot
+/// restore a removed copy through normal delivery or convergence retries. The
+/// engine's retained-history rollback test is intentionally a lower-level proof.
+#[tokio::test]
+async fn late_competing_commit_cannot_restore_terminal_app_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice_account = home.create_account("alice").unwrap();
+    let bob_account = home.create_account("bob").unwrap();
+    let carol_account = home.create_account("carol").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = app_at(&dir, relay.clone());
+    for peer in [&bob_account, &carol_account] {
+        remember_test_member_inbox(&app, &peer.account_id_hex, "wss://relay.example");
+    }
+    let mut bob = app.client("bob").await.unwrap();
+    let mut carol = app.client("carol").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+    carol.publish_key_package().await.unwrap();
+    let mut alice = app.client("alice").await.unwrap();
+    let group = alice
+        .create_group(
+            "terminal fork",
+            &[&bob_account.account_id_hex, &carol_account.account_id_hex],
+        )
+        .await
+        .unwrap();
+    let group_hex = hex::encode(group.as_slice());
+    let mut bob_cursor = 0;
+    let mut carol_cursor = 0;
+    deliver_new(&mut bob, &relay, &mut bob_cursor).await;
+    deliver_new(&mut carol, &relay, &mut carol_cursor).await;
+    bob.sync().await.unwrap();
+    carol.sync().await.unwrap();
+    bob.accept_group_invite(&group).unwrap();
+    carol.accept_group_invite(&group).unwrap();
+    alice
+        .promote_admin(&group, &bob_account.account_id_hex)
+        .await
+        .unwrap();
+    deliver_new(&mut bob, &relay, &mut bob_cursor).await;
+    deliver_new(&mut carol, &relay, &mut carol_cursor).await;
+    bob.retry_group_convergence(&group).await.unwrap();
+    carol.retry_group_convergence(&group).await.unwrap();
+    assert_eq!(
+        alice.runtime.group_record(&group).unwrap().epoch,
+        bob.runtime.group_record(&group).unwrap().epoch
+    );
+    assert_eq!(
+        alice.runtime.group_record(&group).unwrap().epoch,
+        carol.runtime.group_record(&group).unwrap().epoch
+    );
+
+    // Both branches are privileged. The lexicographically smaller admin would
+    // win canonical selection if the late rename were admitted to convergence.
+    let (mut renamer, mut remover) = if alice_account.account_id_hex < bob_account.account_id_hex {
+        (alice, bob)
+    } else {
+        (bob, alice)
+    };
+    renamer.send(&group, b"read baseline").await.unwrap();
+    deliver_new(&mut carol, &relay, &mut carol_cursor).await;
+    carol.sync().await.unwrap();
+    app.initialize_chat_read_state("carol", &group_hex).unwrap();
+    // Read watermarks use whole seconds; advance past the baseline timestamp.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    renamer
+        .send(&group, b"unread before removal")
+        .await
+        .unwrap();
+    deliver_new(&mut carol, &relay, &mut carol_cursor).await;
+    carol.sync().await.unwrap();
+    let unread = || {
+        app.account_unread_summary()
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.account_id_hex == carol_account.account_id_hex)
+            .unwrap()
+            .unread_count
+    };
+    assert!(unread() > 0);
+    assert!(can_send(&carol, &group));
+    remover
+        .remove_members(&group, &[&carol_account.account_id_hex])
+        .await
+        .unwrap();
+    deliver_new(&mut carol, &relay, &mut carol_cursor).await;
+    carol.retry_group_convergence(&group).await.unwrap();
+    let assert_terminal = |client: &AppClient| {
+        assert!(client.runtime.group_record(&group).unwrap().removed);
+        assert_eq!(
+            app.stored_group_self_membership("carol", &group_hex)
+                .unwrap(),
+            Some(SelfMembership::Removed)
+        );
+        assert!(!can_send(client, &group));
+        assert_eq!(unread(), 0);
+        assert_eq!(installed_group_routes(client, &group), 0);
+    };
+    assert_terminal(&carol);
+    let removed_epoch = carol.runtime.group_record(&group).unwrap().epoch;
+
+    let rename = renamer
+        .update_group_profile(&group, Some("late winning rename"), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        rename.accept_disposition,
+        cgka_traits::SendAcceptDisposition::Published
+    );
+    assert_eq!(
+        renamer.runtime.group_record(&group).unwrap().epoch,
+        removed_epoch,
+        "the signed rename must compete at the same source epoch as removal"
+    );
+    assert_eq!(
+        app.group(&renamer.state.label, &group_hex)
+            .unwrap()
+            .unwrap()
+            .profile
+            .name,
+        "late winning rename",
+        "the competing author really confirms its branch"
+    );
+    let mut late = marmot_account::AccountDeviceEffects::default();
+    collect_new_deliveries(&mut carol, &relay, &mut carol_cursor, &mut late).await;
+    collect_effects(
+        &mut late,
+        carol.runtime.advance_convergence(&group).await.unwrap(),
+    );
+    assert!(
+        !late
+            .events
+            .iter()
+            .any(|event| matches!(event, GroupEvent::LocalGroupCopyRestored { .. }))
+    );
+    carol.observe_drained_session_events(&late).await.unwrap();
+    carol.retry_group_convergence(&group).await.unwrap();
+    assert_terminal(&carol);
+    assert_eq!(
+        carol.runtime.group_record(&group).unwrap().epoch,
+        removed_epoch
+    );
+    assert_ne!(
+        app.chat_list_row("carol", &group_hex)
+            .unwrap()
+            .unwrap()
+            .title,
+        "late winning rename"
+    );
+    drop(carol);
+    let reopened = app.client("carol").await.unwrap();
+    assert_terminal(&reopened);
+}
+
 /// Attach the real published KeyPackage event needed by the Welcome wrapper.
 async fn published_key_package(
     client: &mut AppClient,
@@ -356,6 +793,93 @@ async fn sibling_selfremove_through_author_command(profile_command: bool) {
         surviving_leaf
     );
     assert_held(&reopened);
+}
+
+/// Projection contract only: native restoration re-enables the existing unread
+/// aggregate without inserting an invitation or changing the read watermark.
+#[tokio::test]
+async fn native_restoration_restores_projection_unread_without_invitation() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = app_at(&dir, Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = client.create_group("unread contract", &[]).await.unwrap();
+    let group_hex = hex::encode(group.as_slice());
+    app.initialize_chat_read_state("alice", &group_hex).unwrap();
+    // An explicit projection fixture; authenticity/reorg reachability belongs
+    // to separate engine and real-runtime tests, not this synthetic event seam.
+    app.record_account_app_event(
+        "alice",
+        &AppMessageProjection {
+            authority: None,
+            message_id_hex: "unread-projection-fixture".into(),
+            source_message_id_hex: None,
+            direction: "received".into(),
+            group_id_hex: group_hex.clone(),
+            sender: nostr::prelude::Keys::generate().public_key().to_hex(),
+            plaintext: "already retained unread".into(),
+            kind: MARMOT_APP_EVENT_KIND_CHAT,
+            tags: Vec::new(),
+            source_epoch: Some(1),
+            retention: None,
+            recorded_at: Some(unix_now_seconds() + 60),
+            origin_commit_id: None,
+            moderation_grant: false,
+        },
+    )
+    .unwrap();
+    let unread = || {
+        app.account_unread_summary()
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.account_id_hex == account.account_id_hex)
+            .unwrap()
+            .unread_count
+    };
+    assert_eq!(unread(), 1);
+    let termination = marmot_account::AccountDeviceEffects {
+        events: vec![GroupEvent::LocalGroupCopyTerminated {
+            group_id: group.clone(),
+            voluntary: false,
+        }],
+        ..Default::default()
+    };
+    client
+        .observe_drained_session_events(&termination)
+        .await
+        .unwrap();
+    assert_eq!(unread(), 0);
+    let restoration = marmot_account::AccountDeviceEffects {
+        events: vec![GroupEvent::LocalGroupCopyRestored { group_id: group }],
+        ..Default::default()
+    };
+    client
+        .observe_drained_session_events(&restoration)
+        .await
+        .unwrap();
+    assert_eq!(unread(), 1);
+    client
+        .observe_drained_session_events(&restoration)
+        .await
+        .unwrap();
+    assert_eq!(unread(), 1);
+    let rows = app
+        .timeline_messages_with_query(
+            "alice",
+            TimelineMessageQuery {
+                group_id_hex: Some(group_hex),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .messages;
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].group_system.is_none());
+    drop(client);
+    let _reopened = app.client("alice").await.unwrap();
+    assert_eq!(unread(), 1);
 }
 
 /// Explicit projection-seam regression: a termination consumed after the engine
