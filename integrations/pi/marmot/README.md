@@ -217,6 +217,14 @@ shared harness answers its own reserved commands, including `/help`, `/status`,
 documented in the
 [shared chat-command reference](../../terminal-harness/README.md#chat-commands).
 
+## Admin group profile updates
+
+This harness exposes the shared `wn-agent group-profile` command to the agent
+for the active conversation. It supports name and description changes for
+current admins, partial updates and explicit clearing. See the
+[shared control-command contract](../../terminal-harness/README.md#admin-group-profile-updates)
+for routing, release compatibility, permissions and uncertain outcomes.
+
 ## Configuration
 
 | Environment variable | Default | Meaning |
@@ -250,6 +258,12 @@ than adding a containment mechanism. See the shared
 [execution-profile capability matrix](../../terminal-harness/README.md#execution-profiles).
 
 ## Security Notes
+
+- Group-profile routing passes a configured bearer token as a raw child
+  environment value, including tokens loaded from files. Trusted tool shells,
+  MCP servers and other descendants may inherit its full connector authority.
+  Backend environment filtering must preserve the turn's route and token;
+  see the [shared control-command contract](../../terminal-harness/README.md#admin-group-profile-updates).
 
 - The same configured sender list controls prompt execution and is mirrored
   additively into the `wn-agent` welcomer allowlist. To revoke access, remove the

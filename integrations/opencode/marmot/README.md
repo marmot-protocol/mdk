@@ -158,6 +158,14 @@ wn-opencode
 
 Invite the printed agent account from the phone app.
 
+## Admin group profile updates
+
+This harness exposes the shared `wn-agent group-profile` command to the agent
+for the active conversation. It supports name and description changes for
+current admins, partial updates and explicit clearing. See the
+[shared control-command contract](../../terminal-harness/README.md#admin-group-profile-updates)
+for routing, release compatibility, permissions and uncertain outcomes.
+
 ## Configuration
 
 Configure with environment variables:
@@ -324,6 +332,12 @@ directories are removed when the connector restarts. Logs and the session map
 never record file names, paths, contents, or prompt text.
 
 ## Security Notes
+
+- Group-profile routing passes a configured bearer token as a raw child
+  environment value, including tokens loaded from files. Trusted tool shells,
+  MCP servers and other descendants may inherit its full connector authority.
+  Backend environment filtering must preserve the turn's route and token;
+  see the [shared control-command contract](../../terminal-harness/README.md#admin-group-profile-updates).
 
 - The control socket is local Unix-domain only. Use the normal `wn-agent`
   socket mode and bearer-token options for shared local-user setups.

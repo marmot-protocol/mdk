@@ -67,6 +67,9 @@ pub(crate) enum RecoveryStatus {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RecoveryRecord {
     pub(crate) prompt: String,
+    /// Preserve literal forwarding on retry; old records retain ordinary behavior.
+    #[serde(default)]
+    pub(crate) omit_control_instructions: bool,
     #[serde(default)]
     pub(crate) media: Vec<AgentControlMediaRef>,
     pub(crate) cwd: PathBuf,
@@ -934,12 +937,26 @@ mod tests {
         assert_eq!(record.goal, None);
     }
 
+    #[test]
+    fn legacy_recovery_keeps_ordinary_control_instructions() {
+        let record: RecoveryRecord = serde_json::from_value(serde_json::json!({
+            "prompt": "ordinary task",
+            "cwd": "/repo",
+            "session_id": "session",
+            "kind": "failed_resumable",
+            "status": "pending"
+        }))
+        .unwrap();
+        assert!(!record.omit_control_instructions);
+    }
+
     #[tokio::test]
     async fn recovery_store_persists_and_consumes_retry_exactly_once() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("recovery.json");
         let record = RecoveryRecord {
             prompt: "private prompt".to_owned(),
+            omit_control_instructions: false,
             media: Vec::new(),
             cwd: dir.path().join("repo"),
             session_id: "session".to_owned(),

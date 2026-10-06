@@ -176,6 +176,14 @@ never retried automatically. `/goal <text>` stores a standing instruction that
 the harness prepends to every later prompt in that chat, which keeps the
 instruction alive across thread resets and Codex-side context compaction.
 
+## Admin group profile updates
+
+This harness exposes the shared `wn-agent group-profile` command to the agent
+for the active conversation. It supports name and description changes for
+current admins, partial updates and explicit clearing. See the
+[shared control-command contract](../../terminal-harness/README.md#admin-group-profile-updates)
+for routing, release compatibility, permissions and uncertain outcomes.
+
 ## Configuration
 
 | Environment variable | Default | Meaning |
@@ -258,6 +266,12 @@ The ordinary 30-second control timeout applies to socket connection and request 
 Batch copies remain available for the complete turn and are removed after success, failure, timeout, or cancellation. Stale batch directories are reconciled when the connector starts. The staging directory is owner-only and each file is owner-readable only. On Unix, immediate pre-spawn validation refuses a symlink final component and performs an exact-size bounded read through the opened file descriptor; the backend necessarily receives a path, so other processes running as the connector's own operating-system user remain inside the trust boundary.
 
 ## Security Notes
+
+- Group-profile routing passes a configured bearer token as a raw child
+  environment value, including tokens loaded from files. Trusted tool shells,
+  MCP servers and other descendants may inherit its full connector authority.
+  Backend environment filtering must preserve the turn's route and token;
+  see the [shared control-command contract](../../terminal-harness/README.md#admin-group-profile-updates).
 
 - The configured sender list controls prompt execution and is mirrored
   additively into the `wn-agent` welcomer allowlist. To revoke access, remove the

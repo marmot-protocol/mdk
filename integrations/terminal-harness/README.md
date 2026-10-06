@@ -251,6 +251,50 @@ Download timeouts, connector rejections, and local file-validation failures have
 distinct privacy-safe pre-backend replies. The connector never forwards a
 server-provided error string or attachment metadata into those replies.
 
+## Admin group profile updates
+
+Codex, Claude Code, OpenCode and Pi receive the same connector-provided control
+instructions on each ordinary turn, including resumed turns. Literal `//`
+forwarding omits this suffix, including after durable recovery and `/retry-last`.
+Old recovery records without a forwarding discriminator retain ordinary-turn
+behavior. When the user asks the
+agent to change this conversation's name or description, it can invoke the
+`wn-agent` binary from the same release bundle with a JSON object on stdin:
+
+```sh
+printf '%s' '{"name":"New name","description":"New description"}' | wn-agent group-profile
+```
+
+Omit a field to preserve it; an empty string explicitly clears it. Names are
+limited to 256 UTF-8 bytes and descriptions to 4096 bytes. The shared runtime
+supplies `MARMOT_AGENT_SOCKET`, `MARMOT_ACCOUNT_ID_HEX`, `MARMOT_GROUP_ID_HEX`,
+authentication and the request timeout only in that turn's child process.
+Parallel conversations never change global environment state. The agent should
+use this route as supplied, rather than guess an account or group.
+
+The command uses the existing authenticated `group_profile_update` operation.
+MDK checks current admin authority when committing; `not_group_admin` is a
+rejection. A successful response contains `ok: true` and the commit message ids.
+A timeout, EOF or invalid acknowledgement is reported as an unknown outcome:
+the update may have committed, so inspect current group details before retrying.
+The command does not retry a mutation automatically.
+
+Use a matching `wn-agent` and harness release containing this command and keep
+`wn-agent` on the backend's PATH. Backend shell permissions and sandbox policy
+remain authoritative; the harness does not override a policy denying socket
+access. The local token still grants the existing full control API; the turn
+route is convenience context, not a new per-group security capability. Use an
+isolated connector home for a separate trust boundary.
+
+A configured token, including one loaded from a token file, is passed as the raw
+`MARMOT_AGENT_AUTH_TOKEN` value to each backend child. Tool shells, MCP servers
+and other descendants that inherit its environment can use the full control
+API for every account in that connector home. Only run trusted descendants in
+that boundary. Backend environment filtering must explicitly preserve the
+turn's `MARMOT_*` route and token for `wn-agent group-profile`; permission to
+launch a shell alone does not ensure that these values reach it. Without a turn
+token, the CLI retains its normal connector-home `control.token` fallback.
+
 ## Chat Commands
 
 Terminal backends run through their non-interactive machine interfaces, which do
