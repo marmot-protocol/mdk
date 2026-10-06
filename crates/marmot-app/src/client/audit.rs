@@ -203,6 +203,7 @@ impl AppClient {
             AppMessageIntent::Chat { .. } | AppMessageIntent::TaggedChat { .. } => {
                 ("send_message", None)
             }
+            AppMessageIntent::Sticker { .. } => ("send_sticker", None),
             AppMessageIntent::Reply { .. } => ("reply_message", None),
             AppMessageIntent::Edit { .. } => ("edit_message", None),
             AppMessageIntent::Reaction { .. } => ("react", None),
