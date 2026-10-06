@@ -7,12 +7,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- Append invitation diagnostic statuses `MARMOT_STATUS_OBSOLETE_KEY_PACKAGE` (96) and `MARMOT_STATUS_MEMBER_DISCOVERY_INCOMPLETE` (97). Existing status values remain unchanged; detail strings omit recipient identity.
+
 ### Added
 
-- Invitation-discovery status codes 96–103 distinguish obsolete packages,
-  incomplete searches, relay budgets, unusable discovery routes, invalid
-  packages and lifetimes, incompatible capabilities, and timeouts. Existing
-  status values remain unchanged; use the matching generated header and library.
 - Add `marmot_message_reactions` and the owned
   `MarmotTimelineUserReactionList` root/free for complete exact-message details.
   Existing record layouts are unchanged; the new symbols require matching

@@ -44,9 +44,6 @@ pub(crate) struct DirectoryEventQuery {
     pub(crate) kind: u64,
     pub(crate) authors: Vec<String>,
     pub(crate) limit: usize,
-    /// Positive diagnostic evidence is useful even when its history reaches the query limit.
-    /// It never contributes proof of absence; required filters still own completion.
-    pub(crate) evidence_only: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,13 +199,7 @@ impl DirectoryEventQuery {
             kind,
             authors,
             limit,
-            evidence_only: false,
         }
-    }
-
-    pub(crate) fn evidence_only(mut self) -> Self {
-        self.evidence_only = true;
-        self
     }
 }
 
@@ -991,7 +982,10 @@ async fn strict_fetch_endpoint(
                             if received_id.as_ref() == &subscription_id =>
                         {
                             // A filter that reaches its limit cannot establish absence.
-                            break query_limits_complete(&queries, &query_counts);
+                            break queries
+                                .iter()
+                                .zip(&query_counts)
+                                .all(|(query, count)| *count < query.limit);
                         }
                         RelayMessage::Closed {
                             subscription_id: received_id,
@@ -1042,15 +1036,6 @@ async fn strict_fetch_endpoint(
     DirectoryFetchOutcome { records, complete }
 }
 
-fn query_limits_complete(queries: &[DirectoryEventQuery], counts: &[usize]) -> bool {
-    // Diagnostic filters never certify their own absence, nor hide a required filter's saturation.
-    queries.iter().any(|query| !query.evidence_only)
-        && queries
-            .iter()
-            .zip(counts)
-            .all(|(query, count)| query.evidence_only || *count < query.limit)
-}
-
 fn parsed_directory_relay_urls(endpoints: &[TransportEndpoint]) -> Result<Vec<RelayUrl>, String> {
     let mut relay_urls = endpoints
         .iter()
@@ -1068,22 +1053,6 @@ fn parsed_directory_relay_urls(endpoints: &[TransportEndpoint]) -> Result<Vec<Re
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn diagnostic_history_limits_do_not_certify_absence_or_hide_current_saturation() {
-        let current = super::DirectoryEventQuery::new(30443, vec!["author".into()], 12);
-        let legacy =
-            super::DirectoryEventQuery::new(443, vec!["author".into()], 12).evidence_only();
-        assert!(super::query_limits_complete(
-            &[current.clone(), legacy.clone()],
-            &[0, 12]
-        ));
-        assert!(!super::query_limits_complete(
-            &[current, legacy.clone()],
-            &[12, 0]
-        ));
-        assert!(!super::query_limits_complete(&[legacy], &[0]));
-    }
-
     use super::*;
     use nostr_sdk::prelude::FinalizeEvent;
 
@@ -1267,27 +1236,6 @@ mod tests {
         let tampered = Event::from_json(tampered.to_string()).unwrap();
         assert!(tampered.verify().is_err());
         assert!(validated_directory_event(&tampered, &query).is_none());
-    }
-
-    #[test]
-    fn legacy_diagnostic_query_retains_only_signed_matching_events() {
-        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys};
-        let keys = Keys::generate();
-        let event = EventBuilder::new(Kind::Custom(443), "legacy package")
-            .finalize(&keys)
-            .unwrap();
-        let legacy =
-            DirectoryEventQuery::new(443, vec![keys.public_key().to_hex()], 12).evidence_only();
-        assert!(validated_directory_event(&event, &legacy).is_some());
-        let current = DirectoryEventQuery::new(
-            transport_nostr_adapter::KIND_MARMOT_KEY_PACKAGE,
-            vec![keys.public_key().to_hex()],
-            12,
-        );
-        assert!(validated_directory_event(&event, &current).is_none());
-        let wrong = DirectoryEventQuery::new(443, vec![Keys::generate().public_key().to_hex()], 12)
-            .evidence_only();
-        assert!(validated_directory_event(&event, &wrong).is_none());
     }
 
     #[tokio::test]

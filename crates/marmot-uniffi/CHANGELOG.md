@@ -2,28 +2,10 @@
 
 ## Unreleased
 
+- Add typed `ObsoleteKeyPackage { account }` and `MemberDiscoveryIncomplete { account }` invitation errors. Recipient fields support focused recovery guidance; Display omits the identity. No new lookup queries or legacy-package admission.
+
 ### Breaking changes
 
-- `MarmotKitError` gains eight invitation-discovery variants. Regenerate
-  Kotlin/Swift bindings with the matching native artifact and update exhaustive
-  error matches before adoption; the workspace version remains unchanged until
-  a release.
-  - Missing-key outcomes can report `ObsoleteKeyPackage` for verified legacy-only
-    publications or `MemberDiscoveryIncomplete` when absence cannot be proved.
-    Keep `MissingKeyPackage` for a completed search with no usable package;
-    none of these errors proves that the person has never installed the app.
-  - Invalid member publications use `MemberInvalidKeyPackage` or
-    `MemberInvalidKeyPackageLifetime` instead of an opaque
-    `InvalidKeyPackageEvent`; missing group capabilities use
-    `MemberIncompatibleKeyPackage` instead of a nested session/engine error.
-  - Discovery-source failures use `MemberNoUsableDiscoveryRelays`,
-    `MemberRelayBudgetExceeded` or `MemberDiscoveryIncomplete` instead of
-    generic relay-directory or missing-relay-list failures. The overall
-    discovery deadline reports `MemberDiscoveryTimeout`.
-  - The first seven variants carry an `account` field for recipient-specific
-    presentation. Do not log or include it in diagnostic reports. Localize the
-    typed variants rather than parsing their display text. Non-invitation
-    directory APIs retain their existing error behavior.
 - Attachment history adds `AttachmentRoleFfi` and the required, defaultless
   `AttachmentEntryFfi.role` field. Regenerate Swift/Kotlin bindings with the
   matching native library and update host record constructors and fixtures.

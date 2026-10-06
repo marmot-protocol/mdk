@@ -187,17 +187,6 @@ the MLS add.
   requests a fresh readiness signal, so debounce roster changes. The process-local prewarm cache keeps only bounded
   relay metadata; only completed discovery and advertised-outbox metadata hops renew its freshness deadline, and a
   usable package returned after an incomplete metadata hop does not make previously cached routes fresh.
-- A failed lookup using prewarmed routes refreshes those relay lists once within the same deadline. It preserves
-  key-package replacements already observed, so a stale route cannot revive retired private material. Safe, normalized
-  recipient routes are searched up to 64 distinct endpoints, with 16 concurrent requests per endpoint set and a
-  separately bounded configured fallback. Large lists do not fail before trying usable routes.
-- Invitation failures distinguish completed missing/current-version searches, verified obsolete-only packages,
-  incomplete discovery, exhausted relay budgets, invalid or incompatible packages, invalid lifetimes, and missing
-  inbox routes. Hosts should localize these typed failures; incomplete acquisition is not proof of absence, and legacy
-  packages are diagnostic evidence only. Optional legacy probes use separate single-recipient requests after current searches and are
-  deferred past multi-author batches or skipped when a current publication is available; rejection or future-dated legacy evidence cannot downgrade a
-  completed current-package search. The 50-second total deadline reserves two seconds after network acquisition
-  for validation and classification while preserving completed positive results.
 - Directory diagnostics (such as `wn keys check` / `keys fetch`) may still describe cached public packages. Their availability
   result is advisory and does not guarantee a fresh relay lookup or acceptance by the create/invite admission policy.
 
@@ -241,6 +230,10 @@ does not rewrite existing group state. An active group admin can migrate an exis
 Encrypted group images differ: no endpoint is stored in group state, so upload and fetch both resolve against the
 build's primary endpoint. Clients compiled with different defaults therefore look for group images in different places;
 re-setting the group image on a current build republishes it to the current primary endpoint.
+
+### Invitation lookup diagnostics
+
+Invitation resolution reports `ObsoleteKeyPackage` only when the completed bounded lookup finds validated legacy packages in every observed newest addressable slot, with no usable current package. Clients can recommend updating and publishing a current KeyPackage. `MemberDiscoveryIncomplete` means the lookup could not establish missing or obsolete-only packages; retry may help. These diagnoses use the existing queries and preserve strict current-profile admission, slot replacement, fresh validation, and current-client preference. They describe the searched relays, not all publications across Nostr.
 
 ## Application-owned group state
 

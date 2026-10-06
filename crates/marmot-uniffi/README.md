@@ -181,6 +181,10 @@ are not credentials. Never log message bodies, asset references, keys, account/g
 raw DTO stringification or relay URLs as performance labels. Use bounded performance operations
 and aggregate snapshots; keep secrets out of diagnostics and host callback errors.
 
+### Invitation lookup errors
+
+`MarmotKitError::ObsoleteKeyPackage { account }` identifies a recipient whose completed bounded lookup found only validated legacy packages. Recommend updating the recipient’s app and publishing a current KeyPackage. `MemberDiscoveryIncomplete { account }` means missing or obsolete-only packages could not be established; offer retry without claiming absence. Existing malformed-package and capability errors remain distinct. Error Display strings omit recipient identity; keep the structured account field out of logs. No additional queries or legacy admission are introduced.
+
 ### Compatibility
 
 Generated source, DTOs, enums, errors, headers and native code form one versioned contract.
@@ -544,35 +548,6 @@ mutation, re-read the local inventory instead of applying an out-of-order
 refresh.
 
 ## KeyPackage client preference
-
-Create, invite and composition preflight perform fresh, bounded discovery before
-mutating group state. Safe recipient relay lists are searched with at most 16
-concurrent requests per endpoint set, up to 64 distinct normalized recipient
-endpoints. Configured fallback relays have a separate bounded budget. A failed
-outbox lookup also tries configured discovery relays and a single-author query.
-Completed single-author outbox searches are reused; incomplete searches can be
-retried. Failed prewarm route hints receive one metadata refresh within the same
-deadline, retaining observed key-package replacements across the retry. The
-50-second overall deadline reserves two seconds for validation and classification;
-network acquisition returns completed endpoint results before that reserve. Usable
-positive results survive incomplete acquisition; cached package bytes are not a fallback.
-Existing outer concurrency remains four relay-set batches and eight per-member
-fallbacks; the endpoint limit is not a process-wide connection limit.
-
-Hosts can localize `MissingKeyPackage`, `ObsoleteKeyPackage`,
-`MemberDiscoveryIncomplete`, `MemberDiscoveryTimeout`, `MemberRelayBudgetExceeded`,
-`MemberNoUsableDiscoveryRelays`, `MemberInvalidKeyPackage`,
-`MemberInvalidKeyPackageLifetime`, `MemberIncompatibleKeyPackage`, and
-`MissingMemberInboxRoute`. Recipient-specific variants carry the account id;
-the overall deadline cannot identify which recipient stalled. Missing and
-obsolete-only describe the completed bounded search, not all relays worldwide.
-Incomplete/budget outcomes must never be rendered as proof of absence. Legacy
-classification requires decoded MLS signatures, lifetime and account proof;
-client tags alone are insufficient. Legacy publications are inspected only for
-diagnosis and are never admitted to new groups. Offer connection/discovery retry
-for incomplete searches, recipient update/key setup guidance for package failures,
-and inbox-relay settings guidance for missing inbox routes. These pre-commit errors
-must not cause a host to repeat an already committed invitation or group creation.
 
 Invitation discovery temporarily prefers `whitenoise`, then untagged/other clients,
 then `amethyst`. Names are trimmed and matched case-insensitively, exactly (not by

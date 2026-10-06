@@ -14309,9 +14309,7 @@ async fn outbox_acceptance_closed_multi_author_queries_fall_back_per_member() {
 
     assert_eq!(summary.network_resolved_members, 2);
     assert_eq!(discovery_policy.rejected.load(Ordering::SeqCst), 1);
-    // Two recipients each receive metadata, current and (on this empty relay) legacy probes.
-    // Their usable outbox keys skip optional legacy requests.
-    assert_eq!(discovery_policy.accepted.load(Ordering::SeqCst), 6);
+    assert_eq!(discovery_policy.accepted.load(Ordering::SeqCst), 4);
     assert!(
         query_policy.rejected.load(Ordering::SeqCst) >= 2,
         "the real relay must reject both a relay-list and KeyPackage multi-author query"

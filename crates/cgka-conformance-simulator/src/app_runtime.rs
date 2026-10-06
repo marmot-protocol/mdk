@@ -2665,16 +2665,8 @@ fn app_error_kind(error: &AppError) -> &str {
         AppError::GroupInviteNotPending => "group_invite_not_pending",
         AppError::UserBlocked => "user_blocked",
         AppError::MessageDraftRevisionConflict => "message_draft_revision_conflict",
-        AppError::MissingKeyPackage(_) => "missing_key_package",
+        AppError::ObsoleteKeyPackage(_) | AppError::MissingKeyPackage(_) => "missing_key_package",
         AppError::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
-        AppError::ObsoleteKeyPackage(_) => "obsolete_key_package",
-        AppError::MemberDiscoveryIncomplete(_) => "member_discovery_incomplete",
-        AppError::MemberRelayBudgetExceeded(_) => "member_relay_budget_exceeded",
-        AppError::MemberNoUsableDiscoveryRelays(_) => "member_no_usable_discovery_relays",
-        AppError::MemberInvalidKeyPackage(_) => "member_invalid_key_package",
-        AppError::MemberInvalidKeyPackageLifetime(_) => "member_invalid_key_package_lifetime",
-        AppError::MemberIncompatibleKeyPackage(_) => "member_incompatible_key_package",
-        AppError::MemberDiscoveryTimeout => "member_discovery_timeout",
         _ => "app_runtime_operation",
     }
 }
@@ -2741,8 +2733,6 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::FullHistoryRepairIncomplete { .. }
         | AppError::RelayDirectory(_)
         | AppError::MemberDiscoveryIncomplete(_)
-        | AppError::MemberRelayBudgetExceeded(_)
-        | AppError::MemberDiscoveryTimeout
         | AppError::Publish(_)
         | AppError::BlobStore(_)
         | AppError::AgentStreamSendFailed(_)
@@ -2762,9 +2752,6 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::UnexpectedPrivateKey
         | AppError::IdentityKeyMismatch
         | AppError::InvalidKeyPackageEvent(_)
-        | AppError::MemberInvalidKeyPackage(_)
-        | AppError::MemberInvalidKeyPackageLifetime(_)
-        | AppError::MemberIncompatibleKeyPackage(_)
         | AppError::InvalidDirectorySearch(_)
         | AppError::InvalidGroupProfile(_)
         | AppError::InvalidAppComponent(_)
@@ -2785,8 +2772,6 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::InvalidAuditLogFile(_)
         | AppError::AgentStreamInvalidCandidate(_) => SubjectFailureCategory::Protocol,
         AppError::MissingKeyPackage(_)
-        | AppError::ObsoleteKeyPackage(_)
-        | AppError::MemberNoUsableDiscoveryRelays(_)
         | AppError::MissingMemberInboxRoute(_)
         | AppError::UnknownGroup(_)
         | AppError::GroupInviteNotPending
@@ -3123,14 +3108,10 @@ mod tests {
             AppError::AccountWorkerResponseTimedOut,
             AppError::ChatPresentationNotReady,
             AppError::AgentStreamSendFailed(Box::new(AppError::Publish(marker.into()))),
-            AppError::MemberDiscoveryIncomplete(marker.into()),
-            AppError::MemberRelayBudgetExceeded(marker.into()),
-            AppError::MemberDiscoveryTimeout,
         ] {
             let resource = app_error(failure);
             assert_eq!(resource.category, SubjectFailureCategory::Resource);
             assert_ne!(resource.code, denied.code);
-            assert!(!resource.message.contains(marker));
         }
         assert_ne!(environment.code, denied.code);
 
@@ -3147,23 +3128,6 @@ mod tests {
         let refusal = app_error(AppError::GroupInviteNotPending);
         assert_eq!(refusal.category, SubjectFailureCategory::ExpectedRefusal);
         assert!(!refusal.message.contains(marker));
-        for failure in [
-            AppError::ObsoleteKeyPackage(marker.into()),
-            AppError::MemberNoUsableDiscoveryRelays(marker.into()),
-        ] {
-            let refusal = app_error(failure);
-            assert_eq!(refusal.category, SubjectFailureCategory::ExpectedRefusal);
-            assert!(!refusal.message.contains(marker));
-        }
-        for failure in [
-            AppError::MemberInvalidKeyPackage(marker.into()),
-            AppError::MemberInvalidKeyPackageLifetime(marker.into()),
-            AppError::MemberIncompatibleKeyPackage(marker.into()),
-        ] {
-            let protocol = app_error(failure);
-            assert_eq!(protocol.category, SubjectFailureCategory::Protocol);
-            assert!(!protocol.message.contains(marker));
-        }
     }
 
     #[test]

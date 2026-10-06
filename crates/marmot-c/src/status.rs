@@ -138,12 +138,6 @@ pub enum MarmotStatus {
     InvalidAppComponent = 95,
     ObsoleteKeyPackage = 96,
     MemberDiscoveryIncomplete = 97,
-    MemberRelayBudgetExceeded = 98,
-    MemberNoUsableDiscoveryRelays = 99,
-    MemberInvalidKeyPackage = 100,
-    MemberInvalidKeyPackageLifetime = 101,
-    MemberIncompatibleKeyPackage = 102,
-    MemberDiscoveryTimeout = 103,
 }
 
 thread_local! {
@@ -208,20 +202,6 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::InvalidHex { .. } => MarmotStatus::InvalidHex,
         MarmotKitError::InvalidIdentity { .. } => MarmotStatus::InvalidIdentity,
         MarmotKitError::MissingKeyPackage { .. } => MarmotStatus::MissingKeyPackage,
-        MarmotKitError::ObsoleteKeyPackage { .. } => MarmotStatus::ObsoleteKeyPackage,
-        MarmotKitError::MemberDiscoveryIncomplete { .. } => MarmotStatus::MemberDiscoveryIncomplete,
-        MarmotKitError::MemberRelayBudgetExceeded { .. } => MarmotStatus::MemberRelayBudgetExceeded,
-        MarmotKitError::MemberNoUsableDiscoveryRelays { .. } => {
-            MarmotStatus::MemberNoUsableDiscoveryRelays
-        }
-        MarmotKitError::MemberInvalidKeyPackage { .. } => MarmotStatus::MemberInvalidKeyPackage,
-        MarmotKitError::MemberInvalidKeyPackageLifetime { .. } => {
-            MarmotStatus::MemberInvalidKeyPackageLifetime
-        }
-        MarmotKitError::MemberIncompatibleKeyPackage { .. } => {
-            MarmotStatus::MemberIncompatibleKeyPackage
-        }
-        MarmotKitError::MemberDiscoveryTimeout => MarmotStatus::MemberDiscoveryTimeout,
         MarmotKitError::MissingMemberInboxRoute { .. } => MarmotStatus::MissingMemberInboxRoute,
         MarmotKitError::Publish { .. } => MarmotStatus::Publish,
         MarmotKitError::TransportClosed => MarmotStatus::TransportClosed,
@@ -255,6 +235,8 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::MediaAttachmentRejected { .. } => MarmotStatus::MediaAttachmentRejected,
         MarmotKitError::MediaUnfetchable { .. } => MarmotStatus::MediaUnfetchable,
         MarmotKitError::MediaDownloadFailed { .. } => MarmotStatus::MediaDownloadFailed,
+        MarmotKitError::ObsoleteKeyPackage { .. } => MarmotStatus::ObsoleteKeyPackage,
+        MarmotKitError::MemberDiscoveryIncomplete { .. } => MarmotStatus::MemberDiscoveryIncomplete,
         MarmotKitError::InvalidKeyPackageEvent { .. } => MarmotStatus::InvalidKeyPackageEvent,
         MarmotKitError::FollowListUnavailable => MarmotStatus::FollowListUnavailable,
         MarmotKitError::RuntimeBusy => MarmotStatus::RuntimeBusy,
@@ -406,6 +388,12 @@ mod tests {
             MarmotKitError::InvalidIdentity {
                 details: "d".into(),
             },
+            MarmotKitError::ObsoleteKeyPackage {
+                account: "a".into(),
+            },
+            MarmotKitError::MemberDiscoveryIncomplete {
+                account: "a".into(),
+            },
             MarmotKitError::InvalidKeyPackageEvent {
                 details: "d".into(),
             },
@@ -504,38 +492,12 @@ mod tests {
             },
             MarmotKitError::AccountWorkerBusy,
             MarmotKitError::AccountWorkerResponseTimedOut,
-            MarmotKitError::ObsoleteKeyPackage {
-                account: "private-member".into(),
-            },
-            MarmotKitError::MemberDiscoveryIncomplete {
-                account: "private-member".into(),
-            },
-            MarmotKitError::MemberRelayBudgetExceeded {
-                account: "private-member".into(),
-            },
-            MarmotKitError::MemberNoUsableDiscoveryRelays {
-                account: "private-member".into(),
-            },
-            MarmotKitError::MemberInvalidKeyPackage {
-                account: "private-member".into(),
-            },
-            MarmotKitError::MemberInvalidKeyPackageLifetime {
-                account: "private-member".into(),
-            },
-            MarmotKitError::MemberIncompatibleKeyPackage {
-                account: "private-member".into(),
-            },
-            MarmotKitError::MemberDiscoveryTimeout,
         ];
         assert_eq!(
             variants.len(),
-            94,
+            88,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
-        for (error, expected) in variants[86..].iter().zip(96..=103) {
-            assert_eq!(status_from_error(error) as i32, expected);
-            assert!(!take_last_error().unwrap().contains("private-member"));
-        }
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
         assert_eq!(
             status_from_error(&MarmotKitError::BlockListUnavailable) as i32,
@@ -545,6 +507,19 @@ mod tests {
             status_from_error(&MarmotKitError::BlockPublicationUncertain) as i32,
             80
         );
+        assert_eq!(
+            status_from_error(&MarmotKitError::ObsoleteKeyPackage {
+                account: "private".into()
+            }) as i32,
+            96
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::MemberDiscoveryIncomplete {
+                account: "private".into()
+            }) as i32,
+            97
+        );
+        assert!(!take_last_error().unwrap().contains("private"));
         let mut seen = std::collections::BTreeSet::new();
         for err in &variants {
             let status = status_from_error(err);

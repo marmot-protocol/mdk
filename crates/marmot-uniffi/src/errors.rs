@@ -94,23 +94,10 @@ pub enum MarmotKitError {
     /// host apps can present a setup/invite state without string matching.
     #[error("invalid key package event: {details}")]
     InvalidKeyPackageEvent { details: String },
-    /// A validated legacy package was found, but no current package on the searched relays.
     #[error("obsolete key package")]
     ObsoleteKeyPackage { account: String },
     #[error("discovery incomplete")]
     MemberDiscoveryIncomplete { account: String },
-    #[error("relay discovery budget exceeded")]
-    MemberRelayBudgetExceeded { account: String },
-    #[error("no usable discovery relays")]
-    MemberNoUsableDiscoveryRelays { account: String },
-    #[error("member published package failed validation")]
-    MemberInvalidKeyPackage { account: String },
-    #[error("member package lifetime is invalid")]
-    MemberInvalidKeyPackageLifetime { account: String },
-    #[error("member package lacks required group capabilities")]
-    MemberIncompatibleKeyPackage { account: String },
-    #[error("member discovery timed out")]
-    MemberDiscoveryTimeout,
     #[error("missing key package for {account}")]
     MissingKeyPackage { account: String },
     /// The invite target has no kind-10050 inbox endpoint that this device can
@@ -473,32 +460,6 @@ impl From<&AppError> for MarmotKitError {
             AppError::Hex(err) => Self::InvalidHex {
                 details: err.to_string(),
             },
-            AppError::ObsoleteKeyPackage(account) => Self::ObsoleteKeyPackage {
-                account: account.clone(),
-            },
-            AppError::MemberDiscoveryIncomplete(account) => Self::MemberDiscoveryIncomplete {
-                account: account.clone(),
-            },
-            AppError::MemberRelayBudgetExceeded(account) => Self::MemberRelayBudgetExceeded {
-                account: account.clone(),
-            },
-            AppError::MemberNoUsableDiscoveryRelays(account) => {
-                Self::MemberNoUsableDiscoveryRelays {
-                    account: account.clone(),
-                }
-            }
-            AppError::MemberInvalidKeyPackage(account) => Self::MemberInvalidKeyPackage {
-                account: account.clone(),
-            },
-            AppError::MemberInvalidKeyPackageLifetime(account) => {
-                Self::MemberInvalidKeyPackageLifetime {
-                    account: account.clone(),
-                }
-            }
-            AppError::MemberIncompatibleKeyPackage(account) => Self::MemberIncompatibleKeyPackage {
-                account: account.clone(),
-            },
-            AppError::MemberDiscoveryTimeout => Self::MemberDiscoveryTimeout,
             AppError::MissingKeyPackage(account) => Self::MissingKeyPackage {
                 account: account.clone(),
             },
@@ -514,6 +475,10 @@ impl From<&AppError> for MarmotKitError {
             AppError::IdentityKeyMismatch => Self::InvalidIdentity {
                 details: "public identity does not match the imported private key".into(),
             },
+            AppError::ObsoleteKeyPackage(account) => Self::ObsoleteKeyPackage { account },
+            AppError::MemberDiscoveryIncomplete(account) => {
+                Self::MemberDiscoveryIncomplete { account }
+            }
             AppError::InvalidKeyPackageEvent(details) => Self::InvalidKeyPackageEvent {
                 details: details.clone(),
             },
@@ -981,39 +946,6 @@ mod tests {
     }
 
     #[test]
-    fn invite_discovery_failures_cross_ffi_without_becoming_opaque_runtime_errors() {
-        let account = "11".repeat(32);
-        let cases = [
-            AppError::ObsoleteKeyPackage(account.clone()),
-            AppError::MemberDiscoveryIncomplete(account.clone()),
-            AppError::MemberRelayBudgetExceeded(account.clone()),
-            AppError::MemberNoUsableDiscoveryRelays(account.clone()),
-            AppError::MemberInvalidKeyPackage(account.clone()),
-            AppError::MemberInvalidKeyPackageLifetime(account.clone()),
-            AppError::MemberIncompatibleKeyPackage(account.clone()),
-        ];
-        for error in cases {
-            let ffi: MarmotKitError = error.into();
-            assert!(!ffi.to_string().contains(&account));
-            let recipient = match ffi {
-                MarmotKitError::ObsoleteKeyPackage { account }
-                | MarmotKitError::MemberDiscoveryIncomplete { account }
-                | MarmotKitError::MemberRelayBudgetExceeded { account }
-                | MarmotKitError::MemberNoUsableDiscoveryRelays { account }
-                | MarmotKitError::MemberInvalidKeyPackage { account }
-                | MarmotKitError::MemberInvalidKeyPackageLifetime { account }
-                | MarmotKitError::MemberIncompatibleKeyPackage { account } => account,
-                _ => panic!("recipient readiness must remain typed"),
-            };
-            assert_eq!(recipient, account);
-        }
-        assert!(matches!(
-            MarmotKitError::from(AppError::MemberDiscoveryTimeout),
-            MarmotKitError::MemberDiscoveryTimeout
-        ));
-    }
-
-    #[test]
     fn invalid_key_package_event_maps_to_typed_variant() {
         let app_err = AppError::InvalidKeyPackageEvent("unsupported cipher suite".to_string());
         let ffi: MarmotKitError = app_err.into();
@@ -1037,6 +969,23 @@ mod tests {
             MarmotKitError::MissingMemberInboxRoute { account: recipient }
                 if recipient == account
         ));
+    }
+
+    #[test]
+    fn invitation_diagnostics_preserve_recipient_without_displaying_identity() {
+        let account = "11".repeat(32);
+        for error in [
+            AppError::ObsoleteKeyPackage(account.clone()),
+            AppError::MemberDiscoveryIncomplete(account.clone()),
+        ] {
+            let ffi: MarmotKitError = error.into();
+            assert!(!ffi.to_string().contains(&account));
+            assert!(matches!(ffi,
+                MarmotKitError::ObsoleteKeyPackage { account: recipient }
+                | MarmotKitError::MemberDiscoveryIncomplete { account: recipient }
+                if recipient == account
+            ));
+        }
     }
 
     #[test]

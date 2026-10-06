@@ -1,8 +1,8 @@
 mod draft_lifecycle;
 mod group_lookup;
-mod invite_discovery;
 mod key_package_inventory;
 mod key_package_selection;
+mod invite_diagnostics;
 mod message_journeys;
 mod report_backfill;
 mod user_blocks;
@@ -541,14 +541,11 @@ pub(crate) struct MemberResolutionDirectoryFetcher {
     events_by_endpoint:
         std::sync::Mutex<std::collections::HashMap<String, Vec<NostrTransportEvent>>>,
     reject_multi_author: std::sync::atomic::AtomicBool,
-    reject_legacy_queries: std::sync::atomic::AtomicBool,
     key_packages_only_in_single_author: std::sync::Mutex<std::collections::HashSet<String>>,
     key_packages_only_in_multi_author: std::sync::Mutex<std::collections::HashSet<String>>,
     reject_multi_author_incomplete: std::sync::atomic::AtomicBool,
     failing_single_author: std::sync::Mutex<Option<String>>,
-    failing_key_package_endpoint: std::sync::Mutex<Option<String>>,
     stalled_endpoint: std::sync::Mutex<Option<String>>,
-    fetch_delay: std::sync::Mutex<Option<Duration>>,
     incomplete_endpoint: std::sync::Mutex<Option<String>>,
     fetch_gate: std::sync::Mutex<
         Option<(
@@ -585,13 +582,6 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
         request: crate::relay_plane::DirectoryFetchRequest,
     ) -> Result<Vec<crate::relay_plane::DirectoryRelayEventRecord>, String> {
         self.requests.lock().unwrap().push(request.clone());
-        if self
-            .reject_legacy_queries
-            .load(std::sync::atomic::Ordering::SeqCst)
-            && request.queries.iter().any(|query| query.kind == 443)
-        {
-            return Err("CLOSED: unsupported legacy kind".into());
-        }
         let gate = {
             let mut fetch_gate = self.fetch_gate.lock().unwrap();
             if request
@@ -611,19 +601,6 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
         if self.fail_all.load(std::sync::atomic::Ordering::SeqCst) {
             return Err("directory fetch failed".to_owned());
         }
-        let failing_endpoint = self.failing_key_package_endpoint.lock().unwrap().clone();
-        if failing_endpoint.is_some_and(|failing| {
-            request
-                .endpoints
-                .iter()
-                .any(|endpoint| endpoint.0 == failing)
-        }) && request
-            .queries
-            .iter()
-            .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)
-        {
-            return Err("key-package endpoint failed".into());
-        }
         if self
             .reject_multi_author
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -637,10 +614,6 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
             })
         {
             return Err(format!("single-author query failed for {failing_author}"));
-        }
-        let delay = *self.fetch_delay.lock().unwrap();
-        if let Some(delay) = delay {
-            tokio::time::sleep(delay).await;
         }
         let stalled_endpoint = self.stalled_endpoint.lock().unwrap().clone();
         if stalled_endpoint.is_some_and(|stalled| {
@@ -8096,7 +8069,7 @@ async fn incomplete_discovery_is_not_cleared_by_an_empty_cached_outbox() {
         .expect_err("an empty outbox cannot prove absence after discovery failed");
 
     assert!(
-        matches!(error, AppError::MemberDiscoveryIncomplete(_)),
+        matches!(error, AppError::RelayDirectory(ref message) if message.contains("not authoritatively established")),
         "unknown discovery must remain retryable instead of becoming a missing-route verdict: {error:?}"
     );
     assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
@@ -8108,8 +8081,8 @@ async fn incomplete_discovery_is_not_cleared_by_an_empty_cached_outbox() {
 }
 
 #[tokio::test]
-/// A found inbox list naming only retired relays remains a typed, retryable
-/// incomplete-discovery result until refresh establishes a final verdict.
+/// A found inbox list naming only retired relays is named in the error, which
+/// still reports the incomplete outbox hop rather than a final verdict.
 async fn member_inbox_of_only_retired_relays_is_reported_distinctly() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let account_id = accounts[0].account_id_hex.clone();
@@ -8126,7 +8099,7 @@ async fn member_inbox_of_only_retired_relays_is_reported_distinctly() {
         .expect_err("a member with no usable inbox cannot be invited");
 
     assert!(
-        matches!(error, AppError::MemberDiscoveryIncomplete(ref recipient) if recipient == &account_id),
+        matches!(error, AppError::RelayDirectory(ref message) if message.contains("no usable relays") && message.contains("refresh did not complete")),
         "{error:?}"
     );
 }
@@ -8147,7 +8120,7 @@ async fn cached_retired_inbox_with_failed_refresh_remains_retryable() {
         .await
         .expect_err("a failed refresh cannot use a retired-only cached inbox");
     assert!(
-        matches!(error, AppError::MemberDiscoveryIncomplete(ref recipient) if recipient == &account_id),
+        matches!(error, AppError::RelayDirectory(ref message) if message.contains("refresh did not complete")),
         "{error:?}"
     );
 
@@ -8314,10 +8287,7 @@ async fn future_dated_inbox_is_unknown_for_account_and_member_resolution() {
         .resolve_member_key_packages(&[id.as_str()])
         .await
         .unwrap_err();
-    assert!(matches!(
-        member_error,
-        AppError::MemberDiscoveryIncomplete(_)
-    ));
+    assert!(matches!(member_error, AppError::RelayDirectory(_)));
 }
 
 #[tokio::test]
@@ -8803,12 +8773,7 @@ async fn member_key_package_resolution_refreshes_shared_directory_and_prewarm() 
         1,
         "prewarmed routes should avoid repeating discovery"
     );
-    assert!(
-        requests[0]
-            .queries
-            .iter()
-            .any(|query| { query.kind == KIND_MARMOT_KEY_PACKAGE && !query.evidence_only })
-    );
+    assert_eq!(requests[0].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
 }
 
 #[tokio::test]
@@ -8905,7 +8870,7 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
             .await
             .err()
             .expect("future-only discovery must fail closed");
-        assert!(matches!(error, AppError::MemberDiscoveryIncomplete(id) if id == members[0]));
+        assert!(matches!(error, AppError::MissingKeyPackage(id) if id == members[0]));
         assert!(
             fetcher.requests.lock().unwrap().iter().any(|request| {
                 request
@@ -8917,12 +8882,12 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
         );
         let refs = members.iter().map(String::as_str).collect::<Vec<_>>();
         let ordinary = app.resolve_member_key_packages(&refs).await.unwrap_err();
-        assert!(matches!(ordinary, AppError::MemberDiscoveryIncomplete(id) if id == members[0]));
+        assert!(matches!(ordinary, AppError::MissingKeyPackage(id) if id == members[0]));
         let prewarm = app
             .prewarm_group_member_key_packages(&refs)
             .await
             .unwrap_err();
-        assert!(matches!(prewarm, AppError::MemberDiscoveryIncomplete(id) if id == members[0]));
+        assert!(matches!(prewarm, AppError::MissingKeyPackage(id) if id == members[0]));
     }
 }
 
@@ -8968,18 +8933,9 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
             .all(|query| query.authors.len() == 8)
     );
     assert_eq!(requests[2].queries.len(), 1);
-    let package_query = requests[2]
-        .queries
-        .iter()
-        .find(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)
-        .unwrap();
-    assert!(!package_query.evidence_only);
-    assert_eq!(package_query.authors.len(), 8);
-    assert_eq!(package_query.limit, 8 * 12);
-    assert!(
-        requests[2].queries.iter().all(|query| query.kind != 443),
-        "a usable current batch must not trigger optional legacy probes"
-    );
+    assert_eq!(requests[2].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
+    assert_eq!(requests[2].queries[0].authors.len(), 8);
+    assert_eq!(requests[2].queries[0].limit, 8 * 12);
     drop(requests);
 
     for account in &accounts {
@@ -8996,8 +8952,8 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
     assert_eq!(resolved.len(), 8);
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
-        20,
-        "create reuses discovery routes; its package batch adds eight per-author searches of both configured and outbox relays"
+        12,
+        "create reuses discovery routes but adds a package batch and eight preference refetches"
     );
 }
 
@@ -9059,12 +9015,7 @@ async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox
         "discovery covers the outbox; prewarm adds only the package batch"
     );
     assert_eq!(requests[0].queries.len(), 2);
-    assert!(
-        requests[1]
-            .queries
-            .iter()
-            .any(|query| { query.kind == KIND_MARMOT_KEY_PACKAGE && !query.evidence_only })
-    );
+    assert_eq!(requests[1].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
     assert_eq!(
         app.resolve_member_key_packages(&members)
             .await
@@ -9107,8 +9058,8 @@ async fn member_key_package_set_falls_back_when_multi_author_queries_are_rejecte
             .iter()
             .filter(|request| request.queries.iter().all(|query| query.authors.len() == 1))
             .count(),
-        8,
-        "each metadata hop retries per member; package retries search configured and outbox relays separately"
+        6,
+        "discovery, outbox, and KeyPackage batches must each fall back per member"
     );
 }
 
@@ -9140,8 +9091,8 @@ async fn member_key_package_set_falls_back_when_multi_author_queries_are_incompl
             .iter()
             .filter(|request| request.queries.iter().all(|query| query.authors.len() == 1))
             .count(),
-        8,
-        "incomplete relay-list hops and package searches retry each member on both sources"
+        4,
+        "both relay-list hops retry each member; successful prewarm needs no preference refetch"
     );
 }
 
@@ -9228,7 +9179,7 @@ async fn malformed_batch_member_does_not_discard_valid_member_prewarm() {
         .prewarm_group_member_key_packages(&[malformed_account.as_str(), valid_account.as_str()])
         .await
         .expect_err("the malformed member must fail");
-    assert!(matches!(error, AppError::MemberInvalidKeyPackage(_)));
+    assert!(matches!(error, AppError::InvalidKeyPackageEvent(_)));
     let requests_after_partial = fetcher.requests.lock().unwrap().len();
 
     let summary = app
@@ -9294,7 +9245,7 @@ async fn member_key_package_resolution_rejects_superseded_slot_after_malformed_r
         .await
         .expect_err("a malformed replacement must suppress the superseded KeyPackage in its slot");
 
-    assert!(matches!(error, AppError::MemberInvalidKeyPackage(_)));
+    assert!(matches!(error, AppError::InvalidKeyPackageEvent(_)));
 }
 
 #[tokio::test]

@@ -56,10 +56,6 @@ for each release.
 - Every fallible function returns `MarmotStatus` (`MARMOT_STATUS_OK` is
   0); detail text for the calling thread's most recent failure comes from
   `marmot_last_error_message()` (free with `marmot_string_free`).
-  Invitation discovery has distinct status codes for obsolete packages,
-  incomplete searches, relay budgets, unusable routes, invalid packages and
-  lifetimes, incompatible capabilities, and timeouts. These detail strings
-  omit recipient identifiers; status codes carry the diagnosis.
 - Structs returned by pointer are freed ONLY with their matching
   `marmot_*_free`, which deep-frees every field. Never free fields
   individually, never free twice; NULL is always a no-op.
@@ -229,6 +225,10 @@ when that exact event is observed; `relay` becomes true while `local_state`
 remains retained. On refresh failure, keep the local result.
 Free either list with `marmot_account_key_package_inventory_entry_list_free`.
 Each entry embeds the existing `MarmotAccountKeyPackage` record plus `MarmotAccountKeyPackageLocalState`.
+
+### Invitation lookup errors
+
+`MARMOT_STATUS_OBSOLETE_KEY_PACKAGE` identifies validated legacy-only packages on the searched relays. `MARMOT_STATUS_MEMBER_DISCOVERY_INCOMPLETE` means missing or obsolete-only packages could not be established. Preserve these distinct recovery actions without parsing detail strings. Details omit the recipient identity. See the [shared invitation lookup contract](../marmot-uniffi/README.md#invitation-lookup-errors).
 
 ## Selected chat-list presentation
 
