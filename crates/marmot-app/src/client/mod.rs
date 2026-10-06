@@ -537,6 +537,8 @@ pub struct AppClient {
     pub(crate) pending_applied_sync_summary: crate::SyncSummary,
     /// Committed batches retained until every app projection write succeeds.
     pub(super) pending_applied_effects: std::collections::VecDeque<sync::PendingAppliedEffects>,
+    /// Hydrated groups whose canonical push cleanup needs a bounded retry.
+    pub(super) pending_push_leaf_reconciliations: std::collections::HashSet<GroupId>,
     /// App-visible outputs ingested during a sync whose account-projection
     /// checkpoint failed. A retained client keeps the matching projected state
     /// and outbox acknowledgements, then returns this summary after its next

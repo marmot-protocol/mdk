@@ -47,9 +47,11 @@
   convergence, including reportless membership changes and leaf-token cleanup.
   Group commands and maintenance also observe native membership decisions
   produced while settling retained commits. Secondary projection or route-refresh
-  failures preserve the canonical publish result. Failed outbound/native
-  projection batches remain in the session retry queue until their writes succeed;
-  route rebuilds use the same bounded worker retry. This queue is not durable.
+  failures preserve the canonical publish result. Failed projection batches
+  retain their source identity/time in a session queue; later delivery, drain and
+  convergence observations cannot overtake them. Successful-prefix subscriber
+  updates survive a later write failure. Route rebuilds and failed hydration
+  token sweeps use bounded worker retries. These retry queues are not durable.
   Local termination preserves peer push records and tombstones. Late gossip
   cannot re-add an absent account/leaf pair; hydrated open reconciles missed leaf
   cleanup without treating unreadable groups as empty rosters.

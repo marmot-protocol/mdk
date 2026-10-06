@@ -1067,10 +1067,9 @@ impl AppClient {
         &self,
         events: &[cgka_traits::engine::GroupEvent],
         recorded_at: u64,
-    ) -> Result<Vec<crate::AppProjectionUpdate>, AppError> {
-        let mut updates = Vec::new();
-        self.project_group_system_rows_into(events, recorded_at, &mut updates, true)?;
-        Ok(updates)
+        updates: &mut Vec<crate::AppProjectionUpdate>,
+    ) -> Result<(), AppError> {
+        self.project_group_system_rows_into(events, recorded_at, updates, true)
     }
 
     fn project_group_system_rows_into(

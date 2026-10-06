@@ -815,7 +815,26 @@ async fn sibling_selfremove_through_author_command(profile_command: bool) {
     drop(alice);
     drop(app);
     let reopened = app_at(&dir, relay.clone());
-    let client = if profile_command {
+    let path = reopened.account_storage_path("bob");
+    let keys = reopened.account_home().load_signing_keys("bob").unwrap();
+    let key = reopened
+        .sqlcipher_key("bob", &keys, &path, SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    connection
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_reopen_leaf_cleanup BEFORE DELETE ON group_push_tokens
+        WHEN OLD.leaf_index = {departing_leaf}
+        BEGIN SELECT RAISE(FAIL, 'injected leaf cleanup failure'); END;"
+        ))
+        .unwrap();
+    let mut client = if profile_command {
         let plane = MarmotRelayPlane::new(None, relay);
         let mut client = reopened
             .local_client_with_relay_plane_and_hydration("bob", &plane, None, true, None)
@@ -828,6 +847,19 @@ async fn sibling_selfremove_through_author_command(profile_command: bool) {
     } else {
         reopened.client("bob").await.unwrap()
     };
+    assert_eq!(
+        reopened.group_push_tokens("bob", &group_hex).unwrap().len(),
+        2
+    );
+    assert!(client.has_pending_runtime_group_subscription_refresh());
+    connection
+        .execute_batch("DROP TRIGGER fail_reopen_leaf_cleanup")
+        .unwrap();
+    client
+        .retry_pending_runtime_group_subscription_refresh()
+        .await
+        .unwrap();
+    assert!(client.pending_push_leaf_reconciliations.is_empty());
     assert!(can_send(&client, &group));
     assert!(
         !client
@@ -1152,7 +1184,14 @@ async fn maintenance_counts_one_recovery_transition() {
 /// batch. Retrying projects the tail without changing the primary publish result.
 #[tokio::test]
 async fn partial_native_projection_retries_without_republishing() {
-    for failed_publish in [false, true] {
+    for (seam, failed_publish) in [
+        (0, false),
+        (0, true),
+        (1, false),
+        (1, true),
+        (2, false),
+        (2, true),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let account = AccountHome::open(dir.path())
             .create_account("alice")
@@ -1164,6 +1203,27 @@ async fn partial_native_projection_retries_without_republishing() {
         let group = client.create_group("projection retry", &[]).await.unwrap();
         let group_hex = hex::encode(group.as_slice());
         client.take_pending_applied_sync_summary();
+        app.record_account_app_event(
+            "alice",
+            &AppMessageProjection {
+                authority: None,
+                message_id_hex: "held-prefix".into(),
+                source_message_id_hex: None,
+                direction: "sent".into(),
+                group_id_hex: group_hex.clone(),
+                sender: account.account_id_hex.clone(),
+                plaintext: "pending before storage fault".into(),
+                kind: MARMOT_APP_EVENT_KIND_CHAT,
+                tags: Vec::new(),
+                source_epoch: Some(1),
+                retention: None,
+                recorded_at: Some(11),
+                origin_commit_id: None,
+                moderation_grant: false,
+            },
+        )
+        .unwrap();
+
         let path = app.account_storage_path("alice");
         let keys = app.account_home().load_signing_keys("alice").unwrap();
         let key = app
@@ -1212,15 +1272,32 @@ async fn partial_native_projection_retries_without_republishing() {
             });
         }
         let publications = relay.published_events.lock().unwrap().len();
-        let result = client
-            .observe_recovery_evidence_then_fail_if_publish_failed(&effects)
-            .await;
+        let result = match seam {
+            0 => {
+                client
+                    .observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+                    .await
+            }
+            1 => client
+                .observe_drained_session_events(&effects)
+                .await
+                .map(|_| ()),
+            _ => client
+                .observe_convergence_retry_effects(&group, &effects)
+                .await
+                .map(|_| ()),
+        };
         if failed_publish {
             assert!(
                 matches!(result, Err(AppError::Publish(reason)) if reason == "primary failure")
             );
-        } else {
+        } else if seam == 0 {
             result.unwrap();
+        } else {
+            assert!(
+                result.is_err(),
+                "ordinary observers still report their storage failure"
+            );
         }
         assert_eq!(
             app.stored_group_self_membership("alice", &group_hex)
@@ -1229,11 +1306,15 @@ async fn partial_native_projection_retries_without_republishing() {
         );
         assert!(client.has_pending_runtime_group_subscription_refresh());
         assert_eq!(client.pending_applied_effects.len(), 1);
+        let prefix = client.take_pending_applied_sync_summary();
         assert!(
-            client
-                .take_pending_applied_sync_summary()
+            prefix
                 .projection_updates
-                .is_empty()
+                .iter()
+                .flat_map(|update| &update.timeline_messages)
+                .any(|row| row.message_id_hex == "held-prefix"
+                    && row.invalidation_status.as_deref() == Some("local_publish_failed")),
+            "the successful pending-send invalidation must reach subscribers even when the tail fails"
         );
         assert!(
             client
@@ -1369,4 +1450,9 @@ async fn committed_activity_tail_retries_after_storage_failure() {
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(ids.len(), 2, "subscribers receive both committed rows");
     assert_eq!(relay.published_events.lock().unwrap().len(), publications);
+    client.observe_send_applied_effects(&effects).await.unwrap();
+    assert!(
+        !client.has_pending_runtime_group_subscription_refresh(),
+        "successful ordinary activity must not arm an unnecessary route rebuild"
+    );
 }

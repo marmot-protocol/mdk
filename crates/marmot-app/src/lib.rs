@@ -1892,6 +1892,7 @@ impl MarmotApp {
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),
             pending_applied_effects: Default::default(),
+            pending_push_leaf_reconciliations: Default::default(),
             pending_failed_sync_summary: SyncSummary::default(),
             explicit_history_window_certified: false,
             recovery_job_network_cut: false,

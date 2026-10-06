@@ -680,6 +680,8 @@ impl StagedSyncError {
 pub(crate) struct PendingAppliedEffects {
     effects: marmot_account::AccountDeviceEffects,
     received_at: u64,
+    source_message_id_hex: String,
+    drained: bool,
 }
 
 impl AppClient {
@@ -1344,7 +1346,9 @@ impl AppClient {
     }
 
     pub(crate) fn has_pending_runtime_group_subscription_refresh(&self) -> bool {
-        self.pending_runtime_group_subscription_refresh || !self.pending_applied_effects.is_empty()
+        self.pending_runtime_group_subscription_refresh
+            || !self.pending_applied_effects.is_empty()
+            || !self.pending_push_leaf_reconciliations.is_empty()
     }
 
     /// Retry an ordinary group-subscription rebuild that was deliberately
@@ -1359,6 +1363,7 @@ impl AppClient {
         }
         self.pending_runtime_group_subscription_refresh = true;
         self.retry_applied_effect_projections().await?;
+        self.retry_pending_push_leaf_reconciliations()?;
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         self.refresh_group_routes()?;
         if let Err(error) = self.sync_runtime_groups().await {
@@ -1375,7 +1380,7 @@ impl AppClient {
             }
         }
         self.pending_runtime_group_subscription_refresh = false;
-        Ok(false)
+        Ok(self.has_pending_runtime_group_subscription_refresh())
     }
 
     pub(crate) async fn prepare_transport(&mut self) -> Result<(), AppError> {
@@ -1810,8 +1815,32 @@ impl AppClient {
             self.drain_epoch_stall_escalations(&mut summary);
             return Ok(summary);
         }
-        let display_names = self.display_names_for_events(&effects.events);
         let source_received_at = unix_now_seconds();
+        if let Err(error) = Box::pin(self.retry_applied_effect_projections()).await {
+            self.retain_effect_projection(effects, "", source_received_at, true);
+            self.pending_applied_sync_summary.merge(summary);
+            return Err(error);
+        }
+        if let Err(error) = self
+            .project_drained_effects(effects, source_received_at, &mut summary)
+            .await
+        {
+            self.retain_effect_projection(effects, "", source_received_at, true);
+            self.pending_applied_sync_summary.merge(summary);
+            return Err(error);
+        }
+        Ok(summary)
+    }
+
+    /// Replay the projection half of a drain without repeating recovery or
+    /// publication bookkeeping. Keep its successful prefix available on failure.
+    async fn project_drained_effects(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+        source_received_at: u64,
+        summary: &mut SyncSummary,
+    ) -> Result<(), AppError> {
+        let display_names = self.display_names_for_events(&effects.events);
         // Hydration replays a stored group's `GroupDisbanded` once ever
         // (`restore_disband_tombstone`), as the belt-and-braces reconciler for a
         // disband whose live-session projection never completed — a crash, or a
@@ -1868,7 +1897,7 @@ impl AppClient {
             if let Some(message) = observe_event(
                 &mut self.state,
                 &display_names,
-                &mut summary,
+                summary,
                 event,
                 group_projection.as_ref(),
                 &source_message_id_hex,
@@ -1880,7 +1909,7 @@ impl AppClient {
                     message,
                     event_encrypted_media_secret(event),
                     group_metadata.as_ref(),
-                    &mut summary,
+                    summary,
                 ) {
                     Ok(Some(gossip_message_id)) => {
                         gossip_message_ids.insert(gossip_message_id);
@@ -1918,7 +1947,7 @@ impl AppClient {
                     marmot_forensics::v5::UpdateCause::RetainedEventReplay,
                 );
             }
-            let projected = self.observe_event_projection_effects(event, &mut summary);
+            let projected = self.observe_event_projection_effects(event, summary);
             match projected {
                 Ok(dirty) => routes_dirty |= dirty,
                 Err(error) => {
@@ -1959,9 +1988,11 @@ impl AppClient {
         // observation time, exactly like every other projection in the loop.
         // The row id is derived from the change and its epoch, never from the
         // stamp, so a crash that replays the batch re-upserts the same row.
-        summary
-            .projection_updates
-            .extend(self.project_group_system_rows(&effects.events, source_received_at));
+        self.try_project_group_system_rows(
+            &effects.events,
+            source_received_at,
+            &mut summary.projection_updates,
+        )?;
         // Reconcile transport routes once after the batch drains instead of per
         // membership-changing event. This installs a join's current route and
         // retains any still-live address displaced by a routing rotation.
@@ -1981,19 +2012,21 @@ impl AppClient {
             // below owes no arm: when either edge was set the rebuild above
             // already succeeded, and when neither was set nothing is owed.
             self.pending_runtime_group_subscription_refresh = true;
-            self.pending_failed_sync_summary.merge(summary);
+            self.pending_failed_sync_summary
+                .merge(std::mem::take(summary));
             return Err(error);
         }
         if let Err(error) = self.save_state_with_pending_local_group_deletion_frontier_clears() {
             // The engine outbox remains unacknowledged. A reopened client will
             // replay it; a retained client instead checkpoints the projected
             // state on its next sync and returns this deferred summary once.
-            self.pending_failed_sync_summary.merge(summary);
+            self.pending_failed_sync_summary
+                .merge(std::mem::take(summary));
             return Err(error);
         }
         summary.merge(std::mem::take(&mut self.pending_failed_sync_summary));
-        self.drain_epoch_stall_escalations(&mut summary);
-        Ok(summary)
+        self.drain_epoch_stall_escalations(summary);
+        Ok(())
     }
 
     /// Observe group events the engine applied as a side effect of an outbound
@@ -2030,30 +2063,53 @@ impl AppClient {
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) {
+        self.retain_effect_projection(effects, "", unix_now_seconds(), false);
+    }
+
+    fn retain_effect_projection(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+        source_message_id_hex: &str,
+        received_at: u64,
+        drained: bool,
+    ) {
+        if effects.events.is_empty() {
+            return;
+        }
         self.pending_applied_effects
             .push_back(PendingAppliedEffects {
                 effects: effects.clone(),
-                received_at: unix_now_seconds(),
+                received_at,
+                source_message_id_hex: source_message_id_hex.to_owned(),
+                drained,
             });
     }
 
-    /// Replay committed batches in order without repeating engine work or
-    /// publication. Projection writes are idempotent; subscriber summaries are
-    /// released once the entire batch has projected, before fallible routing.
+    /// Retry committed batches in order without repeating engine publication.
+    /// Preserve subscriber updates from successful writes even if a later write
+    /// fails: an idempotent replay may not regenerate those prefix updates.
     async fn retry_applied_effect_projections(&mut self) -> Result<bool, AppError> {
         let mut routes_dirty = false;
         while let Some(pending) = self.pending_applied_effects.front().cloned() {
             let mut summary = SyncSummary::default();
-            routes_dirty |= self
-                .observe_account_device_effects(
+            let result = if pending.drained {
+                self.project_drained_effects(&pending.effects, pending.received_at, &mut summary)
+                    .await
+                    .map(|()| false)
+            } else {
+                self.observe_account_device_effects(
                     &pending.effects,
                     &mut summary,
-                    "",
+                    &pending.source_message_id_hex,
                     pending.received_at,
                     true,
                 )
-                .await?;
+                .await
+            };
             self.pending_applied_sync_summary.merge(summary);
+            let dirty = result?;
+            routes_dirty |= dirty;
+            self.pending_runtime_group_subscription_refresh |= dirty;
             self.pending_applied_effects.pop_front();
         }
         Ok(routes_dirty)
@@ -5541,14 +5597,25 @@ impl AppClient {
         }
     }
 
+    /// Fence fresh observations behind retained batches; a replay already owns
+    /// the queue head and must not recursively flush or enqueue itself.
     async fn observe_account_device_effects(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
         summary: &mut SyncSummary,
         source_message_id_hex: &str,
         source_received_at: u64,
-        retry_projection_writes: bool,
+        replaying: bool,
     ) -> Result<bool, AppError> {
+        if !replaying && let Err(error) = Box::pin(self.retry_applied_effect_projections()).await {
+            self.retain_effect_projection(
+                effects,
+                source_message_id_hex,
+                source_received_at,
+                false,
+            );
+            return Err(error);
+        }
         let started = Instant::now();
         let result = self
             .observe_account_device_effects_inner(
@@ -5556,11 +5623,20 @@ impl AppClient {
                 summary,
                 source_message_id_hex,
                 source_received_at,
-                retry_projection_writes,
             )
             .await;
         if let Err(error) = &result {
             self.record_v5_event_projection_failure(&effects.events, error, started.elapsed());
+            if !replaying {
+                self.retain_effect_projection(
+                    effects,
+                    source_message_id_hex,
+                    source_received_at,
+                    false,
+                );
+                self.pending_applied_sync_summary
+                    .merge(std::mem::take(summary));
+            }
         }
         result
     }
@@ -5571,7 +5647,6 @@ impl AppClient {
         summary: &mut SyncSummary,
         source_message_id_hex: &str,
         source_received_at: u64,
-        retry_projection_writes: bool,
     ) -> Result<bool, AppError> {
         let display_names = self.display_names_for_events(&effects.events);
         self.note_superseded_intent_reports(effects);
@@ -5688,12 +5763,11 @@ impl AppClient {
         }
         // Synthesize durable kind-1210 system rows from authenticated state
         // changes (peer commits, auto-commits, and scheduled convergence).
-        let system_updates = if retry_projection_writes {
-            self.try_project_group_system_rows(&effects.events, source_received_at)?
-        } else {
-            self.project_group_system_rows(&effects.events, source_received_at)
-        };
-        summary.projection_updates.extend(system_updates);
+        self.try_project_group_system_rows(
+            &effects.events,
+            source_received_at,
+            &mut summary.projection_updates,
+        )?;
         Ok(routes_dirty)
     }
 
@@ -6212,6 +6286,107 @@ mod runtime_group_subscription_refresh_tests {
     use crate::tests::ScriptedPushRelayClient;
     use crate::{AppPerformanceTelemetry, MarmotApp};
     use marmot_account::AccountHome;
+
+    /// A later Welcome cannot overtake a retained removal batch. This pins the
+    /// projection seam's ordering while the engine already holds the live tree.
+    #[tokio::test]
+    async fn retained_termination_cannot_overtake_later_welcome() {
+        use cgka_traits::engine::GroupEvent;
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app =
+            MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+        let mut client = app.client("alice").await.unwrap();
+        client.prepare_transport().await.unwrap();
+        let group = client.create_group("rejoined", &[]).await.unwrap();
+        let blocked = client.create_group("blocked", &[]).await.unwrap();
+        let group_hex = hex::encode(group.as_slice());
+        let blocked_hex = hex::encode(blocked.as_slice());
+        let path = app.account_storage_path("alice");
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let key = app
+            .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
+            .unwrap();
+        let connection = rusqlite::Connection::open(path).unwrap();
+        storage_sqlite::open_hardened_sqlcipher(
+            &connection,
+            &key,
+            storage_sqlite::SqlCipherHardening::cipher_only(),
+        )
+        .unwrap();
+        connection.execute_batch(&format!("CREATE TRIGGER fail_second_termination BEFORE UPDATE OF self_membership ON account_groups
+            WHEN NEW.group_id_hex = '{blocked_hex}' AND NEW.self_membership = 'removed'
+            BEGIN SELECT RAISE(FAIL, 'injected second termination failure'); END;")).unwrap();
+        let effects = marmot_account::AccountDeviceEffects {
+            events: vec![
+                GroupEvent::LocalGroupCopyTerminated {
+                    group_id: group.clone(),
+                    voluntary: false,
+                },
+                GroupEvent::LocalGroupCopyTerminated {
+                    group_id: blocked,
+                    voluntary: false,
+                },
+            ],
+            ..Default::default()
+        };
+        client
+            .observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await
+            .unwrap();
+        let rejoin = marmot_account::AccountDeviceEffects {
+            events: vec![GroupEvent::GroupJoined {
+                group_id: group.clone(),
+                via_welcome: cgka_traits::MessageId::new(vec![0x77; 32]),
+                welcomer: None,
+                explicitly_confirmed: true,
+            }],
+            ..Default::default()
+        };
+        let source = "88".repeat(32);
+        assert!(
+            client
+                .observe_account_device_effects(
+                    &rejoin,
+                    &mut SyncSummary::default(),
+                    &source,
+                    123,
+                    false
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(client.pending_applied_effects.len(), 2);
+        let retained = client.pending_applied_effects.back().unwrap();
+        assert_eq!(retained.source_message_id_hex, source);
+        assert_eq!(retained.received_at, 123);
+        assert_eq!(
+            app.stored_group_self_membership("alice", &group_hex)
+                .unwrap(),
+            Some(storage_sqlite::SelfMembership::Removed)
+        );
+        connection
+            .execute_batch("DROP TRIGGER fail_second_termination")
+            .unwrap();
+        client
+            .retry_pending_runtime_group_subscription_refresh()
+            .await
+            .unwrap();
+        assert_eq!(
+            app.stored_group_self_membership("alice", &group_hex)
+                .unwrap(),
+            Some(storage_sqlite::SelfMembership::Member)
+        );
+        assert_eq!(
+            app.stored_group_self_membership("alice", &blocked_hex)
+                .unwrap(),
+            Some(storage_sqlite::SelfMembership::Removed)
+        );
+        assert!(client.pending_applied_effects.is_empty());
+    }
 
     #[tokio::test]
     async fn catch_up_checkpoint_arms_refresh_after_durable_subscription_failure() {

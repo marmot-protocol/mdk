@@ -676,23 +676,51 @@ impl AppClient {
             .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))
     }
 
-    pub(crate) fn cleanup_stale_push_tokens_best_effort(&self, group_id: &GroupId) {
-        // An unreadable/quarantined group is not an empty roster.
-        let Ok(membership) = self.runtime.session().canonical_group_membership(group_id) else {
-            return;
-        };
-        if self
-            .app
-            .reconcile_group_push_token_leaves(
-                &self.state.label,
-                &hex::encode(group_id.as_slice()),
-                &membership.member_leaves,
-            )
-            .is_err()
-        {
-            tracing::warn!(target: "marmot_app::push", error_code = "leaf_reconciliation_failed",
-                "failed to reconcile canonical push destinations");
+    pub(crate) fn cleanup_stale_push_tokens_best_effort(&mut self, group_id: &GroupId) {
+        match self.reconcile_push_token_leaves(group_id) {
+            Ok(()) => {
+                self.pending_push_leaf_reconciliations.remove(group_id);
+            }
+            Err(_) => {
+                self.pending_push_leaf_reconciliations
+                    .insert(group_id.clone());
+                tracing::warn!(target: "marmot_app::push", error_code = "leaf_reconciliation_failed",
+                    "retained canonical push reconciliation for retry");
+            }
         }
+    }
+
+    /// Read current membership again on retry; never turn an unavailable tree
+    /// into an empty roster or apply a roster captured before a later join.
+    fn reconcile_push_token_leaves(&self, group_id: &GroupId) -> Result<(), AppError> {
+        let record = self.runtime.group_record(group_id)?;
+        if record.removed || record.disbanded.is_some() {
+            return Ok(());
+        }
+        let membership = self
+            .runtime
+            .session()
+            .canonical_group_membership(group_id)?;
+        self.app.reconcile_group_push_token_leaves(
+            &self.state.label,
+            &hex::encode(group_id.as_slice()),
+            &membership.member_leaves,
+        )?;
+        Ok(())
+    }
+
+    /// Retry only groups whose earlier canonical sweep failed.
+    pub(crate) fn retry_pending_push_leaf_reconciliations(&mut self) -> Result<(), AppError> {
+        let groups = self
+            .pending_push_leaf_reconciliations
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for group_id in groups {
+            self.reconcile_push_token_leaves(&group_id)?;
+            self.pending_push_leaf_reconciliations.remove(&group_id);
+        }
+        Ok(())
     }
 }
 
