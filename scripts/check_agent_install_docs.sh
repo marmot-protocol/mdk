@@ -21,8 +21,10 @@ active_paths=(
     .github/workflows/wn-agent-binaries.yml
 )
 
-python3 - "$workspace_version" <<'PY'
+python3 - "$workspace_version" "${active_paths[@]}" <<'PY'
 from pathlib import Path
+import re
+import subprocess
 import sys
 
 version = sys.argv[1]
@@ -63,27 +65,24 @@ for connector, quickstart_expected in quickstart_expected_calls.items():
                 file=sys.stderr,
             )
             raise SystemExit(1)
+# Inspect tracked source paths without requiring ripgrep on hosted runners.
+# A failed file listing/read must fail the gate rather than look like no matches.
+def tracked(paths):
+    output = subprocess.check_output(["git", "ls-files", "-z", "--", *paths])
+    return [Path(name.decode()) for name in output.split(b"\0") if name]
+
+for path in tracked(sys.argv[2:]):
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if "releases/download/wn-agent-latest/install-" in text:
+        raise SystemExit(f"error: {path}: active install guidance uses a mutable release alias")
+    for match in re.finditer(
+        r"wn-agent-v[0-9]+\.[0-9]+\.[0-9]+/install-(?:hermes|openclaw|claude|codex|opencode|pi)-marmot\.sh", text
+    ):
+        if not match.group().startswith(f"wn-agent-v{version}/"):
+            raise SystemExit(f"error: {path}: agent install guidance does not match workspace version {version}")
+for path in tracked([".github/workflows"]):
+    if "wn-agent-latest" in path.read_text(encoding="utf-8", errors="replace"):
+        raise SystemExit(f"error: {path}: release workflows advertise a mutable WN Agent alias")
 PY
-
-if rg -n 'releases/download/wn-agent-latest/install-' "${active_paths[@]}"; then
-    echo "error: active agent install guidance must use an immutable versioned release" >&2
-    exit 1
-fi
-
-if rg -n 'wn-agent-latest' .github/workflows; then
-    echo "error: release workflows must not create, update, or advertise a mutable WN Agent alias" >&2
-    exit 1
-fi
-
-stale_versioned_urls="$(
-    rg -n -o 'wn-agent-v[0-9]+\.[0-9]+\.[0-9]+/install-(hermes|openclaw|claude|codex|opencode|pi)-marmot\.sh' \
-        "${active_paths[@]}" |
-        grep -F -v "wn-agent-v${workspace_version}/" || true
-)"
-if [ -n "$stale_versioned_urls" ]; then
-    printf '%s\n' "$stale_versioned_urls" >&2
-    echo "error: agent install guidance does not match workspace version $workspace_version" >&2
-    exit 1
-fi
 
 echo "agent install documentation: evergreen README selection and exact release records are valid"

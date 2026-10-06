@@ -8,6 +8,8 @@ import io
 import json
 import os
 import re
+import shutil
+import sys
 import subprocess
 import tempfile
 import unittest
@@ -18,6 +20,48 @@ import check_install_example_sha256 as gate
 
 
 class InstallExampleSha256GateTests(unittest.TestCase):
+    def test_agent_docs_gate_rejects_bad_guidance_without_ripgrep(self):
+        source = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            root.mkdir()
+            for name in (
+                "Cargo.toml", "release.md", "integrations/README.md",
+                "scripts/check_agent_install_docs.sh", "scripts/check_install_example_sha256.py",
+            ):
+                target = root / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source / name, target)
+            workflow = root / ".github/workflows/fixture.yml"
+            workflow.parent.mkdir(parents=True)
+            workflow.write_text("name: fixture\n")
+            subprocess.run(["git", "init", "--quiet", str(root)], check=True, capture_output=True)
+            subprocess.run(["git", "add", "."], cwd=root, check=True, capture_output=True)
+            tools = Path(temp) / "tools"
+            tools.mkdir()
+            for name in ("bash", "dirname", "sed", "head", "git"):
+                target = shutil.which(name)
+                self.assertIsNotNone(target, name)
+                (tools / name).symlink_to(target)
+            (tools / "python3").symlink_to(sys.executable)
+            env = {**os.environ, "PATH": str(tools)}
+            readme = root / "integrations/README.md"
+            original = readme.read_text()
+            for guidance, workflow_text, success in (
+                (original, "name: fixture\n", True),
+                (original + "\nreleases/download/wn-agent-latest/install-pi-marmot.sh\n", "name: fixture\n", False),
+                (original + "\nwn-agent-v0.0.1/install-pi-marmot.sh\n", "name: fixture\n", False),
+                (original, "# wn-agent-latest\n", False),
+            ):
+                readme.write_text(guidance)
+                workflow.write_text(workflow_text)
+                result = subprocess.run(
+                    [str(tools / "bash"), "scripts/check_agent_install_docs.sh"],
+                    cwd=root, env=env, capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
+                self.assertNotIn("command not found", result.stderr)
+
     def resolve_fixture(self, pages: list[list[dict]]) -> tuple[str, int]:
         readme = (Path(__file__).resolve().parents[1] / "integrations/README.md").read_text()
         source = gate.release_resolver_source(readme)
