@@ -92,7 +92,8 @@ not the agent's identity and never a secret key to import.
    `MARMOT_HOME`, socket, bootstrap label and same-user service name per profile.
    Changing only the Hermes home does not change the default `wn-agent-hermes`
    service. See [isolated and shared deployments](../../integrations/README.md#sharing-options).
-   Do not start a second daemon against an existing home/socket to fix routing.
+   Each existing home/socket has one daemon owner; a second daemon cannot repair
+   routing.
 3. **Install a matching release cohort.** Download the chosen runtime's
    versioned release installer and checksum, verify the checksum, then run the
    local file with explicit home, relay and public-key allowlist options. Use
@@ -116,7 +117,7 @@ not the agent's identity and never a secret key to import.
    conversation. A socket, successful bootstrap, healthy doctor report or
    relay acknowledgement alone is not end-to-end delivery. If the phone test
    cannot be performed, report local checks separately and leave phone
-   verification pending. Do not claim the installation complete.
+   verification pending until that round trip is observed.
 
 ### Sending a generated file
 
@@ -125,7 +126,8 @@ adapter's approved source roots; **stage the file there first**. Its default
 source root is `$MARMOT_HOME/dev/inbound-media`. The adapter then copies it into
 its separate outbound staging directory, which `wn-agent` must allow with
 `--media-allowed-root`. See the [copy-and-send example](../../integrations/hermes/marmot/README.md#sending-a-generated-file).
-Do not widen either root to `/` or the whole home to make a send succeed.
+The source and staging roots remain narrow; `/` or the whole home defeats
+that boundary.
 
 This convention is runtime-specific. OpenClaw uses its normal message tool's
 media/attachment fields; terminal harnesses use only their documented artifact

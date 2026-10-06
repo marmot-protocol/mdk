@@ -114,16 +114,17 @@ class InstallExampleSha256GateTests(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "offline"):
                 exec(compile(source, "README release resolver", "exec"), {})
 
-    def test_evergreen_gate_rejects_a_fixed_or_non_fail_closed_url(self):
+    def test_optional_latest_gate_rejects_a_non_fail_closed_lookup(self):
         readme = (Path(__file__).resolve().parents[1] / "integrations/README.md").read_text()
-        self.assertEqual(gate.evergreen_release_errors(readme), [])
-        self.assertTrue(gate.evergreen_release_errors(readme.replace(')" && test -n "$base_url"; then', ')"; then', 1)))
-        self.assertTrue(gate.evergreen_release_errors(readme + '\nbase_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v1.0.0"'))
+        self.assertEqual(gate.optional_latest_release_errors(readme), [])
+        self.assertTrue(gate.optional_latest_release_errors(readme.replace(')" && test -n "$base_url"; then', ')"; then', 1)))
 
     def test_failed_lookup_keeps_shell_alive_and_never_downloads(self):
         readme = (Path(__file__).resolve().parents[1] / "integrations/README.md").read_text()
-        block = next(code for code in re.findall(r"```sh\n(.*?)\n```", readme, re.DOTALL)
-                     if "install_verified() (" in code)
+        helper = gate.install_definition_block(readme)
+        lookup = next(code for code in re.findall(r"```sh\n(.*?)\n```", readme, re.DOTALL)
+                      if "python3 - <<'RELEASE'" in code)
+        block = helper + '\nbase_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v1.0.0"\n' + lookup
         with tempfile.TemporaryDirectory() as temp:
             fake = Path(temp) / "python3"
             fake.write_text("#!/bin/sh\nexit 1\n")
@@ -155,25 +156,31 @@ class InstallExampleSha256GateTests(unittest.TestCase):
             curl = Path(temp) / "curl"
             curl.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n")
             curl.chmod(0o700)
-            for relative in gate.DOCUMENTED_INSTALL_CALLS:
-                block = gate.install_definition_block((root / relative).read_text())
-                helper = block.split("\nif base_url=", 1)[0]
-                for tag in ["v1/../../../../other/repo/releases/download/x", "v1.0.0-rc1", "vfoo", "v1.0.0\n"]:
-                    url = "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-" + tag + "/install-codex-marmot.sh"
-                    with self.subTest(path=relative, tag=tag):
-                        result = subprocess.run(["bash", "-c", helper + '\ninstall_verified "$1" "$1.sha256"', "fixture", url],
-                            text=True, capture_output=True,
-                            env={**os.environ, "PATH": temp + ":" + os.environ["PATH"]})
-                        self.assertNotEqual(result.returncode, 0)
-                        self.assertFalse(marker.exists())
+            helper = gate.install_definition_block((root / "integrations/README.md").read_text())
+            for tag in ["v1/../../../../other/repo/releases/download/x", "v1.0.0-rc1", "vfoo", "v1.0.0\n"]:
+                url = "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-" + tag + "/install-codex-marmot.sh"
+                with self.subTest(tag=tag):
+                    result = subprocess.run(["bash", "-c", helper + '\ninstall_verified "$1" "$1.sha256"', "fixture", url],
+                        text=True, capture_output=True,
+                        env={**os.environ, "PATH": temp + ":" + os.environ["PATH"]})
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(marker.exists())
 
-    def test_definition_fences_match_canonical_helper(self):
+    def test_runtime_guides_link_the_canonical_helper(self):
         root = Path(__file__).resolve().parents[1]
         canonical = gate.install_definition_block((root / "integrations/README.md").read_text())
         self.assertIsNotNone(canonical)
-        for relative in gate.DOCUMENTED_INSTALL_CALLS:
+        for relative, installers in gate.DOCUMENTED_INSTALL_CALLS.items():
+            if relative == "integrations/README.md":
+                continue
             with self.subTest(path=relative):
-                self.assertEqual(gate.install_definition_block((root / relative).read_text()), canonical)
+                readme = (root / relative).read_text()
+                self.assertIsNone(gate.install_definition_block(readme))
+                self.assertNotIn("python3 - <<'RELEASE'", readme)
+                self.assertEqual(gate.documented_surface_errors(readme, installers, helper_text=canonical), [])
+                mutated = readme.replace("(../../README.md#verified-installer-helper)", "(../../README.md)")
+                self.assertTrue(gate.documented_surface_errors(mutated, installers, helper_text=canonical))
+                self.assertTrue(gate.documented_surface_errors(readme, installers))
 
     def test_rejects_download_to_shell_pipeline(self) -> None:
         text = "curl -fsSL https://example.test/install.sh | bash\n"
@@ -227,7 +234,8 @@ install_verified "$base_url/install.sh"
         readme = (Path(__file__).resolve().parents[1] / "integrations/codex/marmot/README.md").read_text(
             encoding="utf-8"
         )
-        self.assertEqual(gate.documented_surface_errors(readme, installers), [])
+        helper = gate.install_definition_block((Path(__file__).resolve().parents[1] / "integrations/README.md").read_text())
+        self.assertEqual(gate.documented_surface_errors(readme, installers, helper_text=helper), [])
         mutated = readme.replace(
             '"$base_url/install-codex-marmot.sh.sha256"',
             '"$base_url/install-codex-marmot.sh.sig"',
@@ -235,7 +243,7 @@ install_verified "$base_url/install.sh"
         )
         self.assertIn(
             "expected at least 1 companion checksums for install-codex-marmot.sh",
-            gate.documented_surface_errors(mutated, installers),
+            gate.documented_surface_errors(mutated, installers, helper_text=helper),
         )
 
     def test_release_guide_rejects_download_to_shell_mutation(self) -> None:
@@ -280,7 +288,7 @@ install_verified "$base_url/install.sh"
         )
         self.assertEqual(gate.same_shell_notice_errors(readme), [])
         mutated = readme.replace(
-            "Run this example in the same shell where `install_verified` above was defined.",
+            "Run this example in the same shell where `install_verified` was defined.",
             "Prerequisite omitted.",
             1,
         )

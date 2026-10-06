@@ -34,21 +34,22 @@ base_url = (
     "https://github.com/marmot-protocol/mdk/releases/download/"
     f"wn-agent-v{version}"
 )
-# Quickstarts follow the latest published WN Agent cohort; release.md remains
-# the exact-version release record. Preserve immutable download/checksum pairing.
+# Quickstarts and the release record default to the documented release.
+# Latest selection is optional and centralized; preserve checksum pairing.
 sys.path.insert(0, str(Path("scripts").resolve()))
-from check_install_example_sha256 import evergreen_release_errors
-errors = evergreen_release_errors(quickstart)
+from check_install_example_sha256 import optional_latest_release_errors
+errors = optional_latest_release_errors(quickstart)
 if errors:
     print("error: integrations/README.md: " + "; ".join(errors), file=sys.stderr)
     raise SystemExit(1)
-if release_guide.count(f'base_url="{base_url}"') != 1:
-    print(
-        "error: release.md must define exactly one immutable current-release base_url "
-        f"({base_url})",
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
+for label, text in (("integrations/README.md", quickstart), ("release.md", release_guide)):
+    if text.count(f'base_url="{base_url}"') != 1:
+        print(
+            f"error: {label} must define exactly one immutable current-release base_url "
+            f"({base_url})",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
 quickstart_expected_calls = {"hermes": 2, "openclaw": 1, "claude": 1, "codex": 2, "opencode": 1, "pi": 1}
 for connector, quickstart_expected in quickstart_expected_calls.items():
     installer = f"install-{connector}-marmot.sh"
@@ -85,4 +86,4 @@ for path in tracked([".github/workflows"]):
         raise SystemExit(f"error: {path}: release workflows advertise a mutable WN Agent alias")
 PY
 
-echo "agent install documentation: evergreen README selection and exact release records are valid"
+echo "agent install documentation: shared verified helper, release pins and optional latest selection are valid"

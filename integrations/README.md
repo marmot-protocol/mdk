@@ -8,6 +8,7 @@ explain topology, identities, and sharing for operators.
 ## Contents
 
 - [Get Started: White Noise + Agents](#get-started-white-noise--agents)
+- [Optional latest release selection](#optional-latest-release-selection)
 - [Recommended chat setup](#recommended-chat-setup)
 - [Connector capabilities](#connector-capabilities)
 - [First-install verification](#first-install-verification)
@@ -41,29 +42,22 @@ Choose the runtime you already use:
 | Pi | Terminal harness | Repository and coding tasks through Pi |
 
 The guided installers prompt on the terminal for the White Noise account that
-may invite and message the agent. They install the latest published WN Agent release, create
+may invite and message the agent. They install the selected WN Agent release, create
 an isolated White Noise identity for the selected connector, and start same-user
 services where supported. Download each installer with its adjacent checksum,
 verify it, and only then execute the local file:
 
-The example below requires Python 3 and resolves the latest published
-`wn-agent-v*` release once, then uses its immutable URL for all downloads.
-WN Agent releases are currently marked GitHub pre-releases; the resolver accepts
-published numeric tags and excludes draft releases and `-rc`/other suffixes.
-GitHub's repository-wide `/releases/latest` may select MDK or MarmotKit instead.
-Resolution or checksum failure stops installation; no unverified fallback runs.
-If lookup fails due to a GitHub API rate limit, offline networking or Python TLS
-certificates, fix that cause or set `base_url` to a reviewed numeric WN Agent
-release URL from the [release list](https://github.com/marmot-protocol/mdk/releases).
-Keep the checksum verification; do not fall back to an unverified script.
-For the default cohort, remove stale `MARMOT_RELEASE_REPO`, `MARMOT_RELEASE_TAG`,
-`WN_AGENT_VERSION` and `WN_AGENT_SHA` overrides; the published installer defaults
-its companion assets to its own release. Explicit overrides are a custom install.
-For repeatable deployments, save the printed `base_url` and reuse that exact
-release rather than resolving again. The release publisher is the trust anchor;
-the sibling checksum verifies downloaded bytes, not an independent endorsement.
-A reviewed numeric release URL can replace the resolved value for a pinned install. Minimum host versions and pinned test
-cohorts below describe compatibility, not a required MDK install version.
+### Verified installer helper
+
+Define this helper once, then choose a runtime below. It downloads the installer
+and its sibling checksum, verifies the bytes, and runs only the verified local
+file. The release publisher is the trust anchor; the checksum is not an
+independent endorsement.
+
+For the documented release, use the pinned `base_url` below. Its installers and
+companion assets stay in the same cohort. Remove stale `MARMOT_RELEASE_REPO`,
+`MARMOT_RELEASE_TAG`, `WN_AGENT_VERSION` and `WN_AGENT_SHA` overrides for a default
+install; explicit overrides describe a custom deployment.
 
 ```sh
 install_verified() (
@@ -75,7 +69,7 @@ install_verified() (
     *[!a-zA-Z0-9:/._-]*) echo "error: invalid installer URL" >&2; exit 1 ;;
   esac
   if ! printf '%s\n' "$installer_url" | LC_ALL=C grep -Eq '^https://github[.]com/marmot-protocol/mdk/releases/download/wn-agent-v[0-9]+[.][0-9]+[.][0-9]+/install-(hermes|openclaw|claude|codex|opencode|pi)-marmot[.]sh$'; then
-    echo "error: resolve a numeric WN Agent release before installing" >&2
+    echo "error: select a numeric WN Agent release before installing" >&2
     exit 1
   fi
   if [ "$checksum_url" != "$installer_url.sha256" ]; then
@@ -97,34 +91,10 @@ install_verified() (
   fi
   bash "$tmpdir/$installer_script" "$@"
 )
+```
 
-if base_url="$(python3 - <<'RELEASE'
-import json, re, urllib.request
-candidates = []
-for page in range(1, 11):
-    url = f"https://api.github.com/repos/marmot-protocol/mdk/releases?per_page=100&page={page}"
-    with urllib.request.urlopen(url, timeout=30) as response:
-        releases = json.load(response)
-    for release in releases:
-        tag = release["tag_name"]
-        match = re.fullmatch(r"wn-agent-v([0-9]+)\.([0-9]+)\.([0-9]+)", tag)
-        if match and not release["draft"] and release["published_at"]:
-            candidates.append((tuple(map(int, match.groups())), tag))
-    if len(releases) < 100:
-        break
-else:
-    raise SystemExit("Release listing exceeded 1000 entries; choose a reviewed tag explicitly")
-if not candidates:
-    raise SystemExit("No published WN Agent release found")
-tag = max(candidates)[1]
-print(f"https://github.com/marmot-protocol/mdk/releases/download/{tag}")
-RELEASE
-)" && test -n "$base_url"; then
-  printf 'Selected WN Agent release: %s\n' "$base_url"
-else
-  base_url=""
-  printf '%s\n' 'error: release lookup failed; installation is unavailable until resolved' >&2
-fi
+```sh
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
 ```
 
 ### Hermes
@@ -226,7 +196,7 @@ select a working directory under your home directory.
 ### Repeatable Agent Or CI Setup
 
 For repeatable CI, save the exact numeric release URL printed during a
-reviewed setup and set `base_url` to that saved URL instead of resolving latest
+reviewed setup and set `base_url` to that saved URL instead of selecting a newer release
 again on every run. Set `WN_AGENT_PINNED_BASE_URL` in the CI environment to that
 reviewed exact URL; the example clears a previously resolved value if the pin
 is missing, so the installer helper refuses it before any download.
@@ -264,6 +234,51 @@ before running it.
 Use each connector's README for existing-identity imports, shared deployments,
 execution profiles, manual service control, and development workflows.
 
+## Optional latest release selection
+
+The default commands above use the release documented by this checkout. To
+choose a newer release, first review its matching installation guide and
+compatibility notes in the [release list](https://github.com/marmot-protocol/mdk/releases).
+This optional lookup requires Python 3 with working TLS and GitHub API access;
+it accepts published numeric WN Agent tags, including pre-releases, and excludes
+drafts and suffixed tags. GitHub's repository-wide `/releases/latest` can select
+a different product. The lookup stops after 1,000 entries and clears `base_url`
+on failure. Fix API, network or certificate errors, or choose a numeric release
+explicitly. Installer and checksum verification remain required.
+
+Run this optional lookup in the same shell as the helper, then use the selected
+runtime's `install_verified` command. Save the printed URL for repeatable installs.
+
+```sh
+if base_url="$(python3 - <<'RELEASE'
+import json, re, urllib.request
+candidates = []
+for page in range(1, 11):
+    url = f"https://api.github.com/repos/marmot-protocol/mdk/releases?per_page=100&page={page}"
+    with urllib.request.urlopen(url, timeout=30) as response:
+        releases = json.load(response)
+    for release in releases:
+        tag = release["tag_name"]
+        match = re.fullmatch(r"wn-agent-v([0-9]+)\.([0-9]+)\.([0-9]+)", tag)
+        if match and not release["draft"] and release["published_at"]:
+            candidates.append((tuple(map(int, match.groups())), tag))
+    if len(releases) < 100:
+        break
+else:
+    raise SystemExit("Release listing exceeded 1000 entries; choose a reviewed tag explicitly")
+if not candidates:
+    raise SystemExit("No published WN Agent release found")
+tag = max(candidates)[1]
+print(f"https://github.com/marmot-protocol/mdk/releases/download/{tag}")
+RELEASE
+)" && test -n "$base_url"; then
+  printf 'Selected WN Agent release: %s\n' "$base_url"
+else
+  base_url=""
+  printf '%s\n' 'error: release lookup failed; installation is unavailable until resolved' >&2
+fi
+```
+
 ## Recommended chat setup
 
 For a personal agent chat, the recommended setup is a dedicated group/DM with
@@ -286,38 +301,10 @@ Before installation, settle the few choices that change the setup:
 - Which files are needed, and is generated-file delivery supported/configured?
   Keep the selected runtime's existing permissions as the execution default.
 
-Use answers already supplied in the installation prompt; ask only for missing
-choices. A supplied npub is public authorization information, not a secret
-identity import. Summarize the concrete setup plan for the prompt's approval
-step. Do not repeatedly ask for choices that have already been made.
-
-### Suggested agent chat instructions
-
-The following is a suggested instruction block to add to the selected agent's
-normal profile/project instructions. It is not installed automatically by the
-connector, and a terminal session's `/goal` alone cannot expose missing tools:
-
-> Work in the current White Noise conversation. Keep its title a short,
-> findable description of the accepted task, optionally with one project emoji.
-> Rename only on a real topic change; keep the title during status questions,
-> retries and completion. Read the current title first, preserve the current
-> chat binding, and read back an update. Never put secrets or personal details
-> in a title. After an uncertain write, inspect before retrying.
->
-> Use real message reactions for progress: 👀 when an actionable request is
-> accepted, ✅ after the requested result is completed and verified, ⏸️ when a
-> real user decision is required, and ❌ on terminal failure. Replace your own
-> earlier progress reaction rather than stacking it; do not send the emoji as
-> a separate chat message. React to the triggering message in this chat. A
-> planned change, queued build or draft is not a completed result. Emoji-only
-> user messages are context, not blanket approval for a destructive action.
->
-> Read the selected connector's setup and capability guide. Use only tools and
-> file paths authorized for this deployment. Keep follow-up messages attached
-> to the unfinished task unless the user changes it. Report the verified result
-> concisely, with a link or delivered file when appropriate. If a required
-> title, reaction or file tool is missing, explain that limitation rather than
-> pretending the action worked.
+Agent setup and chat policy is collected in
+[the integration instructions](AGENTS.md#suggested-agent-chat-instructions).
+These instructions are not installed automatically; tools still need deployment
+configuration and the acceptance check below.
 
 ### Check the tools before promising the experience
 

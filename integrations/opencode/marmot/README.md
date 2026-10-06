@@ -31,7 +31,8 @@ For the current guided install, runtime chooser, and steps to finish in White No
 
 For task titles and progress reactions, use the shared
 [recommended chat setup](../../README.md#recommended-chat-setup), including
-admin promotion, the suggested instruction block and the phone acceptance test.
+admin promotion and the phone acceptance test. Agent policy is in
+[the integration instructions](../../AGENTS.md#suggested-agent-chat-instructions).
 This harness does not register title/reaction tools. For that experience,
 configure and verify a trusted helper available to the backend; admin promotion
 or a `/goal` instruction alone is insufficient.
@@ -39,19 +40,14 @@ or a `/goal` instruction alone is insufficient.
 - **Work through OpenCode from your phone.** Send a prompt from an authorized
   White Noise account and use the backend's configured model and tools.
   Every allowed message activates the harness; mentioning the agent is not required.
-- **Choose a project for this chat.** Send `/cd src/my-project`, then an ordinary
-  request such as `Explain the failing test`. The path must resolve beneath the
-  service user's home. This selects a working directory, not a sandbox.
+
 - **Continue or reset the conversation.** OpenCode uses its non-interactive JSON interface and retains a session per chat. Its text events are returned as durable replies; the connector does not mirror the interactive TUI.
   `/new` resets the backend session while retaining the project.
-- **Keep a standing instruction.** `/goal Run the affected tests after edits`
-  applies to later prompts in this chat; `/goal clear` removes it. This stores
-  instructions for future turns, not a scheduler or a background task.
-- **Inspect and recover a turn.** `/help`, `/status` and `/pwd` report local
-  chat settings. After a reported recovery barrier, inspect side effects before
-  `/retry-last`, or use `/discard-last` to proceed without replaying that turn.
-  See [Chat Commands](#chat-commands) for all commands and slash escaping.
+
 - **Know the file contract.** Supported images, PDFs and readable text files reach OpenCode in one ordered batch; unsupported files reject the whole prompt. Generated-file return is not implemented. See [Inbound attachments](#inbound-attachments).
+
+Project selection (`/cd`), standing instructions (`/goal`), and recovery
+commands share the [terminal-harness command guide](../../terminal-harness/README.md#chat-commands).
 
 Tool access, credentials and model choices come from the backend's native
 configuration and the [execution profile](../../terminal-harness/README.md#execution-profiles).
@@ -94,88 +90,14 @@ Prerequisites:
 
 Verified install (the helper also forwards any installer arguments after the two URLs):
 
-The example below requires Python 3 and resolves the latest published
-`wn-agent-v*` release once, then uses its immutable URL for all downloads.
-WN Agent releases are currently marked GitHub pre-releases; the resolver accepts
-published numeric tags and excludes draft releases and `-rc`/other suffixes.
-GitHub's repository-wide `/releases/latest` may select MDK or MarmotKit instead.
-Resolution or checksum failure stops installation; no unverified fallback runs.
-If lookup fails due to a GitHub API rate limit, offline networking or Python TLS
-certificates, fix that cause or set `base_url` to a reviewed numeric WN Agent
-release URL from the [release list](https://github.com/marmot-protocol/mdk/releases).
-Keep the checksum verification; do not fall back to an unverified script.
-For the default cohort, remove stale `MARMOT_RELEASE_REPO`, `MARMOT_RELEASE_TAG`,
-`WN_AGENT_VERSION` and `WN_AGENT_SHA` overrides; the published installer defaults
-its companion assets to its own release. Explicit overrides are a custom install.
-For repeatable deployments, save the printed `base_url` and reuse that exact
-release rather than resolving again. The release publisher is the trust anchor;
-the sibling checksum verifies downloaded bytes, not an independent endorsement.
-A reviewed numeric release URL can replace the resolved value for a pinned install. Minimum host versions and pinned test
-cohorts below describe compatibility, not a required MDK install version.
+First copy the [verified installer helper](../../README.md#verified-installer-helper)
+into this shell. Then select the release documented here:
 
 ```sh
-install_verified() (
-  set -eu
-  installer_url="$1"
-  checksum_url="$2"
-  shift 2
-  case "$installer_url" in
-    *[!a-zA-Z0-9:/._-]*) echo "error: invalid installer URL" >&2; exit 1 ;;
-  esac
-  if ! printf '%s\n' "$installer_url" | LC_ALL=C grep -Eq '^https://github[.]com/marmot-protocol/mdk/releases/download/wn-agent-v[0-9]+[.][0-9]+[.][0-9]+/install-(hermes|openclaw|claude|codex|opencode|pi)-marmot[.]sh$'; then
-    echo "error: resolve a numeric WN Agent release before installing" >&2
-    exit 1
-  fi
-  if [ "$checksum_url" != "$installer_url.sha256" ]; then
-    echo "error: checksum must accompany the same release installer" >&2
-    exit 1
-  fi
-  installer_script="${installer_url##*/}"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
-  curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 180 "$installer_url" -o "$tmpdir/$installer_script"
-  curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 180 "$checksum_url" -o "$tmpdir/$installer_script.sha256"
-  if command -v shasum >/dev/null 2>&1; then
-    (cd "$tmpdir" && shasum -a 256 -c "$installer_script.sha256")
-  elif command -v sha256sum >/dev/null 2>&1; then
-    (cd "$tmpdir" && sha256sum -c "$installer_script.sha256")
-  else
-    echo "error: need shasum or sha256sum to verify the installer" >&2
-    exit 1
-  fi
-  bash "$tmpdir/$installer_script" "$@"
-)
-
-if base_url="$(python3 - <<'RELEASE'
-import json, re, urllib.request
-candidates = []
-for page in range(1, 11):
-    url = f"https://api.github.com/repos/marmot-protocol/mdk/releases?per_page=100&page={page}"
-    with urllib.request.urlopen(url, timeout=30) as response:
-        releases = json.load(response)
-    for release in releases:
-        tag = release["tag_name"]
-        match = re.fullmatch(r"wn-agent-v([0-9]+)\.([0-9]+)\.([0-9]+)", tag)
-        if match and not release["draft"] and release["published_at"]:
-            candidates.append((tuple(map(int, match.groups())), tag))
-    if len(releases) < 100:
-        break
-else:
-    raise SystemExit("Release listing exceeded 1000 entries; choose a reviewed tag explicitly")
-if not candidates:
-    raise SystemExit("No published WN Agent release found")
-tag = max(candidates)[1]
-print(f"https://github.com/marmot-protocol/mdk/releases/download/{tag}")
-RELEASE
-)" && test -n "$base_url"; then
-  printf 'Selected WN Agent release: %s\n' "$base_url"
-else
-  base_url=""
-  printf '%s\n' 'error: release lookup failed; installation is unavailable until resolved' >&2
-fi
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
 ```
 
-Run this example in the same shell where `install_verified` above was defined.
+Run this example in the same shell where `install_verified` was defined.
 
 ```sh
 install_verified "$base_url/install-opencode-marmot.sh" \
@@ -185,10 +107,10 @@ install_verified "$base_url/install-opencode-marmot.sh" \
 For repeatable noninteractive setup, pass the allowed inviter and prompt sender
 as either an `npub` or raw hex public key:
 
-Run this example in the same shell where `install_verified` above was defined.
+Run this example in the same shell where `install_verified` was defined.
 
 ```sh
-# Reuse the resolved base_url from the same shell above.
+# Reuse the selected base_url from the same shell above.
 install_verified "$base_url/install-opencode-marmot.sh" \
   "$base_url/install-opencode-marmot.sh.sha256" \
   --yes --allow-welcomer npub1...

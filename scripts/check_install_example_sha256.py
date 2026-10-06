@@ -72,16 +72,11 @@ def install_definition_block(text: str) -> str | None:
     return blocks[0] if len(blocks) == 1 else None
 
 
-def evergreen_release_errors(text: str) -> list[str]:
+def optional_latest_release_errors(text: str) -> list[str]:
     errors: list[str] = []
     source = release_resolver_source(text)
     if source is None:
         errors.append("expected exactly one bounded latest WN Agent release resolver")
-    if re.search(
-        r'base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v[0-9]',
-        text,
-    ):
-        errors.append("install README must not pin a current WN Agent version")
     if 'base_url=""' not in text or 'case "$installer_url" in' not in text:
         errors.append("failed release resolution must clear the URL and prevent execution")
     if '"$checksum_url" != "$installer_url.sha256"' not in text:
@@ -137,17 +132,21 @@ def verify_then_execute_errors(text: str, installer: str) -> list[str]:
 
 
 def documented_surface_errors(
-    text: str, installers: dict[str, int]
+    text: str, installers: dict[str, int], *, helper_text: str | None = None
 ) -> list[str]:
     """Require each documented path to use the verified installer helper."""
     errors: list[str] = []
+    helper = text
     if "install_verified() (" not in text:
-        errors.append("missing verify-then-execute helper")
-    if not re.search(r"install_verified\(\) \(\s*\n\s*set -eu\b", text):
+        if "(../../README.md#verified-installer-helper)" in text and helper_text is not None:
+            helper = helper_text
+        else:
+            errors.append("missing verify-then-execute helper or canonical helper link")
+    if not re.search(r"install_verified\(\) \(\s*\n\s*set -eu\b", helper):
         errors.append("verify-then-execute helper must fail closed with set -eu")
-    if "shasum -a 256 -c" not in text:
+    if "shasum -a 256 -c" not in helper:
         errors.append("missing shasum SHA-256 verification branch")
-    if "sha256sum -c" not in text:
+    if "sha256sum -c" not in helper:
         errors.append("missing sha256sum verification branch")
     for installer, minimum in installers.items():
         call = f'install_verified "$base_url/{installer}"'
@@ -247,21 +246,24 @@ def repository_errors(root: Path) -> list[str]:
         if len(hits) > allowed:
             errors.extend(hits[allowed:])
 
-    canonical = release_resolver_source(
-        (root / "integrations/README.md").read_text(encoding="utf-8")
-    )
-    canonical_block = install_definition_block(
-        (root / "integrations/README.md").read_text(encoding="utf-8")
-    )
+    quickstart = (root / "integrations/README.md").read_text(encoding="utf-8")
+    canonical_block = install_definition_block(quickstart)
+    for error in optional_latest_release_errors(quickstart):
+        errors.append(f"integrations/README.md: {error}")
+    version_match = re.search(r'^version = "([^"]+)"',
+                              (root / "Cargo.toml").read_text(encoding="utf-8"), re.MULTILINE)
+    if version_match is None:
+        return errors + ["Cargo.toml: missing workspace version"]
+    pinned = ('base_url="https://github.com/marmot-protocol/mdk/releases/download/'
+              f'wn-agent-v{version_match.group(1)}"')
     for relative, installers in DOCUMENTED_INSTALL_CALLS.items():
         text = (root / relative).read_text(encoding="utf-8")
-        for error in evergreen_release_errors(text):
-            errors.append(f"{relative}: {error}")
-        if install_definition_block(text) != canonical_block:
-            errors.append(f"{relative}: installer helper differs from canonical quickstart")
-        if release_resolver_source(text) != canonical:
-            errors.append(f"{relative}: release resolver differs from canonical quickstart")
-        for error in documented_surface_errors(text, installers):
+        if text.count(pinned) != 1 or len(re.findall(r'^base_url="https?://', text, re.MULTILINE)) != 1:
+            errors.append(f"{relative}: expected one documented-release URL")
+        if relative != "integrations/README.md":
+            if "install_verified() (" in text or "python3 - <<'RELEASE'" in text:
+                errors.append(f"{relative}: link the canonical helper instead of duplicating it")
+        for error in documented_surface_errors(text, installers, helper_text=canonical_block):
             errors.append(f"{relative}: {error}")
 
     for relative in SAME_SHELL_SURFACES:

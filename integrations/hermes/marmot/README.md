@@ -25,7 +25,8 @@ For the current guided install, runtime chooser, and steps to finish in White No
 
 For task titles and progress reactions, use the shared
 [recommended chat setup](../../README.md#recommended-chat-setup), including
-admin promotion, the suggested instruction block and the phone acceptance test.
+admin promotion and the phone acceptance test. Agent policy is in
+[the integration instructions](../../AGENTS.md#suggested-agent-chat-instructions).
 This plugin supplies the group-profile and reaction tools; enable the chosen
 chat policy in the actual Hermes profile and verify it on the phone.
 
@@ -107,10 +108,10 @@ The two homes serve different purposes: `HERMES_HOME` owns the profile's
 identity, group state and socket. For a default installation, the corresponding
 homes are normally `$HOME/.hermes` and `$HOME/.marmot-agents/hermes`.
 
-First define `install_verified` and `base_url` using the
-[checksum-verified release example](#release-install-hermes-already-installed).
-Copy only its first helper-definition fence; it resolves the release but does
-not run the installer. Then return here for the dry-run.
+First define `install_verified` using the
+[shared helper](../../README.md#verified-installer-helper), then copy only the
+`base_url` selection from the [release example](#release-install-hermes-already-installed).
+Neither step runs an installer. Return here for the dry-run.
 Run this example in the same shell where `install_verified` was defined.
 Review a dry-run first, then remove `--dry-run` after the requested installation
 approval:
@@ -263,88 +264,14 @@ its candidate capability API.
 
 Verified install (the helper also forwards any installer arguments after the two URLs):
 
-The example below requires Python 3 and resolves the latest published
-`wn-agent-v*` release once, then uses its immutable URL for all downloads.
-WN Agent releases are currently marked GitHub pre-releases; the resolver accepts
-published numeric tags and excludes draft releases and `-rc`/other suffixes.
-GitHub's repository-wide `/releases/latest` may select MDK or MarmotKit instead.
-Resolution or checksum failure stops installation; no unverified fallback runs.
-If lookup fails due to a GitHub API rate limit, offline networking or Python TLS
-certificates, fix that cause or set `base_url` to a reviewed numeric WN Agent
-release URL from the [release list](https://github.com/marmot-protocol/mdk/releases).
-Keep the checksum verification; do not fall back to an unverified script.
-For the default cohort, remove stale `MARMOT_RELEASE_REPO`, `MARMOT_RELEASE_TAG`,
-`WN_AGENT_VERSION` and `WN_AGENT_SHA` overrides; the published installer defaults
-its companion assets to its own release. Explicit overrides are a custom install.
-For repeatable deployments, save the printed `base_url` and reuse that exact
-release rather than resolving again. The release publisher is the trust anchor;
-the sibling checksum verifies downloaded bytes, not an independent endorsement.
-A reviewed numeric release URL can replace the resolved value for a pinned install. Minimum host versions and pinned test
-cohorts below describe compatibility, not a required MDK install version.
+First copy the [verified installer helper](../../README.md#verified-installer-helper)
+into this shell. Then select the release documented here:
 
 ```sh
-install_verified() (
-  set -eu
-  installer_url="$1"
-  checksum_url="$2"
-  shift 2
-  case "$installer_url" in
-    *[!a-zA-Z0-9:/._-]*) echo "error: invalid installer URL" >&2; exit 1 ;;
-  esac
-  if ! printf '%s\n' "$installer_url" | LC_ALL=C grep -Eq '^https://github[.]com/marmot-protocol/mdk/releases/download/wn-agent-v[0-9]+[.][0-9]+[.][0-9]+/install-(hermes|openclaw|claude|codex|opencode|pi)-marmot[.]sh$'; then
-    echo "error: resolve a numeric WN Agent release before installing" >&2
-    exit 1
-  fi
-  if [ "$checksum_url" != "$installer_url.sha256" ]; then
-    echo "error: checksum must accompany the same release installer" >&2
-    exit 1
-  fi
-  installer_script="${installer_url##*/}"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
-  curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 180 "$installer_url" -o "$tmpdir/$installer_script"
-  curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 180 "$checksum_url" -o "$tmpdir/$installer_script.sha256"
-  if command -v shasum >/dev/null 2>&1; then
-    (cd "$tmpdir" && shasum -a 256 -c "$installer_script.sha256")
-  elif command -v sha256sum >/dev/null 2>&1; then
-    (cd "$tmpdir" && sha256sum -c "$installer_script.sha256")
-  else
-    echo "error: need shasum or sha256sum to verify the installer" >&2
-    exit 1
-  fi
-  bash "$tmpdir/$installer_script" "$@"
-)
-
-if base_url="$(python3 - <<'RELEASE'
-import json, re, urllib.request
-candidates = []
-for page in range(1, 11):
-    url = f"https://api.github.com/repos/marmot-protocol/mdk/releases?per_page=100&page={page}"
-    with urllib.request.urlopen(url, timeout=30) as response:
-        releases = json.load(response)
-    for release in releases:
-        tag = release["tag_name"]
-        match = re.fullmatch(r"wn-agent-v([0-9]+)\.([0-9]+)\.([0-9]+)", tag)
-        if match and not release["draft"] and release["published_at"]:
-            candidates.append((tuple(map(int, match.groups())), tag))
-    if len(releases) < 100:
-        break
-else:
-    raise SystemExit("Release listing exceeded 1000 entries; choose a reviewed tag explicitly")
-if not candidates:
-    raise SystemExit("No published WN Agent release found")
-tag = max(candidates)[1]
-print(f"https://github.com/marmot-protocol/mdk/releases/download/{tag}")
-RELEASE
-)" && test -n "$base_url"; then
-  printf 'Selected WN Agent release: %s\n' "$base_url"
-else
-  base_url=""
-  printf '%s\n' 'error: release lookup failed; installation is unavailable until resolved' >&2
-fi
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
 ```
 
-Run this example in the same shell where `install_verified` above was defined.
+Run this example in the same shell where `install_verified` was defined.
 
 ```sh
 install_verified "$base_url/install-hermes-marmot.sh" \
@@ -360,10 +287,10 @@ For repeatable noninteractive setup, pass the allowed inviter/welcomer and allow
 message sender as either an `npub` or raw hex public key. `--allow-user` may be
 repeated or given a comma-separated list to authorize multiple senders:
 
-Run this example in the same shell where `install_verified` above was defined.
+Run this example in the same shell where `install_verified` was defined.
 
 ```sh
-# Reuse the resolved base_url from the same shell above.
+# Reuse the selected base_url from the same shell above.
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256" \
   --yes \
@@ -374,12 +301,12 @@ install_verified "$base_url/install-hermes-marmot.sh" \
 Generated-identity onboarding is the default (and can be selected explicitly
 with `--generate-identity`). To preserve an existing Nostr identity, place its
 `nsec` or raw secret hex in a regular file owned by the current user with mode
-`0600`, then use the resolved (or a saved, reviewed) release URL:
+`0600`, then use the selected (or a saved, reviewed) release URL:
 
-Run this example in the same shell where `install_verified` above was defined.
+Run this example in the same shell where `install_verified` was defined.
 
 ```sh
-# Reuse the resolved base_url from the same shell above.
+# Reuse the selected base_url from the same shell above.
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256" \
   --yes \
@@ -406,10 +333,10 @@ the installers never opt into shared home/socket state silently.
 
 To accept Marmot messages from any sender (explicit opt-in):
 
-Run this example in the same shell where `install_verified` above was defined.
+Run this example in the same shell where `install_verified` was defined.
 
 ```sh
-# Reuse the resolved base_url from the same shell above.
+# Reuse the selected base_url from the same shell above.
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256" \
   --yes --allow-all-users
