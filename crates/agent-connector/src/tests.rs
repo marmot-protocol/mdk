@@ -5564,7 +5564,7 @@ fn delivered_inbound_cursor_dedups_and_evicts_oldest() {
 
 #[test]
 fn invalid_edit_target_has_a_distinct_non_retryable_contract() {
-    let error = ConnectorError::App(marmot_app::AppError::InvalidEditTarget);
+    let error = crate::ConnectorError::App(marmot_app::AppError::InvalidEditTarget);
     assert_eq!(error.code(), "invalid_edit_target");
     assert_eq!(
         error.client_message(),
