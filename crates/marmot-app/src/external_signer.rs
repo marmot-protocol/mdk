@@ -1,5 +1,5 @@
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use cgka_engine::account_identity_proof::{
     AccountIdentityProofRequest, AccountIdentityProofSigner,
@@ -73,12 +73,31 @@ impl AccountIdentityProofSigner for LocalAccountIdentityProofSigner {
 #[derive(Clone)]
 pub(crate) struct RegisteredExternalSigner {
     public_key: PublicKey,
-    signer: Arc<dyn ExternalAccountSigner>,
+    signer: Arc<RwLock<Arc<dyn ExternalAccountSigner>>>,
 }
 
 impl RegisteredExternalSigner {
     pub(crate) fn new(public_key: PublicKey, signer: Arc<dyn ExternalAccountSigner>) -> Self {
-        Self { public_key, signer }
+        Self {
+            public_key,
+            signer: Arc::new(RwLock::new(signer)),
+        }
+    }
+
+    /// Existing SDK clients, workers, and proof contexts keep this same pinned
+    /// per-account slot when the host restores/replaces its transport callback.
+    pub(crate) fn replace(&self, signer: Arc<dyn ExternalAccountSigner>) {
+        *self
+            .signer
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = signer;
+    }
+
+    fn signer(&self) -> Arc<dyn ExternalAccountSigner> {
+        self.signer
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub(crate) fn account_signer(&self) -> AccountSigner {
@@ -105,7 +124,7 @@ impl MarmotNostrSigner for RegisteredExternalSigner {
         unsigned: UnsignedEvent,
     ) -> SignerFuture<'_, Result<Event, MarmotSignerError>> {
         let public_key = self.public_key;
-        let signer = self.signer.clone();
+        let signer = self.signer();
         Box::pin(async move {
             let expected_id = unsigned
                 .id
@@ -128,7 +147,8 @@ impl MarmotNostrSigner for RegisteredExternalSigner {
         public_key: &'a PublicKey,
         content: &'a str,
     ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
-        self.signer.nip04_encrypt(public_key, content)
+        let signer = self.signer();
+        Box::pin(async move { signer.nip04_encrypt(public_key, content).await })
     }
 
     fn nip04_decrypt<'a>(
@@ -136,7 +156,8 @@ impl MarmotNostrSigner for RegisteredExternalSigner {
         public_key: &'a PublicKey,
         encrypted_content: &'a str,
     ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
-        self.signer.nip04_decrypt(public_key, encrypted_content)
+        let signer = self.signer();
+        Box::pin(async move { signer.nip04_decrypt(public_key, encrypted_content).await })
     }
 
     fn nip44_encrypt<'a>(
@@ -144,7 +165,8 @@ impl MarmotNostrSigner for RegisteredExternalSigner {
         public_key: &'a PublicKey,
         content: &'a str,
     ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
-        self.signer.nip44_encrypt(public_key, content)
+        let signer = self.signer();
+        Box::pin(async move { signer.nip44_encrypt(public_key, content).await })
     }
 
     fn nip44_decrypt<'a>(
@@ -152,7 +174,8 @@ impl MarmotNostrSigner for RegisteredExternalSigner {
         public_key: &'a PublicKey,
         payload: &'a str,
     ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
-        self.signer.nip44_decrypt(public_key, payload)
+        let signer = self.signer();
+        Box::pin(async move { signer.nip44_decrypt(public_key, payload).await })
     }
 }
 
@@ -166,7 +189,7 @@ impl AccountIdentityProofSigner for RegisteredExternalSigner {
                 "request account identity does not match registered external signer".into(),
             );
         }
-        let signature = self.signer.sign_account_identity_proof(request)?;
+        let signature = self.signer().sign_account_identity_proof(request)?;
         let proof_event = request.proof_event()?;
         let signature_value = Signature::from_slice(&signature).map_err(|err| err.to_string())?;
         proof_event
