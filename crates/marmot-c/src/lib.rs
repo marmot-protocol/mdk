@@ -27,6 +27,7 @@ pub mod attachment_history;
 pub mod commands;
 pub(crate) mod macros;
 pub mod memory;
+pub mod nip46;
 pub mod publisher;
 pub mod secret_store;
 pub mod status;
