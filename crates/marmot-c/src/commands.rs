@@ -2521,7 +2521,7 @@ pub unsafe extern "C" fn marmot_send_custom_event(
     })
 }
 
-/// Create an encrypted NIP-88 poll in a group conversation. Option ids use `"0"`
+/// Create an encrypted NIP-88 poll in a direct or group conversation. Option ids use `"0"`
 /// through `"9"`. Free `out` with `marmot_send_summary_free`.
 ///
 /// # Safety
