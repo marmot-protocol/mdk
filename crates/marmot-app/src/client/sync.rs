@@ -5296,19 +5296,91 @@ impl AppClient {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn advance_convergence_after_runtime_sync(
         &mut self,
         group_id: &cgka_traits::GroupId,
     ) -> Result<SyncSummary, AppError> {
+        self.advance_convergence_with_projection_progress(group_id, None)
+            .await
+    }
+
+    /// Project accepted sends before later relay work finishes. A worker sink
+    /// publishes each committed update immediately; other callers receive the
+    /// updates once in the ordinary summary. The finalizer still owns guarded
+    /// failed-row revival and durable fanout acknowledgement.
+    pub(crate) async fn advance_convergence_with_projection_progress(
+        &mut self,
+        group_id: &cgka_traits::GroupId,
+        on_update: Option<std::sync::Arc<dyn Fn(crate::AppProjectionUpdate) + Send + Sync>>,
+    ) -> Result<SyncSummary, AppError> {
         if self.is_group_forgotten(group_id)? {
             return Ok(SyncSummary::default());
         }
+        let app = self.app.clone();
+        let label = self.state.label.clone();
+        let buffered = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let progress_updates = buffered.clone();
+        let observe = std::sync::Arc::new(
+            move |published: &marmot_account::PublishedApplicationMessage| {
+                // UPDATE-only finalization cannot create absent rows or clear an
+                // invalidation. Revival requires the live-group check in the final
+                // effects handler and intentionally waits for that handler.
+                let result = app.finalize_account_app_event_source_retention(
+                    &label,
+                    &hex::encode(published.group_id.as_slice()),
+                    &published.app_event_id,
+                    Some(&hex::encode(published.message_id.as_slice())),
+                    published.source_epoch.0,
+                    published.retention,
+                    published.authority,
+                );
+                match result {
+                    Ok(Some(update)) => match &on_update {
+                        Some(on_update) => on_update(update),
+                        None => progress_updates.lock().unwrap().push(update),
+                    },
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(
+                        target: "marmot_app::client::projection",
+                        method = "publication_progress",
+                        error_kind = error.privacy_safe_kind(),
+                        "published application-message projection deferred",
+                    ),
+                }
+            },
+        );
         // The worker retries dirty subscription state before this pass. An
         // unchanged group set requires no account-wide refresh per group.
-        let effects = self.runtime.advance_convergence(group_id).await?;
-        let mut summary = self
+        let effects = self
+            .runtime
+            .advance_convergence_with_publication_progress(group_id, observe)
+            .await;
+        let progress_updates = std::mem::take(&mut *buffered.lock().unwrap());
+        let effects = match effects {
+            Ok(effects) => effects,
+            Err(error) => {
+                self.pending_projection_updates.extend(progress_updates);
+                return Err(error.into());
+            }
+        };
+        let pending_updates_before_finalization = self.pending_projection_updates.len();
+        let mut summary = match self
             .finish_scheduled_convergence_effects(group_id, &effects)
-            .await?;
+            .await
+        {
+            Ok(summary) => summary,
+            Err(error) => {
+                // A mixed failure may already have queued a newer revival or
+                // invalidation. Deliver the earlier source snapshots first.
+                self.pending_projection_updates.splice(
+                    pending_updates_before_finalization..pending_updates_before_finalization,
+                    progress_updates,
+                );
+                return Err(error);
+            }
+        };
+        summary.projection_updates.splice(0..0, progress_updates);
         // This seam follows an actual engine evaluation. Projection-only
         // replays of an effects batch must not allocate observation identities.
         if let Err(error) = self.observe_qualified_local_stagnation(group_id) {

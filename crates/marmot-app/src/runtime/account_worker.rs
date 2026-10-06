@@ -2113,7 +2113,21 @@ async fn run_app_runtime_account_worker(
                             Ok(_) => {
                                 // Shutdown is safe here: no engine snapshot guard is live.
                                 if lifecycle.is_stopping() { return; }
-                                match client.advance_convergence_after_runtime_sync(&group_id).await {
+                                let progress = Arc::new(ProjectionPublicationProgress::new(
+                                    events.clone(), &account_id_hex, &account_label,
+                                ));
+                                let progress_sink = progress.clone();
+                                let on_publication = Arc::new(move |update| {
+                                    progress_sink.publish(update);
+                                });
+                                let result = client.advance_convergence_with_projection_progress(&group_id, Some(on_publication)).await;
+                                record_runtime_publication(
+                                    &client,
+                                    marmot_forensics::v5::RuntimePublicationCategory::ProjectionUpdate,
+                                    None,
+                                    progress.take_publication(),
+                                );
+                                match result {
                                     Ok(summary) => {
                                         publish_app_runtime_summary_with_v5(&client, &events, &account_id_hex, &account_label, &summary);
                                         // A pass that superseded one of this
@@ -6898,6 +6912,50 @@ struct RuntimeSummaryPublication {
     no_subscribers: u64,
 }
 
+/// Broadcast committed projection progress without retaining snapshots. Only
+/// bounded aggregate counts remain for the existing v5 publication outcome.
+struct ProjectionPublicationProgress {
+    events: broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: String,
+    account_label: String,
+    publication: std::sync::Mutex<RuntimeSummaryPublication>,
+}
+
+impl ProjectionPublicationProgress {
+    fn new(
+        events: broadcast::Sender<MarmotAppEvent>,
+        account_id_hex: &str,
+        account_label: &str,
+    ) -> Self {
+        Self {
+            events,
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+            publication: Default::default(),
+        }
+    }
+
+    fn publish(&self, update: AppProjectionUpdate) {
+        let accepted = publish_app_runtime_projection_update(
+            &self.events,
+            &self.account_id_hex,
+            &self.account_label,
+            update,
+        );
+        let mut publication = self.publication.lock().unwrap();
+        publication.attempted += 1;
+        if accepted {
+            publication.accepted += 1;
+        } else {
+            publication.no_subscribers += 1;
+        }
+    }
+
+    fn take_publication(&self) -> RuntimeSummaryPublication {
+        std::mem::take(&mut *self.publication.lock().unwrap())
+    }
+}
+
 fn publish_app_runtime_summary(
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
@@ -7242,6 +7300,7 @@ mod tests {
     mod integrated_recovery_acceptance_tests;
     #[cfg(feature = "test-policy-overrides")]
     mod local_submission_queue_tests;
+    mod publication_progress_tests;
     #[cfg(feature = "test-policy-overrides")]
     mod receive_comparison_resume_tests;
     mod resource_bounds_tests;

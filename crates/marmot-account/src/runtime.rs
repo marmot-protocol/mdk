@@ -391,6 +391,21 @@ impl MaintenanceActivity {
             .saturating_add(previous.failed_transitions);
     }
 }
+type PublicationProgressObserver = Arc<dyn Fn(&PublishedApplicationMessage) + Send + Sync>;
+type PublicationProgressSlot = Arc<std::sync::Mutex<Option<PublicationProgressObserver>>>;
+
+/// Restore the previous observer even when the owning convergence future is dropped.
+struct PublicationProgressGuard {
+    slot: PublicationProgressSlot,
+    previous: Option<PublicationProgressObserver>,
+}
+
+impl Drop for PublicationProgressGuard {
+    fn drop(&mut self) {
+        *self.slot.lock().unwrap_or_else(|error| error.into_inner()) = self.previous.take();
+    }
+}
+
 pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackagePublisher> {
     session: AccountDeviceSession,
     adapter: A,
@@ -415,6 +430,7 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// legacy publish for this message id fails with a transient storage
     /// error. Never set by production code.
     finish_stage_failure: Option<cgka_traits::MessageId>,
+    publication_progress: PublicationProgressSlot,
 }
 
 impl<A, R, K> AccountDeviceRuntime<A, R, K>
@@ -439,6 +455,7 @@ where
             pending_leaf_reconciliations: HashMap::new(),
             detached_welcome_publishes: HashSet::new(),
             finish_stage_failure: None,
+            publication_progress: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -2489,6 +2506,29 @@ where
             }))
     }
 
+    /// Advance convergence while observing each durable accepted application
+    /// publication before waiting for later publications in the same batch.
+    ///
+    /// The synchronous observer must not panic or perform network work. Its
+    /// notification uses the same acceptance rule as `published_app_messages`;
+    /// it does not change quorum, MLS confirmation, or acknowledge projection
+    /// persistence. Observers should handle local failures without interrupting
+    /// the remaining batch. Dropping this future removes its observer; durable
+    /// fanouts remain available to the ordinary recovery path.
+    pub async fn advance_convergence_with_publication_progress(
+        &mut self,
+        group_id: &GroupId,
+        observe: Arc<dyn Fn(&PublishedApplicationMessage) + Send + Sync>,
+    ) -> AccountResult<AccountDeviceEffects> {
+        let slot = self.publication_progress.clone();
+        let previous = slot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .replace(observe);
+        let _guard = PublicationProgressGuard { slot, previous };
+        self.advance_convergence(group_id).await
+    }
+
     pub async fn advance_convergence(
         &mut self,
         group_id: &GroupId,
@@ -2826,6 +2866,32 @@ where
             .map(|(effects, _blocked_groups)| effects)
     }
 
+    /// Notify only after the ordinary durable-fanout path records acceptance.
+    fn record_published_application_fanout(
+        &self,
+        fanout: &OutboundFanout,
+        output: &mut AccountDeviceEffects,
+    ) {
+        let previous_count = output.published_app_messages.len();
+        record_published_application_fanout(fanout, output);
+        if output.published_app_messages.len() == previous_count {
+            return;
+        }
+        let observer = self
+            .publication_progress
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(observer) = observer {
+            observer(
+                output
+                    .published_app_messages
+                    .last()
+                    .expect("recorded publication"),
+            );
+        }
+    }
+
     /// Retire terminal accepted application fanouts only after the app has
     /// durably finalized their optimistic projections.
     ///
@@ -2895,7 +2961,7 @@ where
                     blocked_groups.insert(fanout_group);
                 }
             } else if outcome.accepted_targets > 0 && fanout.application_message().is_some() {
-                record_published_application_fanout(&fanout, &mut output);
+                self.record_published_application_fanout(&fanout, &mut output);
                 output.fanout.push(outcome);
             } else {
                 let reason = "insufficient publish acknowledgements".to_owned();
@@ -4259,7 +4325,7 @@ where
             }
         }
         if status.accepted_by_any_endpoint {
-            record_published_application_fanout(&fanout, output);
+            self.record_published_application_fanout(&fanout, output);
         } else if let Some(reason) = publish_failure_reason {
             record_failed_application_fanout(&fanout, reason, output);
         } else if let Some(application) = fanout.application_message()
