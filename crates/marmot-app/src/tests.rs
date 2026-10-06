@@ -9094,10 +9094,10 @@ async fn member_key_package_set_falls_back_when_multi_author_queries_are_incompl
         6,
         "both relay-list hops and the empty incomplete package batch retry each member"
     );
-    for kind in [
-        KIND_NIP65_RELAY_LIST,
-        KIND_MARMOT_INBOX_RELAY_LIST,
-        KIND_MARMOT_KEY_PACKAGE,
+    for (kind, expected) in [
+        (KIND_NIP65_RELAY_LIST, 4),
+        (KIND_MARMOT_INBOX_RELAY_LIST, 4),
+        (KIND_MARMOT_KEY_PACKAGE, 2),
     ] {
         assert_eq!(
             requests
@@ -9105,8 +9105,8 @@ async fn member_key_package_set_falls_back_when_multi_author_queries_are_incompl
                 .flat_map(|request| &request.queries)
                 .filter(|query| query.kind == kind && query.authors.len() == 1)
                 .count(),
-            2,
-            "each incomplete batch falls back once per member; prewarm adds no preference refetch"
+            expected,
+            "each relay-list hop carries both kinds; packages fall back once per member without a preference refetch"
         );
     }
 }
