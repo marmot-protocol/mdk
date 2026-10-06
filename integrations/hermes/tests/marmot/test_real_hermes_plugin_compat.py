@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -21,6 +22,54 @@ class SourceInstallCapabilityTests(unittest.TestCase):
             self.assertFalse(PROBE._parse_args().accept_reviewed_local_plugin_caution)
         with mock.patch.object(sys, "argv", [str(SCRIPT_PATH), "--accept-reviewed-local-plugin-caution"]):
             self.assertTrue(PROBE._parse_args().accept_reviewed_local_plugin_caution)
+
+    def test_scan_preflight_only_confirms_observed_caution(self):
+        class Blocked(Exception):
+            def __init__(self, result):
+                self.scan_result = result
+
+        for verdict, consent, expected in (
+            ("safe", False, False), ("safe", True, False),
+            ("caution", False, None), ("caution", True, True),
+            ("dangerous", False, None), ("dangerous", True, None),
+        ):
+            with self.subTest(verdict=verdict, consent=consent):
+                guard = types.ModuleType("tools.plugin_guard")
+                guard.scan_plugin = lambda *a, **kw: types.SimpleNamespace(
+                    verdict=verdict, findings=[])
+                def scan(*a, force, **kw):
+                    result = guard.scan_plugin()
+                    if result.verdict == "dangerous" or result.verdict == "caution" and not force:
+                        raise Blocked(result)
+                    return result
+                command = types.SimpleNamespace(_scan_plugin_tree=scan, PluginScanBlocked=Blocked)
+                with mock.patch.dict(sys.modules, {"tools.plugin_guard": guard}):
+                    if expected is None:
+                        with self.assertRaises(Blocked):
+                            PROBE._local_plugin_install_force(command, Path("fixture"), accept_caution=consent)
+                    else:
+                        self.assertIs(PROBE._local_plugin_install_force(
+                            command, Path("fixture"), accept_caution=consent), expected)
+
+    def test_scan_preflight_rejects_a_host_that_forces_dangerous_verdicts(self):
+        class Blocked(Exception):
+            def __init__(self, result):
+                self.scan_result = result
+        guard = types.ModuleType("tools.plugin_guard")
+        guard.scan_plugin = lambda *a, **kw: types.SimpleNamespace(verdict="caution", findings=[])
+        def scan(*a, force, **kw):
+            result = guard.scan_plugin()
+            if not force:
+                raise Blocked(result)
+            return result
+        command = types.SimpleNamespace(_scan_plugin_tree=scan, PluginScanBlocked=Blocked)
+        with mock.patch.dict(sys.modules, {"tools.plugin_guard": guard}):
+            with self.assertRaisesRegex(AssertionError, "allows a dangerous"):
+                PROBE._local_plugin_install_force(command, Path("fixture"), accept_caution=True)
+
+    def test_older_hosts_without_scanner_never_force_install(self):
+        self.assertFalse(PROBE._local_plugin_install_force(
+            types.SimpleNamespace(), Path("fixture"), accept_caution=True))
 
     def test_plugin_only_artifact_contains_and_imports_inbound_spool(self):
         mdk_source = Path(__file__).resolve().parents[4]
