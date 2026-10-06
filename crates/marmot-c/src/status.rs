@@ -513,6 +513,7 @@ mod tests {
             }) as i32,
             96
         );
+        assert!(!take_last_error().unwrap().contains("private"));
         assert_eq!(
             status_from_error(&MarmotKitError::MemberDiscoveryIncomplete {
                 account: "private".into()

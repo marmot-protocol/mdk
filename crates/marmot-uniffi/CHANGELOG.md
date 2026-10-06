@@ -4,6 +4,12 @@
 
 ### Breaking changes
 
+- `MarmotKitError` gains `ObsoleteKeyPackage { account }` and
+  `MemberDiscoveryIncomplete { account }`; update exhaustive Swift/Kotlin error
+  switches. Recipient fields support focused recovery guidance; Display omits
+  identity. No new query types or legacy-package admission. An unfinished empty
+  batch can invoke the existing per-member fallback.
+
 - Attachment history adds `AttachmentRoleFfi` and the required, defaultless
   `AttachmentEntryFfi.role` field. Regenerate Swift/Kotlin bindings with the
   matching native library and update host record constructors and fixtures.
@@ -11,8 +17,6 @@
   after filtered pages as described in [the handoff](ATTACHMENT-HISTORY.md).
 
 ### Added
-
-- Add typed `ObsoleteKeyPackage { account }` and `MemberDiscoveryIncomplete { account }` invitation errors. Recipient fields support focused recovery guidance; Display omits the identity. No new lookup queries or legacy-package admission.
 
 - `Marmot::message_reactions` returns complete local reaction details for one exact
   account/group/message, with one effective entry per sender/emoji and no

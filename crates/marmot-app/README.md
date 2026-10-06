@@ -200,7 +200,7 @@ leave, clears the pending flag, and archives the local projection so normal chat
 
 ### Invitation lookup diagnostics
 
-Invitation resolution reports `ObsoleteKeyPackage` only when the completed bounded lookup finds validated legacy packages in every observed newest addressable slot, with no usable current package. Clients can recommend updating and publishing a current KeyPackage. `MemberDiscoveryIncomplete` means the lookup could not establish missing or obsolete-only packages; retry may help. These diagnoses use the existing queries and preserve strict current-profile admission, slot replacement, fresh validation, and current-client preference. They describe the searched relays, not all publications across Nostr.
+Invitation resolution reports `ObsoleteKeyPackage` only when the completed bounded lookup finds validated legacy packages in every observed newest addressable slot, with no usable current package. Clients can recommend updating and publishing a current KeyPackage. `MemberDiscoveryIncomplete` means the lookup could not establish missing or obsolete-only packages; retry may help. These diagnoses use the existing query types and bounded lookup paths; an unfinished empty batch can trigger the existing per-member fallback. They preserve strict current-profile admission, slot replacement, fresh validation, and current-client preference. They describe the searched relays, not all publications across Nostr.
 
 ## Conversations
 
