@@ -105,7 +105,7 @@ pub use attachment_access::{
 mod avatar;
 pub use attachment_history::{
     AttachmentCategory, AttachmentEntry, AttachmentHistoryCursor, AttachmentHistoryVersion,
-    AttachmentPage, AttachmentPageRead, MAX_ATTACHMENT_HISTORY_PAGE,
+    AttachmentPage, AttachmentPageRead, AttachmentRole, MAX_ATTACHMENT_HISTORY_PAGE,
 };
 mod avatar_access;
 pub use avatar_access::{LocalAvatarRead, MAX_AVATAR_BATCH_BYTES, MAX_AVATAR_BATCH_ITEMS};
@@ -2730,7 +2730,7 @@ impl MarmotAppRuntime {
             .await
     }
 
-    /// Create an encrypted NIP-88 poll in a group conversation.
+    /// Create an encrypted NIP-88 poll in a direct or group conversation.
     pub async fn create_poll(
         &self,
         account_ref: &str,

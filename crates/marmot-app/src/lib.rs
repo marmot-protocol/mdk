@@ -7670,8 +7670,8 @@ pub use storage_sqlite::{ContentReport, ContentReportPage, ReportDismissal, Repo
 pub use runtime::{
     AttachmentAssetRef, AttachmentAutomaticPermission, AttachmentCategory, AttachmentControl,
     AttachmentDownloadPolicy, AttachmentEntry, AttachmentHistoryCursor, AttachmentHistoryVersion,
-    AttachmentLocalTarget, AttachmentPage, AttachmentPageRead, AttachmentTransferState,
-    AttachmentTransferStatus, AutomaticAttachmentRequest, MAX_ATTACHMENT_ASSET_LOOKUPS,
-    MAX_ATTACHMENT_HISTORY_PAGE, MAX_ATTACHMENT_LOCAL_READ_BYTES, RetainedAttachmentAsset,
-    RuntimeAttachmentTransferSubscription,
+    AttachmentLocalTarget, AttachmentPage, AttachmentPageRead, AttachmentRole,
+    AttachmentTransferState, AttachmentTransferStatus, AutomaticAttachmentRequest,
+    MAX_ATTACHMENT_ASSET_LOOKUPS, MAX_ATTACHMENT_HISTORY_PAGE, MAX_ATTACHMENT_LOCAL_READ_BYTES,
+    RetainedAttachmentAsset, RuntimeAttachmentTransferSubscription,
 };
