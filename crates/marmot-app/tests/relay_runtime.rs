@@ -8594,69 +8594,113 @@ async fn relay_app_runtime_synthesizes_rows_for_multi_member_invite() {
 }
 
 #[tokio::test]
-async fn relay_app_client_rejects_invalid_edit_targets_before_publish() {
+async fn relay_app_runtime_rejects_invalid_edit_targets_before_publish() {
     let dir = tempfile::tempdir().unwrap();
-    let home = AccountHome::open(dir.path());
-    home.create_account("alice").unwrap();
-    home.create_account("bob").unwrap();
-    let (_relay, app, _url) = mock_app(&dir).await;
-    let mut bob = app.client("bob").await.unwrap();
-    bob.publish_key_package().await.unwrap();
-    let mut alice = app.client("alice").await.unwrap();
-    let group = alice
-        .create_group("edit eligibility", &["bob"])
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    let mut events = runtime.subscribe();
+    let group = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "edit eligibility",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
         .await
         .unwrap();
-    bob.sync().await.unwrap();
-    let sent = alice.send(&group, b"original").await.unwrap();
+    let sent = runtime
+        .send_message(&alice.account.account_id_hex, &group, b"original".to_vec())
+        .await
+        .unwrap();
     let target = &sent.message_ids[0];
-    bob.sync().await.unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(event, MarmotAppEvent::MessageReceived(message)
+            if message.account_id_hex == bob.account.account_id_hex
+                && message.message.group_id == group
+                && message.message.message_id_hex == *target)
+    })
+    .await;
+    let edit_count = |account: &str| {
+        app.messages(account)
+            .unwrap()
+            .iter()
+            .filter(|message| message.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_EDIT)
+            .count()
+    };
     assert_eq!(
-        app.timeline_message("bob", &hex::encode(group.as_slice()), target)
+        app.timeline_message(&bob.account.label, &hex::encode(group.as_slice()), target)
             .unwrap()
             .unwrap()
             .kind,
         MARMOT_APP_EVENT_KIND_CHAT
     );
-    let before = app.messages("bob").unwrap().len();
+    let before = edit_count(&bob.account.label);
     assert!(matches!(
-        bob.edit_message(&group, target, "foreign").await,
+        runtime
+            .edit_message(&bob.account.account_id_hex, &group, target, "foreign")
+            .await,
         Err(AppError::InvalidEditTarget)
     ));
-    assert_eq!(app.messages("bob").unwrap().len(), before);
-    let activity = alice
-        .send_agent_activity(&group, "working".into(), "status".into(), None, None)
+    assert_eq!(edit_count(&bob.account.label), before);
+    let activity = runtime
+        .send_agent_activity(
+            &alice.account.account_id_hex,
+            &group,
+            "working".into(),
+            "status".into(),
+            None,
+            None,
+        )
         .await
         .unwrap();
     for invalid in [&activity.message_ids[0], &"ff".repeat(32)] {
-        let before = app.messages("alice").unwrap().len();
+        let before = edit_count(&alice.account.label);
         assert!(matches!(
-            alice.edit_message(&group, invalid, "invalid").await,
+            runtime
+                .edit_message(&alice.account.account_id_hex, &group, invalid, "invalid")
+                .await,
             Err(AppError::InvalidEditTarget)
         ));
-        assert_eq!(app.messages("alice").unwrap().len(), before);
+        assert_eq!(edit_count(&alice.account.label), before);
     }
-    alice.edit_message(&group, target, "edited").await.unwrap();
+    runtime
+        .edit_message(&alice.account.account_id_hex, &group, target, "edited")
+        .await
+        .unwrap();
     assert_eq!(
-        app.timeline_message("alice", &hex::encode(group.as_slice()), target)
+        app.timeline_message(&alice.account.label, &hex::encode(group.as_slice()), target)
             .unwrap()
             .unwrap()
             .plaintext,
         "edited"
     );
-    alice.delete_message(&group, target).await.unwrap();
+    runtime
+        .delete_message(&alice.account.account_id_hex, &group, target)
+        .await
+        .unwrap();
     assert!(
-        app.timeline_message("alice", &hex::encode(group.as_slice()), target)
+        app.timeline_message(&alice.account.label, &hex::encode(group.as_slice()), target)
             .unwrap()
             .unwrap()
             .deleted
     );
-    let before = app.messages("alice").unwrap().len();
+    let before = edit_count(&alice.account.label);
     assert!(matches!(
-        alice.edit_message(&group, target, "deleted").await,
+        runtime
+            .edit_message(&alice.account.account_id_hex, &group, target, "deleted")
+            .await,
         Err(AppError::InvalidEditTarget)
     ));
-    assert_eq!(app.messages("alice").unwrap().len(), before);
+    assert_eq!(edit_count(&alice.account.label), before);
+    runtime.shutdown().await;
 }
 
 #[tokio::test]
