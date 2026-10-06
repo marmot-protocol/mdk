@@ -2250,7 +2250,11 @@ pub(crate) fn observe_event(
                 return None;
             };
             message.authority = *authority;
-            summary.messages.push(message.clone());
+            // Gossip remains available to native ingestion, but must never enter
+            // the host message summary, including a partially applied batch.
+            if !crate::notifications::is_push_gossip_kind(message.kind) {
+                summary.messages.push(message.clone());
+            }
             summary.events.push(event.clone());
             Some(message)
         }

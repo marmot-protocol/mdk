@@ -50,8 +50,10 @@
   failures preserve the canonical publish result. Failed projection batches
   retain their source identity/time in a session queue; later delivery, drain and
   convergence observations cannot overtake them. Successful-prefix subscriber
-  updates survive a later write failure. Route rebuilds and failed hydration
-  token sweeps use bounded worker retries. These retry queues are not durable.
+  updates survive a later write failure, including an older blocked batch.
+  Push gossip never enters partial host-message summaries. Route rebuilds and
+  failed hydration token sweeps use bounded worker retries; one group's failed
+  sweep does not block other groups or route refresh. These retry queues are not durable.
   Local termination preserves peer push records and tombstones. Late gossip
   cannot re-add an absent account/leaf pair; hydrated open reconciles missed leaf
   cleanup without treating unreadable groups as empty rosters.

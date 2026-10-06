@@ -684,7 +684,9 @@ impl AppClient {
             Err(_) => {
                 self.pending_push_leaf_reconciliations
                     .insert(group_id.clone());
-                tracing::warn!(target: "marmot_app::push", error_code = "leaf_reconciliation_failed",
+                tracing::warn!(target: "marmot_app::push",
+                    method = "cleanup_stale_push_tokens_best_effort",
+                    error_code = "leaf_reconciliation_failed",
                     "retained canonical push reconciliation for retry");
             }
         }
@@ -716,11 +718,18 @@ impl AppClient {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
+        let mut first_error = None;
         for group_id in groups {
-            self.reconcile_push_token_leaves(&group_id)?;
-            self.pending_push_leaf_reconciliations.remove(&group_id);
+            match self.reconcile_push_token_leaves(&group_id) {
+                Ok(()) => {
+                    self.pending_push_leaf_reconciliations.remove(&group_id);
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 }
 

@@ -601,6 +601,7 @@ impl AppClient {
                         ..Default::default()
                     });
                     tracing::warn!(target: "marmot_app::groups",
+                        method = "reconcile_hydrated_account_state",
                         error_code = "terminal_projection_reconciliation_failed",
                         "retained terminal projection for retry");
                 }
@@ -1057,6 +1058,7 @@ impl AppClient {
             .is_err()
         {
             tracing::warn!(target: "marmot_app::groups",
+                method = "project_group_system_rows",
                 error_code = "projection_apply_failed", "failed to project group system row");
         }
         updates
@@ -1149,6 +1151,7 @@ impl AppClient {
                     Ok(update) => updates.push(update),
                     Err(error) if retry_projection_writes => return Err(error),
                     Err(_) => tracing::warn!(target: "marmot_app::groups",
+                        method = "project_group_system_rows_into",
                         error_code = "projection_apply_failed", "failed to project group system row"),
                 }
             }

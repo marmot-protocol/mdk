@@ -1265,6 +1265,30 @@ async fn partial_native_projection_retries_without_republishing() {
             ],
             ..Default::default()
         };
+        // Canonical app payloads model already authenticated native deliveries.
+        // Push protocol traffic must stay hidden even when the next event fails.
+        let message_events = [MARMOT_APP_EVENT_KIND_CHAT, 447, 448, 449]
+            .into_iter()
+            .map(|kind| GroupEvent::MessageReceived {
+                authority: None,
+                group_id: group.clone(),
+                message_id: MessageId::new(vec![kind as u8; 32]),
+                sender: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+                epoch: client.runtime.group_record(&group).unwrap().epoch,
+                payload: cgka_traits::app_event::MarmotAppEvent::new(
+                    &account.account_id_hex,
+                    12,
+                    kind,
+                    Vec::new(),
+                    "projection prefix",
+                )
+                .encode()
+                .unwrap(),
+                retention: None,
+                encrypted_media_secret: None,
+            })
+            .collect::<Vec<_>>();
+        effects.events.splice(0..0, message_events);
         if failed_publish {
             effects.failures.push(marmot_account::PublishFailure {
                 message_id: MessageId::new(vec![0xe4; 32]),
@@ -1309,6 +1333,20 @@ async fn partial_native_projection_retries_without_republishing() {
         let prefix = client.take_pending_applied_sync_summary();
         assert!(
             prefix
+                .messages
+                .iter()
+                .all(|message| !notifications::is_push_gossip_kind(message.kind))
+        );
+        if seam != 0 || failed_publish {
+            assert!(
+                prefix
+                    .messages
+                    .iter()
+                    .any(|message| message.kind == MARMOT_APP_EVENT_KIND_CHAT)
+            );
+        }
+        assert!(
+            prefix
                 .projection_updates
                 .iter()
                 .flat_map(|update| &update.timeline_messages)
@@ -1323,6 +1361,13 @@ async fn partial_native_projection_retries_without_republishing() {
                 .is_err()
         );
         assert_eq!(client.pending_applied_effects.len(), 1);
+        assert!(
+            client
+                .take_pending_applied_sync_summary()
+                .messages
+                .iter()
+                .all(|message| !notifications::is_push_gossip_kind(message.kind))
+        );
         connection
             .execute_batch("DROP TRIGGER fail_restoration")
             .unwrap();
@@ -1338,6 +1383,12 @@ async fn partial_native_projection_retries_without_republishing() {
         assert!(!client.has_pending_runtime_group_subscription_refresh());
         assert!(client.pending_applied_effects.is_empty());
         let summary = client.take_pending_applied_sync_summary();
+        assert!(
+            summary
+                .messages
+                .iter()
+                .all(|message| !notifications::is_push_gossip_kind(message.kind))
+        );
         if failed_publish {
             assert_eq!(
                 summary
@@ -1454,5 +1505,97 @@ async fn committed_activity_tail_retries_after_storage_failure() {
     assert!(
         !client.has_pending_runtime_group_subscription_refresh(),
         "successful ordinary activity must not arm an unnecessary route rebuild"
+    );
+}
+
+/// Independent hydration repairs must not serialize unrelated groups behind a
+/// persistent storage fault or prevent the account's route refresh from finishing.
+#[tokio::test]
+async fn failed_push_sweep_does_not_block_other_groups_or_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = app_at(&dir, Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    client.prepare_transport().await.unwrap();
+    let first = client.create_group("first repair", &[]).await.unwrap();
+    let second = client.create_group("second repair", &[]).await.unwrap();
+    for group in [&first, &second] {
+        app.upsert_group_push_token(
+            "alice",
+            &drained_seam_push_token(&hex::encode(group.as_slice()), &account.account_id_hex, 777),
+        )
+        .unwrap();
+        client
+            .pending_push_leaf_reconciliations
+            .insert(group.clone());
+    }
+    // Fail the first iteration deterministically, independently of HashSet order.
+    let blocked = client
+        .pending_push_leaf_reconciliations
+        .iter()
+        .next()
+        .unwrap()
+        .clone();
+    let healthy = if blocked == first { second } else { first };
+    let blocked_hex = hex::encode(blocked.as_slice());
+    let healthy_hex = hex::encode(healthy.as_slice());
+    let path = app.account_storage_path("alice");
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let key = app
+        .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    connection
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_one_leaf_sweep BEFORE DELETE ON group_push_tokens
+        WHEN OLD.group_id_hex = '{blocked_hex}'
+        BEGIN SELECT RAISE(FAIL, 'injected group-specific cleanup failure'); END;"
+        ))
+        .unwrap();
+    assert!(
+        client
+            .retry_pending_runtime_group_subscription_refresh()
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        app.group_push_tokens("alice", &blocked_hex).unwrap().len(),
+        1
+    );
+    assert!(
+        app.group_push_tokens("alice", &healthy_hex)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        client.pending_push_leaf_reconciliations,
+        HashSet::from([blocked])
+    );
+    assert!(
+        !client.pending_runtime_group_subscription_refresh,
+        "the independent route refresh must finish despite the token cleanup error"
+    );
+    assert!(client.has_pending_runtime_group_subscription_refresh());
+    connection
+        .execute_batch("DROP TRIGGER fail_one_leaf_sweep")
+        .unwrap();
+    assert!(
+        !client
+            .retry_pending_runtime_group_subscription_refresh()
+            .await
+            .unwrap()
+    );
+    assert!(
+        app.group_push_tokens("alice", &blocked_hex)
+            .unwrap()
+            .is_empty()
     );
 }

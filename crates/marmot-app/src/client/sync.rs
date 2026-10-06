@@ -1363,7 +1363,7 @@ impl AppClient {
         }
         self.pending_runtime_group_subscription_refresh = true;
         self.retry_applied_effect_projections().await?;
-        self.retry_pending_push_leaf_reconciliations()?;
+        let push_cleanup_result = self.retry_pending_push_leaf_reconciliations();
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         self.refresh_group_routes()?;
         if let Err(error) = self.sync_runtime_groups().await {
@@ -1380,6 +1380,7 @@ impl AppClient {
             }
         }
         self.pending_runtime_group_subscription_refresh = false;
+        push_cleanup_result?;
         Ok(self.has_pending_runtime_group_subscription_refresh())
     }
 
@@ -1853,7 +1854,6 @@ impl AppClient {
         let local_group_deletion_frontiers =
             self.local_group_deletion_frontiers_at_batch_start(effects)?;
         let mut routes_dirty = false;
-        let mut gossip_message_ids = HashSet::new();
         for event in &effects.events {
             // A replayed application event has no outer relay envelope, but its
             // durable engine outbox key is stable and unique. Use that key as
@@ -1904,26 +1904,18 @@ impl AppClient {
                 source_received_at,
                 None,
                 self.app.allow_loopback_blob_endpoints(),
+            ) && let Err(error) = self.project_received_message(
+                message,
+                event_encrypted_media_secret(event),
+                group_metadata.as_ref(),
+                summary,
             ) {
-                match self.project_received_message(
-                    message,
-                    event_encrypted_media_secret(event),
-                    group_metadata.as_ref(),
-                    summary,
-                ) {
-                    Ok(Some(gossip_message_id)) => {
-                        gossip_message_ids.insert(gossip_message_id);
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        self.record_v5_event_projection_failure(
-                            std::slice::from_ref(event),
-                            &error,
-                            projection_started.elapsed(),
-                        );
-                        return Err(error);
-                    }
-                }
+                self.record_v5_event_projection_failure(
+                    std::slice::from_ref(event),
+                    &error,
+                    projection_started.elapsed(),
+                );
+                return Err(error);
             }
             let updated_group =
                 event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
@@ -1973,11 +1965,6 @@ impl AppClient {
             if self.state.groups.len() != before {
                 routes_dirty = true;
             }
-        }
-        if !gossip_message_ids.is_empty() {
-            summary
-                .messages
-                .retain(|message| !gossip_message_ids.contains(&message.message_id_hex));
         }
         self.clear_terminal_local_group_deletion_frontiers(effects)?;
         // Synthesize durable kind-1210 system rows from the replayed
@@ -5050,7 +5037,7 @@ impl AppClient {
         carried_media_secret: Option<&cgka_traits::EncryptedMediaSecret>,
         group_metadata: Option<&cgka_traits::Group>,
         summary: &mut SyncSummary,
-    ) -> Result<Option<String>, AppError> {
+    ) -> Result<(), AppError> {
         if notifications::is_push_gossip_kind(message.kind) {
             let ingest_result = group_metadata
                 .map(|group| group.protocol_profile)
@@ -5080,7 +5067,7 @@ impl AppClient {
                     "ignoring malformed push token gossip",
                 );
             }
-            return Ok(Some(message.message_id_hex));
+            return Ok(());
         }
         let retains_encrypted_media = message.kind == MARMOT_APP_EVENT_KIND_CHAT
             && media_imeta_tags_are_valid(&message.tags, self.app.allow_loopback_blob_endpoints());
@@ -5133,7 +5120,7 @@ impl AppClient {
         }
         summary.projection_updates.push(projection_update);
         self.prune_plaintext_retention_for_group(&message.group_id)?;
-        Ok(None)
+        Ok(())
     }
 
     fn prepare_pending_application_event_ack(&mut self, event: &cgka_traits::engine::GroupEvent) {
@@ -5614,6 +5601,8 @@ impl AppClient {
                 source_received_at,
                 false,
             );
+            self.pending_applied_sync_summary
+                .merge(std::mem::take(summary));
             return Err(error);
         }
         let started = Instant::now();
@@ -5651,10 +5640,6 @@ impl AppClient {
         let display_names = self.display_names_for_events(&effects.events);
         self.note_superseded_intent_reports(effects);
         let mut routes_dirty = false;
-        // #760: collect push-gossip ids and strip them from `summary.messages` in
-        // ONE pass after the loop. The previous per-message `retain` was O(n) per
-        // gossip event → O(n²) over a batch a relay could flood with kind-448s.
-        let mut gossip_message_ids: HashSet<String> = HashSet::new();
         let local_group_deletion_frontiers =
             self.local_group_deletion_frontiers_at_batch_start(effects)?;
         for event in &effects.events {
@@ -5704,13 +5689,13 @@ impl AppClient {
                 source_received_at,
                 event_outer_transport_at,
                 self.app.allow_loopback_blob_endpoints(),
-            ) && let Some(gossip_message_id) = self.project_received_message(
-                message,
-                event_encrypted_media_secret(event),
-                group_metadata.as_ref(),
-                summary,
-            )? {
-                gossip_message_ids.insert(gossip_message_id);
+            ) {
+                self.project_received_message(
+                    message,
+                    event_encrypted_media_secret(event),
+                    group_metadata.as_ref(),
+                    summary,
+                )?;
             }
             let updated_group =
                 event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
@@ -5755,12 +5740,6 @@ impl AppClient {
             }
         }
         self.clear_terminal_local_group_deletion_frontiers(effects)?;
-        // #760: strip all collected push-gossip messages in one pass.
-        if !gossip_message_ids.is_empty() {
-            summary
-                .messages
-                .retain(|candidate| !gossip_message_ids.contains(&candidate.message_id_hex));
-        }
         // Synthesize durable kind-1210 system rows from authenticated state
         // changes (peer commits, auto-commits, and scheduled convergence).
         self.try_project_group_system_rows(
@@ -6347,17 +6326,43 @@ mod runtime_group_subscription_refresh_tests {
             ..Default::default()
         };
         let source = "88".repeat(32);
+        // Scheduled publication finalization has already committed before it
+        // enters this observer. The older blocked batch must not eat its update.
+        let finalized = app
+            .record_account_app_event(
+                "alice",
+                &crate::AppMessageProjection {
+                    authority: None,
+                    message_id_hex: "finalized-before-queue".into(),
+                    source_message_id_hex: None,
+                    direction: "sent".into(),
+                    group_id_hex: group_hex.clone(),
+                    sender: app.account_home().account("alice").unwrap().account_id_hex,
+                    plaintext: "committed before blocked queue".into(),
+                    kind: cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+                    tags: Vec::new(),
+                    source_epoch: Some(1),
+                    retention: None,
+                    recorded_at: Some(123),
+                    origin_commit_id: None,
+                    moderation_grant: false,
+                },
+            )
+            .unwrap();
+        let mut incoming_summary = SyncSummary::default();
+        incoming_summary.projection_updates.push(finalized.clone());
         assert!(
             client
-                .observe_account_device_effects(
-                    &rejoin,
-                    &mut SyncSummary::default(),
-                    &source,
-                    123,
-                    false
-                )
+                .observe_account_device_effects(&rejoin, &mut incoming_summary, &source, 123, false)
                 .await
                 .is_err()
+        );
+        assert!(incoming_summary.projection_updates.is_empty());
+        assert!(
+            client
+                .take_pending_applied_sync_summary()
+                .projection_updates
+                .contains(&finalized)
         );
         assert_eq!(client.pending_applied_effects.len(), 2);
         let retained = client.pending_applied_effects.back().unwrap();
