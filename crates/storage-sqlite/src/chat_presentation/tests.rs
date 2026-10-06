@@ -49,7 +49,14 @@ fn presented_rows_expose_draft_versions_for_identical_edits_and_deletion() {
     legacy_json.as_object_mut().unwrap().remove("draft_version");
     let legacy: PresentedChatRow = serde_json::from_value(legacy_json).unwrap();
     assert!(legacy.draft_version.is_none());
-    assert!(!format!("{deleted:?}").contains(deleted.draft_version.as_ref().unwrap()));
+    assert_eq!(
+        format!("{:?}", deleted.draft_version.as_ref().unwrap()),
+        "ChatListDraftVersion { .. }"
+    );
+    assert_ne!(
+        first, edited,
+        "identical text still changes the full snapshot row"
+    );
 }
 
 fn seed(store: &SqliteAccountStorage, id: &str) {

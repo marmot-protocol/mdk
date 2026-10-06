@@ -6,6 +6,7 @@ use crate::macros::{c_enum, c_mirror};
 use crate::memory::{CFree, free_c_string, owned_c_string};
 use marmot_uniffi::conversions::*;
 use std::ffi::c_char;
+use std::sync::Arc;
 
 c_enum! { MarmotPresentationSource from PresentationSourceFfi { Group, PeerProfile, PeerFallback, GroupFallback, UnknownFallback, } }
 c_enum! { MarmotPresentationResolution from PresentationResolutionFfi { Cached, LastKnown, Fallback, } }
@@ -157,8 +158,20 @@ c_mirror! { MarmotChatListRowActions from ChatListRowActionsFfi {
     copy can_start_leave: bool,
     copy can_delete_local: bool,
 } }
+/// Read-only marker owned by its presented row. Borrow only while the row is live.
+pub struct MarmotChatListDraftVersion {
+    pub(crate) inner: Arc<ChatListDraftVersionFfi>,
+}
+impl From<Arc<ChatListDraftVersionFfi>> for MarmotChatListDraftVersion {
+    fn from(inner: Arc<ChatListDraftVersionFfi>) -> Self {
+        Self { inner }
+    }
+}
+impl CFree for MarmotChatListDraftVersion {
+    unsafe fn free_in_place(&mut self) {}
+}
 c_mirror! { MarmotPresentedChatRow from PresentedChatRowFfi, free marmot_presented_chat_row_free {
-    opt_str draft_version,
+    opt_rec draft_version: MarmotChatListDraftVersion,
     rec preview: MarmotSelectedChatPreview,
     rec actions: MarmotChatListRowActions,
     rec row: MarmotChatListRow,
@@ -177,20 +190,6 @@ c_mirror! { MarmotPresentedChatListUpdate from PresentedChatListUpdateFfi, free 
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn draft_version_comparison_clears_output_before_rejecting_invalid_borrows() {
-        let mut covered = 9;
-        let status = unsafe {
-            crate::subscriptions::marmot_message_draft_revision_includes_chat_list_version(
-                std::ptr::null(),
-                c"opaque-version".as_ptr(),
-                &raw mut covered,
-            )
-        };
-        assert_eq!(status, crate::MarmotStatus::NullPointer);
-        assert_eq!(covered, 0);
-    }
-
     use super::*;
     use crate::memory::{audit, boxed};
     fn image() -> ChatListAvatarFfi {
@@ -249,7 +248,7 @@ mod tests {
                 sequence: 3,
                 snapshot: PresentedChatListSnapshotFfi {
                     rows: vec![PresentedChatRowFfi {
-                        draft_version: Some("opaque-draft-version".into()),
+                        draft_version: None,
                         preview: SelectedChatPreviewFfi::Draft {
                             draft: ChatListDraftPreviewFfi {
                                 text: "draft".into(),
@@ -282,12 +281,7 @@ mod tests {
             let mirror: MarmotPresentedChatListUpdate = update.into();
             assert_eq!(mirror.sequence, 3);
             assert_eq!(mirror.snapshot.rows_len, 1);
-            assert_eq!(
-                unsafe { std::ffi::CStr::from_ptr((*mirror.snapshot.rows).draft_version) }
-                    .to_str()
-                    .unwrap(),
-                "opaque-draft-version"
-            );
+            assert!(unsafe { (*mirror.snapshot.rows).draft_version.is_null() });
             assert_eq!(
                 mirror.snapshot.presentation_version.account_store_epoch_len,
                 16

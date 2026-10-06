@@ -9,11 +9,14 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
-- `MarmotPresentedChatRow` gains owned nullable `draft_version` and
+- `MarmotPresentedChatRow` gains a nullable row-owned `MarmotChatListDraftVersion` handle and
   `marmot_message_draft_revision_includes_chat_list_version` compares it against
-  a borrowed selected revision without exposing account/group identifiers.
+  a borrowed selected revision. Both inputs are opaque read-only borrows; only
+  the selected revision authorizes revision-checked mutation.
   Newer identical drafts remain distinguishable. Rebuild with matching generated
-  headers/libraries; the row layout changes. See the shared chat-list contract.
+  headers/libraries; the row layout and comparison signature change. Identical-text
+  saves emit a replacement snapshot because their draft revision changes. See the
+  shared chat-list contract.
 - Add `marmot_message_reactions` and the owned
   `MarmotTimelineUserReactionList` root/free for complete exact-message details.
   Existing record layouts are unchanged; the new symbols require matching

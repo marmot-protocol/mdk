@@ -1,6 +1,7 @@
 //! Mechanical mappings of MDK's selected presentation; localization stays on the host.
 use super::{ChatListAvatarFfi, ChatListRowFfi};
 use marmot_app as app;
+use std::sync::Arc;
 
 #[derive(Clone, uniffi::Enum)]
 pub enum PresentationTextFfi {
@@ -115,9 +116,19 @@ impl From<app::ChatListRowActions> for ChatListRowActionsFfi {
         }
     }
 }
+/// Read-only store/group-scoped draft metadata. No constructor or mutation capability.
+#[derive(uniffi::Object)]
+pub struct ChatListDraftVersionFfi {
+    pub(crate) inner: app::ChatListDraftVersion,
+}
+impl From<app::ChatListDraftVersion> for ChatListDraftVersionFfi {
+    fn from(inner: app::ChatListDraftVersion) -> Self {
+        Self { inner }
+    }
+}
 #[derive(Clone, uniffi::Record)]
 pub struct PresentedChatRowFfi {
-    pub draft_version: Option<String>,
+    pub draft_version: Option<Arc<ChatListDraftVersionFfi>>,
     pub preview: SelectedChatPreviewFfi,
     pub actions: ChatListRowActionsFfi,
     pub row: ChatListRowFfi,
@@ -228,7 +239,7 @@ impl From<app::ChatPresentationVersion> for PresentationVersionFfi {
 impl From<app::PresentedChatRow> for PresentedChatRowFfi {
     fn from(v: app::PresentedChatRow) -> Self {
         Self {
-            draft_version: v.draft_version,
+            draft_version: v.draft_version.map(|version| Arc::new(version.into())),
             preview: v.preview.into(),
             actions: v.actions.into(),
             avatar_asset: v.avatar_asset.map(Into::into),

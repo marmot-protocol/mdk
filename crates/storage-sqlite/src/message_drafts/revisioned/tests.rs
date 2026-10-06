@@ -32,11 +32,6 @@ fn chat_list_versions_preserve_newer_identical_drafts_and_reject_foreign_owners(
     let mut foreign_group = sending.clone();
     foreign_group.group_id_hex = "33".repeat(16);
     assert!(!sending.includes_chat_list_version(&foreign_group.chat_list_version()));
-    for malformed in ["", "v1:bad:1", "v1:bad:-1", "v1:bad:9223372036854775808"] {
-        assert!(!sending.includes_chat_list_version(malformed));
-    }
-    assert!(!sending.includes_chat_list_version(&format!("{}:+0", sending.chat_list_scope())));
-    assert!(!sending.includes_chat_list_version(&format!("{}:00", sending.chat_list_scope())));
 }
 #[test]
 fn legacy_save_delete_recreate_never_reuses_a_draft_revision() {

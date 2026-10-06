@@ -336,9 +336,9 @@ pub struct MessageDraftRevisionFfi {
 #[uniffi::export]
 impl MessageDraftRevisionFfi {
     /// Compare opaque chat-list draft metadata without exposing revision internals.
-    /// False for malformed versions or another account store/group.
-    pub fn includes_chat_list_version(&self, version: String) -> bool {
-        self.inner.includes_chat_list_version(&version)
+    /// False for a newer version or another account store/group.
+    pub fn includes_chat_list_version(&self, version: Arc<ChatListDraftVersionFfi>) -> bool {
+        self.inner.includes_chat_list_version(&version.inner)
     }
 }
 #[derive(Clone, uniffi::Record)]

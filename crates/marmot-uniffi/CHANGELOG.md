@@ -4,13 +4,15 @@
 
 ### Breaking changes
 
-- `PresentedChatRowFfi.draft_version` correlates the presented row's draft
+- The optional opaque `ChatListDraftVersionFfi` object in
+  `PresentedChatRowFfi.draft_version` correlates the presented row's draft
   metadata with a captured composer revision through
   `MessageDraftRevisionFfi::includes_chat_list_version`. Regenerate Swift/Kotlin
   bindings with the matching library. Host-constructed row records must pass
   `nil` (Swift), `null` (Kotlin), or a version for the new optional field. Keep
   these opaque versions device-local and use revision-checked draft cleanup
-  after local send acceptance.
+  after local send acceptance. Identical-text saves advance the draft revision
+  and emit a complete replacement presented-list snapshot.
 - Attachment history adds `AttachmentRoleFfi` and the required, defaultless
   `AttachmentEntryFfi.role` field. Regenerate Swift/Kotlin bindings with the
   matching native library and update host record constructors and fixtures.

@@ -8,35 +8,37 @@ pub struct MessageDraftRevision {
     revision: i64,
 }
 
+/// Read-only chat-row metadata. It cannot authorize a draft mutation.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChatListDraftVersion {
+    store_epoch: Vec<u8>,
+    group_id_hex: String,
+    revision: i64,
+}
+
+impl std::fmt::Debug for ChatListDraftVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatListDraftVersion")
+            .finish_non_exhaustive()
+    }
+}
+
 impl MessageDraftRevision {
-    /// Whether an opaque chat-list version belongs to this store/group and is
-    /// no newer than this selected revision. Never compare host-decoded fields.
-    /// Malformed and foreign versions are not covered.
-    pub fn includes_chat_list_version(&self, version: &str) -> bool {
-        let Some((scope, encoded_revision)) = version.rsplit_once(':') else {
-            return false;
-        };
-        let Ok(revision) = encoded_revision.parse::<i64>() else {
-            return false;
-        };
-        revision >= 0
-            && revision <= self.revision
-            && revision.to_string() == encoded_revision
-            && scope == self.chat_list_scope()
+    /// Whether this read-only version belongs to the same store/group and is
+    /// no newer than this selected revision. This comparison never clears a draft.
+    pub fn includes_chat_list_version(&self, version: &ChatListDraftVersion) -> bool {
+        version.store_epoch == self.store_epoch
+            && version.group_id_hex == self.group_id_hex
+            && version.revision <= self.revision
     }
 
-    fn chat_list_scope(&self) -> String {
-        use sha2::{Digest, Sha256};
-        let mut hash = Sha256::new();
-        hash.update(b"mdk-chat-list-draft-version-v1");
-        hash.update((self.store_epoch.len() as u64).to_be_bytes());
-        hash.update(&self.store_epoch);
-        hash.update(self.group_id_hex.as_bytes());
-        format!("v1:{}", hex::encode(hash.finalize()))
-    }
-
-    fn chat_list_version(&self) -> String {
-        format!("{}:{}", self.chat_list_scope(), self.revision)
+    #[cfg(test)]
+    fn chat_list_version(&self) -> ChatListDraftVersion {
+        ChatListDraftVersion {
+            store_epoch: self.store_epoch.clone(),
+            group_id_hex: self.group_id_hex.clone(),
+            revision: self.revision,
+        }
     }
 
     pub fn group_id_hex(&self) -> &str {
@@ -256,12 +258,21 @@ fn revision_tx(conn: &Connection, group: &str) -> StorageResult<MessageDraftRevi
 pub(crate) fn chat_list_version_tx(
     conn: &Connection,
     group: &str,
-) -> StorageResult<Option<String>> {
-    match revision_tx(conn, group) {
-        Ok(revision) => Ok(Some(revision.chat_list_version())),
-        Err(StorageError::NotFound) => Ok(None),
-        Err(error) => Err(error),
-    }
+    store_epoch: &[u8],
+) -> StorageResult<Option<ChatListDraftVersion>> {
+    let revision = conn
+        .query_row_cached(
+            "SELECT revision FROM message_draft_revisions WHERE group_id_hex = ?1",
+            [group],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .storage()?;
+    Ok(revision.map(|revision| ChatListDraftVersion {
+        store_epoch: store_epoch.to_vec(),
+        group_id_hex: group.to_owned(),
+        revision,
+    }))
 }
 
 fn check_revision_tx(
