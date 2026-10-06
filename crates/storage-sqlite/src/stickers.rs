@@ -137,6 +137,45 @@ impl SqliteAccountStorage {
         })
     }
 
+    /// Drop the oldest uninstalled discovery packs once the durable projection
+    /// exceeds `limit`. Installed packs, pending install operations, current
+    /// versions, and assets referenced by retained messages stay.
+    pub fn prune_uninstalled_sticker_discovery(&self, limit: usize) -> StorageResult<usize> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let protected = protected_sticker_coordinates_tx(&conn)?;
+            let mut candidates = conn
+                .prepare(
+                    "SELECT coordinate FROM app_sticker_packs
+                     ORDER BY created_at ASC, event_id_hex ASC",
+                )
+                .storage()?;
+            let coordinates = candidates
+                .query_map([], |row| row.get::<_, String>(0))
+                .storage()?
+                .collect::<Result<Vec<_>, _>>()
+                .storage()?;
+            drop(candidates);
+            let excess = coordinates.len().saturating_sub(limit);
+            let mut removed = 0;
+            for coordinate in coordinates {
+                if removed == excess {
+                    break;
+                }
+                if protected.contains(&coordinate) {
+                    continue;
+                }
+                conn.execute(
+                    "DELETE FROM app_sticker_packs WHERE coordinate = ?1",
+                    params![coordinate],
+                )
+                .storage()?;
+                removed += 1;
+            }
+            Ok(removed)
+        })
+    }
+
     pub fn sticker_pack(&self, coordinate: &str) -> StorageResult<Option<StoredStickerPack>> {
         let conn = self.lock()?;
         sticker_pack_tx(&conn, coordinate)
@@ -464,6 +503,43 @@ fn insert_sticker_assets_tx(conn: &Connection, pack: &StoredStickerPack) -> Stor
     Ok(())
 }
 
+fn protected_sticker_coordinates_tx(conn: &Connection) -> StorageResult<HashSet<String>> {
+    let mut protected = desired_installed_sticker_packs_tx(conn)?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut operations = conn
+        .prepare("SELECT pack_coordinate FROM app_sticker_install_operations")
+        .storage()?;
+    for coordinate in operations
+        .query_map([], |row| row.get::<_, String>(0))
+        .storage()?
+    {
+        protected.insert(coordinate.storage()?);
+    }
+    drop(operations);
+    let mut referenced = conn
+        .prepare(
+            r#"SELECT tags_json FROM message_timeline
+             WHERE kind = 9 AND tags_json LIKE '%"sticker"%'"#,
+        )
+        .storage()?;
+    for tags_json in referenced
+        .query_map([], |row| row.get::<_, String>(0))
+        .storage()?
+    {
+        let tags_json = tags_json.storage()?;
+        let tags = serde_json::from_str::<Vec<Vec<String>>>(&tags_json).unwrap_or_default();
+        for tag in tags {
+            if tag.first().is_some_and(|name| name == "sticker")
+                && let Some(coordinate) = tag.get(1)
+            {
+                protected.insert(coordinate.clone());
+            }
+        }
+    }
+    Ok(protected)
+}
+
 fn replacement_wins(
     existing: Option<&StoredStickerPackVersion>,
     incoming: &StoredStickerPackVersion,
@@ -763,6 +839,30 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn uninstalled_discovery_is_pruned_without_dropping_protected_packs() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let installed = pack(&"11".repeat(32), 1, &"aa".repeat(32));
+        assert!(store.replace_sticker_pack_if_newer(&installed).unwrap());
+        store
+            .enqueue_sticker_install_operation(&installed.coordinate, true, 1)
+            .unwrap();
+        for index in 2..6 {
+            let mut extra = pack(
+                &format!("{index:02x}").repeat(32),
+                index,
+                &format!("{index:02x}").repeat(32),
+            );
+            extra.coordinate = format!("30031:{}:pack-{index}", "bb".repeat(32));
+            extra.identifier = format!("pack-{index}");
+            assert!(store.replace_sticker_pack_if_newer(&extra).unwrap());
+        }
+        let removed = store.prune_uninstalled_sticker_discovery(2).unwrap();
+        assert_eq!(removed, 3);
+        assert!(store.sticker_pack(&installed.coordinate).unwrap().is_some());
+        assert_eq!(store.sticker_packs(false, None, 20).unwrap().len(), 2);
     }
 
     #[test]
