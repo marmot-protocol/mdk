@@ -8662,28 +8662,37 @@ async fn relay_app_client_rejects_invalid_edit_targets_before_publish() {
 #[tokio::test]
 async fn retained_local_edit_survives_shared_runtime_preflight() {
     let dir = tempfile::tempdir().unwrap();
-    let home = AccountHome::open(dir.path());
-    home.create_account("alice").unwrap();
-    home.create_account("bob").unwrap();
-    let (_relay, app, _url) = mock_app(&dir).await;
-    let mut bob = app.client("bob").await.unwrap();
-    bob.publish_key_package().await.unwrap();
-    let mut alice = app.client("alice").await.unwrap();
-    let group = alice
-        .create_group("retained edits", &["bob"])
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    let group = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "retained edits",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
         .await
         .unwrap();
-    bob.sync().await.unwrap();
-    drop(alice);
-    drop(bob);
-    let runtime = MarmotAppRuntime::new(app.clone());
     let original = runtime
-        .submit_text("alice", &group, "original".into(), "original-token".into())
+        .submit_text(
+            &alice.account.account_id_hex,
+            &group,
+            "original".into(),
+            "original-token".into(),
+        )
         .await
         .unwrap();
     runtime
         .submit_edit_for_local_send(
-            "alice",
+            &alice.account.account_id_hex,
             &group,
             "original-token".into(),
             "retained edit".into(),
@@ -8694,7 +8703,7 @@ async fn retained_local_edit_survives_shared_runtime_preflight() {
     timeout(Duration::from_secs(15), async {
         loop {
             match runtime
-                .local_send_status("alice", &group, "edit-token")
+                .local_send_status(&alice.account.account_id_hex, &group, "edit-token")
                 .unwrap()
             {
                 Some(marmot_app::LocalSendStatus::Completed(_)) => break,
@@ -8707,7 +8716,7 @@ async fn retained_local_edit_survives_shared_runtime_preflight() {
     .expect("retained edit completes after its engine-owned original");
     assert_eq!(
         app.timeline_message(
-            "alice",
+            &alice.account.label,
             &hex::encode(group.as_slice()),
             &original.message_id_hex
         )
