@@ -77,11 +77,15 @@ async fn incomplete_lookup_cannot_claim_obsolete_or_missing_but_can_use_current_
             matches!(error, AppError::MemberDiscoveryIncomplete(ref id) if id == &account.account_id_hex)
         );
     }
-    fetcher
-        .events
-        .lock()
-        .unwrap()
-        .push(member_resolution_key_package_event(account, current));
+    // Keep current and legacy in distinct addressable slots: same-second
+    // events in one slot would make the event-id tie break choose the winner.
+    let mut current_event = member_resolution_key_package_event(account, current);
+    current_event
+        .tags
+        .iter_mut()
+        .find(|tag| tag[0] == "d")
+        .unwrap()[1] = "current-fixture-slot".into();
+    fetcher.events.lock().unwrap().push(current_event);
     app.resolve_member_key_packages(&[account.account_id_hex.as_str()])
         .await
         .unwrap();

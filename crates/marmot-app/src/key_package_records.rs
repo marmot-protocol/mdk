@@ -183,6 +183,27 @@ pub(crate) fn preferred_fresh_key_package_from_records(
     freshness: DirectoryFreshness,
     requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
 ) -> Result<DirectorySelection<Option<PreferredKeyPackage>>, AppError> {
+    select_preferred_key_package(account_id_hex, records, freshness, requirements, false)
+}
+
+/// Invitation diagnostics use only the records already fetched. A legacy
+/// publication is evidence for guidance, never a candidate for admission.
+pub(crate) fn preferred_member_key_package_from_records(
+    account_id_hex: &str,
+    records: &[RelayEventRecord],
+    freshness: DirectoryFreshness,
+    requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+) -> Result<DirectorySelection<Option<PreferredKeyPackage>>, AppError> {
+    select_preferred_key_package(account_id_hex, records, freshness, requirements, true)
+}
+
+fn select_preferred_key_package(
+    account_id_hex: &str,
+    records: &[RelayEventRecord],
+    freshness: DirectoryFreshness,
+    requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+    diagnose_legacy: bool,
+) -> Result<DirectorySelection<Option<PreferredKeyPackage>>, AppError> {
     let mut records = records.iter().collect::<Vec<_>>();
     records.sort_by(|a, b| {
         a.event
@@ -195,6 +216,8 @@ pub(crate) fn preferred_fresh_key_package_from_records(
     let mut selected = None;
     let mut selected_priority = 0;
     let mut slots = BTreeSet::new();
+    let mut observed_legacy = false;
+    let mut all_slots_legacy = true;
     for record in records.into_iter().rev() {
         if record.event.kind != KIND_MARMOT_KEY_PACKAGE || record.event.pubkey != account_id_hex {
             continue;
@@ -216,12 +239,26 @@ pub(crate) fn preferred_fresh_key_package_from_records(
             Ok(fetched) if fetched.key_package.protocol_profile == ProtocolProfile::Current => {
                 fetched
             }
-            Ok(_) => continue,
+            Ok(_) => {
+                all_slots_legacy = false;
+                continue;
+            }
             Err(error) => {
+                let legacy = diagnose_legacy
+                    && key_package_from_borrowed_record_for_profile(
+                        record,
+                        ProtocolProfile::Legacy,
+                    )
+                    .is_ok_and(|fetched| {
+                        fetched.key_package.protocol_profile == ProtocolProfile::Legacy
+                    });
+                observed_legacy |= legacy;
+                all_slots_legacy &= legacy;
                 newest_error.get_or_insert(error);
                 continue;
             }
         };
+        all_slots_legacy = false;
         if let Some(requirements) = requirements
             && let Err(error) = requirements.validate(&fetched.key_package)
         {
@@ -237,6 +274,9 @@ pub(crate) fn preferred_fresh_key_package_from_records(
             }
         }
     }
+    if selected.is_none() && observed_legacy && all_slots_legacy && !rejected_future {
+        return Err(AppError::ObsoleteKeyPackage(account_id_hex.to_owned()));
+    }
     if selected.is_none()
         && let Some(error) = newest_error
     {
@@ -246,61 +286,6 @@ pub(crate) fn preferred_fresh_key_package_from_records(
         value: selected,
         rejected_future,
     })
-}
-
-/// Invitation diagnostics use only the records already fetched. A legacy
-/// publication is evidence for guidance, never a candidate for admission.
-pub(crate) fn preferred_member_key_package_from_records(
-    account_id_hex: &str,
-    records: &[RelayEventRecord],
-    freshness: DirectoryFreshness,
-    requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
-) -> Result<DirectorySelection<Option<PreferredKeyPackage>>, AppError> {
-    let selection =
-        preferred_fresh_key_package_from_records(account_id_hex, records, freshness, requirements);
-    if selection
-        .as_ref()
-        .is_ok_and(|selection| selection.value.is_some())
-    {
-        return selection;
-    }
-    let mut records = records
-        .iter()
-        .filter(|record| {
-            record.event.kind == KIND_MARMOT_KEY_PACKAGE && record.event.pubkey == account_id_hex
-        })
-        .collect::<Vec<_>>();
-    records.sort_by(|a, b| {
-        b.event
-            .created_at
-            .cmp(&a.event.created_at)
-            .then_with(|| b.event.id.cmp(&a.event.id))
-    });
-    let mut slots = BTreeSet::new();
-    let mut observed_legacy = false;
-    for record in records {
-        // An ignored future publication cannot establish an obsolete-only result.
-        if !freshness.accepts(record) {
-            return selection;
-        }
-        if let Some(slot) = record.event.tag_value("d").filter(|slot| !slot.is_empty())
-            && !slots.insert(slot.to_owned())
-        {
-            continue;
-        }
-        if !key_package_from_borrowed_record_for_profile(record, ProtocolProfile::Legacy)
-            .is_ok_and(|fetched| fetched.key_package.protocol_profile == ProtocolProfile::Legacy)
-        {
-            // Preserve malformed, expired, identity and capability errors.
-            return selection;
-        }
-        observed_legacy = true;
-    }
-    if observed_legacy {
-        Err(AppError::ObsoleteKeyPackage(account_id_hex.to_owned()))
-    } else {
-        selection
-    }
 }
 
 fn cached_key_package_from_entry(
