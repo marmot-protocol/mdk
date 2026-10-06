@@ -183,7 +183,7 @@ and aggregate snapshots; keep secrets out of diagnostics and host callback error
 
 ### Invitation lookup errors
 
-`MarmotKitError::ObsoleteKeyPackage { account }` identifies a recipient whose completed bounded lookup found only validated legacy packages. Recommend updating the recipient’s app and publishing a current KeyPackage. `MemberDiscoveryIncomplete { account }` means missing or obsolete-only packages could not be established; offer retry without claiming absence. Existing malformed-package and capability errors remain distinct. Error Display strings omit recipient identity; keep the structured account field out of logs. No additional queries or legacy admission are introduced.
+`MarmotKitError::ObsoleteKeyPackage { account }` identifies a recipient whose completed bounded lookup found only validated legacy packages. Recommend updating the recipient’s app and publishing a current KeyPackage. `MemberDiscoveryIncomplete { account }` means missing or obsolete-only packages could not be established; offer retry without claiming absence. Existing malformed-package and capability errors remain distinct. Error Display strings omit recipient identity; keep the structured account field out of logs. Legacy KeyPackages are rejected for new joins.
 
 ### Compatibility
 

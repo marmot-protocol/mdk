@@ -198,6 +198,10 @@ targets.
 chats. Clients render accept/decline UI from the group record: accept clears `pending_confirmation`; decline publishes a
 leave, clears the pending flag, and archives the local projection so normal chat lists hide it.
 
+### Invitation lookup diagnostics
+
+Invitation resolution reports `ObsoleteKeyPackage` only when the completed bounded lookup finds validated legacy packages in every observed newest addressable slot, with no usable current package. Clients can recommend updating and publishing a current KeyPackage. `MemberDiscoveryIncomplete` means the lookup could not establish missing or obsolete-only packages; retry may help. These diagnoses use the existing queries and preserve strict current-profile admission, slot replacement, fresh validation, and current-client preference. They describe the searched relays, not all publications across Nostr.
+
 ## Conversations
 
 - **Drafts.** Rust app/runtime draft commands expose selected metadata, conditional save/clear, keyed attachment bytes,
@@ -230,10 +234,6 @@ does not rewrite existing group state. An active group admin can migrate an exis
 Encrypted group images differ: no endpoint is stored in group state, so upload and fetch both resolve against the
 build's primary endpoint. Clients compiled with different defaults therefore look for group images in different places;
 re-setting the group image on a current build republishes it to the current primary endpoint.
-
-### Invitation lookup diagnostics
-
-Invitation resolution reports `ObsoleteKeyPackage` only when the completed bounded lookup finds validated legacy packages in every observed newest addressable slot, with no usable current package. Clients can recommend updating and publishing a current KeyPackage. `MemberDiscoveryIncomplete` means the lookup could not establish missing or obsolete-only packages; retry may help. These diagnoses use the existing queries and preserve strict current-profile admission, slot replacement, fresh validation, and current-client preference. They describe the searched relays, not all publications across Nostr.
 
 ## Application-owned group state
 

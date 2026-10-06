@@ -2,8 +2,6 @@
 
 ## Unreleased
 
-- Add typed `ObsoleteKeyPackage { account }` and `MemberDiscoveryIncomplete { account }` invitation errors. Recipient fields support focused recovery guidance; Display omits the identity. No new lookup queries or legacy-package admission.
-
 ### Breaking changes
 
 - Attachment history adds `AttachmentRoleFfi` and the required, defaultless
@@ -13,6 +11,8 @@
   after filtered pages as described in [the handoff](ATTACHMENT-HISTORY.md).
 
 ### Added
+
+- Add typed `ObsoleteKeyPackage { account }` and `MemberDiscoveryIncomplete { account }` invitation errors. Recipient fields support focused recovery guidance; Display omits the identity. No new lookup queries or legacy-package admission.
 
 - `Marmot::message_reactions` returns complete local reaction details for one exact
   account/group/message, with one effective entry per sender/emoji and no
