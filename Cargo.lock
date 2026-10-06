@@ -3629,14 +3629,19 @@ dependencies = [
 name = "marmot-c"
 version = "0.12.0"
 dependencies = [
+ "futures",
  "keyring-core",
  "libc",
  "marmot-uniffi",
  "nostr 0.45.5",
  "nostr-relay-builder",
+ "nostr-sdk",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "transport-quic-broker",
+ "url",
  "zeroize",
 ]
 

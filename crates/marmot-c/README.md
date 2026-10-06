@@ -14,6 +14,7 @@ per feature.
 - [Using the ABI](#using-the-abi)
 - [Integration documentation](#integration-documentation)
 - [Lifecycle and teardown](#lifecycle-and-teardown)
+- [NIP-46 accounts](#nip-46-accounts)
 - Feature notes: [runtime construction](#runtime-construction), [local sends](#local-sends),
   [public event verification](#public-event-verification), [host performance stages](#host-performance-stages),
   [Markdown rendering](#markdown-rendering), [identity references and pseudonyms](#identity-references-and-pseudonyms),
@@ -125,9 +126,10 @@ int main(void) {
 - [Integration index](../../docs/integration/README.md): a per-release upgrade guide for every release from 0.10.2,
   including C record, enum, error and schema changes.
 
-Read the exact version's header and docs. External-signer onboarding/login/registration remain
-UniFFI-only until a C signer callback interface exists; the host secret-store vtable
-is already supported and is a different interface. The catalog includes C-only compatibility shims; prefer the
+Read the exact version's header and docs. The `marmot_nip46_*` adapter supports remote
+signer login and registration. Arbitrary host signer callbacks and external-signer
+onboarding remain UniFFI-only. The host secret-store vtable is a separate interface.
+The catalog includes C-only compatibility shims; prefer the
 versioned audit configuration setters and the composable runtime options constructor for new integrations.
 
 ## Lifecycle and teardown
@@ -256,6 +258,58 @@ avatar metadata pointer. Use `marmot_request_avatar_assets` for up to 16 visible
 opaque targets, `marmot_read_avatar_assets` for bounded local bytes (at most 16 references / 16 MiB), and
 `marmot_clear_avatar_cache` for explicit local removal. Free returned lists with their matching
 `marmot_avatar_asset_list_free` / `marmot_avatar_bytes_list_free` functions.
+## NIP-46 accounts
+
+Keep one `MarmotNip46Session` per remote-signer account. Local-key accounts use
+their normal login path in the same client. The session pins three separate keys:
+the client communication key, the remote signer's communication key, and the
+user's account key. Only the last identifies the MDK account.
+
+1. Create an offline handle with `marmot_nip46_new`. Configuration accepts a bunker
+   link in `uri`, or a `relays` array with an optional `name` for client pairing.
+   For pairing, get the credential-bearing link with `marmot_nip46_uri` and show
+   its QR code or let the user copy it.
+2. Run `marmot_nip46_connect` on a background worker. It verifies `get_public_key`
+   and adopts policy-checked `switch_relays` results for this signer transport
+   only. Messaging relays are unchanged. An unsupported-method error leaves the
+   previous signer relays in place; other errors fail connection.
+3. Call `marmot_nip46_login` off the UI thread to create or reopen the external
+   account. It signs real MLS identity proofs and KeyPackages through the signer.
+   Supply default messaging relays for lists the account has not published. Set
+   `inbox_relays` separately, or pass `NULL, 0` to use the defaults for both lists. Login
+   publishes those defaults only for lists that discovery confirms absent. An
+   incomplete directory read fails login with a retryable error instead of
+   overwriting lists it could not see. Signed lists, including explicit-empty
+   declarations, are kept.
+4. Store `marmot_nip46_export` only in the host's encrypted vault. It contains the
+   client secret, pinned user and signer keys, and current relay set, but not the
+   consumed bunker/pairing secret. External database keys also use the configured
+   secret store, under reserved `.external-sqlcipher/<account label>` credentials.
+5. On restart, create handles from these exports before `marmot_client_start`.
+   Do not register them yet. Start local accounts, then independently connect and
+   call `marmot_nip46_register` for each remote account on background workers.
+   Registration activates its worker and may request a fresh identity proof.
+
+Poll `marmot_nip46_state` for JSON fields `state`, `detail`, and `auth_url`. States
+are `connecting`, `ready`, `approval`, `unavailable`, `cancelled`, and `logged_out`.
+An approval URL is an intermediate response, not failure or completion. Show
+pending work until the final response; let the user review the URL before opening
+it. RPC requests have a 90-second budget; MDK account setup can time out sooner.
+
+`marmot_nip46_cancel` interrupts pending work without invalidating a saved export.
+For lock, reload, or shutdown, cancel, join every borrower, then free sessions
+before their creating client. Free disconnects without remote logout. For signout,
+complete MDK signout first, remove the vault export, then call
+`marmot_nip46_logout`. Its five-second courtesy request clears local client keys
+even when the signer does not acknowledge it. Do not free a handle while calls
+are in flight. Returned strings use `marmot_string_free`.
+
+The loopback example exercises the C ABI with real NIP-44 websocket traffic,
+distinct user/bunker/client keys, mixed accounts, approvals and logout:
+
+```sh
+cargo run --release -p marmot-c --example nip46_smoke
+```
 
 ## History may be incomplete notices
 
