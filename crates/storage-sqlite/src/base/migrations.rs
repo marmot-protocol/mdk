@@ -246,6 +246,10 @@ mod migration_0114_avatar_media_files;
 mod migration_0115_recovery_replay_admission;
 #[path = "migrations/0116_attachment_keep_media.rs"]
 mod migration_0116_attachment_keep_media;
+#[path = "migrations/0117_sonar_stickers.rs"]
+mod migration_0117_sonar_stickers;
+#[path = "migrations/0118_sticker_asset_history.rs"]
+mod migration_0118_sticker_asset_history;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -962,6 +966,18 @@ const MIGRATIONS: &[Migration] = &[
         name: "0116_attachment_keep_media",
         suspend_foreign_keys: &[],
         apply: migration_0116_attachment_keep_media::apply,
+    },
+    Migration {
+        version: 117,
+        name: "0117_sonar_stickers",
+        suspend_foreign_keys: &[],
+        apply: migration_0117_sonar_stickers::apply,
+    },
+    Migration {
+        version: 118,
+        name: "0118_sticker_asset_history",
+        suspend_foreign_keys: &[],
+        apply: migration_0118_sticker_asset_history::apply,
     },
 ];
 

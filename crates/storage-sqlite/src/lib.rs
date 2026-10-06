@@ -100,6 +100,10 @@ pub use app::message_drafts::{
     StoredMessageDraftAttachment, StoredMessageDraftAttachmentSummary, StoredMessageDraftSummary,
 };
 pub use app::pending_welcome_delivery::PendingWelcomeDeliveryRecord;
+pub use app::stickers::{
+    StoredInstalledStickerState, StoredSticker, StoredStickerInstallOperation,
+    StoredStickerOutboxEvent, StoredStickerPack, StoredStickerPackVersion,
+};
 pub use app::timeline::{
     BRANCH_SELECTION_WITHDRAWAL_REASON, BranchSelectionWithdrawalDivergence,
     ConversationAccountSnapshot, ConversationAnchor, ConversationOpenAnchorOutcome,
