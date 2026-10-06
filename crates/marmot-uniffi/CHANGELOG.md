@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Attachment history adds `AttachmentRoleFfi` and the required, defaultless
+  `AttachmentEntryFfi.role` field. Regenerate Swift/Kotlin bindings with the
+  matching native library and update host record constructors and fixtures.
+  Gallery clients can exclude `InlineEmoji`; preserve slots and continue paging
+  after filtered pages as described in [the handoff](ATTACHMENT-HISTORY.md).
+
 ### Added
 
 - `Marmot::propose_onboarding_relay_repair` previews a lossless relay-list repair

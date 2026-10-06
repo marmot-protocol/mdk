@@ -32,6 +32,7 @@ impl CFree for MarmotAttachmentHistoryVersion {
     unsafe fn free_in_place(&mut self) {}
 }
 c_enum! { MarmotAttachmentCategory from AttachmentCategoryFfi { Image, Video, Audio, File, Rejected, } }
+c_enum! { MarmotAttachmentRole from AttachmentRoleFfi { Shared, InlineEmoji, } }
 c_enum! { MarmotAttachmentHistoryChange from AttachmentHistoryChangeFfi { Unchanged, Additions, RestartRequired, } }
 c_mirror! { MarmotAttachmentEntry from AttachmentEntryFfi {
     str message_id_hex,
@@ -41,6 +42,7 @@ c_mirror! { MarmotAttachmentEntry from AttachmentEntryFfi {
     copy received_at: u64,
     opt_copy has_source_epoch/source_epoch: u64,
     copy category: MarmotAttachmentCategory,
+    copy role: MarmotAttachmentRole,
     rec attachment: MarmotMediaAttachmentOutcome,
 } }
 /// All fields, including opaque handles, are owned by this page's result.
@@ -250,6 +252,7 @@ mod tests {
             Ok(())
         }
     }
+    /// C results preserve slot metadata while page and cloned-version ownership remain independent.
     #[test]
     fn attachment_c_handles_preflight_borrowing_and_deep_free() {
         let _guard = crate::memory::audit::test_lock();
@@ -438,6 +441,7 @@ mod tests {
                 received_at: 2,
                 source_epoch: None,
                 category: AttachmentCategoryFfi::Rejected,
+                role: AttachmentRoleFfi::Shared,
                 attachment: MediaAttachmentOutcomeFfi::Rejected {
                     attachment_index: 3,
                     rejection: MediaAttachmentRejectionFfi {
