@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Attachment history adds `AttachmentRole` and the required `AttachmentEntry.role`
+  field. Update Rust struct literals; gallery consumers can exclude `InlineEmoji`
+  without changing original slots, parser verdicts or acquisition references.
+  See [the attachment-history handoff](../marmot-uniffi/ATTACHMENT-HISTORY.md).
+
 ### Added
 
 - `MarmotAppRuntime::message_reactions` returns complete local reaction details for one exact
