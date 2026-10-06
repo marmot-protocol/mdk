@@ -6369,7 +6369,7 @@ const CONVERGENCE_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 const CONVERGENCE_UNSETTLED_MAX_REARMS: u32 = 10;
 
 #[cfg(test)]
-static HELD_SCHEDULED_CONVERGENCE_ACCOUNTS: std::sync::LazyLock<Mutex<HashSet<String>>> =
+pub(crate) static HELD_SCHEDULED_CONVERGENCE_ACCOUNTS: std::sync::LazyLock<Mutex<HashSet<String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
 
 #[cfg(test)]

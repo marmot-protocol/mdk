@@ -82,13 +82,13 @@ pub use account_attention::{
 mod chat_list_window;
 mod conversation_window;
 mod worker_startup;
-pub(crate) use conversation_window::SendCapture;
 pub use conversation_window::{
     CONVERSATION_WINDOW_MAX_ROWS, ConversationAnchor, ConversationOpenAnchorOutcome,
     ConversationOpenQuery, ConversationOpenReadState, ConversationOpenTarget,
     ConversationPageDirection, ConversationWindowError, ConversationWindowHandle,
     ConversationWindowRevision, ConversationWindowSnapshot, RuntimeConversationWindowSubscription,
 };
+pub(crate) use conversation_window::{SendCapture, publish_conversation_captures_from_session};
 pub(crate) mod attachment_controls;
 pub(crate) mod attachment_permission;
 pub use attachment_controls::{

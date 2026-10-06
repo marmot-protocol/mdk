@@ -262,7 +262,7 @@ async fn queued_publication_cancel_removes_scoped_observer() {
             .runtime
             .advance_convergence_with_publication_progress(
                 &group,
-                Arc::new(move |_| {
+                Arc::new(move |_, _| {
                     counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }),
             ),
@@ -405,5 +405,126 @@ async fn queued_publication_mixed_failure_keeps_progress_before_revival() {
         first_snapshots.last().unwrap().invalidation_status,
         None,
         "the final delivered snapshot must supersede earlier failed state"
+    );
+}
+
+/// The primary selected-conversation stream must expose a committed source while
+/// the real worker is still waiting on a later publication in the same pass.
+#[tokio::test]
+async fn queued_publication_updates_live_window_before_later_publish_finishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://progress.example")
+        .with_test_relay_client(relay.clone());
+    let (client, group, ids) = queued_messages(&app).await;
+    drop(client);
+    struct HeldSchedule(String);
+    impl Drop for HeldSchedule {
+        fn drop(&mut self) {
+            crate::runtime::account_worker::HELD_SCHEDULED_CONVERGENCE_ACCOUNTS
+                .lock()
+                .unwrap()
+                .remove(&self.0);
+        }
+    }
+    crate::runtime::account_worker::HELD_SCHEDULED_CONVERGENCE_ACCOUNTS
+        .lock()
+        .unwrap()
+        .insert(account.account_id_hex.clone());
+    let held_schedule = HeldSchedule(account.account_id_hex);
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    let mut window = runtime
+        .open_conversation_window("alice", &group, Default::default())
+        .await
+        .unwrap();
+    while window.snapshot.presentation.header.epoch.is_none() {
+        window.snapshot = tokio::time::timeout(Duration::from_secs(5), window.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    assert!(window.snapshot.presentation.header.capabilities.can_send);
+    assert!(
+        window
+            .snapshot
+            .page
+            .page()
+            .messages
+            .iter()
+            .find(|row| row.message_id_hex == ids[0])
+            .unwrap()
+            .source_message_id_hex
+            .is_none()
+    );
+    let published_before = relay.published_events.lock().unwrap().len();
+    relay.block_next_publish();
+    drop(held_schedule);
+    // Wake the worker after releasing the test-only scheduled-pass gate.
+    runtime
+        .group_recovery_status("alice", &group)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), relay.wait_for_blocked_publish())
+        .await
+        .unwrap();
+    relay.block_next_publish();
+    relay.release_publish();
+    tokio::time::timeout(Duration::from_secs(5), relay.wait_for_blocked_publish())
+        .await
+        .unwrap();
+    assert_eq!(
+        relay.published_events.lock().unwrap().len(),
+        published_before + 1
+    );
+    let expected_source = relay
+        .published_events
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .id
+        .clone();
+    let committed = app
+        .timeline_message("alice", &hex::encode(group.as_slice()), &ids[0])
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        committed.source_message_id_hex.as_ref(),
+        Some(&expected_source)
+    );
+    let observed = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = window.recv().await.unwrap().unwrap();
+            if snapshot.page.page().messages.iter().any(|row| {
+                row.message_id_hex == ids[0]
+                    && row.source_message_id_hex.as_ref() == Some(&expected_source)
+            }) {
+                break snapshot;
+            }
+        }
+    })
+    .await;
+    // Release and close even on the expected RED timeout.
+    relay.release_publish();
+    runtime.shutdown_and_close().await.unwrap();
+    let observed = observed.expect("live conversation must show the first accepted source before the later publication is released");
+    assert!(observed.presentation.header.epoch.is_some());
+    assert!(observed.presentation.header.capabilities.can_send);
+    assert!(
+        observed
+            .page
+            .page()
+            .messages
+            .iter()
+            .find(|row| row.message_id_hex == ids[1])
+            .unwrap()
+            .source_message_id_hex
+            .is_none()
     );
 }

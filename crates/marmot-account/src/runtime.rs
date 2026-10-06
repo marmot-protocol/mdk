@@ -391,7 +391,8 @@ impl MaintenanceActivity {
             .saturating_add(previous.failed_transitions);
     }
 }
-type PublicationProgressObserver = Arc<dyn Fn(&PublishedApplicationMessage) + Send + Sync>;
+type PublicationProgressObserver =
+    Arc<dyn Fn(&AccountDeviceSession, &PublishedApplicationMessage) + Send + Sync>;
 type PublicationProgressSlot = Arc<std::sync::Mutex<Option<PublicationProgressObserver>>>;
 
 /// Restore the previous observer even when the owning convergence future is dropped.
@@ -2509,7 +2510,8 @@ where
     /// Advance convergence while observing each durable accepted application
     /// publication before waiting for later publications in the same batch.
     ///
-    /// The synchronous observer must not panic or perform network work. Its
+    /// The synchronous observer receives the live session at the completed
+    /// engine boundary. It must not panic or perform network work. Its
     /// notification uses the same acceptance rule as `published_app_messages`;
     /// it does not change quorum, MLS confirmation, or acknowledge projection
     /// persistence. Observers should handle local failures without interrupting
@@ -2518,7 +2520,7 @@ where
     pub async fn advance_convergence_with_publication_progress(
         &mut self,
         group_id: &GroupId,
-        observe: Arc<dyn Fn(&PublishedApplicationMessage) + Send + Sync>,
+        observe: PublicationProgressObserver,
     ) -> AccountResult<AccountDeviceEffects> {
         let slot = self.publication_progress.clone();
         let previous = slot
@@ -2884,6 +2886,7 @@ where
             .clone();
         if let Some(observer) = observer {
             observer(
+                &self.session,
                 output
                     .published_app_messages
                     .last()

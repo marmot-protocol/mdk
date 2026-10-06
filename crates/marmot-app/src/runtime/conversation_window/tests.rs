@@ -2119,3 +2119,142 @@ async fn send_checkpoint_capture_cost() {
     drop(client);
     f.close().await;
 }
+
+/// Progress uses current engine authority, repairs only keyed local read state,
+/// and refuses another store generation or a session whose authority is cold.
+#[tokio::test]
+async fn publication_checkpoint_refreshes_epoch_and_dirty_rows_without_reviving_authority() {
+    let f = Fixture::new(1).await;
+    f.runtime
+        .accounts
+        .workers
+        .lock()
+        .await
+        .remove(&f.account)
+        .unwrap()
+        .shutdown()
+        .await;
+    let mut client = f.app.client("alice").await.unwrap();
+    let query = ConversationWindowQuery::default();
+    let store_epoch = f.store.chat_presentation_version().unwrap().store_epoch;
+    let observer = Arc::new(SendCapture::new(
+        f.group.clone(),
+        store_epoch.clone(),
+        query.clone(),
+    ));
+    let observers = vec![Arc::downgrade(&observer)];
+    publish_conversation_captures_from_session(
+        &observers,
+        client.runtime.session(),
+        &f.app,
+        "alice",
+        &f.group,
+    );
+    let old_epoch = observer.take().unwrap().authority.unwrap().facts.epoch;
+    client
+        .update_group_profile(&f.group, Some("new epoch"), None)
+        .await
+        .unwrap();
+    let current_epoch = client
+        .runtime
+        .session()
+        .group_authority(&f.group)
+        .unwrap()
+        .facts
+        .epoch;
+    assert!(current_epoch > old_epoch);
+    // Direct source insertion dirties the read projection without going through
+    // the app's normal refresh. The checkpoint owns exactly the same repair as
+    // a regular coherent window read, outside its immutable snapshot.
+    f.add(2);
+    assert!(matches!(
+        f.store
+            .conversation_account_snapshot(&f.group_hex(), query.clone()),
+        Err(ConversationOpenError::ReadStateNotReady)
+    ));
+    publish_conversation_captures_from_session(
+        &observers,
+        client.runtime.session(),
+        &f.app,
+        "alice",
+        &f.group,
+    );
+    let captured = observer
+        .take()
+        .expect("dirty projection is repaired at the live boundary");
+    assert_eq!(captured.authority.unwrap().facts.epoch, current_epoch);
+    assert!(
+        captured
+            .account
+            .page
+            .page()
+            .messages
+            .iter()
+            .any(|row| row.message_id_hex == id(2))
+    );
+    f.app
+        .set_group_self_membership("alice", &f.group_hex(), crate::SelfMembership::Removed)
+        .unwrap();
+    publish_conversation_captures_from_session(
+        &observers,
+        client.runtime.session(),
+        &f.app,
+        "alice",
+        &f.group,
+    );
+    assert_eq!(
+        observer
+            .take()
+            .unwrap()
+            .account
+            .presentation_input
+            .self_membership,
+        crate::SelfMembership::Removed
+    );
+    let wrong_store = Arc::new(SendCapture::new(
+        f.group.clone(),
+        vec![0xff; store_epoch.len() + 1],
+        query.clone(),
+    ));
+    publish_conversation_captures_from_session(
+        &[Arc::downgrade(&wrong_store)],
+        client.runtime.session(),
+        &f.app,
+        "alice",
+        &f.group,
+    );
+    assert!(wrong_store.take().is_none());
+    drop(client);
+    let cold = f
+        .app
+        .local_client_with_relay_plane_and_hydration("alice", &f.app.relay_plane, None, true, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        cold.runtime.session().group_authority(&f.group),
+        Err(cgka_session::SessionError::Engine(
+            cgka_traits::EngineError::GroupNotHydrated(_)
+        ))
+    ));
+    f.add(3);
+    publish_conversation_captures_from_session(
+        &observers,
+        cold.runtime.session(),
+        &f.app,
+        "alice",
+        &f.group,
+    );
+    assert!(
+        observer.take().is_none(),
+        "cold authority cannot reuse the preceding live capture"
+    );
+    assert!(
+        matches!(
+            f.store.conversation_account_snapshot(&f.group_hex(), query),
+            Err(ConversationOpenError::ReadStateNotReady)
+        ),
+        "cold capture must not even repair the projection or hydrate the engine"
+    );
+    drop(cold);
+    f.close().await;
+}

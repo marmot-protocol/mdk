@@ -5317,12 +5317,16 @@ impl AppClient {
         if self.is_group_forgotten(group_id)? {
             return Ok(SyncSummary::default());
         }
+        self.conversation_captures
+            .retain(|capture| capture.strong_count() > 0);
+        let conversation_captures = self.conversation_captures.clone();
         let app = self.app.clone();
         let label = self.state.label.clone();
         let buffered = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let progress_updates = buffered.clone();
         let observe = std::sync::Arc::new(
-            move |published: &marmot_account::PublishedApplicationMessage| {
+            move |session: &cgka_session::AccountDeviceSession,
+                  published: &marmot_account::PublishedApplicationMessage| {
                 // UPDATE-only finalization cannot create absent rows or clear an
                 // invalidation. Revival requires the live-group check in the final
                 // effects handler and intentionally waits for that handler.
@@ -5336,11 +5340,24 @@ impl AppClient {
                     published.authority,
                 );
                 match result {
-                    Ok(Some(update)) => match &on_update {
-                        Some(on_update) => on_update(update),
-                        None => progress_updates.lock().unwrap().push(update),
-                    },
-                    Ok(None) => {}
+                    Ok(update) => {
+                        // Make the coherent live checkpoint available before the
+                        // projection broadcast wakes the selected window. Replay
+                        // may have no SQL delta but still owes a fresh checkpoint.
+                        crate::runtime::publish_conversation_captures_from_session(
+                            &conversation_captures,
+                            session,
+                            &app,
+                            &label,
+                            &published.group_id,
+                        );
+                        if let Some(update) = update {
+                            match &on_update {
+                                Some(on_update) => on_update(update),
+                                None => progress_updates.lock().unwrap().push(update),
+                            }
+                        }
+                    }
                     Err(error) => tracing::warn!(
                         target: "marmot_app::client::projection",
                         method = "publication_progress",
