@@ -53,7 +53,10 @@ A new same-account durable admission also lets the managed worker yield a schedu
 waiting on a relay. This applies only after required acknowledgements and MLS confirmation are complete. Unfinished
 attempts remain conservatively recorded as possibly exposed and retry their exact saved bytes after backoff. The
 worker finishes its current local effects before servicing the new send; required publication and confirmation work
-is not cancelled.
+is not cancelled. After a yielded pass, one durable submission receives service ahead of overdue secondary retry
+passes once the finite backlog of deferred and buffered worker commands has drained. Earlier blocked commands keep
+their ordering, and a temporarily unavailable submission keeps its existing retry deadline. This does not prioritize
+durable sends over an indefinitely replenished command stream.
 
 For new durable admissions in the current runtime, `send_queue` and `outbound_message_queue_wait` measure the interval
 from the committed admission to its first worker execution. Execution and publication remain separate measurements.

@@ -1785,6 +1785,7 @@ async fn run_app_runtime_account_worker(
         });
 
     let mut yield_to_convergence = false;
+    let mut local_submission_service_owed = false;
     let mut comparison_recovery: Option<ComparisonRecoveryJob> = None;
     'worker: loop {
         // A pass whose network wait ended admits its owned batch a few events
@@ -1887,6 +1888,13 @@ async fn run_app_runtime_account_worker(
         }
         let ready_command =
             ready_command_index(&pending, &media_http, comparison_recovery.is_some());
+        #[cfg(test)]
+        tests::secondary_retry_scheduler_tests::record_turn(
+            &account_id_hex,
+            pending.len(),
+            commands.len(),
+            yield_to_convergence,
+        );
         tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
@@ -2002,6 +2010,8 @@ async fn run_app_runtime_account_worker(
                 yield_to_convergence = true;
                 match command {
                     Some((command, approved_pending)) => {
+                        #[cfg(test)]
+                        tests::secondary_retry_scheduler_tests::record_command(&account_id_hex, &command);
                         // ready_command_index has already approved pending work
                         // before the CatchUp barrier. Apply this extra gate only
                         // to fresh channel arrivals, or the earlier work would
@@ -2088,6 +2098,27 @@ async fn run_app_runtime_account_worker(
                     None => break 'worker,
                 }
             }
+            // A completed optional retry owes durable admission one turn once
+            // its finite command predecessors have drained. Keep the existing
+            // command/convergence alternation, including blocked predecessors.
+            _ = tokio::time::sleep_until(local_submission_retry_at),
+                if local_submission_service_owed && local_submission_due
+                    && pending.is_empty() && commands.is_empty()
+                    && !lifecycle.is_stopping() => {
+                // Recheck after polling the deadline: a buffered command may
+                // have arrived while the normal command arm was fairness-gated.
+                if !pending.is_empty() || !commands.is_empty() { continue 'worker; }
+                let retry = publish_next_local_submission(
+                    &mut client, &app, &shared, &events,
+                    &account_id_hex, &account_label,
+                ).await;
+                local_submission_service_owed = false;
+                local_submission_due = retry.is_some();
+                if let Some(delay) = retry {
+                    local_submission_retry_at = TokioInstant::now() + delay;
+                    schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
+                }
+            }
             _ = scheduled_convergence.timer.as_mut(), if !scheduled_convergence_held_for_test(&account_id_hex) => {
                 yield_to_convergence = false;
                 let Some(group_id) = scheduled_convergence.take_ready() else { continue };
@@ -2098,6 +2129,7 @@ async fn run_app_runtime_account_worker(
                     shared.local_submission_wakeups.subscribe(),
                     lifecycle.subscribe_shutdown(),
                 ).boxed().shared();
+                let yield_observation = secondary_retry_yield.clone();
                 let mut phase = Some(shared.app_performance_telemetry().observe(RuntimeOp::WorkerConvergence));
                 // Recovery owns the live client, but member/roster reads can
                 // use the last committed snapshot while its relay I/O waits.
@@ -2256,6 +2288,17 @@ async fn run_app_runtime_account_worker(
                     &account_label,
                 ))
                 .await;
+                if yield_observation.peek().is_some() {
+                    local_submission_service_owed = true;
+                    // Never erase the ordinary drain's contention/completion
+                    // backoff merely because another optional pass yielded.
+                    if !local_submission_due {
+                        local_submission_due = true;
+                        local_submission_retry_at = TokioInstant::now();
+                    }
+                }
+                #[cfg(test)]
+                tests::secondary_retry_scheduler_tests::pass_tail(&account_id_hex).await;
 
                 if let Some(phase) = phase {
                     phase.finish(TelemetryOutcome::Success);
@@ -2663,11 +2706,14 @@ async fn run_app_runtime_account_worker(
                 }
             }
             _ = local_submission_wakeups.changed() => { local_submission_due = true; }
-            _ = tokio::time::sleep_until(local_submission_retry_at), if local_submission_due => {
+            _ = tokio::time::sleep_until(local_submission_retry_at),
+                if local_submission_due && (!local_submission_service_owed
+                    || (pending.is_empty() && commands.is_empty())) => {
                 let retry = publish_next_local_submission(
                     &mut client, &app, &shared, &events,
                     &account_id_hex, &account_label,
                 ).await;
+                local_submission_service_owed = false;
                 local_submission_due = retry.is_some();
                 if let Some(delay) = retry {
                     local_submission_retry_at = TokioInstant::now() + delay;
@@ -6019,6 +6065,8 @@ async fn publish_next_local_submission(
     account_id_hex: &str,
     account_label: &str,
 ) -> Option<Duration> {
+    #[cfg(test)]
+    tests::secondary_retry_scheduler_tests::record_drain(account_id_hex);
     let (submission, queued) = {
         // Account-local admission may be waiting on storage. Do not park this
         // executor thread or the worker's shutdown/read serving behind it.
@@ -7352,6 +7400,7 @@ mod tests {
     #[cfg(feature = "test-policy-overrides")]
     mod receive_comparison_resume_tests;
     mod resource_bounds_tests;
+    pub(super) mod secondary_retry_scheduler_tests;
     mod selective_history_tests;
     mod worker_comparison_resume_tests;
     mod worker_recovery_resume_tests;
