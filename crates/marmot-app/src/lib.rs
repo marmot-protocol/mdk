@@ -6276,15 +6276,17 @@ impl MarmotApp {
 
     /// Clear a `local_publish_failed` retraction on one locally-sent row, so a
     /// fresh send intent for an id a failed send already retracted starts from a
-    /// live pending row instead of a permanent tombstone.
+    /// live pending row instead of a permanent tombstone, and so a retracted
+    /// send that a relay later accepted stops claiming it reached no one.
     ///
     /// An exact retained-event retry reuses the failed send's id; identical
     /// independently authored chat messages within one second also share an id.
     /// `record_app_event`'s upsert keeps
     /// invalidation terminal, so the revival has to be explicit and has to carry
-    /// evidence — and the send intent is the evidence. Only this path can
-    /// produce one: replay seams (`observe_drained_session_events`, backfill,
-    /// rejoin reprocessing) re-record rows without ever entering a send.
+    /// evidence. Two callers hold some: the send path holds a fresh send intent,
+    /// and publish finalization holds a relay acceptance of the row's own
+    /// fanout. Replay seams (`observe_drained_session_events`, backfill, rejoin
+    /// reprocessing) re-record rows without either and never call this.
     pub(crate) fn clear_timeline_local_publish_failure(
         &self,
         label: &str,
@@ -7672,8 +7674,8 @@ pub use storage_sqlite::{ContentReport, ContentReportPage, ReportDismissal, Repo
 pub use runtime::{
     AttachmentAssetRef, AttachmentAutomaticPermission, AttachmentCategory, AttachmentControl,
     AttachmentDownloadPolicy, AttachmentEntry, AttachmentHistoryCursor, AttachmentHistoryVersion,
-    AttachmentLocalTarget, AttachmentPage, AttachmentPageRead, AttachmentTransferState,
-    AttachmentTransferStatus, AutomaticAttachmentRequest, MAX_ATTACHMENT_ASSET_LOOKUPS,
-    MAX_ATTACHMENT_HISTORY_PAGE, MAX_ATTACHMENT_LOCAL_READ_BYTES, RetainedAttachmentAsset,
-    RuntimeAttachmentTransferSubscription,
+    AttachmentLocalTarget, AttachmentPage, AttachmentPageRead, AttachmentRole,
+    AttachmentTransferState, AttachmentTransferStatus, AutomaticAttachmentRequest,
+    MAX_ATTACHMENT_ASSET_LOOKUPS, MAX_ATTACHMENT_HISTORY_PAGE, MAX_ATTACHMENT_LOCAL_READ_BYTES,
+    RetainedAttachmentAsset, RuntimeAttachmentTransferSubscription,
 };

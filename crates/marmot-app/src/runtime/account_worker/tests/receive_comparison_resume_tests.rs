@@ -3,8 +3,8 @@
 
 use super::*;
 use nostr_relay_builder::prelude::{
-    BoxedFuture, Filter as RelayFilter, MemoryDatabase, MemoryDatabaseOptions, NostrDatabase,
-    PolicyResult, QueryPolicy,
+    BoxedFuture, Event as RelayEvent, Filter as RelayFilter, MemoryDatabase, MemoryDatabaseOptions,
+    NostrDatabase, PolicyResult, QueryPolicy, WritePolicy,
 };
 use nostr_relay_builder::{LocalRelay, RelayBuilder};
 use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag, Timestamp as SdkTimestamp};
@@ -44,6 +44,36 @@ impl Drop for ActiveQuery {
 impl Drop for ReleaseOnDrop {
     fn drop(&mut self) {
         self.0.release();
+    }
+}
+
+/// Once armed, hands every event the held relay admits to the live relay's
+/// subscribers as well.
+///
+/// A group send needs one relay acknowledgement and cancels its other relay
+/// attempts once it has it, so a send may never reach the live relay. While
+/// the target's exact-ID query is held, the held relay serves none of that
+/// connection's other subscriptions, so such a send would never reach the
+/// target at all. The mirror keeps the delivery path deterministic: an event
+/// the held relay never admitted was acknowledged by the live relay itself.
+#[derive(Clone, Debug)]
+struct MirrorToLive {
+    live: LocalRelay,
+    armed: Arc<AtomicBool>,
+}
+
+impl WritePolicy for MirrorToLive {
+    fn admit_event<'a>(
+        &'a self,
+        event: &'a RelayEvent,
+        _addr: &'a SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(async move {
+            if self.armed.load(Ordering::SeqCst) {
+                self.live.notify_event(event.clone());
+            }
+            PolicyResult::Accept
+        })
     }
 }
 
@@ -95,16 +125,21 @@ async fn run_receive_selected_comparison(shutdown_while_held: bool) {
         events: true,
         max_events: Some(64),
     });
+    let live_relay = LocalRelay::new(RelayBuilder::default());
+    live_relay.run().await.unwrap();
+    let live_url = live_relay.url().await.to_string();
+    let mirror = MirrorToLive {
+        live: live_relay.clone(),
+        armed: Arc::new(AtomicBool::new(false)),
+    };
     let relay = LocalRelay::new(
         RelayBuilder::default()
             .query_policy(gate.clone())
+            .write_policy(mirror.clone())
             .database(database.clone()),
     );
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
-    let live_relay = LocalRelay::new(RelayBuilder::default());
-    live_relay.run().await.unwrap();
-    let live_url = live_relay.url().await.to_string();
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     let alice = home.create_account("receive_target").unwrap();
@@ -376,6 +411,9 @@ async fn run_receive_selected_comparison(shutdown_while_held: bool) {
     // The first owned comparison keeps its grant while a second normal MLS
     // delivery is committed. This Receive tail must defer without selecting
     // or overwriting another attempt, and its visible publication still runs.
+    // The held query blocks the target's held-relay subscriptions, so the
+    // delivery must arrive through the live relay.
+    mirror.armed.store(true, Ordering::SeqCst);
     sender
         .send_custom_event(&group, 22_222, Vec::new(), "while held".into())
         .await

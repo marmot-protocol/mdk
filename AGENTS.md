@@ -8,6 +8,12 @@ implementation, its architecture notes, conformance fixtures, formal models, and
 
 Nested `AGENTS.md` files add rules for their subtree. Read the nearest one before editing.
 
+## MDK and host-app ownership
+
+MDK owns shared product logic and authoritative state; White Noise Android is a
+minimal display and Android platform layer. Follow [the host-app boundary](docs/marmot-architecture/overview/app-core-boundary.md#host-app-boundary)
+before adding behavior or bindings.
+
 ## Where to go
 
 | Task | Start here |

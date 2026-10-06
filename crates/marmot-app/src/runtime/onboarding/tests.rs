@@ -407,7 +407,7 @@ async fn mixed_health_relay_declarations_pass_without_rewriting_signed_metadata(
             10002,
             vec![
                 vec!["r".into(), "wss://healthy.example".into()],
-                vec!["r".into(), "wss://relay.damus.io".into()],
+                vec!["r".into(), "wss://relay.nostr.band".into()],
             ],
             OnboardingIssue::RetiredRelay,
         ),
@@ -416,7 +416,7 @@ async fn mixed_health_relay_declarations_pass_without_rewriting_signed_metadata(
             10050,
             vec![
                 vec!["relay".into(), "wss://healthy.example".into()],
-                vec!["relay".into(), "wss://relay.damus.io".into()],
+                vec!["relay".into(), "wss://relay.nostr.band".into()],
             ],
             OnboardingIssue::RetiredRelay,
         ),
@@ -443,7 +443,7 @@ async fn mixed_health_relay_declarations_pass_without_rewriting_signed_metadata(
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|endpoint| !endpoint.contains("relay.damus.io")
+                .all(|endpoint| !endpoint.contains("relay.nostr.band")
                     && !endpoint.contains("127.0.0.1"))
         );
     }
@@ -464,7 +464,7 @@ async fn mixed_health_relay_steps_advance_the_checkpoint_without_publication() {
             10002,
             vec![
                 vec!["r".into(), "wss://healthy.example".into()],
-                vec!["r".into(), "wss://relay.damus.io".into()],
+                vec!["r".into(), "wss://relay.nostr.band".into()],
             ],
             "",
             unix_now_seconds(),
@@ -474,7 +474,7 @@ async fn mixed_health_relay_steps_advance_the_checkpoint_without_publication() {
             10050,
             vec![
                 vec!["relay".into(), "wss://healthy.example".into()],
-                vec!["relay".into(), "wss://relay.damus.io".into()],
+                vec!["relay".into(), "wss://relay.nostr.band".into()],
             ],
             "",
             unix_now_seconds(),
@@ -502,7 +502,7 @@ async fn mixed_health_relay_steps_advance_the_checkpoint_without_publication() {
             .lock()
             .unwrap()
             .iter()
-            .all(|endpoint| !endpoint.contains("relay.damus.io"))
+            .all(|endpoint| !endpoint.contains("relay.nostr.band"))
     );
     runtime.shutdown_and_close().await.unwrap();
 }
@@ -650,13 +650,13 @@ async fn relay_directionality_and_inconclusive_checks_never_produce_false_readin
         (
             OnboardingStep::Relays,
             10002,
-            vec![vec!["r".into(), "wss://relay.damus.io".into()]],
+            vec![vec!["r".into(), "wss://relay.nostr.band".into()]],
             OnboardingStatus::NeedsInput,
         ),
         (
             OnboardingStep::InboxRelays,
             10050,
-            vec![vec!["relay".into(), "wss://relay.damus.io".into()]],
+            vec![vec!["relay".into(), "wss://relay.nostr.band".into()]],
             OnboardingStatus::NeedsInput,
         ),
         (
@@ -1132,7 +1132,7 @@ async fn onboarding_rejects_unsafe_inbox_defaults() {
         .begin_onboarding(
             Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             OnboardingOptions {
-                inbox_relays: vec!["wss://relay.damus.io".into()],
+                inbox_relays: vec!["wss://relay.nostr.band".into()],
                 ..options()
             },
         )

@@ -162,6 +162,7 @@ pub use quiescence::{
     QuiescenceTransportPolicy, QuiescenceWatchdog, drive_subject_to_quiescence,
 };
 pub use reference_subject::ReferenceModelSubject;
+pub use relay_control::harness_relay_builder;
 pub use report::{
     ReportArgs, ReportCommand, ReportFailureSummary, ReportInput, ReportRunSummary,
     ScenarioReportSummary, parse_report_command, report_usage, run_report,

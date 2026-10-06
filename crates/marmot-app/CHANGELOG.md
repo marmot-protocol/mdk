@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Attachment history adds `AttachmentRole` and the required `AttachmentEntry.role`
+  field. Update Rust struct literals; gallery consumers can exclude `InlineEmoji`
+  without changing original slots, parser verdicts or acquisition references.
+  See [the attachment-history handoff](../marmot-uniffi/ATTACHMENT-HISTORY.md).
+
+### Added
+
+- `MarmotAppRuntime::message_reactions` returns complete local reaction details for one exact
+  account/group/message, with one effective entry per sender/emoji and no
+  conversation-preview cap. Missing, hidden, deleted, invalidated and
+  retention-pruned targets return no participants; blocked reactors are excluded.
+  The read performs no network work or conversation-history scan.
+
+### Changed
+
+- `relay.damus.io` is no longer on the retired-relay denylist; the relay is
+  still operating. `retired_relay_hosts()` now returns only
+  `relay.nostr.band`. Members whose kind-10050 inbox list names only
+  `relay.damus.io` can be invited again.
+
+### Fixed
+
+- When a member lookup does not complete and the member's known inbox relay
+  list has no usable relays, the invite now fails with "known member inbox
+  relay list has no usable relays and its refresh did not complete" instead
+  of "relay-list absence was not authoritatively established". The error is
+  still retryable. A completed lookup still returns
+  `AppError::MissingMemberInboxRoute`.
+
+- A sent message the engine queued while the group was converging is no longer
+  marked failed when an unrelated publish in the same batch fails, and a sent
+  row already marked failed revives once a relay accepts its fanout. Before,
+  other members received the message while the sender's row stayed failed
+  forever, and a sender's poll showed no projection.
+
 ## 0.12.0 - 2026-10-02
 
 ### Added

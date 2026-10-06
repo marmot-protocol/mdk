@@ -8068,7 +8068,7 @@ async fn incomplete_discovery_is_not_cleared_by_an_empty_cached_outbox() {
         .expect_err("an empty outbox cannot prove absence after discovery failed");
 
     assert!(
-        matches!(error, AppError::RelayDirectory(_)),
+        matches!(error, AppError::RelayDirectory(ref message) if message.contains("not authoritatively established")),
         "unknown discovery must remain retryable instead of becoming a missing-route verdict: {error:?}"
     );
     assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
@@ -8077,6 +8077,58 @@ async fn incomplete_discovery_is_not_cleared_by_an_empty_cached_outbox() {
             .iter()
             .any(|endpoint| endpoint.0 == outbox)
     }));
+}
+
+#[tokio::test]
+/// A found inbox list naming only retired relays is named in the error, which
+/// still reports the incomplete outbox hop rather than a final verdict.
+async fn member_inbox_of_only_retired_relays_is_reported_distinctly() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let account_id = accounts[0].account_id_hex.clone();
+    for event in fetcher.events.lock().unwrap().iter_mut() {
+        if event.kind == KIND_MARMOT_INBOX_RELAY_LIST {
+            event.tags = vec![vec!["relay".into(), "wss://relay.nostr.band".into()]];
+        }
+    }
+    *fetcher.incomplete_endpoint.lock().unwrap() = Some("wss://shared.example".into());
+
+    let error = app
+        .resolve_member_key_packages(&[account_id.as_str()])
+        .await
+        .expect_err("a member with no usable inbox cannot be invited");
+
+    assert!(
+        matches!(error, AppError::RelayDirectory(ref message) if message.contains("no usable relays") && message.contains("refresh did not complete")),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+/// A cached retired-only inbox list stays retryable when the refresh fails,
+/// and a completed refresh replaces it with the member's newer usable list.
+async fn cached_retired_inbox_with_failed_refresh_remains_retryable() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let account_id = accounts[0].account_id_hex.clone();
+    remember_test_member_inbox(&app, &account_id, "wss://relay.nostr.band");
+    fetcher
+        .fail_all
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let error = app
+        .resolve_member_key_packages(&[account_id.as_str()])
+        .await
+        .expect_err("a failed refresh cannot use a retired-only cached inbox");
+    assert!(
+        matches!(error, AppError::RelayDirectory(ref message) if message.contains("refresh did not complete")),
+        "{error:?}"
+    );
+
+    fetcher
+        .fail_all
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    app.resolve_member_key_packages(&[account_id.as_str()])
+        .await
+        .expect("a completed refresh finds the newer usable inbox without republication");
 }
 
 #[tokio::test]
@@ -18767,6 +18819,215 @@ async fn a_confirmed_but_partial_send_publish_still_passes_the_arming_gate() {
         audit_rows_of_kind(&app, "epoch_stall_backfill_armed"),
         1,
         "the arm must leave exactly one durable forensic row"
+    );
+}
+
+/// A send the engine queued durably was never fanned out, so an unrelated
+/// failure in the same batch says nothing about it. Retracting it would
+/// tombstone a row the queued-outbound drain later delivers: the group sees the
+/// message while the sender sees `failed`, and a poll loses its projection.
+#[tokio::test]
+async fn a_queued_send_is_not_failed_by_an_unrelated_failure_in_its_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://queued-send-gate.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("queued send gate", &[]).await.unwrap();
+    let queued_for = |group_id: &cgka_traits::GroupId| cgka_session::QueuedIntentRef {
+        group_id: group_id.clone(),
+        intent_id: cgka_traits::MessageId::new(vec![0x22; 32]),
+    };
+
+    let mut queued = a_refusal_riding_a_rolled_back_publish(&group_id);
+    queued.queued.push(queued_for(&group_id));
+    assert!(
+        client
+            .observe_recovery_evidence_then_gate_send_publish(&queued, &group_id, "current-send")
+            .await
+            .is_ok(),
+        "a durably queued send must survive an unrelated rolled-back sibling"
+    );
+
+    let mut failed = a_refusal_riding_a_rolled_back_publish(&group_id);
+    failed.queued.push(queued_for(&group_id));
+    failed
+        .failed_app_messages
+        .push(marmot_account::FailedApplicationMessage {
+            group_id: group_id.clone(),
+            app_event_id: "current-send".to_owned(),
+            message_id: cgka_traits::MessageId::new(vec![0xab; 32]),
+            reason: "injected publish failure".to_owned(),
+        });
+    assert!(
+        client
+            .observe_recovery_evidence_then_gate_send_publish(&failed, &group_id, "current-send")
+            .await
+            .is_err(),
+        "a queued sibling must not excuse the current send's own terminal failure"
+    );
+
+    let other_group = cgka_traits::GroupId::new(vec![0x99; 16]);
+    let mut elsewhere = a_refusal_riding_a_rolled_back_publish(&group_id);
+    elsewhere.queued.push(queued_for(&other_group));
+    assert!(
+        client
+            .observe_recovery_evidence_then_gate_send_publish(&elsewhere, &group_id, "current-send")
+            .await
+            .is_err(),
+        "an intent queued in another group is not evidence about this send"
+    );
+}
+
+/// A relay accepting a send the send path already retracted must revive the
+/// row: otherwise the group has the message while the sender's row says
+/// `failed` forever, and a poll's projection stays dropped. A terminal group
+/// keeps the sweep's verdict.
+#[tokio::test]
+async fn a_relay_accepted_send_revives_its_local_publish_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://revive-accepted-send.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let created_at = unix_now_seconds();
+    let poll = |app_event_id: &str, group_id: &cgka_traits::GroupId| AppMessageProjection {
+        authority: None,
+        message_id_hex: app_event_id.to_owned(),
+        source_message_id_hex: None,
+        direction: "sent".to_owned(),
+        group_id_hex: hex::encode(group_id.as_slice()),
+        sender: account.account_id_hex.clone(),
+        plaintext: "Lunch?".to_owned(),
+        kind: cgka_traits::MARMOT_APP_EVENT_KIND_POLL,
+        tags: cgka_traits::poll_tags(
+            created_at,
+            "Lunch?",
+            &["Yes".to_owned(), "No".to_owned()],
+            cgka_traits::PollType::SingleChoice,
+            None,
+        )
+        .unwrap(),
+        source_epoch: None,
+        retention: None,
+        recorded_at: Some(created_at),
+        origin_commit_id: None,
+        moderation_grant: false,
+    };
+    let published = |app_event_id: &str, group_id: &cgka_traits::GroupId| {
+        marmot_account::AccountDeviceEffects {
+            published_app_messages: vec![marmot_account::PublishedApplicationMessage {
+                authority: None,
+                group_id: group_id.clone(),
+                app_event_id: app_event_id.to_owned(),
+                // Source ids are unique per account; reuse the event id bytes.
+                message_id: cgka_traits::MessageId::new(hex::decode(app_event_id).unwrap()),
+                source_epoch: cgka_traits::EpochId(1),
+                retention: AppMessageRetentionDecision::new(created_at, 0),
+            }],
+            ..Default::default()
+        }
+    };
+    let retracted = |app_event_id: &str, group_id: &cgka_traits::GroupId| {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        app.record_account_app_event("alice", &poll(app_event_id, group_id))
+            .unwrap();
+        app.invalidate_timeline_app_event(
+            "alice",
+            &group_id_hex,
+            app_event_id,
+            crate::LOCAL_PUBLISH_FAILED_REASON,
+        )
+        .unwrap();
+        let row = app
+            .timeline_message("alice", &group_id_hex, app_event_id)
+            .unwrap()
+            .unwrap();
+        assert!(row.poll.is_none(), "a retracted poll has no projection");
+    };
+
+    let live = client.create_group("revive live", &[]).await.unwrap();
+    let live_event = "11".repeat(32);
+    retracted(&live_event, &live);
+    client
+        .finalize_published_app_message_source_retention(&published(&live_event, &live))
+        .unwrap();
+    let row = app
+        .timeline_message("alice", &hex::encode(live.as_slice()), &live_event)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.invalidation_status, None,
+        "relay acceptance revives the row"
+    );
+    assert_eq!(
+        row.source_message_id_hex,
+        Some(live_event.clone()),
+        "the revival keeps the finalized source"
+    );
+    assert!(row.poll.is_some(), "the revived poll projects again");
+
+    let terminal = client.create_group("revive terminal", &[]).await.unwrap();
+    let terminal_event = "22".repeat(32);
+    retracted(&terminal_event, &terminal);
+    make_group_terminal(&client, &terminal, false);
+    client
+        .finalize_published_app_message_source_retention(&published(&terminal_event, &terminal))
+        .unwrap();
+    let row = app
+        .timeline_message("alice", &hex::encode(terminal.as_slice()), &terminal_event)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.invalidation_status.as_deref(),
+        Some(crate::LOCAL_PUBLISH_FAILED_REASON),
+        "a terminal group keeps the sweep's verdict"
+    );
+
+    // A group record that cannot be read yet decides nothing: the fanout must
+    // stay for a replay instead of being acknowledged with the row still failed.
+    let unreadable = cgka_traits::GroupId::new(vec![0x5a; 16]);
+    let unreadable_event = "33".repeat(32);
+    let unreadable_hex = hex::encode(unreadable.as_slice());
+    retracted(&unreadable_event, &unreadable);
+    let accepted = published(&unreadable_event, &unreadable);
+    client
+        .finalize_published_app_message_source_retention(&accepted)
+        .unwrap();
+    let row = app
+        .timeline_message("alice", &unreadable_hex, &unreadable_event)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.invalidation_status.as_deref(),
+        Some(crate::LOCAL_PUBLISH_FAILED_REASON),
+        "an unreadable group cannot revive the row yet"
+    );
+    assert!(
+        client.pending_convergence_groups.contains(&unreadable),
+        "the accepted fanout is kept and its group scheduled for a replay"
+    );
+    {
+        use cgka_traits::storage::GroupStorage;
+        let storage = client.app.account_storage(&client.state.label).unwrap();
+        let mut record = storage.get_group(&live).unwrap();
+        record.id = unreadable.clone();
+        storage.put_group(&record).unwrap();
+    }
+    client
+        .finalize_published_app_message_source_retention(&accepted)
+        .unwrap();
+    let row = app
+        .timeline_message("alice", &unreadable_hex, &unreadable_event)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.invalidation_status, None,
+        "the replay revives the row once the group is readable"
     );
 }
 

@@ -9,12 +9,19 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Add `marmot_message_reactions` and the owned
+  `MarmotTimelineUserReactionList` root/free for complete exact-message details.
+  Existing record layouts are unchanged; the new symbols require matching
+  generated headers and native libraries.
 - Per-account NIP-46 sessions for bunker links and client-initiated pairing,
   with identity pinning, approval URLs, relay switching, cancellation and logout.
   Local-key accounts and separate remote signers can run in the same client.
 
 ### Changed
 
+- `MarmotAttachmentEntry` adds `role: MarmotAttachmentRole` (`Shared` or
+  `InlineEmoji`) for gallery filtering without changing slot or acquisition identity.
+  This changes the record layout; rebuild clients with the matching header/library.
 - External account SQLCipher keys use the configured host secret store. Existing
   plaintext key files migrate only after a verified secret-store write.
 

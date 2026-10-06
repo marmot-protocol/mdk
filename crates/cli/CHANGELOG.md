@@ -9,6 +9,20 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed
+
+- `relay.damus.io` is no longer a retired relay host. The relay is still
+  operating, so relay lists, invites and `wn` commands accept it again.
+  `relay.nostr.band` remains retired.
+
+### Fixed
+
+- A sent message the engine queued while the group was converging is no longer
+  marked failed when an unrelated publish in the same batch fails, and a sent
+  row already marked failed revives once a relay accepts its fanout. Before,
+  other members received the message while the sender's row stayed failed
+  forever, and a sender's poll showed no projection.
+
 ## [0.12.0] - 2026-10-02
 
 Update generated Swift/Kotlin bindings, native libraries and C headers together. Account storage advances through

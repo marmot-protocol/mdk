@@ -2559,7 +2559,7 @@ async fn directory_fetches_reject_retired_relays_before_fetching() {
     let relay_plane = relay_plane_with_directory_fetcher(relay, directory_fetcher.clone());
     let query = DirectoryEventQuery::new(0, vec!["11".repeat(32)], 12);
 
-    for endpoint in ["wss://relay.damus.io", "wss://relay.nostr.band"] {
+    for endpoint in ["wss://relay.nostr.band", "wss://RELAY.NOSTR.BAND./path"] {
         let err = relay_plane
             .fetch_directory_events(
                 vec![TransportEndpoint(endpoint.into())],

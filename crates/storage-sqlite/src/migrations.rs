@@ -209,6 +209,8 @@ mod migration_0099_attachment_preparation_deferrals;
 mod migration_0100_attachment_explicit_priority;
 #[path = "migrations/0101_outgoing_attachment_uploads.rs"]
 mod migration_0101_outgoing_attachment_uploads;
+#[path = "migrations/0102_attachment_emoji_role.rs"]
+mod migration_0102_attachment_emoji_role;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -729,6 +731,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 101,
         name: "0101_outgoing_attachment_uploads",
         apply: migration_0101_outgoing_attachment_uploads::apply,
+    },
+    Migration {
+        version: 102,
+        name: "0102_attachment_emoji_role",
+        apply: migration_0102_attachment_emoji_role::apply,
     },
 ];
 

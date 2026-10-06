@@ -9787,7 +9787,7 @@ async fn import_ignores_retired_published_routes_without_rewriting_relay_lists()
         &publisher_home,
         "publisher",
         &relay_url,
-        "wss://relay.damus.io",
+        "wss://relay.nostr.band",
         test_unix_now_seconds(),
     )
     .await;
@@ -9816,11 +9816,11 @@ async fn import_ignores_retired_published_routes_without_rewriting_relay_lists()
     assert!(imported.relay_lists.complete);
     assert_eq!(
         imported.relay_lists.nip65.relays,
-        vec!["wss://relay.damus.io"]
+        vec!["wss://relay.nostr.band"]
     );
     assert_eq!(
         imported.relay_lists.inbox.relays,
-        vec!["wss://relay.damus.io"]
+        vec!["wss://relay.nostr.band"]
     );
     assert!(imported.key_package_bytes.is_some());
     assert_eq!(
@@ -9921,7 +9921,7 @@ async fn remote_key_package_fetch_falls_back_when_published_outbox_is_retired() 
         &publisher_home,
         &created.account.label,
         &relay_url,
-        "wss://relay.damus.io",
+        "wss://relay.nostr.band",
         test_unix_now_seconds() + 1,
     )
     .await;
@@ -9942,7 +9942,7 @@ async fn remote_key_package_fetch_falls_back_when_published_outbox_is_retired() 
 
     assert_eq!(
         fetched.relay_lists.nip65.relays,
-        vec!["wss://relay.damus.io"]
+        vec!["wss://relay.nostr.band"]
     );
     assert_eq!(
         fetched.key_package.bytes().len(),
@@ -9975,7 +9975,7 @@ async fn relay_list_edits_reject_retired_endpoints_in_every_input_role() {
             "alice",
             AccountRelayListBootstrap::new(
                 vec![endpoint(&seed_url)],
-                vec![endpoint("wss://relay.damus.io")],
+                vec![endpoint("wss://relay.nostr.band")],
             ),
         )
         .await;
@@ -9999,7 +9999,7 @@ async fn relay_list_edits_reject_retired_endpoints_in_every_input_role() {
         .publish_account_nip65_relay_set(
             "alice",
             vec![endpoint(&seed_url)],
-            vec![endpoint("wss://relay.damus.io")],
+            vec![endpoint("wss://relay.nostr.band")],
             vec![endpoint(&seed_url)],
         )
         .await;

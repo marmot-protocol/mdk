@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Attachment history adds `AttachmentRoleFfi` and the required, defaultless
+  `AttachmentEntryFfi.role` field. Regenerate Swift/Kotlin bindings with the
+  matching native library and update host record constructors and fixtures.
+  Gallery clients can exclude `InlineEmoji`; preserve slots and continue paging
+  after filtered pages as described in [the handoff](ATTACHMENT-HISTORY.md).
+
+### Added
+
+- `Marmot::message_reactions` returns complete local reaction details for one exact
+  account/group/message, with one effective entry per sender/emoji and no
+  conversation-preview cap. Missing, hidden, deleted, invalidated and
+  retention-pruned targets return no participants; blocked reactors are excluded.
+  The read performs no network work or conversation-history scan.
+  Regenerate matching Swift/Kotlin bindings to call `messageReactions`.
+
+### Changed
+
+- `retired_relay_hosts()` no longer includes `relay.damus.io`, and
+  `classify_relay_endpoints` now reports it as `Allowed`.
+
 ## 0.12.0 - 2026-10-02
 
 Regenerate Swift/Kotlin bindings with the matching native library. See the

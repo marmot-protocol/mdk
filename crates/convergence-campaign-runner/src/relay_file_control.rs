@@ -160,7 +160,7 @@ pub fn file_control_relay_builder(control_root: &Path) -> io::Result<RelayBuilde
     fs_private::ensure_private_file(&control_root.join(PUBLICATION_LOG))?;
     let secret = read_control_secret(control_root)?;
     Ok(
-        RelayBuilder::default().database(FileRecordingRelayDatabase {
+        cgka_conformance_simulator::harness_relay_builder().database(FileRecordingRelayDatabase {
             inner: MemoryDatabase::with_opts(MemoryDatabaseOptions {
                 events: true,
                 max_events: Some(75_000),
