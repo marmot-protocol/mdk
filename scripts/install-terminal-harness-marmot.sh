@@ -70,6 +70,10 @@ case "$HARNESS_KIND" in
         exit 64
         ;;
 esac
+HARNESS_PROFILE_CHOICES="inherit, autonomous, or unrestricted"
+if [ "$HARNESS_AUTONOMOUS_SUPPORTED" -ne 1 ]; then
+    HARNESS_PROFILE_CHOICES="inherit or unrestricted"
+fi
 HARNESS_BINARY="wn-$HARNESS_KIND"
 HARNESS_BIN_ENV="${HARNESS_ENV_PREFIX}_BIN"
 HARNESS_ALLOWED_SENDERS_ENV="${HARNESS_ENV_PREFIX}_ALLOWED_SENDERS_HEX"
@@ -155,7 +159,7 @@ Options:
   --allow-sender VALUE     Alias for --allow-welcomer
   --relay URL              Relay URL for wn-agent/bootstrap; may repeat
   --$HARNESS_KIND-bin PATH      $HARNESS_DISPLAY_NAME binary or command name (default: $HARNESS_DEFAULT_BIN)
-  --execution-profile PROFILE  inherit, autonomous, or unrestricted (default: inherit)
+  --execution-profile PROFILE  $HARNESS_PROFILE_CHOICES (default: inherit)
   --acknowledge-unrestricted   Confirm that unrestricted requires external isolation
   --no-service             Do not install/start LaunchAgents or systemd user units
   --no-start-wn-agent      Install services but do not start wn-agent or the harness
@@ -342,7 +346,7 @@ validate_execution_profile() {
             fi
             ;;
         *)
-            echo "error: --execution-profile must be inherit, autonomous, or unrestricted" >&2
+            echo "error: --execution-profile must be $HARNESS_PROFILE_CHOICES" >&2
             exit 1
             ;;
     esac

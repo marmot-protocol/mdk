@@ -407,6 +407,11 @@ if [ "$kind" = goose ]; then
         || autonomous_status=$?
     [ "$autonomous_status" -ne 0 ]
     grep -F "does not support the autonomous execution profile" "$autonomous_stderr" >/dev/null
+    goose_help="$("$installer" --help)"
+    case "$goose_help" in
+        *"--execution-profile PROFILE  inherit or unrestricted"*) ;;
+        *) echo "goose installer help advertises an unsupported execution profile" >&2; exit 1 ;;
+    esac
 fi
 
 custom_root="$fixture_parent/custom"

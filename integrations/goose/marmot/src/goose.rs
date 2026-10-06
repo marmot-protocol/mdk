@@ -59,10 +59,11 @@ impl GooseBackend {
         path_root: Option<PathBuf>,
     ) -> Result<Self> {
         let permission = GoosePermission::from_profile(execution_profile)?;
+        validate_cli_version(&bin)?;
+        // Create (or tighten) the connector-owned Goose root only after every check passes.
         if let Some(path_root) = &path_root {
             fs_private::create_dir_all_private(path_root)?;
         }
-        validate_cli_version(&bin)?;
         Ok(Self {
             bin,
             permission,
@@ -244,14 +245,13 @@ impl GooseEventParser {
                 self.finished = true;
                 self.pending = None;
                 // Goose emits stream events only after the named session exists.
-                self.session_reported = true;
                 return Ok(ParsedEvent::Error {
                     session_id: Some(self.session_name.clone()),
                     summary: summary.to_owned(),
                 });
             }
-            "notification" => ParsedEvent::Ignored,
-            _ => return Ok(ParsedEvent::Ignored),
+            // `notification` and future event types carry no reply text.
+            _ => ParsedEvent::Ignored,
         };
         Ok(self.with_session(event))
     }
@@ -279,7 +279,17 @@ impl GooseEventParser {
         let Some(Value::Array(content)) = message.get("content") else {
             return Err(HarnessError::Json);
         };
-        let continues_pending = id.is_some()
+        let user_visible = message
+            .get("metadata")
+            .and_then(|metadata| metadata.get("userVisible"))
+            .and_then(Value::as_bool)
+            .ok_or(HarnessError::Json)?;
+        let text = user_visible_text(content)?;
+
+        let is_assistant = role == "assistant";
+        // Chunks of one message share an id. Id-less assistant chunks cannot be told apart,
+        // so they are joined until a different message or a terminal event arrives.
+        let continues_pending = is_assistant
             && self
                 .pending
                 .as_ref()
@@ -289,18 +299,10 @@ impl GooseEventParser {
         } else {
             self.flush()
         };
-        let user_visible = message
-            .get("metadata")
-            .and_then(|metadata| metadata.get("userVisible"))
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        if role == "assistant" && user_visible {
-            let text = user_visible_text(content);
-            if !text.is_empty() {
-                match &mut self.pending {
-                    Some(pending) if continues_pending => pending.text.push_str(&text),
-                    _ => self.pending = Some(PendingText { id, text }),
-                }
+        if is_assistant && user_visible && !text.is_empty() {
+            match &mut self.pending {
+                Some(pending) if continues_pending => pending.text.push_str(&text),
+                _ => self.pending = Some(PendingText { id, text }),
             }
         }
         Ok(flushed)
@@ -315,20 +317,32 @@ impl GooseEventParser {
 }
 
 /// Joins `text` blocks meant for the user; thinking, tool, and notification blocks are
-/// never forwarded, nor is text whose audience excludes the user.
-fn user_visible_text(content: &[Value]) -> String {
-    content
-        .iter()
-        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-        .filter(|block| {
-            block
-                .get("annotations")
-                .and_then(|annotations| annotations.get("audience"))
-                .and_then(Value::as_array)
-                .is_none_or(|audience| audience.iter().any(|role| role == "user"))
-        })
-        .filter_map(|block| block.get("text").and_then(Value::as_str))
-        .collect()
+/// never forwarded, nor is text whose audience excludes the user. A malformed text block
+/// rejects the whole event rather than defaulting to visible.
+fn user_visible_text(content: &[Value]) -> Result<String> {
+    let mut joined = String::new();
+    for block in content {
+        if block.get("type").and_then(Value::as_str) != Some("text") {
+            continue;
+        }
+        let text = block
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or(HarnessError::Json)?;
+        let audience = match block.get("annotations") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(annotations)) => match annotations.get("audience") {
+                None | Some(Value::Null) => None,
+                Some(Value::Array(audience)) => Some(audience),
+                Some(_) => return Err(HarnessError::Json),
+            },
+            Some(_) => return Err(HarnessError::Json),
+        };
+        if audience.is_none_or(|audience| audience.iter().any(|role| role == "user")) {
+            joined.push_str(text);
+        }
+    }
+    Ok(joined)
 }
 
 fn validate_cli_version(bin: &str) -> Result<()> {
@@ -546,21 +560,39 @@ mod tests {
     }
 
     #[test]
-    fn parser_treats_messages_without_ids_and_hidden_messages_as_standalone() {
+    fn parser_joins_id_less_chunks_and_skips_hidden_messages() {
         let mut parser = GooseEventParser::new(SESSION.to_owned());
-        let no_id = |value: &str| {
+        let no_id = |role: &str, content: &str| {
             format!(
-                r#"{{"type":"message","message":{{"id":null,"role":"assistant","created":1,"content":{},"metadata":{{"userVisible":true,"agentVisible":true}}}}}}"#,
-                text(value)
+                r#"{{"type":"message","message":{{"id":null,"role":"{role}","created":1,"content":{content},"metadata":{{"userVisible":true,"agentVisible":true}}}}}}"#
             )
         };
         assert_eq!(
-            parser.parse_line(&no_id("first")).unwrap(),
+            parser
+                .parse_line(&no_id("assistant", &text("one ")))
+                .unwrap(),
             ParsedEvent::Session(SESSION.to_owned())
         );
         assert_eq!(
-            parser.parse_line(&no_id("second")).unwrap(),
-            ParsedEvent::Text("first".to_owned())
+            parser
+                .parse_line(&no_id("assistant", &text("reply")))
+                .unwrap(),
+            ParsedEvent::Ignored
+        );
+        assert_eq!(
+            parser
+                .parse_line(&no_id(
+                    "user",
+                    r#"[{"type":"toolResponse","id":"t1","toolResult":{"status":"success","value":[]}}]"#
+                ))
+                .unwrap(),
+            ParsedEvent::Text("one reply".to_owned())
+        );
+        assert_eq!(
+            parser
+                .parse_line(&no_id("assistant", &text("second")))
+                .unwrap(),
+            ParsedEvent::Ignored
         );
         let hidden = r#"{"type":"message","message":{"id":"h1","role":"assistant","created":1,"content":[{"type":"text","text":"internal"}],"metadata":{"userVisible":false,"agentVisible":true}}}"#;
         assert_eq!(
@@ -617,16 +649,23 @@ mod tests {
             r#"{"type":"message","message":{"id":"m1","content":[]}}"#,
             r#"{"type":"message","message":{"id":"m1","role":"assistant","content":"text"}}"#,
             r#"{"type":"error"}"#,
+            // Visibility must be explicit and well-formed; malformed markers never default to visible.
+            r#"{"type":"message","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"x"}]}}"#,
+            r#"{"type":"message","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"x"}],"metadata":{"userVisible":"false"}}}"#,
+            r#"{"type":"message","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"x"}],"metadata":{"userVisible":null}}}"#,
+            r#"{"type":"message","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"x","annotations":{"audience":"assistant"}}],"metadata":{"userVisible":true}}}"#,
+            r#"{"type":"message","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"x","annotations":"assistant"}],"metadata":{"userVisible":true}}}"#,
+            r#"{"type":"message","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":7}],"metadata":{"userVisible":true}}}"#,
         ] {
             assert!(parser.parse_line(line).is_err(), "accepted {line}");
         }
         assert_eq!(
             parser.parse_line(r#"{"type":"future_event"}"#).unwrap(),
-            ParsedEvent::Ignored
+            ParsedEvent::Session(SESSION.to_owned())
         );
         assert_eq!(
             parser.parse_line(r#"{"type":"complete"}"#).unwrap(),
-            ParsedEvent::Session(SESSION.to_owned())
+            ParsedEvent::Ignored
         );
     }
 
@@ -711,6 +750,41 @@ mod tests {
         .err()
         .expect("autonomous profile");
         assert!(matches!(error, HarnessError::Config(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backend_creates_path_root_only_after_goose_validates() {
+        let root = tempfile::tempdir().unwrap();
+        let path_root = root.path().join("goose-root");
+        let old = root.path().join("old-goose");
+        write_executable(&old, "#!/usr/bin/env bash\nprintf '%s\\n' ' 1.52.0'\n");
+        assert!(
+            GooseBackend::new(
+                old.to_string_lossy().into_owned(),
+                ExecutionProfile::Inherit,
+                Some(path_root.clone()),
+            )
+            .is_err()
+        );
+        assert!(
+            !path_root.exists(),
+            "rejected startup created the Goose root"
+        );
+
+        let supported = root.path().join("goose");
+        write_executable(
+            &supported,
+            "#!/usr/bin/env bash\nprintf '%s\\n' ' 1.53.0'\n",
+        );
+        GooseBackend::new(
+            supported.to_string_lossy().into_owned(),
+            ExecutionProfile::Inherit,
+            Some(path_root.clone()),
+        )
+        .unwrap();
+        let mode = fs::metadata(&path_root).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
     }
 
     #[cfg(unix)]

@@ -49,7 +49,11 @@ Rust Goose harness for Marmot through the local `wn-agent` control socket. Read
   Never write Goose configuration files.
 - Keep `WN_GOOSE_MAX_REPLY_BYTES=30000` below the Marmot message cap.
 - Keep event validation strict: validate an event before mutating parser state,
-  and never turn malformed or unknown events into replies.
+  and never turn malformed or unknown events into replies. `metadata.userVisible`
+  must be a bool and a text block's `annotations.audience` must be absent, null,
+  or an array; anything else rejects the event instead of defaulting to visible.
+- Join chunks that share a message id. Goose ids are optional, so consecutive
+  id-less assistant chunks are joined too; never emit one reply per delta.
 - The supported minimum is Goose 1.53.0. The `run` flags, `stream-json` event
   shapes, chunk merging by message id, user-provided session-name resolution,
   and `--version` output (` 1.53.0`, from an empty clap display name) were
