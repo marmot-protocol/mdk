@@ -9091,9 +9091,24 @@ async fn member_key_package_set_falls_back_when_multi_author_queries_are_incompl
             .iter()
             .filter(|request| request.queries.iter().all(|query| query.authors.len() == 1))
             .count(),
-        4,
-        "both relay-list hops retry each member; successful prewarm needs no preference refetch"
+        6,
+        "both relay-list hops and the empty incomplete package batch retry each member"
     );
+    for kind in [
+        KIND_NIP65_RELAY_LIST,
+        KIND_MARMOT_INBOX_RELAY_LIST,
+        KIND_MARMOT_KEY_PACKAGE,
+    ] {
+        assert_eq!(
+            requests
+                .iter()
+                .flat_map(|request| &request.queries)
+                .filter(|query| query.kind == kind && query.authors.len() == 1)
+                .count(),
+            2,
+            "each incomplete batch falls back once per member; prewarm adds no preference refetch"
+        );
+    }
 }
 
 #[tokio::test]
