@@ -28,6 +28,7 @@ _EXPECTED_RESPONSE_TYPES = {
     "account_relay_list_add": frozenset({"relay_lists"}),
     "account_relay_list_remove": frozenset({"relay_lists"}),
     "send_final": frozenset({"final_sent"}),
+    "edit_message": frozenset({"final_sent"}),
     "delete_message": frozenset({"app_event_sent"}),
     "send_reaction": frozenset({"app_event_sent"}),
     "remove_reaction": frozenset({"app_event_sent"}),
@@ -321,6 +322,21 @@ class MarmotAgentControlClient:
         if key:
             payload["idempotency_key"] = key
         return await self.request(payload)
+
+    async def edit_message(
+        self,
+        account_id_hex: str,
+        group_id_hex: str,
+        target_message_id_hex: str,
+        text: str,
+    ) -> Dict[str, Any]:
+        return await self.request({
+            "type": "edit_message",
+            "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+            "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
+            "target_message_id_hex": _normalize_hex(target_message_id_hex, "target_message_id_hex"),
+            "text": str(text or ""),
+        })
 
     async def delete_message(
         self,

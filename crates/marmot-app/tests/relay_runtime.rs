@@ -8594,6 +8594,132 @@ async fn relay_app_runtime_synthesizes_rows_for_multi_member_invite() {
 }
 
 #[tokio::test]
+async fn relay_app_client_rejects_invalid_edit_targets_before_publish() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+    let mut alice = app.client("alice").await.unwrap();
+    let group = alice
+        .create_group("edit eligibility", &["bob"])
+        .await
+        .unwrap();
+    bob.sync().await.unwrap();
+    let sent = alice.send(&group, b"original").await.unwrap();
+    let target = &sent.message_ids[0];
+    bob.sync().await.unwrap();
+    assert_eq!(
+        app.timeline_message("bob", &hex::encode(group.as_slice()), target)
+            .unwrap()
+            .unwrap()
+            .kind,
+        MARMOT_APP_EVENT_KIND_CHAT
+    );
+    let before = app.messages("bob").unwrap().len();
+    assert!(matches!(
+        bob.edit_message(&group, target, "foreign").await,
+        Err(AppError::InvalidEditTarget)
+    ));
+    assert_eq!(app.messages("bob").unwrap().len(), before);
+    let activity = alice
+        .send_agent_activity(&group, "working".into(), "status".into(), None, None)
+        .await
+        .unwrap();
+    for invalid in [&activity.message_ids[0], &"ff".repeat(32)] {
+        let before = app.messages("alice").unwrap().len();
+        assert!(matches!(
+            alice.edit_message(&group, invalid, "invalid").await,
+            Err(AppError::InvalidEditTarget)
+        ));
+        assert_eq!(app.messages("alice").unwrap().len(), before);
+    }
+    alice.edit_message(&group, target, "edited").await.unwrap();
+    assert_eq!(
+        app.timeline_message("alice", &hex::encode(group.as_slice()), target)
+            .unwrap()
+            .unwrap()
+            .plaintext,
+        "edited"
+    );
+    alice.delete_message(&group, target).await.unwrap();
+    assert!(
+        app.timeline_message("alice", &hex::encode(group.as_slice()), target)
+            .unwrap()
+            .unwrap()
+            .deleted
+    );
+    let before = app.messages("alice").unwrap().len();
+    assert!(matches!(
+        alice.edit_message(&group, target, "deleted").await,
+        Err(AppError::InvalidEditTarget)
+    ));
+    assert_eq!(app.messages("alice").unwrap().len(), before);
+}
+
+#[tokio::test]
+async fn retained_local_edit_survives_shared_runtime_preflight() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+    let mut alice = app.client("alice").await.unwrap();
+    let group = alice
+        .create_group("retained edits", &["bob"])
+        .await
+        .unwrap();
+    bob.sync().await.unwrap();
+    drop(alice);
+    drop(bob);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let original = runtime
+        .submit_text("alice", &group, "original".into(), "original-token".into())
+        .await
+        .unwrap();
+    runtime
+        .submit_edit_for_local_send(
+            "alice",
+            &group,
+            "original-token".into(),
+            "retained edit".into(),
+            "edit-token".into(),
+        )
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(15), async {
+        loop {
+            match runtime
+                .local_send_status("alice", &group, "edit-token")
+                .unwrap()
+            {
+                Some(marmot_app::LocalSendStatus::Completed(_)) => break,
+                Some(marmot_app::LocalSendStatus::Rejected) => panic!("retained edit was rejected"),
+                _ => sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .expect("retained edit completes after its engine-owned original");
+    assert_eq!(
+        app.timeline_message(
+            "alice",
+            &hex::encode(group.as_slice()),
+            &original.message_id_hex
+        )
+        .unwrap()
+        .unwrap()
+        .plaintext,
+        "retained edit"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());

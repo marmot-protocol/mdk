@@ -616,6 +616,26 @@ export class MarmotAgentControlClient {
     })) as unknown as FinalSentResponse;
   }
 
+  /** Edit an available chat message authored by this account. */
+  async editMessage(
+    accountIdHex: string,
+    groupIdHex: string,
+    targetMessageIdHex: string,
+    text: string,
+  ): Promise<FinalSentResponse> {
+    const response = await this.request({
+      type: "edit_message",
+      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
+      group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
+      target_message_id_hex: normalizeHex(targetMessageIdHex, "target_message_id_hex"),
+      text: String(text ?? ""),
+    });
+    if (response.type !== "final_sent") {
+      throw new AgentControlError("unexpected response to edit_message");
+    }
+    return response as unknown as FinalSentResponse;
+  }
+
   /** Delete (retract) a previously-sent group message; emits a kind-5 deletion. */
   async deleteMessage(
     accountIdHex: string,

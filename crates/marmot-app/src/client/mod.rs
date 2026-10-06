@@ -4125,6 +4125,24 @@ impl AppClient {
                 }
                 intent
             }
+            AppMessageIntent::Edit {
+                ref target_message_id,
+                ..
+            } => {
+                let target = self
+                    .app
+                    .account_storage(&self.state.label)?
+                    .timeline_message(&hex::encode(group_id.as_slice()), target_message_id)?;
+                if !target.is_some_and(|target| {
+                    target.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT
+                        && target.sender == sender
+                        && !target.deleted
+                        && target.invalidation_status.is_none()
+                }) {
+                    return Err(AppError::InvalidEditTarget);
+                }
+                intent
+            }
             AppMessageIntent::Delete { target_message_id } => {
                 let storage = self.app.account_storage(&self.state.label)?;
                 let target =

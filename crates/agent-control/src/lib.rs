@@ -240,8 +240,8 @@ pub enum AgentControlRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         idempotency_key: Option<String>,
     },
-    /// Edit a message authored by the selected local account. The connector
-    /// validates ownership before emitting an authenticated edit event.
+    /// Edit a message authored by the selected local account. Shared runtime
+    /// preflight requires a locally available, non-invalidated chat target.
     EditMessage {
         account_id_hex: String,
         group_id_hex: String,
@@ -1608,22 +1608,6 @@ mod tests {
     }
 
     #[test]
-    fn edit_message_request_round_trips() {
-        let request = AgentControlRequest::EditMessage {
-            account_id_hex: account(),
-            group_id_hex: group(),
-            target_message_id_hex: message(),
-            text: "updated dashboard".to_owned(),
-        };
-        let value = serde_json::to_value(&request).unwrap();
-        assert_eq!(value["type"], "edit_message");
-        assert_eq!(
-            serde_json::from_value::<AgentControlRequest>(value).unwrap(),
-            request
-        );
-    }
-
-    #[test]
     fn send_final_idempotency_key_is_omitted_when_absent_and_present_when_set() {
         // Optional field: omitted from the wire when None; present and
         // round-tripping when
@@ -1949,6 +1933,15 @@ mod tests {
                     idempotency_key: None,
                 },
                 "send_final",
+            ),
+            (
+                AgentControlRequest::EditMessage {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    target_message_id_hex: message(),
+                    text: "updated dashboard".to_owned(),
+                },
+                "edit_message",
             ),
             (
                 AgentControlRequest::DeleteMessage {

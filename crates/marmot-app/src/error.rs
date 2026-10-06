@@ -363,6 +363,8 @@ pub enum AppError {
     AttachmentAccountSignedOut,
     #[error("marmot runtime is shutting down")]
     RuntimeStopping,
+    #[error("edit target must be an available self-authored chat message")]
+    InvalidEditTarget,
     #[error("no matching reaction by this account to retract")]
     ReactionNotFound,
     #[error("transport event stream closed")]
@@ -515,6 +517,7 @@ impl AppError {
             Self::AttachmentModeRequired => "attachment_mode_required",
             Self::AttachmentAccountSignedOut => "attachment_account_signed_out",
             Self::RuntimeStopping => "runtime_stopping",
+            Self::InvalidEditTarget => "invalid_edit_target",
             Self::ReactionNotFound => "reaction_not_found",
             Self::TransportClosed => "transport_closed",
         }

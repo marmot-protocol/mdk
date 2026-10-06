@@ -23,8 +23,6 @@ pub enum ConnectorError {
     DebugControlsDisabled,
     #[error("agent control request is unauthorized")]
     Unauthorized,
-    #[error("message is not an editable target")]
-    InvalidEditTarget,
     #[error("unsafe agent control plane configuration: {0}")]
     UnsafeControlPlaneConfig(&'static str),
     #[error("agent stream error: {0}")]
@@ -86,7 +84,7 @@ impl ConnectorError {
             Self::Io(_) => "io_error",
             Self::DebugControlsDisabled => "debug_controls_disabled",
             Self::Unauthorized => "unauthorized",
-            Self::InvalidEditTarget => "invalid_edit_target",
+            Self::App(AppError::InvalidEditTarget) => "invalid_edit_target",
             Self::UnsafeControlPlaneConfig(_) => "unsafe_control_plane_config",
             Self::Stream(_) => "stream_error",
             Self::InvalidGroupCreate(_) => "invalid_group_create",
@@ -111,7 +109,9 @@ impl ConnectorError {
         match self {
             Self::DebugControlsDisabled => "debug controls are disabled",
             Self::Unauthorized => "agent control request is unauthorized",
-            Self::InvalidEditTarget => "target must be an available self-authored chat message",
+            Self::App(AppError::InvalidEditTarget) => {
+                "target must be an available self-authored chat message"
+            }
             Self::UnsafeControlPlaneConfig(_) => "unsafe agent control plane configuration",
             Self::Hex(_) => "invalid hex value",
             Self::Json(_) | Self::Control(_) => "invalid control request",

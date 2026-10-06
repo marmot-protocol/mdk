@@ -294,7 +294,7 @@ impl AgentConnector {
         })
     }
 
-    /// Require an available, visible, self-authored chat target before publishing an edit event.
+    /// Delegate edit eligibility to the shared runtime preflight.
     pub(crate) async fn edit_message_response(
         &self,
         account_id_hex: &str,
@@ -306,18 +306,6 @@ impl AgentConnector {
         let group_id_hex = normalize_hex(group_id_hex)?;
         let group_id = GroupId::new(hex::decode(&group_id_hex)?);
         let target_message_id = normalize_hex(target_message_id_hex)?;
-        // Runtime projection ignores foreign-author edits, but the runtime send
-        // method can publish them. Reject those requests before any publication.
-        match self.timeline_message_response(account_id_hex, &group_id_hex, &target_message_id)? {
-            AgentControlResponse::TimelineMessage {
-                message: Some(message),
-                ..
-            } if message.sender.account_id_hex == account.account_id_hex
-                && message.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT
-                && message.availability
-                    == agent_control::AgentControlTimelineMessageAvailability::Available => {}
-            _ => return Err(ConnectorError::InvalidEditTarget),
-        }
         let summary = self
             .runtime
             .edit_message(&account.label, &group_id, &target_message_id, text)

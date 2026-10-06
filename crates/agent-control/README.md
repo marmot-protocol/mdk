@@ -69,13 +69,19 @@ of the account's active reactions on the target in one durable delete event.
 
 `edit_message` lets a control client update a message authored by the selected
 local account. Supply `account_id_hex`, `group_id_hex`, `target_message_id_hex`,
-and replacement `text`. Before publishing, `wn-agent` checks that the target is
-visible, available, self-authored, and a kind-9 chat message
-(`MARMOT_APP_EVENT_KIND_CHAT`). A foreign, deleted, invalidated, missing, or
-non-chat target is rejected before publication with the non-retryable
-`invalid_edit_target` error code; `unauthorized` remains reserved for peer
-authorization failures. A successful request returns `final_sent` with the edit event id. This
-lets an agent update a pinned status message without adding another chat row.
+and replacement `text`. The shared app-client send preflight checks the locally
+projected target for chat kind, authorship, deletion and invalidation. A target
+that fails this check produces the non-retryable `invalid_edit_target` error;
+`unauthorized` remains reserved for peer authorization failures. This check also
+covers the CLI, mobile runtime and retained local submissions. It is a preflight,
+not an atomic guarantee against deletion/invalidation arriving during a send;
+recipient projection still decides whether an edit applies.
+
+A successful request returns `final_sent` with the edit event id. The Hermes
+`MarmotAgentControlClient.edit_message` and OpenClaw `MarmotAgentControlClient.editMessage`
+methods expose this operation to control-client integrations, for example a
+client that updates its own pinned status row. The existing message tools do not
+automatically edit status updates.
 
 An edit has no idempotency key. If the response is lost after publication, read
 the materialized target with `timeline_message_get` before deciding whether to
