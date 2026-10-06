@@ -4264,7 +4264,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         adapter._inbound_spool_wakeup.set()
         key = adapter._debounce_key(first)
         try:
-            await asyncio.wait_for(retry_checked.wait(), timeout=5)
+            await retry_checked.wait()
             # The real retry pass cannot claim either debounce-owned row.
             self.assertEqual(await adapter._inbound_spool_call(adapter._inbound_spool.due), [])
             self.assertEqual(adapter.events, [])
@@ -4272,22 +4272,25 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
             timer.cancel()
             await asyncio.gather(timer, return_exceptions=True)
             # Exercise the real coalescing/admission path once both sources
-            # are in the same live batch, independently of filesystem latency.
+            # are in the same live batch. The test-process watchdog bounds a
+            # stuck test; individual durable writes are not latency assertions.
             await adapter._flush_debounced(key)
-            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=5)
+            await adapter._inbound_queue.join()
+            self.assertEqual([message.text for message in adapter.events], ["first\nsecond"])
+            self.assertEqual(
+                "unresolved",
+                adapter._inbound_spool.get(first["message_id_hex"]).state,
+            )
+            self.assertEqual(
+                "unresolved",
+                adapter._inbound_spool.get(second["message_id_hex"]).state,
+            )
         finally:
             retry.cancel()
             await asyncio.gather(retry, return_exceptions=True)
-
-        self.assertEqual([message.text for message in adapter.events], ["first\nsecond"])
-        self.assertEqual(
-            "unresolved",
-            adapter._inbound_spool.get(first["message_id_hex"]).state,
-        )
-        self.assertEqual(
-            "unresolved",
-            adapter._inbound_spool.get(second["message_id_hex"]).state,
-        )
+            # Disconnect cancels and awaits debounce/queue producers before
+            # closing storage, including when an assertion/wait is cancelled.
+            await adapter.disconnect()
 
     async def test_pre_handoff_poison_dead_letters_and_unblocks_group_fifo(self):
         first = {
@@ -8740,21 +8743,21 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         retry = asyncio.create_task(adapter._run_inbound_spool_retry_loop())
         try:
             adapter._inbound_spool_wakeup.set()
-            await asyncio.wait_for(failed_once.wait(), timeout=5)
+            await failed_once.wait()
             self.assertFalse(retry.done())
             adapter._inbound_spool_wakeup.set()
-            # This is a retry-resilience check, not a disk-latency benchmark.
-            # Wait for the actual handoff and disposition write before closing
-            # the spool, rather than racing them with a timed polling loop.
-            await asyncio.wait_for(delivered.wait(), timeout=5)
-            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=5)
+            # Exercise real storage without imposing a per-write latency SLA;
+            # the bounded test-process watchdog owns hangs, not a 5 s IO race.
+            await delivered.wait()
+            await adapter._inbound_queue.join()
             self.assertEqual([item.text for item in adapter.events], ["durable"])
             self.assertEqual({}, adapter._debounce_release_pending)
             self.assertFalse(retry.done())
+            self.assertEqual("unresolved", adapter._inbound_spool.get(message_id).state)
         finally:
             retry.cancel()
             await asyncio.gather(retry, return_exceptions=True)
-            await adapter._inbound_spool_call(adapter._inbound_spool.close)
+            await adapter.disconnect()
 
     async def test_debounce_release_reason_is_latest_reason_wins(self):
         adapter = self.make_adapter(extra={"group_activation": "always"})
