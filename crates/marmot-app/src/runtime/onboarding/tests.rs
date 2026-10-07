@@ -1434,6 +1434,79 @@ async fn cancel_required_relay_repair_remains_pending() {
 }
 
 #[tokio::test]
+async fn unsigned_cleanup_is_cleared_on_signed_out_reimport() {
+    for restart in [false, true] {
+        let (directory, first, network, keys, id) = fixture().await;
+        let source = signed(
+            &keys,
+            10002,
+            vec![
+                vec!["r".into(), "wss://custom.example".into()],
+                vec!["r".into(), retired_relay_fixture_endpoint()],
+            ],
+            "opaque content",
+            unix_now_seconds() - 1,
+        );
+        *network.events.lock().unwrap() = vec![source.clone()];
+        let manager = first.accounts();
+        let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        for step in &mut checkpoint.snapshot.steps {
+            step.status = OnboardingStatus::Passed;
+        }
+        checkpoint.set(
+            OnboardingStep::Relays,
+            OnboardingStatus::Passed,
+            vec![finding(OnboardingIssue::RetiredRelay)],
+        );
+        checkpoint.records[OnboardingStep::Relays.index()] = Some(source);
+        manager.save_onboarding(&mut checkpoint).unwrap();
+        let preview = manager
+            .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
+            .await
+            .unwrap();
+        assert!(preview.ready);
+        assert!(preview.proposal.is_some());
+        manager
+            .app
+            .account_home()
+            .set_account_signed_out(&id, true)
+            .unwrap();
+        let active = if restart {
+            first.shutdown_and_close().await.unwrap();
+            runtime(directory.path(), network.clone())
+        } else {
+            first
+        };
+        let reset = active
+            .accounts()
+            .begin_onboarding(
+                Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
+                options(),
+            )
+            .await
+            .unwrap();
+        assert!(reset.proposal.is_none());
+        assert!(!reset.ready);
+        assert!(reset.revision > preview.revision);
+        assert!(
+            reset
+                .steps
+                .iter()
+                .all(|step| step.status == OnboardingStatus::Pending)
+        );
+        let checked = active.accounts().run_onboarding(&id).await.unwrap();
+        assert!(checked.proposal.is_none());
+        assert!(
+            checked.steps[OnboardingStep::Profile.index()]
+                .checked_at
+                .is_some()
+        );
+        assert!(network.attempts.lock().unwrap().is_empty());
+        active.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn cancel_removal_only_cleanup_after_restart_preserves_readiness() {
     cancel_removal_only_cleanup(true).await;
 }

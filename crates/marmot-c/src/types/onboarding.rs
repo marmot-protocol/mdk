@@ -25,9 +25,9 @@ c_enum! { MarmotOnboardingRelayTagRole from OnboardingRelayTagRoleFfi { Other, U
 c_enum! { MarmotOnboardingRelayTagDisposition from OnboardingRelayTagDispositionFfi { Retained, Removed, Added } }
 c_enum! { MarmotOnboardingRelayCapability from OnboardingRelayCapabilityFfi { None, Read, Write, ReadAndWrite, Inbox } }
 c_enum! { MarmotOnboardingRelayRepairMode from OnboardingRelayRepairModeFfi { ManualReview, RemovalOnly, Additive, RemovalAndAdditive } }
-c_mirror! { MarmotOnboardingRelayTag from OnboardingRelayTagFfi { str_vec fields/fields_len, opt_str endpoint, copy role: MarmotOnboardingRelayTagRole, } }
-c_mirror! { MarmotOnboardingRelayTagChange from OnboardingRelayTagChangeFfi { copy disposition: MarmotOnboardingRelayTagDisposition, opt_copy has_before_index/before_index: u64, opt_copy has_after_index/after_index: u64, str_vec fields/fields_len, opt_str endpoint, copy role: MarmotOnboardingRelayTagRole, copy restores: MarmotOnboardingRelayCapability, } }
-c_mirror! { MarmotOnboardingRelayRepair from OnboardingRelayRepairFfi { copy mode: MarmotOnboardingRelayRepairMode, opt_str original_event_id, str original_content, str proposed_content, vec before_tags/before_tags_len: MarmotOnboardingRelayTag, vec after_tags/after_tags_len: MarmotOnboardingRelayTag, vec changes/changes_len: MarmotOnboardingRelayTagChange, } }
+c_mirror! { MarmotOnboardingRelayTag from OnboardingRelayTagFfi { json_str_vec fields/fields_len, json_opt_str endpoint, copy role: MarmotOnboardingRelayTagRole, } }
+c_mirror! { MarmotOnboardingRelayTagChange from OnboardingRelayTagChangeFfi { copy disposition: MarmotOnboardingRelayTagDisposition, opt_copy has_before_index/before_index: u64, opt_copy has_after_index/after_index: u64, json_str_vec fields/fields_len, json_opt_str endpoint, copy role: MarmotOnboardingRelayTagRole, copy restores: MarmotOnboardingRelayCapability, } }
+c_mirror! { MarmotOnboardingRelayRepair from OnboardingRelayRepairFfi { copy mode: MarmotOnboardingRelayRepairMode, opt_str original_event_id, json_str original_content, json_str proposed_content, vec before_tags/before_tags_len: MarmotOnboardingRelayTag, vec after_tags/after_tags_len: MarmotOnboardingRelayTag, vec changes/changes_len: MarmotOnboardingRelayTagChange, } }
 c_mirror! { MarmotOnboardingRepairProposal from OnboardingRepairProposalFfi { copy step: MarmotOnboardingStep, copy revision: u64, opt_str previous_event_id, str_vec read_relays/read_relays_len, str_vec write_relays/write_relays_len, opt_rec profile: MarmotUserProfileMetadata, opt_rec follows: MarmotStringList, opt_rec relay_repair: MarmotOnboardingRelayRepair, } }
 c_mirror! { MarmotOnboardingSnapshot from OnboardingSnapshotFfi, free marmot_onboarding_snapshot_free { str account_id_hex, opt_str recovery_epoch, copy revision: u64, copy ready: bool, vec steps/steps_len: MarmotOnboardingStepState, opt_rec proposal: MarmotOnboardingRepairProposal, opt_rec single_device_notice: MarmotOnboardingSingleDeviceNotice, copy cancellation_pending: bool, } }
 
@@ -91,15 +91,25 @@ mod tests {
                 relay_repair: Some(OnboardingRelayRepairFfi {
                     mode: OnboardingRelayRepairModeFfi::RemovalAndAdditive,
                     original_event_id: Some("event-id".into()),
-                    original_content: "opaque".into(),
-                    proposed_content: "opaque".into(),
+                    original_content: "a\0b\"\\🙂".into(),
+                    proposed_content: "a\0b\"\\🙂".into(),
                     before_tags: vec![OnboardingRelayTagFfi {
-                        fields: vec!["r".into(), "wss://retired.example".into()],
+                        fields: vec![
+                            "r".into(),
+                            "wss://retired.example".into(),
+                            "a\0b\"\\🙂".into(),
+                            "".into(),
+                        ],
                         endpoint: Some("wss://retired.example".into()),
                         role: OnboardingRelayTagRoleFfi::Unmarked,
                     }],
                     after_tags: vec![OnboardingRelayTagFfi {
-                        fields: vec!["r".into(), "wss://safe.example".into()],
+                        fields: vec![
+                            "r".into(),
+                            "wss://safe.example".into(),
+                            "a\0b\"\\🙂".into(),
+                            "".into(),
+                        ],
                         endpoint: Some("wss://safe.example".into()),
                         role: OnboardingRelayTagRoleFfi::Unmarked,
                     }],
@@ -107,7 +117,12 @@ mod tests {
                         disposition: OnboardingRelayTagDispositionFfi::Added,
                         before_index: None,
                         after_index: Some(0),
-                        fields: vec!["r".into(), "wss://safe.example".into()],
+                        fields: vec![
+                            "r".into(),
+                            "wss://safe.example".into(),
+                            "a\0b\"\\🙂".into(),
+                            "".into(),
+                        ],
                         endpoint: Some("wss://safe.example".into()),
                         role: OnboardingRelayTagRoleFfi::Unmarked,
                         restores: OnboardingRelayCapabilityFfi::ReadAndWrite,
@@ -123,6 +138,23 @@ mod tests {
             repair.mode,
             MarmotOnboardingRelayRepairMode::RemovalAndAdditive
         );
+        let decode = |value| {
+            let encoded = unsafe { std::ffi::CStr::from_ptr(value) }.to_str().unwrap();
+            serde_json::from_str::<String>(encoded).unwrap()
+        };
+        assert_eq!(decode(repair.original_content), "a\0b\"\\🙂");
+        assert_eq!(decode(repair.proposed_content), "a\0b\"\\🙂");
+        for tag in [unsafe { &*repair.before_tags }, unsafe {
+            &*repair.after_tags
+        }] {
+            assert_eq!(decode(unsafe { *tag.fields.add(2) }), "a\0b\"\\🙂");
+            assert_eq!(decode(unsafe { *tag.fields.add(3) }), "");
+            assert!(decode(tag.endpoint).starts_with("wss://"));
+        }
+        let change = unsafe { &*repair.changes };
+        assert_eq!(decode(unsafe { *change.fields.add(2) }), "a\0b\"\\🙂");
+        assert_eq!(decode(unsafe { *change.fields.add(3) }), "");
+        assert_eq!(decode(change.endpoint), "wss://safe.example");
         assert_eq!(repair.before_tags_len, 1);
         assert_eq!(repair.after_tags_len, 1);
         assert_eq!(repair.changes_len, 1);

@@ -1237,6 +1237,14 @@ impl AccountManager {
                 return Err(onboarding_error());
             }
             if account.signed_out && existing.snapshot.ready {
+                // A completed checkpoint can carry an optional unsigned cleanup.
+                // Fresh checks must not stop at its now-stale preview revision.
+                // Never discard an approved or signed publication on this path.
+                if existing.approved || existing.signed_repair.is_some() {
+                    return Err(onboarding_error());
+                }
+                existing.snapshot.proposal = None;
+                existing.append_relays = false;
                 existing.single_device_acknowledged = false;
                 existing.snapshot.single_device_notice = None;
                 for index in 0..STEP_COUNT {

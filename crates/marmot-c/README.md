@@ -153,6 +153,16 @@ publish it or treat it as a full reset. Free the snapshot with
 `marmot_onboarding_snapshot_free` after presenting the exact diff. Approval
 remains a separate revision- and recovery-epoch-bound call.
 
+C relay-repair previews encode `original_content`, `proposed_content`, every
+`fields` element in tags and changes, and each non-NULL `endpoint` as a JSON
+string literal. Decode exactly once with a parser that preserves embedded zero
+bytes and decoded UTF-8 lengths before displaying or prefilling an editor.
+For example, `"a\u0000b"` represents three bytes: `61 00 62`; `""` is an empty
+string, distinct from a NULL optional endpoint. Do not use `strlen` on decoded
+content or discard control bytes. The encoded C strings contain no embedded
+NULs; their snapshot ownership and deep-free rules are unchanged. Swift/Kotlin
+records retain ordinary strings and do not use this C-only encoding.
+
 ## Runtime construction
 
 `marmot_client_new_with_configuration` takes a `MarmotClientOptions` struct combining relay policy, cursor
