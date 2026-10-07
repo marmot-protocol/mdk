@@ -103,6 +103,65 @@ async fn incomplete_lookup_cannot_claim_obsolete_or_missing_but_can_use_current_
 }
 
 #[tokio::test]
+async fn incomplete_multi_author_legacy_batch_remains_retryable_after_fallback() {
+    let (_dir, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    for account in &accounts {
+        let package = fresh_key_package_for_account(&app, account, true).await;
+        fetcher
+            .events
+            .lock()
+            .unwrap()
+            .push(member_resolution_key_package_event(account, package));
+    }
+    let targets = accounts
+        .iter()
+        .map(|account| account.account_id_hex.as_str())
+        .collect::<Vec<_>>();
+    for incomplete in [true, false] {
+        *fetcher.incomplete_endpoint.lock().unwrap() =
+            incomplete.then(|| "wss://shared.example".into());
+        for prewarm in [false, true] {
+            fetcher.requests.lock().unwrap().clear();
+            let error = if prewarm {
+                app.prewarm_group_member_key_packages(&targets)
+                    .await
+                    .unwrap_err()
+            } else {
+                app.resolve_member_key_packages(&targets).await.unwrap_err()
+            };
+            if incomplete {
+                assert!(matches!(
+                    error,
+                    AppError::MemberDiscoveryIncomplete(ref id) if id == targets[0]
+                ));
+            } else {
+                assert!(matches!(
+                    error,
+                    AppError::ObsoleteKeyPackage(ref id) if id == targets[0]
+                ));
+            }
+            let requests = fetcher.requests.lock().unwrap();
+            let package_queries = requests
+                .iter()
+                .flat_map(|request| &request.queries)
+                .filter(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)
+                .collect::<Vec<_>>();
+            assert!(package_queries.iter().any(|query| query.authors.len() == 2));
+            assert!(
+                package_queries
+                    .iter()
+                    .any(|query| { query.authors.len() == 1 && query.authors[0] == targets[0] })
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn member_diagnosis_preserves_current_selection_and_newest_slot_validation() {
     let (_dir, app, accounts, _) = member_resolution_fixture(2, false).await;
     let account = &accounts[0];
