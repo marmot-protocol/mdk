@@ -19,6 +19,8 @@ pub enum ConnectorError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error("control socket path exceeds platform byte limit; shorten --home or --socket")]
+    SocketPathTooLong,
     #[error("debug controls are disabled")]
     DebugControlsDisabled,
     #[error("agent control request is unauthorized")]
@@ -82,6 +84,7 @@ impl ConnectorError {
             Self::Hex(_) => "invalid_hex",
             Self::Json(_) => "json_error",
             Self::Io(_) => "io_error",
+            Self::SocketPathTooLong => "socket_path_too_long",
             Self::DebugControlsDisabled => "debug_controls_disabled",
             Self::Unauthorized => "unauthorized",
             Self::UnsafeControlPlaneConfig(_) => "unsafe_control_plane_config",
@@ -107,6 +110,9 @@ impl ConnectorError {
     pub fn client_message(&self) -> &'static str {
         match self {
             Self::DebugControlsDisabled => "debug controls are disabled",
+            Self::SocketPathTooLong => {
+                "control socket path exceeds platform byte limit; shorten --home or --socket"
+            }
             Self::Unauthorized => "agent control request is unauthorized",
             Self::UnsafeControlPlaneConfig(_) => "unsafe agent control plane configuration",
             Self::Hex(_) => "invalid hex value",

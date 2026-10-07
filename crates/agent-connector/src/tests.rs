@@ -1224,6 +1224,75 @@ async fn connector_socket_bind_preserves_existing_non_socket_path() {
 }
 
 #[tokio::test]
+async fn connector_socket_bind_reports_overlong_staging_path_before_creating_parent() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let probe = dir.path().join("x").join("wn-agent.sock");
+    let limit = (1..=256)
+        .take_while(|bytes| {
+            std::os::unix::net::SocketAddr::from_pathname("x".repeat(*bytes)).is_ok()
+        })
+        .last()
+        .unwrap();
+    let parent_len = 1 + limit - probe.as_os_str().as_bytes().len();
+    let socket = dir
+        .path()
+        .join("x".repeat(parent_len))
+        .join("wn-agent.sock");
+    assert_eq!(socket.as_os_str().as_bytes().len(), limit);
+    assert!(fs_private::validate_private_unix_socket_path(&socket).is_err());
+    let error = bind_connector_socket(&socket).unwrap_err();
+    assert_eq!(error.code(), "socket_path_too_long");
+    assert!(!error.retryable());
+    assert!(
+        error
+            .client_message()
+            .contains("shorten --home or --socket")
+    );
+    assert!(!error.to_string().contains(dir.path().to_str().unwrap()));
+    assert!(!socket.parent().unwrap().exists());
+    assert!(!fs_private::socket_staging_dir(&socket).exists());
+}
+
+#[tokio::test]
+async fn management_socket_can_exceed_the_budget_while_regular_control_still_fits() {
+    use std::os::unix::ffi::OsStrExt;
+
+    // macOS spells /tmp through a symlink to world-writable /private/tmp.
+    // Use the real short base so the control bind tests socket length rather
+    // than the production rejection of an untrusted directory alias.
+    let short_temp_base = std::fs::canonicalize("/tmp").unwrap();
+    let dir = tempfile::tempdir_in(short_temp_base).unwrap();
+    let probe = dir
+        .path()
+        .join("x")
+        .join("dev")
+        .join("usage-diagnostics.sock");
+    let limit = (1..=256)
+        .take_while(|bytes| {
+            std::os::unix::net::SocketAddr::from_pathname("x".repeat(*bytes)).is_ok()
+        })
+        .last()
+        .unwrap();
+    let staged_len = fs_private::socket_staging_dir(&probe)
+        .join("usage-diagnostics.sock")
+        .as_os_str()
+        .as_bytes()
+        .len();
+    let home = dir.path().join("x".repeat(2 + limit - staged_len));
+    let control = home.join("dev").join("wn-agent.sock");
+    let management = home.join("dev").join("usage-diagnostics.sock");
+    assert!(fs_private::validate_private_unix_socket_path(&control).is_ok());
+    assert!(management.as_os_str().as_bytes().len() <= limit);
+    let error = crate::usage_diagnostics::bind(&home).unwrap_err();
+    assert_eq!(error.code(), "socket_path_too_long");
+    assert!(!home.exists());
+    let listener = bind_connector_socket(&control).unwrap();
+    assert!(listener.local_addr().is_ok());
+}
+
+#[tokio::test]
 async fn connector_socket_bind_applies_configured_group_modes() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("dev").join("wn-agent.sock");
