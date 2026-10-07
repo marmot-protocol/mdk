@@ -478,6 +478,10 @@ mod tests;
 /// A complete existing row with MDK-selected display; callers need no peer lookup.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PresentedChatRow {
+    /// Opaque, account-store/group-scoped local draft version. Present even
+    /// after draft deletion; compare through MessageDraftRevision only.
+    #[serde(default)]
+    pub draft_version: Option<crate::ChatListDraftVersion>,
     #[serde(default)]
     pub preview: SelectedChatPreview,
     #[serde(default)]
@@ -556,6 +560,18 @@ impl SqliteAccountStorage {
             .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()
             .storage()?;
         drop(statement);
+        let presentation_version = tx
+            .query_row(
+                "SELECT store_epoch, revision FROM chat_presentation_meta WHERE id = 1",
+                [],
+                |r| {
+                    Ok(ChatPresentationVersion {
+                        store_epoch: r.get(0)?,
+                        revision: nonnegative(r, 1)?,
+                    })
+                },
+            )
+            .storage()?;
         let mut presented = Vec::with_capacity(rows.len());
         for row in rows {
             let Some((Some(bytes), dirty)) = selections.remove(&row.group_id_hex) else {
@@ -570,6 +586,11 @@ impl SqliteAccountStorage {
                 crate::codec::unix_now_seconds(),
             )?;
             presented.push(PresentedChatRow {
+                draft_version: crate::message_drafts::revisioned::chat_list_version_tx(
+                    &tx,
+                    &row.group_id_hex,
+                    &presentation_version.store_epoch,
+                )?,
                 preview: row_contract::selected_preview_tx(&tx, &row)?,
                 actions: ChatListRowActions::for_row(&row),
                 row,
@@ -577,18 +598,6 @@ impl SqliteAccountStorage {
                 avatar_asset,
             });
         }
-        let presentation_version = tx
-            .query_row(
-                "SELECT store_epoch, revision FROM chat_presentation_meta WHERE id = 1",
-                [],
-                |r| {
-                    Ok(ChatPresentationVersion {
-                        store_epoch: r.get(0)?,
-                        revision: nonnegative(r, 1)?,
-                    })
-                },
-            )
-            .storage()?;
         tx.commit().storage()?;
         Ok(Some(PresentedChatListSnapshot {
             rows: presented,

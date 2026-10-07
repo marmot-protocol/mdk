@@ -7811,6 +7811,10 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
         "seeded local inbox list must contain the untouched entry: {:?}",
         seeded.inbox
     );
+    // Give both seeded replaceable kinds an older timestamp than their first
+    // edit. Same-second event-id ordering could otherwise keep the seed on
+    // the relay, just as the removal below needs a newer second than the add.
+    sleep(Duration::from_millis(1_100)).await;
 
     let connector = AgentConnector::open(test_config(
         dir.path(),

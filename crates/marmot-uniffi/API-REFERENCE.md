@@ -3366,6 +3366,21 @@ Observe block-list snapshots.
 </details>
 
 <details>
+<summary>conversions/conversation_window.rs</summary>
+
+### `MessageDraftRevisionFfi::includes_chat_list_version`
+
+```rust
+pub fn includes_chat_list_version(&self, version: Arc<ChatListDraftVersionFfi>) -> bool
+```
+
+Compare a chat-list row’s opaque `draft_version` with this captured composer revision. True means the same account store/group and a version no newer than this revision; false includes foreign store/group metadata and newer identical edits. This is presentation correlation, not mutation authorization. Keep both values device-local and use revision-checked cleanup. See [pending-send draft presentation](CHAT-LIST-ROWS.md#pending-send-draft-presentation-unreleased).
+
+[Source](src/conversions/conversation_window.rs#L340)
+
+</details>
+
+<details>
 <summary>conversions/attachment_history.rs</summary>
 
 ### `AttachmentHistoryVersion::change_since`

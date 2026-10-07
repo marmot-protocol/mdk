@@ -210,8 +210,8 @@ pub use directory::{
     UserSearchUpdate, sort_user_search_results,
 };
 pub use drafts::{
-    MessageDraft, MessageDraftAttachment, MessageDraftAttachmentSummary, MessageDraftInvalidation,
-    MessageDraftRevision, MessageDraftSummary, SelectedMessageDraft,
+    ChatListDraftVersion, MessageDraft, MessageDraftAttachment, MessageDraftAttachmentSummary,
+    MessageDraftInvalidation, MessageDraftRevision, MessageDraftSummary, SelectedMessageDraft,
     SelectedMessageDraftAttachment, SelectedMessageDraftContent,
 };
 pub use error::{AccountCatchUpFailure, AppError, FullHistoryRepairIncompleteReason};
