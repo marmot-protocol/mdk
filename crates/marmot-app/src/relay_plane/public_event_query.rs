@@ -201,14 +201,21 @@ pub(super) async fn query_public_events_on(
         acquire(&client, urls, filters, budget, deadline, &mut outcome),
     )
     .await;
-    // The phase is over: drop every descriptor now, even though SDK cleanup
-    // may still run its own longer close timeout.
+    // Close descriptors and refuse reconnects before bounded SDK cleanup.
+    // Both acquisition and cleanup share the request's absolute deadline.
     sockets.close_all();
-    client.shutdown().await;
+    shutdown_before_deadline(deadline, client.shutdown()).await;
     // Actual raw traffic, not the SDK's verified and deduplicated result.
     outcome.received_items = phase.items();
     outcome.received_bytes = phase.bytes();
     outcome
+}
+
+async fn shutdown_before_deadline(
+    deadline: Instant,
+    shutdown: impl std::future::Future<Output = ()>,
+) {
+    let _ = timeout_at(deadline, shutdown).await;
 }
 
 async fn acquire(
@@ -454,6 +461,31 @@ mod tests {
         )
         .await;
         assert_eq!(outcome, PublicEventQueryOutcome::default());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn public_event_preview_regression_sdk_cleanup_obeys_deadline() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct CleanupWitness(Arc<AtomicBool>);
+        impl Drop for CleanupWitness {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let witness = CleanupWitness(dropped.clone());
+        let started = Instant::now();
+        shutdown_before_deadline(started + Duration::from_secs(1), async move {
+            let _witness = witness;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "expired cleanup is cancelled"
+        );
     }
 
     #[test]

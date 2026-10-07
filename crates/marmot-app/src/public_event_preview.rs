@@ -1460,15 +1460,15 @@ impl PublicEventCache {
             malformed,
             mac,
         } = stored;
+        if !provenance.verify(&record, &mac)? {
+            return Err(corrupt_evidence());
+        }
         if malformed || record.cache_key != cache_key {
             return Err(corrupt_evidence());
         }
         // A newer build's evidence is retained untouched; this build cannot read it.
         if record.projection_version != i64::from(PUBLIC_EVENT_PROJECTION_VERSION) {
             return Err(unsupported_projection());
-        }
-        if !provenance.verify(&record, &mac)? {
-            return Err(corrupt_evidence());
         }
         if record.deletion_json.len() > MAX_EVENT_BYTES {
             return Err(corrupt_evidence());

@@ -78,6 +78,8 @@ impl MarmotAppRuntime {
     /// account was removed, wiped, reimported or closed meanwhile, the leader
     /// and every coalesced waiter return a retryable `Busy` row without
     /// opening any storage for the replaced incarnation.
+    /// A coalesced wait that expires also returns `Busy`: cached state is
+    /// not a completed refresh while its leader still owns persistence.
     pub async fn resolve_public_event_preview(
         &self,
         account_ref: &str,
@@ -118,7 +120,15 @@ impl MarmotAppRuntime {
         let mut lease = match cache.begin_refresh(&key.storage_key()) {
             RefreshAdmission::Lead(lease) => lease,
             RefreshAdmission::Coalesced(mut done) => {
-                let _ = timeout(COALESCED_REFRESH_WAIT, done.changed()).await;
+                // Expiry is not completion: the leader may still own the
+                // persistence transaction. Report retryable Busy even when
+                // older cached content exists, rather than a finished refresh.
+                if timeout(COALESCED_REFRESH_WAIT, done.changed())
+                    .await
+                    .is_err()
+                {
+                    return stale_incarnation(&reference);
+                }
                 return self
                     .fenced_public_event_read(account_ref, account, cache, reference)
                     .await;
@@ -524,6 +534,64 @@ mod tests {
                 .cached_public_event_previews("alice", &[note.id.to_hex()])
                 .is_err()
         );
+        runtime.shutdown_and_close().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn public_event_preview_regression_coalesced_timeout_is_busy_until_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let cache = app.public_event_cache_for_account(&alice).unwrap();
+        let runtime = app.runtime();
+        for retained in [false, true] {
+            let note = signed(
+                &Keys::generate(),
+                1,
+                Timestamp::now().as_secs() - 20,
+                "note",
+                vec![],
+            );
+            let reference_text = note.id.to_hex();
+            let reference = PublicEventReference::parse(&reference_text).unwrap();
+            if retained {
+                runtime
+                    .cache_public_event_preview("alice", &reference_text, vec![note.as_json()])
+                    .await
+                    .unwrap();
+            }
+            let key = reference.cache_key().unwrap().storage_key();
+            let RefreshAdmission::Lead(mut lease) = cache.begin_refresh(&key) else {
+                panic!("a fresh key must admit the leader");
+            };
+            lease.mark_attempted();
+            let read = runtime
+                .resolve_public_event_preview("alice", &reference_text)
+                .await
+                .unwrap();
+            assert_eq!(
+                state(&read),
+                "busy",
+                "timeout does not certify cached state"
+            );
+            assert!(matches!(
+                cache.begin_refresh(&key),
+                RefreshAdmission::Coalesced(_)
+            ));
+            // Model the leader committing before releasing its shared lease.
+            runtime
+                .cache_public_event_preview("alice", &reference_text, vec![note.as_json()])
+                .await
+                .unwrap();
+            drop(lease);
+            let completed = runtime
+                .resolve_public_event_preview("alice", &reference_text)
+                .await
+                .unwrap();
+            assert_eq!(present_id(&completed), note.id.to_hex());
+        }
         runtime.shutdown_and_close().await.unwrap();
     }
 

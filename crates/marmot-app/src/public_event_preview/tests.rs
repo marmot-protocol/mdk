@@ -982,6 +982,42 @@ fn a_cohort_over_its_tombstone_cap_is_evicted_whole() {
 }
 
 #[test]
+fn public_event_preview_regression_tombstone_authentication_precedes_projection() {
+    let provenance =
+        ProvenanceKey::derive(&SqlCipherKey::new("projection-order-test").unwrap()).unwrap();
+    let record = || TombstoneRecord {
+        cache_key: "event:unsigned".into(),
+        cohort_key: "event:unsigned".into(),
+        deletion_json: String::new(),
+        received_at: 0,
+        projection_version: i64::from(PUBLIC_EVENT_PROJECTION_VERSION) + 1,
+        proof: None,
+        target_kind: 1,
+        rank_created_at: 0,
+        rank_event_id: "unsigned".into(),
+        fences_selection: false,
+    };
+    let unsigned = StoredTombstone {
+        record: record(),
+        malformed: false,
+        mac: vec![0; PROVENANCE_MAC_BYTES],
+    };
+    let error = PublicEventCache::check_tombstone(&provenance, "event:unsigned", unsigned)
+        .err()
+        .unwrap();
+    assert_eq!(error.to_string(), corrupt_evidence().to_string());
+    let authenticated = StoredTombstone {
+        record: record(),
+        malformed: false,
+        mac: provenance.tag(&record()).unwrap(),
+    };
+    let error = PublicEventCache::check_tombstone(&provenance, "event:unsigned", authenticated)
+        .err()
+        .unwrap();
+    assert_eq!(error.to_string(), unsupported_projection().to_string());
+}
+
+#[test]
 fn tombstone_provenance_is_mac_bound_and_tampering_fails_closed() {
     let now = 5000;
     let other_author = Keys::generate().public_key().to_hex();
