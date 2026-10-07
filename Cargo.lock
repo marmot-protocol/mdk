@@ -2607,7 +2607,7 @@ dependencies = [
 [[package]]
 name = "hpke-rs-libcrux"
 version = "0.7.0"
-source = "git+https://github.com/dannym-arx/libcrux.git?rev=bef9ac602b00b1796dbad89faa538d1abd1f58a4#bef9ac602b00b1796dbad89faa538d1abd1f58a4"
+
 dependencies = [
  "hpke-rs-crypto",
  "libcrux-aead",
