@@ -51,6 +51,10 @@
   retain their source identity/time in a session queue; later delivery, drain and
   convergence observations cannot overtake them. Successful-prefix subscriber
   updates survive a later write failure, including an older blocked batch.
+  Retries resume completed native and activity-row phases instead of repeating
+  old termination cleanup over newer sends. Repaired updates precede newer
+  deltas and are returned once by quiet direct-client sync and event reads;
+  cancelled drain checkpoints retain both progress and pending notifications.
   Push gossip never enters partial host-message summaries. Route rebuilds and
   failed hydration token sweeps use bounded worker retries; one group's failed
   sweep does not block other groups or route refresh. These retry queues are not durable.
@@ -64,6 +68,9 @@
   membership cleanup before consuming its retry handle, preserving author
   activity after transient storage failures. Inbound replay failure after confirmed
   publication retains a session retry without changing the publish result.
+  Replay-only work remains visible to the convergence scheduler after its
+  one-shot notification is consumed, respecting terminal, unrecoverable and
+  pending-publication gates and the worker's existing error backoff.
   Eviction realization commits its
   marker, roster and queued-work cleanup together before emitting events.
   Forgetting a group removes its queued projection work without blocking other

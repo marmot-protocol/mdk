@@ -2276,15 +2276,87 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
             1
         );
         assert!(alice.drain_pending_convergence_groups().contains(&group_id));
+        assert_eq!(
+            alice
+                .prepare_convergence_cutoff_delay_ms(&group_id)
+                .unwrap(),
+            Some(0),
+            "worker readiness must retain replay after the notification is drained"
+        );
+        assert!(
+            !alice.has_pending_convergence_inputs(&group_id).unwrap(),
+            "a raw application retry must not gate outbound work"
+        );
+        let runnable = storage.get_group(&group_id).unwrap();
+        for terminal in [false, true] {
+            let mut blocked = runnable.clone();
+            blocked.removed = terminal;
+            blocked.unrecoverable = !terminal;
+            storage.put_group(&blocked).unwrap();
+            assert_eq!(
+                alice
+                    .prepare_convergence_cutoff_delay_ms(&group_id)
+                    .unwrap(),
+                None,
+                "terminal and unrecoverable copies must not arm replay"
+            );
+        }
+        storage.put_group(&runnable).unwrap();
+        assert_eq!(
+            alice
+                .prepare_convergence_cutoff_delay_ms(&group_id)
+                .unwrap(),
+            Some(0),
+            "a temporary gate must not consume the retained replay marker"
+        );
         assert_ne!(
             storage.get_message(&msg.id).unwrap().state,
             MessageState::Processed
         );
+        let SendResult::GroupEvolution {
+            pending: next_pending,
+            ..
+        } = alice
+            .send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some("another publication".into()),
+                description: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("application-only replay must allow a new commit");
+        };
+        assert_eq!(
+            alice
+                .prepare_convergence_cutoff_delay_ms(&group_id)
+                .unwrap(),
+            None,
+            "retained replay cannot run during pending publication"
+        );
+        fault.replay.arm(1);
+        alice.confirm_published(next_pending).await.unwrap();
+        alice.drain_events();
+        assert_eq!(
+            alice
+                .prepare_convergence_cutoff_delay_ms(&group_id)
+                .unwrap(),
+            Some(0)
+        );
+        fault.replay.arm(1);
+        // Only advance work that the real worker readiness query admits.
         let retry_error = advance_replay(&mut alice, &group_id, mode, 1_000)
             .await
             .unwrap_err();
         assert!(retry_error.is_transient());
         assert!(alice.drain_pending_convergence_groups().contains(&group_id));
+        assert_eq!(
+            alice
+                .prepare_convergence_cutoff_delay_ms(&group_id)
+                .unwrap(),
+            Some(0),
+            "worker readiness must retain replay after the notification is drained"
+        );
         assert_ne!(
             storage.get_message(&msg.id).unwrap().state,
             MessageState::Processed
@@ -2292,6 +2364,12 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
         assert!(alice.drain_events().is_empty());
         let mut replay_events = Vec::new();
         for _ in 0..4 {
+            assert_eq!(
+                alice
+                    .prepare_convergence_cutoff_delay_ms(&group_id)
+                    .unwrap(),
+                Some(0)
+            );
             advance_replay(&mut alice, &group_id, mode, 1_000)
                 .await
                 .unwrap();
@@ -2325,6 +2403,17 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
             alice.confirm_published(pending).await,
             Err(EngineError::UnknownPending)
         ));
+        assert_eq!(
+            alice
+                .prepare_convergence_cutoff_delay_ms(&group_id)
+                .unwrap(),
+            None,
+            "successful replay disarms scheduling"
+        );
+        assert!(
+            !alice.has_pending_convergence_inputs(&group_id).unwrap(),
+            "application-only replay is not an outbound ambiguity gate"
+        );
         // Successful replay clears the marker, so a later advance does not scan
         // raw input again just because this group once had a replay failure.
         fault.replay.arm(1);

@@ -1054,7 +1054,7 @@ impl AppClient {
     ) -> Vec<crate::AppProjectionUpdate> {
         let mut updates = Vec::new();
         if self
-            .project_group_system_rows_into(events, recorded_at, &mut updates, false)
+            .project_group_system_rows_into(events, recorded_at, &mut updates, false, &mut 0)
             .is_err()
         {
             tracing::warn!(target: "marmot_app::groups",
@@ -1070,8 +1070,9 @@ impl AppClient {
         events: &[cgka_traits::engine::GroupEvent],
         recorded_at: u64,
         updates: &mut Vec<crate::AppProjectionUpdate>,
+        cursor: &mut usize,
     ) -> Result<(), AppError> {
-        self.project_group_system_rows_into(events, recorded_at, updates, true)
+        self.project_group_system_rows_into(events, recorded_at, updates, true, cursor)
     }
 
     fn project_group_system_rows_into(
@@ -1080,6 +1081,7 @@ impl AppClient {
         recorded_at: u64,
         updates: &mut Vec<crate::AppProjectionUpdate>,
         retry_projection_writes: bool,
+        cursor: &mut usize,
     ) -> Result<(), AppError> {
         // Last verdict wins, per commit. `true` = withdrawn, `false` = revalidated.
         let mut final_verdict: std::collections::HashMap<&[u8], bool> =
@@ -1105,7 +1107,7 @@ impl AppClient {
             .into_iter()
             .filter_map(|(commit_id, withdrawn)| withdrawn.then_some(commit_id))
             .collect();
-        for event in events {
+        for (index, event) in events.iter().enumerate().skip(*cursor) {
             if let cgka_traits::engine::GroupEvent::GroupStateChanged {
                 group_id,
                 epoch,
@@ -1120,6 +1122,7 @@ impl AppClient {
                     .as_ref()
                     .is_some_and(|id| superseded_commits.contains(id.as_slice()))
                 {
+                    *cursor = index + 1;
                     continue;
                 }
                 let projection = match build_group_system_projection(
@@ -1140,6 +1143,7 @@ impl AppClient {
                             error_code = "projection_build_failed",
                             "failed to build group system row",
                         );
+                        *cursor = index + 1;
                         continue;
                     }
                 };
@@ -1155,6 +1159,7 @@ impl AppClient {
                         error_code = "projection_apply_failed", "failed to project group system row"),
                 }
             }
+            *cursor = index + 1;
         }
         Ok(())
     }

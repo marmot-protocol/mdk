@@ -821,7 +821,7 @@ impl ScriptedPushRelayClient {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn fail_publishes_as_unavailable(&self) {
+    pub(crate) fn fail_publishes_as_unavailable(&self) {
         self.fail_publish_unavailable
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -18362,10 +18362,25 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
             "the unrelated hard failure must still surface to aggregate observers"
         );
     }
+    // Drained batches keep these deltas in the ordered summary so repaired
+    // activity cannot be broadcast after newer finalization or withdrawals.
+    let mut broadcast_updates = client.take_pending_projection_updates();
+    broadcast_updates.extend(
+        client
+            .take_pending_applied_sync_summary()
+            .projection_updates,
+    );
     assert_eq!(
-        client.take_pending_projection_updates().len(),
+        broadcast_updates.len(),
         2,
-        "the delivered and failed sibling updates must remain available for runtime broadcast"
+        "the delivered and failed sibling updates must remain available once for runtime broadcast"
+    );
+    assert!(client.take_pending_projection_updates().is_empty());
+    assert!(
+        client
+            .take_pending_applied_sync_summary()
+            .projection_updates
+            .is_empty()
     );
 
     #[cfg(feature = "product-analytics-export")]
@@ -19480,13 +19495,27 @@ async fn a_failed_ingest_leaves_the_delivery_retryable_on_the_reused_client() {
         bob_client.seen_events_index.contains(&event_id),
         "a successful ingest must mark the delivery seen",
     );
-    // The first attempt durably projected the message before its injected
-    // post-ack failure, so the retried duplicate must not project it again.
-    // (Live-summary replay after a post-ack failure is pinned separately in
-    // `tests/partial_sync_summary.rs`.)
+    // The first attempt durably projected the message but its AppError-only
+    // caller could not receive a summary. The retry transfers that notification
+    // exactly once without applying the message to storage again.
+    assert_eq!(summary.messages.len(), 1);
+    assert_eq!(
+        summary.messages[0].plaintext,
+        "must survive a failed ingest"
+    );
     assert!(
-        summary.messages.is_empty(),
-        "the retried duplicate must not re-project the already-applied message",
+        bob_client
+            .take_pending_applied_sync_summary()
+            .messages
+            .is_empty()
+    );
+    assert!(
+        bob_client
+            .drain_pending_session_events()
+            .await
+            .unwrap()
+            .messages
+            .is_empty()
     );
     assert_eq!(
         app.messages("bob")

@@ -215,6 +215,24 @@ impl<S: StorageProvider> Engine<S> {
                 Some(pass.cutoff_monotonic_ms().saturating_sub(now.monotonic_ms))
             }
             Some(pass) if pass.is_active() => Some(0),
+            // RawTransport applications do not open a convergence pass. A
+            // failed post-confirmation replay still needs a scheduler edge,
+            // after existing pass deadlines and pending-publication gates.
+            _ if self.pending_confirmation_replays.contains(group_id)
+                && self
+                    .epoch_manager
+                    .state(group_id)
+                    .is_none_or(|state| matches!(state, EpochState::Stable { .. }))
+                && {
+                    let group = self
+                        .storage
+                        .get_group(group_id)
+                        .map_err(|error| OpenMlsProjectionError::Storage(format!("{error:?}")))?;
+                    !group.is_terminal() && !group.unrecoverable
+                } =>
+            {
+                Some(0)
+            }
             _ if self
                 .has_pending_canonical_applications(group_id)
                 .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))? =>

@@ -9571,6 +9571,32 @@ mod tests {
         );
     }
 
+    /// A runnable retained replay wakes once; failures use bounded error
+    /// backoff rather than repeatedly rearming the short Ready deadline.
+    #[tokio::test(start_paused = true)]
+    async fn ready_replay_timer_backs_off_and_disarms_after_success() {
+        let group = test_group_id(42);
+        let mut scheduled = ScheduledConvergence::new(Duration::ZERO);
+        scheduled.schedule_after_pass(&group, ConvergenceScheduleState::Ready);
+        for delay in [
+            MIN_CONVERGENCE_SETTLEMENT_DELAY,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        ] {
+            assert_eq!(scheduled.timer.deadline() - TokioInstant::now(), delay);
+            tokio::time::advance(delay - Duration::from_millis(1)).await;
+            assert!(!scheduled.timer.is_elapsed());
+            tokio::time::advance(Duration::from_millis(1)).await;
+            scheduled.timer.as_mut().await;
+            assert_eq!(scheduled.take_ready(), Some(group.clone()));
+            scheduled.schedule_retry_groups([group.clone()]);
+        }
+        scheduled.schedule_after_pass(&group, ConvergenceScheduleState::Idle);
+        assert!(scheduled.deadlines.is_empty());
+        assert!(scheduled.retry_attempts.is_empty());
+        assert_eq!(scheduled.take_ready(), None);
+    }
+
     #[tokio::test]
     async fn scheduled_convergence_clamps_zero_delay_and_clears_retry_state() {
         let group_id = test_group_id(7);
