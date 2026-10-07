@@ -5171,7 +5171,7 @@ and MLS membership policy. Pair this header with the exact matching library.
 </details>
 
 <details>
-<summary>New exports — complete and organize before merging</summary>
+<summary>Audit v5 OTLP delivery</summary>
 
 ### `marmot_audit_log_tracker_update_result_v5_free`
 
