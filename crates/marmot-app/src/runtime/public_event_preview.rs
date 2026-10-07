@@ -144,8 +144,9 @@ impl MarmotAppRuntime {
             .await;
 
         let account_transaction = self.accounts.worker_transactions.clone().lock_owned().await;
-        self.accounts.shared.lifecycle().ensure_running()?;
-        let current = self.accounts.resolve(account_ref)?;
+        let Some(current) = self.public_event_account_after_wait(account_ref) else {
+            return stale_incarnation(&reference);
+        };
         let app = self.accounts.app.clone();
         blocking_app_task(move || {
             let _account_transaction = account_transaction;
@@ -168,14 +169,23 @@ impl MarmotAppRuntime {
         reference: PublicEventReference,
     ) -> Result<PublicEventCacheRead, AppError> {
         let account_transaction = self.accounts.worker_transactions.clone().lock_owned().await;
-        self.accounts.shared.lifecycle().ensure_running()?;
-        let current = self.accounts.resolve(account_ref)?;
+        let Some(current) = self.public_event_account_after_wait(account_ref) else {
+            return stale_incarnation(&reference);
+        };
         let app = self.accounts.app.clone();
         blocking_app_task(move || {
             let _account_transaction = account_transaction;
             read_if_current(&app, &account, &current, &cache, &reference)
         })
         .await
+    }
+
+    /// Called under the account transaction after a refresh or coalesced wait.
+    /// Initial admission already resolved this account. A late lifecycle failure
+    /// is retryable stale work, not a new fatal error or permission to open storage.
+    fn public_event_account_after_wait(&self, account_ref: &str) -> Option<AccountSummary> {
+        self.accounts.shared.lifecycle().ensure_running().ok()?;
+        self.accounts.resolve(account_ref).ok()
     }
 }
 
@@ -515,6 +525,43 @@ mod tests {
                 .is_err()
         );
         runtime.shutdown_and_close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn late_public_event_lifecycle_failures_are_busy_without_reopening_storage() {
+        for close in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let account = AccountHome::open(dir.path())
+                .create_account("alice")
+                .unwrap();
+            let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+            let runtime = app.runtime();
+            let reference = PublicEventReference::parse(&"ab".repeat(32)).unwrap();
+            let cache = app.public_event_cache_for_account(&account).unwrap();
+            if close {
+                runtime.shutdown_and_close().await.unwrap();
+            } else {
+                runtime.accounts.remove_account("alice").await.unwrap();
+            }
+            // Leader persistence and coalesced readers share this late fence.
+            assert!(runtime.public_event_account_after_wait("alice").is_none());
+            let read = runtime
+                .fenced_public_event_read("alice", account, cache, reference)
+                .await
+                .unwrap();
+            assert_eq!(state(&read), "busy");
+            assert!(
+                !app.public_event_caches
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .contains_key("alice"),
+                "late work must not publish another cache handle"
+            );
+            if !close {
+                assert!(!app.public_event_cache_path("alice").exists());
+                runtime.shutdown_and_close().await.unwrap();
+            }
+        }
     }
 
     #[test]

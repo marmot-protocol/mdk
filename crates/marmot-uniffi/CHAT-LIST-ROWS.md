@@ -45,6 +45,42 @@ move chats, change pin order, alter filters or create unread activity. A draft o
 Continue using the revisioned conversation draft API for editing and sending; do
 not reconstruct a composer from the shortened list preview.
 
+## Pending-send draft presentation (unreleased)
+
+`PresentedChatRowFfi.draft_version` is an optional opaque `ChatListDraftVersionFfi`
+object holding device-local store/group/revision metadata,
+read in the same transaction as the selected preview. It is also returned for
+empty/deleted drafts, so a host can observe cleanup without comparing text.
+Missing metadata means no comparable revision is available, not successful
+cleanup. Never decode, log, persist or transmit this version.
+
+Capture the selected composer's `MessageDraftRevisionFfi` before accepting a
+send. `includesChatListVersion(row.draftVersion)` returns true only when the
+row's version belongs to the same account store and group and is no newer than
+that captured revision. It returns false for a newer edit (even identical text),
+a recreated draft or another store/group. A true result does
+not authorize deletion: retain recovery until durable acceptance, then use
+`clearMessageDraftIfRevision` with the captured revision. Never reselect an
+unrelated newer revision for cleanup.
+
+This enables a temporary host presentation handoff to a pending outgoing
+preview while Markdown preparation or native cleanup is delayed. The host must
+fence that presentation by its accepted editor generation, restore it on a
+known pre-acceptance failure, and immediately honor newer edits. MDK remains the
+sole persisted draft authority. The metadata does not change preview selection,
+pins, ordering, unread state or delivery semantics. It does affect update emission:
+a save with identical text still advances the draft revision, so the presented
+list subscription emits a complete replacement snapshot for that change.
+
+Adoption requires matching regenerated bindings and native libraries. C adds
+a nullable row-owned `MarmotChatListDraftVersion` handle as `draft_version` in
+`MarmotPresentedChatRow`; parent deep-free releases it. The handle has no foreign
+constructor, getters or draft-mutation capability. Borrow that handle and a live
+`MarmotMessageDraftRevision` for
+`marmot_message_draft_revision_includes_chat_list_version`; its required `uint8_t`
+output is cleared on errors. Rebuild against the matching header/library.
+No schema migration or workspace version bump is required.
+
 ## Disappearing-message previews (0.10.4)
 
 `ChatListMessagePreviewFfi` now carries `retention_seconds` and

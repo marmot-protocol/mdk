@@ -224,7 +224,7 @@ impl Marmot {
         Ok(summary.into())
     }
 
-    /// Create an encrypted NIP-88 poll in a group conversation. Option ids use
+    /// Create an encrypted NIP-88 poll in a direct or group conversation. Option ids use
     /// `"0"` through `"9"`.
     pub async fn create_poll(
         &self,

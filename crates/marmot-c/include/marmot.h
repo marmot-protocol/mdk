@@ -195,6 +195,11 @@ typedef enum MarmotAttachmentCategory {
   MARMOT_ATTACHMENT_CATEGORY_REJECTED,
 } MarmotAttachmentCategory;
 
+typedef enum MarmotAttachmentRole {
+  MARMOT_ATTACHMENT_ROLE_SHARED,
+  MARMOT_ATTACHMENT_ROLE_INLINE_EMOJI,
+} MarmotAttachmentRole;
+
 /**
  * Stable category of a rejected encrypted-media attachment (mdk#1787).
  * Branch on this rather than on `detail`; the set only grows.
@@ -1168,6 +1173,11 @@ typedef struct MarmotAttachmentTransferSubscription MarmotAttachmentTransferSubs
 typedef struct MarmotBlockListSubscription MarmotBlockListSubscription;
 
 /**
+ * Read-only marker owned by its presented row. Borrow only while the row is live.
+ */
+typedef struct MarmotChatListDraftVersion MarmotChatListDraftVersion;
+
+/**
  * Opaque handle to one account's durable chat-list projection: an
  * initial row snapshot, then row upserts (`next`) or raw deltas
  * including row removals (`next_update`).
@@ -1220,6 +1230,12 @@ typedef struct MarmotMessageDraftRevision MarmotMessageDraftRevision;
  * then one message update per store change.
  */
 typedef struct MarmotMessagesSubscription MarmotMessagesSubscription;
+
+/**
+ * Opaque per-account remote signer. Free before its creating client. Cancellation
+ * is thread-safe; free must not race an in-flight call on this handle.
+ */
+typedef struct MarmotNip46Session MarmotNip46Session;
 
 /**
  * Opaque handle to the notification pipeline: local-notification
@@ -1474,6 +1490,7 @@ typedef struct MarmotAttachmentEntry {
    */
   uint64_t source_epoch;
   enum MarmotAttachmentCategory category;
+  enum MarmotAttachmentRole role;
   struct MarmotMediaAttachmentOutcome attachment;
 } MarmotAttachmentEntry;
 
@@ -1506,6 +1523,25 @@ typedef struct MarmotAttachmentPageRead {
     MarmotAttachmentPageRead_Page_Body PAGE;
   };
 } MarmotAttachmentPageRead;
+
+/**
+ * One individual authenticated reaction.
+ */
+typedef struct MarmotTimelineUserReaction {
+  char *reaction_message_id_hex;
+  char *target_message_id_hex;
+  char *sender;
+  char *emoji;
+  uint64_t reacted_at;
+} MarmotTimelineUserReaction;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotTimelineUserReactionList {
+  struct MarmotTimelineUserReaction *items;
+  uintptr_t len;
+} MarmotTimelineUserReactionList;
 
 typedef struct MarmotAvatarAsset {
   char *target;
@@ -2985,6 +3021,7 @@ typedef struct MarmotConversationPresentation {
 } MarmotConversationPresentation;
 
 typedef struct MarmotPresentedChatRow {
+  struct MarmotChatListDraftVersion *draft_version;
   struct MarmotSelectedChatPreview preview;
   struct MarmotChatListRowActions actions;
   struct MarmotChatListRow row;
@@ -3900,17 +3937,6 @@ typedef struct MarmotTimelineReactionEmoji {
   char **senders;
   uintptr_t senders_len;
 } MarmotTimelineReactionEmoji;
-
-/**
- * One individual authenticated reaction.
- */
-typedef struct MarmotTimelineUserReaction {
-  char *reaction_message_id_hex;
-  char *target_message_id_hex;
-  char *sender;
-  char *emoji;
-  uint64_t reacted_at;
-} MarmotTimelineUserReaction;
 
 /**
  * A message's reaction summary.
@@ -5733,6 +5759,23 @@ MarmotStatus marmot_attachment_history_version(const struct MarmotClient *client
 MarmotStatus marmot_attachment_history_version_change_since(const struct MarmotAttachmentHistoryVersion *current,
                                                             const struct MarmotAttachmentHistoryVersion *previous,
                                                             uint32_t *out);
+
+/**
+ * Read every effective sender/emoji pair for one visible message, off the UI thread.
+ * Local snapshot; re-read on conversation changes. Missing/hidden/deleted/invalidated
+ * targets yield an empty list. Free with `marmot_timeline_user_reaction_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_message_reactions(const struct MarmotClient *client,
+                                      const char *account_ref,
+                                      const char *group_id_hex,
+                                      const char *message_id_hex,
+                                      struct MarmotTimelineUserReactionList **out);
 
 /**
  * Read a bounded range (1..=1048576 bytes) from a local reference. No network fallback.
@@ -8864,7 +8907,7 @@ MarmotStatus marmot_send_custom_event(const struct MarmotClient *client,
                                       struct MarmotSendSummary **out);
 
 /**
- * Create an encrypted NIP-88 poll in a group conversation. Option ids use `"0"`
+ * Create an encrypted NIP-88 poll in a direct or group conversation. Option ids use `"0"`
  * through `"9"`. Free `out` with `marmot_send_summary_free`.
  *
  * # Safety
@@ -9297,6 +9340,97 @@ MarmotStatus marmot_report_message(const struct MarmotClient *client,
  * Input is borrowed and never retained.
  */
 MarmotStatus marmot_verify_public_nostr_event_json(const char *event_json, uint8_t *out);
+
+/**
+ * Create an offline session from a bunker URI, client pairing config, or durable
+ * export. The creating client must outlive the session. Client communication keys
+ * remain session-local; persist them through the host's encrypted vault export.
+ * # Safety
+ * Client and config must be valid for the call; out must be writable.
+ */
+MarmotStatus marmot_nip46_new(const struct MarmotClient *client,
+                              const char *config_json,
+                              struct MarmotNip46Session **out);
+
+/**
+ * Get the pairing URI without network IO. Treat this string as a credential.
+ * # Safety
+ * Session must be live; out writable. Free string with marmot_string_free.
+ */
+MarmotStatus marmot_nip46_uri(const struct MarmotNip46Session *session, char **out);
+
+/**
+ * Connect, pin get_public_key, and adopt policy-checked switch_relays. Run off UI.
+ * # Safety
+ * Session must be live; out writable. Returned user hex uses marmot_string_free.
+ */
+MarmotStatus marmot_nip46_connect(const struct MarmotNip46Session *session, char **out);
+
+/**
+ * Export restart credentials. Store ONLY in an encrypted vault; never log them.
+ * # Safety
+ * Session must be live; out writable. Free with marmot_string_free.
+ */
+MarmotStatus marmot_nip46_export(const struct MarmotNip46Session *session, char **out);
+
+/**
+ * Set up an external account using the verified stable signer instance.
+ * inbox_relays sets kind-10050 independently; NULL/0 uses default_relays.
+ * # Safety
+ * All pointers must be valid for the call; relay arrays follow ordinary C ABI
+ * str-array ownership. Out summary is freed with marmot_account_summary_free.
+ */
+MarmotStatus marmot_nip46_login(const struct MarmotClient *client,
+                                const struct MarmotNip46Session *session,
+                                const char *const *default_relays,
+                                uintptr_t default_len,
+                                const char *const *bootstrap_relays,
+                                uintptr_t bootstrap_len,
+                                const char *const *inbox_relays,
+                                uintptr_t inbox_len,
+                                struct MarmotAccountSummary **out);
+
+/**
+ * Attach a pinned signer and activate its MDK worker. Identity lookup itself
+ * is offline, but worker activation requests a fresh identity proof. Restore
+ * handles before client_start, then run each account's connect/register on an
+ * independent background worker after local startup; never run this on UI.
+ * # Safety
+ * Client, account_ref and session must be live and belong to the same client.
+ */
+MarmotStatus marmot_nip46_register(const struct MarmotClient *client,
+                                   const char *account_ref,
+                                   const struct MarmotNip46Session *session);
+
+/**
+ * Nonblocking state snapshot; no session keys or signer request payloads.
+ * # Safety
+ * Session must be live; out writable. Free with marmot_string_free.
+ */
+MarmotStatus marmot_nip46_state(const struct MarmotNip46Session *session, char **out);
+
+/**
+ * Permanently interrupt pending requests, including synchronous proof callbacks.
+ * # Safety
+ * Session must be NULL or live; may race other operations, but not free.
+ */
+void marmot_nip46_cancel(const struct MarmotNip46Session *session);
+
+/**
+ * Bounded courtesy logout. Local session keys are cleared even on timeout or
+ * cancellation. Complete MDK signout first; delete the vault export regardless.
+ * # Safety
+ * Session must be live.
+ */
+MarmotStatus marmot_nip46_logout(const struct MarmotNip46Session *session);
+
+/**
+ * Cancel and release transport without remote logout. Vault credentials remain
+ * usable after restart. Registered callbacks become cancelled, never dangling.
+ * # Safety
+ * Session must be NULL or uniquely owned and no other call may be in flight.
+ */
+void marmot_nip46_free(struct MarmotNip46Session *session);
 
 /**
  * Free a value of this type returned by this library. NULL
@@ -10507,6 +10641,17 @@ MarmotStatus marmot_selected_message_draft(const struct MarmotClient *client,
                                            struct MarmotSelectedMessageDraft **out);
 
 /**
+ * Compare an opaque chat-list draft version with a selected revision.
+ * Returns zero for a foreign store/group or a newer draft.
+ * # Safety
+ * revision's owning draft/snapshot and version's owning row remain live;
+ * out is writable. Inputs are borrowed for this call only.
+ */
+MarmotStatus marmot_message_draft_revision_includes_chat_list_version(const struct MarmotMessageDraftRevision *revision,
+                                                                      const struct MarmotChatListDraftVersion *version,
+                                                                      uint8_t *out);
+
+/**
  * Clear only this selected revision; later edits are preserved.
  * # Safety
  * client, account and revision valid; revision's owning snapshot/draft must remain live; out writable.
@@ -11452,6 +11597,15 @@ void marmot_app_performance_snapshot_free(struct MarmotAppPerformanceSnapshot *p
  * this library.
  */
 void marmot_poll_vote_page_free(struct MarmotPollVotePage *ptr);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_timeline_user_reaction_list_free(struct MarmotTimelineUserReactionList *list);
 
 /**
  * Free a value of this type returned by this library. NULL

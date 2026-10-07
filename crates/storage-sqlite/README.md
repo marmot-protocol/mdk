@@ -175,6 +175,10 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   retired watermark separately from import: clearing one token restores other joined generations and returns `false`
   while loss remains, preserving the runtime's pending flag across reopen. Late duplicate writers cannot resurrect a
   retired generation; increased counts can.
+- **Comparison plans.** Format-1 plans still accept the retired optional `live_since_seconds` field from older
+  databases, but recovery ignores it and new writes omit it. A normal settlement rewrites a legacy plan without
+  changing its fence, route scopes, retry cost, or uncovered demand. Other unknown fields and malformed legacy values
+  remain errors; no schema migration or plan-format change is required.
 - **Inventory revision.** Inventory expiration, compaction, message release, and route/group deletion bump the account
   inventory revision in the same transaction; reservations and plan installation check it. Installed proof is
   invalidated only for overlapping route/window scopes (and the exact event for known-event predicates), so unrelated or

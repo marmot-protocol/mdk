@@ -6,6 +6,35 @@ use crate::{Marmot, timeline_query_from_ffi};
 
 #[uniffi::export]
 impl Marmot {
+    /// Complete effective reaction participants for one account/group/message.
+    ///
+    /// Unlike a conversation window's bounded reactor preview, this includes
+    /// every distinct sender/emoji pair, selecting the latest event per pair.
+    /// The local materialized read applies block visibility;
+    /// missing, hidden, retention-pruned, deleted or invalidated targets return an empty list.
+    /// Results are ordered by timestamp, sender and emoji in one snapshot.
+    /// Re-read on conversation updates; no network request is made. This
+    /// synchronous read must run off the UI thread. Use matching generated
+    /// bindings and native libraries; returned records are owned by the caller.
+    pub fn message_reactions(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        message_id_hex: String,
+    ) -> Result<Vec<crate::conversions::TimelineUserReactionFfi>, MarmotKitError> {
+        let group = crate::conversions::group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .message_reactions(
+                &account_ref,
+                &hex::encode(group.as_slice()),
+                &message_id_hex,
+            )?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
     /// Accepted edit versions, oldest first within a latest-first page (1..=100).
     /// Supply both cursor fields from the first version to load older versions.
     /// Run this synchronous details query off the UI thread; screens already carry effective content.

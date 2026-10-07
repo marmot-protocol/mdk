@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- The optional opaque `ChatListDraftVersionFfi` object in
+  `PresentedChatRowFfi.draft_version` correlates the presented row's draft
+  metadata with a captured composer revision through
+  `MessageDraftRevisionFfi::includes_chat_list_version`. Regenerate Swift/Kotlin
+  bindings with the matching library. Host-constructed row records must pass
+  `nil` (Swift), `null` (Kotlin), or a version for the new optional field. Keep
+  these opaque versions device-local and use revision-checked draft cleanup
+  after local send acceptance. Identical-text saves advance the draft revision
+  and emit a complete replacement presented-list snapshot.
+- Attachment history adds `AttachmentRoleFfi` and the required, defaultless
+  `AttachmentEntryFfi.role` field. Regenerate Swift/Kotlin bindings with the
+  matching native library and update host record constructors and fixtures.
+  Gallery clients can exclude `InlineEmoji`; preserve slots and continue paging
+  after filtered pages as described in [the handoff](ATTACHMENT-HISTORY.md).
+
+### Added
+
+- `Marmot::message_reactions` returns complete local reaction details for one exact
+  account/group/message, with one effective entry per sender/emoji and no
+  conversation-preview cap. Missing, hidden, deleted, invalidated and
+  retention-pruned targets return no participants; blocked reactors are excluded.
+  The read performs no network work or conversation-history scan.
+  Regenerate matching Swift/Kotlin bindings to call `messageReactions`.
+
 ### Changed
 
 - `retired_relay_hosts()` no longer includes `relay.damus.io`, and

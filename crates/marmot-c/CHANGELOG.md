@@ -17,6 +17,40 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `marmot_public_event_cache_read_free`; embedded records have no separate free. These additive exports require the
   matching generated header and library; existing record layouts are unchanged.
 
+- `MarmotPresentedChatRow` gains a nullable row-owned `MarmotChatListDraftVersion` handle and
+  `marmot_message_draft_revision_includes_chat_list_version` compares it against
+  a borrowed selected revision. Both inputs are opaque read-only borrows; only
+  the selected revision authorizes revision-checked mutation.
+  Newer identical drafts remain distinguishable. Rebuild with matching generated
+  headers/libraries; the row layout and comparison signature change. Identical-text
+  saves emit a replacement snapshot because their draft revision changes. See the
+  shared chat-list contract.
+- Add `marmot_message_reactions` and the owned
+  `MarmotTimelineUserReactionList` root/free for complete exact-message details.
+  Existing record layouts are unchanged; the new symbols require matching
+  generated headers and native libraries.
+- Per-account NIP-46 sessions for bunker links and client-initiated pairing,
+  with identity pinning, approval URLs, relay switching, cancellation and logout.
+  Local-key accounts and separate remote signers can run in the same client.
+
+### Changed
+
+- `MarmotAttachmentEntry` adds `role: MarmotAttachmentRole` (`Shared` or
+  `InlineEmoji`) for gallery filtering without changing slot or acquisition identity.
+  This changes the record layout; rebuild clients with the matching header/library.
+- External account SQLCipher keys use the configured host secret store. Existing
+  plaintext key files migrate only after a verified secret-store write.
+
+### Fixed
+
+- NIP-46 signing requests contain only `kind`, `content`, `tags`, and `created_at`.
+  SDK-only event IDs and public keys stay local for response verification.
+- Publication signing failures report the event kind. Signer error text stays
+  out of the message because it can carry relay URLs.
+- NIP-46 request publication failures report how many relays rejected the
+  request, without relay URLs or relay-supplied text.
+- Account onboarding can establish inbox-list absence from a completed read of
+  freshly discovered outboxes even when a discovery indexer is unavailable.
 
 ## [0.12.0] - 2026-10-02
 
@@ -62,7 +96,6 @@ record layouts changed. See the [client upgrade guide](../../docs/integration/0.
   stays silent and blocked senders remain suppressed; C hosts still apply
   their own notification permission, channel, and foreground policy. No C ABI
   layout changes. (marmot-protocol/whitenoise-android#2984)
-
 
 ## [0.11.0] - 2026-09-29
 
