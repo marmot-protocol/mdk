@@ -218,7 +218,12 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::EmptyPassphrase => MarmotStatus::EmptyPassphrase,
         MarmotKitError::EncryptionFailed { .. } => MarmotStatus::EncryptionFailed,
         MarmotKitError::Io { .. } => MarmotStatus::Io,
-        MarmotKitError::Runtime { .. } => MarmotStatus::Runtime,
+        MarmotKitError::Runtime { .. }
+        | MarmotKitError::InvalidSticker { .. }
+        | MarmotKitError::StickerNotFound
+        | MarmotKitError::StickerNetwork { .. }
+        | MarmotKitError::StickerImport { .. }
+        | MarmotKitError::StickerImportUnsupported => MarmotStatus::Runtime,
         MarmotKitError::ExternalSignerUnavailable { .. } => MarmotStatus::ExternalSignerUnavailable,
         MarmotKitError::ExternalSignerMismatch => MarmotStatus::ExternalSignerMismatch,
         MarmotKitError::ExternalSignerRejected => MarmotStatus::ExternalSignerRejected,

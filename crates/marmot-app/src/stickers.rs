@@ -465,7 +465,7 @@ impl MarmotApp {
         fetch_pack_into_storage(self, &context, &parsed.coordinate, &parsed.relay_hints).await?;
         context
             .storage
-            .prune_uninstalled_sticker_discovery(MAX_DISCOVERY_PACKS)?;
+            .prune_uninstalled_sticker_discovery(MAX_DISCOVERY_PACKS, &parsed.coordinate)?;
         app_pack_for_context(&context, &parsed.coordinate)
     }
 
@@ -821,7 +821,7 @@ fn ingest_pack_events(
         }
     }
     storage
-        .prune_uninstalled_sticker_discovery(MAX_DISCOVERY_PACKS)
+        .prune_uninstalled_sticker_discovery(MAX_DISCOVERY_PACKS, "")
         .map_err(AppError::Storage)?;
     Ok(updated)
 }
@@ -1557,8 +1557,8 @@ fn inspect_webp(bytes: &[u8]) -> Result<InspectedImage, AppError> {
                 }
                 let (canvas_width, canvas_height) =
                     dimensions.ok_or_else(|| invalid_sticker("WebP frame precedes canvas"))?;
-                let frame_x = webp_anmf_u24(bytes, data)? >> 2;
-                let frame_y = webp_anmf_u24(bytes, data + 3)? >> 2;
+                let frame_x = webp_anmf_u24(bytes, data)?.saturating_mul(2);
+                let frame_y = webp_anmf_u24(bytes, data + 3)?.saturating_mul(2);
                 let stored_width = webp_anmf_u24(bytes, data + 6)?;
                 let stored_height = webp_anmf_u24(bytes, data + 9)?;
                 let frame_width = stored_width
@@ -1747,8 +1747,8 @@ mod tests {
         vp8x.extend_from_slice(&(width.saturating_sub(1) & 0xff_ffff).to_le_bytes()[..3]);
         vp8x.extend_from_slice(&(height.saturating_sub(1) & 0xff_ffff).to_le_bytes()[..3]);
         let mut anmf = Vec::new();
-        anmf.extend_from_slice(&(frame_x << 2).to_le_bytes()[..3]);
-        anmf.extend_from_slice(&(frame_y << 2).to_le_bytes()[..3]);
+        anmf.extend_from_slice(&(frame_x / 2).to_le_bytes()[..3]);
+        anmf.extend_from_slice(&(frame_y / 2).to_le_bytes()[..3]);
         let stored_width = frame_width.checked_sub(1).unwrap_or(0xff_ffff);
         let stored_height = frame_height.checked_sub(1).unwrap_or(0xff_ffff);
         anmf.extend_from_slice(&(stored_width & 0xff_ffff).to_le_bytes()[..3]);
@@ -2009,7 +2009,7 @@ mod tests {
         assert!(inspect_image(&gif_with_frame(32, 32, 17, 0, 16, 16)).is_err());
         assert!(inspect_image(&webp_with_frame(32, 32, 0, 0, 0, 32)).is_err());
         assert!(inspect_image(&webp_with_frame(32, 32, 0, 0, 33, 32)).is_err());
-        assert!(inspect_image(&webp_with_frame(32, 32, 17, 0, 16, 16)).is_err());
+        assert!(inspect_image(&webp_with_frame(32, 32, 18, 0, 16, 16)).is_err());
         assert!(inspect_image(b"not an image").is_err());
     }
 

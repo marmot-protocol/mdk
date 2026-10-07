@@ -140,7 +140,11 @@ impl SqliteAccountStorage {
     /// Drop the oldest uninstalled discovery packs once the durable projection
     /// exceeds `limit`. Installed packs, pending install operations, current
     /// versions, and assets referenced by retained messages stay.
-    pub fn prune_uninstalled_sticker_discovery(&self, limit: usize) -> StorageResult<usize> {
+    pub fn prune_uninstalled_sticker_discovery(
+        &self,
+        limit: usize,
+        keep: &str,
+    ) -> StorageResult<usize> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let protected = protected_sticker_coordinates_tx(&conn)?;
@@ -162,7 +166,7 @@ impl SqliteAccountStorage {
                 if removed == excess {
                     break;
                 }
-                if protected.contains(&coordinate) {
+                if protected.contains(&coordinate) || coordinate == keep {
                     continue;
                 }
                 conn.execute(
@@ -473,19 +477,17 @@ fn insert_sticker_assets_tx(conn: &Connection, pack: &StoredStickerPack) -> Stor
         ],
     )
     .storage()?;
-    for sticker in &pack.stickers {
+    let mut assets = pack.stickers.clone();
+    if let Some(cover) = &pack.cover {
+        assets.push(cover.clone());
+    }
+    for sticker in assets {
         conn.execute(
             "INSERT INTO app_sticker_assets (
                 pack_coordinate, shortcode, url, sha256, mime, width,
                 height, alt, emoji
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             ON CONFLICT(pack_coordinate, shortcode, sha256) DO UPDATE SET
-                url = excluded.url,
-                mime = excluded.mime,
-                width = excluded.width,
-                height = excluded.height,
-                alt = excluded.alt,
-                emoji = excluded.emoji",
+             ON CONFLICT(pack_coordinate, shortcode, sha256) DO NOTHING",
             params![
                 &pack.coordinate,
                 &sticker.shortcode,
@@ -859,7 +861,7 @@ mod tests {
             extra.identifier = format!("pack-{index}");
             assert!(store.replace_sticker_pack_if_newer(&extra).unwrap());
         }
-        let removed = store.prune_uninstalled_sticker_discovery(2).unwrap();
+        let removed = store.prune_uninstalled_sticker_discovery(2, "").unwrap();
         assert_eq!(removed, 3);
         assert!(store.sticker_pack(&installed.coordinate).unwrap().is_some());
         assert_eq!(store.sticker_packs(false, None, 20).unwrap().len(), 2);

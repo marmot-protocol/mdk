@@ -83,6 +83,10 @@ use crate::types::relay::{
     MarmotAccountRelayLists, MarmotRelayEndpointClassificationList, MarmotRelayHealth,
     MarmotRelayTelemetryRuntimeConfig, MarmotRelayTelemetrySettings,
 };
+use crate::types::sticker::{
+    MarmotStickerAsset, MarmotStickerImportResult, MarmotStickerPack, MarmotStickerPackList,
+    MarmotStickerSyncResult,
+};
 use crate::types::telemetry::{
     MarmotAppPerformanceSnapshot, MarmotHostPerformanceOperation, MarmotHostPerformanceOutcome,
 };
@@ -3274,6 +3278,145 @@ pub unsafe extern "C" fn marmot_message_edit_history(
                     (has_before != 0).then_some(before_edited_at),
                     before,
                     limit,
+                ),
+                out,
+            )
+        }
+    })
+}
+
+/// Read the encrypted sticker projection off the UI thread.
+/// `installed_only` is a uint8_t flag. `has_limit` 0 leaves the limit unset.
+/// Free with `marmot_sticker_pack_list_free`.
+///
+/// # Safety
+/// `client` must be live, strings must be NUL-terminated, and `out` must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_sticker_packs(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    installed_only: u8,
+    search: *const c_char,
+    has_limit: u8,
+    limit: u32,
+    out: *mut *mut MarmotStickerPackList,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let search = try_arg!(unsafe { crate::memory::optional_str(search) });
+        let limit = crate::memory::c_bool(has_limit).then_some(limit);
+        unsafe {
+            deliver(
+                client.marmot.sticker_packs(
+                    account_ref,
+                    crate::memory::c_bool(installed_only),
+                    search,
+                    limit,
+                ),
+                out,
+            )
+        }
+    })
+}
+
+c_cmd! {
+    /// Read one cached pack by coordinate or trusted pack link. NULL when absent.
+    /// Free with `marmot_sticker_pack_free`.
+    sync fn marmot_sticker_pack(
+        account_ref: str, input: str,
+    ) -> opt_rec(MarmotStickerPack) = sticker_pack;
+
+    /// Refresh recent public packs and this account's installed list.
+    /// Free with `marmot_sticker_sync_result_free`.
+    async fn marmot_sync_sticker_packs(
+        account_ref: str,
+    ) -> rec(MarmotStickerSyncResult) = sync_sticker_packs;
+
+    /// Fetch one pack from its relay hints, then the account relays.
+    /// Free with `marmot_sticker_pack_free`.
+    async fn marmot_fetch_sticker_pack(
+        account_ref: str, input: str,
+    ) -> rec(MarmotStickerPack) = fetch_sticker_pack;
+
+    /// Record local install intent and publish the installed list.
+    /// Free with `marmot_sticker_pack_free`.
+    async fn marmot_install_sticker_pack(
+        account_ref: str, input: str,
+    ) -> rec(MarmotStickerPack) = install_sticker_pack;
+
+    /// Record local uninstall intent and publish the installed list.
+    async fn marmot_uninstall_sticker_pack(
+        account_ref: str, input: str,
+    ) -> unit = uninstall_sticker_pack;
+
+    /// Import a canonical Signal pack link. External-signer accounts are rejected.
+    /// `blossom_server` may be NULL. Free with `marmot_sticker_import_result_free`.
+    async fn marmot_import_signal_sticker_pack(
+        account_ref: str, signal_link: str, blossom_server: opt_str,
+    ) -> rec(MarmotStickerImportResult) = import_signal_sticker_pack;
+}
+
+/// Download one exact sticker asset. The reference is borrowed and not freed.
+/// Free the result with `marmot_sticker_asset_free`.
+///
+/// # Safety
+/// `client` must be live, strings must be NUL-terminated, and `out` must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_fetch_sticker_asset(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    pack_coordinate: *const c_char,
+    shortcode: *const c_char,
+    plaintext_sha256: *const c_char,
+    out: *mut *mut MarmotStickerAsset,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let sticker_ref = marmot_uniffi::StickerRefFfi {
+            pack_coordinate: try_arg!(unsafe { required_str(pack_coordinate) }),
+            shortcode: try_arg!(unsafe { required_str(shortcode) }),
+            plaintext_sha256: try_arg!(unsafe { required_str(plaintext_sha256) }),
+        };
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.fetch_sticker_asset(account_ref, sticker_ref)),
+                out,
+            )
+        }
+    })
+}
+
+/// Send an exact sticker reference into a group.
+///
+/// # Safety
+/// `client` must be live, strings must be NUL-terminated, and `out` must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_send_sticker(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    pack_coordinate: *const c_char,
+    shortcode: *const c_char,
+    plaintext_sha256: *const c_char,
+    out: *mut *mut MarmotSendSummary,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let sticker_ref = marmot_uniffi::StickerRefFfi {
+            pack_coordinate: try_arg!(unsafe { required_str(pack_coordinate) }),
+            shortcode: try_arg!(unsafe { required_str(shortcode) }),
+            plaintext_sha256: try_arg!(unsafe { required_str(plaintext_sha256) }),
+        };
+        unsafe {
+            deliver(
+                client.block_on(
+                    client
+                        .marmot
+                        .send_sticker(account_ref, group_id_hex, sticker_ref),
                 ),
                 out,
             )

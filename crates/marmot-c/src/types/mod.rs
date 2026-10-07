@@ -24,6 +24,7 @@ pub mod message;
 pub mod notification;
 pub mod push;
 pub mod relay;
+pub mod sticker;
 pub mod telemetry;
 pub mod timeline;
 

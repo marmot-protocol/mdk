@@ -4513,9 +4513,17 @@ fn reply_preview_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineR
         sender: row.get(1)?,
         plaintext: row.get(2)?,
         kind: row.get::<_, i64>(3)?.try_into().unwrap_or_default(),
-        tags: serde_json::from_str(&row.get::<_, String>(4)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err))
-        })?,
+        tags: if row.get::<_, i64>(7)? != 0 {
+            Vec::new()
+        } else {
+            serde_json::from_str(&row.get::<_, String>(4)?).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?
+        },
         media: media_value_from_json(row.get::<_, Option<String>>(5)?),
         agent_text_stream: optional_value_from_json(row.get::<_, Option<String>>(6)?).map_err(
             |err| {

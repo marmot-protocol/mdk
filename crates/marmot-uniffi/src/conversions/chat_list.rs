@@ -130,7 +130,6 @@ impl From<ChatListMessagePreview> for ChatListMessagePreviewFfi {
             sender_display_name: value.sender_display_name,
             plaintext: value.plaintext,
             content_tokens,
-            tags: Vec::new(),
             kind: value.kind,
             sticker,
             timeline_at: value.timeline_at,

@@ -129,14 +129,18 @@ impl From<AppStickerSyncResult> for StickerSyncResultFfi {
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct StickerImportResultFfi {
     pub pack: StickerPackFfi,
-    pub skipped_signal_sticker_ids: Vec<u32>,
+    pub skipped_signal_sticker_ids: Vec<String>,
 }
 
 impl From<AppStickerImportResult> for StickerImportResultFfi {
     fn from(value: AppStickerImportResult) -> Self {
         Self {
             pack: value.pack.into(),
-            skipped_signal_sticker_ids: value.skipped_signal_sticker_ids,
+            skipped_signal_sticker_ids: value
+                .skipped_signal_sticker_ids
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect(),
         }
     }
 }

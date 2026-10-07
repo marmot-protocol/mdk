@@ -525,10 +525,16 @@ impl From<&AppError> for MarmotKitError {
             },
             AppError::ExternalSignerMismatch => Self::ExternalSignerMismatch,
             AppError::ExternalSignerRejected => Self::ExternalSignerRejected,
-            AppError::InvalidSticker(details) => Self::InvalidSticker { details },
+            AppError::InvalidSticker(details) => Self::InvalidSticker {
+                details: details.clone(),
+            },
             AppError::StickerNotFound => Self::StickerNotFound,
-            AppError::StickerRelay(details) => Self::StickerNetwork { details },
-            AppError::StickerImport(details) => Self::StickerImport { details },
+            AppError::StickerRelay(details) => Self::StickerNetwork {
+                details: details.clone(),
+            },
+            AppError::StickerImport(details) => Self::StickerImport {
+                details: details.clone(),
+            },
             AppError::StickerExternalSignerImportUnsupported => Self::StickerImportUnsupported,
             other => Self::Runtime {
                 details: other.to_string(),
