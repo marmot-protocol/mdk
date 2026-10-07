@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "c5fb80f37530ee9b2df9501ae5ff8cb4a973a4bd"
+  },
+  "path_in_vcs": "crates/protocols/hpke/libcrux_provider"
+}
