@@ -9,6 +9,8 @@ For the current guided install, runtime chooser, and steps to finish in White No
 
 ## Contents
 
+- [What you can do](#what-you-can-do)
+- [First install and profile selection](#first-install-and-profile-selection)
 - [Source Install (Exact Commit)](#source-install-exact-commit)
 - [Release Install (Hermes Already Installed)](#release-install-hermes-already-installed)
 - [Repeatable Dev Setup](#repeatable-dev-setup)
@@ -18,6 +20,167 @@ For the current guided install, runtime chooser, and steps to finish in White No
 - [Approval reactions (opt in)](#approval-reactions-opt-in)
 - [Optional presence reactions](#optional-presence-reactions)
 - [Inbound durability boundary](#inbound-durability-boundary)
+
+## What you can do
+
+For task titles and progress reactions, use the shared
+[recommended chat setup](../../README.md#recommended-chat-setup), including
+admin promotion and the phone acceptance test. Agent policy is in
+[the integration instructions](../../AGENTS.md#suggested-agent-chat-instructions).
+This plugin supplies the group-profile and reaction tools; enable the chosen
+chat policy in the actual Hermes profile and verify it on the phone.
+
+- **Chat privately with your configured Hermes agent.** Replies use the current
+  White Noise conversation; effective DMs activate automatically, while group
+  mentions or configured triggers control multi-party activation. Sender
+  authorization still applies. See [activation](#group-activation-multi-party-groups).
+- **Follow a conversation and its history.** Recent messages, reply quotes,
+  reactions and deletion state accompany a turn. `marmot_history` reads an exact
+  message or older pages; [quiet ambient continuity](#quiet-ambient-continuity)
+  carries relevant changes into a later turn without triggering a reply.
+- **Send and receive files.** The adapter has explicit image, document, video
+  and voice send methods; the host decides how received media reaches its model.
+  Return a generated file using [approved-root MEDIA staging](#sending-a-generated-file).
+  [Endpoint and voice-note limits](#upload-endpoints-and-voice-notes) apply to audio too.
+- **Manage messages and group presentation.** `marmot_reaction` adds/removes
+  reactions; `delete_marmot_message` retracts a prior own message.
+  `marmot_group_profile` changes a group's name/description only as a current
+  admin. Tool arguments, history cursors and limits are in [Behavior](#behavior).
+- **Show progress when configured.** Live previews are transient; the completed
+  answer is durable. Explicit host delivery context can route commentary to
+  agent activity. Preview configuration and final-delivery rules are in
+  [Behavior](#behavior), and [presence reactions](#optional-presence-reactions)
+  and [approval reactions](#approval-reactions-opt-in) are opt-in features.
+- **Check installation health.** `marmot_status` and the
+  [installation doctor](#installation-doctor) diagnose local wiring; a phone
+  round trip remains the delivery test. Public profile-name onboarding asks for
+  consent before publication.
+
+Models, repository tools, automation, credentials and execution permissions
+come from the selected Hermes profile. The connector does not grant a new tool
+permission or a self-hosted media preference merely because a sender is allowed.
+
+## First install and profile selection
+
+Read the connector's [first-install checklist](../../../crates/agent-connector/README.md#first-installation-from-a-white-noise-prompt)
+when following a prompt copied from White Noise. The installer configures an
+existing Hermes installation; it does not install Hermes, choose a model,
+authenticate a provider or determine which profile you intended to connect.
+Verify that the intended profile can already run an ordinary model turn.
+
+### Pin the profile home before installing
+
+On Hermes versions with profiles, use `hermes profile list` and
+`hermes profile show <profile>` to identify the intended home. Check the running
+gateway/service's actual home too. See the upstream
+[profile guide](https://hermes-agent.nousresearch.com/docs/user-guide/profiles/).
+For a default or custom-home installation, obtain that home from its launcher.
+Do not change the OS user's `HOME` or infer the profile from the current directory.
+
+Export the resolved **absolute** Hermes home before running any installer or
+plugin command. The shell installer accepts `--hermes-home`, but its child
+`hermes plugins enable marmot` also needs the intended environment. An explicit
+export supplies the home to child commands. Also verify Hermes's sticky profile:
+some Hermes versions still resolve plain `hermes` through `active_profile` for
+default/custom homes. An export by itself is not proof that those commands
+selected the intended profile. If selection differs, record the previous choice
+and, as part of the approved install plan, use `hermes profile use <name>`
+(or `hermes profile use default`) to select the intended installation. Restore
+the previous sticky choice after setup if it should remain the CLI default.
+Explicit `hermes -p <name> ...` commands avoid that ambiguity for subsequent
+manual plugin and gateway operations; the shell installer itself has no
+`--profile` option.
+
+For example, after confirming the real home of an existing `research` profile:
+
+```sh
+export HERMES_HOME="/absolute/path/to/the/research/profile"
+export MARMOT_HOME="$HOME/.marmot-agents/hermes-research"
+export MARMOT_AGENT_SOCKET="$MARMOT_HOME/dev/wn-agent.sock"
+export MARMOT_AGENT_LABEL="hermes-research"
+export MARMOT_AGENT_SERVICE_NAME="wn-agent-hermes-research"
+export MARMOT_AGENT_LAUNCHD_LABEL="org.marmot.wn-agent.hermes-research"
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+The two homes serve different purposes: `HERMES_HOME` owns the profile's
+`config.yaml`, `.env`, plugins and gateway state; `MARMOT_HOME` owns the connector's
+identity, group state and socket. For a default installation, the corresponding
+homes are normally `$HOME/.hermes` and `$HOME/.marmot-agents/hermes`.
+
+First define `install_verified` using the
+[shared helper](../../README.md#verified-installer-helper), then copy only the
+`base_url` selection from the [release example](#release-install-hermes-already-installed).
+Neither step runs an installer. Return here for the dry-run.
+Run this example in the same shell where `install_verified` was defined.
+Review a dry-run first, then remove `--dry-run` after the requested installation
+approval:
+
+```sh
+install_verified "$base_url/install-hermes-marmot.sh" \
+  "$base_url/install-hermes-marmot.sh.sha256" \
+  --dry-run --yes \
+  --hermes-home "$HERMES_HOME" --home "$MARMOT_HOME" \
+  --allow-welcomer npub1... --allow-user npub1...
+```
+
+Replace both `npub1...` placeholders with the phone owner's actual public key.
+Use explicit `--relay` options if the phone uses a different public relay set.
+Check the printed profile/plugin path, connector home, socket and service name
+before a real run. `--yes` skips questions; it does not supply missing model
+credentials or authorize an unspecified sender. Keep the installer archive and
+`wn-agent` on the same release cohort.
+
+The installer patches Marmot-specific configuration and sender authorization
+in the selected home's `.env`; existing connectors are preserved. Its plugin
+enablement may need a manual, explicitly profile-targeted
+`hermes -p research plugins enable marmot` (or `-p default` for the default
+profile). Verify that this resolves to the intended home. Restart the
+**selected** gateway using its existing service manager. On
+profile-aware Hermes, explicitly targeted commands such as
+`hermes -p research gateway status` and `hermes -p research gateway restart`
+select that named profile; confirm the name resolves to the same home. Custom
+home or container supervisors need their own supported restart procedure. Do
+not launch an extra `hermes gateway run` beside an already-managed gateway.
+
+### Multiple profiles and connector ownership
+
+Decide whether each profile is an independent agent before repeating an install.
+Changing `HERMES_HOME` alone leaves the default `MARMOT_HOME` and same-user service
+name unchanged. Independent agents need distinct values for every connector
+variable in the example above; otherwise the next install can replace another
+profile's connector service or attach both gateways to the same identity.
+Record the tuple `(Hermes home, connector home, socket, service, agent account)`
+for each installation and retain it for updates. Persist custom daemon settings
+in the service, and gateway settings in that profile's configuration/launcher;
+a one-time shell export does not configure a background process after reboot.
+
+Sharing one connector is an explicit advanced topology: use one service owner,
+point the selected adapters at the same socket/account, and avoid another
+installer taking ownership of that service. Review allowlist reconciliation
+and activation first; several subscribers may all reply to the same message.
+Separate homes and identities are the simplest first-install layout.
+
+### Verify before reporting success
+
+- Confirm `wn-agent --version`, plugin enablement and the selected service/socket.
+  If the release includes `--doctor`, run the downloaded installer with the same
+  home arguments and `--doctor --json`; use its `--help` to check availability.
+- Check the account id persisted under `platforms.marmot` matches bootstrap and
+  the agent identity invited from the phone. Avoid printing tokens or whole `.env`
+  files while diagnosing configuration.
+- Confirm the phone's public key is permitted both to invite (`--allow-welcomer`)
+  and to message (`--allow-user`). Enablement and sender changes require the
+  selected gateway to reload them.
+- Invite the agent npub from White Noise and send an ordinary prompt. In a
+  multi-party group, address the agent using its configured activation pattern;
+  effective DMs always activate. Verify the model's reply in that same chat.
+- Test one small generated file using the approved source root below. Text
+  delivery alone does not establish file delivery.
+
+A healthy installation doctor is passive local evidence, not phone delivery
+proof. If the phone owner has not completed the round trip, state what was
+verified locally and leave the phone test pending.
 
 ## Source Install (Exact Commit)
 
@@ -52,7 +215,15 @@ hermes plugins enable marmot
 Hermes clones the detached exact-commit checkout and copies only this plugin
 subdirectory into `~/.hermes/plugins/marmot`; it does not install an MDK
 workspace. Removing `MDK_PLUGIN_CHECKOUT` after installation does not remove the
-installed plugin. Hermes versions that expose `plugins install --ref` may use it
+installed plugin. Newer Hermes versions may require a separate security-scan
+confirmation for source plugins. Review that report for the exact checked-out
+revision; an unattended process cannot assume the confirmation was granted.
+If admission is blocked, report the findings and obtain the runtime's required
+operator confirmation instead of disabling scanning or forcing installation.
+Plugin source approval is also separate from permission to override built-in
+tools; do not grant the latter just to make setup finish.
+
+Hermes versions that expose `plugins install --ref` may use it
 as a shorter equivalent. The release installer below consumes an archive built
 from these same files. A community-index entry should pin an immutable commit
 or release tag; until such an entry is published, use the exact-checkout source
@@ -93,29 +264,16 @@ its candidate capability API.
 
 Verified install (the helper also forwards any installer arguments after the two URLs):
 
-```sh
-install_verified() (
-  set -eu
-  installer_url="$1"
-  checksum_url="$2"
-  shift 2
-  installer_script="${installer_url##*/}"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
-  curl -fsSL "$installer_url" -o "$tmpdir/$installer_script"
-  curl -fsSL "$checksum_url" -o "$tmpdir/$installer_script.sha256"
-  if command -v shasum >/dev/null 2>&1; then
-    (cd "$tmpdir" && shasum -a 256 -c "$installer_script.sha256")
-  elif command -v sha256sum >/dev/null 2>&1; then
-    (cd "$tmpdir" && sha256sum -c "$installer_script.sha256")
-  else
-    echo "error: need shasum or sha256sum to verify the installer" >&2
-    exit 1
-  fi
-  bash "$tmpdir/$installer_script" "$@"
-)
+First copy the [verified installer helper](../../README.md#verified-installer-helper)
+into this shell. Then select the release documented here:
 
+```sh
 base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
+```
+
+Run this example in the same shell where `install_verified` was defined.
+
+```sh
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256"
 ```
@@ -129,10 +287,10 @@ For repeatable noninteractive setup, pass the allowed inviter/welcomer and allow
 message sender as either an `npub` or raw hex public key. `--allow-user` may be
 repeated or given a comma-separated list to authorize multiple senders:
 
-Run this example in the same shell where `install_verified` above was defined.
+Run this example in the same shell where `install_verified` was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
+# Reuse the selected base_url from the same shell above.
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256" \
   --yes \
@@ -143,12 +301,12 @@ install_verified "$base_url/install-hermes-marmot.sh" \
 Generated-identity onboarding is the default (and can be selected explicitly
 with `--generate-identity`). To preserve an existing Nostr identity, place its
 `nsec` or raw secret hex in a regular file owned by the current user with mode
-`0600`, then use a pinned release URL:
+`0600`, then use the selected (or a saved, reviewed) release URL:
 
-Run this example in the same shell where `install_verified` above was defined.
+Run this example in the same shell where `install_verified` was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
+# Reuse the selected base_url from the same shell above.
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256" \
   --yes \
@@ -175,10 +333,10 @@ the installers never opt into shared home/socket state silently.
 
 To accept Marmot messages from any sender (explicit opt-in):
 
-Run this example in the same shell where `install_verified` above was defined.
+Run this example in the same shell where `install_verified` was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
+# Reuse the selected base_url from the same shell above.
 install_verified "$base_url/install-hermes-marmot.sh" \
   "$base_url/install-hermes-marmot.sh.sha256" \
   --yes --allow-all-users
@@ -587,6 +745,58 @@ then stages a private copy under `MARMOT_OUTBOUND_MEDIA_DIR` (defaults to
 `$MARMOT_HOME/dev/outbound-media`), sends only that path, and removes it after
 the connector responds. `wn-agent` must independently allow that exact staging
 directory with `--media-allowed-root`; without one, path sends fail closed.
+
+#### Sending a generated file
+
+`MEDIA:<absolute-path>` is Hermes's file-delivery syntax, not a permission to
+read any path. Copy a generated file into the active `MARMOT_MEDIA_LOCAL_ROOTS`
+first. With the default configuration and the **same** connector home used by
+the running adapter:
+
+```sh
+install -d -m 0700 "$MARMOT_HOME/dev/inbound-media"
+install -m 0600 /absolute/path/to/report.pdf \
+  "$MARMOT_HOME/dev/inbound-media/report.pdf"
+```
+
+Return a plain line containing the resulting absolute path, for example:
+
+```text
+MEDIA:/home/alice/.marmot-agents/hermes-research/dev/inbound-media/report.pdf
+```
+
+Substitute the actual staged path; `$MARMOT_HOME` is not expanded inside an
+agent's final text. The path must be a regular non-symlink file readable by the
+gateway. Do not wrap the directive in a code fence in the outgoing message or
+use a Markdown link as a substitute for delivery.
+
+For a dedicated export-source directory, configure `media_local_roots` in the
+Marmot platform extra (or `MARMOT_MEDIA_LOCAL_ROOTS` if no extra overrides it),
+create that directory before the adapter starts, and reload the selected gateway.
+The default is **not** the current workspace or arbitrary `/tmp` output. Keep
+source authorization separate from `MARMOT_OUTBOUND_MEDIA_DIR` and the daemon's
+`--media-allowed-root`; changing one does not configure the others. See the
+connector's [outbound media paths](../../../crates/agent-connector/README.md#outbound-media-paths)
+for split-user/container permissions. Never allow the entire home or filesystem.
+
+#### Upload endpoints and voice notes
+
+A Nostr relay setting is not a Blossom endpoint setting. Encrypted attachments,
+including audio routed through `send_voice`, use MDK's encrypted-media upload
+path and require a server that accepts opaque `application/octet-stream` bytes.
+Source/staging root permissions fix local access errors, not upload server
+selection or server size limits.
+
+MDK already has persistent admin-authorized group endpoint replacement through
+[`wn media set-endpoints`](../../../crates/cli/README.md#media) and the shared
+runtime/bindings. It changes signed group policy, not a Hermes preference, and
+is not currently an agent-control endpoint-setting request. Build-time
+`MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS` sets defaults for new groups; exporting
+it when starting an installed binary does not reconfigure existing groups.
+Do not promise that installing the connector imports an account's kind-10063
+Blossom server list. Keep the endpoint-selection feature separate from
+[voice-note intent](https://github.com/marmot-protocol/mdk/issues/1252) and
+[negotiated media size limits](https://github.com/marmot-protocol/mdk/issues/1355).
 
 Hermes multi-image responses are sent as one ordered Marmot media message, not
 as one message per image. The adapter accepts at most 10 attachments and caps

@@ -4,7 +4,9 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
+from unittest import mock
 
 
 SCRIPT_PATH = Path(__file__).with_name("test_real_hermes_plugin.py")
@@ -15,6 +17,85 @@ SPEC.loader.exec_module(PROBE)
 
 
 class SourceInstallCapabilityTests(unittest.TestCase):
+    def test_local_fixture_scan_confirmation_is_explicit(self):
+        with mock.patch.object(sys, "argv", [str(SCRIPT_PATH)]):
+            self.assertFalse(PROBE._parse_args().accept_known_local_plugin_caution)
+        with mock.patch.object(sys, "argv", [str(SCRIPT_PATH), "--accept-known-local-plugin-caution"]):
+            self.assertTrue(PROBE._parse_args().accept_known_local_plugin_caution)
+
+    def test_scan_preflight_only_confirms_observed_caution(self):
+        class Blocked(Exception):
+            def __init__(self, result):
+                self.scan_result = result
+
+        retained_scans = []
+        for verdict, consent, expected in (
+            ("safe", False, False), ("safe", True, False),
+            ("caution", False, None), ("caution", True, True),
+            ("dangerous", False, None), ("dangerous", True, None),
+        ):
+            with self.subTest(verdict=verdict, consent=consent):
+                guard = types.ModuleType("tools.plugin_guard")
+                guard.scan_plugin = lambda *a, verdict=verdict, **kw: types.SimpleNamespace(
+                    verdict=verdict, findings=[types.SimpleNamespace(pattern_id="python_subprocess")])
+                def scan(*a, force, guard=guard, **kw):
+                    result = guard.scan_plugin()
+                    if result.verdict == "dangerous" or (result.verdict == "caution" and not force):
+                        raise Blocked(result)
+                    return result
+                retained_scans.append((verdict, guard.scan_plugin, scan))
+                command = types.SimpleNamespace(_scan_plugin_tree=scan, PluginScanBlocked=Blocked)
+                with mock.patch.dict(sys.modules, {"tools.plugin_guard": guard}):
+                    if expected is None:
+                        with self.assertRaises(Blocked):
+                            PROBE._local_plugin_install_force(command, Path("fixture"), accept_caution=consent)
+                    else:
+                        self.assertIs(PROBE._local_plugin_install_force(
+                            command, Path("fixture"), accept_caution=consent), expected)
+
+        for expected_verdict, scan_plugin, scan in retained_scans:
+            with self.subTest(retained_verdict=expected_verdict):
+                self.assertEqual(scan_plugin().verdict, expected_verdict)
+                if expected_verdict == "dangerous":
+                    with self.assertRaises(Blocked):
+                        scan(force=True)
+                else:
+                    self.assertEqual(scan(force=True).verdict, expected_verdict)
+
+    def test_scan_preflight_rejects_unknown_or_empty_caution_findings(self):
+        class Blocked(Exception):
+            def __init__(self, result):
+                self.scan_result = result
+        for patterns in ([], ["new_scanner_pattern"], ["python_subprocess", "new_scanner_pattern"]):
+            with self.subTest(patterns=patterns):
+                result = types.SimpleNamespace(verdict="caution", findings=[
+                    types.SimpleNamespace(pattern_id=pattern) for pattern in patterns])
+                scan = mock.Mock(side_effect=Blocked(result))
+                command = types.SimpleNamespace(_scan_plugin_tree=scan, PluginScanBlocked=Blocked)
+                with self.assertRaises(Blocked):
+                    PROBE._local_plugin_install_force(command, Path("fixture"), accept_caution=True)
+                scan.assert_called_once_with(Path("fixture"), "pinned-local-fixture", force=False)
+
+    def test_scan_preflight_rejects_a_host_that_forces_dangerous_verdicts(self):
+        class Blocked(Exception):
+            def __init__(self, result):
+                self.scan_result = result
+        guard = types.ModuleType("tools.plugin_guard")
+        guard.scan_plugin = lambda *a, **kw: types.SimpleNamespace(verdict="caution", findings=[types.SimpleNamespace(pattern_id="python_subprocess")])
+        def scan(*a, force, **kw):
+            result = guard.scan_plugin()
+            if not force:
+                raise Blocked(result)
+            return result
+        command = types.SimpleNamespace(_scan_plugin_tree=scan, PluginScanBlocked=Blocked)
+        with mock.patch.dict(sys.modules, {"tools.plugin_guard": guard}):
+            with self.assertRaisesRegex(AssertionError, "allows a dangerous"):
+                PROBE._local_plugin_install_force(command, Path("fixture"), accept_caution=True)
+
+    def test_older_hosts_without_scanner_never_force_install(self):
+        self.assertFalse(PROBE._local_plugin_install_force(
+            types.SimpleNamespace(), Path("fixture"), accept_caution=True))
+
     def test_plugin_only_artifact_contains_and_imports_inbound_spool(self):
         mdk_source = Path(__file__).resolve().parents[4]
         mdk_ref = subprocess.check_output(

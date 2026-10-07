@@ -26,6 +26,9 @@
 
 ### Fixed
 
+- The HPKE dependency now uses `libcrux-kem` 0.0.10, fixing malformed hybrid-key
+  and short-seed panics (RUSTSEC-2026-0330 and RUSTSEC-2026-0331). A documented
+  compatibility patch preserves the existing HPKE and OpenMLS versions.
 - When a member lookup does not complete and the member's known inbox relay
   list has no usable relays, the invite now fails with "known member inbox
   relay list has no usable relays and its refresh did not complete" instead

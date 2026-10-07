@@ -17,6 +17,8 @@ with `codex exec resume --json <thread-id> -`.
 
 ## Contents
 
+- [What you can do](#what-you-can-do)
+- [First-install checklist](#first-install-checklist)
 - [Install (Codex Already Installed)](#install-codex-already-installed)
 - [Manual Setup](#manual-setup)
 - [Chat Commands](#chat-commands)
@@ -24,6 +26,59 @@ with `codex exec resume --json <thread-id> -`.
 - [Inbound attachments](#inbound-attachments)
 - [Security Notes](#security-notes)
 - [Development](#development)
+
+## What you can do
+
+For task titles and progress reactions, use the shared
+[recommended chat setup](../../README.md#recommended-chat-setup), including
+admin promotion and the phone acceptance test. Agent policy is in
+[the integration instructions](../../AGENTS.md#suggested-agent-chat-instructions).
+Each ordinary turn exposes the shared `wn-agent group-profile` route for
+admin name/description updates. Verify that the installed release includes it,
+`wn-agent` is on the backend's PATH, and the backend's shell/sandbox policy permits
+access to the connector socket. See [Admin group profile updates](#admin-group-profile-updates).
+Progress reactions require a separately configured tool; the harness has none built in.
+
+- **Work through Codex from your phone.** Send a prompt from an authorized
+  White Noise account and use the backend's configured model and tools.
+  Every allowed message activates the harness; mentioning the agent is not required.
+
+- **Continue or reset the conversation.** Codex creates a separate thread for each chat and resumes that thread on later prompts. Completed assistant messages reach the phone; reasoning, tool/command output and partial events do not.
+  `/new` resets the backend session while retaining the project.
+
+- **Know the file contract.** Images use native CLI image inputs; other supported files use a staged-file manifest and normal file tools. Native audio/PDF interpretation is not guaranteed. Generated-file return is available only through opt-in, exact chat/root grants and a completion manifest. See [Configuration](#configuration) and [Inbound attachments](#inbound-attachments).
+
+Project selection (`/cd`), standing instructions (`/goal`), and recovery
+commands share the [terminal-harness command guide](../../terminal-harness/README.md#chat-commands).
+
+Tool access, credentials and model choices come from the backend's native
+configuration and the [execution profile](../../terminal-harness/README.md#execution-profiles).
+The harness does not implement mention activation, reaction tools
+or live previews. An interactive backend's slash commands are not automatically
+available through this chat; shared harness commands are handled locally.
+
+## First-install checklist
+
+Follow the [shared terminal-harness first-install guide](../../terminal-harness/README.md#first-installation-and-verification)
+before the release command below. It covers the two services, matching home and
+socket, sender authorization, manual environment loading, independent instance
+state, execution policy and the required phone/model round trip.
+
+Verify native Codex authentication and a local non-interactive turn as the
+service user, with the intended configuration and a trusted Git working
+directory. `WN_CODEX_BIN` / `--codex-bin` selects the executable; the connector
+does not log in, rewrite global Codex settings or implement TUI slash commands.
+Select the repository in the phone chat before the first model prompt: the
+harness's default working directory is the service user's home, which may not
+be a Git repository.
+
+Use a text-only round trip first. Native image inputs require the documented
+CLI image capability; other supported files are offered through a staged-file
+manifest and ordinary file tools. A staged audio/PDF path is not a promise of
+native transcription/PDF processing. Generated files are returned only when
+Codex artifact export is explicitly enabled with an exact chat/root grant,
+backend write access and a connector-approved staging root. An assistant's
+`MEDIA:` line or Markdown download link does not trigger this exporter.
 
 ## Install (Codex Already Installed)
 
@@ -42,29 +97,16 @@ the current guided install command and the steps to finish in White Noise.
 
 For noninteractive setup, provide the allowed inviter and prompt sender:
 
-```sh
-install_verified() (
-  set -eu
-  installer_url="$1"
-  checksum_url="$2"
-  shift 2
-  installer_script="${installer_url##*/}"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
-  curl -fsSL "$installer_url" -o "$tmpdir/$installer_script"
-  curl -fsSL "$checksum_url" -o "$tmpdir/$installer_script.sha256"
-  if command -v shasum >/dev/null 2>&1; then
-    (cd "$tmpdir" && shasum -a 256 -c "$installer_script.sha256")
-  elif command -v sha256sum >/dev/null 2>&1; then
-    (cd "$tmpdir" && sha256sum -c "$installer_script.sha256")
-  else
-    echo "error: need shasum or sha256sum to verify the installer" >&2
-    exit 1
-  fi
-  bash "$tmpdir/$installer_script" "$@"
-)
+First copy the [verified installer helper](../../README.md#verified-installer-helper)
+into this shell. Then select the release documented here:
 
+```sh
 base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
+```
+
+Run this example in the same shell where `install_verified` was defined.
+
+```sh
 install_verified "$base_url/install-codex-marmot.sh" \
   "$base_url/install-codex-marmot.sh.sha256" \
   --yes --allow-welcomer npub1...
@@ -89,20 +131,28 @@ codex --version
 Install Codex first and authenticate it normally, then run an isolated
 `wn-agent` identity and the harness:
 
+In terminal 1, run the daemon only if its service is not already running:
+
 ```sh
 export MARMOT_HOME="$HOME/.marmot-agents/codex"
 export MARMOT_AGENT_SOCKET="$MARMOT_HOME/dev/wn-agent.sock"
-export WN_CODEX_ALLOWED_SENDERS_HEX="..."
-
-# Shell 1: wn-agent runs in the foreground.
+export WN_CODEX_ALLOWED_SENDERS_HEX="<phone-public-key-as-64-hex-characters>"
 wn-agent --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
+```
 
-# Shell 2: bootstrap the identity, then start the harness.
+In terminal 2, export the same settings again, bootstrap the single sender in
+this example, then start the harness only if its service is not already running:
+
+```sh
+export MARMOT_HOME="$HOME/.marmot-agents/codex"
+export MARMOT_AGENT_SOCKET="$MARMOT_HOME/dev/wn-agent.sock"
+export WN_CODEX_ALLOWED_SENDERS_HEX="<phone-public-key-as-64-hex-characters>"
 wn-agent bootstrap --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" \
-  --label codex-harness-agent --allow-welcomer "$WN_CODEX_ALLOWED_SENDERS_HEX" --qr
-
+  --label codex-harness-agent --allow-welcomer "$WN_CODEX_ALLOWED_SENDERS_HEX" \
+  --relay wss://relay.eu.whitenoise.chat \
+  --relay wss://relay.us.whitenoise.chat --qr
 wn-codex
 ```
 
@@ -161,12 +211,24 @@ for routing, release compatibility, permissions and uncertain outcomes.
 | `WN_CODEX_ARTIFACT_MAX_COUNT` | `10` | Maximum artifacts accepted per result; configurable from 1 to 10 |
 | `WN_CODEX_ARTIFACT_STAGING_ROOT` | `$MARMOT_HOME/media-uploads` | Private staging root that must also be passed to `wn-agent --media-allowed-root` |
 
-Artifact export is fail-closed and Codex-only in the initial release. Enable it only with both layers configured:
+Artifact export is fail-closed and Codex-only in the initial release. Enable it
+only with both layers configured.
+
+The following is a manual daemon example, not a second daemon to run beside
+an installed service. Update/restart the existing daemon with the same approved
+staging-root flag, or run it manually as shown. Create the private staging root
+first, configure the real chat/root grant, and start `wn-codex` in a second
+terminal that exports these same `WN_CODEX_ARTIFACT_*` values and the account /
+sender settings. For managed installs, persist the values in the harness's
+actual service environment; changing only `dev/wn-codex.env` does not change the
+generated service. Do not start with a placeholder grant or claim export works
+before a completion manifest is accepted and the file appears in White Noise.
 
 ```sh
 export WN_CODEX_ARTIFACT_EXPORTS_ENABLED=true
 export WN_CODEX_ARTIFACT_GRANTS_JSON='[{"group_id_hex":"<opaque-hex-group-id>","export_root":"'"$HOME"'/src/my-project/output","ttl_seconds":300}]'
 export WN_CODEX_ARTIFACT_STAGING_ROOT="$MARMOT_HOME/media-uploads"
+install -d -m 0700 "$WN_CODEX_ARTIFACT_STAGING_ROOT"
 wn-agent --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" \
   --media-allowed-root "$WN_CODEX_ARTIFACT_STAGING_ROOT" \
   --relay wss://relay.eu.whitenoise.chat \
