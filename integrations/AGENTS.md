@@ -14,12 +14,13 @@ systems to Marmot through `wn-agent`.
 - `codex/marmot` - `wn-codex` Codex harness binary.
 - `opencode/marmot` - `wn-opencode` OpenCode harness binary.
 - `pi/marmot` - `wn-pi` Pi harness binary.
+- `goose/marmot` - `wn-goose` Goose harness binary.
 - `terminal-harness` - shared terminal-harness control/runtime library
   (`marmot-terminal-harness`).
 - `test_installer_systemd_service.sh` - shared systemd-service installer check
   invoked by the Hermes and OpenClaw dev-script tests.
 
-Installer scripts live in `scripts/install-*-marmot.sh`; the four terminal
+Installer scripts live in `scripts/install-*-marmot.sh`; the five terminal
 harness installers are thin wrappers over `scripts/install-terminal-harness-marmot.sh`.
 
 The shared boundary is the `marmot.agent-control.v2` NDJSON protocol over a
@@ -35,7 +36,7 @@ deletes, invite policy, and local storage.
 - Treat `MARMOT_HOME`, `MARMOT_AGENT_SOCKET`, `MARMOT_AGENT_AUTH_TOKEN_FILE`,
   `MARMOT_AGENT_AUTH_TOKEN`, and `MARMOT_ACCOUNT_ID_HEX` as the common connector
   vocabulary. Use integration-specific prefixes only for integration-specific
-  behavior, for example `WN_OPENCODE_*` and `WN_PI_*`.
+  behavior, for example `WN_OPENCODE_*`, `WN_PI_*`, and `WN_GOOSE_*`.
 - Prefer explicit account ids in production configuration. Auto-select only the
   sole local-signing account; fail closed when multiple local-signing accounts
   are available.
@@ -60,7 +61,7 @@ runtime to Marmot and may own activation policy, message-tool routing, live
 preview adaptation, media staging policy, profile onboarding, and gateway
 session behavior.
 
-`wn-claude`, `wn-codex`, `wn-opencode`, and `wn-pi` are pure terminal harnesses. They subscribe to allowed
+`wn-claude`, `wn-codex`, `wn-opencode`, `wn-pi`, and `wn-goose` are pure terminal harnesses. They subscribe to allowed
 Marmot prompts and invoke their respective binaries; they should stay narrower than the
 gateway integrations unless there is a concrete product reason to broaden it.
 
@@ -132,11 +133,12 @@ Installer expectations:
 The default Hermes, OpenClaw, and terminal-harness service names are
 connector-specific
 (`wn-agent-hermes.service`, `wn-agent-openclaw.service`, `wn-agent-claude.service`,
-`wn-agent-codex.service`, `wn-agent-harnesses.service`, `wn-agent-pi.service`,
+`wn-agent-codex.service`, `wn-agent-harnesses.service`, `wn-agent-pi.service`, `wn-agent-goose.service`,
 `org.marmot.wn-agent.hermes`, `org.marmot.wn-agent.openclaw`,
 `org.marmot.wn-agent.claude`, `org.marmot.wn-agent.codex`,
-`org.marmot.wn-agent.harnesses`, and `org.marmot.wn-agent.pi`). Harness services
-are also connector-specific (`wn-claude`, `wn-codex`, `wn-opencode`, and `wn-pi`). If you add a new
+`org.marmot.wn-agent.harnesses`, `org.marmot.wn-agent.pi`, and
+`org.marmot.wn-agent.goose`). Harness services are also connector-specific
+(`wn-claude`, `wn-codex`, `wn-opencode`, `wn-pi`, and `wn-goose`). If you add a new
 production installer, choose names that can coexist with the existing
 integrations on the same login.
 
@@ -171,6 +173,10 @@ cargo test -p marmot-terminal-harness
 cargo test -p wn-pi
 just pi-dev-e2e-connector
 just pi-installer-test
+
+cargo test -p wn-goose
+just goose-dev-e2e-connector
+just goose-installer-test
 ```
 
 When editing install examples in any integration README, `integrations/README.md`,
@@ -206,7 +212,7 @@ New integrations should follow the existing shape:
 - share installer/release conventions with the existing scripts;
 - document whether the integration is a gateway/channel plugin or a pure
   harness;
-- document coexistence with Hermes, OpenClaw, Claude Code, Codex, OpenCode, and Pi before landing
+- document coexistence with Hermes, OpenClaw, Claude Code, Codex, OpenCode, Pi, and Goose before landing
   production install support.
 
 ## Installation policy

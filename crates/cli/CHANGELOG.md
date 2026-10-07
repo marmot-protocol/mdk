@@ -9,6 +9,15 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- WN Agent releases now include the `wn-goose` terminal-harness connector and
+  `install-goose-marmot.sh` for [Goose](https://github.com/aaif-goose/goose)
+  1.53.0 or newer. It runs one `goose run` per prompt under a connector-generated
+  session name and supports the `inherit` and `unrestricted` execution
+  profiles. It refuses `autonomous`, because no Goose mode skips approval
+  prompts while still enforcing configured tool denies.
+
 ### Changed
 
 - `relay.damus.io` is no longer a retired relay host. The relay is still

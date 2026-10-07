@@ -50,7 +50,7 @@ for label, text in (("integrations/README.md", quickstart), ("release.md", relea
             file=sys.stderr,
         )
         raise SystemExit(1)
-quickstart_expected_calls = {"hermes": 2, "openclaw": 1, "claude": 1, "codex": 2, "opencode": 1, "pi": 1}
+quickstart_expected_calls = {"hermes": 2, "openclaw": 1, "claude": 1, "codex": 2, "opencode": 1, "pi": 1, "goose": 1}
 for connector, quickstart_expected in quickstart_expected_calls.items():
     installer = f"install-{connector}-marmot.sh"
     call = f'install_verified "$base_url/{installer}"'
@@ -77,7 +77,7 @@ for path in tracked(sys.argv[2:]):
     if "releases/download/wn-agent-latest/install-" in text:
         raise SystemExit(f"error: {path}: active install guidance uses a mutable release alias")
     for match in re.finditer(
-        r"wn-agent-v[0-9]+\.[0-9]+\.[0-9]+/install-(?:hermes|openclaw|claude|codex|opencode|pi)-marmot\.sh", text
+        r"wn-agent-v[0-9]+\.[0-9]+\.[0-9]+/install-(?:hermes|openclaw|claude|codex|opencode|pi|goose)-marmot\.sh", text
     ):
         if not match.group().startswith(f"wn-agent-v{version}/"):
             raise SystemExit(f"error: {path}: agent install guidance does not match workspace version {version}")

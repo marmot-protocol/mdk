@@ -1,7 +1,7 @@
 # Marmot Integrations
 
 Connectors that let you chat with an agent runtime you already run (Hermes, OpenClaw, Claude Code, Codex, OpenCode,
-or Pi) from White Noise, over end-to-end encrypted Marmot groups. Each connector runs next to the local `wn-agent`
+Pi, or Goose) from White Noise, over end-to-end encrypted Marmot groups. Each connector runs next to the local `wn-agent`
 service on your Mac or Linux machine. Start with [Get Started](#get-started-white-noise--agents); the later sections
 explain topology, identities, and sharing for operators.
 
@@ -40,6 +40,7 @@ Choose the runtime you already use:
 | Codex | Terminal harness | Repository and coding tasks through Codex |
 | OpenCode | Terminal harness | Repository and coding tasks through OpenCode |
 | Pi | Terminal harness | Repository and coding tasks through Pi |
+| Goose | Terminal harness | Repository and coding tasks through Goose |
 
 The guided installers prompt on the terminal for the White Noise account that
 may invite and message the agent. They install the selected WN Agent release, create
@@ -170,6 +171,19 @@ install_verified "$base_url/install-pi-marmot.sh" \
   "$base_url/install-pi-marmot.sh.sha256"
 ```
 
+### Goose
+
+Goose 1.53.0 or newer must already be installed, configured with a provider,
+and runnable as `goose`. The Goose harness supports the `inherit` and
+`unrestricted` execution profiles only.
+
+Run this example in the same shell where `install_verified` above was defined.
+
+```sh
+install_verified "$base_url/install-goose-marmot.sh" \
+  "$base_url/install-goose-marmot.sh.sha256"
+```
+
 ### Finish In White Noise
 
 Each installer records the new agent's `npub` and `nprofile` in the
@@ -180,7 +194,7 @@ python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["npub"]); p
   "$HOME/.marmot-agents/codex/bootstrap.json"
 ```
 
-Use `hermes`, `openclaw`, `claude`, `codex`, `harnesses` (OpenCode), or `pi` in that path.
+Use `hermes`, `openclaw`, `claude`, `codex`, `harnesses` (OpenCode), `pi`, or `goose` in that path.
 The installers also show these values directly and render a terminal QR when
 `qrencode` is installed.
 
@@ -189,7 +203,7 @@ The installers also show these values directly and render a terminal QR when
 3. Send a test message.
 
 Hermes and OpenClaw print one final gateway restart command because the installer
-does not restart an existing gateway. Claude Code, Codex, OpenCode, and Pi services are
+does not restart an existing gateway. Claude Code, Codex, OpenCode, Pi, and Goose services are
 started by the default install. Their first group message can be `/<path>` to
 select a working directory under your home directory.
 
@@ -215,7 +229,7 @@ install_verified "$base_url/install-codex-marmot.sh" \
   --yes --allow-welcomer "$OWNER_NPUB"
 ```
 
-Replace `codex` in the URL with `claude`, `openclaw`, `opencode`, or `pi`. Hermes keeps
+Replace `codex` in the URL with `claude`, `openclaw`, `opencode`, `pi`, or `goose`. Hermes keeps
 invite acceptance and message-sender authorization explicit:
 
 Run this example in the same shell where `install_verified` above was defined.
@@ -410,8 +424,9 @@ Current integrations:
 - [`codex/marmot`](codex/marmot) - `wn-codex` Codex harness binary.
 - [`opencode/marmot`](opencode/marmot) - `wn-opencode` OpenCode harness binary.
 - [`pi/marmot`](pi/marmot) - `wn-pi` Pi harness binary.
+- [`goose/marmot`](goose/marmot) - `wn-goose` Goose harness binary.
 - [`terminal-harness`](terminal-harness) - shared hardened runtime for the
-  Claude Code, Codex, OpenCode, and Pi terminal harnesses.
+  Claude Code, Codex, OpenCode, Pi, and Goose terminal harnesses.
 
 All integrations are intentionally thin at the Marmot boundary. They do not own MLS
 state, Nostr transport, local account storage, relay access, QUIC preview
@@ -429,6 +444,7 @@ The release installers are published with the `wn-agent-v*` release family:
 - `scripts/install-codex-marmot.sh`
 - `scripts/install-opencode-marmot.sh`
 - `scripts/install-pi-marmot.sh`
+- `scripts/install-goose-marmot.sh`
 
 By default the production-shaped installs create separate local agent identities
 per connector:
@@ -441,24 +457,25 @@ per connector:
 | Codex harness | `$HOME/.marmot-agents/codex` | `wn-agent-codex.service` / `org.marmot.wn-agent.codex` plus `wn-codex.service` / `org.marmot.wn-codex` |
 | OpenCode harness | `$HOME/.marmot-agents/harnesses` | `wn-agent-harnesses.service` / `org.marmot.wn-agent.harnesses` plus `wn-opencode.service` / `org.marmot.wn-opencode` |
 | Pi harness | `$HOME/.marmot-agents/pi` | `wn-agent-pi.service` / `org.marmot.wn-agent.pi` plus `wn-pi.service` / `org.marmot.wn-pi` |
+| Goose harness | `$HOME/.marmot-agents/goose` | `wn-agent-goose.service` / `org.marmot.wn-agent.goose` plus `wn-goose.service` / `org.marmot.wn-goose` |
 
 Each home derives its own default socket at `$MARMOT_HOME/dev/wn-agent.sock` and
 uses the public relay defaults shared with the phone app pilot setup. Claude Code,
-Codex, OpenCode, and Pi use separate connector homes and Marmot identities by default. They share
+Codex, OpenCode, Pi, and Goose use separate connector homes and Marmot identities by default. They share
 implementation in `integrations/terminal-harness`, but they do not share prompts,
 sessions, sockets, or services unless an operator explicitly configures a shared
 deployment.
 
 Hermes and OpenClaw install or patch their host-runtime plugin configuration and
 then print restart guidance for the existing gateway. They do not restart the
-gateway automatically. `wn-claude`, `wn-codex`, `wn-opencode`, and `wn-pi` each install their own harness
+gateway automatically. `wn-claude`, `wn-codex`, `wn-opencode`, `wn-pi`, and `wn-goose` each install their own harness
 binary and service in addition to `wn-agent`, because they are standalone
 harnesses rather than plugins loaded by an existing gateway.
 
 ## Identity Model
 
 The default topology creates or reuses one Marmot account per connector home,
-which means Hermes, OpenClaw, Claude Code, Codex, OpenCode, and Pi present as separate Nostr
+which means Hermes, OpenClaw, Claude Code, Codex, OpenCode, Pi, and Goose present as separate Nostr
 identities when installed with default options.
 
 Within each home, `wn-agent bootstrap` lists local-signing accounts and reuses one
@@ -474,8 +491,9 @@ The installers persist the selected account into connector-specific config:
 - `wn-codex` uses `WN_CODEX_ACCOUNT_ID_HEX`.
 - `wn-opencode` uses `WN_OPENCODE_ACCOUNT_ID_HEX`.
 - `wn-pi` uses `WN_PI_ACCOUNT_ID_HEX`.
+- `wn-goose` uses `WN_GOOSE_ACCOUNT_ID_HEX`.
 
-Installing all six connectors on one machine with default options therefore
+Installing all seven connectors on one machine with default options therefore
 creates distinct agent identities and distinct chat/group memberships.
 
 ## What Is Shared
@@ -514,6 +532,10 @@ Each host runtime keeps its own runtime state:
 - `wn-pi` keeps harness configuration in `$MARMOT_HOME/dev/wn-pi.env`, connector
   state under `$XDG_STATE_HOME/wn-pi`, and Pi sessions under
   `$MARMOT_HOME/dev/pi-sessions` by default.
+- `wn-goose` keeps harness configuration in `$MARMOT_HOME/dev/wn-goose.env`
+  and connector state under `$XDG_STATE_HOME/wn-goose` by default. Goose
+  sessions live in the operator's Goose session store, or under
+  `WN_GOOSE_PATH_ROOT` when that is set.
 
 Each integration also makes its own activation decision:
 
@@ -522,21 +544,22 @@ Each integration also makes its own activation decision:
   mention-style activation and always reply in effective DMs. Activation cannot
   widen sender authorization. They also support richer gateway features such as
   live previews, durable reply routing, profile onboarding, and media handling.
-- `wn-claude`, `wn-codex`, `wn-opencode`, and `wn-pi` are pure harnesses. They currently support only
+- `wn-claude`, `wn-codex`, `wn-opencode`, `wn-pi`, and `wn-goose` are pure harnesses. They currently support only
   `always` activation for prompt messages from explicitly allowed senders, and
   have no profile onboarding or live-preview behavior. Their shared runtime
   validates and privately stages bounded ordered attachment batches. `wn-codex`
   maps image batches to ordered Codex image inputs; `wn-opencode` passes each
   file as an ordered `opencode run --file` argument; `wn-pi` passes each image
   or UTF-8 text file as an ordered `@file` operand and rejects the whole batch
-  before spawning Pi if any file is another type; `wn-claude` rejects every
-  non-empty batch, including its accompanying text, before spawning its backend.
+  before spawning Pi if any file is another type; `wn-claude` and `wn-goose`
+  reject every non-empty batch, including its accompanying text, before
+  spawning their backend.
 
 Because activation is per integration, there is no global "claim this message"
 lease in shared-account deployments. If several integrations subscribe to the
 same account and group, every eligible integration can reply. For example, a
 direct message from an allowlisted sender could trigger Hermes/OpenClaw,
-`wn-claude`, `wn-codex`, `wn-opencode`, and `wn-pi` if all are running and configured for that account.
+`wn-claude`, `wn-codex`, `wn-opencode`, `wn-pi`, and `wn-goose` if all are running and configured for that account.
 
 ## Allowlist Behavior
 
@@ -635,6 +658,10 @@ cargo test -p marmot-terminal-harness
 cargo test -p wn-pi
 just pi-dev-e2e-connector
 just pi-installer-test
+
+cargo test -p wn-goose
+just goose-dev-e2e-connector
+just goose-installer-test
 ```
 
 For release-installer work, test dry-runs and real release assets from the

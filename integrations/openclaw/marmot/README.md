@@ -152,8 +152,16 @@ active workspace or an OpenClaw-managed media store and use the normal message
 tool's `media` / `attachments` fields. Do not use a raw control-client call or
 Hermes `MEDIA:` syntax. The plugin restages authorized bytes under
 `MARMOT_OUTBOUND_MEDIA_DIR`; the one daemon must allow that same path with
-`--media-allowed-root`. For manual/container deployments configure both sides
-and shared path visibility. A successful text reply does not prove file delivery,
+`--media-allowed-root`. Before the file test, persist the daemon-approved
+absolute path as `MARMOT_OUTBOUND_MEDIA_DIR` in the selected OpenClaw gateway's
+service environment, then restart that gateway. This also applies to managed
+release installs: the installer configures `channels.marmot.home` and the
+daemon's allowed root, but does not set the existing gateway's media-staging
+environment. An export in the installer shell does not configure a running
+managed gateway. For the default release home, use the absolute path to
+`~/.marmot-agents/openclaw/dev/outbound-media` (expand `~` before configuring the
+service). Manual/container deployments must configure both sides and shared
+path visibility. A successful text reply does not prove file delivery,
 and local source-root permission does not change the remote Blossom endpoint.
 
 ## Admin group profile tool
