@@ -403,6 +403,11 @@ fn presented_timeline(row: &app::TimelineMessageRecord, trusted: bool) -> Timeli
         row,
         trusted,
         super::common::markdown_content_tokens(row.kind, &row.plaintext),
+        if row.deleted {
+            None
+        } else {
+            app::sticker_ref_from_tags(row.kind, &row.tags).map(Into::into)
+        },
     )
 }
 
@@ -410,6 +415,7 @@ fn presented_timeline_with_tokens(
     row: &app::TimelineMessageRecord,
     trusted: bool,
     content_tokens: crate::markdown::MarkdownDocumentFfi,
+    sticker: Option<StickerRefFfi>,
 ) -> TimelineMessageRecordFfi {
     TimelineMessageRecordFfi {
         client_token: row.client_token.clone(),
@@ -427,11 +433,7 @@ fn presented_timeline_with_tokens(
         plaintext: row.plaintext.clone(),
         content_tokens,
         kind: row.kind,
-        sticker: if row.deleted {
-            None
-        } else {
-            app::sticker_ref_from_tags(row.kind, &row.tags).map(Into::into)
-        },
+        sticker,
         tags: super::common::message_tags_ffi(presented_custom_tags(row).into_owned()),
         timeline_at: row.timeline_at,
         received_at: row.received_at,
@@ -613,7 +615,12 @@ impl ConversationConversionCache {
         {
             self.conversions += 1;
         }
-        let converted = presented_timeline_with_tokens(&source, trusted, tokens);
+        let sticker = if row.deleted {
+            None
+        } else {
+            app::sticker_ref_from_tags(row.kind, &row.tags).map(Into::into)
+        };
+        let converted = presented_timeline_with_tokens(&source, trusted, tokens, sticker);
         self.rows.insert(
             row.message_id_hex.clone(),
             CachedConversationRow {

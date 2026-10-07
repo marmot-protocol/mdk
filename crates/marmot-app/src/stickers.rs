@@ -1064,7 +1064,7 @@ async fn publish_outboxed_event(
             created_at: event.created_at.as_secs(),
         })?;
     app.relay_plane
-        .publish_public_event(context.endpoints.clone(), event)
+        .publish_public_event(&context.account_id_hex, context.endpoints.clone(), event)
         .await
         .map_err(AppError::StickerRelay)?;
     apply_published_sticker_event(&context.storage, event)?;
@@ -1092,7 +1092,7 @@ async fn flush_sticker_outbox(
             .verify()
             .map_err(|_| invalid_sticker("stored sticker publication signature is invalid"))?;
         app.relay_plane
-            .publish_public_event(context.endpoints.clone(), &event)
+            .publish_public_event(&context.account_id_hex, context.endpoints.clone(), &event)
             .await
             .map_err(AppError::StickerRelay)?;
         apply_published_sticker_event(&context.storage, &event)?;
@@ -1536,20 +1536,26 @@ fn inspect_webp(bytes: &[u8]) -> Result<InspectedImage, AppError> {
             .ok_or_else(|| invalid_sticker("invalid WebP chunk length"))?;
         match kind {
             b"VP8X" if length >= 10 => {
-                dimensions = Some((
+                record_webp_dimensions(
+                    &mut dimensions,
                     le_u24(bytes, data + 4)?.saturating_add(1),
                     le_u24(bytes, data + 7)?.saturating_add(1),
-                ));
+                )?;
             }
             b"VP8L" if length >= 5 && bytes[data] == 0x2f => {
                 let bits = le_u32(bytes, data + 1)?;
-                dimensions = Some(((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1));
+                record_webp_dimensions(
+                    &mut dimensions,
+                    (bits & 0x3fff) + 1,
+                    ((bits >> 14) & 0x3fff) + 1,
+                )?;
             }
             b"VP8 " if length >= 10 && bytes.get(data + 3..data + 6) == Some(b"\x9d\x01\x2a") => {
-                dimensions = Some((
+                record_webp_dimensions(
+                    &mut dimensions,
                     u32::from(le_u16(bytes, data + 6)? & 0x3fff),
                     u32::from(le_u16(bytes, data + 8)? & 0x3fff),
-                ));
+                )?;
             }
             b"ANMF" => {
                 if length < 16 {
@@ -1595,6 +1601,19 @@ fn inspect_webp(bytes: &[u8]) -> Result<InspectedImage, AppError> {
         height,
         frames: frames.max(1),
     })
+}
+
+fn record_webp_dimensions(
+    dimensions: &mut Option<(u32, u32)>,
+    width: u32,
+    height: u32,
+) -> Result<(), AppError> {
+    let next = (width, height);
+    if dimensions.is_some_and(|current| current != next) {
+        return Err(invalid_sticker("conflicting WebP dimensions"));
+    }
+    *dimensions = Some(next);
+    Ok(())
 }
 
 fn validate_frame_rectangle(
@@ -2013,6 +2032,11 @@ mod tests {
         let mut trailing = webp_with_frame(32, 32, 0, 0, 16, 16);
         trailing.extend_from_slice(b"VP8L   /     ");
         assert!(inspect_image(&trailing).is_err());
+        let mut conflicting = webp_with_frame(32, 32, 0, 0, 16, 16);
+        conflicting.extend_from_slice(b"VP8L\x05\x00\x00\x00/\x00\x00\x00\x00\x00");
+        let riff_len = u32::try_from(conflicting.len() - 8).unwrap();
+        conflicting[4..8].copy_from_slice(&riff_len.to_le_bytes());
+        assert!(inspect_image(&conflicting).is_err());
         assert!(inspect_image(b"not an image").is_err());
     }
 

@@ -1,5 +1,6 @@
 //! C mirrors of the notification pipeline conversions.
 
+use super::sticker::MarmotStickerRef;
 use marmot_uniffi::conversions::{
     BackgroundNotificationCollectionFfi, CursorPersistenceFfi, NotificationCollectionStatusFfi,
     NotificationSettingsFfi, NotificationTrafficClassFfi, NotificationTriggerFfi,
@@ -118,6 +119,7 @@ c_mirror! {
         rec sender: MarmotNotificationUser,
         rec receiver: MarmotNotificationUser,
         opt_str preview_text,
+        opt_rec sticker: MarmotStickerRef,
         opt_str reaction_emoji,
         opt_str reacted_to_preview,
         copy timestamp_ms: i64,

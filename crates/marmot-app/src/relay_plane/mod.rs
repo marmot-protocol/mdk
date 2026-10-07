@@ -1855,6 +1855,7 @@ impl MarmotRelayPlane {
     /// privacy-safe errors, and acknowledgement accounting.
     pub(crate) async fn publish_public_event(
         &self,
+        account_id_hex: &str,
         endpoints: Vec<TransportEndpoint>,
         event: &Event,
     ) -> Result<NostrPublishOutcome, String> {
@@ -1874,8 +1875,12 @@ impl MarmotRelayPlane {
             .ok_or_else(|| "public event publish requires SDK relay plane".to_owned())?;
         let event = NostrTransportEvent::from_nostr_event(event)
             .map_err(|_| "public event publish: invalid signed event".to_owned())?;
+        let account_id = cgka_traits::MemberId::new(
+            hex::decode(account_id_hex)
+                .map_err(|_| "public event publish: invalid account".to_owned())?,
+        );
         relay_client
-            .publish_event(&endpoints, &event, 1)
+            .publish_event_for_account(&account_id, &endpoints, &event, 1)
             .await
             .map_err(|_| "public event publish failed".to_owned())
     }
