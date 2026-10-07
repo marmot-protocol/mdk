@@ -378,6 +378,14 @@ pub struct ConversationWindowSnapshotFfi {
 }
 // Borrow raw rows and retain only custom-event tags and chat NIP-30 `emoji` tags in the
 // FFI presentation. MDK-owned tags and full reactor collections use prepared references.
+fn conversation_sticker_ref(row: &app::TimelineMessageRecord) -> Option<app::AppStickerRef> {
+    if row.deleted {
+        None
+    } else {
+        app::sticker_ref_from_tags(row.kind, &row.tags)
+    }
+}
+
 fn presented_custom_tags(row: &app::TimelineMessageRecord) -> Cow<'_, [Vec<String>]> {
     // Defence in depth for in-memory records that did not cross the storage read boundary.
     if row.deleted {
@@ -403,11 +411,7 @@ fn presented_timeline(row: &app::TimelineMessageRecord, trusted: bool) -> Timeli
         row,
         trusted,
         super::common::markdown_content_tokens(row.kind, &row.plaintext),
-        if row.deleted {
-            None
-        } else {
-            app::sticker_ref_from_tags(row.kind, &row.tags).map(Into::into)
-        },
+        conversation_sticker_ref(row).map(Into::into),
     )
 }
 
@@ -518,6 +522,10 @@ pub(crate) struct ConversationConversionCache {
 }
 struct CachedConversationRow {
     source: app::TimelineMessageRecord,
+    // Original-tag sticker, not the stripped tags stored on `source`.
+    // Removing the sticker must miss the cache even though both presented
+    // tag lists are empty.
+    sticker: Option<app::AppStickerRef>,
     converted: TimelineMessageRecordFfi,
 }
 impl ConversationConversionCache {
@@ -560,10 +568,12 @@ impl ConversationConversionCache {
         ConversationWindowSnapshotFfi::with_messages(v, messages)
     }
     fn row(&mut self, row: &app::TimelineMessageRecord, trusted: bool) -> TimelineMessageRecordFfi {
+        let sticker = conversation_sticker_ref(row);
         let cached = self.rows.get(&row.message_id_hex);
-        if let Some(cached) = cached
-            .filter(|cached| visible_row_key(&cached.source, true) == visible_row_key(row, trusted))
-        {
+        if let Some(cached) = cached.filter(|cached| {
+            cached.sticker == sticker
+                && visible_row_key(&cached.source, true) == visible_row_key(row, trusted)
+        }) {
             return cached.converted.clone();
         }
         let source = app::TimelineMessageRecord {
@@ -615,16 +625,13 @@ impl ConversationConversionCache {
         {
             self.conversions += 1;
         }
-        let sticker = if row.deleted {
-            None
-        } else {
-            app::sticker_ref_from_tags(row.kind, &row.tags).map(Into::into)
-        };
-        let converted = presented_timeline_with_tokens(&source, trusted, tokens, sticker);
+        let sticker_ffi = sticker.clone().map(Into::into);
+        let converted = presented_timeline_with_tokens(&source, trusted, tokens, sticker_ffi);
         self.rows.insert(
             row.message_id_hex.clone(),
             CachedConversationRow {
                 source,
+                sticker,
                 converted: converted.clone(),
             },
         );
