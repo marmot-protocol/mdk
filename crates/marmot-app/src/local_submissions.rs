@@ -115,6 +115,16 @@ impl LocalMessageRequest {
     }
 }
 
+/// Choose a strictly newer edit second within the local 30-second skew budget.
+/// Prepared submissions keep their existing event identity instead of using this.
+pub(crate) fn next_edit_created_at(now: u64, previous: Option<u64>) -> Option<u64> {
+    let created_at = match previous {
+        Some(previous) => now.max(previous.checked_add(1)?),
+        None => now,
+    };
+    (created_at <= now.saturating_add(30)).then_some(created_at)
+}
+
 impl MarmotApp {
     pub(crate) fn finish_local_message(
         &self,
@@ -318,14 +328,15 @@ impl MarmotApp {
                 // Edit resolution uses (second, event id), not queue order.
                 // Give rapid local revisions strictly increasing seconds so
                 // the last submitted text remains the effective version.
-                if let Some(previous) = original_row.edit {
-                    event_created_at = event_created_at.max(previous.edited_at.saturating_add(1));
-                    if event_created_at > created_at.saturating_add(30) {
-                        return Err(AppError::InvalidAppMessagePayload(
-                            "pending edit rate limit: retry shortly".into(),
-                        ));
-                    }
-                }
+                event_created_at = next_edit_created_at(
+                    created_at,
+                    original_row.edit.map(|previous| previous.edited_at),
+                )
+                .ok_or_else(|| {
+                    AppError::InvalidAppMessagePayload(
+                        "pending edit rate limit: retry shortly".into(),
+                    )
+                })?;
                 AppMessageIntent::Edit {
                     target_message_id: original.message_id_hex,
                     content: request.content.clone(),
@@ -406,5 +417,25 @@ impl MarmotApp {
             self.notify_draft_changed(&account.label, &group_hex);
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod edit_timestamp_tests {
+    use super::next_edit_created_at;
+
+    #[test]
+    fn sequential_edits_advance_in_the_same_wall_clock_second() {
+        let first = next_edit_created_at(100, None).unwrap();
+        let second = next_edit_created_at(100, Some(first)).unwrap();
+        assert_eq!((first, second), (100, 101));
+        assert_eq!(next_edit_created_at(110, Some(second)), Some(110));
+    }
+
+    #[test]
+    fn edit_timestamp_bounds_clock_rollback_and_rejects_overflow() {
+        assert_eq!(next_edit_created_at(100, Some(129)), Some(130));
+        assert_eq!(next_edit_created_at(100, Some(130)), None);
+        assert_eq!(next_edit_created_at(100, Some(u64::MAX)), None);
     }
 }

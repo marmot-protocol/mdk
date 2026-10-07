@@ -5718,6 +5718,30 @@ async fn connector_edit_dispatch_preserves_typed_eligibility_errors() {
         panic!("expected materialized target");
     };
     assert_eq!(message.text.as_deref(), Some("updated"));
+    let first_edit_time = connector
+        .runtime
+        .timeline_message(&agent.account.account_id_hex, &group_hex, &target)
+        .unwrap()
+        .unwrap()
+        .edit
+        .unwrap()
+        .edited_at;
+    connector
+        .edit_message_response(
+            &agent.account.account_id_hex,
+            &group_hex,
+            &target,
+            "latest revision",
+        )
+        .await
+        .unwrap();
+    let latest = connector
+        .runtime
+        .timeline_message(&agent.account.account_id_hex, &group_hex, &target)
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.plaintext, "latest revision");
+    assert!(latest.edit.unwrap().edited_at > first_edit_time);
     connector.runtime.shutdown().await;
 }
 
