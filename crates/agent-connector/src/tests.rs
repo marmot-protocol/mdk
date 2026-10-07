@@ -7862,15 +7862,28 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
         relay_lists.inbox
     );
 
-    let published = app
-        .fetch_current_account_relay_list_status_for_account_id(
-            &account.account_id_hex,
-            vec![relay_endpoint.clone()],
-            Some("nip65"),
-        )
-        .await
-        .unwrap()
-        .expect("published relay lists");
+    // Publication requires one acknowledgement, not every routed relay's ACK.
+    // Also, an overlapping directory read can share a pre-edit query. Wait for
+    // this relay to expose the acknowledged revision before checking its tags.
+    let published = timeout(Duration::from_secs(15), async {
+        loop {
+            let status = app
+                .fetch_current_account_relay_list_status_for_account_id(
+                    &account.account_id_hex,
+                    vec![relay_endpoint.clone()],
+                    Some("nip65"),
+                )
+                .await
+                .unwrap()
+                .expect("published relay lists");
+            if status.inbox.created_at >= relay_lists.inbox.created_at {
+                break status;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the routed relay must expose the acknowledged inbox revision");
     for expected in [&added_url, &read_url, &relay_url] {
         assert!(
             published

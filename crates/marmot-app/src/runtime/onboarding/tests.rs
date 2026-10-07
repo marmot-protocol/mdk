@@ -1176,6 +1176,7 @@ async fn minimal_relay_repair_falls_back_to_unapprovable_manual_review() {
         .unwrap();
     checkpoint.set(OnboardingStep::Relays, OnboardingStatus::NeedsInput, vec![]);
     checkpoint.records[OnboardingStep::Relays.index()] = Some(malformed);
+    checkpoint.append_relays = true;
     runtime.accounts().save_onboarding(&mut checkpoint).unwrap();
     let snapshot = runtime
         .accounts()
@@ -1212,6 +1213,14 @@ async fn minimal_relay_repair_falls_back_to_unapprovable_manual_review() {
             .unwrap()
             .unwrap()
             .approved
+    );
+    assert!(
+        !runtime
+            .accounts()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap()
+            .append_relays
     );
     runtime.shutdown_and_close().await.unwrap();
 }
@@ -1861,6 +1870,17 @@ async fn approved_unsigned_relay_repair_rejects_modified_checkpoint_before_signi
             .unwrap();
         assert!(runtime.accounts().run_onboarding(&id).await.is_err());
         assert!(network.attempts.lock().unwrap().is_empty());
+        let rejected = runtime
+            .accounts()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
+        assert!(!rejected.approved);
+        assert!(rejected.snapshot.proposal.is_none());
+        assert_eq!(
+            rejected.snapshot.steps[OnboardingStep::Relays.index()].status,
+            OnboardingStatus::RetryableFailure
+        );
     }
     runtime.shutdown_and_close().await.unwrap();
 }

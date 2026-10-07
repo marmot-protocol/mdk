@@ -2422,7 +2422,20 @@ impl AccountManager {
             }
         };
         if c.signed_repair.is_none() {
-            self.validate_typed_onboarding_repair(c, &proposal)?;
+            if let Err(error) = self.validate_typed_onboarding_repair(c, &proposal) {
+                // Policy or persisted preview changes invalidate approval. Keep
+                // the error fail-closed, but allow a new inspection/preview.
+                c.approved = false;
+                c.snapshot.proposal = None;
+                c.append_relays = false;
+                c.set(
+                    proposal.step,
+                    OnboardingStatus::RetryableFailure,
+                    vec![finding(OnboardingIssue::RecordChanged)],
+                );
+                self.save_onboarding(c)?;
+                return Err(error);
+            }
             self.require_live_onboarding_attempt(c)?;
             if account.external_signing {
                 c.set(

@@ -342,6 +342,8 @@ impl AccountManager {
             write_relays.clear();
         }
         let manual = repair.mode == OnboardingRelayRepairMode::ManualReview;
+        // A typed preview replaces any earlier append-only editor proposal.
+        c.append_relays = false;
         c.snapshot.proposal = Some(OnboardingRepairProposal {
             step,
             revision: c

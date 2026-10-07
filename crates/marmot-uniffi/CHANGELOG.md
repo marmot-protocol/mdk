@@ -4,6 +4,9 @@
 
 ### Breaking changes
 
+- `OnboardingRepairProposalFfi.relay_repair` is a new optional field without
+  a binding default. Regenerate matching Swift/Kotlin bindings and pass `nil`
+  (Swift) or `null` (Kotlin) in host record initializers without a typed preview.
 - The optional opaque `ChatListDraftVersionFfi` object in
   `PresentedChatRowFfi.draft_version` correlates the presented row's draft
   metadata with a captured composer revision through
@@ -24,8 +27,7 @@
 - `Marmot::propose_onboarding_relay_repair` previews a lossless relay-list repair
   without signing or publishing. `OnboardingRepairProposalFfi.relay_repair` carries
   the typed before/after tags, exact diff, restored capabilities and ManualReview
-  mode. Regenerate Swift/Kotlin bindings and update record initializers for the new
-  optional field. Optional passed-step previews retain readiness when dismissed
+  mode. Optional passed-step previews retain readiness when dismissed
   before approval.
 - `Marmot::message_reactions` returns complete local reaction details for one exact
   account/group/message, with one effective entry per sender/emoji and no
