@@ -156,6 +156,7 @@ fn collect_inline_mention_hexes(inlines: &[marmot_markdown::Inline], out: &mut V
             | Inline::HardBreak
             | Inline::Code(_)
             | Inline::Autolink { .. }
+            | Inline::Timestamp { .. }
             | Inline::Math(_) => {}
         }
     }

@@ -189,6 +189,22 @@ See the [diagnostics contract](../marmot-uniffi/README.md#localization-privacy-a
 
 ## Markdown rendering
 
+`MarmotMarkdownInline::Timestamp` carries signed `int64_t` Unix seconds and a
+`MarmotMarkdownTimestampStyle`, with no allocated display string. The tag follows
+`NostrUri`, preserving existing inline tag values. Style values are `ShortTime`
+(`t`), `LongTime` (`T`), `ShortDate` (`d`), `LongDate` (`D`), `ShortDateTime`
+(`f`, the parser default), `LongDateTime` (`F`), `CompactDateTime` (`s`),
+`CompactDateTimeSeconds` (`S`), and `Relative` (`R`).
+
+Format timestamps at render time using the device locale and time zone. Refresh
+labels after locale, time-zone or clock changes and when the app resumes; visible
+`Relative` nodes also need updates as time passes. An absolute-time tooltip or
+accessibility label is optional. Timestamp payloads require no separate free;
+`marmot_markdown_document_free` releases the containing tree. See the
+[shared Markdown contract](../marmot-markdown/README.md) for host
+rendering guidance and [Binary compatibility](#binary-compatibility) for adopting
+the new union tag.
+
 `MarmotMarkdownBlock` includes a `Details` tag (bounded `<details>` / `<summary>` blocks) whose fields live behind
 `MarmotMarkdownDetails`. It was appended without changing existing discriminants or union stride; clients built
 against an older header cannot render it.

@@ -21,6 +21,11 @@
 
 ### Added
 
+- Markdown tokens expose local-time timestamps through
+  `MarkdownInlineFfi::Timestamp { unix_seconds, style }` and all nine typed
+  `MarkdownTimestampStyleFfi` variants. Seconds remain signed and unformatted;
+  native renderers own locale/timezone formatting and visible relative-time
+  refresh. Update exhaustive inline switches with matching generated bindings.
 - `Marmot::message_reactions` returns complete local reaction details for one exact
   account/group/message, with one effective entry per sender/emoji and no
   conversation-preview cap. Missing, hidden, deleted, invalidated and

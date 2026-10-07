@@ -181,6 +181,37 @@ are not credentials. Never log message bodies, asset references, keys, account/g
 raw DTO stringification or relay URLs as performance labels. Use bounded performance operations
 and aggregate snapshots; keep secrets out of diagnostics and host callback errors.
 
+### Markdown rendering
+
+Render the typed Markdown tokens on message, timeline and reply-preview records.
+`parseMarkdown` returns the same AST for draft previews and custom renderers.
+`MarkdownInlineFfi.Timestamp` carries signed `unixSeconds` (Swift `Int64`, Kotlin
+`Long`) and a `MarkdownTimestampStyleFfi`, with no formatted text. Timestamp syntax
+is `<t:UNIX_SECONDS>` or `<t:UNIX_SECONDS:STYLE>`; the parser resolves an omitted
+style to `ShortDateTime`. Invalid timestamp syntax remains literal text.
+
+| Style token | Enum variant | Display |
+| --- | --- | --- |
+| `t` | `ShortTime` | Time without seconds |
+| `T` | `LongTime` | Time including seconds |
+| `d` | `ShortDate` | Short date |
+| `D` | `LongDate` | Long date |
+| `f` (default) | `ShortDateTime` | Long date and time without seconds |
+| `F` | `LongDateTime` | Weekday, long date and time without seconds |
+| `s` | `CompactDateTime` | Short date and time without seconds |
+| `S` | `CompactDateTimeSeconds` | Short date and time including seconds |
+| `R` | `Relative` | Time relative to the current clock |
+
+Use native date/time formatters with the device's current locale and timezone at
+render time, including its date order and 12/24-hour preference. The parser and
+bindings do not own a clock, timezone, formatter or refresh task. Refresh displayed
+timestamps when locale, timezone or system clock changes and when the app resumes;
+visible `Relative` nodes also need time-driven refresh even if the message tokens
+are unchanged. A host may provide a localized absolute-time tooltip or accessibility
+description. Keep the timestamp and typed style in display caches rather than
+persisting formatted strings. The native renderer is supplied by the host app,
+not this crate.
+
 ### Compatibility
 
 Generated source, DTOs, enums, errors, headers and native code form one versioned contract.
