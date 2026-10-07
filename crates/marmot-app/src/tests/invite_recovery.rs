@@ -380,13 +380,14 @@ async fn invite_recovery_does_not_resurrect_an_older_slot_after_revoking_its_win
     winner.created_at += 2;
     winner.id = "f2".repeat(32);
     let deletion = signed_deletion(&app, account, "e", winner.id.clone(), winner.created_at);
-    let mut endpoints = fetcher.events_by_endpoint.lock().unwrap();
-    endpoints
-        .get_mut(OUTBOX)
-        .unwrap()
-        .extend([malformed, deletion]);
-    endpoints.get_mut(DISCOVERY).unwrap().push(winner);
-    drop(endpoints);
+    {
+        let mut endpoints = fetcher.events_by_endpoint.lock().unwrap();
+        endpoints
+            .get_mut(OUTBOX)
+            .unwrap()
+            .extend([malformed, deletion]);
+        endpoints.get_mut(DISCOVERY).unwrap().push(winner);
+    }
     assert!(matches!(
         app.resolve_member_key_packages(&[&account.account_id_hex])
             .await,
@@ -397,11 +398,12 @@ async fn invite_recovery_does_not_resurrect_an_older_slot_after_revoking_its_win
 #[tokio::test]
 async fn invite_recovery_mixed_batch_preserves_first_failed_recipient() {
     let (_directory, app, accounts, fetcher) = discovery_fixture(3).await;
-    let mut endpoints = fetcher.events_by_endpoint.lock().unwrap();
-    endpoints.get_mut(DISCOVERY).unwrap().retain(|event| {
-        event.kind != KIND_MARMOT_KEY_PACKAGE || event.pubkey == accounts[0].account_id_hex
-    });
-    drop(endpoints);
+    {
+        let mut endpoints = fetcher.events_by_endpoint.lock().unwrap();
+        endpoints.get_mut(DISCOVERY).unwrap().retain(|event| {
+            event.kind != KIND_MARMOT_KEY_PACKAGE || event.pubkey == accounts[0].account_id_hex
+        });
+    }
     let result = app
         .resolve_member_key_packages(&[
             &accounts[0].account_id_hex,
@@ -490,8 +492,8 @@ async fn invite_recovery_limits_safe_canonical_supplementary_endpoints() {
         format!("{OUTBOX}/"),
         "ws://127.0.0.1:9876".into(),
         "not a relay".into(),
-        format!("{DISCOVERY}/"),
         DISCOVERY.into(),
+        format!("{DISCOVERY}/"),
     ];
     app.config
         .directory_relay_urls
@@ -519,6 +521,7 @@ async fn invite_recovery_limits_safe_canonical_supplementary_endpoints() {
         supplementary
             .endpoints
             .iter()
+            .map(|endpoint| nostr_sdk::prelude::RelayUrl::parse(&endpoint.0).unwrap())
             .collect::<std::collections::BTreeSet<_>>()
             .len(),
         8
@@ -567,16 +570,17 @@ async fn invite_recovery_preserves_only_unrevoked_future_record_cache_fallback()
             ),
             revoked.created_at,
         );
-        let mut endpoints = fetcher.events_by_endpoint.lock().unwrap();
-        endpoints
-            .get_mut(DISCOVERY)
-            .unwrap()
-            .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
-        endpoints
-            .get_mut(DISCOVERY)
-            .unwrap()
-            .extend([future, revoked, deletion]);
-        drop(endpoints);
+        {
+            let mut endpoints = fetcher.events_by_endpoint.lock().unwrap();
+            endpoints
+                .get_mut(DISCOVERY)
+                .unwrap()
+                .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+            endpoints
+                .get_mut(DISCOVERY)
+                .unwrap()
+                .extend([future, revoked, deletion]);
+        }
         let result = app
             .fetch_latest_key_package_for_account_id(&account.account_id_hex, vec![])
             .await;
@@ -966,15 +970,16 @@ async fn invite_recovery_preserves_incompatible_errors_for_empty_and_failed_supp
             )))
         ));
     }
-    let mut routes = fetcher.events_by_endpoint.lock().unwrap();
-    routes
-        .get_mut(OUTBOX)
-        .unwrap()
-        .iter_mut()
-        .find(|e| e.kind == KIND_MARMOT_KEY_PACKAGE)
-        .unwrap()
-        .content = "not base64".into();
-    drop(routes);
+    {
+        let mut routes = fetcher.events_by_endpoint.lock().unwrap();
+        routes
+            .get_mut(OUTBOX)
+            .unwrap()
+            .iter_mut()
+            .find(|e| e.kind == KIND_MARMOT_KEY_PACKAGE)
+            .unwrap()
+            .content = "not base64".into();
+    }
     assert!(matches!(
         app.resolve_member_key_packages(&[&account.account_id_hex])
             .await,

@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 
 use cgka_engine::key_package::KeyPackageRequirements;
 use cgka_traits::TransportEndpoint;
+use nostr_sdk::prelude::RelayUrl;
 use transport_nostr_adapter::KIND_MARMOT_KEY_PACKAGE;
 
 use crate::key_package_records::{
@@ -67,11 +68,19 @@ impl MarmotApp {
             searched.to_vec(),
             "KeyPackage recovery searched routes",
         );
-        let mut seen = searched.iter().cloned().collect::<BTreeSet<_>>();
+        // RelayUrl equality ignores an optional root slash, while its display
+        // spelling (and TransportEndpoint equality) preserves it. Count relay
+        // identities, not spellings, against the supplementary route budget.
+        let mut seen = searched
+            .iter()
+            .filter_map(|endpoint| RelayUrl::parse(endpoint.as_str()).ok())
+            .collect::<BTreeSet<_>>();
         let supplementary = self
             .retain_safe_discovered_endpoints(discovery.to_vec(), "KeyPackage discovery recovery")
             .into_iter()
-            .filter(|endpoint| seen.insert(endpoint.clone()))
+            .filter(|endpoint| {
+                RelayUrl::parse(endpoint.as_str()).is_ok_and(|relay| seen.insert(relay))
+            })
             .take(RECOVERY_ENDPOINT_LIMIT)
             .collect::<Vec<_>>();
         let mut package_coverage = primary_complete;

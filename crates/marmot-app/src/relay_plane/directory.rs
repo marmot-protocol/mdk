@@ -263,8 +263,7 @@ impl DirectoryEventQuery {
             && self.reference.as_ref().is_none_or(|(name, value)| {
                 event
                     .tag_values(&name.to_string())
-                    .iter()
-                    .any(|tag| *tag == value.as_str())
+                    .contains(&value.as_str())
             })
     }
 }

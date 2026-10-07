@@ -7785,7 +7785,8 @@ async fn member_key_package_skips_local_legacy_cache() {
     let directory = tempfile::tempdir().unwrap();
     let home = AccountHome::open(directory.path());
     let account = home.create_account("alice").unwrap();
-    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let legacy = fresh_key_package_for_account(&app, &account, true).await;
     write_json(
         app.key_package_record_path(&account.label),
