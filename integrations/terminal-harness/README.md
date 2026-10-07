@@ -33,7 +33,7 @@ need a separately configured tool. The suggested instruction block is not
 installed automatically.
 
 Use the [checksum-verified quickstart](../README.md#get-started-white-noise--agents)
-for the selected runtime. Claude Code, Codex, OpenCode and Pi share this setup
+for the selected runtime. Claude Code, Codex, OpenCode, Pi and Goose share this setup
 contract; their READMEs below describe backend-specific permissions and files.
 The installer supplies `wn-agent` and the harness, not the model CLI, its login,
 provider credentials or model configuration. Before installation, verify an

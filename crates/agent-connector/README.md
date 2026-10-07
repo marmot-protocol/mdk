@@ -69,7 +69,7 @@ missing preference questions and a complete phone acceptance checklist.
 White Noise's copied installation prompt links to this README. Installation
 also requires the selected runtime's guide: the
 [quickstart](../../integrations/README.md#get-started-white-noise--agents) links
-Hermes, OpenClaw, Claude Code, Codex, OpenCode and Pi. Installing `wn-agent`
+Hermes, OpenClaw, Claude Code, Codex, OpenCode, Pi and Goose. Installing `wn-agent`
 alone does not connect the model runtime or start its gateway/harness.
 The detailed preflight is [Hermes profile selection](../../integrations/hermes/marmot/README.md#first-install-and-profile-selection),
 [OpenClaw instance selection](../../integrations/openclaw/marmot/README.md#first-install-checklist),

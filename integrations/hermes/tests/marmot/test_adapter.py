@@ -1951,19 +1951,29 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             client=FakeClient(),
         )
 
-        # Drive the loop just long enough to reconnect once and deliver the recovered message.
+        # Observe delivery, including asynchronous durable-spool work, rather
+        # than assuming it fits a fixed number of event-loop polling ticks.
+        delivered = asyncio.Event()
+        handle_message = adapter.handle_message
+
+        async def observe_delivery(event):
+            await handle_message(event)
+            delivered.set()
+
+        adapter.handle_message = observe_delivery
         loop_task = asyncio.ensure_future(adapter._consume_inbound_loop())
         try:
-            for _ in range(300):
-                if adapter.events:
-                    break
-                await asyncio.sleep(0.01)
+            await asyncio.wait_for(delivered.wait(), timeout=30)
+            # Delivery precedes the journal disposition; let that finish before
+            # cancelling the listener and closing its private stores.
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=30)
         finally:
             loop_task.cancel()
             try:
                 await loop_task
             except asyncio.CancelledError:
                 pass
+            await adapter.disconnect()
 
         self.assertGreaterEqual(attempts["n"], 2, "loop should reconnect after resync")
         self.assertEqual(len(adapter.events), 1)
