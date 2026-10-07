@@ -1330,6 +1330,7 @@ async fn partial_native_projection_retries_without_republishing() {
         );
         assert!(client.has_pending_runtime_group_subscription_refresh());
         assert_eq!(client.pending_applied_effects.len(), 1);
+        let native_only = seam == 0 && !failed_publish;
         let prefix = client.take_pending_applied_sync_summary();
         assert!(
             prefix
@@ -1337,22 +1338,25 @@ async fn partial_native_projection_retries_without_republishing() {
                 .iter()
                 .all(|message| !notifications::is_push_gossip_kind(message.kind))
         );
-        if seam != 0 || failed_publish {
-            assert!(
-                prefix
-                    .messages
-                    .iter()
-                    .any(|message| message.kind == MARMOT_APP_EVENT_KIND_CHAT)
-            );
-        }
         assert!(
-            prefix
+            prefix.messages.is_empty(),
+            "outbox notifications wait for the failed batch's acknowledgement checkpoint"
+        );
+        let cleanup_count = |summary: &crate::SyncSummary| {
+            summary
                 .projection_updates
                 .iter()
                 .flat_map(|update| &update.timeline_messages)
-                .any(|row| row.message_id_hex == "held-prefix"
-                    && row.invalidation_status.as_deref() == Some("local_publish_failed")),
-            "the successful pending-send invalidation must reach subscribers even when the tail fails"
+                .filter(|row| {
+                    row.message_id_hex == "held-prefix"
+                        && row.invalidation_status.as_deref() == Some("local_publish_failed")
+                })
+                .count()
+        };
+        assert_eq!(
+            cleanup_count(&prefix),
+            usize::from(native_only),
+            "native-only prefixes are immediately visible; outbox batches wait for acknowledgement"
         );
         assert!(
             client
@@ -1388,6 +1392,20 @@ async fn partial_native_projection_retries_without_republishing() {
                 .messages
                 .iter()
                 .all(|message| !notifications::is_push_gossip_kind(message.kind))
+        );
+        assert_eq!(
+            summary
+                .messages
+                .iter()
+                .filter(|message| message.kind == MARMOT_APP_EVENT_KIND_CHAT)
+                .count(),
+            usize::from(!native_only),
+            "repair emits the deferred chat once when the seam observes messages"
+        );
+        assert_eq!(
+            cleanup_count(&prefix) + cleanup_count(&summary),
+            1,
+            "the committed invalidation survives the failed tail and is delivered once"
         );
         if failed_publish {
             assert_eq!(

@@ -54,8 +54,8 @@
   Retries resume completed native and activity-row phases instead of repeating
   old termination cleanup over newer sends. Repaired updates precede newer
   deltas and are returned once by quiet direct-client sync and event reads;
-  cancelled drain checkpoints and receive waits retain progress and pending
-  notifications. Completed pending-send cleanup retains its exact storage update
+  cancelled drain checkpoints, receive waits and explicit-sync recovery waits
+  retain progress and pending notifications. Completed pending-send cleanup retains its exact storage update
   across chat-list conversion failures; message and Welcome notifications wait
   for acknowledgement completion, and retries re-stage removed acknowledgements.
   Push gossip never enters partial host-message summaries. Route rebuilds and

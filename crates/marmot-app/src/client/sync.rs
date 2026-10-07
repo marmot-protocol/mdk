@@ -1548,8 +1548,10 @@ impl AppClient {
         {
             self.activate_live_transport(telemetry).await?;
         } else if routing_changed || self.pending_runtime_group_subscription_refresh {
-            self.refresh_live_group_subscriptions(SyncSummary::default())
+            let refreshed = self
+                .refresh_live_group_subscriptions(SyncSummary::default())
                 .await?;
+            self.pending_applied_sync_summary.merge(refreshed);
         }
         // Network cooldown never withholds already queued input or engine
         // events. Receiving existing subscriptions is not a new acquisition.
@@ -1573,14 +1575,22 @@ impl AppClient {
         let credit = if !wants_job || !pending {
             None
         } else if explicit {
-            Some(recovery_credits::acquire_recovery_credit(&self.recovery_credits).await)
+            self.pending_applied_sync_summary
+                .merge(std::mem::take(&mut summary));
+            let credit = recovery_credits::acquire_recovery_credit(&self.recovery_credits).await;
+            self.prepend_pending_applied_summary(&mut summary);
+            Some(credit)
         } else {
             recovery_credits::try_acquire_recovery_credit(&self.recovery_credits)
         };
         let grant = if credit.is_some() {
             // Input that arrived while the credit was pending is ingested
             // before the inventory freezes, so the job does not fetch it again.
-            match self.sync_sdk_relay().await {
+            self.pending_applied_sync_summary
+                .merge(std::mem::take(&mut summary));
+            let drained = self.sync_sdk_relay().await;
+            self.prepend_pending_applied_summary(&mut summary);
+            match drained {
                 Ok(drained) => summary.merge(drained),
                 Err(mut failure) => {
                     summary.merge(std::mem::take(&mut failure.partial_summary));
@@ -1596,7 +1606,11 @@ impl AppClient {
             None
         };
         if let (Some(grant), Some(credit)) = (grant, credit) {
-            match self.run_recovery_job(grant, credit, None).await {
+            self.pending_applied_sync_summary
+                .merge(std::mem::take(&mut summary));
+            let recovered = self.run_recovery_job(grant, credit, None).await;
+            self.prepend_pending_applied_summary(&mut summary);
+            match recovered {
                 Ok(
                     EpochBackfillRunOutcome::Completed(recovered)
                     | EpochBackfillRunOutcome::Incomplete(recovered),
@@ -1627,10 +1641,12 @@ impl AppClient {
         summary: SyncSummary,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         self.pending_runtime_group_subscription_refresh = true;
-        match self
+        self.pending_applied_sync_summary.merge(summary);
+        let refresh = self
             .retry_pending_runtime_group_subscription_refresh()
-            .await
-        {
+            .await;
+        let summary = self.take_pending_applied_sync_summary();
+        match refresh {
             Ok(_) => Ok(summary),
             Err(error) => Err(ClassifiedSyncFailure::at_stage(
                 summary,
@@ -1753,7 +1769,11 @@ impl AppClient {
         // above, `sync_sdk_relay` never drained the engine, so these would stay
         // buffered and invisible to runtime subscribers until some later
         // unrelated send/ingest. Fold any pending events into this summary.
-        let drained = match self.drain_pending_session_events().await {
+        self.pending_applied_sync_summary
+            .merge(std::mem::take(&mut summary));
+        let drained = self.drain_pending_session_events().await;
+        self.prepend_pending_applied_summary(&mut summary);
+        let drained = match drained {
             Ok(drained) => drained,
             Err(error) => {
                 summary.merge(self.take_pending_applied_sync_summary());

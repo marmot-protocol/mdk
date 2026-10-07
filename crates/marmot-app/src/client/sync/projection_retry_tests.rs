@@ -576,3 +576,93 @@ async fn failed_message_projection_does_not_duplicate_its_deferred_summary() {
         "direct next_event checkpoints the repaired acknowledgement"
     );
 }
+
+#[tokio::test]
+async fn cancelling_public_sync_while_waiting_for_recovery_keeps_repaired_activity() {
+    use crate::runtime::account_worker::recovery_credits;
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    let mut client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
+    client.recovery_credits = recovery_credits::private_recovery_credit_pool_for_test();
+    let group = client.create_group("retry", &[]).await.unwrap();
+    let connection =
+        super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
+    connection.execute_batch("CREATE TRIGGER fail_activity BEFORE INSERT ON app_events WHEN NEW.kind = 1210 BEGIN SELECT RAISE(FAIL, 'injected activity'); END;").unwrap();
+    let effects = marmot_account::AccountDeviceEffects {
+        events: vec![rename(&group, &account.account_id_hex, 0x82)],
+        ..Default::default()
+    };
+    assert!(
+        client
+            .observe_account_device_effects(&effects, &mut SyncSummary::default(), "source", 123)
+            .await
+            .is_err()
+    );
+    connection
+        .execute_batch("DROP TRIGGER fail_activity")
+        .unwrap();
+    assert!(client.recovery_pending().unwrap());
+    assert!(client.recovery_endpoints_admitted());
+    let comparison_before = app
+        .account_storage("alice")
+        .unwrap()
+        .recovery_comparison()
+        .unwrap()
+        .revision;
+    let held = recovery_credits::hold_all_credits_for_test(&client.recovery_credits);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), client.sync())
+            .await
+            .is_err()
+    );
+    assert!(
+        client.pending_applied_effects.is_empty(),
+        "repair completed before the credit wait"
+    );
+    assert!(
+        app.account_storage("alice")
+            .unwrap()
+            .recovery_comparison()
+            .unwrap()
+            .revision
+            > comparison_before,
+        "the public call requested comparison after finishing its first drain"
+    );
+    assert_eq!(
+        app.account_storage("alice")
+            .unwrap()
+            .recovery_retry_state()
+            .unwrap()
+            .attempt_serial,
+        0,
+        "held credits prevent recovery from starting"
+    );
+    drop(held);
+    client.test_comparison_results = Some(ScriptedComparisons::by_route(|_| {
+        Ok(Some((
+            transport_nostr_adapter::NostrReconciliationSummary {
+                relays_succeeded: 1,
+                ..Default::default()
+            },
+            Vec::new(),
+        )))
+    }));
+    let summary = tokio::time::timeout(Duration::from_secs(10), client.sync())
+        .await
+        .unwrap()
+        .unwrap();
+    let count_activity = |summary: &SyncSummary| {
+        summary.projection_updates.iter().flat_map(|update| &update.timeline_changes).filter(|change| matches!(change, crate::TimelineMessageChange::Upsert { message, .. } if message.kind == 1210)).count()
+    };
+    assert_eq!(
+        count_activity(&summary),
+        1,
+        "the cancelled call's repaired notification is returned once"
+    );
+    assert_eq!(count_activity(&client.sync().await.unwrap()), 0);
+}
