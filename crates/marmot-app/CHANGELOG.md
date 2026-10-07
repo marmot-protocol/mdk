@@ -26,6 +26,15 @@
 
 ### Fixed
 
+- Historical canonical replay clears stale removal metadata when the selected
+  local MLS leaf remains active, without emitting a false restoration event.
+  Activity from commits preceding a disband survives a later terminal-cleanup
+  failure. Confirmation replay retries share the normal background row and time
+  budget and resume beyond an unchanged deferred prefix.
+- Quiet projection repair releases the accepted delivery's cursor pin. Resumed
+  chat and poll publications wake recipients after source revival and checkpoint;
+  projection or checkpoint failures retain that session's notification obligation.
+
 - Identical same-actor fork activity retains its reaction target when a fresh
   canonical commit replaces a withdrawn origin; adoption and revival are atomic.
   Canonical removal and membership cleanup commit together; their native events

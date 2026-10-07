@@ -19374,6 +19374,32 @@ async fn an_escalation_recorded_during_a_received_delivery_rides_that_seam() {
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test]
 async fn a_failed_ingest_leaves_the_delivery_retryable_on_the_reused_client() {
+    assert_failed_delivery_cursor_pin(FailedDeliveryRecovery::Redelivery).await;
+}
+
+/// Projection repair must release its taken delivery without relay redelivery.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn quiet_projection_retry_releases_the_failed_delivery_cursor_pin() {
+    assert_failed_delivery_cursor_pin(FailedDeliveryRecovery::QuietProjectionRetry).await;
+}
+
+/// A failure before engine admission still needs a real ingest before release.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn pre_engine_ingest_failure_keeps_the_delivery_cursor_pin() {
+    assert_failed_delivery_cursor_pin(FailedDeliveryRecovery::BeforeEngine).await;
+}
+
+#[cfg(feature = "test-policy-overrides")]
+enum FailedDeliveryRecovery {
+    Redelivery,
+    QuietProjectionRetry,
+    BeforeEngine,
+}
+
+#[cfg(feature = "test-policy-overrides")]
+async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
@@ -19384,7 +19410,7 @@ async fn a_failed_ingest_leaves_the_delivery_retryable_on_the_reused_client() {
     remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
     // One shared plane for both clients, so a publish fans out locally into
     // the other account's registered routes (`deliver_local_publish`).
-    let plane = MarmotRelayPlane::new(None, relay.clone());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
 
     let mut alice = app
         .client_with_relay_plane("alice", &plane, None)
@@ -19421,6 +19447,8 @@ async fn a_failed_ingest_leaves_the_delivery_retryable_on_the_reused_client() {
             .contains(&group_id),
         "bob must join before the failing application message",
     );
+    bob_client.take_pending_projection_updates();
+    bob_client.take_pending_applied_sync_summary();
 
     let published_before_send = relay.published_events.lock().unwrap().len();
     alice
@@ -19436,10 +19464,6 @@ async fn a_failed_ingest_leaves_the_delivery_retryable_on_the_reused_client() {
         .find(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
         .cloned()
         .expect("published group message backing the send");
-    bob_client
-        .app
-        .config
-        .dev_fail_ingest_after_application_event_ack = true;
     let delivery = tokio::time::timeout(Duration::from_secs(5), bob_client.receive_next_delivery())
         .await
         .expect("locally fanned-out application message")
@@ -19450,46 +19474,102 @@ async fn a_failed_ingest_leaves_the_delivery_retryable_on_the_reused_client() {
     let delivery = *delivery;
     let event_id = hex::encode(delivery.message.id.as_slice());
     assert_eq!(event_id, relay_event.id);
+    let later_cursor = delivery.message.timestamp.0 + 10_000;
+    let probe_cursor = |client: &AppClient| {
+        let sealed = client.adapter.seal_transport_cursor(Some(later_cursor));
+        client
+            .adapter
+            .unseal_transport_cursor(client.state.last_transport_timestamp);
+        sealed
+    };
+    if matches!(recovery, FailedDeliveryRecovery::BeforeEngine) {
+        bob_client.fail_ingest_of = Some(delivery.message.id.clone());
+    } else {
+        bob_client
+            .app
+            .config
+            .dev_fail_ingest_after_application_event_ack = true;
+    }
     bob_client
         .ingest_received_delivery(delivery)
         .await
-        .expect_err("the injected post-ack failure must surface");
+        .expect_err("the injected ingest failure must surface");
     assert!(
         !bob_client.seen_events_index.contains(&event_id),
         "a failed ingest must not mark the delivery seen",
     );
+    assert!(
+        probe_cursor(&bob_client).is_some_and(|cursor| cursor < later_cursor),
+        "a taken delivery must cap the cursor while its ingest remains failed",
+    );
 
-    // The relay redelivers (for example on resubscribe); the reused client
-    // must return the delivery again instead of skipping it as already seen.
+    // Lift the projection fault before quiet repair or relay redelivery.
     bob_client
         .app
         .config
         .dev_fail_ingest_after_application_event_ack = false;
-    assert!(
-        inject(relay_event).await.expect("route the redelivery") >= 1,
-        "the group route must accept the redelivery",
-    );
-    let redelivery =
-        tokio::time::timeout(Duration::from_secs(5), bob_client.receive_next_delivery())
+    let summary = if matches!(recovery, FailedDeliveryRecovery::QuietProjectionRetry) {
+        assert!(bob_client.arm_failed_receive_projection_retry());
+        bob_client
+            .retry_pending_runtime_group_subscription_refresh()
             .await
-            .expect("redelivered application message")
-            .unwrap();
-    let crate::relay_plane::AccountDeliveryReceive::Delivery(redelivery) = redelivery else {
-        panic!("the test did not overflow its account delivery queue");
+            .expect("quiet retry must complete the retained projection");
+        assert!(!bob_client.has_pending_effect_projections());
+        assert_eq!(
+            probe_cursor(&bob_client),
+            Some(later_cursor),
+            "projection retry must release the pin without another delivery",
+        );
+        bob_client.take_pending_applied_sync_summary()
+    } else {
+        if matches!(recovery, FailedDeliveryRecovery::BeforeEngine) {
+            assert!(
+                !bob_client.arm_failed_receive_projection_retry(),
+                "a pre-engine failure has no accepted projection to repair",
+            );
+            assert!(
+                !bob_client
+                    .retry_pending_runtime_group_subscription_refresh()
+                    .await
+                    .unwrap(),
+            );
+            assert!(
+                probe_cursor(&bob_client).is_some_and(|cursor| cursor < later_cursor),
+                "projection retry must not release an unaccepted delivery",
+            );
+        }
+        assert!(
+            inject(relay_event).await.expect("route the redelivery") >= 1,
+            "the group route must accept the redelivery",
+        );
+        let redelivery =
+            tokio::time::timeout(Duration::from_secs(5), bob_client.receive_next_delivery())
+                .await
+                .expect("redelivered application message")
+                .unwrap();
+        let crate::relay_plane::AccountDeliveryReceive::Delivery(redelivery) = redelivery else {
+            panic!("the test did not overflow its account delivery queue");
+        };
+        let redelivery = *redelivery;
+        assert_eq!(hex::encode(redelivery.message.id.as_slice()), event_id);
+        let summary = bob_client
+            .ingest_received_delivery(redelivery)
+            .await
+            .expect("the retry must ingest the redelivered event");
+        assert!(
+            bob_client.seen_events_index.contains(&event_id),
+            "a successful ingest must mark the delivery seen",
+        );
+        assert_eq!(
+            probe_cursor(&bob_client),
+            Some(later_cursor),
+            "successful redelivery must release the original cursor pin",
+        );
+        summary
     };
-    let redelivery = *redelivery;
-    assert_eq!(hex::encode(redelivery.message.id.as_slice()), event_id);
-    let summary = bob_client
-        .ingest_received_delivery(redelivery)
-        .await
-        .expect("the retry must ingest the redelivered event");
-    assert!(
-        bob_client.seen_events_index.contains(&event_id),
-        "a successful ingest must mark the delivery seen",
-    );
-    // The first attempt durably projected the message but its AppError-only
-    // caller could not receive a summary. The retry transfers that notification
-    // exactly once without applying the message to storage again.
+    // A post-ack failure already projected the message without returning its
+    // summary; a pre-engine failure projected nothing. Either recovery path
+    // must deliver exactly one notification and leave exactly one durable row.
     assert_eq!(summary.messages.len(), 1);
     assert_eq!(
         summary.messages[0].plaintext,

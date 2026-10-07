@@ -744,12 +744,23 @@ impl AppClient {
             .unwrap_or_else(|_| AppGroupAdminPolicyComponent::new(Vec::new()))
     }
 
+    #[cfg(test)]
     pub(crate) fn finalize_published_app_message_source_retention(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<Vec<crate::AppProjectionUpdate>, AppError> {
+        self.finalize_published_app_message_source_retention_with_status(effects)
+            .map(|(updates, _)| updates)
+    }
+
+    /// The status proves all source rows finalized; acknowledgement may still
+    /// be retried independently through the durable accepted fanout.
+    pub(super) fn finalize_published_app_message_source_retention_with_status(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<(Vec<crate::AppProjectionUpdate>, bool), AppError> {
         if effects.published_app_messages.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), true));
         }
         let mut updates = Vec::new();
         for published in &effects.published_app_messages {
@@ -790,7 +801,7 @@ impl AppClient {
                         error_kind = error.privacy_safe_kind(),
                         "published application-message projection deferred",
                     );
-                    return Ok(updates);
+                    return Ok((updates, false));
                 }
             }
         }
@@ -822,7 +833,7 @@ impl AppClient {
                 "published application-message cleanup deferred",
             );
         }
-        Ok(updates)
+        Ok((updates, true))
     }
 
     /// Clear a `local_publish_failed` tombstone on an own send that a relay

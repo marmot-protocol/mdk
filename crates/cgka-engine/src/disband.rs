@@ -409,7 +409,6 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         accepted_commit_ids: &[String],
         origin_commit_id: Option<&cgka_traits::MessageId>,
-        group_changes: &[crate::openmls_projection::AppliedGroupChanges],
     ) -> Result<bool, EngineError> {
         let candidates = self.storage.list_disband_candidates(group_id)?;
         if candidates.is_empty() {
@@ -570,14 +569,6 @@ impl<S: StorageProvider> Engine<S> {
         self.leaving_groups.remove(group_id);
         self.drop_self_remove_auto_commit_schedules_for_group(group_id);
         self.epoch_manager.mark_disbanded(group_id, epoch)?;
-        // Publish prior commits' immutable activity before the terminal row.
-        // The closing commit's mechanical roster cleanup is not user activity.
-        self.emit_applied_group_changes(
-            group_id,
-            group_changes
-                .iter()
-                .filter(|commit| commit.resulting_epoch < epoch),
-        );
         self.push_group_state_change(
             group_id,
             epoch,

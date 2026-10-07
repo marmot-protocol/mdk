@@ -134,12 +134,19 @@ impl<S: StorageProvider> Engine<S> {
                 termination = Some(crate::message_processor::prepare_local_group_termination(
                     storage, group_id,
                 )?);
-            } else if before.record_removed || !before.local_active {
-                record.removed = false;
-                storage.put_group(&record)?;
-                events.push(GroupEvent::LocalGroupCopyRestored {
-                    group_id: group_id.clone(),
-                });
+            } else {
+                // Historical selection can restore an old removed marker even
+                // when the source copy was already live. Normalize the selected
+                // record independently of whether membership actually changed.
+                if record.removed {
+                    record.removed = false;
+                    storage.put_group(&record)?;
+                }
+                if before.record_removed || !before.local_active {
+                    events.push(GroupEvent::LocalGroupCopyRestored {
+                        group_id: group_id.clone(),
+                    });
+                }
             }
         }
         Ok(CanonicalMembershipEffects {
@@ -170,7 +177,56 @@ impl<S: StorageProvider> Engine<S> {
 mod tests {
     use super::*;
     use crate::distributed_convergence::tests::test_engine;
+    use cgka_traits::GroupStorage;
     use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, SendResult};
+
+    /// Selected historical metadata must agree with the authenticated live leaf,
+    /// without inventing restoration when the source copy was already active.
+    #[tokio::test]
+    async fn active_selection_normalizes_removed_metadata_without_false_restoration() {
+        let mut engine = test_engine();
+        let (group, created) = engine
+            .create_group(CreateGroupRequest {
+                name: "selected membership".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let SendResult::GroupCreated { pending, .. } = created else {
+            panic!("legacy creation");
+        };
+        engine.confirm_published(pending).await.unwrap();
+        engine.drain_events();
+        for source_removed in [false, true] {
+            for selected_removed in [false, true] {
+                let mut record = engine.storage.get_group(&group).unwrap();
+                record.removed = source_removed;
+                engine.storage.put_group(&record).unwrap();
+                let before = engine.canonical_membership_snapshot(&group).unwrap();
+                // Model historical selection replacing only device-local record
+                // metadata; the authenticated MLS leaf remains active.
+                record.removed = selected_removed;
+                engine.storage.put_group(&record).unwrap();
+                engine
+                    .emit_canonical_membership_effects(&group, &before)
+                    .unwrap();
+                assert!(!engine.storage.get_group(&group).unwrap().removed);
+                let events = engine.drain_events();
+                assert_eq!(events.len(), usize::from(source_removed));
+                assert!(events.iter().all(|event| matches!(event,
+                    GroupEvent::LocalGroupCopyRestored { group_id } if group_id == &group)));
+                let current = engine.canonical_membership_snapshot(&group).unwrap();
+                engine
+                    .emit_canonical_membership_effects(&group, &current)
+                    .unwrap();
+                assert!(engine.drain_events().is_empty());
+            }
+        }
+    }
 
     /// A reused slot and account still represent a different device when its
     /// authenticated leaf key changes. Replayed unchanged prefixes stay silent.

@@ -1668,12 +1668,21 @@ impl<S: StorageProvider> Engine<S> {
                     selected_tip,
                     &group_changes,
                 )?;
+            } else {
+                // These earlier commits are already canonical even if the
+                // closing disband's tombstone cleanup fails. Their deltas are
+                // local to this apply and cannot be reconstructed on retry.
+                self.emit_applied_group_changes(
+                    group_id,
+                    group_changes
+                        .iter()
+                        .filter(|commit| commit.resulting_epoch < selected_tip),
+                );
             }
             self.settle_disband_after_convergence(
                 group_id,
                 &result.accepted_commits,
                 origin_commit_id.as_ref(),
-                &group_changes,
             )
             .map_err(|error| OpenMlsProjectionError::Storage(error.to_string()))?
         } else {
@@ -1681,7 +1690,6 @@ impl<S: StorageProvider> Engine<S> {
                 group_id,
                 &result.accepted_commits,
                 origin_commit_id.as_ref(),
-                &group_changes,
             )
             .map_err(|error| OpenMlsProjectionError::Storage(error.to_string()))?
         };

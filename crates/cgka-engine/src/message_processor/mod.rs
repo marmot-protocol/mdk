@@ -41,7 +41,7 @@ use cgka_traits::storage::{
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use web_time::Instant;
@@ -284,6 +284,10 @@ pub(crate) const MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS: usize = 8;
 pub(crate) struct DeferredPeelGroupState {
     /// Monotonic sweep counter used to report aggregate sweep progress.
     sweep_count: u64,
+    /// Examined rows in the current confirmation retry sweep. Preserve storage's
+    /// arrival order while skipping a deferred prefix on subsequent slices.
+    /// Pruned against retained rows each slice and cleared when the sweep ends.
+    confirmation_replay_visited: HashSet<MessageId>,
     /// Cached count of retained `PeelDeferred` rows backing the flood cap.
     /// Refreshed from storage on every sweep; adjusted at the deferral /
     /// terminal transition sites in between.
@@ -1512,19 +1516,19 @@ impl<S: StorageProvider> Engine<S> {
         now_ms: u64,
         deadline: Option<Instant>,
     ) -> Result<bool, EngineError> {
-        if !self.retry_pending_confirmation_replay(group_id).await? {
+        let mut execution = DeferredPeelExecution::Background {
+            deadline,
+            rows_remaining: MAX_DEFERRED_ROWS_PER_SWEEP,
+        };
+        if !self
+            .retry_pending_confirmation_replay(group_id, &mut execution)
+            .await?
+        {
             return Ok(false);
         }
         Ok(matches!(
-            self.advance_convergence_inputs_with_execution(
-                group_id,
-                now_ms,
-                DeferredPeelExecution::Background {
-                    deadline,
-                    rows_remaining: MAX_DEFERRED_ROWS_PER_SWEEP,
-                },
-            )
-            .await?,
+            self.advance_convergence_inputs_with_execution(group_id, now_ms, execution)
+                .await?,
             AdvanceConvergenceStatus::Settled
         ))
     }
@@ -1535,6 +1539,7 @@ impl<S: StorageProvider> Engine<S> {
     async fn retry_pending_confirmation_replay(
         &mut self,
         group_id: &GroupId,
+        execution: &mut DeferredPeelExecution<'_>,
     ) -> Result<bool, EngineError> {
         if !self.pending_confirmation_replays.contains(group_id) {
             return Ok(true);
@@ -1542,9 +1547,19 @@ impl<S: StorageProvider> Engine<S> {
         if !self.prepare_convergence_input_advance(group_id)? {
             return Ok(false);
         }
-        if let Err(error) = self.replay_buffered_messages(group_id).await {
-            self.schedule_pending_convergence_group(group_id);
-            return Err(error);
+        match self
+            .replay_buffered_messages_with_execution(group_id, Some(execution))
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                self.schedule_pending_convergence_group(group_id);
+                return Ok(false);
+            }
+            Err(error) => {
+                self.schedule_pending_convergence_group(group_id);
+                return Err(error);
+            }
         }
         self.pending_confirmation_replays.remove(group_id);
         // Replayed input can terminate the copy or stage a new publish.
@@ -3675,12 +3690,32 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<(), EngineError> {
+        self.deferred_peel
+            .entry(group_id.clone())
+            .or_default()
+            .confirmation_replay_visited
+            .clear();
+        self.replay_buffered_messages_with_execution(group_id, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Replay complete input operations within the caller's shared background allowance.
+    /// Synchronous publication and rejoin callers pass no budget.
+    async fn replay_buffered_messages_with_execution(
+        &mut self,
+        group_id: &GroupId,
+        mut execution: Option<&mut DeferredPeelExecution<'_>>,
+    ) -> Result<bool, EngineError> {
         use ingest::GroupMessageIngestOutcome::{Deferred, Outcome};
 
+        if execution.as_ref().is_some_and(|budget| budget.exhausted()) {
+            return Ok(false);
+        }
         // Only states the loop below can act on; the storage backend skips
         // fetching and decoding terminal/record-only rows entirely, which
         // keeps a re-join from re-parsing the group's whole message history.
-        let records = self.storage.list_messages_in_states(
+        let mut records = self.storage.list_messages_in_states(
             group_id,
             &[
                 MessageState::Created,
@@ -3689,7 +3724,23 @@ impl<S: StorageProvider> Engine<S> {
             ],
             EpochId(0),
         )?;
+        if execution.is_some() {
+            let retained_ids: HashSet<_> = records.iter().map(|record| record.id.clone()).collect();
+            let visited = &mut self
+                .deferred_peel
+                .entry(group_id.clone())
+                .or_default()
+                .confirmation_replay_visited;
+            visited.retain(|id| retained_ids.contains(id));
+            records.retain(|record| !visited.contains(&record.id));
+        }
         for record in records {
+            if let Some(budget) = execution.as_mut() {
+                if budget.exhausted() {
+                    return Ok(false);
+                }
+                budget.consume_row();
+            }
             if !matches!(
                 record.state,
                 MessageState::Created | MessageState::Retryable | MessageState::PeelDeferred
@@ -3699,6 +3750,13 @@ impl<S: StorageProvider> Engine<S> {
             let stored_payload = StoredMessagePayload::decode(&record.payload)
                 .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
             let Some(msg) = stored_payload.as_raw_transport().cloned() else {
+                if execution.is_some() {
+                    self.deferred_peel
+                        .entry(group_id.clone())
+                        .or_default()
+                        .confirmation_replay_visited
+                        .insert(record.id);
+                }
                 continue;
             };
             let was_peel_deferred = record.state == MessageState::PeelDeferred;
@@ -3845,8 +3903,20 @@ impl<S: StorageProvider> Engine<S> {
                     return Err(e);
                 }
             }
+            if execution.is_some() {
+                self.deferred_peel
+                    .entry(group_id.clone())
+                    .or_default()
+                    .confirmation_replay_visited
+                    .insert(record.id);
+            }
         }
-        Ok(())
+        self.deferred_peel
+            .entry(group_id.clone())
+            .or_default()
+            .confirmation_replay_visited
+            .clear();
+        Ok(true)
     }
 }
 
@@ -3961,6 +4031,26 @@ mod deferred_peel_accounting_tests {
             deferred_peel: None,
         };
         engine.storage.put_message(&record).unwrap();
+        engine.pending_confirmation_replays.insert(group_id.clone());
+        for (deadline, rows_remaining) in [(Some(Instant::now()), 64), (None, 0)] {
+            let mut execution = DeferredPeelExecution::Background {
+                deadline,
+                rows_remaining,
+            };
+            assert!(
+                !engine
+                    .retry_pending_confirmation_replay(&group_id, &mut execution)
+                    .await
+                    .unwrap()
+            );
+            assert!(engine.pending_confirmation_replays.contains(&group_id));
+            assert_eq!(engine.storage.get_message(&id).unwrap(), record);
+            assert!(
+                engine
+                    .drain_pending_convergence_groups()
+                    .contains(&group_id)
+            );
+        }
         let status = engine
             .advance_convergence_inputs_with_execution(
                 &group_id,
@@ -3993,6 +4083,139 @@ mod deferred_peel_accounting_tests {
                 .distinct_context_attempts,
             0
         );
+    }
+
+    /// A permanently opaque prefix must not monopolize every confirmation retry slice.
+    #[tokio::test]
+    async fn confirmation_retry_resumes_after_deferred_prefix() {
+        use cgka_traits::engine::{CgkaEngine, CreateGroupRequest};
+        use cgka_traits::error::PeelerError;
+        use cgka_traits::group_context::GroupContextSnapshot;
+        use cgka_traits::ingest::PeeledMessage;
+        use cgka_traits::peeler::TransportPeeler;
+        use cgka_traits::storage::MessageStorage;
+        use cgka_traits::transport::{EncryptedPayload, Timestamp, TransportSource};
+        struct OpaquePeeler;
+        #[async_trait::async_trait]
+        impl TransportPeeler for OpaquePeeler {
+            async fn peel_group_message(
+                &self,
+                _: &TransportMessage,
+                _: &GroupContextSnapshot,
+            ) -> Result<PeeledMessage, PeelerError> {
+                Err(PeelerError::DecryptFailed)
+            }
+            async fn peel_welcome(
+                &self,
+                _: &TransportMessage,
+            ) -> Result<PeeledMessage, PeelerError> {
+                unreachable!()
+            }
+            async fn wrap_group_message(
+                &self,
+                _: &EncryptedPayload,
+                _: &GroupContextSnapshot,
+            ) -> Result<TransportMessage, PeelerError> {
+                unreachable!()
+            }
+            async fn wrap_welcome(
+                &self,
+                _: &EncryptedPayload,
+                _: &MemberId,
+            ) -> Result<TransportMessage, PeelerError> {
+                unreachable!()
+            }
+        }
+        let mut engine = crate::distributed_convergence::tests::test_engine();
+        let (group_id, created) = engine
+            .create_group(CreateGroupRequest {
+                name: "confirmation retry fairness".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        if let SendResult::GroupCreated { pending, .. } = created {
+            engine.confirm_published(pending).await.unwrap();
+        }
+        engine.peeler = Box::new(OpaquePeeler);
+        let mut ids = Vec::new();
+        for index in 0..65u8 {
+            let id = MessageId::new(vec![255 - index; 32]);
+            let msg = TransportMessage {
+                id: id.clone(),
+                payload: vec![index],
+                timestamp: Timestamp(1),
+                causal_deps: vec![],
+                source: TransportSource("test".into()),
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: group_id.as_slice().to_vec(),
+                },
+            };
+            engine
+                .storage
+                .put_message(&MessageRecord {
+                    id: id.clone(),
+                    group_id: group_id.clone(),
+                    epoch: EpochId(0),
+                    state: MessageState::Retryable,
+                    payload: StoredMessagePayload::raw_transport(msg).encode().unwrap(),
+                    deferred_peel: None,
+                })
+                .unwrap();
+            ids.push(id);
+        }
+        engine.pending_confirmation_replays.insert(group_id.clone());
+        let mut execution = DeferredPeelExecution::Background {
+            deadline: None,
+            rows_remaining: 64,
+        };
+        assert!(
+            !engine
+                .retry_pending_confirmation_replay(&group_id, &mut execution)
+                .await
+                .unwrap()
+        );
+        assert_eq!(execution.row_limit(), 0);
+        assert!(engine.pending_confirmation_replays.contains(&group_id));
+        assert!(
+            engine
+                .drain_pending_convergence_groups()
+                .contains(&group_id)
+        );
+        for id in &ids[..64] {
+            assert_eq!(
+                engine.storage.get_message(id).unwrap().state,
+                MessageState::PeelDeferred
+            );
+        }
+        assert_eq!(
+            engine.storage.get_message(&ids[64]).unwrap().state,
+            MessageState::Retryable
+        );
+        let mut execution = DeferredPeelExecution::Background {
+            deadline: None,
+            rows_remaining: 64,
+        };
+        assert!(
+            engine
+                .retry_pending_confirmation_replay(&group_id, &mut execution)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            execution.row_limit(),
+            63,
+            "only the remaining suffix spends the shared allowance"
+        );
+        assert_eq!(
+            engine.storage.get_message(&ids[64]).unwrap().state,
+            MessageState::PeelDeferred
+        );
+        assert!(!engine.pending_confirmation_replays.contains(&group_id));
     }
 
     #[tokio::test]

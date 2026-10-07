@@ -1220,3 +1220,169 @@ async fn accepted_source_finalization_rolls_back_when_revival_conversion_fails()
     assert!(repaired.source_message_id_hex.is_some());
     assert!(repaired.invalidation_status.is_none());
 }
+
+/// A resumed accepted send owes its recipient wake after revival and checkpoint,
+/// including when either step has to finish on a later worker pass.
+#[tokio::test]
+async fn resumed_publication_wakes_after_revival_and_checkpoint() {
+    for kind in [MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_POLL] {
+        for fault in [
+            "none",
+            "checkpoint",
+            "revival",
+            "withdrawn",
+            "forgotten",
+            "terminal",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let home = AccountHome::open(dir.path());
+            let alice = home.create_account("alice").unwrap();
+            let bob = home.create_account("bob").unwrap();
+            let relay = Arc::new(ScriptedPushRelayClient::default());
+            let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+                .with_test_relay_client(relay.clone());
+            crate::tests::remember_test_member_inbox(
+                &app,
+                &bob.account_id_hex,
+                "wss://relay.example",
+            );
+            let mut bob_client = app.client("bob").await.unwrap();
+            bob_client.sync().await.unwrap();
+            let mut client = app.client("alice").await.unwrap();
+            let group = client
+                .create_group("resumed push", &[&bob.account_id_hex])
+                .await
+                .unwrap();
+            let group_hex = hex::encode(group.as_slice());
+            app.upsert_group_push_token(
+                "alice",
+                &crate::notifications::GroupPushTokenRecord {
+                    group_id_hex: group_hex.clone(),
+                    member_id_hex: bob.account_id_hex.clone(),
+                    leaf_index: 1,
+                    platform: crate::notifications::PushPlatform::Apns,
+                    token_fingerprint: "resumed-peer".into(),
+                    server_pubkey_hex: bob.account_id_hex,
+                    relay_hint: Some("wss://relay.example".into()),
+                    encrypted_token: vec![1; crate::notifications::PUSH_ENCRYPTED_TOKEN_LEN],
+                    owner_ts: 1,
+                    owner_sig: String::new(),
+                    updated_at_ms: 1,
+                },
+            )
+            .unwrap();
+            let now = unix_now_seconds();
+            let tags = if kind == MARMOT_APP_EVENT_KIND_POLL {
+                cgka_traits::poll_tags(
+                    now,
+                    "Lunch?",
+                    &["Yes".into(), "No".into()],
+                    cgka_traits::PollType::SingleChoice,
+                    None,
+                )
+                .unwrap()
+            } else {
+                vec![]
+            };
+            let event = cgka_traits::app_event::MarmotAppEvent::new(
+                &alice.account_id_hex,
+                now,
+                kind,
+                tags,
+                "Lunch?",
+            );
+            client
+                .record_send_intent_projection(&group, &alice.account_id_hex, &event)
+                .unwrap();
+            app.invalidate_timeline_app_event(
+                "alice",
+                &group_hex,
+                &event.id,
+                crate::LOCAL_PUBLISH_FAILED_REASON,
+            )
+            .unwrap();
+            let effects = client
+                .runtime
+                .send(cgka_traits::engine::SendIntent::AppMessage {
+                    group_id: group.clone(),
+                    payload: event.encode().unwrap(),
+                    expected_epoch: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(effects.published_app_messages.len(), 1);
+            let before = relay.published_event_ids().len();
+            let connection =
+                super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
+            match fault {
+                "terminal" => crate::tests::make_group_terminal(&client, &group, false),
+                "checkpoint" | "forgotten" => connection.execute_batch("CREATE TRIGGER fail_resumed_checkpoint BEFORE INSERT ON account_groups BEGIN SELECT RAISE(FAIL, 'injected checkpoint'); END;").unwrap(),
+                "revival" => connection.execute_batch("CREATE TRIGGER fail_resumed_revival BEFORE INSERT ON chat_list_rows WHEN EXISTS (SELECT 1 FROM app_events WHERE invalidated = 0 AND source_message_id_hex IS NOT NULL) BEGIN SELECT RAISE(FAIL, 'injected revival'); END;").unwrap(),
+                "withdrawn" => { app.invalidate_timeline_app_event("alice", &group_hex, &event.id, "fork_loser").unwrap(); },
+                _ => {}
+            }
+            if matches!(fault, "checkpoint" | "forgotten") {
+                client
+                    .pending_group_projection_updates
+                    .insert(group_hex.clone());
+            }
+            let observed = client
+                .observe_scheduled_convergence_effects(&group, &effects)
+                .await;
+            match fault {
+                "checkpoint" | "forgotten" => {
+                    assert!(observed.is_err());
+                    assert_eq!(relay.published_event_ids().len(), before);
+                    assert!(client.has_pending_runtime_group_subscription_refresh());
+                    connection
+                        .execute_batch("DROP TRIGGER fail_resumed_checkpoint")
+                        .unwrap();
+                    if fault == "forgotten" {
+                        client.forget_pending_effect_projections(&group);
+                    }
+                    client
+                        .retry_pending_runtime_group_subscription_refresh()
+                        .await
+                        .unwrap();
+                }
+                "revival" => {
+                    observed.unwrap();
+                    assert_eq!(relay.published_event_ids().len(), before);
+                    assert_eq!(client.pending_resumed_message_notifications.len(), 1);
+                    connection
+                        .execute_batch("DROP TRIGGER fail_resumed_revival")
+                        .unwrap();
+                    // This is the actual scheduled retry of the durable accepted
+                    // fanout; it must not publish the application bytes again.
+                    client
+                        .advance_convergence_after_runtime_sync(&group)
+                        .await
+                        .unwrap();
+                }
+                _ => {
+                    observed.unwrap();
+                }
+            }
+            let expected =
+                before + usize::from(!matches!(fault, "withdrawn" | "forgotten" | "terminal"));
+            assert_eq!(
+                relay.published_event_ids().len(),
+                expected,
+                "kind={kind} fault={fault}"
+            );
+            assert!(
+                client.pending_resumed_message_notifications.is_empty(),
+                "kind={kind} fault={fault}"
+            );
+            client
+                .retry_pending_runtime_group_subscription_refresh()
+                .await
+                .unwrap();
+            assert_eq!(
+                relay.published_event_ids().len(),
+                expected,
+                "retry must not duplicate a wake"
+            );
+        }
+    }
+}

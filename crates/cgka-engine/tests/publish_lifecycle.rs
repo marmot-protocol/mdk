@@ -2169,7 +2169,8 @@ async fn confirmation_anchor_and_membership_failures_preserve_author_effects() {
 }
 
 /// Replay is ancillary to an already durable confirmation. Its transient read
-/// failure must arm normal scheduling instead of orphaning the consumed slot.
+/// failure must arm normal scheduling instead of orphaning the consumed slot;
+/// 96 retained messages drain in multiple turns sharing the 64-row allowance.
 #[tokio::test]
 async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance() {
     use cgka_traits::engine::{GroupEvent, GroupStateChange};
@@ -2255,6 +2256,28 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
             alice.ingest(msg.clone()).await.unwrap(),
             IngestOutcome::Buffered { .. }
         ));
+        let mut retained_ids = vec![msg.id.clone()];
+        for index in 1..96 {
+            let SendResult::ApplicationMessage { mut msg, .. } = bob
+                .send(SendIntent::AppMessage {
+                    group_id: group_id.clone(),
+                    payload: app_payload_for(&bob, &format!("retained message {index}")),
+                    expected_epoch: None,
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("peer application message");
+            };
+            msg.envelope = TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            };
+            retained_ids.push(msg.id.clone());
+            assert!(matches!(
+                alice.ingest(msg).await.unwrap(),
+                IngestOutcome::Buffered { .. }
+            ));
+        }
         alice.drain_events();
         fault.replay.arm(2);
         alice
@@ -2397,7 +2420,8 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
         );
         assert!(alice.drain_events().is_empty());
         let mut replay_events = Vec::new();
-        for _ in 0..4 {
+        let mut turns = 0;
+        for _ in 0..8 {
             assert_eq!(
                 alice
                     .prepare_convergence_cutoff_delay_ms(&group_id)
@@ -2407,15 +2431,40 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
             advance_replay(&mut alice, &group_id, mode, 1_000)
                 .await
                 .unwrap();
-            replay_events.extend(alice.drain_events());
-            if storage.get_message(&msg.id).unwrap().state == MessageState::Processed {
+            turns += 1;
+            let events = alice.drain_events();
+            let delivered = events
+                .iter()
+                .filter(|event| {
+                    matches!(event,
+                GroupEvent::MessageReceived { sender, .. } if sender == &bob.self_id())
+                })
+                .count();
+            assert!(
+                delivered <= 64,
+                "one background turn exceeded its shared row allowance: {delivered}"
+            );
+            replay_events.extend(events);
+            if retained_ids
+                .iter()
+                .all(|id| storage.get_message(id).unwrap().state == MessageState::Processed)
+            {
                 break;
             }
+            assert!(
+                alice.drain_pending_convergence_groups().contains(&group_id),
+                "yield must rearm retry scheduling"
+            );
             clock.advance_ms(1_000);
         }
-        assert_eq!(
-            storage.get_message(&msg.id).unwrap().state,
-            MessageState::Processed
+        assert!(
+            turns >= 2,
+            "96 retained messages must require multiple background turns"
+        );
+        assert!(
+            retained_ids
+                .iter()
+                .all(|id| storage.get_message(id).unwrap().state == MessageState::Processed)
         );
         assert_eq!(
             replay_events
@@ -2424,7 +2473,7 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
                     event, GroupEvent::MessageReceived { sender, .. } if sender == &bob.self_id()
                 ))
                 .count(),
-            1
+            96
         );
         assert!(!replay_events.iter().any(|event| matches!(
             event,

@@ -3365,3 +3365,160 @@ async fn assert_convergence_membership_fault(
         1
     );
 }
+
+/// A terminal cleanup fault cannot erase activity from earlier canonical commits.
+#[tokio::test]
+async fn disband_cleanup_failure_preserves_earlier_canonical_activity_once() {
+    use cgka_engine::ManualConvergenceClock;
+    use cgka_traits::engine::{GroupEvent, GroupStateChange};
+    use cgka_traits::group::ProtocolProfile;
+
+    let clock = ManualConvergenceClock::new(0, 10_000);
+    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(pad32(b"alice-disband-cleanup"))
+        .account_identity_proof_signer(proof_signer(b"alice-disband-cleanup"))
+        .protocol_profile(ProtocolProfile::Current)
+        .convergence_clock(Arc::new(clock.clone()))
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    let termination_fault = LeaveWriteFault::default();
+    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let handle = inner.clone();
+    let mut bob = EngineBuilder::new(FaultStorage {
+        inner,
+        fault: PutGroupFault::default(),
+        capability_fault: CapabilityWriteFault::default(),
+        leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: LeaveWriteFault::default(),
+        failed_state_fault: FailedStateWriteFault::default(),
+        release_fault: LeaveWriteFault::default(),
+        preparation_delay: PreparationDelay::default(),
+        retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        termination_fault: termination_fault.clone(),
+        post_commit_disband_read_fault: LeaveWriteFault::default(),
+    })
+    .identity(pad32(b"bob-disband-cleanup"))
+    .account_identity_proof_signer(proof_signer(b"bob-disband-cleanup"))
+    .protocol_profile(ProtocolProfile::Current)
+    .peeler(Box::new(MockPeeler))
+    .build()
+    .unwrap();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "before rename".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+        panic!("current-profile founding group");
+    };
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    bob.drain_events();
+    let SendResult::GroupEvolution {
+        msg: mut rename,
+        pending,
+        ..
+    } = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("committed before disband".into()),
+            description: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("rename commit");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    alice
+        .send(SendIntent::Disband {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let mut prepared = None;
+    for _ in 0..8 {
+        let sends = alice.advance_convergence(&group_id).await.unwrap();
+        if let [SendResult::GroupEvolution { msg, pending, .. }] = sends.as_slice() {
+            prepared = Some((msg.clone(), *pending));
+            break;
+        }
+        assert!(sends.is_empty());
+        clock.advance_ms(1_000);
+    }
+    let (mut disband, pending) = prepared.expect("scheduled disband");
+    alice.confirm_published(pending).await.unwrap();
+    for message in [&mut rename, &mut disband] {
+        message.envelope = TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        };
+    }
+    let rename_id = content_hex(&rename);
+    bob.buffer_openmls_convergence_message_at(&group_id, disband, 1_000)
+        .unwrap();
+    bob.buffer_openmls_convergence_message_at(&group_id, rename, 1_000)
+        .unwrap();
+    // clear_leave_request runs after writing the terminal tombstone and group
+    // record, but all terminal cleanup rolls back together on this fault.
+    termination_fault.arm_on_write(1);
+    let error = bob
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .unwrap_err();
+    assert!(format!("{error:?}").contains("injected termination cleanup failure"));
+    assert!(handle.disband_tombstone(&group_id).unwrap().is_none());
+    assert!(handle.get_group(&group_id).unwrap().disbanded.is_none());
+    let prefix = bob.drain_events();
+    let activity: Vec<_> = prefix
+        .iter()
+        .filter_map(|event| match event {
+            GroupEvent::GroupStateChanged {
+                change,
+                actor,
+                origin_commit_id,
+                ..
+            } => Some((change, actor, origin_commit_id)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        activity.len(),
+        1,
+        "only the committed rename may be announced"
+    );
+    assert!(
+        matches!(activity[0].0, GroupStateChange::GroupRenamed { name, .. }
+        if name == "committed before disband")
+    );
+    assert_eq!(activity[0].1.as_ref(), Some(&alice.self_id()));
+    assert_eq!(
+        activity[0].2.as_ref().map(|id| hex::encode(id.as_slice())),
+        Some(rename_id),
+    );
+    bob.converge_stored_openmls_messages_at(&group_id, 2_000_000)
+        .unwrap();
+    // The completed pass has to reopen and cross its own collection cutoff.
+    bob.converge_stored_openmls_messages_at(&group_id, 3_000_000)
+        .unwrap();
+    assert!(handle.disband_tombstone(&group_id).unwrap().is_some());
+    let suffix = bob.drain_events();
+    let changes: Vec<_> = suffix
+        .iter()
+        .filter_map(|event| match event {
+            GroupEvent::GroupStateChanged { change, .. } => Some(change),
+            _ => None,
+        })
+        .collect();
+    assert!(matches!(&changes[..], [GroupStateChange::GroupDisbanded]));
+    bob.advance_convergence(&group_id).await.unwrap();
+    assert!(
+        !bob.drain_events()
+            .iter()
+            .any(|event| matches!(event, GroupEvent::GroupStateChanged { .. }))
+    );
+}

@@ -2249,6 +2249,71 @@ async fn convergence_apply_clears_removed_marker_without_canonical_evidence() {
     assert_eq!(group.name, "healed");
     assert!(group.members.iter().any(|m| m.id == carol.self_id()));
     send_app(&mut carol, &group_id, b"send after healing".to_vec()).await;
+    assert_eq!(
+        carol
+            .drain_events()
+            .iter()
+            .filter(|event| matches!(event, GroupEvent::LocalGroupCopyRestored { .. }))
+            .count(),
+        1,
+    );
+
+    // Bob still holds the founding epoch. Its longer branch forces Carol to
+    // replay the retained anchor captured while her metadata said removed.
+    // Her current source tree is already live, so selection must clear the
+    // historical marker without announcing a second restoration.
+    assert_eq!(bob.epoch(&group_id).unwrap(), EpochId(1));
+    let mut bob_commits = Vec::new();
+    for name in ["bob branch", "bob longer branch"] {
+        let (commit, pending) = evolution(
+            bob.send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some(name.into()),
+                description: None,
+            })
+            .await
+            .unwrap(),
+        );
+        bob.confirm_published(pending).await.unwrap();
+        bob_commits.push(route(commit, &group_id));
+    }
+    for commit in &bob_commits {
+        carol
+            .buffer_openmls_convergence_message_at(&group_id, commit.clone(), 2_000_000)
+            .unwrap();
+    }
+    let selected = carol
+        .converge_stored_openmls_messages_at(&group_id, 3_000_000)
+        .unwrap();
+    assert_eq!(selected.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(
+        selected.accepted_commits,
+        bob_commits.iter().map(content_hex).collect::<Vec<_>>(),
+    );
+    let group = carol_storage.get_group(&group_id).unwrap();
+    assert_eq!(group.name, "bob longer branch");
+    assert!(
+        !group.removed,
+        "historical metadata must not undo the earlier heal"
+    );
+    assert!(
+        carol
+            .canonical_group_membership(&group_id)
+            .unwrap()
+            .local_leaf_active
+    );
+    assert!(
+        !carol
+            .drain_events()
+            .iter()
+            .any(|event| matches!(event, GroupEvent::LocalGroupCopyRestored { .. }))
+    );
+    send_app(
+        &mut carol,
+        &group_id,
+        b"send after historical replay".to_vec(),
+    )
+    .await;
 }
 
 /// Sibling of the test above with the FULL post-`realize_self_eviction`

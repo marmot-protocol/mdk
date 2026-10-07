@@ -681,6 +681,7 @@ pub(crate) struct PendingAppliedEffects {
     effects: marmot_account::AccountDeviceEffects,
     received_at: u64,
     source_message_id_hex: String,
+    source_delivery_id: Option<cgka_traits::MessageId>,
     drained: bool,
     progress: EffectProjectionProgress,
     leading_updates: Vec<crate::AppProjectionUpdate>,
@@ -1375,7 +1376,11 @@ impl AppClient {
             || !self.pending_group_projection_updates.is_empty()
             || !self.pending_local_group_deletion_frontier_clears.is_empty()
             || !self.pending_projection_updates.is_empty()
-            || !self.pending_application_event_acks.is_empty();
+            || !self.pending_application_event_acks.is_empty()
+            || self
+                .pending_resumed_message_notifications
+                .values()
+                .any(|ready| *ready);
         if pending {
             self.pending_runtime_group_subscription_refresh = true;
         }
@@ -1386,6 +1391,10 @@ impl AppClient {
         self.pending_runtime_group_subscription_refresh
             || !self.pending_applied_effects.is_empty()
             || !self.pending_push_leaf_reconciliations.is_empty()
+            || self
+                .pending_resumed_message_notifications
+                .values()
+                .any(|ready| *ready)
     }
 
     /// Retry an ordinary group-subscription rebuild that was deliberately
@@ -1420,6 +1429,8 @@ impl AppClient {
             }
         }
         self.pending_runtime_group_subscription_refresh = false;
+        self.publish_checkpointed_resumed_message_notifications()
+            .await?;
         push_cleanup_result?;
         Ok(self.has_pending_runtime_group_subscription_refresh())
     }
@@ -2138,6 +2149,7 @@ impl AppClient {
                 effects: effects.clone(),
                 received_at,
                 source_message_id_hex: source_message_id_hex.to_owned(),
+                source_delivery_id: None,
                 drained,
                 progress: EffectProjectionProgress::default(),
                 leading_updates: Vec::new(),
@@ -2187,9 +2199,19 @@ impl AppClient {
             self.observe_recovery_health(&pending.effects)?;
             // This helper transfers unfinished source finalization back to its
             // durable accepted fanout; success means that handoff is complete.
-            pending
-                .leading_updates
-                .extend(self.finalize_published_app_message_source_retention(&pending.effects)?);
+            let (updates, finalized) =
+                self.finalize_published_app_message_source_retention_with_status(&pending.effects)?;
+            pending.leading_updates.extend(updates);
+            if finalized {
+                for published in &pending.effects.published_app_messages {
+                    if let Some(ready) = self
+                        .pending_resumed_message_notifications
+                        .get_mut(&(published.group_id.clone(), published.app_event_id.clone()))
+                    {
+                        *ready = true;
+                    }
+                }
+            }
             pending.bookkeeping_started = true;
         }
         while let Some(failed) = pending
@@ -2312,6 +2334,11 @@ impl AppClient {
                 .front_mut()
                 .expect("queued batch") = pending.clone();
             routes_dirty |= result?;
+            // Only post-engine-success batches own this pin. Projection has
+            // settled; release before any checkpoint can seal a newer cursor.
+            if let Some(id) = &pending.source_delivery_id {
+                self.adapter.release_account_delivery(id);
+            }
             if pending.drained {
                 self.pending_applied_sync_summary
                     .merge(std::mem::take(summary));
@@ -2347,6 +2374,8 @@ impl AppClient {
     /// released in the same batch or changing their ordering and provenance.
     pub(super) fn forget_pending_effect_projections(&mut self, group_id: &cgka_traits::GroupId) {
         let group_hex = hex::encode(group_id.as_slice());
+        self.pending_resumed_message_notifications
+            .retain(|(group, _), _| group != group_id);
         for summary in [
             &mut self.pending_applied_sync_summary,
             &mut self.pending_failed_sync_summary,
@@ -2455,6 +2484,7 @@ impl AppClient {
                 || !pending.leading_updates.is_empty()
                 || !pending.effects.published_app_messages.is_empty()
                 || !pending.effects.failed_app_messages.is_empty()
+                || pending.source_delivery_id.is_some()
         });
     }
 
@@ -3511,6 +3541,7 @@ impl AppClient {
             });
         }
         let effects = ingest?;
+        let queued = client.pending_applied_effects.len();
         client.retain_effect_projection(
             &effects.effects,
             &source_message_id_hex,
@@ -3528,6 +3559,37 @@ impl AppClient {
             .was_released(&source_message_id_hex);
         let publish_error = fail_if_publish_failed(&effects.effects).err();
         let must_stay_fetchable = effects.left_object_unpersisted || source_released;
+        // The side effects alone do not prove the transport input was retained.
+        // A refusal or failed receipt classification still needs genuine reingest;
+        // only a durably settled source may release its pin after projection repair.
+        if !must_stay_fetchable {
+            if client.pending_applied_effects.len() == queued {
+                // Eventless accepted deliveries still owe a cursor-pin release if
+                // a subsequent bookkeeping operation fails.
+                client
+                    .pending_applied_effects
+                    .push_back(PendingAppliedEffects {
+                        effects: effects.effects.clone(),
+                        received_at: source_received_at,
+                        source_message_id_hex: source_message_id_hex.clone(),
+                        source_delivery_id: None,
+                        drained: false,
+                        progress: EffectProjectionProgress::default(),
+                        leading_updates: Vec::new(),
+                        uncommitted_summary: SyncSummary::default(),
+                        native_only: false,
+                        activity_only: false,
+                        bookkeeping_started: false,
+                        failed_message_cursor: 0,
+                        failed_message_update: None,
+                    });
+            }
+            client
+                .pending_applied_effects
+                .back_mut()
+                .expect("accepted delivery batch")
+                .source_delivery_id = Some(source_message_id.clone());
+        }
         if !must_stay_fetchable && let Some((route, item)) = &reconciliation_record {
             client.record_transport_reconciliation_item(route, item);
             if matches!(
@@ -5258,6 +5320,11 @@ impl AppClient {
         group_id: &cgka_traits::GroupId,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<SyncSummary, AppError> {
+        for published in &effects.published_app_messages {
+            self.pending_resumed_message_notifications
+                .entry((published.group_id.clone(), published.app_event_id.clone()))
+                .or_insert(false);
+        }
         self.retain_effect_projection(effects, "", unix_now_seconds(), false);
         if let Err(error) = fail_if_publish_failed(effects) {
             // The primary publish error must not skip committed route/state
@@ -5272,21 +5339,6 @@ impl AppClient {
             }
             return Err(error);
         }
-        let publish_new_message_notification =
-            effects.published_app_messages.iter().any(|published| {
-                let group_id_hex = hex::encode(published.group_id.as_slice());
-                self.app
-                    .reaction_target(&self.state.label, &group_id_hex, &published.app_event_id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|message| {
-                        matches!(
-                            message.kind,
-                            MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_POLL
-                        ) && !message.deleted
-                            && !message.invalidated
-                    })
-            });
         self.refresh_group(group_id);
 
         let mut summary = SyncSummary::default();
@@ -5304,7 +5356,9 @@ impl AppClient {
                 self.sync_runtime_groups().await?;
             }
             self.prune_plaintext_retention_for_group(group_id)?;
-            self.save_state_with_pending_local_group_deletion_frontier_clears()
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+            self.publish_checkpointed_resumed_message_notifications()
+                .await
         }
         .await;
         if let Err(error) = result {
@@ -5316,15 +5370,54 @@ impl AppClient {
             self.pending_applied_sync_summary.merge(summary);
             return Err(error);
         }
-        if publish_new_message_notification {
+        self.drain_epoch_stall_escalations(&mut summary);
+        Ok(summary)
+    }
+
+    /// Dispatch only after source finalization and the account checkpoint. A
+    /// failed row read retains the obligation for the quiet worker retry.
+    async fn publish_checkpointed_resumed_message_notifications(&mut self) -> Result<(), AppError> {
+        let ready = self
+            .pending_resumed_message_notifications
+            .iter()
+            .filter(|(_, ready)| **ready)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let mut groups = HashSet::new();
+        let mut completed = Vec::new();
+        for (group, id) in ready {
+            let message =
+                self.app
+                    .reaction_target(&self.state.label, &hex::encode(group.as_slice()), &id)?;
+            if message.is_some_and(|message| {
+                matches!(
+                    message.kind,
+                    MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_POLL
+                ) && !message.deleted
+                    && !message.invalidated
+            }) {
+                groups.insert(group.clone());
+            }
+            completed.push((group, id));
+        }
+        for group in groups {
             self.publish_notification_trigger_best_effort(
-                group_id,
+                &group,
                 notifications::NotificationTrigger::NewMessage,
             )
             .await;
+            // Remove each dispatched group before awaiting another one.
+            for key in completed
+                .iter()
+                .filter(|(candidate, _)| candidate == &group)
+            {
+                self.pending_resumed_message_notifications.remove(key);
+            }
         }
-        self.drain_epoch_stall_escalations(&mut summary);
-        Ok(summary)
+        for key in completed {
+            self.pending_resumed_message_notifications.remove(&key);
+        }
+        Ok(())
     }
 
     /// Snapshot each affected group's durable local-delete frontier before any
