@@ -230,7 +230,7 @@ mod tests {
         // /private/tmp target when reached through a symlink.
         let short_temp_base = std::fs::canonicalize("/tmp").unwrap();
         let home = tempfile::Builder::new()
-            .prefix("mdk-use-")
+            .prefix(".mu-")
             .tempdir_in(short_temp_base)
             .unwrap();
         let app = MarmotApp::try_with_relays_and_account_home_and_config(
