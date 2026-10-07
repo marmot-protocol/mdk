@@ -175,9 +175,9 @@ second alert for the same completion.
    round-trip status.
    This patch changes that handoff and the canonical quickstart. It does not
    publish profiles, create groups, change permissions, or enable auto-titles.
-2. **Title defaults:** consume the proposed
-   [harness group-profile exposure (open PR 2115)](https://github.com/marmot-protocol/mdk/pull/2115)
-   once merged and included in a matching release. Add per-turn default policy and editable preferences,
+2. **Title defaults:** build on the
+   [harness group-profile exposure (PR 2115)](https://github.com/marmot-protocol/mdk/pull/2115)
+   once included in a matching release. Add per-turn default policy and editable preferences,
    including non-admin, concurrent-group, compaction, and unknown-write tests.
 3. **Mobile parity and pairing:** the inspected Android source offers Codex but not Claude
    or Pi in its agent list; iOS offers all three. Align their installation prompts
