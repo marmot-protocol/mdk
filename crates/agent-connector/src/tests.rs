@@ -7805,6 +7805,12 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
     )
     .await;
 
+    let seeded = app.account_relay_list_status(&account.label).unwrap();
+    assert!(
+        seeded.inbox.relays.contains(&inbox_url),
+        "seeded local inbox list must contain the untouched entry: {:?}",
+        seeded.inbox
+    );
     // Give both seeded replaceable kinds an older timestamp than their first
     // edit. Same-second event-id ordering could otherwise keep the seed on
     // the relay, just as the removal below needs a newer second than the add.
@@ -7831,7 +7837,7 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
         })
         .await
         .unwrap();
-    connector
+    let inbox_edit = connector
         .relay_list_edit_response(crate::relays::RelayListEdit {
             account_id_hex: account.account_id_hex.clone(),
             relay_type: agent_control::AgentControlRelayListType::Inbox,
@@ -7842,15 +7848,42 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
         .await
         .unwrap();
 
-    let published = app
-        .fetch_current_account_relay_list_status_for_account_id(
-            &account.account_id_hex,
-            vec![relay_endpoint.clone()],
-            Some("nip65"),
-        )
-        .await
-        .unwrap()
-        .expect("published relay lists");
+    let AgentControlResponse::RelayLists { relay_lists, .. } = inbox_edit else {
+        panic!("expected inbox edit response: {inbox_edit:?}");
+    };
+    assert!(
+        relay_lists.inbox.relays.contains(&inbox_url),
+        "edit response must preserve the untouched inbox entry: {:?}",
+        relay_lists.inbox
+    );
+    assert!(
+        relay_lists.inbox.relays.contains(&inbox_added_url),
+        "edit response must include the added inbox entry: {:?}",
+        relay_lists.inbox
+    );
+
+    // Publication requires one acknowledgement, not every routed relay's ACK.
+    // Also, an overlapping directory read can share a pre-edit query. Wait for
+    // this relay to expose the acknowledged revision before checking its tags.
+    let published = timeout(Duration::from_secs(15), async {
+        loop {
+            let status = app
+                .fetch_current_account_relay_list_status_for_account_id(
+                    &account.account_id_hex,
+                    vec![relay_endpoint.clone()],
+                    Some("nip65"),
+                )
+                .await
+                .unwrap()
+                .expect("published relay lists");
+            if status.inbox.created_at >= relay_lists.inbox.created_at {
+                break status;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the routed relay must expose the acknowledged inbox revision");
     for expected in [&added_url, &read_url, &relay_url] {
         assert!(
             published
@@ -7874,7 +7907,9 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
     for expected in [&inbox_url, &inbox_added_url] {
         assert!(
             published.inbox.relays.iter().any(|relay| relay == expected),
-            "inbox list should still hold {expected}"
+            "inbox list should still hold {expected}; readback={:?}, edit={:?}",
+            published.inbox,
+            relay_lists.inbox
         );
     }
 
