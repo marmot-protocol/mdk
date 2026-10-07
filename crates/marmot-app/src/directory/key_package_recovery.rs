@@ -222,6 +222,12 @@ fn distinct_recovery_routes<'a>(
         .collect()
 }
 
+fn recovery_incomplete() -> AppError {
+    AppError::RelayDirectory(
+        "invitation key recovery could not establish complete lookup and deletion coverage".into(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,10 +245,4 @@ mod tests {
             vec![routes[0].clone(), routes[2].clone()]
         );
     }
-}
-
-fn recovery_incomplete() -> AppError {
-    AppError::RelayDirectory(
-        "invitation key recovery could not establish complete lookup and deletion coverage".into(),
-    )
 }
