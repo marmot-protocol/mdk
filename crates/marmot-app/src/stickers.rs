@@ -12,11 +12,12 @@ use nostr::prelude::{
 };
 use serde::{Deserialize, Serialize};
 use sonar_stickers::{
-    InstalledPackList, PACK_FORMAT, PackAddress, STICKER_PACK_KIND, Sticker, StickerPack,
-    StickerRef, USER_STICKER_PACKS_KIND, build_installed_packs_tags, build_pack_tags,
-    build_sticker_ref_tag, parse_installed_pack_list, parse_pack_event, parse_sticker_ref_tag,
-    sha256_hex,
+    InstalledPackList, PACK_FORMAT, PackAddress, STICKER_PACK_KIND, Sticker, StickerRef,
+    USER_STICKER_PACKS_KIND, build_installed_packs_tags, build_sticker_ref_tag,
+    parse_installed_pack_list, parse_pack_event, parse_sticker_ref_tag, sha256_hex,
 };
+#[cfg(test)]
+use sonar_stickers::{StickerPack, build_pack_tags};
 use storage_sqlite::{
     SqliteAccountStorage, StoredSticker, StoredStickerOutboxEvent, StoredStickerPack,
     StoredStickerPackVersion,
@@ -25,10 +26,9 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use crate::external_signer::AccountSigner;
-use crate::media::{BlossomHttpTransport, fetch_blossom_blob_limited, upload_blossom_blob};
+use crate::media::fetch_blossom_blob_limited;
 use crate::{AppError, MarmotApp, ReceivedMessage, unix_now_seconds};
 
-pub const DEFAULT_STICKER_BLOSSOM_SERVER_URL: &str = "https://nostr.download";
 const MAX_STICKER_ASSET_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_STICKER_DIMENSION: u32 = 4096;
 const MAX_STICKER_PIXELS: u64 = 4096 * 4096;
@@ -519,190 +519,33 @@ impl MarmotApp {
         tolerate_offline(publish_pending_installed_list(self, &context).await)
     }
 
-    /// Import/decrypt a Signal pack with `sonar-stickers`, validate every
-    /// plaintext image, upload content-addressed public bytes to Blossom, then
-    /// publish and install the Sonar pack. The link is zeroized by this wrapper
-    /// and is never persisted. External-signing accounts are explicitly gated:
-    /// Blossom requires one authorization signature per asset, which would
-    /// otherwise trigger up to 200 Amber prompts.
+    /// Signal import is refused before any network call.
+    ///
+    /// The pinned `sonar-stickers` importer dials Signal's CDN with its own
+    /// `reqwest` client: proxies and redirects stay enabled, and resolved
+    /// addresses are not pinned. That bypasses this runtime's dial discipline.
+    /// The library does not accept an injected fetch, and its decrypt helpers
+    /// are private, so MDK cannot pin the download itself. The public command
+    /// stays in place and validates the link, then returns
+    /// [`AppError::StickerImport`] without reading account state or dialing.
+    /// The link is zeroized and never persisted.
+    ///
+    /// Re-enable only after `sonar-stickers` accepts a caller-supplied fetch
+    /// that this runtime can pin the same way as Blossom and profile-image
+    /// downloads. External-signer accounts remain unsupported for that future
+    /// path: Blossom would otherwise require one authorization signature per
+    /// asset.
     pub async fn import_signal_sticker_pack(
         &self,
-        account_ref: &str,
+        _account_ref: &str,
         signal_link: String,
-        blossom_server: Option<&str>,
+        _blossom_server: Option<&str>,
     ) -> Result<AppStickerImportResult, AppError> {
         let signal_link = Zeroizing::new(signal_link);
-        let signal_pack_id = validate_signal_sticker_link(signal_link.as_str())?;
-        let context = self.sticker_context(account_ref)?;
-        if !context.local_signing {
-            return Err(AppError::StickerExternalSignerImportUnsupported);
-        }
-        let mutation_lock = self.sticker_mutation_lock(&context.label);
-        let _guard = mutation_lock.lock().await;
-        rebase_and_flush_sticker_outbox_best_effort(self, &context).await?;
-        let anticipated_coordinate = PackAddress::new(
-            context.account_id_hex.clone(),
-            format!("signal-{signal_pack_id}"),
-        )
-        .map_err(|_| invalid_sticker("imported pack address is invalid"))?
-        .coordinate();
-        validate_install_capacity(
-            &context.storage.desired_installed_sticker_packs()?,
-            &anticipated_coordinate,
-        )?;
-
-        let imported = sonar_stickers::signal::import_signal_pack(signal_link.as_str())
-            .await
-            .map_err(|_| AppError::StickerImport("Signal pack could not be imported".into()))?;
-        if imported.pack_id != signal_pack_id {
-            return Err(invalid_sticker(
-                "Signal pack identity changed during import",
-            ));
-        }
-        let server = blossom_server
-            .map(str::trim)
-            .filter(|server| !server.is_empty())
-            .unwrap_or(DEFAULT_STICKER_BLOSSOM_SERVER_URL);
-        let signer = context.signer.as_nostr_signer();
-        // Validate the whole pack before the first irreversible upload. A
-        // later malformed sticker must not leave earlier plaintext blobs on
-        // the Blossom server. Uploads are content-addressed, so a retry after
-        // an upload or publication failure reuses the same blob.
-        struct PlannedSticker {
-            id: u32,
-            shortcode: String,
-            sha256: String,
-            mime: String,
-            width: u32,
-            height: u32,
-            alt: Option<String>,
-            emoji: Option<String>,
-            bytes: Vec<u8>,
-        }
-        let mut planned = Vec::with_capacity(imported.stickers.len());
-        for imported_sticker in &imported.stickers {
-            validate_sticker_asset_size(&imported_sticker.bytes)?;
-            let inspected = inspect_image(&imported_sticker.bytes)?;
-            if sha256_hex(&imported_sticker.bytes) != imported_sticker.sha256 {
-                return Err(invalid_sticker("Signal sticker hash mismatch"));
-            }
-            planned.push(PlannedSticker {
-                id: imported_sticker.id,
-                shortcode: imported_sticker.shortcode.clone(),
-                sha256: imported_sticker.sha256.clone(),
-                mime: inspected.mime.to_owned(),
-                width: inspected.width,
-                height: inspected.height,
-                alt: imported_sticker
-                    .emoji
-                    .as_ref()
-                    .map(|emoji| format!("{emoji} sticker")),
-                emoji: imported_sticker.emoji.clone(),
-                bytes: imported_sticker.bytes.clone(),
-            });
-        }
-        let placeholder = |plan: &PlannedSticker| {
-            Sticker::new(
-                plan.shortcode.clone(),
-                format!("https://sticker.invalid/{}", plan.sha256),
-                plan.sha256.clone(),
-                plan.mime.clone(),
-                Some(plan.width),
-                Some(plan.height),
-                plan.alt.clone(),
-                plan.emoji.clone(),
-            )
-            .map_err(|_| invalid_sticker("imported sticker metadata is invalid"))
-        };
-        let preview: Vec<Sticker> = planned.iter().map(placeholder).collect::<Result<_, _>>()?;
-        let cover_id = imported.cover.as_ref().map(|cover| cover.id);
-        let cover = cover_id.and_then(|id| {
-            planned
-                .iter()
-                .zip(preview.iter())
-                .find(|(plan, _)| plan.id == id && plan.mime == "image/webp")
-                .map(|(_, sticker)| sticker.clone())
-        });
-        let address = PackAddress::new(
-            context.account_id_hex.clone(),
-            format!("signal-{}", imported.pack_id),
-        )
-        .map_err(|_| invalid_sticker("imported pack address is invalid"))?;
-        let description = imported
-            .author
-            .as_deref()
-            .map(|author| truncate_chars(author.trim(), 500))
-            .filter(|author| !author.is_empty());
-        let title = truncate_chars(imported.title.trim(), 80);
-        StickerPack::new(
-            address.clone(),
-            title.clone(),
-            description.clone(),
-            cover.clone(),
-            preview,
-            None,
-        )
-        .map_err(|_| invalid_sticker("imported sticker pack is invalid"))?;
-        let transport = BlossomHttpTransport::new(self.allow_loopback_blob_endpoints());
-        let mut stickers = Vec::with_capacity(planned.len());
-        for plan in &planned {
-            let url = upload_blossom_blob(
-                server,
-                plan.bytes.clone().into(),
-                &plan.sha256,
-                signer.as_ref(),
-                &transport,
-            )
-            .await
-            .map_err(|_| AppError::StickerImport("sticker asset upload failed".into()))?;
-            stickers.push(
-                Sticker::new(
-                    plan.shortcode.clone(),
-                    url,
-                    plan.sha256.clone(),
-                    plan.mime.clone(),
-                    Some(plan.width),
-                    Some(plan.height),
-                    plan.alt.clone(),
-                    plan.emoji.clone(),
-                )
-                .map_err(|_| invalid_sticker("imported sticker metadata is invalid"))?,
-            );
-        }
-        let cover = cover_id.and_then(|id| {
-            planned
-                .iter()
-                .zip(stickers.iter())
-                .find(|(plan, _)| plan.id == id && plan.mime == "image/webp")
-                .map(|(_, sticker)| sticker.clone())
-        });
-        let pack = StickerPack::new(address, title, description, cover, stickers, None)
-            .map_err(|_| invalid_sticker("imported sticker pack is invalid"))?;
-        let coordinate = pack.address.coordinate();
-        let created_at = next_pack_publication_timestamp(&context.storage, &coordinate)?;
-        let event = sign_public_event(
-            &context,
-            STICKER_PACK_KIND,
-            build_pack_tags(&pack),
-            created_at,
-        )
-        .await?;
-        publish_outboxed_event(self, &context, &event).await?;
-        // The newly published pack is already durable locally. A transient
-        // relay read must not prevent recording the user's install intent;
-        // the same pending-operation projection used by normal installs will
-        // reconcile it on the next sync.
-        tolerate_offline(refresh_installed_base(self, &context).await)?;
-        let desired = context.storage.desired_installed_sticker_packs()?;
-        validate_install_capacity(&desired, &coordinate)?;
-        context
-            .storage
-            .enqueue_sticker_install_operation(&coordinate, true, unix_now_seconds())?;
-        tolerate_offline(publish_pending_installed_list(self, &context).await)?;
-        Ok(AppStickerImportResult {
-            pack: app_pack_for_context(&context, &coordinate)?,
-            skipped_signal_sticker_ids: imported.skipped_sticker_ids,
-        })
+        validate_signal_sticker_link(signal_link.as_str())?;
+        Err(AppError::StickerImport(
+            "Signal sticker import is unavailable until its fetch can be pinned".into(),
+        ))
     }
 
     fn sticker_mutation_lock(&self, account_label: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -727,7 +570,6 @@ impl MarmotApp {
         Ok(StickerAccountContext {
             label: account.label.clone(),
             account_id_hex: account.account_id_hex,
-            local_signing: account.local_signing,
             storage: self.account_storage(&account.label)?,
             endpoints,
             signer,
@@ -957,41 +799,6 @@ fn next_installed_list_publication_timestamp(
     )
 }
 
-fn next_pack_publication_timestamp(
-    storage: &SqliteAccountStorage,
-    coordinate: &str,
-) -> Result<u64, AppError> {
-    let now = unix_now_seconds();
-    let stored_created_at = storage
-        .sticker_pack(coordinate)?
-        .map(|pack| pack.version.created_at);
-    let mut outbox_created_at: Option<u64> = None;
-    for pending in storage
-        .sticker_outbox_events()?
-        .into_iter()
-        .filter(|event| event.kind == u64::from(STICKER_PACK_KIND))
-    {
-        let Ok(event) = Event::from_json(&pending.event_json) else {
-            continue;
-        };
-        let Ok(pack) = parse_pack_event(&app_event_to_sonar(&event)?) else {
-            continue;
-        };
-        if pack.address.coordinate() == coordinate {
-            outbox_created_at = Some(
-                outbox_created_at
-                    .unwrap_or_default()
-                    .max(event.created_at.as_secs()),
-            );
-        }
-    }
-    next_monotonic_publication_timestamp(
-        now,
-        stored_created_at.into_iter().chain(outbox_created_at).max(),
-        "sticker-pack timestamp is too far in the future",
-    )
-}
-
 fn next_monotonic_publication_timestamp(
     now: u64,
     latest: Option<u64>,
@@ -1159,10 +966,6 @@ fn app_pack_for_context(
         .and_then(|pack| app_pack_from_stored(pack, &installed))
 }
 
-fn truncate_chars(value: &str, max: usize) -> String {
-    value.chars().take(max).collect()
-}
-
 fn tolerate_offline(result: Result<(), AppError>) -> Result<(), AppError> {
     match result {
         Ok(()) | Err(AppError::StickerRelay(_)) => Ok(()),
@@ -1173,7 +976,6 @@ fn tolerate_offline(result: Result<(), AppError>) -> Result<(), AppError> {
 struct StickerAccountContext {
     label: String,
     account_id_hex: String,
-    local_signing: bool,
     storage: SqliteAccountStorage,
     endpoints: Vec<TransportEndpoint>,
     signer: AccountSigner,
@@ -1927,6 +1729,23 @@ mod tests {
     }
 
     #[test]
+    fn signal_import_source_does_not_call_the_unpinned_importer() {
+        let source = include_str!("stickers.rs");
+        let start = source
+            .find("pub async fn import_signal_sticker_pack")
+            .expect("import command");
+        let body = &source[start..];
+        let end = body.find("\n    fn ").expect("following method");
+        let body = &body[..end];
+        assert!(
+            !body.contains("import_signal_pack"),
+            "Signal import must not call the unpinned sonar-stickers fetcher"
+        );
+        assert!(body.contains("validate_signal_sticker_link"));
+        assert!(body.contains("StickerImport"));
+    }
+
+    #[test]
     fn install_capacity_rejects_only_a_new_pack_at_the_limit() {
         let installed = (0..MAX_INSTALLED_PACKS)
             .map(|index| format!("pack-{index}"))
@@ -1960,30 +1779,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pack_republication_timestamp_advances_past_same_second_version() {
-        let storage = SqliteAccountStorage::in_memory().unwrap();
-        let created_at = unix_now_seconds();
-        let coordinate = coordinate();
-        storage
-            .replace_sticker_pack_if_newer(&StoredStickerPack {
-                coordinate: coordinate.clone(),
-                author_pubkey_hex: "ab".repeat(32),
-                identifier: "cats".to_owned(),
-                version: StoredStickerPackVersion {
-                    event_id_hex: "cd".repeat(32),
-                    created_at,
-                },
-                title: "Cats".to_owned(),
-                description: None,
-                cover: None,
-                stickers: Vec::new(),
-                license: None,
-            })
-            .unwrap();
-
-        assert!(next_pack_publication_timestamp(&storage, &coordinate).unwrap() > created_at);
-    }
 
     #[test]
     fn image_inspection_enforces_dimensions_and_animation_limits() {

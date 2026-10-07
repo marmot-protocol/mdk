@@ -3352,8 +3352,10 @@ c_cmd! {
         account_ref: str, input: str,
     ) -> unit = uninstall_sticker_pack;
 
-    /// Import a canonical Signal pack link. External-signer accounts are rejected.
-    /// `blossom_server` may be NULL. Free with `marmot_sticker_import_result_free`.
+    /// Validate a canonical Signal pack link, then refuse before any network
+    /// call. The pinned importer cannot be address-pinned, so this command
+    /// does not download or upload. `blossom_server` may be NULL. Free with
+    /// `marmot_sticker_import_result_free`.
     async fn marmot_import_signal_sticker_pack(
         account_ref: str, signal_link: str, blossom_server: opt_str,
     ) -> rec(MarmotStickerImportResult) = import_signal_sticker_pack;

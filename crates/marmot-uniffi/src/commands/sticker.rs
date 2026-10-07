@@ -84,6 +84,10 @@ impl Marmot {
             .map_err(Into::into)
     }
 
+    /// Validate a canonical Signal pack link, then refuse before any network
+    /// call. The pinned importer cannot be address-pinned, so this command
+    /// does not download, upload, or publish. External-signer rejection is
+    /// unchanged for a future pinned fetch.
     pub async fn import_signal_sticker_pack(
         &self,
         account_ref: String,

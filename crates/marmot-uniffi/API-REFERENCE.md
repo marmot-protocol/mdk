@@ -4466,7 +4466,7 @@ Fetches one pack by coordinate or trusted Sonar link, using caller relay hints b
 pub async fn import_signal_sticker_pack( &self, account_ref: String, signal_link: String, blossom_server: Option<String>, ) -> Result<StickerImportResultFfi, MarmotKitError>
 ```
 
-Imports a canonical HTTPS Signal pack link for a locally signing account. The pack is validated before the first Blossom upload; external-signer accounts are rejected so one import cannot trigger hundreds of signer prompts. The Signal key stays in memory only.
+Validates a canonical HTTPS Signal pack link, then refuses before any network call. The pinned importer dials Signal's CDN without address pinning, so this command does not download, upload, or publish until that fetch can be injected. The Signal key stays in memory only and is not persisted.
 
 [Source](src/commands/sticker.rs#L87)
 

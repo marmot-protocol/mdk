@@ -5320,3 +5320,178 @@ MarmotStatus marmot_message_draft_revision_includes_chat_list_version(const stru
 Compare the opaque `draft_version` from a presented chat-list row with a live captured draft revision. Returns 1 only for the same account-store/group scope at or before that captured revision; foreign and newer versions return 0. Borrow both opaque handles for the call while their owning selected draft and presented row remain live and supply a non-NULL output byte, which is reset on errors. Treat the version as private presentation correlation: never parse, log or persist it, and never use it to select a newer draft for deletion. Revision-checked draft cleanup remains authoritative. Regenerate bindings and consume the matching native binary before adopting this added row field.
 
 [Header contract](include/marmot.h#L10753)
+
+<details>
+<summary>New exports — complete and organize before merging</summary>
+
+### `marmot_fetch_sticker_asset`
+
+```c
+MarmotStatus marmot_fetch_sticker_asset(const struct MarmotClient *client, const char *account_ref, const char *pack_coordinate, const char *shortcode, const char *plaintext_sha256, struct MarmotStickerAsset **out);
+```
+
+Downloads one exact sticker after its reference is authorized. Free with marmot_sticker_asset_free.
+
+[Header contract](include/marmot.h#L9324)
+
+### `marmot_fetch_sticker_pack`
+
+```c
+MarmotStatus marmot_fetch_sticker_pack(const struct MarmotClient *client, const char *account_ref, const char *input, struct MarmotStickerPack **out);
+```
+
+Fetches one pack and protects that coordinate from discovery eviction. Free with marmot_sticker_pack_free.
+
+[Header contract](include/marmot.h#L9268)
+
+### `marmot_import_signal_sticker_pack`
+
+```c
+MarmotStatus marmot_import_signal_sticker_pack(const struct MarmotClient *client, const char *account_ref, const char *signal_link, const char *blossom_server, struct MarmotStickerImportResult **out);
+```
+
+Validates a canonical Signal pack link, then refuses before any network call. The pinned importer cannot be address-pinned, so this command does not download or upload. Free with marmot_sticker_import_result_free.
+
+[Header contract](include/marmot.h#L9311)
+
+### `marmot_install_sticker_pack`
+
+```c
+MarmotStatus marmot_install_sticker_pack(const struct MarmotClient *client, const char *account_ref, const char *input, struct MarmotStickerPack **out);
+```
+
+Records install intent and publishes the installed list. Free with marmot_sticker_pack_free.
+
+[Header contract](include/marmot.h#L9283)
+
+### `marmot_send_sticker`
+
+```c
+MarmotStatus marmot_send_sticker(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const char *pack_coordinate, const char *shortcode, const char *plaintext_sha256, struct MarmotSendSummary **out);
+```
+
+Sends one exact sticker reference. Preflights the output pointer before any send. Free with marmot_send_summary_free.
+
+[Header contract](include/marmot.h#L9337)
+
+### `marmot_sticker_asset_free`
+
+```c
+void marmot_sticker_asset_free(struct MarmotStickerAsset *ptr);
+```
+
+Frees a sticker asset and its owned bytes. NULL is safe.
+
+[Header contract](include/marmot.h#L11724)
+
+### `marmot_sticker_free`
+
+```c
+void marmot_sticker_free(struct MarmotSticker *ptr);
+```
+
+Frees one embedded sticker record returned as a root. NULL is safe.
+
+[Header contract](include/marmot.h#L11686)
+
+### `marmot_sticker_import_result_free`
+
+```c
+void marmot_sticker_import_result_free(struct MarmotStickerImportResult *value);
+```
+
+Frees an import result, its pack, and skipped-id strings. NULL is safe.
+
+[Header contract](include/marmot.h#L11743)
+
+### `marmot_sticker_list_free`
+
+```c
+void marmot_sticker_list_free(struct MarmotStickerList *list);
+```
+
+Frees a sticker list and every owned element. NULL is safe.
+
+[Header contract](include/marmot.h#L11695)
+
+### `marmot_sticker_pack`
+
+```c
+MarmotStatus marmot_sticker_pack(const struct MarmotClient *client, const char *account_ref, const char *input, struct MarmotStickerPack **out);
+```
+
+Reads one cached pack by coordinate or trusted link without network I/O. Returns NULL when absent. Free with marmot_sticker_pack_free.
+
+[Header contract](include/marmot.h#L9239)
+
+### `marmot_sticker_pack_free`
+
+```c
+void marmot_sticker_pack_free(struct MarmotStickerPack *ptr);
+```
+
+Frees one pack, its cover, and sticker vector. NULL is safe.
+
+[Header contract](include/marmot.h#L11705)
+
+### `marmot_sticker_pack_list_free`
+
+```c
+void marmot_sticker_pack_list_free(struct MarmotStickerPackList *list);
+```
+
+Frees a pack list and every owned pack. NULL is safe.
+
+[Header contract](include/marmot.h#L11714)
+
+### `marmot_sticker_packs`
+
+```c
+MarmotStatus marmot_sticker_packs(const struct MarmotClient *client, const char *account_ref, uint8_t installed_only, const char *search, uint8_t has_limit, uint32_t limit, struct MarmotStickerPackList **out);
+```
+
+Reads the encrypted sticker projection off the UI thread. installed_only is a uint8_t flag; has_limit 0 leaves the storage default. Free with marmot_sticker_pack_list_free.
+
+[Header contract](include/marmot.h#L9221)
+
+### `marmot_sticker_ref_free`
+
+```c
+void marmot_sticker_ref_free(struct MarmotStickerRef *ptr);
+```
+
+Frees one exact sticker reference. NULL is safe.
+
+[Header contract](include/marmot.h#L11676)
+
+### `marmot_sticker_sync_result_free`
+
+```c
+void marmot_sticker_sync_result_free(struct MarmotStickerSyncResult *ptr);
+```
+
+Frees a sync result. NULL is safe.
+
+[Header contract](include/marmot.h#L11734)
+
+### `marmot_sync_sticker_packs`
+
+```c
+MarmotStatus marmot_sync_sticker_packs(const struct MarmotClient *client, const char *account_ref, struct MarmotStickerSyncResult **out);
+```
+
+Refreshes a bounded public discovery window and rebases the installed list. Free with marmot_sticker_sync_result_free.
+
+[Header contract](include/marmot.h#L9254)
+
+### `marmot_uninstall_sticker_pack`
+
+```c
+MarmotStatus marmot_uninstall_sticker_pack(const struct MarmotClient *client, const char *account_ref, const char *input);
+```
+
+Records uninstall intent and publishes the installed list. Historical message references remain resolvable.
+
+[Header contract](include/marmot.h#L9297)
+
+</details>
