@@ -527,6 +527,42 @@ fn insert_sticker_assets_tx(
         )
         .storage()?;
     }
+    if pack_wins_replacement {
+        trim_sticker_asset_history_tx(conn, &pack.coordinate)?;
+    }
+    Ok(())
+}
+
+fn trim_sticker_asset_history_tx(conn: &Connection, coordinate: &str) -> StorageResult<()> {
+    let count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM app_sticker_assets WHERE pack_coordinate = ?1",
+            params![coordinate],
+            |row| row.get::<_, i64>(0),
+        )
+        .storage()?;
+    let excess = count - MAX_STICKER_ASSET_HISTORY_ROWS;
+    if excess <= 0 {
+        return Ok(());
+    }
+    conn.execute(
+        "DELETE FROM app_sticker_assets
+         WHERE pack_coordinate = ?1
+           AND rowid IN (
+               SELECT assets.rowid
+               FROM app_sticker_assets AS assets
+               WHERE assets.pack_coordinate = ?1
+                 AND NOT EXISTS (
+                     SELECT 1 FROM app_stickers AS current
+                     WHERE current.pack_coordinate = assets.pack_coordinate
+                       AND current.shortcode = assets.shortcode
+                       AND current.sha256 = assets.sha256
+                 )
+               LIMIT ?2
+           )",
+        params![coordinate, excess],
+    )
+    .storage()?;
     Ok(())
 }
 
@@ -973,6 +1009,35 @@ mod tests {
                 .sticker_for_ref(&current.coordinate, "wave", &"aa".repeat(32))
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn winning_replacements_trim_asset_history_to_the_cap() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let coordinate = pack(&"aa".repeat(32), 1, &"11".repeat(32)).coordinate;
+        for index in 0..=MAX_STICKER_ASSET_HISTORY_ROWS {
+            let mut winner = pack(
+                &format!("{index:064x}"),
+                u64::try_from(index).unwrap() + 1,
+                &format!("{:064x}", index + 1),
+            );
+            winner.coordinate = coordinate.clone();
+            assert!(store.replace_sticker_pack_if_newer(&winner).unwrap());
+        }
+        let mut retained = 0;
+        for index in 0..=MAX_STICKER_ASSET_HISTORY_ROWS {
+            if store
+                .sticker_for_ref(&coordinate, "wave", &format!("{:064x}", index + 1))
+                .unwrap()
+                .is_some()
+            {
+                retained += 1;
+            }
+        }
+        assert!(
+            retained <= MAX_STICKER_ASSET_HISTORY_ROWS,
+            "winning versions retained {retained} historical assets"
         );
     }
 
