@@ -71,7 +71,6 @@ macro_rules! c_mirror {
         $(crate::macros::c_list!($list, $name, $ffi, free $list_free);)?
     };
 
-    // Terminal: emit struct, From, CFree from the four accumulators.
     (@munch [$($m:tt)*] $name:ident, $ffi:ty, $value:ident, $this:ident,
         {$($sf:tt)*} {$($lets:tt)*} {$($names:tt)*} {$($fr:tt)*}
         $(#[$fm:meta])* json_str $f:ident, $($rest:tt)*
@@ -109,6 +108,7 @@ macro_rules! c_mirror {
             $($rest)*);
     };
 
+    // Terminal: emit struct, From, CFree from the four accumulators.
     (@munch [$($m:tt)*] $name:ident, $ffi:ty, $value:ident, $this:ident,
         {$($sf:tt)*} {$($lets:tt)*} {$($names:tt)*} {$($fr:tt)*}
     ) => {

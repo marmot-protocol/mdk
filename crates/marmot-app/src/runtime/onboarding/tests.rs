@@ -1352,10 +1352,13 @@ async fn passed_relay_step_with_retired_finding_offers_consent_gated_removal_onl
     );
     assert!(network.attempts.lock().unwrap().is_empty());
     network.zero_acks.store(true, Ordering::SeqCst);
-    manager
+    let failed_publication = manager
         .approve_onboarding_repair(&id, preview.revision)
         .await
         .unwrap();
+    // Approved cleanup with zero ACKs is pending, never a ready checkpoint
+    // subject to the unsigned completed-account reset path.
+    assert!(!failed_publication.ready);
     let published = network.attempts.lock().unwrap()[0].clone();
     assert_eq!(
         published.tags,

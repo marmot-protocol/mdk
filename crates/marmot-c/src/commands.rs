@@ -3005,6 +3005,10 @@ pub unsafe extern "C" fn marmot_propose_onboarding_relays(
 ///
 /// # Safety
 /// The client must be live, input pointers valid and borrowed, and out writable.
+/// Relay-repair content, tag fields and non-NULL tag/change endpoints are JSON
+/// string literals. Decode once preserving embedded NULs and UTF-8 lengths
+/// before displaying consent or prefilling an editor. Read/write route lists
+/// and event identifiers retain their ordinary-string contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_propose_onboarding_relay_repair(
     client: *const MarmotClient,

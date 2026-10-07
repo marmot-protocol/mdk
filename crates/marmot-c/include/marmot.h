@@ -1736,8 +1736,14 @@ typedef struct MarmotStringList {
 } MarmotStringList;
 
 typedef struct MarmotOnboardingRelayTag {
+  /**
+   *Each element is a JSON string literal. Decode once preserving NUL bytes and UTF-8 lengths.
+   */
   char **fields;
   uintptr_t fields_len;
+  /**
+   *NULL or a JSON string literal; decode once preserving embedded NULs.
+   */
   char *endpoint;
   enum MarmotOnboardingRelayTagRole role;
 } MarmotOnboardingRelayTag;
@@ -1754,8 +1760,14 @@ typedef struct MarmotOnboardingRelayTagChange {
    *Only meaningful when the matching `has_` flag is set.
    */
   uint64_t after_index;
+  /**
+   *Each element is a JSON string literal. Decode once preserving NUL bytes and UTF-8 lengths.
+   */
   char **fields;
   uintptr_t fields_len;
+  /**
+   *NULL or a JSON string literal; decode once preserving embedded NULs.
+   */
   char *endpoint;
   enum MarmotOnboardingRelayTagRole role;
   enum MarmotOnboardingRelayCapability restores;
@@ -1764,7 +1776,13 @@ typedef struct MarmotOnboardingRelayTagChange {
 typedef struct MarmotOnboardingRelayRepair {
   enum MarmotOnboardingRelayRepairMode mode;
   char *original_event_id;
+  /**
+   *JSON string literal, not raw content. Decode once preserving NUL bytes and UTF-8 lengths.
+   */
   char *original_content;
+  /**
+   *JSON string literal, not raw content. Decode once preserving NUL bytes and UTF-8 lengths.
+   */
   char *proposed_content;
   struct MarmotOnboardingRelayTag *before_tags;
   uintptr_t before_tags_len;
@@ -9047,6 +9065,10 @@ MarmotStatus marmot_propose_onboarding_relays(const struct MarmotClient *client,
  *
  * # Safety
  * The client must be live, input pointers valid and borrowed, and out writable.
+ * Relay-repair content, tag fields and non-NULL tag/change endpoints are JSON
+ * string literals. Decode once preserving embedded NULs and UTF-8 lengths
+ * before displaying consent or prefilling an editor. Read/write route lists
+ * and event identifiers retain their ordinary-string contract.
  */
 MarmotStatus marmot_propose_onboarding_relay_repair(const struct MarmotClient *client,
                                                     const char *account_ref,
