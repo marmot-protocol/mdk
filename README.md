@@ -158,6 +158,10 @@ still land on the same epoch and group state. The engine — not relay order or 
 
 The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml); most tasks run through [`just`](Justfile).
 
+`Cargo.toml` pins a dependency-only HPKE 0.7 backend patch to use `libcrux-kem 0.0.10`,
+fixing RUSTSEC-2026-0330 and RUSTSEC-2026-0331. Remove this patch when the OpenMLS
+dependency supports a patched HPKE release.
+
 ```sh
 just fast-ci                 # formatting, doc/naming gates, compile checks, clippy; skips the `just test` matrix
 cargo test -p <crate>        # targeted tests for the crate you changed
