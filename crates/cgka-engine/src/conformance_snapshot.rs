@@ -598,6 +598,7 @@ fn capture_pending_work_snapshot_from<S: StorageProvider>(
         } else {
             engine.has_pending_convergence_inputs(group_id)?
                 || engine.has_pending_canonical_applications(group_id)?
+                || engine.pending_confirmation_replays.contains(group_id)
         }),
         queued_outbound_intents: engine.storage.list_queued_outbound_intents(group_id)?.len(),
         stored_created_messages,
@@ -768,7 +769,15 @@ pub(crate) fn capture_structural_progress_snapshot<S: StorageProvider>(
     {
         runnable_work = runnable_work.saturating_add(1);
     }
-    if pass.is_none() && pending_work.unresolved_convergence_inputs > 0 {
+    let confirmation_replay_ready = engine.pending_confirmation_replays.contains(group_id)
+        && matches!(epoch_state, EpochState::Stable { .. })
+        && engine
+            .stored_group_record(group_id)?
+            .is_some_and(|group| !group.is_terminal() && !group.unrecoverable)
+        && pass.as_ref().is_none_or(|pass| !pass.is_active());
+    if (pass.is_none() && pending_work.unresolved_convergence_inputs > 0)
+        || confirmation_replay_ready
+    {
         runnable_work = runnable_work.saturating_add(1);
     }
     runnable_work = runnable_work

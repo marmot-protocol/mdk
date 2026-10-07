@@ -1363,7 +1363,7 @@ async fn run_app_runtime_account_worker(
                                     ));
                                 }
                             },
-                            received = client.receive_next_delivery() => {
+                            received = client.receive_next_delivery(), if !client.has_pending_effect_projections() => {
                                 match received {
                                     Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(delivery)) => {
                                         // Once claimed, finish engine ingest and projection
@@ -1789,14 +1789,14 @@ async fn run_app_runtime_account_worker(
                 None => Ok(true),
             };
             if !matches!(turn, Ok(false)) {
-                let job = comparison_recovery
+                let mut job = comparison_recovery
                     .take()
                     .expect("settling comparison exists");
                 let result = match (turn, job.failure) {
                     (Err(error), _) | (_, Some(error)) => Err(client.fail_comparison_grant(
                         job.grant,
                         job.execution,
-                        job.admission.as_ref(),
+                        job.admission.as_mut(),
                         error,
                     )),
                     _ if job.abandoned => client.abandon_comparison_grant(job.grant, job.execution),
@@ -2225,7 +2225,7 @@ async fn run_app_runtime_account_worker(
                     phase.finish(TelemetryOutcome::Success);
                 }
             }
-            received = client.receive_next_delivery() => {
+            received = client.receive_next_delivery(), if !client.has_pending_effect_projections() => {
                 #[cfg(test)]
                 if let Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(delivery)) = &received
                     && let (Ok(event_id), Some(subscription_id)) = (
@@ -2381,6 +2381,15 @@ async fn run_app_runtime_account_worker(
                             &account_label,
                             account_error_message("runtime receive failed", &err),
                         );
+                        if client.has_pending_effect_projections() {
+                            // Reopening cannot reconstruct consumed activity events.
+                            // Keep this client and pause live admission while the
+                            // existing bounded projection retry owns the debt.
+                            scheduled_runtime_group_subscription_refresh.observe_pending(
+                                true, &command_tx,
+                            );
+                            continue 'worker;
+                        }
                         // The account-session ownership guard is held by
                         // `AppClient`. Destroy the failed engine before the
                         // backoff as well as before hydrating its replacement;

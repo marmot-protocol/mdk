@@ -3154,3 +3154,138 @@ async fn eviction_realization_retries_all_cleanup_before_announcing_termination(
         );
     }
 }
+
+/// Canonical removal and its terminal cleanup commit together, including the pass.
+#[tokio::test]
+async fn convergence_membership_cleanup_rolls_back_canonical_apply_on_failure() {
+    for (queued_count, fault_write) in [(1, 1), (1, 2), (0, 1)] {
+        let termination_fault = LeaveWriteFault::default();
+        let inner = SqliteAccountStorage::in_memory().unwrap();
+        let handle = inner.clone();
+        let mut bob = EngineBuilder::new(FaultStorage {
+            inner,
+            fault: PutGroupFault::default(),
+            capability_fault: CapabilityWriteFault::default(),
+            leave_write_fault: LeaveWriteFault::default(),
+            intent_write_fault: LeaveWriteFault::default(),
+            failed_state_fault: FailedStateWriteFault::default(),
+            release_fault: LeaveWriteFault::default(),
+            preparation_delay: PreparationDelay::default(),
+            retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+            termination_fault: termination_fault.clone(),
+        })
+        .legacy_compatibility_profile()
+        .identity(pad32(b"eviction-atomic-bob"))
+        .account_identity_proof_signer(proof_signer(b"eviction-atomic-bob"))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+        let mut alice = build_selfremove_client(b"eviction-atomic-alice");
+        let bob_kp = bob.fresh_key_package().await.unwrap();
+        let (group_id, created) = alice
+            .create_group(CreateGroupRequest {
+                name: "atomic eviction".into(),
+                description: String::new(),
+                members: vec![bob_kp],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } = created
+        else {
+            panic!("group creation");
+        };
+        alice.confirm_published(pending).await.unwrap();
+        bob.join_welcome(welcomes.remove(0)).await.unwrap();
+        let SendResult::GroupEvolution { msg, pending, .. } = alice
+            .send(SendIntent::RemoveMembers {
+                group_id: group_id.clone(),
+                members: vec![bob.self_id()],
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("removal commit");
+        };
+        alice.confirm_published(pending).await.unwrap();
+        bob.ingest(TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        })
+        .await
+        .unwrap();
+        bob.drain_events();
+        let before = handle.get_group(&group_id).unwrap();
+        handle
+            .put_leave_request(&LeaveRequest {
+                group_id: group_id.clone(),
+                requested_at_ms: 1,
+                last_proposed_epoch: None,
+            })
+            .unwrap();
+        for tag in 0..queued_count {
+            handle
+                .put_queued_outbound_intent(&QueuedOutboundIntent {
+                    id: MessageId::new(vec![tag as u8; 32]),
+                    group_id: group_id.clone(),
+                    intent: SendIntent::SelfUpdate {
+                        group_id: group_id.clone(),
+                    },
+                    created_at_ms: 1,
+                    reissue_attempts: 0,
+                })
+                .unwrap();
+        }
+        termination_fault.arm_on_write(fault_write);
+        let error = bob
+            .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("injected termination cleanup failure"));
+        assert_eq!(handle.get_group(&group_id).unwrap(), before);
+        assert_eq!(bob.epoch(&group_id).unwrap(), before.epoch);
+        assert_eq!(
+            handle
+                .list_queued_outbound_intents(&group_id)
+                .unwrap()
+                .len(),
+            queued_count
+        );
+        assert!(handle.leave_request(&group_id).unwrap().is_some());
+        assert!(
+            !handle
+                .convergence_pass(&group_id)
+                .unwrap()
+                .unwrap()
+                .fairness_slot_available
+        );
+        assert!(bob.drain_events().is_empty());
+        bob.converge_stored_openmls_messages_at(&group_id, 2_000_000)
+            .unwrap();
+        assert!(handle.get_group(&group_id).unwrap().removed);
+        assert!(
+            handle
+                .list_queued_outbound_intents(&group_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(handle.leave_request(&group_id).unwrap().is_none());
+        let events = bob.drain_events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event,
+            cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated { group_id: id, .. }
+            if id == &group_id))
+                .count(),
+            1
+        );
+    }
+}

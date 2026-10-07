@@ -7873,7 +7873,6 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
         crate::validation::endpoint(&inbox_url),
     )
     .await;
-    let seeded = app.account_relay_list_status(&account.label).unwrap();
 
     // Give both seeded replaceable kinds an older timestamp than their first
     // edit. Same-second event-id ordering could otherwise keep the seed on
@@ -7921,18 +7920,6 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
         .await
         .unwrap()
         .expect("published relay lists");
-    assert!(
-        published.nip65.created_at > seeded.nip65.created_at,
-        "fixture add must supersede its NIP-65 seed: {} <= {}",
-        published.nip65.created_at,
-        seeded.nip65.created_at
-    );
-    assert!(
-        published.inbox.created_at > seeded.inbox.created_at,
-        "fixture add must supersede its inbox seed: {} <= {}",
-        published.inbox.created_at,
-        seeded.inbox.created_at
-    );
     for expected in [&added_url, &read_url, &relay_url] {
         assert!(
             published

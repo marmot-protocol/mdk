@@ -158,8 +158,7 @@ require_rust_targets() {
       echo "supported ABIs: $SUPPORTED_ANDROID_ABIS" >&2
       return 1
     fi
-    # Drain the listing: early grep exit can SIGPIPE rustup under pipefail.
-    if ! rustup target list --installed | grep -x "$target" >/dev/null; then
+    if ! rustup target list --installed | grep -qx "$target"; then
       missing+=("$target")
     fi
   done

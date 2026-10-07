@@ -569,4 +569,60 @@ mod tests {
         }
         assert_eq!(audit::live_allocations(), before);
     }
+    #[test]
+    fn native_membership_events_convert_and_free_deeply() {
+        let _lock = audit::test_lock();
+        let before = audit::live_allocations();
+        for (index, event) in [
+            GroupEventKindFfi::LocalGroupCopyTerminated { voluntary: true },
+            GroupEventKindFfi::LocalGroupCopyRestored,
+            GroupEventKindFfi::GroupMemberLeavesRemoved { epoch: 42 },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let event = boxed(MarmotEvent::from(MarmotEventFfi::GroupEvent {
+                account_id_hex: "account".into(),
+                account_label: "alice".into(),
+                group_id_hex: "31".repeat(16),
+                event,
+            }));
+            unsafe {
+                let MarmotEvent::GroupEvent {
+                    account_id_hex,
+                    account_label,
+                    group_id_hex,
+                    event: kind,
+                } = &*event
+                else {
+                    panic!("group event");
+                };
+                assert_eq!(
+                    std::ffi::CStr::from_ptr(*account_id_hex).to_str().unwrap(),
+                    "account"
+                );
+                assert_eq!(
+                    std::ffi::CStr::from_ptr(*account_label).to_str().unwrap(),
+                    "alice"
+                );
+                assert_eq!(
+                    std::ffi::CStr::from_ptr(*group_id_hex).to_str().unwrap(),
+                    "31".repeat(16)
+                );
+                assert!(matches!(
+                    (index, kind),
+                    (
+                        0,
+                        MarmotGroupEventKind::LocalGroupCopyTerminated { voluntary: true }
+                    ) | (1, MarmotGroupEventKind::LocalGroupCopyRestored)
+                        | (
+                            2,
+                            MarmotGroupEventKind::GroupMemberLeavesRemoved { epoch: 42 }
+                        )
+                ));
+                marmot_event_free(event);
+            }
+            assert_eq!(audit::live_allocations(), before);
+        }
+    }
 }

@@ -4,6 +4,11 @@
 
 ### Breaking changes
 
+- Native lifecycle events add `LocalGroupCopyTerminated`, `LocalGroupCopyRestored`,
+  and `GroupMemberLeavesRemoved`. Update exhaustive Swift/Kotlin event handling
+  and regenerate bindings with the matching native library. Restoration describes
+  retained-history repair, not automatic scheduler restoration of removed copies.
+
 - The optional opaque `ChatListDraftVersionFfi` object in
   `PresentedChatRowFfi.draft_version` correlates the presented row's draft
   metadata with a captured composer revision through
@@ -40,16 +45,9 @@
 
 ### Fixed
 
-- Android binding preflight consumes the complete installed-target list,
-  preventing false missing-target failures from an early pipe exit.
-
 - Group activity uses shared per-commit reaction targets for authors and peers,
-  including commits preceding a disband. Native lifecycle events add
-  `LocalGroupCopyTerminated`, `LocalGroupCopyRestored`, and
-  `GroupMemberLeavesRemoved`; update exhaustive Swift/Kotlin event handling and
-  regenerate bindings with the matching native library. The restoration event
-  describes retained-history repair, not a scheduler guarantee for removed copies.
-  See `marmot-app`'s Unreleased fixes for projection and push-token behavior.
+  including commits preceding a disband. See `marmot-app`'s Unreleased fixes
+  for projection and push-token behavior.
 
 ## 0.12.0 - 2026-10-02
 

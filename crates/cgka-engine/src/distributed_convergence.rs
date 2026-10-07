@@ -1539,24 +1539,63 @@ impl<S: StorageProvider> Engine<S> {
         } else {
             None
         };
-        let (group_changes, application_events) = self.storage.with_transaction(|storage| {
-            let output = apply_openmls_canonicalization_result_with_profile_policy(
-                storage,
-                group_id,
-                &result,
-                max_retained_anchor_rewind,
-                replay_profile_policy,
-            )?;
-            storage.put_convergence_pass(&completed_pass)?;
-            let application_events =
-                Self::application_replay_events(group_id, &output.observations)?;
-            for event in &application_events {
-                storage
-                    .put_pending_application_event(event)
-                    .map_err(storage_projection_error)?;
-            }
-            Ok::<_, OpenMlsProjectionError>((output.group_changes, application_events))
-        })?;
+        let (group_changes, application_events, membership_effects) =
+            self.storage.with_transaction(|storage| {
+                let output = apply_openmls_canonicalization_result_with_profile_policy(
+                    storage,
+                    group_id,
+                    &result,
+                    max_retained_anchor_rewind,
+                    replay_profile_policy,
+                )?;
+                // Membership cleanup belongs to canonical apply: a failed queue or
+                // leave-request write must roll back MLS and the completed pass too.
+                let membership_effects = if let Some(before) = previous_membership.as_ref() {
+                    let group = openmls::group::MlsGroup::load(
+                        storage.mls_storage(),
+                        &openmls::group::GroupId::from_slice(group_id.as_slice()),
+                    )
+                    .map_err(|error| OpenMlsProjectionError::Storage(format!("{error:?}")))?
+                    .ok_or_else(|| {
+                        OpenMlsProjectionError::Replay("selected group missing".into())
+                    })?;
+                    // Disband owns its terminal cleanup and must not announce an
+                    // intermediate local restoration from its replayed source tree.
+                    if crate::app_components::lifecycle_of_group(&group)
+                        .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?
+                        == Some(cgka_traits::app_components::GroupLifecycleV1::Disbanded)
+                    {
+                        None
+                    } else {
+                        let after = crate::membership_effects::MembershipSnapshot::capture(
+                            &group,
+                            self.identity.self_id(),
+                            storage.get_group(group_id)?.removed,
+                        );
+                        Some(
+                            self.prepare_canonical_membership_effects_on_storage(
+                                storage, group_id, before, &after,
+                            )
+                            .map_err(|error| OpenMlsProjectionError::Storage(error.to_string()))?,
+                        )
+                    }
+                } else {
+                    None
+                };
+                storage.put_convergence_pass(&completed_pass)?;
+                let application_events =
+                    Self::application_replay_events(group_id, &output.observations)?;
+                for event in &application_events {
+                    storage
+                        .put_pending_application_event(event)
+                        .map_err(storage_projection_error)?;
+                }
+                Ok::<_, OpenMlsProjectionError>((
+                    output.group_changes,
+                    application_events,
+                    membership_effects,
+                ))
+            })?;
         // mdk#1472: completing the pass opens the gate that held queued
         // outbound intents. A drain that ran before the settle consumed the
         // one-shot schedule edge without releasing them, so completion must
@@ -1629,9 +1668,7 @@ impl<S: StorageProvider> Engine<S> {
             if !terminalized {
                 self.emit_convergence_events(
                     group_id,
-                    previous_membership
-                        .as_ref()
-                        .expect("selected branch captured its source membership"),
+                    membership_effects.expect("non-disband selection prepared membership"),
                     previous_tip,
                     selected_tip,
                     &group_changes,
@@ -1720,7 +1757,7 @@ impl<S: StorageProvider> Engine<S> {
     fn emit_convergence_events(
         &mut self,
         group_id: &GroupId,
-        previous_membership: &crate::membership_effects::MembershipSnapshot,
+        membership_effects: crate::membership_effects::CanonicalMembershipEffects,
         previous_tip: EpochId,
         selected_tip: EpochId,
         group_changes: &[AppliedGroupChanges],
@@ -1734,8 +1771,7 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         self.emit_applied_group_changes(group_id, group_changes);
-        self.emit_canonical_membership_effects(group_id, previous_membership)
-            .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?;
+        self.finish_canonical_membership_effects(group_id, membership_effects);
         if self
             .with_mls_group(group_id, |group| {
                 Ok(crate::identity::local_leaf_is_active(

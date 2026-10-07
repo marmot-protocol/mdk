@@ -710,7 +710,7 @@ impl ScriptedPushRelayClient {
         *self.publish_results.lock().unwrap() = results.into_iter().collect();
     }
 
-    fn published_event_ids(&self) -> Vec<String> {
+    pub(crate) fn published_event_ids(&self) -> Vec<String> {
         self.published_events
             .lock()
             .unwrap()
@@ -18192,30 +18192,20 @@ async fn invite_recovery_failure_preserves_committed_effects_and_results() {
             !storage.automatic_recovery_failed(&group_id).unwrap(),
             "committed health evidence must clear the warning"
         );
-        // Maintenance leaves the warning checkpoint queued for the worker.
-        // Both scheduled paths persist it; the failed-publish observer also
-        // buffers the committed join before preserving the primary error.
-        if maintenance {
+        // Both boundaries persist the warning projection. A failed publish
+        // also buffers the committed join before returning the primary error.
+        assert!(
+            client.pending_group_projection_updates.is_empty(),
+            "the cleared warning must be checkpointed"
+        );
+        if failed_publish {
             assert!(
                 client
-                    .pending_group_projection_updates
-                    .contains(&hex::encode(group_id.as_slice())),
-                "the warning projection must remain queued"
+                    .take_pending_applied_sync_summary()
+                    .joined_groups
+                    .contains(&group_id),
+                "the committed join must reach subscribers despite the publish error"
             );
-        } else {
-            assert!(
-                client.pending_group_projection_updates.is_empty(),
-                "scheduled convergence must checkpoint the cleared warning"
-            );
-            if failed_publish {
-                assert!(
-                    client
-                        .take_pending_applied_sync_summary()
-                        .joined_groups
-                        .contains(&group_id),
-                    "the committed join must reach subscribers despite the publish error"
-                );
-            }
         }
     }
 }
@@ -18324,14 +18314,15 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
     };
 
     let result = match observation {
-        MixedPublishObservation::DirectSend => client
-            .observe_recovery_evidence_then_gate_send_publish(&effects, &group_id, app_event_id)
-            .await
-            .and_then(|()| {
-                let updates = client.finalize_published_app_message_source_retention(&effects)?;
-                client.pending_projection_updates.extend(updates);
-                Ok(SyncSummary::default())
-            }),
+        MixedPublishObservation::DirectSend => {
+            let result = client
+                .observe_recovery_evidence_then_gate_send_publish(&effects, &group_id, app_event_id)
+                .await;
+            if result.is_ok() {
+                client.retry_send_applied_effects_best_effort().await;
+            }
+            result.map(|()| SyncSummary::default())
+        }
         MixedPublishObservation::DirectSendCurrentFailed => client
             .observe_recovery_evidence_then_gate_send_publish(
                 &effects,
@@ -19222,7 +19213,8 @@ async fn a_maintenance_tick_reports_its_own_epoch_passage_to_the_stall_detector(
 
     // Maintenance then confirms a recovered evolution, 10 -> 11.
     client
-        .observe_recovery_evidence_then_summarize_maintenance(&an_epoch_passage(&group_id, 10, 11))
+        .finish_maintenance_effects(&an_epoch_passage(&group_id, 10, 11))
+        .await
         .expect("a maintenance batch carrying only an epoch passage summarizes cleanly");
 
     // A peer fold carries the device on to 12. Only a detector that heard the

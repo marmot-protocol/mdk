@@ -2917,11 +2917,43 @@ where
                     self.maintenance_quiet_monotonic.remove(&obligation.id);
                 }
                 if let Some(mut state) = self.session.group_maintenance(&group_id)? {
-                    state.periodic_enrolled = false;
+                    // Enrollment is policy, not current membership. Preserve it
+                    // for a later canonical restoration; terminal groups are
+                    // excluded from the maintenance tick's live group set.
                     state.next_periodic_rotation_at = None;
                     self.session.put_group_maintenance(&state)?;
                 }
                 continue;
+            }
+            if events.iter().any(|event| {
+                matches!(event,
+                GroupEvent::LocalGroupCopyRestored { group_id: restored } if restored == &group_id)
+            }) && let Some(mut state) = self.session.group_maintenance(&group_id)?
+                && state.periodic_enrolled
+                && state.next_periodic_rotation_at.is_none()
+            {
+                // Use a fresh deadline, including copies that never rotated.
+                // An old failed periodic id is immutable even after restoration.
+                let mut deadline = now.0.saturating_add(
+                    self.maintenance_random
+                        .sample_inclusive(PERIODIC_MIN_SECS, PERIODIC_MAX_SECS),
+                );
+                loop {
+                    let mut hasher = Sha256::new();
+                    hasher.update(b"marmot-periodic-self-update-v1");
+                    hasher.update((group_id.as_slice().len() as u64).to_be_bytes());
+                    hasher.update(group_id.as_slice());
+                    hasher.update(deadline.to_be_bytes());
+                    let id = cgka_traits::MessageId::new(hasher.finalize().to_vec());
+                    if self.session.maintenance_obligation(&id)?.is_none() {
+                        break;
+                    }
+                    deadline = deadline.checked_add(1).ok_or_else(|| {
+                        cgka_traits::EngineError::Backend("periodic deadline exhausted".into())
+                    })?;
+                }
+                state.next_periodic_rotation_at = Some(Timestamp(deadline));
+                self.session.put_group_maintenance(&state)?;
             }
             let current = self.session.own_leaf_hash(&group_id)?;
             for mut obligation in self.session.maintenance_obligations_for_group(&group_id)? {

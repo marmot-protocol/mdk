@@ -7,7 +7,7 @@ use cgka_traits::app_components::{
 };
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent as MarmotInnerEvent};
 use cgka_traits::group::ProtocolProfile;
-use cgka_traits::storage::GroupStorage;
+use cgka_traits::storage::{GroupStorage, MessageStorage, StorageProvider};
 use cgka_traits::{GroupId, TransportGroupSubscription};
 use storage_sqlite::StoredNostrRoute;
 
@@ -748,25 +748,33 @@ impl AppClient {
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<Vec<crate::AppProjectionUpdate>, AppError> {
+        if effects.published_app_messages.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut updates = Vec::new();
         for published in &effects.published_app_messages {
             let group_id_hex = hex::encode(published.group_id.as_slice());
             let source_message_id_hex = hex::encode(published.message_id.as_slice());
-            let finalized = (|| {
-                let finalized = self.app.finalize_account_app_event_source_retention(
-                    &self.state.label,
-                    &group_id_hex,
-                    &published.app_event_id,
-                    Some(source_message_id_hex.as_str()),
-                    published.source_epoch.0,
-                    published.retention,
-                    published.authority,
-                )?;
-                // Revive after the source write, so the revival reprojects the
-                // finalized row and its update supersedes the finalize update.
-                let revived = self.revive_published_local_send(published, &group_id_hex)?;
-                Ok::<_, AppError>(finalized.into_iter().chain(revived))
-            })();
+            let finalized = self
+                .app
+                .account_storage(&self.state.label)
+                .and_then(|storage| {
+                    storage.with_transaction(|_| {
+                        let finalized = self.app.finalize_account_app_event_source_retention(
+                            &self.state.label,
+                            &group_id_hex,
+                            &published.app_event_id,
+                            Some(source_message_id_hex.as_str()),
+                            published.source_epoch.0,
+                            published.retention,
+                            published.authority,
+                        )?;
+                        // Revive after the source write, so the revival reprojects the
+                        // finalized row and its update supersedes the finalize update.
+                        let revived = self.revive_published_local_send(published, &group_id_hex)?;
+                        Ok::<_, AppError>(finalized.into_iter().chain(revived))
+                    })
+                });
             match finalized {
                 Ok(row_updates) => updates.extend(row_updates),
                 Err(error) => {
@@ -863,37 +871,6 @@ impl AppClient {
         )
     }
 
-    /// Invalidates local projections for application messages whose durable
-    /// fanouts reached a terminal publish failure.
-    ///
-    /// A direct send excludes its own optimistic row because the caller owns
-    /// that row's callback-delivered retraction. Sibling failures and recovery
-    /// batches have no such caller, so their updates are returned for the
-    /// account worker to broadcast.
-    pub(crate) fn invalidate_failed_app_message_projections(
-        &self,
-        effects: &marmot_account::AccountDeviceEffects,
-        excluded: Option<(&GroupId, &str)>,
-    ) -> Result<Vec<crate::AppProjectionUpdate>, AppError> {
-        let mut updates = Vec::new();
-        for failed in &effects.failed_app_messages {
-            if excluded.is_some_and(|(group_id, app_event_id)| {
-                failed.group_id == *group_id && failed.app_event_id == app_event_id
-            }) {
-                continue;
-            }
-            if let Some(update) = self.app.invalidate_timeline_app_event(
-                &self.state.label,
-                &hex::encode(failed.group_id.as_slice()),
-                &failed.app_event_id,
-                crate::LOCAL_PUBLISH_FAILED_REASON,
-            )? {
-                updates.push(update);
-            }
-        }
-        Ok(updates)
-    }
-
     pub(crate) fn prune_plaintext_retention_for_group(
         &self,
         group_id: &GroupId,
@@ -976,8 +953,8 @@ impl AppClient {
     }
 
     /// Persist and queue kind-1210 system rows for our own authenticated commits.
-    /// Call only after the caller's final fallible persistence step succeeds so
-    /// failed commands do not leave stale buffered timeline updates.
+    /// Call once publication has committed, before later local refreshes can
+    /// fail. The canonical activity remains valid even if that refresh fails.
     pub(crate) fn queue_own_group_system_projection_updates(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
@@ -988,8 +965,33 @@ impl AppClient {
         if effects.reports.is_empty() {
             return;
         }
-        self.pending_projection_updates
-            .extend(self.project_group_system_rows(&effects.events, unix_now_seconds()));
+        let events: Vec<_> = effects
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    cgka_traits::engine::GroupEvent::GroupStateChanged { .. }
+                        | cgka_traits::engine::GroupEvent::GroupStateInvalidated { .. }
+                        | cgka_traits::engine::GroupEvent::GroupStateRevalidated { .. }
+                )
+            })
+            .cloned()
+            .collect();
+        if events.is_empty() {
+            return;
+        }
+        let recorded_at = unix_now_seconds();
+        let mut updates = Vec::new();
+        let mut cursor = 0;
+        if self.has_pending_effect_projections()
+            || self
+                .try_project_group_system_rows(&events, recorded_at, &mut updates, &mut cursor)
+                .is_err()
+        {
+            self.retain_system_row_projection(&events, recorded_at, cursor);
+        }
+        self.pending_projection_updates.extend(updates);
     }
 
     pub(crate) fn take_pending_projection_updates(&mut self) -> Vec<crate::AppProjectionUpdate> {
@@ -1047,6 +1049,7 @@ impl AppClient {
     /// This also keeps the tail consistent with the dispatch loop that ran just
     /// before it, which applies the same events *in order* against storage. The
     /// two must agree on which verdict is final or they fight over the row.
+    #[cfg(test)]
     pub(crate) fn project_group_system_rows(
         &self,
         events: &[cgka_traits::engine::GroupEvent],
@@ -1147,12 +1150,59 @@ impl AppClient {
                         continue;
                     }
                 };
-                match self.app.record_account_app_event_at(
-                    &self.state.label,
-                    &projection,
-                    recorded_at,
-                ) {
-                    Ok(update) => updates.push(update),
+                // Identical changes by sibling devices deliberately share a row id.
+                // Adopt a freshly selected origin and undo only a provisional fork
+                // withdrawal in the same transaction. A retained loser must never
+                // repoint that row when its projection is replayed later.
+                let result = self
+                    .app
+                    .account_storage(&self.state.label)
+                    .and_then(|storage| {
+                        storage.with_transaction(|storage| {
+                            let canonical = if let Some(origin) = origin_commit_id {
+                                match storage.get_message(origin) {
+                                    Ok(record) => {
+                                        if record.group_id != *group_id
+                                            || !matches!(
+                                                record.state,
+                                                cgka_traits::MessageState::Processed
+                                                    | cgka_traits::MessageState::Sent
+                                            )
+                                        {
+                                            return Ok(None);
+                                        }
+                                        true
+                                    }
+                                    // Older/pruned history can still be displayed, but
+                                    // has no durable proof authorizing a revival.
+                                    Err(cgka_traits::StorageError::NotFound) => false,
+                                    Err(error) => return Err(error.into()),
+                                }
+                            } else {
+                                false
+                            };
+                            let recorded = self.app.record_account_app_event_at(
+                                &self.state.label,
+                                &projection,
+                                recorded_at,
+                            )?;
+                            let revived = if canonical {
+                                self.app.revalidate_timeline_origin_commit(
+                                    &self.state.label,
+                                    projection
+                                        .origin_commit_id
+                                        .as_deref()
+                                        .expect("canonical origin"),
+                                )?
+                            } else {
+                                None
+                            };
+                            Ok(Some(revived.unwrap_or(recorded)))
+                        })
+                    });
+                match result {
+                    Ok(Some(update)) => updates.push(update),
+                    Ok(None) => {}
                     Err(error) if retry_projection_writes => return Err(error),
                     Err(_) => tracing::warn!(target: "marmot_app::groups",
                         method = "project_group_system_rows_into",

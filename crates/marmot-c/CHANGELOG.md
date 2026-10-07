@@ -9,6 +9,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- The C event surface appends local-copy termination/restoration and removed-device-leaf
+  events; existing discriminants remain unchanged. Recompile with the matching
+  header and native library and handle the new event kinds. Restoration describes
+  retained-history repair, not automatic scheduler restoration of removed copies.
+
 - `MarmotPresentedChatRow` gains a nullable row-owned `MarmotChatListDraftVersion` handle and
   `marmot_message_draft_revision_includes_chat_list_version` compares it against
   a borrowed selected revision. Both inputs are opaque read-only borrows; only
@@ -51,12 +56,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   freshly discovered outboxes even when a discovery indexer is unavailable.
 
 - Group activity preserves per-commit reaction targets across author and peer
-  replay, including before disband. The C event surface appends local-copy
-  termination/restoration and removed-device-leaf events; existing discriminants
-  remain unchanged. Recompile with the matching header and native library and
-  handle the new event kinds. Restoration describes native retained-history
-  repair, not automatic scheduler restoration of removed copies. See
-  `marmot-app`'s Unreleased fixes for projection and push-token behavior.
+  replay, including before disband. See `marmot-app`'s Unreleased fixes for
+  projection and push-token behavior.
 
 ## [0.12.0] - 2026-10-02
 

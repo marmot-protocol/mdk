@@ -3254,6 +3254,9 @@ impl SqliteAccountStorage {
         group_id_hex: &str,
         active_leaves: &[(String, u32)],
     ) -> StorageResult<usize> {
+        // Materialize one scalar lookup set per statement. Correlated JSON
+        // scans (and row-value NOT IN null checks) grow quadratically. Member
+        // plus ':' plus a non-null u32 leaf is an unambiguous identity key.
         let roster = serde_json::to_string(active_leaves)
             .map_err(|error| StorageError::Serialization(error.to_string()))?;
         self.connection
@@ -3262,19 +3265,17 @@ impl SqliteAccountStorage {
                 let removed = conn
                     .execute_cached(
                         "DELETE FROM group_push_tokens
-                 WHERE group_id_hex = ?1 AND NOT EXISTS (
-                     SELECT 1 FROM json_each(?2) AS leaf
-                     WHERE json_extract(leaf.value, '$[0]') = member_id_hex
-                       AND json_extract(leaf.value, '$[1]') = leaf_index
+                 WHERE group_id_hex = ?1 AND (member_id_hex || ':' || leaf_index) NOT IN (
+                     SELECT json_extract(leaf.value, '$[0]') || ':' || json_extract(leaf.value, '$[1]')
+                     FROM json_each(?2) AS leaf
                  )",
                         params![group_id_hex, roster],
                     )
                     .storage()?;
                 conn.execute_cached(
                     "DELETE FROM group_push_token_tombstones
-                 WHERE group_id_hex = ?1 AND NOT EXISTS (
-                     SELECT 1 FROM json_each(?2) AS leaf
-                     WHERE json_extract(leaf.value, '$[0]') = member_id_hex
+                 WHERE group_id_hex = ?1 AND member_id_hex NOT IN (
+                     SELECT json_extract(leaf.value, '$[0]') FROM json_each(?2) AS leaf
                  )",
                     params![group_id_hex, roster],
                 )

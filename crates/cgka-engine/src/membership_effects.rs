@@ -100,33 +100,17 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Compare the actual pre-apply and selected trees once. Replayed common-prefix
     /// removals must not delete a replacement device's newer registration.
+    #[cfg(test)]
     pub(crate) fn emit_canonical_membership_effects(
         &mut self,
         group_id: &GroupId,
         before: &MembershipSnapshot,
     ) -> Result<(), EngineError> {
         let after = self.canonical_membership_snapshot(group_id)?;
-        let mut record = self.storage.get_group(group_id)?;
-        // These callers already committed canonical MLS apply. Preserve its
-        // leaf fact even if the independent terminal queue cleanup must retry.
-        if let Some(event) = before.departed_leaf_event(&after, group_id, record.epoch) {
-            self.events_buf.push_back(event);
-        }
-        if record.disbanded.is_none() {
-            if !after.local_active {
-                self.discard_queued_outbound_intents_with_termination(
-                    group_id,
-                    before.local_active || !before.record_removed,
-                )?;
-            } else if before.record_removed || !before.local_active {
-                record.removed = false;
-                self.storage.put_group(&record)?;
-                self.events_buf
-                    .push_back(GroupEvent::LocalGroupCopyRestored {
-                        group_id: group_id.clone(),
-                    });
-            }
-        }
+        let effects = self.storage.with_transaction(|storage| {
+            self.prepare_canonical_membership_effects_on_storage(storage, group_id, before, &after)
+        })?;
+        self.finish_canonical_membership_effects(group_id, effects);
         Ok(())
     }
 

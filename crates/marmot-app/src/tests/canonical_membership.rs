@@ -1486,8 +1486,9 @@ async fn committed_activity_tail_retries_after_storage_failure() {
     };
     let publications = relay.published_events.lock().unwrap().len();
     client
-        .observe_send_applied_effects_best_effort(&effects)
-        .await;
+        .observe_send_applied_effects(&effects)
+        .await
+        .expect_err("the injected activity tail is retained for retry");
     assert!(client.has_pending_runtime_group_subscription_refresh());
     assert_eq!(client.pending_applied_effects.len(), 1);
     let count = || {
@@ -1616,4 +1617,135 @@ async fn failed_push_sweep_does_not_block_other_groups_or_routes() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// A blocked one-shot activity row survives the managed worker's live receive
+/// boundary and is delivered without another engine event or client reopen.
+#[tokio::test]
+#[cfg(feature = "test-policy-overrides")]
+async fn managed_worker_keeps_activity_retry_while_live_delivery_waits() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice_account = home.create_account("alice").unwrap();
+    let bob_account = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = app_at(&dir, relay.clone());
+    remember_test_member_inbox(&app, &alice_account.account_id_hex, "wss://relay.example");
+    remember_test_member_inbox(&app, &bob_account.account_id_hex, "wss://relay.example");
+    let mut alice = app.client("alice").await.unwrap();
+    alice.publish_key_package().await.unwrap();
+    let mut bob = app.client("bob").await.unwrap();
+    let group = bob
+        .create_group("worker retry", &[&alice_account.account_id_hex])
+        .await
+        .unwrap();
+    let mut cursor = 0;
+    deliver_new(&mut alice, &relay, &mut cursor).await;
+    alice.sync().await.unwrap();
+    alice.accept_group_invite(&group).unwrap();
+    let path = app.account_storage_path("alice");
+    let keys = home.load_signing_keys("alice").unwrap();
+    let key = app
+        .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    drop(alice);
+    let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+    let runtime = app.runtime();
+    let mut notifications = runtime.subscribe();
+    let mut timeline = runtime
+        .subscribe_timeline_messages(
+            "alice",
+            TimelineMessageQuery {
+                group_id_hex: Some(hex::encode(group.as_slice())),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    runtime
+        .retry_group_convergence("alice", &group)
+        .await
+        .unwrap();
+    let baseline = timeline.take_snapshot().messages.len();
+    connection.execute_batch("CREATE TRIGGER fail_live_activity BEFORE INSERT ON app_events WHEN NEW.kind = 1210 BEGIN SELECT RAISE(FAIL, 'injected live activity'); END;").unwrap();
+    let cursor = relay.published_events.lock().unwrap().len();
+    bob.update_group_profile(&group, Some("surviving worker rename"), None)
+        .await
+        .unwrap();
+    let signed = relay.published_events.lock().unwrap()[cursor..]
+        .iter()
+        .find(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
+        .unwrap()
+        .clone();
+    let delivery = cgka_traits::TransportDelivery {
+        account_id: MemberId::new(hex::decode(&alice_account.account_id_hex).unwrap()),
+        group_id_hint: Some(group.clone()),
+        message: signed.to_transport_message().unwrap(),
+        received_at: cgka_traits::Timestamp(unix_now_seconds()),
+        source: cgka_traits::TransportDeliverySource {
+            transport: cgka_traits::transport::TransportSource("nostr".into()),
+            plane: cgka_traits::TransportDeliveryPlane::Group,
+            endpoint: None,
+            subscription_id: None,
+            wire: None,
+        },
+    };
+    app.relay_plane
+        .route_account_delivery_for_test(delivery.clone());
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let crate::MarmotAppEvent::AccountError(error) = notifications.recv().await.unwrap()
+                && error.account_label == "alice"
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("worker must reach the injected projection failure");
+    // Another live delivery used to provoke reopening the client, losing its
+    // one-shot retry. Keep the fault through several bounded retry turns.
+    let cursor = relay.published_events.lock().unwrap().len();
+    bob.send(&group, b"chat waiting behind activity")
+        .await
+        .unwrap();
+    let next_signed = relay.published_events.lock().unwrap()[cursor..]
+        .iter()
+        .find(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
+        .unwrap()
+        .clone();
+    let mut later_delivery = delivery;
+    later_delivery.message = next_signed.to_transport_message().unwrap();
+    app.relay_plane
+        .route_account_delivery_for_test(later_delivery);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    connection
+        .execute_batch("DROP TRIGGER fail_live_activity")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            timeline.recv().await.unwrap();
+            let page = timeline.take_snapshot();
+            if page.messages.iter().any(|message| {
+                message.kind == 1210 && message.plaintext.contains("surviving worker rename")
+            }) && page
+                .messages
+                .iter()
+                .any(|message| message.plaintext == "chat waiting behind activity")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("quiet worker retry must deliver the one-shot activity");
+    assert_eq!(timeline.take_snapshot().messages.len(), baseline + 2);
+    runtime.shutdown().await;
 }

@@ -2287,6 +2287,22 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
             !alice.has_pending_convergence_inputs(&group_id).unwrap(),
             "a raw application retry must not gate outbound work"
         );
+        #[cfg(feature = "test-conformance-snapshot")]
+        assert!(
+            alice
+                .conformance_pending_work_snapshot(&group_id)
+                .unwrap()
+                .unresolved_convergence_inputs
+                > 0
+        );
+        #[cfg(feature = "test-conformance-snapshot")]
+        assert!(
+            alice
+                .conformance_structural_progress_snapshot(&group_id)
+                .unwrap()
+                .runnable_work
+                > 0
+        );
         let runnable = storage.get_group(&group_id).unwrap();
         for terminal in [false, true] {
             let mut blocked = runnable.clone();

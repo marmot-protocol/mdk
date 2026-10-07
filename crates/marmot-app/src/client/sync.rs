@@ -685,6 +685,11 @@ pub(crate) struct PendingAppliedEffects {
     progress: EffectProjectionProgress,
     leading_updates: Vec<crate::AppProjectionUpdate>,
     uncommitted_summary: SyncSummary,
+    native_only: bool,
+    activity_only: bool,
+    bookkeeping_started: bool,
+    failed_message_cursor: usize,
+    failed_message_update: Option<Option<storage_sqlite::TimelineProjectionUpdate>>,
 }
 
 /// Completed work must not run against messages created after a restoration.
@@ -974,12 +979,6 @@ impl AppClient {
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<(), AppError> {
-        // Retire released receipts even when this effects batch makes no receipt read.
-        self.transport_receipts()?;
-        self.observe_recovery_evidence(effects);
-        self.remember_pending_convergence_groups(effects);
-        let failed_updates = self.invalidate_failed_app_message_projections(effects, None)?;
-        self.pending_projection_updates.extend(failed_updates);
         // Foreground send preflight can settle unrelated retained commits.
         // Their membership decisions are already canonical even if the
         // requested command's publication fails or emits no report.
@@ -990,6 +989,9 @@ impl AppClient {
         } else {
             self.observe_native_membership_effects_best_effort(effects)
                 .await;
+            // Publication already committed. Retain its activity before a
+            // command's later local refresh can fail and discard these effects.
+            self.queue_own_group_system_projection_updates(effects);
         }
         publish_result
     }
@@ -1001,26 +1003,19 @@ impl AppClient {
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<(), AppError> {
-        let native = marmot_account::AccountDeviceEffects {
-            events: effects
-                .events
-                .iter()
-                .filter(|event| {
-                    matches!(
-                        event,
-                        cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated { .. }
-                            | cgka_traits::engine::GroupEvent::LocalGroupCopyRestored { .. }
-                            | cgka_traits::engine::GroupEvent::GroupMemberLeavesRemoved { .. }
-                    )
-                })
-                .cloned()
-                .collect(),
-            ..Default::default()
-        };
-        if native.events.is_empty() {
-            return Ok(());
+        let queued = self.pending_applied_effects.len();
+        self.retain_effect_projection(effects, "", unix_now_seconds(), false);
+        if self.pending_applied_effects.len() > queued {
+            self.pending_applied_effects
+                .back_mut()
+                .expect("new batch")
+                .native_only = true;
         }
-        self.observe_send_applied_effects(&native).await?;
+        let routes_dirty = self.retry_applied_effect_projections_buffered().await?;
+        let routes_changed = self.refresh_group_routes()?.routing_changed;
+        if routes_dirty || routes_changed {
+            self.sync_runtime_groups().await?;
+        }
         self.save_state_with_pending_local_group_deletion_frontier_clears()
     }
 
@@ -1364,6 +1359,11 @@ impl AppClient {
             }
         }
         Ok((frozen, rotation_claim))
+    }
+
+    /// One-shot native effects must keep their engine-owning client until projected.
+    pub(crate) fn has_pending_effect_projections(&self) -> bool {
+        !self.pending_applied_effects.is_empty()
     }
 
     pub(crate) fn has_pending_runtime_group_subscription_refresh(&self) -> bool {
@@ -1822,36 +1822,7 @@ impl AppClient {
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<SyncSummary, AppError> {
-        self.observe_recovery_health(effects)?;
-        // These reports are consumed once, even for eventless fanout completion
-        // or when an older projection remains blocked.
-        self.transport_receipts()?;
-        self.remember_pending_convergence_groups(effects);
-        self.observe_recovery_evidence(effects);
-        self.remember_published_reports(effects);
-        let mut leading_updates = self.finalize_published_app_message_source_retention(effects)?;
-        match self.invalidate_failed_app_message_projections(effects, None) {
-            Ok(updates) => leading_updates.extend(updates),
-            Err(error) => {
-                self.pending_applied_sync_summary
-                    .projection_updates
-                    .extend(leading_updates);
-                self.retain_effect_projection(effects, "", unix_now_seconds(), true);
-                return Err(error);
-            }
-        }
-        if !effects.events.is_empty() || !leading_updates.is_empty() {
-            self.pending_applied_effects
-                .push_back(PendingAppliedEffects {
-                    effects: effects.clone(),
-                    received_at: unix_now_seconds(),
-                    source_message_id_hex: String::new(),
-                    drained: true,
-                    progress: EffectProjectionProgress::default(),
-                    leading_updates,
-                    uncommitted_summary: SyncSummary::default(),
-                });
-        }
+        self.retain_effect_projection(effects, "", unix_now_seconds(), true);
         let mut summary = self.take_pending_applied_sync_summary();
         let projected = self.retry_applied_effect_projections(&mut summary).await;
         // A failed publish is the primary error; successful native work and
@@ -2094,10 +2065,12 @@ impl AppClient {
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<(), AppError> {
-        if effects.events.is_empty() {
-            return Ok(());
-        }
         self.retain_applied_effects(effects);
+        self.flush_send_applied_effects().await
+    }
+
+    /// Finish retained projection and routes without enqueuing the batch twice.
+    async fn flush_send_applied_effects(&mut self) -> Result<(), AppError> {
         let routes_dirty = self.retry_applied_effect_projections_buffered().await?;
         let routes_changed = self.refresh_group_routes()?.routing_changed;
         if routes_dirty || routes_changed {
@@ -2121,7 +2094,24 @@ impl AppClient {
         received_at: u64,
         drained: bool,
     ) {
-        if effects.events.is_empty() {
+        self.observe_recovery_evidence(effects);
+        self.remember_pending_convergence_groups(effects);
+        self.remember_published_reports(effects);
+        self.note_superseded_intent_reports(effects);
+        self.enqueue_effect_projection(effects, source_message_id_hex, received_at, drained);
+    }
+
+    fn enqueue_effect_projection(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+        source_message_id_hex: &str,
+        received_at: u64,
+        drained: bool,
+    ) {
+        if effects.events.is_empty()
+            && effects.failed_app_messages.is_empty()
+            && effects.published_app_messages.is_empty()
+        {
             return;
         }
         self.pending_applied_effects
@@ -2133,22 +2123,106 @@ impl AppClient {
                 progress: EffectProjectionProgress::default(),
                 leading_updates: Vec::new(),
                 uncommitted_summary: SyncSummary::default(),
+                native_only: false,
+                activity_only: false,
+                bookkeeping_started: false,
+                failed_message_cursor: 0,
+                failed_message_update: None,
             });
+    }
+
+    pub(super) fn retain_system_row_projection(
+        &mut self,
+        events: &[cgka_traits::engine::GroupEvent],
+        received_at: u64,
+        cursor: usize,
+    ) {
+        let effects = marmot_account::AccountDeviceEffects {
+            events: events.to_vec(),
+            ..Default::default()
+        };
+        // The command's native batch already observed these one-shot facts.
+        // This entry owns only its unprojected activity suffix.
+        self.enqueue_effect_projection(&effects, "", received_at, false);
+        if let Some(pending) = self.pending_applied_effects.back_mut() {
+            pending.activity_only = true;
+            pending.bookkeeping_started = true;
+            pending.progress.system_row_cursor = cursor;
+            pending
+                .progress
+                .events
+                .resize_with(events.len(), EventProjectionProgress::default);
+        }
     }
 
     /// Retry committed batches in order without repeating engine publication.
     /// Preserve subscriber updates from successful writes even if a later write
     /// fails: an idempotent replay may not regenerate those prefix updates.
+    /// Retry metadata writes before projecting this already-committed event batch.
+    fn project_retained_bookkeeping(
+        &mut self,
+        pending: &mut PendingAppliedEffects,
+    ) -> Result<(), AppError> {
+        if !pending.bookkeeping_started {
+            self.transport_receipts()?;
+            self.observe_recovery_health(&pending.effects)?;
+            // This helper transfers unfinished source finalization back to its
+            // durable accepted fanout; success means that handoff is complete.
+            pending
+                .leading_updates
+                .extend(self.finalize_published_app_message_source_retention(&pending.effects)?);
+            pending.bookkeeping_started = true;
+        }
+        while let Some(failed) = pending
+            .effects
+            .failed_app_messages
+            .get(pending.failed_message_cursor)
+        {
+            if pending.failed_message_update.is_none() {
+                pending.failed_message_update = Some(
+                    self.app
+                        .account_storage(&self.state.label)?
+                        .invalidate_app_event_by_message_id(
+                            &hex::encode(failed.group_id.as_slice()),
+                            &failed.app_event_id,
+                            crate::LOCAL_PUBLISH_FAILED_REASON,
+                        )?,
+                );
+            }
+            if let Some(Some(update)) = &pending.failed_message_update {
+                pending.leading_updates.push(
+                    self.app
+                        .app_projection_update(&self.state.label, update.clone())?,
+                );
+            }
+            pending.failed_message_cursor += 1;
+            pending.failed_message_update = None;
+        }
+        Ok(())
+    }
+
     async fn retry_applied_effect_projections(
         &mut self,
         summary: &mut SyncSummary,
     ) -> Result<bool, AppError> {
         let mut routes_dirty = false;
         while let Some(mut pending) = self.pending_applied_effects.front().cloned() {
+            let bookkeeping = self.project_retained_bookkeeping(&mut pending);
             summary
                 .projection_updates
                 .append(&mut pending.leading_updates);
-            let has_outbox_events = pending.effects.events.iter().any(|event| {
+            let mut projected_effects = pending.effects.clone();
+            if pending.native_only {
+                projected_effects.events.retain(|event| {
+                    matches!(
+                        event,
+                        cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated { .. }
+                            | cgka_traits::engine::GroupEvent::LocalGroupCopyRestored { .. }
+                            | cgka_traits::engine::GroupEvent::GroupMemberLeavesRemoved { .. }
+                    )
+                });
+            }
+            let has_outbox_events = projected_effects.events.iter().any(|event| {
                 matches!(
                     event,
                     cgka_traits::engine::GroupEvent::MessageReceived { .. }
@@ -2156,23 +2230,33 @@ impl AppClient {
                 )
             });
             let mut batch_summary = std::mem::take(&mut pending.uncommitted_summary);
-            let result = if pending.drained {
-                self.project_drained_effects(
-                    &pending.effects,
-                    pending.received_at,
-                    &mut batch_summary,
-                    &mut pending.progress,
-                )
-                .map(|()| false)
-            } else {
-                self.observe_account_device_effects_inner(
-                    &pending.effects,
-                    &mut batch_summary,
-                    &pending.source_message_id_hex,
-                    pending.received_at,
-                    &mut pending.progress,
-                )
-            };
+            let result = bookkeeping.and_then(|()| {
+                if pending.activity_only {
+                    self.try_project_group_system_rows(
+                        &projected_effects.events,
+                        pending.received_at,
+                        &mut batch_summary.projection_updates,
+                        &mut pending.progress.system_row_cursor,
+                    )
+                    .map(|()| false)
+                } else if pending.drained {
+                    self.project_drained_effects(
+                        &projected_effects,
+                        pending.received_at,
+                        &mut batch_summary,
+                        &mut pending.progress,
+                    )
+                    .map(|()| false)
+                } else {
+                    self.observe_account_device_effects_inner(
+                        &projected_effects,
+                        &mut batch_summary,
+                        &pending.source_message_id_hex,
+                        pending.received_at,
+                        &mut pending.progress,
+                    )
+                }
+            });
             if result.is_err() && has_outbox_events {
                 // The live ingest failure keeps these engine outbox rows for
                 // restart replay. Retain their summary and re-stage their acks
@@ -2240,29 +2324,64 @@ impl AppClient {
         *summary = older;
     }
 
-    /// Remove a forgotten copy's retry input without discarding other groups
+    /// Remove a deleted or forgotten copy's retry input without discarding other groups
     /// released in the same batch or changing their ordering and provenance.
     pub(super) fn forget_pending_effect_projections(&mut self, group_id: &cgka_traits::GroupId) {
+        let group_hex = hex::encode(group_id.as_slice());
+        for summary in [
+            &mut self.pending_applied_sync_summary,
+            &mut self.pending_failed_sync_summary,
+        ] {
+            summary.joined_groups.retain(|group| group != group_id);
+            summary
+                .messages
+                .retain(|message| &message.group_id != group_id);
+            summary
+                .events
+                .retain(|event| crate::groups::event_group_id(event) != Some(group_id));
+            summary
+                .projection_updates
+                .retain(|update| update.group_id_hex != group_hex);
+            summary
+                .epoch_stall_escalations
+                .retain(|event| &event.group_id != group_id);
+        }
         self.pending_applied_effects.retain_mut(|pending| {
-            pending.progress.events.resize_with(
-                pending.effects.events.len(),
-                EventProjectionProgress::default,
-            );
-            let mut kept_events = Vec::new();
+            let projected_events = pending
+                .effects
+                .events
+                .iter()
+                .filter(|event| {
+                    !pending.native_only
+                        || matches!(
+                            event,
+                            cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated { .. }
+                                | cgka_traits::engine::GroupEvent::LocalGroupCopyRestored { .. }
+                                | cgka_traits::engine::GroupEvent::GroupMemberLeavesRemoved { .. }
+                        )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            pending
+                .progress
+                .events
+                .resize_with(projected_events.len(), EventProjectionProgress::default);
             let mut kept_progress = Vec::new();
             let mut row_cursor = 0;
-            for (index, (event, progress)) in std::mem::take(&mut pending.effects.events)
+            for (index, (event, progress)) in projected_events
                 .into_iter()
                 .zip(std::mem::take(&mut pending.progress.events))
                 .enumerate()
             {
                 if event_group_id(&event) != Some(group_id) {
                     row_cursor += usize::from(index < pending.progress.system_row_cursor);
-                    kept_events.push(event);
                     kept_progress.push(progress);
                 }
             }
-            pending.effects.events = kept_events;
+            pending
+                .effects
+                .events
+                .retain(|event| event_group_id(event) != Some(group_id));
             pending.progress.events = kept_progress;
             pending.progress.system_row_cursor = row_cursor;
             if let Some(frontiers) = &mut pending.progress.frontiers {
@@ -2289,26 +2408,44 @@ impl AppClient {
             pending
                 .leading_updates
                 .retain(|update| update.group_id_hex != hex::encode(group_id.as_slice()));
-            !pending.effects.events.is_empty() || !pending.leading_updates.is_empty()
+            pending
+                .effects
+                .published_app_messages
+                .retain(|report| &report.group_id != group_id);
+            let failed_cursor = pending.failed_message_cursor;
+            if pending
+                .effects
+                .failed_app_messages
+                .get(failed_cursor)
+                .is_some_and(|report| &report.group_id == group_id)
+            {
+                pending.failed_message_update = None;
+            }
+            pending.failed_message_cursor = pending
+                .effects
+                .failed_app_messages
+                .iter()
+                .take(failed_cursor)
+                .filter(|report| &report.group_id != group_id)
+                .count();
+            pending
+                .effects
+                .failed_app_messages
+                .retain(|report| &report.group_id != group_id);
+            !pending.effects.events.is_empty()
+                || !pending.leading_updates.is_empty()
+                || !pending.effects.published_app_messages.is_empty()
+                || !pending.effects.failed_app_messages.is_empty()
         });
     }
 
-    /// Best-effort wrapper over [`Self::observe_send_applied_effects`] for the
-    /// outbound send paths: a projection or route-refresh failure here must
-    /// not fail a publish that already completed (or mask a publish error on
-    /// the failure path), so it is logged rather than propagated.
-    pub(crate) async fn observe_send_applied_effects_best_effort(
-        &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
-    ) {
-        if let Err(_err) = self.observe_send_applied_effects(effects).await {
+    pub(crate) async fn retry_send_applied_effects_best_effort(&mut self) {
+        if self
+            .retry_applied_effect_projections_buffered()
+            .await
+            .is_err()
+        {
             self.pending_runtime_group_subscription_refresh = true;
-            tracing::warn!(
-                target: "marmot_app::messages",
-                method = "observe_send_applied_effects",
-                error_code = "send_applied_observe_failed",
-                "failed to observe group events applied during a send"
-            );
         }
     }
 
@@ -3359,7 +3496,12 @@ impl AppClient {
             });
         }
         let effects = ingest?;
-        client.observe_recovery_health(&effects.effects)?;
+        client.retain_effect_projection(
+            &effects.effects,
+            &source_message_id_hex,
+            source_received_at,
+            false,
+        );
         if let Some(before) = rejoin_offers_before {
             // Account-wide eviction may remove an offer for a different group.
             // Invalidate every changed group's host projection, not just the
@@ -3408,8 +3550,6 @@ impl AppClient {
             _ => None,
         };
         client.remember_buffered_convergence_outcome(&effects.outcome);
-        client.remember_pending_convergence_groups(&effects.effects);
-        client.observe_recovery_evidence(&effects.effects);
         // The cursor is held back only by a resource refusal, which is
         // narrower than `must_stay_fetchable` on purpose.
         //
@@ -3458,15 +3598,8 @@ impl AppClient {
             })
             .filter(|event_id| !client.pending_application_event_acks.contains(event_id))
             .collect::<Vec<_>>();
-        let routes_dirty = match client
-            .observe_account_device_effects(
-                &effects.effects,
-                summary,
-                &source_message_id_hex,
-                source_received_at,
-            )
-            .await
-        {
+        client.prepend_pending_applied_summary(summary);
+        let routes_dirty = match client.retry_applied_effect_projections(summary).await {
             Ok(routes_dirty) => routes_dirty,
             Err(error) => {
                 for event_id in new_application_event_ack_candidates {
@@ -5110,28 +5243,18 @@ impl AppClient {
         group_id: &cgka_traits::GroupId,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<SyncSummary, AppError> {
-        self.observe_recovery_health(effects)?;
-        self.remember_pending_convergence_groups(effects);
-        // Observe before the publish gate, for the reason spelled out in
-        // `observe_drained_session_events`.
-        self.observe_recovery_evidence(effects);
-        self.remember_published_reports(effects);
-        let finalize_updates = self.finalize_published_app_message_source_retention(effects)?;
-        let failed_updates = match self.invalidate_failed_app_message_projections(effects, None) {
-            Ok(updates) => updates,
-            Err(error) => {
-                self.pending_projection_updates.extend(finalize_updates);
-                return Err(error);
-            }
-        };
-        // Preserve successful publications in a mixed batch before surfacing
-        // an unrelated hard failure. Their durable fanouts are already gone,
-        // so a later pass cannot reconstruct this source metadata.
+        self.retain_effect_projection(effects, "", unix_now_seconds(), false);
         if let Err(error) = fail_if_publish_failed(effects) {
-            self.pending_projection_updates.extend(finalize_updates);
-            self.pending_projection_updates.extend(failed_updates);
-            self.observe_failed_publish_effects_best_effort(effects)
-                .await;
+            // The primary publish error must not skip committed route/state
+            // checkpoints or consume their one-shot scheduling edge.
+            if self
+                .flush_send_applied_effects()
+                .await
+                .and_then(|()| self.save_state_with_pending_local_group_deletion_frontier_clears())
+                .is_err()
+            {
+                self.pending_runtime_group_subscription_refresh = true;
+            }
             return Err(error);
         }
         let publish_new_message_notification =
@@ -5152,19 +5275,9 @@ impl AppClient {
         self.refresh_group(group_id);
 
         let mut summary = SyncSummary::default();
-        summary.projection_updates.extend(finalize_updates);
-        summary.projection_updates.extend(failed_updates);
-        let source_message_id_hex = String::new();
-        let source_received_at = unix_now_seconds();
+        self.prepend_pending_applied_summary(&mut summary);
         let result = async {
-            let routes_dirty = self
-                .observe_account_device_effects(
-                    effects,
-                    &mut summary,
-                    &source_message_id_hex,
-                    source_received_at,
-                )
-                .await?;
+            let routes_dirty = self.retry_applied_effect_projections(&mut summary).await?;
             let routes_changed = match self.refresh_group_routes() {
                 Ok(refresh) => refresh.routing_changed,
                 Err(error) => {
@@ -5872,6 +5985,7 @@ impl AppClient {
 
     /// Fence fresh observations behind retained batches and transfer their
     /// committed notifications into the caller's summary before newer deltas.
+    #[cfg(test)]
     async fn observe_account_device_effects(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
@@ -5907,7 +6021,6 @@ impl AppClient {
         progress: &mut EffectProjectionProgress,
     ) -> Result<bool, AppError> {
         let display_names = self.display_names_for_events(&effects.events);
-        self.note_superseded_intent_reports(effects);
         if progress.frontiers.is_none() {
             progress.frontiers = Some(self.local_group_deletion_frontiers_at_batch_start(effects)?);
         }
@@ -5961,9 +6074,29 @@ impl AppClient {
                     event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
                 let group_metadata = event_group_id(event)
                     .and_then(|group_id| self.runtime.group_record(group_id).ok());
-                let group_projection = event_group_id(event)
-                    .map(|group_id| self.event_group_projection(group_id, group_metadata.as_ref()))
-                    .transpose()?;
+                // A Welcome and terminal commit can be released together before
+                // this app has ever projected the group. There are no retained
+                // display components to load, and terminal MLS state is gone.
+                let terminal_without_projection = group_metadata
+                    .as_ref()
+                    .is_some_and(|group| group.disbanded.is_some())
+                    && previous_group.is_none()
+                    && match event_group_id(event) {
+                        Some(group_id) => self
+                            .app
+                            .group(&self.state.label, &hex::encode(group_id.as_slice()))?
+                            .is_none(),
+                        None => false,
+                    };
+                let group_projection = if terminal_without_projection {
+                    None
+                } else {
+                    event_group_id(event)
+                        .map(|group_id| {
+                            self.event_group_projection(group_id, group_metadata.as_ref())
+                        })
+                        .transpose()?
+                };
                 if let Some(message) = observe_event(
                     &mut self.state,
                     &display_names,

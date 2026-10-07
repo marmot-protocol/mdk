@@ -26,6 +26,17 @@
 
 ### Fixed
 
+- Identical same-actor fork activity retains its reaction target when a fresh
+  canonical commit replaces a withdrawn origin; adoption and revival are atomic.
+  Canonical removal and membership cleanup commit together. Later retained-history
+  restoration resumes enrolled periodic maintenance without reviving failed work.
+- Projection retry retains bookkeeping and failed-message updates as well as
+  native events. Live receive keeps the owning client while projection is pending;
+  comparison admission/checkpoint failures preserve repaired subscriber updates.
+  A second local deletion discards obsolete retained projections. Terminal groups
+  that never reached app projection do not stall later batches. Queues remain
+  session-local; this does not claim crash-durable activity replay.
+
 - The HPKE dependency now uses `libcrux-kem` 0.0.10, fixing malformed hybrid-key
   and short-seed panics (RUSTSEC-2026-0330 and RUSTSEC-2026-0331). A documented
   compatibility patch preserves the existing HPKE and OpenMLS versions.
