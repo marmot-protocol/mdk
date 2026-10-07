@@ -28,6 +28,7 @@ pub mod commands;
 pub mod file_media;
 pub(crate) mod macros;
 pub mod memory;
+pub mod nip46;
 pub mod publisher;
 pub mod secret_store;
 pub mod status;

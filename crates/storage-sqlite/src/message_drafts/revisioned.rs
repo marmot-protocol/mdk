@@ -8,7 +8,39 @@ pub struct MessageDraftRevision {
     revision: i64,
 }
 
+/// Read-only chat-row metadata. It cannot authorize a draft mutation.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChatListDraftVersion {
+    store_epoch: Vec<u8>,
+    group_id_hex: String,
+    revision: i64,
+}
+
+impl std::fmt::Debug for ChatListDraftVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatListDraftVersion")
+            .finish_non_exhaustive()
+    }
+}
+
 impl MessageDraftRevision {
+    /// Whether this read-only version belongs to the same store/group and is
+    /// no newer than this selected revision. This comparison never clears a draft.
+    pub fn includes_chat_list_version(&self, version: &ChatListDraftVersion) -> bool {
+        version.store_epoch == self.store_epoch
+            && version.group_id_hex == self.group_id_hex
+            && version.revision <= self.revision
+    }
+
+    #[cfg(test)]
+    fn chat_list_version(&self) -> ChatListDraftVersion {
+        ChatListDraftVersion {
+            store_epoch: self.store_epoch.clone(),
+            group_id_hex: self.group_id_hex.clone(),
+            revision: self.revision,
+        }
+    }
+
     pub fn group_id_hex(&self) -> &str {
         &self.group_id_hex
     }
@@ -219,6 +251,28 @@ fn revision_tx(conn: &Connection, group: &str) -> StorageResult<MessageDraftRevi
     .optional()
     .storage()?
     .ok_or(StorageError::NotFound)
+}
+
+/// Read only revision metadata in the row's existing read transaction. Does
+/// not hydrate draft text, attachment metadata or attachment plaintext.
+pub(crate) fn chat_list_version_tx(
+    conn: &Connection,
+    group: &str,
+    store_epoch: &[u8],
+) -> StorageResult<Option<ChatListDraftVersion>> {
+    let revision = conn
+        .query_row_cached(
+            "SELECT revision FROM message_draft_revisions WHERE group_id_hex = ?1",
+            [group],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .storage()?;
+    Ok(revision.map(|revision| ChatListDraftVersion {
+        store_epoch: store_epoch.to_vec(),
+        group_id_hex: group.to_owned(),
+        revision,
+    }))
 }
 
 fn check_revision_tx(

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Shared installer implementation for Marmot terminal harnesses.
-# MARMOT_TERMINAL_HARNESS must be `claude`, `codex`, `pi`, or `opencode`.
+# MARMOT_TERMINAL_HARNESS must be `claude`, `codex`, `pi`, `opencode`, or `goose`.
 
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
 SCRIPT_DIR=""
@@ -11,6 +11,7 @@ if [ -n "$SCRIPT_SOURCE" ] && [ -f "$SCRIPT_SOURCE" ]; then
 fi
 
 HARNESS_KIND="${MARMOT_TERMINAL_HARNESS:-}"
+HARNESS_AUTONOMOUS_SUPPORTED=1
 case "$HARNESS_KIND" in
     claude)
         HARNESS_DISPLAY_NAME="Claude Code"
@@ -52,11 +53,27 @@ case "$HARNESS_KIND" in
         HARNESS_DEFAULT_AGENT_SERVICE="wn-agent-harnesses"
         HARNESS_DEFAULT_AGENT_LAUNCHD="org.marmot.wn-agent.harnesses"
         ;;
+    goose)
+        HARNESS_DISPLAY_NAME="Goose"
+        HARNESS_ENV_PREFIX="WN_GOOSE"
+        HARNESS_DEFAULT_BIN="goose"
+        HARNESS_FALLBACK_BIN_DIR="$HOME/.local/bin"
+        HARNESS_DEFAULT_HOME="$HOME/.marmot-agents/goose"
+        HARNESS_DEFAULT_AGENT_LABEL="goose-harness-agent"
+        HARNESS_DEFAULT_AGENT_SERVICE="wn-agent-goose"
+        HARNESS_DEFAULT_AGENT_LAUNCHD="org.marmot.wn-agent.goose"
+        # Goose has no non-interactive mode that keeps tool denies; wn-goose refuses it.
+        HARNESS_AUTONOMOUS_SUPPORTED=0
+        ;;
     *)
-        echo "error: MARMOT_TERMINAL_HARNESS must be claude, codex, pi, or opencode" >&2
+        echo "error: MARMOT_TERMINAL_HARNESS must be claude, codex, pi, opencode, or goose" >&2
         exit 64
         ;;
 esac
+HARNESS_PROFILE_CHOICES="inherit, autonomous, or unrestricted"
+if [ "$HARNESS_AUTONOMOUS_SUPPORTED" -ne 1 ]; then
+    HARNESS_PROFILE_CHOICES="inherit or unrestricted"
+fi
 HARNESS_BINARY="wn-$HARNESS_KIND"
 HARNESS_BIN_ENV="${HARNESS_ENV_PREFIX}_BIN"
 HARNESS_ALLOWED_SENDERS_ENV="${HARNESS_ENV_PREFIX}_ALLOWED_SENDERS_HEX"
@@ -142,7 +159,7 @@ Options:
   --allow-sender VALUE     Alias for --allow-welcomer
   --relay URL              Relay URL for wn-agent/bootstrap; may repeat
   --$HARNESS_KIND-bin PATH      $HARNESS_DISPLAY_NAME binary or command name (default: $HARNESS_DEFAULT_BIN)
-  --execution-profile PROFILE  inherit, autonomous, or unrestricted (default: inherit)
+  --execution-profile PROFILE  $HARNESS_PROFILE_CHOICES (default: inherit)
   --acknowledge-unrestricted   Confirm that unrestricted requires external isolation
   --no-service             Do not install/start LaunchAgents or systemd user units
   --no-start-wn-agent      Install services but do not start wn-agent or the harness
@@ -315,7 +332,13 @@ validate_prompt_senders() {
 
 validate_execution_profile() {
     case "$HARNESS_EXECUTION_PROFILE" in
-        inherit | autonomous) ;;
+        inherit) ;;
+        autonomous)
+            if [ "$HARNESS_AUTONOMOUS_SUPPORTED" -ne 1 ]; then
+                echo "error: $HARNESS_DISPLAY_NAME does not support the autonomous execution profile; use inherit or unrestricted" >&2
+                exit 1
+            fi
+            ;;
         unrestricted)
             if [ "$ACKNOWLEDGE_UNRESTRICTED" -ne 1 ]; then
                 echo "error: --acknowledge-unrestricted is required before writing the unrestricted execution profile" >&2
@@ -323,7 +346,7 @@ validate_execution_profile() {
             fi
             ;;
         *)
-            echo "error: --execution-profile must be inherit, autonomous, or unrestricted" >&2
+            echo "error: --execution-profile must be $HARNESS_PROFILE_CHOICES" >&2
             exit 1
             ;;
     esac

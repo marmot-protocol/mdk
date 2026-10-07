@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Attachment history adds `AttachmentRole` and the required `AttachmentEntry.role`
+  field. Update Rust struct literals; gallery consumers can exclude `InlineEmoji`
+  without changing original slots, parser verdicts or acquisition references.
+  See [the attachment-history handoff](../marmot-uniffi/ATTACHMENT-HISTORY.md).
+
 ### Added
 
 - `MarmotAppRuntime::message_reactions` returns complete local reaction details for one exact
@@ -32,6 +39,9 @@
 
 ### Fixed
 
+- The HPKE dependency now uses `libcrux-kem` 0.0.10, fixing malformed hybrid-key
+  and short-seed panics (RUSTSEC-2026-0330 and RUSTSEC-2026-0331). A documented
+  compatibility patch preserves the existing HPKE and OpenMLS versions.
 - When a member lookup does not complete and the member's known inbox relay
   list has no usable relays, the invite now fails with "known member inbox
   relay list has no usable relays and its refresh did not complete" instead

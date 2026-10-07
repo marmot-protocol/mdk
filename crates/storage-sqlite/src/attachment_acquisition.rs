@@ -237,6 +237,7 @@ impl SqliteAccountStorage {
                 group_id_hex: r.get(0)?,
                 generation: r.get(1)?,
                 entry: crate::AttachmentHistoryEntry {
+                    emoji_tags: Vec::new(),
                     message_id_hex: r.get(2)?,
                     attachment_index: r.get::<_, u32>(3)? as usize,
                     source_message_id_hex: r.get(4)?,

@@ -207,8 +207,8 @@ pub use directory::{
     UserSearchUpdate, sort_user_search_results,
 };
 pub use drafts::{
-    MessageDraft, MessageDraftAttachment, MessageDraftAttachmentSummary, MessageDraftInvalidation,
-    MessageDraftRevision, MessageDraftSummary, SelectedMessageDraft,
+    ChatListDraftVersion, MessageDraft, MessageDraftAttachment, MessageDraftAttachmentSummary,
+    MessageDraftInvalidation, MessageDraftRevision, MessageDraftSummary, SelectedMessageDraft,
     SelectedMessageDraftAttachment, SelectedMessageDraftContent,
 };
 pub use error::{AccountCatchUpFailure, AppError, FullHistoryRepairIncompleteReason};
@@ -6822,13 +6822,17 @@ impl MarmotApp {
         if public_key.to_hex() != account.account_id_hex {
             return Err(AppError::ExternalSignerMismatch);
         }
-        self.external_signers
+        let mut signers = self
+            .external_signers
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(
-                account.account_id_hex.clone(),
-                RegisteredExternalSigner::new(public_key, signer),
-            );
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match signers.entry(account.account_id_hex.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.get().replace(signer),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(RegisteredExternalSigner::new(public_key, signer));
+            }
+        }
+        drop(signers);
         self.account_publish_clients
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -7674,8 +7678,8 @@ pub use storage_sqlite::{ContentReport, ContentReportPage, ReportDismissal, Repo
 pub use runtime::{
     AttachmentAssetRef, AttachmentAutomaticPermission, AttachmentCategory, AttachmentControl,
     AttachmentDownloadPolicy, AttachmentEntry, AttachmentHistoryCursor, AttachmentHistoryVersion,
-    AttachmentLocalTarget, AttachmentPage, AttachmentPageRead, AttachmentTransferState,
-    AttachmentTransferStatus, AutomaticAttachmentRequest, MAX_ATTACHMENT_ASSET_LOOKUPS,
-    MAX_ATTACHMENT_HISTORY_PAGE, MAX_ATTACHMENT_LOCAL_READ_BYTES, RetainedAttachmentAsset,
-    RuntimeAttachmentTransferSubscription,
+    AttachmentLocalTarget, AttachmentPage, AttachmentPageRead, AttachmentRole,
+    AttachmentTransferState, AttachmentTransferStatus, AutomaticAttachmentRequest,
+    MAX_ATTACHMENT_ASSET_LOOKUPS, MAX_ATTACHMENT_HISTORY_PAGE, MAX_ATTACHMENT_LOCAL_READ_BYTES,
+    RetainedAttachmentAsset, RuntimeAttachmentTransferSubscription,
 };

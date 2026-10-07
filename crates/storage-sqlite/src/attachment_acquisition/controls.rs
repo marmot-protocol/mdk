@@ -619,6 +619,7 @@ impl SqliteAccountStorage {
 }
 
 impl SqliteAccountStorage {
+    /// Resolve a live acquisition slot; presentation-only emoji metadata is unnecessary here.
     pub fn attachment_control_entry(
         &self,
         group: &str,
@@ -633,7 +634,7 @@ impl SqliteAccountStorage {
             AND h.visible=1 AND g.pending_confirmation=0 AND length(CAST(h.slot_json AS BLOB))<=16384
             AND (a.retention_expires_at IS NULL OR a.retention_expires_at>?5)",params![group,message,source,index,u64_to_i64(now)?],|r| {
                 let slot:String=r.get(4)?;
-                Ok(crate::AttachmentHistoryEntry {message_id_hex:message.into(),source_message_id_hex:source.into(),attachment_index:index as usize,
+                Ok(crate::AttachmentHistoryEntry { emoji_tags: Vec::new(),message_id_hex:message.into(),source_message_id_hex:source.into(),attachment_index:index as usize,
                     source_epoch:r.get::<_,Option<i64>>(0)?.map(|v|v as u64),sender:r.get(1)?,timeline_at:nonnegative(r,2)?,received_at:nonnegative(r,3)?,
                     slot:serde_json::from_str(&slot).unwrap_or(serde_json::Value::Null)})
             }).optional().storage()

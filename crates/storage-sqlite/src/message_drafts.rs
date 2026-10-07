@@ -1,7 +1,8 @@
 pub(crate) mod revisioned;
 pub use revisioned::{
-    MessageDraftCommitObserver, MessageDraftRevision, MessageDraftRevisionError,
-    SelectedMessageDraft, SelectedMessageDraftAttachment, SelectedMessageDraftContent,
+    ChatListDraftVersion, MessageDraftCommitObserver, MessageDraftRevision,
+    MessageDraftRevisionError, SelectedMessageDraft, SelectedMessageDraftAttachment,
+    SelectedMessageDraftContent,
 };
 
 use crate::connection::CachedSql;

@@ -1240,8 +1240,10 @@ Metadata notes:
 
 - Some events have `group_ref` (`persist`, fork/publish/peeler paths). The generic `state_update` helper emits without
   group attribution only when the existing message record cannot be read; otherwise it uses that record's `group_id`.
-- Re-persisting a message with the same `group_id`, `epoch`, and `MessageState` does not emit another
-  `message_state_changed` row; this keeps repeated deferred-peel retries from producing duplicate diagnostics.
+- Re-persisting a message in the `MessageState` it already has does not emit another `message_state_changed` row, even
+  when the row is rewritten under a new `epoch` or payload. A deferred-peel retry that still cannot peel restamps its
+  row at the current epoch on every epoch advance; without this rule each retained row would log a
+  `peel_deferred -> peel_deferred` row per advance.
 - The reasons above are the `MessageDisposition` tags in `crates/cgka-engine/src/message_disposition.rs` plus the
   literal call-site reasons. v5 keeps each one verbatim on `reason` (here and on `rejection`); the engine test
   `every_disposition_tag_survives_v5_recording` fails if a new tag is missing from the v5 allowlist. v5 rows written

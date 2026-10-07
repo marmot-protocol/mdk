@@ -6,6 +6,7 @@ use crate::macros::{c_enum, c_mirror};
 use crate::memory::{CFree, free_c_string, owned_c_string};
 use marmot_uniffi::conversions::*;
 use std::ffi::c_char;
+use std::sync::Arc;
 
 c_enum! { MarmotPresentationSource from PresentationSourceFfi { Group, PeerProfile, PeerFallback, GroupFallback, UnknownFallback, } }
 c_enum! { MarmotPresentationResolution from PresentationResolutionFfi { Cached, LastKnown, Fallback, } }
@@ -157,7 +158,20 @@ c_mirror! { MarmotChatListRowActions from ChatListRowActionsFfi {
     copy can_start_leave: bool,
     copy can_delete_local: bool,
 } }
+/// Read-only marker owned by its presented row. Borrow only while the row is live.
+pub struct MarmotChatListDraftVersion {
+    pub(crate) inner: Arc<ChatListDraftVersionFfi>,
+}
+impl From<Arc<ChatListDraftVersionFfi>> for MarmotChatListDraftVersion {
+    fn from(inner: Arc<ChatListDraftVersionFfi>) -> Self {
+        Self { inner }
+    }
+}
+impl CFree for MarmotChatListDraftVersion {
+    unsafe fn free_in_place(&mut self) {}
+}
 c_mirror! { MarmotPresentedChatRow from PresentedChatRowFfi, free marmot_presented_chat_row_free {
+    opt_rec draft_version: MarmotChatListDraftVersion,
     rec preview: MarmotSelectedChatPreview,
     rec actions: MarmotChatListRowActions,
     rec row: MarmotChatListRow,
@@ -234,6 +248,7 @@ mod tests {
                 sequence: 3,
                 snapshot: PresentedChatListSnapshotFfi {
                     rows: vec![PresentedChatRowFfi {
+                        draft_version: None,
                         preview: SelectedChatPreviewFfi::Draft {
                             draft: ChatListDraftPreviewFfi {
                                 text: "draft".into(),
@@ -266,6 +281,7 @@ mod tests {
             let mirror: MarmotPresentedChatListUpdate = update.into();
             assert_eq!(mirror.sequence, 3);
             assert_eq!(mirror.snapshot.rows_len, 1);
+            assert!(unsafe { (*mirror.snapshot.rows).draft_version.is_null() });
             assert_eq!(
                 mirror.snapshot.presentation_version.account_store_epoch_len,
                 16
