@@ -6,6 +6,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{SqliteAccountStorage, SqliteResultExt, bool_i64, u64_to_i64, usize_to_i64};
 
+/// Historical exact-hash rows retained per pack, including the current version.
+/// Older hashes beyond this stop being recorded. Current-pack rows are never
+/// dropped by the cap.
+const MAX_STICKER_ASSET_HISTORY_ROWS: i64 = 400;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredSticker {
     pub shortcode: String,
@@ -69,9 +74,10 @@ impl SqliteAccountStorage {
             // Immutable message refs are (coordinate, shortcode, hash). Record
             // them even when this event loses NIP-01 replacement, so an older
             // version that arrives after the current pack can still render.
-            insert_sticker_assets_tx(&conn, pack)?;
             let existing = sticker_pack_version_tx(&conn, &pack.coordinate)?;
-            if !replacement_wins(existing.as_ref(), &pack.version) {
+            let wins = replacement_wins(existing.as_ref(), &pack.version);
+            insert_sticker_assets_tx(&conn, pack, wins)?;
+            if !wins {
                 return Ok(false);
             }
             let cover_json = pack
@@ -459,7 +465,11 @@ impl SqliteAccountStorage {
     }
 }
 
-fn insert_sticker_assets_tx(conn: &Connection, pack: &StoredStickerPack) -> StorageResult<()> {
+fn insert_sticker_assets_tx(
+    conn: &Connection,
+    pack: &StoredStickerPack,
+    pack_wins_replacement: bool,
+) -> StorageResult<()> {
     // Historical assets must not become the current pack version. A losing
     // event still needs a parent row for the foreign key, so create one only
     // when absent and leave an existing version untouched.
@@ -482,6 +492,21 @@ fn insert_sticker_assets_tx(conn: &Connection, pack: &StoredStickerPack) -> Stor
         assets.push(cover.clone());
     }
     for sticker in assets {
+        // History is exact-hash lookup, not an unbounded archive. Always record
+        // the incoming pack's own assets. Refuse only an older hash once this
+        // pack already holds the cap, so a losing event cannot grow the table.
+        if !pack_wins_replacement {
+            let historical = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM app_sticker_assets WHERE pack_coordinate = ?1",
+                    params![&pack.coordinate],
+                    |row| row.get::<_, i64>(0),
+                )
+                .storage()?;
+            if historical >= MAX_STICKER_ASSET_HISTORY_ROWS {
+                continue;
+            }
+        }
         conn.execute(
             "INSERT INTO app_sticker_assets (
                 pack_coordinate, shortcode, url, sha256, mime, width,
@@ -522,7 +547,7 @@ fn protected_sticker_coordinates_tx(conn: &Connection) -> StorageResult<HashSet<
     let mut referenced = conn
         .prepare(
             r#"SELECT tags_json FROM message_timeline
-             WHERE kind = 9 AND tags_json LIKE '%"sticker"%'"#,
+             WHERE kind = 9 AND deleted = 0 AND tags_json LIKE '%"sticker"%'"#,
         )
         .storage()?;
     for tags_json in referenced
@@ -907,6 +932,45 @@ mod tests {
         assert!(
             store
                 .sticker_for_ref(&first.coordinate, "wave", &hash_b)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn losing_pack_versions_cannot_grow_asset_history_without_a_bound() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let current = pack(&"ff".repeat(32), 1_000, &"aa".repeat(32));
+        assert!(store.replace_sticker_pack_if_newer(&current).unwrap());
+        for index in 0..MAX_STICKER_ASSET_HISTORY_ROWS + 5 {
+            let older = pack(
+                &format!("{index:064x}"),
+                10,
+                &format!("{:064x}", index + 1),
+            );
+            assert!(!store.replace_sticker_pack_if_newer(&older).unwrap());
+        }
+        let mut retained = 0;
+        for index in 0..MAX_STICKER_ASSET_HISTORY_ROWS + 5 {
+            if store
+                .sticker_for_ref(
+                    &current.coordinate,
+                    "wave",
+                    &format!("{:064x}", index + 1),
+                )
+                .unwrap()
+                .is_some()
+            {
+                retained += 1;
+            }
+        }
+        assert!(
+            retained <= MAX_STICKER_ASSET_HISTORY_ROWS,
+            "losing versions retained {retained} historical assets"
+        );
+        assert!(
+            store
+                .sticker_for_ref(&current.coordinate, "wave", &"aa".repeat(32))
                 .unwrap()
                 .is_some()
         );
