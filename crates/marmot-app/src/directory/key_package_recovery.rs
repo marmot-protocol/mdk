@@ -104,13 +104,7 @@ impl MarmotApp {
                 Err(_) => package_coverage = false,
             }
         }
-        let routes = searched
-            .iter()
-            .chain(&supplementary)
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
+        let routes = distinct_recovery_routes(searched.iter().chain(&supplementary));
         let mut deletions = Vec::new();
         for round in 0..=RECOVERY_CANDIDATE_LIMIT {
             // Preserve every newest slot as a barrier, including malformed,
@@ -214,6 +208,36 @@ impl MarmotApp {
             });
         }
         Err(recovery_incomplete())
+    }
+}
+
+fn distinct_recovery_routes<'a>(
+    endpoints: impl IntoIterator<Item = &'a TransportEndpoint>,
+) -> Vec<TransportEndpoint> {
+    let mut seen = BTreeSet::new();
+    endpoints
+        .into_iter()
+        .filter(|endpoint| RelayUrl::parse(endpoint.as_str()).is_ok_and(|relay| seen.insert(relay)))
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invite_recovery_deletion_routes_deduplicate_optional_root_slashes() {
+        let routes = [
+            TransportEndpoint("wss://outbox.example".into()),
+            TransportEndpoint("wss://outbox.example/".into()),
+            TransportEndpoint("wss://directory.example/".into()),
+            TransportEndpoint("wss://directory.example".into()),
+        ];
+        assert_eq!(
+            distinct_recovery_routes(&routes),
+            vec![routes[0].clone(), routes[2].clone()]
+        );
     }
 }
 

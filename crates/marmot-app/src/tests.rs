@@ -7785,8 +7785,17 @@ async fn member_key_package_skips_local_legacy_cache() {
     let directory = tempfile::tempdir().unwrap();
     let home = AccountHome::open(directory.path());
     let account = home.create_account("alice").unwrap();
-    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
-        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let mut app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    // A records-only mock reports unknown completion. Model an explicitly
+    // completed empty lookup so this test checks missing remote evidence.
+    app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+        None,
+        relay,
+        Arc::new(MemberResolutionDirectoryFetcher::default()),
+        false,
+    );
     let legacy = fresh_key_package_for_account(&app, &account, true).await;
     write_json(
         app.key_package_record_path(&account.label),
@@ -7805,10 +7814,10 @@ async fn member_key_package_skips_local_legacy_cache() {
     let result = app.member_key_package(&account.label).await;
     assert!(
         matches!(
-            result,
+            &result,
             Err(AppError::MissingKeyPackage(_) | AppError::MissingRelayLists(_))
         ),
-        "legacy local cache must not be selected for invites; fallback must fail closed"
+        "legacy local cache must not be selected for invites; got {result:?}"
     );
 }
 
