@@ -73,11 +73,58 @@ c_mirror! {
     }
 }
 
-c_mirror! {
-    /// A published imported pack and the Signal sticker ids that were skipped.
-    MarmotStickerImportResult from StickerImportResultFfi,
-    free marmot_sticker_import_result_free {
-        rec pack: MarmotStickerPack,
-        str_vec skipped_signal_sticker_ids/skipped_signal_sticker_ids_len,
+#[repr(C)]
+pub struct MarmotStickerImportResult {
+    pub pack: MarmotStickerPack,
+    pub skipped_signal_sticker_ids: *mut *mut std::ffi::c_char,
+    pub skipped_signal_sticker_ids_len: usize,
+}
+
+impl From<StickerImportResultFfi> for MarmotStickerImportResult {
+    fn from(value: StickerImportResultFfi) -> Self {
+        let mut ids = value
+            .skipped_signal_sticker_ids
+            .into_iter()
+            .map(|id| crate::memory::owned_c_string(id.to_string()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let skipped_signal_sticker_ids_len = ids.len();
+        let skipped_signal_sticker_ids = ids.as_mut_ptr();
+        std::mem::forget(ids);
+        Self {
+            pack: value.pack.into(),
+            skipped_signal_sticker_ids,
+            skipped_signal_sticker_ids_len,
+        }
     }
+}
+
+impl crate::memory::CFree for MarmotStickerImportResult {
+    unsafe fn free_in_place(&mut self) {
+        unsafe { self.pack.free_in_place() };
+        if !self.skipped_signal_sticker_ids.is_null() {
+            let ids = unsafe {
+                Vec::from_raw_parts(
+                    self.skipped_signal_sticker_ids,
+                    self.skipped_signal_sticker_ids_len,
+                    self.skipped_signal_sticker_ids_len,
+                )
+            };
+            for id in ids {
+                unsafe { crate::memory::free_c_string(id) };
+            }
+        }
+        self.skipped_signal_sticker_ids = std::ptr::null_mut();
+        self.skipped_signal_sticker_ids_len = 0;
+    }
+}
+
+/// Free a sticker import result returned by this library.
+///
+/// # Safety
+/// `value` must be NULL or a pointer returned by a Marmot sticker import call,
+/// and it must not have been freed already.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_sticker_import_result_free(value: *mut MarmotStickerImportResult) {
+    unsafe { crate::memory::free_boxed(value) };
 }

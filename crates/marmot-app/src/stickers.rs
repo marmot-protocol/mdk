@@ -1517,22 +1517,22 @@ fn inspect_webp(bytes: &[u8]) -> Result<InspectedImage, AppError> {
         return Err(invalid_sticker("invalid WebP sticker"));
     }
     let riff_len = le_u32(bytes, 4)? as usize;
-    if riff_len
+    let riff_end = riff_len
         .checked_add(8)
-        .is_none_or(|length| length > bytes.len())
-    {
-        return Err(invalid_sticker("truncated WebP sticker"));
+        .ok_or_else(|| invalid_sticker("invalid WebP size"))?;
+    if riff_end != bytes.len() {
+        return Err(invalid_sticker("WebP RIFF size does not match input"));
     }
     let mut offset = 12_usize;
     let mut dimensions = None;
     let mut frames = 0_u32;
-    while offset.checked_add(8).is_some_and(|end| end <= bytes.len()) {
+    while offset.checked_add(8).is_some_and(|end| end <= riff_end) {
         let kind = &bytes[offset..offset + 4];
         let length = le_u32(bytes, offset + 4)? as usize;
         let data = offset + 8;
         let end = data
             .checked_add(length)
-            .filter(|end| *end <= bytes.len())
+            .filter(|end| *end <= riff_end)
             .ok_or_else(|| invalid_sticker("invalid WebP chunk length"))?;
         match kind {
             b"VP8X" if length >= 10 => {
@@ -2010,6 +2010,9 @@ mod tests {
         assert!(inspect_image(&webp_with_frame(32, 32, 0, 0, 0, 32)).is_err());
         assert!(inspect_image(&webp_with_frame(32, 32, 0, 0, 33, 32)).is_err());
         assert!(inspect_image(&webp_with_frame(32, 32, 18, 0, 16, 16)).is_err());
+        let mut trailing = webp_with_frame(32, 32, 0, 0, 16, 16);
+        trailing.extend_from_slice(b"VP8L   /     ");
+        assert!(inspect_image(&trailing).is_err());
         assert!(inspect_image(b"not an image").is_err());
     }
 
