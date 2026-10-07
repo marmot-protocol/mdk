@@ -7874,10 +7874,6 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
     )
     .await;
     let seeded = app.account_relay_list_status(&account.label).unwrap();
-    // Both list kinds are second-resolution replaceable events. The additions
-    // must be newer than these seeds, just as the removal below must be newer
-    // than the additions; a same-second read may select the unedited list.
-    sleep(Duration::from_millis(1_100)).await;
 
     // Give both seeded replaceable kinds an older timestamp than their first
     // edit. Same-second event-id ordering could otherwise keep the seed on
