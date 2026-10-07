@@ -153,8 +153,10 @@ impl TransportPeeler for MockPeeler {
         payload: &EncryptedPayload,
         recipient: &MemberId,
     ) -> Result<TransportMessage, PeelerError> {
+        let mut id_material = payload.ciphertext.clone();
+        id_material.extend_from_slice(recipient.as_slice());
         Ok(TransportMessage {
-            id: hash_id(&payload.ciphertext),
+            id: hash_id(&id_material),
             payload: payload.ciphertext.clone(),
             timestamp: Timestamp(0),
             causal_deps: vec![],
@@ -349,6 +351,7 @@ async fn send_gate_filters_stored_rows() {
         lifecycle_fault: ProcessedFault::default(),
         disband_request_fault: ProcessedFault::default(),
         queued_intent_list_fault: ProcessedFault::default(),
+        confirmation_fault: ConfirmationFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(b"alice"))
@@ -1060,6 +1063,17 @@ async fn welcome_wrapped_pre_merge_lands_recipient_at_post_stage_epoch() {
 #[derive(Clone, Default)]
 struct ProcessedFault(Arc<AtomicUsize>);
 
+/// Fail anchor persistence or the first membership read after that anchor,
+/// specifically at the newly merged epoch rather than its source snapshot.
+#[derive(Clone, Default)]
+struct ConfirmationFault {
+    epoch: Arc<AtomicUsize>,
+    anchor: ProcessedFault,
+    membership: ProcessedFault,
+    after_anchor: Arc<AtomicUsize>,
+    replay: ProcessedFault,
+}
+
 impl ProcessedFault {
     fn arm(&self, times: usize) {
         self.0.store(times, Ordering::SeqCst);
@@ -1084,6 +1098,7 @@ struct FaultStorage {
     lifecycle_fault: ProcessedFault,
     disband_request_fault: ProcessedFault,
     queued_intent_list_fault: ProcessedFault,
+    confirmation_fault: ConfirmationFault,
 }
 
 impl GroupStorage for FaultStorage {
@@ -1091,6 +1106,11 @@ impl GroupStorage for FaultStorage {
         self.inner.put_group(group)
     }
     fn get_group(&self, id: &GroupId) -> StorageResult<Group> {
+        if self.confirmation_fault.after_anchor.load(Ordering::SeqCst) != 0
+            && self.confirmation_fault.membership.should_fail()
+        {
+            return Err(StorageError::Busy("injected late membership read".into()));
+        }
         self.inner.get_group(id)
     }
     fn delete_group(&self, id: &GroupId) -> StorageResult<()> {
@@ -1147,6 +1167,18 @@ impl MessageStorage for FaultStorage {
         states: &[MessageState],
         at_or_after_epoch: EpochId,
     ) -> StorageResult<Vec<MessageRecord>> {
+        if states
+            == [
+                MessageState::Created,
+                MessageState::Retryable,
+                MessageState::PeelDeferred,
+            ]
+            && self.confirmation_fault.replay.should_fail()
+        {
+            return Err(StorageError::Busy(
+                "injected post-confirm replay read".into(),
+            ));
+        }
         let records = self
             .inner
             .list_messages_in_states(group_id, states, at_or_after_epoch)?;
@@ -1194,6 +1226,24 @@ impl MessageStorage for FaultStorage {
     }
     fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
         self.inner.create_group_snapshot(group_id, name)
+    }
+    fn create_group_state_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
+        let targeted = name
+            .strip_prefix("openmls-retained-anchor-")
+            .and_then(|epoch| epoch.parse::<usize>().ok())
+            == Some(self.confirmation_fault.epoch.load(Ordering::SeqCst));
+        if targeted && self.confirmation_fault.anchor.should_fail() {
+            return Err(StorageError::Busy(
+                "injected post-merge anchor write".into(),
+            ));
+        }
+        self.inner.create_group_state_snapshot(group_id, name)?;
+        if targeted {
+            self.confirmation_fault
+                .after_anchor
+                .store(1, Ordering::SeqCst);
+        }
+        Ok(())
     }
     fn list_group_snapshots(&self, group_id: &GroupId) -> StorageResult<Vec<String>> {
         self.inner.list_group_snapshots(group_id)
@@ -1648,6 +1698,7 @@ fn build_fault_engine(
         lifecycle_fault: ProcessedFault::default(),
         disband_request_fault: ProcessedFault::default(),
         queued_intent_list_fault: ProcessedFault::default(),
+        confirmation_fault: ConfirmationFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(id))
@@ -1671,6 +1722,7 @@ async fn disband_publish_failure_reconciliation_is_atomic_and_retryable() {
         lifecycle_fault: ProcessedFault::default(),
         disband_request_fault: disband_request_fault.clone(),
         queued_intent_list_fault: ProcessedFault::default(),
+        confirmation_fault: ConfirmationFault::default(),
     })
     .identity(pad32(b"alice-disband-rollback"))
     .account_identity_proof_signer(proof_signer(b"alice-disband-rollback"))
@@ -1760,6 +1812,7 @@ fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
         lifecycle_fault: lifecycle_fault.clone(),
         disband_request_fault: ProcessedFault::default(),
         queued_intent_list_fault: ProcessedFault::default(),
+        confirmation_fault: ConfirmationFault::default(),
     })
     .identity(pad32(b"alice-maintenance"))
     .account_identity_proof_signer(proof_signer(b"alice-maintenance"))
@@ -1918,6 +1971,327 @@ async fn confirm_published_recovers_from_transient_lock_on_processed_write() {
     // The slot is now genuinely consumed: a further confirm is UnknownPending.
     let third = alice.confirm_published(inv_pending).await;
     assert!(matches!(third, Err(EngineError::UnknownPending)));
+}
+
+/// A failure after the MLS merge must preserve its source tree, pending slot,
+/// activity and native leaf delta until the same confirmation succeeds.
+#[tokio::test]
+async fn confirmation_anchor_and_membership_failures_preserve_author_effects() {
+    use cgka_traits::engine::{GroupEvent, GroupStateChange};
+    use cgka_traits::group::ProtocolProfile;
+
+    for fail_anchor in [true, false] {
+        for remove_member in [false, true] {
+            let storage = SqliteAccountStorage::in_memory().unwrap();
+            let fault = ConfirmationFault::default();
+            let mut alice = EngineBuilder::new(FaultStorage {
+                inner: storage.clone(),
+                message_rows: Arc::default(),
+                fault: ProcessedFault::default(),
+                lifecycle_fault: ProcessedFault::default(),
+                disband_request_fault: ProcessedFault::default(),
+                queued_intent_list_fault: ProcessedFault::default(),
+                confirmation_fault: fault.clone(),
+            })
+            .identity(pad32(b"confirmation-alice"))
+            .account_identity_proof_signer(proof_signer(b"confirmation-alice"))
+            .protocol_profile(ProtocolProfile::Current)
+            .peeler(Box::new(MockPeeler))
+            .build()
+            .unwrap();
+            let peer = |seed: &[u8]| {
+                EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+                    .identity(pad32(seed))
+                    .account_identity_proof_signer(proof_signer(seed))
+                    .protocol_profile(ProtocolProfile::Current)
+                    .peeler(Box::new(MockPeeler))
+                    .build()
+                    .unwrap()
+            };
+            let mut bob = peer(b"confirmation-bob");
+            let mut carol = peer(b"confirmation-carol");
+            let (group_id, created) = alice
+                .create_group(CreateGroupRequest {
+                    name: "source profile".into(),
+                    description: String::new(),
+                    members: vec![
+                        bob.fresh_key_package().await.unwrap(),
+                        carol.fresh_key_package().await.unwrap(),
+                    ],
+                    required_features: vec![],
+                    app_components: vec![],
+                    initial_admins: vec![],
+                })
+                .await
+                .unwrap();
+            let SendResult::FoundingGroupCreated { welcomes } = created else {
+                panic!("current-profile founding creation");
+            };
+            carol
+                .join_welcome(
+                    welcomes
+                        .into_iter()
+                        .find(|welcome| matches!(
+                            &welcome.envelope,
+                            TransportEnvelope::Welcome { recipient } if recipient == &carol.self_id()
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            alice.drain_events();
+            carol.drain_events();
+            let before_membership = alice.canonical_group_membership(&group_id).unwrap();
+            let intent = if remove_member {
+                SendIntent::RemoveMembers {
+                    group_id: group_id.clone(),
+                    members: vec![bob.self_id()],
+                }
+            } else {
+                SendIntent::UpdateGroupData {
+                    group_id: group_id.clone(),
+                    name: Some("confirmed profile".into()),
+                    description: None,
+                }
+            };
+            let SendResult::GroupEvolution {
+                mut msg, pending, ..
+            } = alice.send(intent).await.unwrap()
+            else {
+                panic!("one pending evolution");
+            };
+            alice.drain_events();
+            let before = storage.get_group(&group_id).unwrap();
+            fault.epoch.store(2, Ordering::SeqCst);
+            fault.after_anchor.store(0, Ordering::SeqCst);
+            if fail_anchor {
+                fault.anchor.arm(1);
+            } else {
+                fault.membership.arm(1);
+            }
+            let error = alice.confirm_published(pending).await.unwrap_err();
+            assert!(
+                error.is_transient(),
+                "storage faults retain their retry classification"
+            );
+            assert!(format!("{error:?}").contains(if fail_anchor {
+                "injected post-merge anchor write"
+            } else {
+                "injected late membership read"
+            }));
+            let rolled_back = storage.get_group(&group_id).unwrap();
+            assert_eq!(rolled_back.epoch, before.epoch);
+            assert_eq!(rolled_back.name, before.name);
+            assert_eq!(rolled_back.members, before.members);
+            assert_eq!(
+                alice
+                    .canonical_group_membership(&group_id)
+                    .unwrap()
+                    .member_leaves,
+                before_membership.member_leaves,
+                "the authoritative MLS tree rolled back with the group record"
+            );
+            assert_eq!(
+                storage.get_message(&msg.id).unwrap().state,
+                MessageState::Sent
+            );
+            assert!(
+                alice.drain_events().is_empty(),
+                "failed confirmation emitted activity"
+            );
+            assert!(
+                !retained_anchor_snapshot_names(&storage, &group_id)
+                    .contains(&"openmls-retained-anchor-2".to_owned())
+            );
+
+            alice.confirm_published(pending).await.unwrap();
+            let author_events = alice.drain_events();
+            let activity = |events: &[GroupEvent]| {
+                events.iter().filter_map(|event| match event {
+                    GroupEvent::GroupStateChanged { group_id, epoch, actor, change, .. } => {
+                        assert_eq!(*epoch, EpochId(2));
+                        assert_eq!(actor.as_ref(), Some(&alice.self_id()));
+                        assert!(matches!(change,
+                            GroupStateChange::MemberRemoved { .. } if remove_member)
+                            || matches!(change, GroupStateChange::GroupRenamed { .. } if !remove_member));
+                        Some(cgka_traits::app_event::group_system_event_material(
+                            group_id, epoch.0, actor.as_ref(), change,
+                        ).unwrap().message_id_hex)
+                    }
+                    _ => None,
+                }).collect::<Vec<_>>()
+            };
+            let author_activity = activity(&author_events);
+            assert_eq!(
+                author_activity.len(),
+                1,
+                "exactly one authored state change"
+            );
+            let removed = author_events
+                .iter()
+                .filter_map(|event| match event {
+                    GroupEvent::GroupMemberLeavesRemoved {
+                        epoch,
+                        leaves,
+                        departed_members,
+                        ..
+                    } => {
+                        assert_eq!(*epoch, EpochId(2));
+                        assert_eq!(leaves.len(), 1);
+                        assert_eq!(leaves[0].member, bob.self_id());
+                        assert_eq!(departed_members, &vec![bob.self_id()]);
+                        Some(())
+                    }
+                    _ => None,
+                })
+                .count();
+            assert_eq!(removed, usize::from(remove_member));
+            msg.envelope = TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            };
+            carol
+                .buffer_openmls_convergence_message_at(&group_id, msg, 1_000)
+                .unwrap();
+            carol
+                .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+                .unwrap();
+            assert_eq!(activity(&carol.drain_events()), author_activity);
+            assert!(matches!(
+                alice.confirm_published(pending).await,
+                Err(EngineError::UnknownPending)
+            ));
+            assert!(
+                alice.drain_events().is_empty(),
+                "confirmation emitted twice"
+            );
+        }
+    }
+}
+
+/// Replay is ancillary to an already durable confirmation. Its transient read
+/// failure must arm normal scheduling instead of orphaning the consumed slot.
+#[tokio::test]
+async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance() {
+    use cgka_traits::engine::{GroupEvent, GroupStateChange};
+
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let fault = ConfirmationFault::default();
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let mut alice = EngineBuilder::new(FaultStorage {
+        inner: storage.clone(),
+        message_rows: Arc::default(),
+        fault: ProcessedFault::default(),
+        lifecycle_fault: ProcessedFault::default(),
+        disband_request_fault: ProcessedFault::default(),
+        queued_intent_list_fault: ProcessedFault::default(),
+        confirmation_fault: fault.clone(),
+    })
+    .legacy_compatibility_profile()
+    .identity(pad32(b"replay-alice"))
+    .account_identity_proof_signer(proof_signer(b"replay-alice"))
+    .feature_registry(registry_with_reactions())
+    .peeler(Box::new(MockPeeler))
+    .convergence_clock(Arc::new(clock.clone()))
+    .build()
+    .unwrap();
+    let mut bob = build(b"replay-bob");
+    let group_id = group_with_bob(&mut alice, &mut bob).await;
+    alice.drain_events();
+    let SendResult::GroupEvolution { pending, .. } = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("confirmed despite replay failure".into()),
+            description: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("rename stages a commit");
+    };
+    let SendResult::ApplicationMessage { mut msg, .. } = bob
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&bob, "retained across confirmation"),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("peer application message");
+    };
+    msg.envelope = TransportEnvelope::GroupMessage {
+        transport_group_id: group_id.as_slice().to_vec(),
+    };
+    assert!(matches!(
+        alice.ingest(msg.clone()).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    alice.drain_events();
+    fault.replay.arm(2);
+    alice
+        .confirm_published(pending)
+        .await
+        .expect("durable confirmation succeeds");
+    let author_events = alice.drain_events();
+    assert_eq!(
+        author_events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                GroupEvent::GroupStateChanged {
+                    change: GroupStateChange::GroupRenamed { .. },
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert!(alice.drain_pending_convergence_groups().contains(&group_id));
+    assert_ne!(
+        storage.get_message(&msg.id).unwrap().state,
+        MessageState::Processed
+    );
+    let retry_error = alice.advance_convergence(&group_id).await.unwrap_err();
+    assert!(retry_error.is_transient());
+    assert!(alice.drain_pending_convergence_groups().contains(&group_id));
+    assert_ne!(
+        storage.get_message(&msg.id).unwrap().state,
+        MessageState::Processed
+    );
+    assert!(alice.drain_events().is_empty());
+    let mut replay_events = Vec::new();
+    for _ in 0..4 {
+        alice.advance_convergence(&group_id).await.unwrap();
+        replay_events.extend(alice.drain_events());
+        if storage.get_message(&msg.id).unwrap().state == MessageState::Processed {
+            break;
+        }
+        clock.advance_ms(1_000);
+    }
+    assert_eq!(
+        storage.get_message(&msg.id).unwrap().state,
+        MessageState::Processed
+    );
+    assert_eq!(
+        replay_events
+            .iter()
+            .filter(|event| matches!(
+                event, GroupEvent::MessageReceived { sender, .. } if sender == &bob.self_id()
+            ))
+            .count(),
+        1
+    );
+    assert!(!replay_events.iter().any(|event| matches!(
+        event,
+        GroupEvent::GroupStateChanged {
+            change: GroupStateChange::GroupRenamed { .. },
+            ..
+        }
+    )));
+    assert!(matches!(
+        alice.confirm_published(pending).await,
+        Err(EngineError::UnknownPending)
+    ));
 }
 
 // ── Retained app messages across a temporary non-stable state ────────────────
@@ -2297,6 +2671,7 @@ async fn an_unreadable_intent_queue_still_schedules_the_drain() {
             lifecycle_fault: ProcessedFault::default(),
             disband_request_fault: ProcessedFault::default(),
             queued_intent_list_fault: queued_intent_list_fault.clone(),
+            confirmation_fault: ConfirmationFault::default(),
         })
         .legacy_compatibility_profile()
         .identity(pad32(b"alice"))
@@ -2367,6 +2742,7 @@ async fn an_unreadable_intent_queue_at_pass_close_still_rearms_and_drains() {
         lifecycle_fault: ProcessedFault::default(),
         disband_request_fault: ProcessedFault::default(),
         queued_intent_list_fault: queued_intent_list_fault.clone(),
+        confirmation_fault: ConfirmationFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(b"alice-pass-close"))

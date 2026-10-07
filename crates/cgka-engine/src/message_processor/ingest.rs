@@ -2070,18 +2070,12 @@ impl<S: StorageProvider> Engine<S> {
     /// authenticated evidence of eviction (the local MLS group state records
     /// our removal), never on a bare decrypt failure.
     ///
-    /// Ordering: the notification is enqueued BEFORE the durable marker write,
-    /// so a crash between the two re-runs realization on the next
-    /// `SelfEvicted` input (at worst a duplicate notification, absorbed by the
-    /// app's canonical-row-id upsert) instead of leaving a durable marker that
-    /// suppresses a notification nobody observed. A window this ordering
-    /// cannot close remains: `events_buf` is in-memory, so a process death
-    /// after the marker write but before the caller drains and persists the
-    /// event still loses it. That at-most-once property is shared by every
-    /// `GroupStateChanged` emission in the engine today (the commit-apply seam
-    /// has the same shape for all roster/admin/profile rows); making the event
-    /// channel durable — or reconciling on session open from `Group::removed`
-    /// at the app layer — is a systemic follow-up, not realization-specific.
+    /// Marker, roster, outbound invalidation, deferred-row retirement, and
+    /// leave-intent cleanup commit together. Only then are native events and
+    /// account activity emitted. A storage failure leaves realization retryable
+    /// without leaking a partial notification or releasing capacity early.
+    /// Events remain memory-only; this provides storage-error retryability,
+    /// not durable event delivery across process death.
     pub(crate) fn realize_self_eviction(
         &mut self,
         group_id: &GroupId,
@@ -2122,43 +2116,19 @@ impl<S: StorageProvider> Engine<S> {
         let canonical_members = self.with_mls_group(group_id, |mls_group| {
             Ok(crate::group_lifecycle::marmot_members(mls_group))
         })?;
-        // Losing this device does not imply that its account's sibling leaves
-        // left too. Only an account-wide departure belongs in timeline history.
-        if !canonical_members
+        // Losing this device does not imply its account's sibling leaves left.
+        let account_departed = !canonical_members
             .iter()
-            .any(|active| &active.id == self.identity.self_id())
-        {
+            .any(|active| &active.id == self.identity.self_id());
+        group.members = canonical_members;
+        let prepared = self.storage.with_transaction(|storage| {
+            storage.put_group(&group)?;
+            super::prepare_local_group_termination(storage, group_id)
+        })?;
+        if account_departed {
             self.push_group_state_change(group_id, epoch, actor, change, None);
         }
-        // Marker + roster reconciliation in one durable write: a removed copy
-        // must not keep presenting self as a member, so roster-gated callers
-        // (`members()`, hydrate restore checks, backfill) cannot disagree with
-        // the terminal marker. The seam and convergence paths already write
-        // the post-removal roster; this reconciles the pathological copy whose
-        // roster was never mirrored.
-        group.removed = true;
-        group.members = canonical_members;
-        self.storage.put_group(&group)?;
-        // A removed copy must never publish: drop any outbound intents that
-        // were durably queued before the removal was realized, instead of
-        // leaving them to re-fail through the removed-copy send gate on every
-        // later drain.
-        self.discard_queued_outbound_intents_with_termination(group_id, true)?;
-        // Same for retained inbound work: see
-        // `retire_deferred_peel_rows_for_terminal_group` for why no later
-        // sweep can reach these rows.
-        self.retire_deferred_peel_rows_for_terminal_group(group_id)?;
-        // Deliberately LAST, after the marker write — not before it like the
-        // convergence path (which has no attribution read). The notification
-        // is already enqueued above, so a failure here cannot lose it; it only
-        // leaves a stale leave-request row, which the removed-copy send gate
-        // supersedes and re-join cleans up. Clearing BEFORE the marker write
-        // would be worse: a failed marker write would then retry against
-        // already-cleared leave state and emit a differently-attributed
-        // duplicate (`MemberRemoved` after an original `MemberLeft`), i.e. a
-        // second visible row. With this order any retry duplicate is
-        // byte-identical and collapses in the app's canonical-row-id upsert.
-        self.clear_leave_request_state(group_id)?;
+        self.finish_local_group_termination(group_id, prepared, true);
         Ok(())
     }
 

@@ -359,9 +359,7 @@ impl<S: StorageProvider> Engine<S> {
             group_id,
             policy.convergence.max_rewind_commits,
         )
-        .map_err(|error| {
-            cgka_traits::error::EngineError::Backend(format!("retain anchor: {error}"))
-        })
+        .map_err(cgka_traits::error::EngineError::Storage)
     }
 
     pub(crate) fn convergence_policy_for_group(
@@ -400,7 +398,7 @@ impl<S: StorageProvider> Engine<S> {
             group_id,
             policy.convergence.max_rewind_commits,
         )
-        .map_err(|e| cgka_traits::error::EngineError::Backend(format!("retain anchor: {e}")))
+        .map_err(cgka_traits::error::EngineError::Storage)
     }
 
     #[doc(hidden)]

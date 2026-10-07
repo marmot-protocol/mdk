@@ -46,6 +46,45 @@ use std::sync::Arc;
 use std::time::Duration;
 use web_time::Instant;
 
+/// Committed terminal cleanup awaiting in-memory reconciliation.
+#[must_use = "finish local termination only after its storage transaction commits"]
+pub(crate) struct LocalGroupTermination {
+    queued: Vec<QueuedOutboundIntent>,
+    retired: Vec<DeferredMessageMetadata>,
+    voluntary: bool,
+    disbanded: bool,
+    newly_removed: bool,
+}
+
+/// Persist the entire terminal transition inside the caller's transaction.
+/// No engine events, caches, or capacity counters change before commit.
+pub(crate) fn prepare_local_group_termination<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+) -> Result<LocalGroupTermination, EngineError> {
+    let voluntary = storage.leave_request(group_id)?.is_some();
+    let mut record = storage.get_group(group_id)?;
+    let newly_removed = !record.removed;
+    if record.disbanded.is_none() {
+        record.removed = true;
+        storage.put_group(&record)?;
+    }
+    storage.delete_deferred_peel_generation(group_id)?;
+    let queued = storage.list_queued_outbound_intents(group_id)?;
+    for intent in &queued {
+        storage.delete_queued_outbound_intent(&intent.id)?;
+    }
+    let retired = fail_deferred_peel_rows_in_terminal_group(storage, group_id)?;
+    storage.clear_leave_request(group_id)?;
+    Ok(LocalGroupTermination {
+        queued,
+        retired,
+        voluntary,
+        disbanded: record.disbanded.is_some(),
+        newly_removed,
+    })
+}
+
 pub(crate) const MAX_CONVERGENCE_REPROCESSING_PASSES: usize = 16;
 pub(crate) const SELF_REMOVE_AUTO_COMMIT_JITTER_MIN_MS: u64 = 10;
 pub(crate) const SELF_REMOVE_AUTO_COMMIT_JITTER_SPAN_MS: u64 = 40;
@@ -994,6 +1033,22 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(Vec::new());
         }
 
+        // A completed publication owns its result even if the following raw
+        // inbound replay failed. Retry only those marked groups, after the
+        // terminal/pending gates, before allowing later convergence or sends.
+        if self.pending_confirmation_replays.contains(group_id) {
+            if let Err(error) = self.replay_buffered_messages(group_id).await {
+                self.schedule_pending_convergence_group(group_id);
+                return Err(error);
+            }
+            self.pending_confirmation_replays.remove(group_id);
+            // Replayed input can terminate the copy or stage a new publish.
+            // Recheck before entering later convergence or queued work.
+            if !self.prepare_convergence_input_advance(group_id)? {
+                return Ok(Vec::new());
+            }
+        }
+
         // This entry point belongs to background recovery even when output is
         // queued. Borrowing a send's four-row preflight allowance here makes
         // queued maintenance throttle the worker's entire deferred generation.
@@ -1145,7 +1200,6 @@ impl<S: StorageProvider> Engine<S> {
         // the moment the copy becomes terminal.
         if group.is_some_and(|group| group.is_terminal()) {
             self.discard_queued_outbound_intents_for_removed_group(group_id)?;
-            self.retire_deferred_peel_rows_for_terminal_group(group_id)?;
             return Ok(false);
         }
         if let Some(state) = self.epoch_manager.state(group_id)
@@ -3448,25 +3502,32 @@ impl<S: StorageProvider> Engine<S> {
         group_id: &GroupId,
         announce_transition: bool,
     ) -> Result<usize, EngineError> {
+        let prepared = self
+            .storage
+            .with_transaction(|storage| prepare_local_group_termination(storage, group_id))?;
+        Ok(self.finish_local_group_termination(group_id, prepared, announce_transition))
+    }
+
+    /// Publish terminal effects and reconcile derived state after durable commit.
+    pub(crate) fn finish_local_group_termination(
+        &mut self,
+        group_id: &GroupId,
+        prepared: LocalGroupTermination,
+        announce_transition: bool,
+    ) -> usize {
+        let LocalGroupTermination {
+            queued,
+            retired,
+            voluntary,
+            disbanded,
+            newly_removed,
+        } = prepared;
         self.drop_self_remove_auto_commit_schedules_for_group(group_id);
         self.invalidate_deferred_peel_candidate_cache(group_id);
-        let voluntary = self.load_leave_request_state(group_id)?.is_some();
-        let (queued, disbanded, newly_removed) =
-            self.storage
-                .with_transaction(|storage| -> Result<_, EngineError> {
-                    let mut record = storage.get_group(group_id)?;
-                    let newly_removed = !record.removed;
-                    if record.disbanded.is_none() {
-                        record.removed = true;
-                        storage.put_group(&record)?;
-                    }
-                    storage.delete_deferred_peel_generation(group_id)?;
-                    let queued = storage.list_queued_outbound_intents(group_id)?;
-                    for intent in &queued {
-                        storage.delete_queued_outbound_intent(&intent.id)?;
-                    }
-                    Ok((queued, record.disbanded.is_some(), newly_removed))
-                })?;
+        self.leave_requests.remove(group_id);
+        self.leaving_groups.remove(group_id);
+        self.pending_confirmation_replays.remove(group_id);
+        self.release_retired_deferred_peel_rows(&retired);
         if !disbanded && (announce_transition || newly_removed || !queued.is_empty()) {
             self.events_buf
                 .push_back(cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated {
@@ -3475,7 +3536,7 @@ impl<S: StorageProvider> Engine<S> {
                 });
         }
         if queued.is_empty() {
-            return Ok(0);
+            return 0;
         }
         for record in &queued {
             self.audit_group(
@@ -3494,7 +3555,7 @@ impl<S: StorageProvider> Engine<S> {
             discarded = queued.len(),
             "discarded queued outbound intents for a removed group copy"
         );
-        Ok(queued.len())
+        queued.len()
     }
 
     pub(crate) fn queue_outbound_intent(

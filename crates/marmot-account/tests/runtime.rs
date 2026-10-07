@@ -2595,6 +2595,116 @@ fn obligation_phase(
         .phase
 }
 
+/// Lifecycle announcements describe intermediate states; maintenance follows the
+/// final canonical local leaf, including a restoration without an epoch event.
+#[tokio::test]
+async fn maintenance_reconciles_restored_copy_from_final_canonical_membership() {
+    for terminated_first in [true, false] {
+        for leaf_rotated in [false, true] {
+            let (_dir, mut runtime, group_id, _) =
+                manual_only_group_runtime(MaintenanceTiming::default()).await;
+            let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
+            let mut obligation = runtime
+                .session()
+                .maintenance_obligation(&obligation_id)
+                .unwrap()
+                .unwrap();
+            if leaf_rotated {
+                // Model an obligation captured before the selected branch's leaf.
+                obligation.own_leaf_baseline_hash = Some(vec![0; 32]);
+                assert_ne!(
+                    obligation.own_leaf_baseline_hash.as_ref().unwrap(),
+                    &runtime.session().own_leaf_hash(&group_id).unwrap()
+                );
+                runtime
+                    .session()
+                    .put_maintenance_obligation(&obligation)
+                    .unwrap();
+            }
+            let mut failed = obligation.clone();
+            failed.id = MessageId::new(vec![0x77; 32]);
+            failed.phase = cgka_traits::MaintenancePhase::Failed;
+            failed.last_failure_code = Some("local_member_removed".into());
+            runtime
+                .session()
+                .put_maintenance_obligation(&failed)
+                .unwrap();
+            let mut enrolled = runtime
+                .session()
+                .group_maintenance(&group_id)
+                .unwrap()
+                .unwrap();
+            enrolled.periodic_enrolled = true;
+            enrolled.next_periodic_rotation_at = Some(Timestamp(200_000));
+            runtime.session().put_group_maintenance(&enrolled).unwrap();
+            assert!(
+                runtime
+                    .session()
+                    .canonical_group_membership(&group_id)
+                    .unwrap()
+                    .local_leaf_active
+            );
+
+            let mut events = Vec::new();
+            if terminated_first {
+                events.push(GroupEvent::LocalGroupCopyTerminated {
+                    group_id: group_id.clone(),
+                    voluntary: false,
+                });
+            }
+            events.push(GroupEvent::LocalGroupCopyRestored {
+                group_id: group_id.clone(),
+            });
+            runtime
+                .publish_session_effects(cgka_session::SessionEffects {
+                    events,
+                    publish: Vec::new(),
+                    queued: Vec::new(),
+                    pending_convergence: Vec::new(),
+                })
+                .await
+                .unwrap();
+
+            let after = runtime
+                .session()
+                .maintenance_obligation(&obligation_id)
+                .unwrap()
+                .unwrap();
+            if leaf_rotated {
+                assert_eq!(after.phase, cgka_traits::MaintenancePhase::Complete);
+                assert_eq!(after.last_failure_code, None);
+            } else {
+                assert_eq!(
+                    after, obligation,
+                    "an unchanged active leaf still owes its rotation"
+                );
+            }
+            let state = runtime
+                .session()
+                .group_maintenance(&group_id)
+                .unwrap()
+                .unwrap();
+            assert!(
+                state.periodic_enrolled,
+                "intermediate termination must not disenroll the restored copy"
+            );
+            assert!(state.next_periodic_rotation_at.is_some());
+            if !leaf_rotated {
+                assert_eq!(state, enrolled);
+            }
+            assert_eq!(
+                runtime
+                    .session()
+                    .maintenance_obligation(&failed.id)
+                    .unwrap()
+                    .unwrap(),
+                failed,
+                "a previously terminal failure must never be revived by restoration"
+            );
+        }
+    }
+}
+
 /// The obligation leg mints its work while the copy is live, and disenrollment
 /// is event-driven only. A removal this device never saw as an event therefore
 /// leaves a non-terminal obligation against a copy whose durable record is

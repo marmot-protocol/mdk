@@ -2874,6 +2874,8 @@ where
         Ok((output, blocked_groups))
     }
 
+    /// Reconcile against the final canonical local leaf after all batch effects,
+    /// since branch selection can restore a copy terminated earlier in the batch.
     fn reconcile_confirmed_own_leaf_rotations(
         &mut self,
         events: &[GroupEvent],
@@ -2882,7 +2884,8 @@ where
             .iter()
             .filter_map(|event| match event {
                 GroupEvent::EpochChanged { group_id, .. }
-                | GroupEvent::LocalGroupCopyTerminated { group_id, .. } => Some(group_id.clone()),
+                | GroupEvent::LocalGroupCopyTerminated { group_id, .. }
+                | GroupEvent::LocalGroupCopyRestored { group_id } => Some(group_id.clone()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -2893,17 +2896,13 @@ where
                 continue;
             }
             unique_changed_groups.push(group_id.clone());
-            let self_id = self.session.self_id();
             // A surviving sibling keeps the account in the roster, but it
             // cannot supply this copy's removed local leaf for rotation.
-            let terminated = events.iter().any(|event| matches!(event, GroupEvent::LocalGroupCopyTerminated { group_id: id, .. } if id == &group_id));
-            let local_member_present = !terminated
-                && !self.session.group_record(&group_id)?.is_terminal()
+            let local_member_present = !self.session.group_record(&group_id)?.is_terminal()
                 && self
                     .session
-                    .members(&group_id)?
-                    .iter()
-                    .any(|member| member.id == self_id);
+                    .canonical_group_membership(&group_id)?
+                    .local_leaf_active;
             if !local_member_present {
                 for mut obligation in self.session.maintenance_obligations_for_group(&group_id)? {
                     if matches!(

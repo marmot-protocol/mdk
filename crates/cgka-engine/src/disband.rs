@@ -517,7 +517,7 @@ impl<S: StorageProvider> Engine<S> {
                 storage.delete_deferred_peel_generation(group_id)?;
                 // The generation barrier is gone and the rows it tracked
                 // must go with it (see
-                // `Engine::retire_deferred_peel_rows_for_terminal_group`).
+                // `crate::message_processor::prepare_local_group_termination`).
                 // Durably retired on this transaction, not after it: the early
                 // return above makes a re-entry after a crash skip this body
                 // forever.
@@ -564,6 +564,7 @@ impl<S: StorageProvider> Engine<S> {
             .delete_transport_group_routes_for_group(group_id);
         self.route_backfill_pending.remove(group_id);
         self.pending_convergence_groups.remove(group_id);
+        self.pending_confirmation_replays.remove(group_id);
         self.invalidate_deferred_peel_candidate_cache(group_id);
         self.engine_metrics.forget_group(group_id);
         self.leaving_groups.remove(group_id);

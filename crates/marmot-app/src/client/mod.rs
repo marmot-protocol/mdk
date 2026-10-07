@@ -2967,6 +2967,8 @@ impl AppClient {
         self.pending_recovery_capacity_writes.remove(group_id);
         self.encrypted_media_not_required_epochs.remove(&group_hex);
         self.pending_convergence_groups.remove(group_id);
+        self.forget_pending_effect_projections(group_id);
+        self.pending_push_leaf_reconciliations.remove(group_id);
         for summary in [
             &mut self.pending_applied_sync_summary,
             &mut self.pending_failed_sync_summary,

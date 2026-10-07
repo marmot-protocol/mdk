@@ -8,6 +8,14 @@ use cgka_traits::{
 };
 use openmls::prelude::{BasicCredential, MlsGroup};
 
+/// Durable membership work prepared inside its caller's transaction. Native
+/// notifications and derived engine bookkeeping are released only after commit.
+pub(crate) struct CanonicalMembershipEffects {
+    events: Vec<GroupEvent>,
+    termination: Option<crate::message_processor::LocalGroupTermination>,
+    announce_termination: bool,
+}
+
 /// Retain leaf keys privately so reuse of an index by the same account is a real transition.
 /// Keys never leave the engine or enter diagnostics.
 pub(crate) struct MembershipSnapshot {
@@ -39,6 +47,40 @@ impl MembershipSnapshot {
             record_removed,
         }
     }
+    /// Derive a leaf notification from immutable trees; this performs no writes.
+    fn departed_leaf_event(
+        &self,
+        after: &Self,
+        group_id: &GroupId,
+        epoch: cgka_traits::EpochId,
+    ) -> Option<GroupEvent> {
+        let leaves: Vec<_> = self
+            .leaves
+            .iter()
+            .filter(|leaf| !after.leaves.contains(leaf))
+            .map(|(leaf, _)| leaf.clone())
+            .collect();
+        let mut departed_members = Vec::new();
+        for leaf in &leaves {
+            if !after
+                .leaves
+                .iter()
+                .any(|(active, _)| active.member == leaf.member)
+                && !departed_members.contains(&leaf.member)
+            {
+                departed_members.push(leaf.member.clone());
+            }
+        }
+        if !leaves.is_empty() {
+            return Some(GroupEvent::GroupMemberLeavesRemoved {
+                group_id: group_id.clone(),
+                epoch,
+                leaves,
+                departed_members,
+            });
+        }
+        None
+    }
 }
 
 impl<S: StorageProvider> Engine<S> {
@@ -64,45 +106,19 @@ impl<S: StorageProvider> Engine<S> {
         before: &MembershipSnapshot,
     ) -> Result<(), EngineError> {
         let after = self.canonical_membership_snapshot(group_id)?;
-        let leaves: Vec<_> = before
-            .leaves
-            .iter()
-            .filter(|leaf| !after.leaves.contains(leaf))
-            .map(|(leaf, _)| leaf.clone())
-            .collect();
-        let mut departed_members = Vec::new();
-        for leaf in &leaves {
-            if !after
-                .leaves
-                .iter()
-                .any(|(active, _)| active.member == leaf.member)
-                && !departed_members.contains(&leaf.member)
-            {
-                departed_members.push(leaf.member.clone());
-            }
+        let mut record = self.storage.get_group(group_id)?;
+        // These callers already committed canonical MLS apply. Preserve its
+        // leaf fact even if the independent terminal queue cleanup must retry.
+        if let Some(event) = before.departed_leaf_event(&after, group_id, record.epoch) {
+            self.events_buf.push_back(event);
         }
-        if !leaves.is_empty() {
-            self.events_buf
-                .push_back(GroupEvent::GroupMemberLeavesRemoved {
-                    group_id: group_id.clone(),
-                    epoch: self.storage.get_group(group_id)?.epoch,
-                    leaves,
-                    departed_members,
-                });
-        }
-        if !after.local_active {
-            let record = self.storage.get_group(group_id)?;
-            if record.disbanded.is_none() {
+        if record.disbanded.is_none() {
+            if !after.local_active {
                 self.discard_queued_outbound_intents_with_termination(
                     group_id,
                     before.local_active || !before.record_removed,
                 )?;
-                self.retire_deferred_peel_rows_for_terminal_group(group_id)?;
-                self.clear_leave_request_state(group_id)?;
-            }
-        } else if before.record_removed || !before.local_active {
-            let mut record = self.storage.get_group(group_id)?;
-            if record.disbanded.is_none() {
+            } else if before.record_removed || !before.local_active {
                 record.removed = false;
                 self.storage.put_group(&record)?;
                 self.events_buf
@@ -112,6 +128,57 @@ impl<S: StorageProvider> Engine<S> {
             }
         }
         Ok(())
+    }
+
+    /// Prepare all fallible storage work before a merge consumes its pending
+    /// slot. The supplied snapshots describe the actual pre/post-merge trees.
+    pub(crate) fn prepare_canonical_membership_effects_on_storage(
+        &self,
+        storage: &S,
+        group_id: &GroupId,
+        before: &MembershipSnapshot,
+        after: &MembershipSnapshot,
+    ) -> Result<CanonicalMembershipEffects, EngineError> {
+        let mut record = storage.get_group(group_id)?;
+        let mut events = Vec::new();
+        if let Some(event) = before.departed_leaf_event(after, group_id, record.epoch) {
+            events.push(event);
+        }
+        let mut termination = None;
+        if record.disbanded.is_none() {
+            if !after.local_active {
+                termination = Some(crate::message_processor::prepare_local_group_termination(
+                    storage, group_id,
+                )?);
+            } else if before.record_removed || !before.local_active {
+                record.removed = false;
+                storage.put_group(&record)?;
+                events.push(GroupEvent::LocalGroupCopyRestored {
+                    group_id: group_id.clone(),
+                });
+            }
+        }
+        Ok(CanonicalMembershipEffects {
+            events,
+            termination,
+            announce_termination: before.local_active || !before.record_removed,
+        })
+    }
+
+    /// Publish a successfully committed membership plan without reading storage.
+    pub(crate) fn finish_canonical_membership_effects(
+        &mut self,
+        group_id: &GroupId,
+        prepared: CanonicalMembershipEffects,
+    ) {
+        self.events_buf.extend(prepared.events);
+        if let Some(termination) = prepared.termination {
+            self.finish_local_group_termination(
+                group_id,
+                termination,
+                prepared.announce_termination,
+            );
+        }
     }
 }
 

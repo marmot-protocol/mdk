@@ -60,7 +60,17 @@
   A pass ending in disband retains preceding commits' activity before the terminal
   row, without emitting the closing commit's incidental member removals.
   Drained and retried batches retain committed activity even when an unrelated
-  publication fails.
+  publication fails. Publish confirmation commits retained anchors and native
+  membership cleanup before consuming its retry handle, preserving author
+  activity after transient storage failures. Inbound replay failure after confirmed
+  publication retains a session retry without changing the publish result.
+  Eviction realization commits its
+  marker, roster and queued-work cleanup together before emitting events.
+  Forgetting a group removes its queued projection work without blocking other
+  groups. Manual and scheduled retries preserve finalized subscriber updates
+  when later route, retention or checkpoint work fails. Maintenance reconciles
+  the final canonical local leaf when a batch terminates and then restores a copy,
+  without reviving previously failed obligations.
   Rust consumers must handle the three new non-timeline `GroupEvent` variants.
   Existing row IDs and correctly attributed stored rows remain unchanged;
   no account reset or destructive history migration is required.

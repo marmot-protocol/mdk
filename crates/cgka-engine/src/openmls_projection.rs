@@ -2775,6 +2775,7 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
         && own_checkpoint_prefix.realized.is_none()
     {
         retain_current_group_epoch_snapshot(storage, group_id, max_retained_anchor_rewind)
+            .map_err(OpenMlsProjectionError::from)
     } else {
         Ok(())
     };
@@ -3223,12 +3224,8 @@ pub(crate) fn retain_current_group_epoch_snapshot<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
     max_retained_anchor_rewind: u64,
-) -> Result<(), OpenMlsProjectionError> {
-    let epoch = storage
-        .get_group(group_id)
-        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
-        .epoch
-        .0;
+) -> Result<(), StorageError> {
+    let epoch = storage.get_group(group_id)?.epoch.0;
     // State-scoped: this runs on every canonical advance, and the anchor is
     // only ever consumed as an OpenMLS/group-state rewind base. The message
     // ledger is deliberately not captured — the convergence probe works from
@@ -3236,9 +3233,7 @@ pub(crate) fn retain_current_group_epoch_snapshot<S: StorageProvider>(
     // rewind), and the historical apply restores the live message/queue sets
     // over the rollback anyway (`restore_live_message_and_queue_records`).
     // Capturing them would make every applied commit O(retained bytes).
-    storage
-        .create_group_state_snapshot(group_id, &retained_anchor_snapshot_name(epoch))
-        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+    storage.create_group_state_snapshot(group_id, &retained_anchor_snapshot_name(epoch))?;
     prune_retained_anchor_snapshots(storage, group_id, epoch, max_retained_anchor_rewind)?;
     prune_group_state_checkpoints(storage, group_id, epoch, max_retained_anchor_rewind)
 }
@@ -3248,18 +3243,15 @@ fn prune_group_state_checkpoints<S: StorageProvider>(
     group_id: &GroupId,
     retained_epoch: u64,
     max_retained_anchor_rewind: u64,
-) -> Result<(), OpenMlsProjectionError> {
+) -> Result<(), StorageError> {
     let oldest_retained_epoch = oldest_retained_epoch(retained_epoch, max_retained_anchor_rewind);
-    for checkpoint in storage
-        .list_group_state_checkpoints(group_id)
-        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
-    {
+    for checkpoint in storage.list_group_state_checkpoints(group_id)? {
         if checkpoint.resulting_epoch.0 >= oldest_retained_epoch {
             continue;
         }
         match storage.release_group_state_checkpoint(group_id, &checkpoint.id) {
             Ok(()) | Err(StorageError::SnapshotMissing(_)) => {}
-            Err(e) => return Err(OpenMlsProjectionError::Snapshot(format!("{e:?}"))),
+            Err(e) => return Err(e),
         }
     }
     Ok(())
@@ -3270,11 +3262,9 @@ fn prune_retained_anchor_snapshots<S: StorageProvider>(
     group_id: &GroupId,
     retained_epoch: u64,
     max_retained_anchor_rewind: u64,
-) -> Result<(), OpenMlsProjectionError> {
+) -> Result<(), StorageError> {
     let oldest_retained_epoch = oldest_retained_epoch(retained_epoch, max_retained_anchor_rewind);
-    let snapshots = storage
-        .list_group_snapshots(group_id)
-        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
+    let snapshots = storage.list_group_snapshots(group_id)?;
 
     for snapshot in snapshots {
         let Some(epoch) = retained_anchor_epoch_from_snapshot_name(&snapshot) else {
@@ -3285,7 +3275,7 @@ fn prune_retained_anchor_snapshots<S: StorageProvider>(
         }
         match storage.release_group_snapshot(group_id, &snapshot) {
             Ok(()) | Err(StorageError::SnapshotMissing(_)) => {}
-            Err(e) => return Err(OpenMlsProjectionError::Snapshot(format!("{e:?}"))),
+            Err(e) => return Err(e),
         }
     }
 

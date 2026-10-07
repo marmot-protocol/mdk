@@ -199,6 +199,11 @@ pub struct Engine<S: StorageProvider> {
     /// `IngestOutcome::Buffered`.
     pub(crate) pending_convergence_groups: HashSet<GroupId>,
 
+    /// Session-only retries for inbound replay that failed after durable
+    /// publish confirmation. The input rows remain durable; this marker
+    /// avoids scanning every group on ordinary convergence advancement.
+    pub(crate) pending_confirmation_replays: HashSet<GroupId>,
+
     /// Queued intents regenerated into standalone publish work. The session
     /// reads these associations when it builds `PublishWork`, then deletes
     /// the durable intent only after the transport reports acceptance. An
@@ -623,6 +628,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             leaving_groups: HashSet::new(),
             scheduled_self_remove_auto_commits: HashMap::new(),
             pending_convergence_groups: HashSet::new(),
+            pending_confirmation_replays: HashSet::new(),
             queued_intent_by_message: HashMap::new(),
             queued_intent_by_pending: HashMap::new(),
             // Keep the in-memory app-message window aligned with MLS
@@ -3086,6 +3092,7 @@ impl<S: StorageProvider> Engine<S> {
             .retain(|_, group| group != group_id);
         self.route_backfill_pending.remove(group_id);
         self.pending_convergence_groups.remove(group_id);
+        self.pending_confirmation_replays.remove(group_id);
         self.unhydrated_groups.remove(group_id);
         self.quarantined_groups.remove(group_id);
         self.leaving_groups.remove(group_id);
