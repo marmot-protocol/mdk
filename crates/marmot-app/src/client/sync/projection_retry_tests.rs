@@ -350,3 +350,229 @@ async fn partial_sync_failure_transfers_the_committed_prefix_once() {
     );
     assert!(client.sync().await.unwrap().projection_updates.is_empty());
 }
+
+#[tokio::test]
+async fn committed_cleanup_retries_conversion_without_sweeping_new_sends() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group = client.create_group("retry", &[]).await.unwrap();
+    relay.fail_publishes_as_unavailable();
+    client
+        .send(&group, b"purged before restoration")
+        .await
+        .unwrap();
+    let connection =
+        super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
+    connection.execute_batch("CREATE TRIGGER fail_cleanup_conversion BEFORE INSERT ON chat_list_rows WHEN EXISTS (SELECT 1 FROM app_events WHERE direction = 'sent' AND invalidated = 1) BEGIN SELECT RAISE(FAIL, 'injected cleanup conversion'); END;").unwrap();
+    let effects = marmot_account::AccountDeviceEffects {
+        events: vec![
+            GroupEvent::LocalGroupCopyTerminated {
+                group_id: group.clone(),
+                voluntary: false,
+            },
+            GroupEvent::LocalGroupCopyRestored {
+                group_id: group.clone(),
+            },
+        ],
+        ..Default::default()
+    };
+    let error = client
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("injected cleanup conversion"));
+    assert!(
+        timeline(&app, &group).messages[0]
+            .invalidation_status
+            .is_some()
+    );
+    connection
+        .execute_batch("DROP TRIGGER fail_cleanup_conversion")
+        .unwrap();
+    let sent = client
+        .send(&group, b"accepted after native restoration")
+        .await
+        .unwrap();
+    assert_eq!(
+        sent.accept_disposition,
+        cgka_traits::SendAcceptDisposition::CompletionUnknown
+    );
+    assert_eq!(client.pending_applied_effects.len(), 1);
+    let summary = client
+        .observe_drained_session_events(&Default::default())
+        .await
+        .unwrap();
+    let stored = timeline(&app, &group);
+    let old = stored
+        .messages
+        .iter()
+        .find(|message| message.plaintext == "purged before restoration")
+        .unwrap();
+    let new = stored
+        .messages
+        .iter()
+        .find(|message| message.plaintext == "accepted after native restoration")
+        .unwrap();
+    assert!(old.invalidation_status.is_some());
+    assert!(new.invalidation_status.is_none());
+    assert!(summary.projection_updates.iter().flat_map(|update| &update.timeline_changes).any(|change| matches!(change, crate::TimelineMessageChange::Upsert { message, .. } if message.message_id_hex == old.message_id_hex && message.invalidation_status.is_some())), "the original cleanup notification must survive conversion failure");
+}
+
+#[tokio::test]
+async fn cancelling_public_waits_keeps_repaired_notifications() {
+    for next_event in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = app.client("alice").await.unwrap();
+        client.prepare_transport().await.unwrap();
+        let telemetry = AppPerformanceTelemetry::default();
+        let group = client
+            .create_group_with_options_and_telemetry("retry", &[], Default::default(), &telemetry)
+            .await
+            .unwrap()
+            .group_id;
+        client
+            .create_group_with_options_and_telemetry(
+                "pending route",
+                &[],
+                Default::default(),
+                &telemetry,
+            )
+            .await
+            .unwrap();
+        let connection =
+            super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
+        connection.execute_batch("CREATE TRIGGER fail_activity BEFORE INSERT ON app_events WHEN NEW.kind = 1210 BEGIN SELECT RAISE(FAIL, 'injected activity'); END;").unwrap();
+        let mut events = vec![];
+        if next_event {
+            events.extend([
+                GroupEvent::LocalGroupCopyTerminated {
+                    group_id: group.clone(),
+                    voluntary: false,
+                },
+                GroupEvent::LocalGroupCopyRestored {
+                    group_id: group.clone(),
+                },
+            ]);
+        }
+        events.push(rename(&group, &account.account_id_hex, 0x76));
+        let effects = marmot_account::AccountDeviceEffects {
+            events,
+            ..Default::default()
+        };
+        assert!(
+            client
+                .observe_account_device_effects(
+                    &effects,
+                    &mut SyncSummary::default(),
+                    "source",
+                    123
+                )
+                .await
+                .is_err()
+        );
+        connection
+            .execute_batch("DROP TRIGGER fail_activity")
+            .unwrap();
+        if next_event {
+            relay.block_next_subscribe();
+            let observe = client.next_event();
+            tokio::pin!(observe);
+            tokio::select! {
+                result = &mut observe => panic!("subscription should block: {result:?}"),
+                _ = relay.wait_for_blocked_subscribe() => {},
+                _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("subscription never started"),
+            }
+        } else {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), client.sync_sdk_relay())
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            client.pending_applied_effects.is_empty(),
+            "cancellation happened after repair"
+        );
+        let summary = if next_event {
+            client.next_event().await.unwrap()
+        } else {
+            client.sync_sdk_relay().await.unwrap()
+        };
+        assert_eq!(summary.projection_updates.iter().flat_map(|update| &update.timeline_changes).filter(|change| matches!(change, crate::TimelineMessageChange::Upsert { message, .. } if message.kind == 1210)).count(), 1);
+        assert!(
+            client
+                .take_pending_applied_sync_summary()
+                .projection_updates
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
+async fn failed_message_projection_does_not_duplicate_its_deferred_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group = client.create_group("retry", &[]).await.unwrap();
+    let payload = cgka_traits::app_event::MarmotAppEvent::new(
+        account.account_id_hex.clone(),
+        unix_now_seconds(),
+        9,
+        vec![],
+        "one deferred message",
+    )
+    .encode()
+    .unwrap();
+    let effects = marmot_account::AccountDeviceEffects {
+        events: vec![GroupEvent::MessageReceived {
+            authority: None,
+            group_id: group.clone(),
+            message_id: cgka_traits::MessageId::new(vec![0x81; 32]),
+            sender: cgka_traits::MemberId::new(hex::decode(account.account_id_hex).unwrap()),
+            epoch: client.runtime.group_record(&group).unwrap().epoch,
+            payload,
+            retention: None,
+            encrypted_media_secret: None,
+        }],
+        ..Default::default()
+    };
+    let connection =
+        super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
+    connection.execute_batch("CREATE TRIGGER fail_message BEFORE INSERT ON app_events WHEN NEW.kind = 9 BEGIN SELECT RAISE(FAIL, 'injected message projection'); END;").unwrap();
+    let mut failed = SyncSummary::default();
+    assert!(
+        client
+            .observe_account_device_effects(&effects, &mut failed, "source", 123)
+            .await
+            .is_err()
+    );
+    assert!(failed.messages.is_empty());
+    connection
+        .execute_batch("DROP TRIGGER fail_message")
+        .unwrap();
+    let summary = client.next_event().await.unwrap();
+    assert_eq!(summary.messages.len(), 1);
+    assert_eq!(summary.messages[0].plaintext, "one deferred message");
+    assert_eq!(timeline(&app, &group).messages.len(), 1);
+    assert!(
+        client.pending_application_event_acks.is_empty(),
+        "direct next_event checkpoints the repaired acknowledgement"
+    );
+}

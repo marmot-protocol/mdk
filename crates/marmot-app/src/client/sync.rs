@@ -684,6 +684,7 @@ pub(crate) struct PendingAppliedEffects {
     drained: bool,
     progress: EffectProjectionProgress,
     leading_updates: Vec<crate::AppProjectionUpdate>,
+    uncommitted_summary: SyncSummary,
 }
 
 /// Completed work must not run against messages created after a restoration.
@@ -701,6 +702,7 @@ struct EventProjectionProgress {
     projected: bool,
     completed: bool,
     crosses_frontier: Option<bool>,
+    terminal_cleanup: Option<Option<storage_sqlite::TimelineProjectionUpdate>>,
 }
 
 impl AppClient {
@@ -1827,6 +1829,7 @@ impl AppClient {
                     drained: true,
                     progress: EffectProjectionProgress::default(),
                     leading_updates,
+                    uncommitted_summary: SyncSummary::default(),
                 });
         }
         let mut summary = self.take_pending_applied_sync_summary();
@@ -1902,6 +1905,7 @@ impl AppClient {
             };
             event_progress.crosses_frontier = Some(crosses_frontier);
             if !event_progress.projected {
+                let mut event_summary = SyncSummary::default();
                 if !crosses_frontier
                     && let Some(changed) =
                         self.suppress_local_deleted_group_event(event, batch_start_frontier)?
@@ -1926,7 +1930,7 @@ impl AppClient {
                 if let Some(message) = observe_event(
                     &mut self.state,
                     &display_names,
-                    summary,
+                    &mut event_summary,
                     event,
                     group_projection.as_ref(),
                     &source_message_id_hex,
@@ -1937,7 +1941,7 @@ impl AppClient {
                     message,
                     event_encrypted_media_secret(event),
                     group_metadata.as_ref(),
-                    summary,
+                    &mut event_summary,
                 ) {
                     self.record_v5_event_projection_failure(
                         std::slice::from_ref(event),
@@ -1968,7 +1972,11 @@ impl AppClient {
                         marmot_forensics::v5::UpdateCause::RetainedEventReplay,
                     );
                 }
-                let projected = self.observe_event_projection_effects(event, summary);
+                let projected = self.observe_event_projection_effects_with_cleanup(
+                    event,
+                    &mut event_summary,
+                    &mut event_progress.terminal_cleanup,
+                );
                 match projected {
                     Ok(dirty) => progress.routes_dirty |= dirty,
                     Err(error) => {
@@ -1983,6 +1991,7 @@ impl AppClient {
                 if self.state.groups.len() != before {
                     progress.routes_dirty = true;
                 }
+                summary.merge(event_summary);
                 event_progress.projected = true;
             }
             let can_ack_application_event = if crosses_frontier {
@@ -2103,6 +2112,7 @@ impl AppClient {
                 drained,
                 progress: EffectProjectionProgress::default(),
                 leading_updates: Vec::new(),
+                uncommitted_summary: SyncSummary::default(),
             });
     }
 
@@ -2118,34 +2128,68 @@ impl AppClient {
             summary
                 .projection_updates
                 .append(&mut pending.leading_updates);
+            let has_outbox_events = pending.effects.events.iter().any(|event| {
+                matches!(
+                    event,
+                    cgka_traits::engine::GroupEvent::MessageReceived { .. }
+                        | cgka_traits::engine::GroupEvent::GroupJoined { .. }
+                )
+            });
+            let mut batch_summary = std::mem::take(&mut pending.uncommitted_summary);
             let result = if pending.drained {
                 self.project_drained_effects(
                     &pending.effects,
                     pending.received_at,
-                    summary,
+                    &mut batch_summary,
                     &mut pending.progress,
                 )
                 .map(|()| false)
             } else {
                 self.observe_account_device_effects_inner(
                     &pending.effects,
-                    summary,
+                    &mut batch_summary,
                     &pending.source_message_id_hex,
                     pending.received_at,
                     &mut pending.progress,
                 )
             };
+            if result.is_err() && has_outbox_events {
+                // The live ingest failure keeps these engine outbox rows for
+                // restart replay. Retain their summary and re-stage their acks
+                // on retry without repeating completed native cleanup.
+                for (event, progress) in pending
+                    .effects
+                    .events
+                    .iter()
+                    .zip(&mut pending.progress.events)
+                {
+                    let id = match event {
+                        cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. } => {
+                            message_id
+                        }
+                        cgka_traits::engine::GroupEvent::GroupJoined { via_welcome, .. } => {
+                            via_welcome
+                        }
+                        _ => continue,
+                    };
+                    self.pending_application_event_acks.remove(id);
+                    progress.completed = false;
+                }
+            }
+            if has_outbox_events {
+                pending.uncommitted_summary = batch_summary;
+            } else {
+                summary.merge(batch_summary);
+            }
             self.pending_runtime_group_subscription_refresh |= pending.progress.routes_dirty;
-            // No await precedes this checkpoint. Even cancellation of the
-            // subscription tail must retain completed native and row phases.
+            // No await precedes this checkpoint. Cancellation retains native
+            // progress and any summary whose outbox acknowledgement is owed.
             *self
                 .pending_applied_effects
                 .front_mut()
                 .expect("queued batch") = pending.clone();
             routes_dirty |= result?;
             if pending.drained {
-                // The tail can be cancelled by the worker's maintenance budget.
-                // Keep notifications in self until that await returns too.
                 self.pending_applied_sync_summary
                     .merge(std::mem::take(summary));
                 let checkpoint = self
@@ -2155,6 +2199,7 @@ impl AppClient {
                 checkpoint?;
                 self.drain_epoch_stall_escalations(summary);
             }
+            summary.merge(pending.uncommitted_summary);
             self.pending_applied_effects.pop_front();
         }
         Ok(routes_dirty)
@@ -2207,6 +2252,20 @@ impl AppClient {
                 .effects
                 .superseded_intents
                 .retain(|report| &report.group_id != group_id);
+            let retained_summary = &mut pending.uncommitted_summary;
+            retained_summary.joined_groups.retain(|id| id != group_id);
+            retained_summary
+                .messages
+                .retain(|message| &message.group_id != group_id);
+            retained_summary
+                .events
+                .retain(|event| event_group_id(event) != Some(group_id));
+            retained_summary
+                .projection_updates
+                .retain(|update| update.group_id_hex != hex::encode(group_id.as_slice()));
+            retained_summary
+                .epoch_stall_escalations
+                .retain(|event| &event.group_id != group_id);
             pending
                 .leading_updates
                 .retain(|update| update.group_id_hex != hex::encode(group_id.as_slice()));
@@ -2258,7 +2317,7 @@ impl AppClient {
 
     pub async fn next_event(&mut self) -> Result<SyncSummary, AppError> {
         loop {
-            let mut repaired = self
+            let repaired = self
                 .observe_drained_session_events(&Default::default())
                 .await?;
             if !repaired.projection_updates.is_empty()
@@ -2267,18 +2326,22 @@ impl AppClient {
                 || !repaired.joined_groups.is_empty()
                 || !repaired.epoch_stall_escalations.is_empty()
             {
-                if let Err(error) = self
-                    .retry_pending_runtime_group_subscription_refresh()
+                self.pending_applied_sync_summary.merge(repaired);
+                self.retry_pending_runtime_group_subscription_refresh()
+                    .await?;
+                // A repaired live batch may have re-staged outbox acks. Seal
+                // their checkpoint before exposing its deferred notification.
+                let mut checkpointed = SyncSummary::default();
+                self.checkpoint_sync_prefix(&mut checkpointed, false, 0)
                     .await
-                {
-                    repaired.merge(self.take_pending_applied_sync_summary());
-                    self.pending_applied_sync_summary.merge(repaired);
-                    return Err(error);
-                }
-                repaired.merge(self.take_pending_applied_sync_summary());
-                return Ok(repaired);
+                    .map_err(|error| match error {
+                        SyncCheckpointError::BeforePersistence(error)
+                        | SyncCheckpointError::AfterPersistence(error) => error,
+                    })?;
+                self.pending_applied_sync_summary.merge(checkpointed);
+                return Ok(self.take_pending_applied_sync_summary());
             }
-            let mut summary = match self.receive_next_delivery().await? {
+            let summary = match self.receive_next_delivery().await? {
                 crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) => {
                     self.ingest_received_delivery(*delivery).await?
                 }
@@ -2302,15 +2365,10 @@ impl AppClient {
             // contract by completing the pending rebuild before handing the
             // summary to its caller; the managed worker uses the lower-level
             // ingest method and owns the background retry instead.
-            if let Err(error) = self
-                .retry_pending_runtime_group_subscription_refresh()
-                .await
-            {
-                summary.merge(self.take_pending_applied_sync_summary());
-                self.pending_applied_sync_summary.merge(summary);
-                return Err(error);
-            }
-            summary.merge(self.take_pending_applied_sync_summary());
+            self.pending_applied_sync_summary.merge(summary);
+            self.retry_pending_runtime_group_subscription_refresh()
+                .await?;
+            let summary = self.take_pending_applied_sync_summary();
             if summary.joined_groups.is_empty()
                 && summary.messages.is_empty()
                 && summary.events.is_empty()
@@ -2696,6 +2754,8 @@ impl AppClient {
                 SDK_DRAIN_WAIT
             };
             first_wait = false;
+            self.pending_applied_sync_summary
+                .merge(std::mem::take(&mut summary));
             let receive = async {
                 loop {
                     match timeout(EOSE_QUIET_WAIT, self.adapter.receive_account_delivery()).await {
@@ -2707,7 +2767,9 @@ impl AppClient {
                     }
                 }
             };
-            let delivery = match timeout(wait, receive).await {
+            let received = timeout(wait, receive).await;
+            self.prepend_pending_applied_summary(&mut summary);
+            let delivery = match received {
                 Ok(Ok(Some(crate::relay_plane::AccountDeliveryReceive::Delivery(delivery)))) => {
                     delivery
                 }
@@ -2754,9 +2816,12 @@ impl AppClient {
                     .config
                     .dev_fail_sync_before_delivery
                     .is_some_and(|limit| counts.deliveries >= limit);
+            self.pending_applied_sync_summary
+                .merge(std::mem::take(&mut summary));
             let receipts = match self.transport_receipts() {
                 Ok(receipts) => receipts,
                 Err(error) => {
+                    self.prepend_pending_applied_summary(&mut summary);
                     return Err(self
                         .finish_failed_sync_drain(
                             summary,
@@ -2777,6 +2842,7 @@ impl AppClient {
                 continue;
             }
             if fail_before_delivery {
+                self.prepend_pending_applied_summary(&mut summary);
                 return Err(self
                     .finish_failed_sync_drain(
                         summary,
@@ -2793,27 +2859,28 @@ impl AppClient {
             }
             let mut delivery_summary = SyncSummary::default();
             let message_id = delivery.message.id.clone();
-            let ingested =
-                match Self::ingest_delivery(receipts, *delivery, &mut delivery_summary).await {
-                    Ok(ingested) => ingested,
-                    Err(error) => {
-                        summary.merge(delivery_summary);
-                        // The failed delivery is still taken, so this
-                        // checkpoint stops where a restart fetches it again,
-                        // though newest-first replay already remembered a
-                        // newer cursor.
-                        return Err(self
-                            .finish_failed_sync_drain(
-                                summary,
-                                routes_dirty,
-                                counts,
-                                StagedSyncError::new(error, SyncFailureStage::CgkaIngest),
-                                drain_started,
-                                cursor_before_secs,
-                            )
-                            .await);
-                    }
-                };
+            let ingest = Self::ingest_delivery(receipts, *delivery, &mut delivery_summary).await;
+            self.prepend_pending_applied_summary(&mut summary);
+            let ingested = match ingest {
+                Ok(ingested) => ingested,
+                Err(error) => {
+                    summary.merge(delivery_summary);
+                    // The failed delivery is still taken, so this
+                    // checkpoint stops where a restart fetches it again,
+                    // though newest-first replay already remembered a
+                    // newer cursor.
+                    return Err(self
+                        .finish_failed_sync_drain(
+                            summary,
+                            routes_dirty,
+                            counts,
+                            StagedSyncError::new(error, SyncFailureStage::CgkaIngest),
+                            drain_started,
+                            cursor_before_secs,
+                        )
+                        .await);
+                }
+            };
             self.adapter.release_account_delivery(&message_id);
             if ingested.must_stay_fetchable {
                 counts.unpersisted = counts.unpersisted.saturating_add(1);
@@ -3004,7 +3071,11 @@ impl AppClient {
         summary.merge(std::mem::take(&mut self.pending_failed_sync_summary));
 
         if routes_dirty || routes_changed {
-            match self.sync_runtime_groups().await {
+            self.pending_applied_sync_summary
+                .merge(std::mem::take(summary));
+            let refresh = self.sync_runtime_groups().await;
+            self.prepend_pending_applied_summary(summary);
+            match refresh {
                 Ok(()) => self.pending_runtime_group_subscription_refresh = false,
                 Err(error) => {
                     // The projection and route checkpoint above are durable.
@@ -5490,6 +5561,7 @@ impl AppClient {
         &self,
         event: &cgka_traits::engine::GroupEvent,
         summary: &mut SyncSummary,
+        cleanup: &mut Option<Option<storage_sqlite::TimelineProjectionUpdate>>,
     ) -> Result<(), AppError> {
         let group_id = match event {
             cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated { group_id, .. }
@@ -5500,11 +5572,24 @@ impl AppClient {
             } => group_id,
             _ => return Ok(()),
         };
-        if let Some(update) = self.app.invalidate_timeline_pending_sends_for_group(
-            &self.state.label,
-            &hex::encode(group_id.as_slice()),
-        )? {
-            summary.projection_updates.push(update);
+        // Storage invalidation commits before chat-list enrichment. Preserve
+        // its exact update across conversion failures rather than sweeping
+        // newer sends (or losing the original notification on an empty retry).
+        if cleanup.is_none() {
+            *cleanup = Some(
+                self.app
+                    .account_storage(&self.state.label)?
+                    .invalidate_pending_sent_app_events_for_group(
+                        &hex::encode(group_id.as_slice()),
+                        crate::LOCAL_PUBLISH_FAILED_REASON,
+                    )?,
+            );
+        }
+        if let Some(Some(update)) = cleanup {
+            summary.projection_updates.push(
+                self.app
+                    .app_projection_update(&self.state.label, update.clone())?,
+            );
         }
         Ok(())
     }
@@ -5533,6 +5618,15 @@ impl AppClient {
         &mut self,
         event: &cgka_traits::engine::GroupEvent,
         summary: &mut SyncSummary,
+    ) -> Result<bool, AppError> {
+        self.observe_event_projection_effects_with_cleanup(event, summary, &mut None)
+    }
+
+    fn observe_event_projection_effects_with_cleanup(
+        &mut self,
+        event: &cgka_traits::engine::GroupEvent,
+        summary: &mut SyncSummary,
+        cleanup: &mut Option<Option<storage_sqlite::TimelineProjectionUpdate>>,
     ) -> Result<bool, AppError> {
         let mut routes_dirty = false;
         // Timeline invalidation dispatch: `AppMessageInvalidated` withdraws
@@ -5625,7 +5719,7 @@ impl AppClient {
                 .app
                 .remove_stale_group_push_tokens(&self.state.label, &group_id_hex, &[]);
         }
-        self.invalidate_terminal_pending_sends(event, summary)?;
+        self.invalidate_terminal_pending_sends(event, summary, cleanup)?;
         if let Some(group_id) = self_arrival_group(event) {
             routes_dirty |= self.restore_joined_self_membership(group_id)?;
         }
@@ -5832,6 +5926,7 @@ impl AppClient {
             };
             event_progress.crosses_frontier = Some(crosses_frontier);
             if !event_progress.projected {
+                let mut event_summary = SyncSummary::default();
                 if !crosses_frontier
                     && let Some(changed) =
                         self.suppress_local_deleted_group_event(event, batch_start_frontier)?
@@ -5852,7 +5947,7 @@ impl AppClient {
                 if let Some(message) = observe_event(
                     &mut self.state,
                     &display_names,
-                    summary,
+                    &mut event_summary,
                     event,
                     group_projection.as_ref(),
                     &event_source,
@@ -5864,7 +5959,7 @@ impl AppClient {
                         message,
                         event_encrypted_media_secret(event),
                         group_metadata.as_ref(),
-                        summary,
+                        &mut event_summary,
                     )?;
                 }
                 let updated_group =
@@ -5886,10 +5981,15 @@ impl AppClient {
                 {
                     probe.projected(event, marmot_forensics::v5::UpdateCause::WelcomeJoin);
                 }
-                progress.routes_dirty |= self.observe_event_projection_effects(event, summary)?;
+                progress.routes_dirty |= self.observe_event_projection_effects_with_cleanup(
+                    event,
+                    &mut event_summary,
+                    &mut event_progress.terminal_cleanup,
+                )?;
                 if self.state.groups.len() != before {
                     progress.routes_dirty = true;
                 }
+                summary.merge(event_summary);
                 event_progress.projected = true;
             }
             let can_ack_application_event = if crosses_frontier {
