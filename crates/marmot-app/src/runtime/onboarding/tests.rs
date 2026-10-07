@@ -1847,7 +1847,7 @@ async fn approved_unsigned_relay_repair_rejects_modified_checkpoint_before_signi
         .unwrap()
         .unwrap();
 
-    for variant in 0..3 {
+    for variant in 0..4 {
         let mut changed = original.clone();
         changed.approved = true;
         let proposal = changed.snapshot.proposal.as_mut().unwrap();
@@ -1860,7 +1860,11 @@ async fn approved_unsigned_relay_repair_rejects_modified_checkpoint_before_signi
                 .push_str(" modified"),
             1 => proposal.relay_repair.as_mut().unwrap().after_tags[0].fields[1]
                 .push_str(".attacker"),
-            _ => proposal.read_relays.push("wss://attacker.example".into()),
+            2 => proposal.read_relays.push("wss://attacker.example".into()),
+            _ => {
+                proposal.relay_repair.as_mut().unwrap().mode =
+                    OnboardingRelayRepairMode::ManualReview;
+            }
         }
         runtime
             .accounts()

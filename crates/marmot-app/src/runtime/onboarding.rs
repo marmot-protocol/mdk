@@ -2405,10 +2405,13 @@ impl AccountManager {
         c: &mut OnboardingCheckpoint,
     ) -> Result<bool, AppError> {
         let proposal = c.snapshot.proposal.clone().ok_or_else(onboarding_error)?;
-        if proposal
-            .relay_repair
-            .as_ref()
-            .is_some_and(|repair| repair.mode == OnboardingRelayRepairMode::ManualReview)
+        // Unsigned manual previews must reach validation below so a stale or
+        // modified checkpoint loses approval and can be inspected again.
+        if c.signed_repair.is_some()
+            && proposal
+                .relay_repair
+                .as_ref()
+                .is_some_and(|repair| repair.mode == OnboardingRelayRepairMode::ManualReview)
         {
             return Err(onboarding_error());
         }

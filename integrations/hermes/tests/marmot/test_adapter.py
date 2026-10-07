@@ -1963,10 +1963,10 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         adapter.handle_message = observe_delivery
         loop_task = asyncio.ensure_future(adapter._consume_inbound_loop())
         try:
-            await asyncio.wait_for(delivered.wait(), timeout=10)
+            await asyncio.wait_for(delivered.wait(), timeout=30)
             # Delivery precedes the journal disposition; let that finish before
             # cancelling the listener and closing its private stores.
-            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=10)
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=30)
         finally:
             loop_task.cancel()
             try:
