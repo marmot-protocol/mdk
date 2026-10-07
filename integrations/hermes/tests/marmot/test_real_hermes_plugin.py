@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import importlib
 import inspect
 import json
@@ -24,11 +25,27 @@ import time
 from unittest import mock
 
 
+# Observed in the real-host CI scan of this local plugin fixture. New pattern
+# classes require inspection before this test can confirm installation.
+KNOWN_LOCAL_PLUGIN_CAUTION_PATTERNS = frozenset({
+    "agent_config_ref", "git_clone", "path_traversal", "path_traversal_deep",
+    "python_subprocess",
+})
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--hermes-source", type=Path)
     parser.add_argument("--mdk-source", type=Path)
     parser.add_argument("--mdk-ref")
+    parser.add_argument(
+        "--accept-known-local-plugin-caution",
+        action="store_true",
+        help=(
+            "Accept only known scanner pattern ids for the pinned local fixture in "
+            "this isolated test home after checking dangerous-verdict enforcement."
+        ),
+    )
     parser.add_argument(
         "--internal-mode",
         choices=("busy-crash-child", "busy-crash-probe"),
@@ -42,6 +59,49 @@ def _parse_args() -> argparse.Namespace:
         choices=("monorepo", "plugin-only"),
     )
     return parser.parse_args()
+
+
+def _local_plugin_install_force(plugins_cmd_module, plugin_dir: Path, *, accept_caution: bool) -> bool:
+    """Confirm only an observed caution from this host's scanner, never all installs."""
+    scan = getattr(plugins_cmd_module, "_scan_plugin_tree", None)
+    if not callable(scan):
+        print(json.dumps({"plugin_scan_verdict": "unsupported", "install_force": False}))
+        return False
+    blocked = plugins_cmd_module.PluginScanBlocked
+    try:
+        result = scan(plugin_dir, "pinned-local-fixture", force=False)
+    except blocked as error:
+        result = error.scan_result
+        verdict = getattr(result, "verdict", None)
+        patterns = {finding.pattern_id for finding in result.findings} if result is not None else set()
+        print(json.dumps({
+            "plugin_scan_verdict": verdict,
+            "plugin_scan_patterns": sorted(patterns),
+        }))
+        if (verdict != "caution" or not accept_caution or not patterns
+                or not patterns.issubset(KNOWN_LOCAL_PLUGIN_CAUTION_PATTERNS)):
+            raise
+    else:
+        if result is None or getattr(result, "verdict", None) != "safe":
+            raise AssertionError("host scanner must be enabled and enforce its verdict")
+        print(json.dumps({"plugin_scan_verdict": "safe", "install_force": False}))
+        return False
+
+    # Exercise this actual host's enforcement with a synthetic dangerous verdict.
+    # No malicious code is executed or included in the plugin runtime tree.
+    dangerous = copy.copy(result)
+    dangerous.verdict = "dangerous"
+    guard = importlib.import_module("tools.plugin_guard")
+    with mock.patch.object(guard, "scan_plugin", return_value=dangerous):
+        try:
+            scan(plugin_dir, "dangerous-verdict-fixture", force=True)
+        except blocked as error:
+            if getattr(error.scan_result, "verdict", None) != "dangerous":
+                raise AssertionError("host blocked for a reason other than dangerous verdict") from error
+        else:
+            raise AssertionError("host allows a dangerous verdict with force=True")
+    print(json.dumps({"dangerous_verdict_blocked_with_force": True, "install_force": True}))
+    return True
 
 
 def _plugin_test_tempdir() -> tempfile.TemporaryDirectory[str]:
@@ -678,18 +738,34 @@ def main() -> int:
         supports_subdirectories = _source_install_supports_subdirectories(
             plugins_cmd_module
         )
+        if supports_subdirectories:
+            pinned_source = _pinned_source_checkout(mdk_source, resolved_ref, home)
+            scan_source = pinned_source / "integrations/hermes/marmot"
+        else:
+            plugin_source = _plugin_only_repository(mdk_source, resolved_ref, home)
+            scan_source = plugin_source
+        install_force = _local_plugin_install_force(
+            plugins_cmd_module, scan_source,
+            accept_caution=args.accept_known_local_plugin_caution,
+        )
         if supports_subdirectories and "ref" in install_parameters:
+            # The archive-backed scan checkout has a fixture-only commit id.
+            # Ref-capable hosts must fetch the requested id from the original Git source.
             identifier = f"file://{mdk_source}#integrations/hermes/marmot"
-            cmd_install(identifier, force=False, enable=False, ref=resolved_ref)
+            cmd_install(
+                identifier,
+                force=install_force,
+                enable=False,
+                ref=resolved_ref,
+            )
             source_install_mode = "monorepo"
         elif supports_subdirectories:
             # Hermes 0.19.0 supports local monorepo subdirectories but has no
             # --ref option. Exercise the documented portable path: detach a
             # local checkout at the exact MDK commit, then install its subdir.
-            pinned_source = _pinned_source_checkout(mdk_source, resolved_ref, home)
             cmd_install(
                 f"file://{pinned_source}#integrations/hermes/marmot",
-                force=False,
+                force=install_force,
                 enable=False,
             )
             source_install_mode = "monorepo"
@@ -697,8 +773,11 @@ def main() -> int:
             # Some older candidate builds predate source subdirectories,
             # independently of whether they expose --ref. Avoid passing a URL
             # fragment through to git clone as a literal path.
-            plugin_source = _plugin_only_repository(mdk_source, resolved_ref, home)
-            cmd_install(f"file://{plugin_source}", force=False, enable=False)
+            cmd_install(
+                f"file://{plugin_source}",
+                force=install_force,
+                enable=False,
+            )
             source_install_mode = "plugin-only"
 
         if (

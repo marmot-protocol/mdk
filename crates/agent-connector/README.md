@@ -24,6 +24,7 @@ Supported integrations, all speaking the same [`agent-control`](../agent-control
 
 - [Names and versions](#names-and-versions)
 - [What this crate owns](#what-this-crate-owns)
+- [First installation from a White Noise prompt](#first-installation-from-a-white-noise-prompt)
 - [Run locally](#run-locally)
 - [Invite policy](#invite-policy)
 - [Outbound media paths](#outbound-media-paths)
@@ -58,6 +59,85 @@ This crate is process glue. It owns:
 
 Agent-facing wire types live in [`agent-control`](../agent-control) and stream composition behavior in
 [`agent-stream-compose`](../agent-stream-compose).
+
+## First installation from a White Noise prompt
+
+The [recommended chat setup](../../integrations/README.md#recommended-chat-setup)
+covers the trusted-agent admin default, task titles, progress reactions,
+missing preference questions and a complete phone acceptance checklist.
+
+White Noise's copied installation prompt links to this README. Installation
+also requires the selected runtime's guide: the
+[quickstart](../../integrations/README.md#get-started-white-noise--agents) links
+Hermes, OpenClaw, Claude Code, Codex, OpenCode, Pi and Goose. Installing `wn-agent`
+alone does not connect the model runtime or start its gateway/harness.
+The detailed preflight is [Hermes profile selection](../../integrations/hermes/marmot/README.md#first-install-and-profile-selection),
+[OpenClaw instance selection](../../integrations/openclaw/marmot/README.md#first-install-checklist),
+or the [terminal-harness installation guide](../../integrations/terminal-harness/README.md#first-installation-and-verification)
+with each backend's checklist. Compare the [connector capabilities](../../integrations/README.md#connector-capabilities)
+to select the runtime that supports the required chat and file workflow.
+
+The setup plan identifies the connector's local account/socket/service, the
+runtime configuration being changed, the supplied **public** phone `npub`
+authorization and the verification steps. The installation prompt includes an
+approval step for that plan. The phone's npub is an inviter/sender identity,
+not the agent's identity and never a secret key to import.
+
+1. **Identify the runtime and its real state home.** Confirm its version,
+   authentication and executable on PATH under the user that will run the
+   service. A chat's working directory, profile display name or remembered
+   default is not evidence of the active configuration directory. For Hermes,
+   follow [First install and profile selection](../../integrations/hermes/marmot/README.md#first-install-and-profile-selection)
+   before running the installer; pin `HERMES_HOME` for installation, plugin
+   commands and gateway startup.
+2. **Choose the topology.** For one gateway, reuse one connector home and one
+   service owning its socket. For independent profile agents, choose a distinct
+   `MARMOT_HOME`, socket, bootstrap label and same-user service name per profile.
+   Changing only the Hermes home does not change the default `wn-agent-hermes`
+   service. See [isolated and shared deployments](../../integrations/README.md#sharing-options).
+   Each existing home/socket has one daemon owner; a second daemon cannot repair
+   routing.
+3. **Install a matching release cohort.** Download the chosen runtime's
+   versioned release installer and checksum, verify the checksum, then run the
+   local file with explicit home, relay and public-key allowlist options. Use
+   the verified helper in the [quickstart](../../integrations/README.md#get-started-white-noise--agents).
+   A checkout's installer/help may be newer than the published asset: use that
+   asset's `--help` and the matching release, rather than mixing a new plugin
+   with an older `wn-agent`. Source-only plugin installation does not install
+   or start the connector.
+4. **Verify the local wiring before the phone test.** The daemon, adapter and
+   bootstrap must agree on home, socket and selected agent account. Use public
+   relays shared with the phone; relay WebSocket URLs and Blossom HTTP upload
+   URLs are different settings. Verify both the invite allowlist and the host
+   runtime's allowed-message-sender list. An accepted invite does not grant
+   permission to invoke the model. Restart only the intended gateway after
+   plugin/configuration changes, using the deployment's supported procedure.
+   If no service manager is available, the installer's bootstrap process is
+   temporary; arrange a supervised connector and gateway/harness before leaving.
+5. **Complete the round trip.** Return the bootstrapped **agent** npub/nprofile.
+   The phone owner invites that identity and sends a test from the allowed
+   phone account. Confirm an actual model reply reaches the same White Noise
+   conversation. A socket, successful bootstrap, healthy doctor report or
+   relay acknowledgement alone is not end-to-end delivery. If the phone test
+   cannot be performed, report local checks separately and leave phone
+   verification pending until that round trip is observed.
+
+### Sending a generated file
+
+For Hermes, `MEDIA:<absolute-path>` only sends a regular file under the active
+adapter's approved source roots; **stage the file there first**. Its default
+source root is `$MARMOT_HOME/dev/inbound-media`. The adapter then copies it into
+its separate outbound staging directory, which `wn-agent` must allow with
+`--media-allowed-root`. See the [copy-and-send example](../../integrations/hermes/marmot/README.md#sending-a-generated-file).
+The source and staging roots remain narrow; `/` or the whole home defeats
+that boundary.
+
+This convention is runtime-specific. OpenClaw uses its normal message tool's
+media/attachment fields; terminal harnesses use only their documented artifact
+export support. `MEDIA:` is not a universal `wn-agent` command. In a split-user
+or container deployment, both processes must see the staged path with the
+required permissions/mounts; a path in the model's workspace is not necessarily
+a path the connector can read.
 
 ## Run locally
 
