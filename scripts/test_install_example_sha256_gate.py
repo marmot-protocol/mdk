@@ -166,6 +166,27 @@ class InstallExampleSha256GateTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertFalse(marker.exists())
 
+    def test_every_documented_numeric_installer_reaches_download(self):
+        readme = (Path(__file__).resolve().parents[1] / "integrations/README.md").read_text()
+        helper = gate.install_definition_block(readme)
+        self.assertIsNotNone(helper)
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / "curl-called"
+            curl = Path(temp) / "curl"
+            curl.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CURL_MARKER\"\nexit 42\n")
+            curl.chmod(0o755)
+            for installer in gate.INSTALLERS:
+                marker.unlink(missing_ok=True)
+                url = "https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0/" + installer
+                with self.subTest(installer=installer):
+                    result = subprocess.run(
+                        ["bash", "-c", helper + '\ninstall_verified "$1" "$1.sha256"', "fixture", url],
+                        text=True, capture_output=True,
+                        env={**os.environ, "PATH": temp + ":" + os.environ["PATH"], "CURL_MARKER": str(marker)},
+                    )
+                    self.assertEqual(result.returncode, 42, result.stderr)
+                    self.assertIn(url, marker.read_text())
+
     def test_runtime_guides_link_the_canonical_helper(self):
         root = Path(__file__).resolve().parents[1]
         canonical = gate.install_definition_block((root / "integrations/README.md").read_text())

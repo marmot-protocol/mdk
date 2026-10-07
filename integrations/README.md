@@ -69,7 +69,7 @@ install_verified() (
   case "$installer_url" in
     *[!a-zA-Z0-9:/._-]*) echo "error: invalid installer URL" >&2; exit 1 ;;
   esac
-  if ! printf '%s\n' "$installer_url" | LC_ALL=C grep -Eq '^https://github[.]com/marmot-protocol/mdk/releases/download/wn-agent-v[0-9]+[.][0-9]+[.][0-9]+/install-(hermes|openclaw|claude|codex|opencode|pi)-marmot[.]sh$'; then
+  if ! printf '%s\n' "$installer_url" | LC_ALL=C grep -Eq '^https://github[.]com/marmot-protocol/mdk/releases/download/wn-agent-v[0-9]+[.][0-9]+[.][0-9]+/install-(hermes|openclaw|claude|codex|opencode|pi|goose)-marmot[.]sh$'; then
     echo "error: select a numeric WN Agent release before installing" >&2
     exit 1
   fi
@@ -359,7 +359,7 @@ configuration and the acceptance check below.
 
 ## Connector capabilities
 
-All six connectors provide encrypted White Noise conversations with an agent
+All seven connectors provide encrypted White Noise conversations with an agent
 runtime you already use. The runtime supplies the model, tools and permissions;
 `wn-agent` supplies Marmot identity, encrypted transport and durable delivery.
 Choose by the features you need:
@@ -372,6 +372,7 @@ Choose by the features you need:
 | [Codex](codex/marmot/README.md#what-you-can-do) | Per-chat thread/project/goal; shared chat and recovery commands; admin group profile updates; completed text replies | Native images and supported staged files; opt-in generated-file return with exact grants |
 | [OpenCode](opencode/marmot/README.md#what-you-can-do) | Per-chat session/project/goal; shared chat and recovery commands; admin group profile updates; text-event replies | Supported images/PDFs/text; no generated-file return |
 | [Pi](pi/marmot/README.md#what-you-can-do) | Per-chat session/project/goal; shared chat and recovery commands; admin group profile updates; completed text replies | Supported images/text; no generated-file return |
+| [Goose](goose/marmot/README.md) | Per-chat session/project/goal; shared chat and recovery commands; text replies between tool calls | Text-only; no attachments or generated-file return |
 
 For terminal harnesses, start with `/cd src/my-project`, send an ordinary request,
 then use `/status`, `/goal <instruction>` or `/new` as needed. The complete
@@ -401,8 +402,9 @@ Before installing, follow the runtime-specific checklist: [Hermes](hermes/marmot
 [OpenClaw](openclaw/marmot/README.md#first-install-checklist),
 [Claude Code](claude/marmot/README.md#first-install-checklist),
 [Codex](codex/marmot/README.md#first-install-checklist),
-[OpenCode](opencode/marmot/README.md#first-install-checklist), or
-[Pi](pi/marmot/README.md#first-install-checklist). The four terminal harnesses also
+[OpenCode](opencode/marmot/README.md#first-install-checklist),
+[Pi](pi/marmot/README.md#first-install-checklist), or
+[Goose](goose/marmot/README.md#install-goose-already-installed). The five terminal harnesses also
 share a [two-process/environment verification guide](terminal-harness/README.md#first-installation-and-verification).
 These guides distinguish invitation authorization from prompt authorization and
 actual backend replies from local setup/status acknowledgements.
