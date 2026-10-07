@@ -2174,124 +2174,165 @@ async fn confirmation_anchor_and_membership_failures_preserve_author_effects() {
 async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance() {
     use cgka_traits::engine::{GroupEvent, GroupStateChange};
 
-    let storage = SqliteAccountStorage::in_memory().unwrap();
-    let fault = ConfirmationFault::default();
-    let clock = ManualConvergenceClock::new(1_000, 10_000);
-    let mut alice = EngineBuilder::new(FaultStorage {
-        inner: storage.clone(),
-        message_rows: Arc::default(),
-        fault: ProcessedFault::default(),
-        lifecycle_fault: ProcessedFault::default(),
-        disband_request_fault: ProcessedFault::default(),
-        queued_intent_list_fault: ProcessedFault::default(),
-        confirmation_fault: fault.clone(),
-    })
-    .legacy_compatibility_profile()
-    .identity(pad32(b"replay-alice"))
-    .account_identity_proof_signer(proof_signer(b"replay-alice"))
-    .feature_registry(registry_with_reactions())
-    .peeler(Box::new(MockPeeler))
-    .convergence_clock(Arc::new(clock.clone()))
-    .build()
-    .unwrap();
-    let mut bob = build(b"replay-bob");
-    let group_id = group_with_bob(&mut alice, &mut bob).await;
-    alice.drain_events();
-    let SendResult::GroupEvolution { pending, .. } = alice
-        .send(SendIntent::UpdateGroupData {
-            group_id: group_id.clone(),
-            name: Some("confirmed despite replay failure".into()),
-            description: None,
-        })
-        .await
-        .unwrap()
-    else {
-        panic!("rename stages a commit");
-    };
-    let SendResult::ApplicationMessage { mut msg, .. } = bob
-        .send(SendIntent::AppMessage {
-            group_id: group_id.clone(),
-            payload: app_payload_for(&bob, "retained across confirmation"),
-            expected_epoch: None,
-        })
-        .await
-        .unwrap()
-    else {
-        panic!("peer application message");
-    };
-    msg.envelope = TransportEnvelope::GroupMessage {
-        transport_group_id: group_id.as_slice().to_vec(),
-    };
-    assert!(matches!(
-        alice.ingest(msg.clone()).await.unwrap(),
-        IngestOutcome::Buffered { .. }
-    ));
-    alice.drain_events();
-    fault.replay.arm(2);
-    alice
-        .confirm_published(pending)
-        .await
-        .expect("durable confirmation succeeds");
-    let author_events = alice.drain_events();
-    assert_eq!(
-        author_events
-            .iter()
-            .filter(|event| matches!(
-                event,
-                GroupEvent::GroupStateChanged {
-                    change: GroupStateChange::GroupRenamed { .. },
-                    ..
-                }
-            ))
-            .count(),
-        1
-    );
-    assert!(alice.drain_pending_convergence_groups().contains(&group_id));
-    assert_ne!(
-        storage.get_message(&msg.id).unwrap().state,
-        MessageState::Processed
-    );
-    let retry_error = alice.advance_convergence(&group_id).await.unwrap_err();
-    assert!(retry_error.is_transient());
-    assert!(alice.drain_pending_convergence_groups().contains(&group_id));
-    assert_ne!(
-        storage.get_message(&msg.id).unwrap().state,
-        MessageState::Processed
-    );
-    assert!(alice.drain_events().is_empty());
-    let mut replay_events = Vec::new();
-    for _ in 0..4 {
-        alice.advance_convergence(&group_id).await.unwrap();
-        replay_events.extend(alice.drain_events());
-        if storage.get_message(&msg.id).unwrap().state == MessageState::Processed {
-            break;
-        }
-        clock.advance_ms(1_000);
+    #[derive(Clone, Copy)]
+    enum Advance {
+        Drain,
+        Inputs,
+        DeterministicInputs,
     }
-    assert_eq!(
-        storage.get_message(&msg.id).unwrap().state,
-        MessageState::Processed
-    );
-    assert_eq!(
-        replay_events
-            .iter()
-            .filter(|event| matches!(
-                event, GroupEvent::MessageReceived { sender, .. } if sender == &bob.self_id()
-            ))
-            .count(),
-        1
-    );
-    assert!(!replay_events.iter().any(|event| matches!(
-        event,
-        GroupEvent::GroupStateChanged {
-            change: GroupStateChange::GroupRenamed { .. },
-            ..
+    async fn advance_replay(
+        engine: &mut cgka_engine::Engine<FaultStorage>,
+        group_id: &GroupId,
+        mode: Advance,
+        now_ms: u64,
+    ) -> Result<(), EngineError> {
+        match mode {
+            Advance::Drain => engine.advance_convergence(group_id).await.map(|_| ()),
+            Advance::Inputs => engine
+                .advance_convergence_inputs(group_id)
+                .await
+                .map(|_| ()),
+            Advance::DeterministicInputs => engine
+                .advance_convergence_inputs_until_settled(group_id, now_ms)
+                .await
+                .map(|_| ()),
         }
-    )));
-    assert!(matches!(
-        alice.confirm_published(pending).await,
-        Err(EngineError::UnknownPending)
-    ));
+    }
+    for mode in [
+        Advance::Drain,
+        Advance::Inputs,
+        Advance::DeterministicInputs,
+    ] {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let fault = ConfirmationFault::default();
+        let clock = ManualConvergenceClock::new(1_000, 10_000);
+        let mut alice = EngineBuilder::new(FaultStorage {
+            inner: storage.clone(),
+            message_rows: Arc::default(),
+            fault: ProcessedFault::default(),
+            lifecycle_fault: ProcessedFault::default(),
+            disband_request_fault: ProcessedFault::default(),
+            queued_intent_list_fault: ProcessedFault::default(),
+            confirmation_fault: fault.clone(),
+        })
+        .legacy_compatibility_profile()
+        .identity(pad32(b"replay-alice"))
+        .account_identity_proof_signer(proof_signer(b"replay-alice"))
+        .feature_registry(registry_with_reactions())
+        .peeler(Box::new(MockPeeler))
+        .convergence_clock(Arc::new(clock.clone()))
+        .build()
+        .unwrap();
+        let mut bob = build(b"replay-bob");
+        let group_id = group_with_bob(&mut alice, &mut bob).await;
+        alice.drain_events();
+        let SendResult::GroupEvolution { pending, .. } = alice
+            .send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some("confirmed despite replay failure".into()),
+                description: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("rename stages a commit");
+        };
+        let SendResult::ApplicationMessage { mut msg, .. } = bob
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload_for(&bob, "retained across confirmation"),
+                expected_epoch: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("peer application message");
+        };
+        msg.envelope = TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        };
+        assert!(matches!(
+            alice.ingest(msg.clone()).await.unwrap(),
+            IngestOutcome::Buffered { .. }
+        ));
+        alice.drain_events();
+        fault.replay.arm(2);
+        alice
+            .confirm_published(pending)
+            .await
+            .expect("durable confirmation succeeds");
+        let author_events = alice.drain_events();
+        assert_eq!(
+            author_events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    GroupEvent::GroupStateChanged {
+                        change: GroupStateChange::GroupRenamed { .. },
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(alice.drain_pending_convergence_groups().contains(&group_id));
+        assert_ne!(
+            storage.get_message(&msg.id).unwrap().state,
+            MessageState::Processed
+        );
+        let retry_error = advance_replay(&mut alice, &group_id, mode, 1_000)
+            .await
+            .unwrap_err();
+        assert!(retry_error.is_transient());
+        assert!(alice.drain_pending_convergence_groups().contains(&group_id));
+        assert_ne!(
+            storage.get_message(&msg.id).unwrap().state,
+            MessageState::Processed
+        );
+        assert!(alice.drain_events().is_empty());
+        let mut replay_events = Vec::new();
+        for _ in 0..4 {
+            advance_replay(&mut alice, &group_id, mode, 1_000)
+                .await
+                .unwrap();
+            replay_events.extend(alice.drain_events());
+            if storage.get_message(&msg.id).unwrap().state == MessageState::Processed {
+                break;
+            }
+            clock.advance_ms(1_000);
+        }
+        assert_eq!(
+            storage.get_message(&msg.id).unwrap().state,
+            MessageState::Processed
+        );
+        assert_eq!(
+            replay_events
+                .iter()
+                .filter(|event| matches!(
+                    event, GroupEvent::MessageReceived { sender, .. } if sender == &bob.self_id()
+                ))
+                .count(),
+            1
+        );
+        assert!(!replay_events.iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupStateChanged {
+                change: GroupStateChange::GroupRenamed { .. },
+                ..
+            }
+        )));
+        assert!(matches!(
+            alice.confirm_published(pending).await,
+            Err(EngineError::UnknownPending)
+        ));
+        // Successful replay clears the marker, so a later advance does not scan
+        // raw input again just because this group once had a replay failure.
+        fault.replay.arm(1);
+        advance_replay(&mut alice, &group_id, mode, 5_000)
+            .await
+            .unwrap();
+        assert!(alice.drain_events().is_empty());
+    }
 }
 
 // ── Retained app messages across a temporary non-stable state ────────────────

@@ -1033,22 +1033,6 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(Vec::new());
         }
 
-        // A completed publication owns its result even if the following raw
-        // inbound replay failed. Retry only those marked groups, after the
-        // terminal/pending gates, before allowing later convergence or sends.
-        if self.pending_confirmation_replays.contains(group_id) {
-            if let Err(error) = self.replay_buffered_messages(group_id).await {
-                self.schedule_pending_convergence_group(group_id);
-                return Err(error);
-            }
-            self.pending_confirmation_replays.remove(group_id);
-            // Replayed input can terminate the copy or stage a new publish.
-            // Recheck before entering later convergence or queued work.
-            if !self.prepare_convergence_input_advance(group_id)? {
-                return Ok(Vec::new());
-            }
-        }
-
         // This entry point belongs to background recovery even when output is
         // queued. Borrowing a send's four-row preflight allowance here makes
         // queued maintenance throttle the worker's entire deferred generation.
@@ -1528,6 +1512,9 @@ impl<S: StorageProvider> Engine<S> {
         now_ms: u64,
         deadline: Option<Instant>,
     ) -> Result<bool, EngineError> {
+        if !self.retry_pending_confirmation_replay(group_id).await? {
+            return Ok(false);
+        }
         Ok(matches!(
             self.advance_convergence_inputs_with_execution(
                 group_id,
@@ -1540,6 +1527,28 @@ impl<S: StorageProvider> Engine<S> {
             .await?,
             AdvanceConvergenceStatus::Settled
         ))
+    }
+
+    /// Retry only raw input whose replay failed after durable confirmation.
+    /// Background drain and inputs-only entry points share this before later work; the
+    /// terminal/pending gates still own whether the retained input may run.
+    async fn retry_pending_confirmation_replay(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
+        if !self.pending_confirmation_replays.contains(group_id) {
+            return Ok(true);
+        }
+        if !self.prepare_convergence_input_advance(group_id)? {
+            return Ok(false);
+        }
+        if let Err(error) = self.replay_buffered_messages(group_id).await {
+            self.schedule_pending_convergence_group(group_id);
+            return Err(error);
+        }
+        self.pending_confirmation_replays.remove(group_id);
+        // Replayed input can terminate the copy or stage a new publish.
+        self.prepare_convergence_input_advance(group_id)
     }
 
     async fn advance_convergence_inputs_with_execution(
