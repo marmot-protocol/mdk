@@ -158,6 +158,13 @@ By default the control socket is `<home>/dev/wn-agent.sock`, here:
 ~/.marmot-agent/dev/wn-agent.sock
 ```
 
+If startup reports `socket_path_too_long`, use a shorter `--home` or a shorter
+`--socket` path inside a private directory. The private bind needs more room than
+the final socket address alone. A custom `--socket` does not move the local
+usage-diagnostics socket: use a shorter home if those controls are unavailable.
+Regular control continues when the optional diagnostics socket cannot bind.
+Keep the existing directory and socket permissions.
+
 In another terminal, create or reuse the local agent account and print the phone invite details:
 
 ```sh
