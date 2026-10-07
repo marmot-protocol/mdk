@@ -2727,6 +2727,13 @@ fn app_error_kind(error: &AppError) -> &str {
         AppError::MissingKeyPackage { .. } => "missing_key_package",
         AppError::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
         AppError::DirectoryLookupIncomplete(_) => "directory_lookup_incomplete",
+        AppError::InvalidSticker(_) => "invalid_sticker",
+        AppError::StickerNotFound => "sticker_not_found",
+        AppError::StickerRelay(_) => "sticker_relay",
+        AppError::StickerImport(_) => "sticker_import",
+        AppError::StickerExternalSignerImportUnsupported => {
+            "sticker_external_signer_import_unsupported"
+        }
         _ => "app_runtime_operation",
     }
 }
@@ -2831,6 +2838,11 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::MediaUnfetchable(_)
         | AppError::UnsafeMediaFetch(_)
         | AppError::InvalidAppMessagePayload(_)
+        | AppError::InvalidSticker(_)
+        | AppError::StickerNotFound
+        | AppError::StickerRelay(_)
+        | AppError::StickerImport(_)
+        | AppError::StickerExternalSignerImportUnsupported
         | AppError::InvalidPushToken(_)
         | AppError::InvalidPushServer(_)
         | AppError::InvalidPushGossip(_)

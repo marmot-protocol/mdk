@@ -2386,9 +2386,14 @@ fn timeline_message_for_read_marker_tx(
 }
 
 fn chat_list_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatListMessagePreview> {
-    let tags = serde_json::from_str(&row.get::<_, String>(4)?).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err))
-    })?;
+    let deleted = row.get::<_, i64>(6)? != 0;
+    let tags = if deleted {
+        Vec::new()
+    } else {
+        serde_json::from_str(&row.get::<_, String>(4)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err))
+        })?
+    };
     let direction = row.get::<_, String>(8)?;
     let source_message_id_hex = row.get::<_, Option<String>>(9)?;
     let invalidation_status = row.get::<_, Option<String>>(10)?;
@@ -2416,7 +2421,7 @@ fn chat_list_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatL
         retention_expires_at: row
             .get::<_, Option<i64>>("retention_expires_at")?
             .and_then(|value| value.try_into().ok()),
-        deleted: row.get::<_, i64>(6)? != 0,
+        deleted,
         deletion_source: crate::DeletionSource::from_storage(&row.get::<_, String>(15)?),
         attachment_kind: None,
         attachment_count: 0,
@@ -2747,6 +2752,7 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
     let retention_expires_at = row
         .get::<_, Option<i64>>("retention_expires_at")?
         .and_then(|value| value.try_into().ok());
+    let deleted = row.get::<_, i64>(17).unwrap_or_default() != 0;
     let last_message = last_message_id_hex.map(|message_id_hex| ChatListMessagePreview {
         retention_seconds,
         retention_expires_at,
@@ -2760,17 +2766,20 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
             .unwrap_or_default()
             .and_then(|value| value.try_into().ok())
             .unwrap_or_default(),
-        tags: row
-            .get::<_, Option<String>>("last_message_tags_json")
-            .unwrap_or_default()
-            .and_then(|json| serde_json::from_str(&json).ok())
-            .unwrap_or_default(),
+        tags: if deleted {
+            Vec::new()
+        } else {
+            row.get::<_, Option<String>>("last_message_tags_json")
+                .unwrap_or_default()
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default()
+        },
         timeline_at: row
             .get::<_, Option<i64>>(16)
             .unwrap_or_default()
             .and_then(|value| value.try_into().ok())
             .unwrap_or_default(),
-        deleted: row.get::<_, i64>(17).unwrap_or_default() != 0,
+        deleted,
         deletion_source,
         attachment_kind: None,
         attachment_count: 0,

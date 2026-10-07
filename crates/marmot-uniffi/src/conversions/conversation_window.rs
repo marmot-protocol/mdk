@@ -427,6 +427,11 @@ fn presented_timeline_with_tokens(
         plaintext: row.plaintext.clone(),
         content_tokens,
         kind: row.kind,
+        sticker: if row.deleted {
+            None
+        } else {
+            app::sticker_ref_from_tags(row.kind, &row.tags).map(Into::into)
+        },
         tags: super::common::message_tags_ffi(presented_custom_tags(row).into_owned()),
         timeline_at: row.timeline_at,
         received_at: row.received_at,

@@ -4763,3 +4763,96 @@ White Noise's deployment: its recovery relays, discovery indexers, media and ima
 
 </details>
 
+<summary>New exports — complete and organize before merging</summary>
+
+### `Marmot::fetch_sticker_asset`
+
+```rust
+pub async fn fetch_sticker_asset( &self, account_ref: String, sticker_ref: StickerRefFfi, ) -> Result<StickerAssetFfi, MarmotKitError>
+```
+
+Downloads one exact sticker after the account has its `(coordinate, shortcode, hash)` mapping. Hosts pass the typed reference from a timeline row; MDK never asks the host to parse tags. A missing mapping returns `StickerNotFound` rather than fetching an unvalidated URL.
+
+[Source](src/commands/sticker.rs#L100)
+
+### `Marmot::fetch_sticker_pack`
+
+```rust
+pub async fn fetch_sticker_pack( &self, account_ref: String, input: String, ) -> Result<StickerPackFfi, MarmotKitError>
+```
+
+Fetches one pack by coordinate or trusted Sonar link, using caller relay hints before the account relays. The requested coordinate is protected from discovery eviction. Call this when the user opens a shared pack, not from a background crawl.
+
+[Source](src/commands/sticker.rs#L52)
+
+### `Marmot::import_signal_sticker_pack`
+
+```rust
+pub async fn import_signal_sticker_pack( &self, account_ref: String, signal_link: String, blossom_server: Option<String>, ) -> Result<StickerImportResultFfi, MarmotKitError>
+```
+
+Imports a canonical HTTPS Signal pack link for a locally signing account. The pack is validated before the first Blossom upload; external-signer accounts are rejected so one import cannot trigger hundreds of signer prompts. The Signal key stays in memory only.
+
+[Source](src/commands/sticker.rs#L87)
+
+### `Marmot::install_sticker_pack`
+
+```rust
+pub async fn install_sticker_pack( &self, account_ref: String, input: String, ) -> Result<StickerPackFfi, MarmotKitError>
+```
+
+Records local install intent and publishes the installed list. This is the user action after previewing a pack; it does not upload sticker bytes.
+
+[Source](src/commands/sticker.rs#L64)
+
+### `Marmot::send_sticker`
+
+```rust
+pub async fn send_sticker( &self, account_ref: String, group_id_hex: String, sticker_ref: StickerRefFfi, ) -> Result<SendSummaryFfi, MarmotKitError>
+```
+
+Sends a kind-9 message carrying one exact sticker reference. The account must already have that reference in its projection, so a host cannot send an arbitrary URL.
+
+[Source](src/commands/message.rs#L56)
+
+### `Marmot::sticker_pack`
+
+```rust
+pub fn sticker_pack( &self, account_ref: String, input: String, ) -> Result<Option<StickerPackFfi>, MarmotKitError>
+```
+
+Reads one cached pack without network I/O. Returns none when the coordinate is absent; use `fetch_sticker_pack` for an explicit network fetch.
+
+[Source](src/commands/sticker.rs#L30)
+
+### `Marmot::sticker_packs`
+
+```rust
+pub fn sticker_packs( &self, account_ref: String, installed_only: bool, search: Option<String>, limit: Option<u32>, ) -> Result<Vec<StickerPackFfi>, MarmotKitError>
+```
+
+Reads the encrypted sticker projection off the UI thread. `installed_only` selects the installed list; search matches public title and description only.
+
+[Source](src/commands/sticker.rs#L12)
+
+### `Marmot::sync_sticker_packs`
+
+```rust
+pub async fn sync_sticker_packs( &self, account_ref: String, ) -> Result<StickerSyncResultFfi, MarmotKitError>
+```
+
+Refreshes at most `MAX_DISCOVERY_PACKS` recent public packs and rebases the installed list. Uninstalled discovery above that bound is pruned; installed packs, pending operations, and message-referenced assets stay.
+
+[Source](src/commands/sticker.rs#L41)
+
+### `Marmot::uninstall_sticker_pack`
+
+```rust
+pub async fn uninstall_sticker_pack( &self, account_ref: String, input: String, ) -> Result<(), MarmotKitError>
+```
+
+Records local uninstall intent and publishes the installed list. Previously received messages can still resolve their exact historical asset.
+
+[Source](src/commands/sticker.rs#L76)
+
+</details>
