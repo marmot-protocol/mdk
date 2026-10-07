@@ -1366,6 +1366,22 @@ impl AppClient {
         !self.pending_applied_effects.is_empty()
     }
 
+    /// A live receive may finish its event queue before its state checkpoint.
+    /// Keep that client and arm repair while it still owns one-shot output or writes.
+    pub(crate) fn arm_failed_receive_projection_retry(&mut self) -> bool {
+        let pending = self.has_pending_effect_projections()
+            || self.pending_applied_sync_summary != SyncSummary::default()
+            || self.pending_failed_sync_summary != SyncSummary::default()
+            || !self.pending_group_projection_updates.is_empty()
+            || !self.pending_local_group_deletion_frontier_clears.is_empty()
+            || !self.pending_projection_updates.is_empty()
+            || !self.pending_application_event_acks.is_empty();
+        if pending {
+            self.pending_runtime_group_subscription_refresh = true;
+        }
+        pending
+    }
+
     pub(crate) fn has_pending_runtime_group_subscription_refresh(&self) -> bool {
         self.pending_runtime_group_subscription_refresh
             || !self.pending_applied_effects.is_empty()
@@ -1386,6 +1402,9 @@ impl AppClient {
         self.retry_applied_effect_projections_buffered().await?;
         let push_cleanup_result = self.retry_pending_push_leaf_reconciliations();
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        let mut checkpointed = std::mem::take(&mut self.pending_failed_sync_summary);
+        checkpointed.merge(std::mem::take(&mut self.pending_applied_sync_summary));
+        self.pending_applied_sync_summary = checkpointed;
         self.refresh_group_routes()?;
         if let Err(error) = self.sync_runtime_groups().await {
             if error.is_account_not_active() {
@@ -2440,11 +2459,7 @@ impl AppClient {
     }
 
     pub(crate) async fn retry_send_applied_effects_best_effort(&mut self) {
-        if self
-            .retry_applied_effect_projections_buffered()
-            .await
-            .is_err()
-        {
+        if self.flush_send_applied_effects().await.is_err() {
             self.pending_runtime_group_subscription_refresh = true;
         }
     }
@@ -6695,6 +6710,83 @@ mod runtime_group_subscription_refresh_tests {
     use crate::tests::ScriptedPushRelayClient;
     use crate::{AppPerformanceTelemetry, MarmotApp};
     use marmot_account::AccountHome;
+
+    /// A send can release a peer's route update without changing membership.
+    /// Its retained observer must install that route and retry a failed rebuild.
+    #[tokio::test]
+    async fn retained_send_route_change_refreshes_subscriptions() {
+        use cgka_traits::TransportEndpoint;
+        use cgka_traits::app_components::{
+            AppComponentData, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, encode_nostr_routing_v1,
+        };
+        use cgka_traits::engine::SendIntent;
+
+        for fail_subscription in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            AccountHome::open(dir.path())
+                .create_account("alice")
+                .unwrap();
+            let relay = Arc::new(ScriptedPushRelayClient::default());
+            let app = MarmotApp::with_relay(dir.path(), "wss://old.example")
+                .with_test_relay_client(relay.clone());
+            let mut client = app.client("alice").await.unwrap();
+            let group_id = client.create_group("retained routing", &[]).await.unwrap();
+            let routes_before = client.routing.snapshot().group_routes;
+            let subscriptions_before = relay.subscription_count();
+            let next_route =
+                NostrRoutingV1::new([0x22; 32], vec!["wss://next.example".into()]).unwrap();
+            // Apply the authenticated component through the real engine, leaving
+            // its one-shot effects for the application-send publication seam.
+            let effects = client
+                .runtime
+                .send(SendIntent::UpdateAppComponents {
+                    group_id: group_id.clone(),
+                    updates: vec![AppComponentData {
+                        component_id: NOSTR_ROUTING_COMPONENT_ID,
+                        data: encode_nostr_routing_v1(&next_route).unwrap(),
+                    }],
+                })
+                .await
+                .unwrap();
+            assert!(effects.failures.is_empty());
+            assert!(!effects.events.is_empty());
+            assert_eq!(client.routing.snapshot().group_routes, routes_before);
+            client
+                .observe_recovery_evidence_then_gate_send_publish(
+                    &effects,
+                    &group_id,
+                    "unrelated-successful-send",
+                )
+                .await
+                .unwrap();
+            assert!(client.has_pending_effect_projections());
+            if fail_subscription {
+                relay.fail_next_subscribe();
+            }
+            client.retry_send_applied_effects_best_effort().await;
+            assert!(!client.has_pending_effect_projections());
+            assert!(client.routing.snapshot().group_routes.iter().any(|route| {
+                route.group_id == group_id
+                    && route.transport_group_id == vec![0x22; 32]
+                    && route.endpoints == vec![TransportEndpoint("wss://next.example".into())]
+            }));
+            assert_eq!(
+                client.has_pending_runtime_group_subscription_refresh(),
+                fail_subscription,
+            );
+            if fail_subscription {
+                // The routing table has already changed, so the retry flag is
+                // the only remaining reason to rebuild the subscriptions.
+                assert!(!client.refresh_group_routes().unwrap().routing_changed);
+                client
+                    .retry_pending_runtime_group_subscription_refresh()
+                    .await
+                    .unwrap();
+                assert!(!client.has_pending_runtime_group_subscription_refresh());
+            }
+            assert!(relay.subscription_count() > subscriptions_before);
+        }
+    }
 
     pub(super) fn projection_fault_connection(app: &MarmotApp) -> rusqlite::Connection {
         let path = app.account_storage_path("alice");

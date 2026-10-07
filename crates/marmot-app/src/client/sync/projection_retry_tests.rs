@@ -100,6 +100,15 @@ async fn restored_copy_retry_preserves_a_new_pending_send() {
 
 #[tokio::test]
 async fn repaired_activity_is_returned_before_its_newer_withdrawal() {
+    assert_repaired_activity_precedes_withdrawal(false).await;
+}
+
+#[tokio::test]
+async fn checkpoint_retry_returns_older_activity_before_retained_withdrawal() {
+    assert_repaired_activity_precedes_withdrawal(true).await;
+}
+
+async fn assert_repaired_activity_precedes_withdrawal(checkpoint_retry: bool) {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
         .create_account("alice")
@@ -135,10 +144,37 @@ async fn repaired_activity_is_returned_before_its_newer_withdrawal() {
         ..Default::default()
     };
     let mut returned = SyncSummary::default();
-    client
-        .observe_account_device_effects(&newer, &mut returned, "newer", 123)
-        .await
-        .unwrap();
+    if checkpoint_retry {
+        client
+            .observe_account_device_effects(
+                &marmot_account::AccountDeviceEffects::default(),
+                &mut returned,
+                "older",
+                122,
+            )
+            .await
+            .unwrap();
+        // The real activity projection succeeded but its enclosing checkpoint
+        // has not: this is the same ownership transfer as a failed drain save.
+        let (unreported, _) = client.checkpoint_failure_summary(
+            returned,
+            SyncCheckpointError::BeforePersistence(AppError::BlockingTask(
+                "injected checkpoint failure".into(),
+            )),
+        );
+        assert!(unreported.projection_updates.is_empty());
+        client.retain_applied_effects(&newer);
+        client
+            .retry_pending_runtime_group_subscription_refresh()
+            .await
+            .unwrap();
+        returned = client.take_pending_applied_sync_summary();
+    } else {
+        client
+            .observe_account_device_effects(&newer, &mut returned, "newer", 123)
+            .await
+            .unwrap();
+    }
     let mut window = crate::TimelinePage {
         messages: vec![],
         has_more_before: false,

@@ -775,9 +775,11 @@ pub(crate) fn capture_structural_progress_snapshot<S: StorageProvider>(
             .stored_group_record(group_id)?
             .is_some_and(|group| !group.is_terminal() && !group.unrecoverable)
         && pass.as_ref().is_none_or(|pass| !pass.is_active());
-    if (pass.is_none() && pending_work.unresolved_convergence_inputs > 0)
-        || confirmation_replay_ready
-    {
+    // Diagnostic unresolved work includes replay markers even while blocked.
+    // Only the gated readiness above can make those markers runnable.
+    let canonical_inputs = engine.has_pending_convergence_inputs(group_id)?
+        || engine.has_pending_canonical_applications(group_id)?;
+    if (pass.is_none() && canonical_inputs) || confirmation_replay_ready {
         runnable_work = runnable_work.saturating_add(1);
     }
     runnable_work = runnable_work

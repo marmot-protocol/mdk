@@ -2316,6 +2316,15 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
                 None,
                 "terminal and unrecoverable copies must not arm replay"
             );
+            #[cfg(feature = "test-conformance-snapshot")]
+            assert_eq!(
+                alice
+                    .conformance_structural_progress_snapshot(&group_id)
+                    .unwrap()
+                    .runnable_work,
+                0,
+                "diagnostics must not bypass the terminal/unrecoverable replay gate"
+            );
         }
         storage.put_group(&runnable).unwrap();
         assert_eq!(
@@ -2349,6 +2358,15 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
                 .unwrap(),
             None,
             "retained replay cannot run during pending publication"
+        );
+        #[cfg(feature = "test-conformance-snapshot")]
+        assert_eq!(
+            alice
+                .conformance_structural_progress_snapshot(&group_id)
+                .unwrap()
+                .runnable_work,
+            0,
+            "diagnostics must not bypass the pending-publication replay gate"
         );
         fault.replay.arm(1);
         alice.confirm_published(next_pending).await.unwrap();

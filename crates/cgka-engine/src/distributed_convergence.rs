@@ -1657,24 +1657,25 @@ impl<S: StorageProvider> Engine<S> {
                     now_ms,
                 );
             }
-            let terminalized = self
-                .settle_disband_after_convergence(
-                    group_id,
-                    &result.accepted_commits,
-                    origin_commit_id.as_ref(),
-                    &group_changes,
-                )
-                .map_err(|error| OpenMlsProjectionError::Storage(error.to_string()))?;
-            if !terminalized {
+            // The canonical transaction already committed these non-disband
+            // effects. Publish them before unrelated, fallible candidate cleanup
+            // can return: a removed copy cannot reconstruct its old membership.
+            if let Some(membership_effects) = membership_effects {
                 self.emit_convergence_events(
                     group_id,
-                    membership_effects.expect("non-disband selection prepared membership"),
+                    membership_effects,
                     previous_tip,
                     selected_tip,
                     &group_changes,
                 )?;
             }
-            terminalized
+            self.settle_disband_after_convergence(
+                group_id,
+                &result.accepted_commits,
+                origin_commit_id.as_ref(),
+                &group_changes,
+            )
+            .map_err(|error| OpenMlsProjectionError::Storage(error.to_string()))?
         } else {
             self.settle_disband_after_convergence(
                 group_id,

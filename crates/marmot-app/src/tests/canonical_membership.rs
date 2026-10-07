@@ -1624,6 +1624,15 @@ async fn failed_push_sweep_does_not_block_other_groups_or_routes() {
 #[tokio::test]
 #[cfg(feature = "test-policy-overrides")]
 async fn managed_worker_keeps_activity_retry_while_live_delivery_waits() {
+    assert_managed_worker_retains_activity(false).await;
+}
+
+#[tokio::test]
+async fn managed_worker_keeps_activity_after_late_checkpoint_failure() {
+    assert_managed_worker_retains_activity(true).await;
+}
+
+async fn assert_managed_worker_retains_activity(late_checkpoint: bool) {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     let alice_account = home.create_account("alice").unwrap();
@@ -1674,7 +1683,12 @@ async fn managed_worker_keeps_activity_retry_while_live_delivery_waits() {
         .await
         .unwrap();
     let baseline = timeline.take_snapshot().messages.len();
-    connection.execute_batch("CREATE TRIGGER fail_live_activity BEFORE INSERT ON app_events WHEN NEW.kind = 1210 BEGIN SELECT RAISE(FAIL, 'injected live activity'); END;").unwrap();
+    let fault = if late_checkpoint {
+        "CREATE TRIGGER fail_live_activity BEFORE INSERT ON account_groups WHEN NEW.profile_name = 'surviving worker rename' BEGIN SELECT RAISE(FAIL, 'injected late checkpoint'); END;"
+    } else {
+        "CREATE TRIGGER fail_live_activity BEFORE INSERT ON app_events WHEN NEW.kind = 1210 BEGIN SELECT RAISE(FAIL, 'injected live activity'); END;"
+    };
+    connection.execute_batch(fault).unwrap();
     let cursor = relay.published_events.lock().unwrap().len();
     bob.update_group_profile(&group, Some("surviving worker rename"), None)
         .await

@@ -2381,10 +2381,10 @@ async fn run_app_runtime_account_worker(
                             &account_label,
                             account_error_message("runtime receive failed", &err),
                         );
-                        if client.has_pending_effect_projections() {
-                            // Reopening cannot reconstruct consumed activity events.
-                            // Keep this client and pause live admission while the
-                            // existing bounded projection retry owns the debt.
+                        if client.arm_failed_receive_projection_retry() {
+                            // Reopening cannot reconstruct consumed activity events
+                            // or the output of a batch awaiting its state checkpoint.
+                            // Keep the owning client for the bounded projection retry.
                             scheduled_runtime_group_subscription_refresh.observe_pending(
                                 true, &command_tx,
                             );

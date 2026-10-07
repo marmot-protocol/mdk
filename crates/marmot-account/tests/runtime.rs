@@ -5547,17 +5547,70 @@ async fn later_restoration_reschedules_periodic_maintenance_without_reviving_fai
             // Retained-history repair has restored canonical membership before
             // its notification reaches this account runtime, in a later batch.
             storage.put_group(&live).unwrap();
+            runtime = runtime.with_maintenance_sources(
+                wall.clone(),
+                Arc::new(TestMonotonicClock::default()),
+                Arc::new(TestRandom::new(0)),
+            );
             runtime
                 .publish_session_effects(effects(GroupEvent::LocalGroupCopyRestored {
                     group_id: group.clone(),
                 }))
                 .await
                 .unwrap();
-            let restored = runtime
+            let mut restored = runtime
                 .session()
                 .group_maintenance(&group)
                 .unwrap()
                 .unwrap();
+            let failed_periodic = if let Some(deadline) = restored.next_periodic_rotation_at {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(b"marmot-periodic-self-update-v1");
+                hasher.update((group.as_slice().len() as u64).to_be_bytes());
+                hasher.update(group.as_slice());
+                hasher.update(deadline.0.to_be_bytes());
+                let mut periodic = failed.clone();
+                periodic.id = cgka_traits::MessageId::new(hasher.finalize().to_vec());
+                periodic.trigger = cgka_traits::MaintenanceTrigger::Periodic;
+                runtime
+                    .session()
+                    .put_maintenance_obligation(&periodic)
+                    .unwrap();
+                storage.put_group(&removed).unwrap();
+                runtime
+                    .publish_session_effects(effects(GroupEvent::LocalGroupCopyTerminated {
+                        group_id: group.clone(),
+                        voluntary: false,
+                    }))
+                    .await
+                    .unwrap();
+                storage.put_group(&live).unwrap();
+                // Repeat the same sampled deadline: its failed ID cannot be reused.
+                runtime = runtime.with_maintenance_sources(
+                    wall.clone(),
+                    Arc::new(TestMonotonicClock::default()),
+                    Arc::new(TestRandom::new(0)),
+                );
+                runtime
+                    .publish_session_effects(effects(GroupEvent::LocalGroupCopyRestored {
+                        group_id: group.clone(),
+                    }))
+                    .await
+                    .unwrap();
+                restored = runtime
+                    .session()
+                    .group_maintenance(&group)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    restored.next_periodic_rotation_at,
+                    Some(Timestamp(deadline.0 + 1))
+                );
+                Some(periodic)
+            } else {
+                None
+            };
             assert_eq!(restored.periodic_enrolled, enrolled);
             assert_eq!(restored.next_periodic_rotation_at.is_some(), enrolled);
             if let Some(deadline) = restored.next_periodic_rotation_at {
@@ -5571,6 +5624,15 @@ async fn later_restoration_reschedules_periodic_maintenance_without_reviving_fai
                 assert!(obligations.iter().any(|item| item.id != failed_id
                     && item.trigger == cgka_traits::MaintenanceTrigger::Periodic
                     && item.phase != cgka_traits::MaintenancePhase::Failed));
+            }
+            if let Some(periodic) = failed_periodic {
+                assert_eq!(
+                    runtime
+                        .session()
+                        .maintenance_obligation(&periodic.id)
+                        .unwrap(),
+                    Some(periodic)
+                );
             }
             assert_eq!(
                 runtime

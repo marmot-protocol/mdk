@@ -28,11 +28,14 @@
 
 - Identical same-actor fork activity retains its reaction target when a fresh
   canonical commit replaces a withdrawn origin; adoption and revival are atomic.
-  Canonical removal and membership cleanup commit together. Later retained-history
-  restoration resumes enrolled periodic maintenance without reviving failed work.
+  Canonical removal and membership cleanup commit together; their native events
+  survive later candidate-cleanup failures. Retained-history restoration resumes
+  enrolled periodic maintenance without reusing failed work IDs.
 - Projection retry retains bookkeeping and failed-message updates as well as
-  native events. Live receive keeps the owning client while projection is pending;
-  comparison admission/checkpoint failures preserve repaired subscriber updates.
+  native events. Live receive keeps the owning client until projection and its
+  checkpoint finish. Outbound sends reconcile retained route changes and retry
+  failed subscription rebuilds. Comparison admission/checkpoint failures preserve
+  repaired subscriber updates.
   A second local deletion discards obsolete retained projections. Terminal groups
   that never reached app projection do not stall later batches. Queues remain
   session-local; this does not claim crash-durable activity replay.
