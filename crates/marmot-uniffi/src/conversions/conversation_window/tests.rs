@@ -268,7 +268,17 @@ fn bench_prepared_conversation_conversion() {
                                 ),
                             );
                         }
-                        black_box(presented_timeline_with_tokens(row, false, cached.2.clone()));
+                        black_box(presented_timeline_with_tokens(
+                            row,
+                            false,
+                            cached.2.clone(),
+                            if row.deleted {
+                                None
+                            } else {
+                                marmot_app::sticker_ref_from_tags(row.kind, &row.tags)
+                                    .map(Into::into)
+                            },
+                        ));
                     }
                 }
                 let token_only = started.elapsed();

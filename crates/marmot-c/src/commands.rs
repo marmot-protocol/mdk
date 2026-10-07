@@ -3433,6 +3433,8 @@ pub unsafe extern "C" fn marmot_sticker_packs(
     out: *mut *mut MarmotStickerPackList,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+
         let client = try_arg!(unsafe { client_ref(client) });
         let account_ref = try_arg!(unsafe { required_str(account_ref) });
         let search = try_arg!(unsafe { crate::memory::optional_str(search) });
@@ -3503,6 +3505,8 @@ pub unsafe extern "C" fn marmot_fetch_sticker_asset(
     out: *mut *mut MarmotStickerAsset,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+
         let client = try_arg!(unsafe { client_ref(client) });
         let account_ref = try_arg!(unsafe { required_str(account_ref) });
         let sticker_ref = marmot_uniffi::StickerRefFfi {
@@ -3534,6 +3538,8 @@ pub unsafe extern "C" fn marmot_send_sticker(
     out: *mut *mut MarmotSendSummary,
 ) -> MarmotStatus {
     ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+
         let client = try_arg!(unsafe { client_ref(client) });
         let account_ref = try_arg!(unsafe { required_str(account_ref) });
         let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
