@@ -131,6 +131,9 @@ PLUGIN_ONLY_PATHS = HERMES_PATHS | {"scripts/install-openclaw-marmot.sh"}
 
 
 def _is_documentation(path: str) -> bool:
+    if path.startswith("vendor/"):
+        return False
+
     executable_markdown = path in EXECUTABLE_MARKDOWN or path.startswith(
         EXECUTABLE_MARKDOWN_PREFIXES
     )

@@ -23,6 +23,10 @@ This repair adds no advisory suppressions. The fixed KEM brings its matching lib
 transitive dependency versions; older versions needed by the unchanged HPKE
 provider coexist. OpenMLS and HPKE's public 0.7 interfaces stay pinned.
 
+Container builders copy `vendor/` alongside the workspace manifests. CI treats
+vendored files as build inputs, including `Readme.md`, which the provider embeds
+with `include_str!`.
+
 ## Reproduce the compatibility and security checks
 
 From the MDK repository root:
