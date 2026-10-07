@@ -25,9 +25,9 @@ storage, QUIC previews, or backend-specific CLI semantics.
 ## First installation and verification
 
 For admin promotion, task titles and progress reactions, see the
-[recommended chat setup](../README.md#recommended-chat-setup). Every ordinary turn
-provides the shared `wn-agent group-profile` route for admin name/description
-updates. Verify the installed command, backend PATH and authorized socket access;
+[recommended chat setup](../README.md#recommended-chat-setup). Claude Code,
+Codex, OpenCode and Pi provide the shared `wn-agent group-profile` route on each
+ordinary turn for admin name/description updates. Verify the installed command, backend PATH and authorized socket access;
 see [Admin group profile updates](#admin-group-profile-updates). Progress reactions
 need a separately configured tool. The suggested instruction block is not
 installed automatically.
@@ -62,8 +62,8 @@ The default homes/services differ by runtime. For a second instance of the
 **same** harness, make its home, socket, bootstrap label, agent service,
 harness service and launchd labels distinct. Changing only `--home` does not
 change a service name or the default session-map path. Set a separate
-`WN_CLAUDE_STATE_PATH`, `WN_CODEX_STATE_PATH`, `WN_OPENCODE_STATE_PATH` or
-`WN_PI_STATE_PATH` for same-kind instances; Pi's backend session directory also
+`WN_CLAUDE_STATE_PATH`, `WN_CODEX_STATE_PATH`, `WN_OPENCODE_STATE_PATH`,
+`WN_PI_STATE_PATH` or `WN_GOOSE_STATE_PATH` for same-kind instances; Pi's backend session directory also
 needs its own `WN_PI_SESSION_DIR` when explicitly overridden. Persist these
 settings in the actual service/launcher, not just the install shell.
 
@@ -128,6 +128,7 @@ provider login and tokens private; do not paste them into White Noise.
 | Codex | Recognized images and the documented staged-file classes | Opt-in completion manifest with an exact group/export-root grant |
 | OpenCode | Its documented text/image/PDF classifications | Not implemented |
 | Pi | Its documented image or nonempty NUL-free UTF-8 classifications | Not implemented |
+| Goose | Non-empty file batches are rejected before invocation | Not implemented |
 
 See the exact [Codex](../codex/marmot/README.md#inbound-attachments),
 [OpenCode](../opencode/marmot/README.md#inbound-attachments) and

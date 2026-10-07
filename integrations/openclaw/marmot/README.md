@@ -21,7 +21,6 @@ the Python Hermes plugin in [`../../hermes/marmot/`](../../hermes/marmot).
 
 - [What you can do](#what-you-can-do)
 - [First-install checklist](#first-install-checklist)
-
 - [Admin group profile tool](#admin-group-profile-tool)
 - [Install (release)](#install-release)
 - [Dev setup](#dev-setup)
