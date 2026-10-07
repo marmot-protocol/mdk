@@ -2,7 +2,8 @@
 
 `marmot-terminal-harness` is the shared Rust runtime behind
 [`wn-claude`](../claude/marmot), [`wn-codex`](../codex/marmot),
-[`wn-opencode`](../opencode/marmot), and [`wn-pi`](../pi/marmot). It keeps the
+[`wn-opencode`](../opencode/marmot), [`wn-pi`](../pi/marmot), and
+[`wn-goose`](../goose/marmot). It keeps the
 Marmot-facing behavior of pure terminal connectors consistent while leaving
 backend command construction and event parsing in each connector crate.
 
@@ -46,7 +47,7 @@ process group at once and fails the turn without keeping the session id
 observed in that run. The backend may already have acted on the prompt before
 the decoder reports the failure.
 
-Claude Code, Codex, OpenCode, and Pi write prompt text to stdin. Backend-specific behavior
+Claude Code, Codex, OpenCode, Pi, and Goose write prompt text to stdin. Backend-specific behavior
 belongs in those connector crates, not in this shared runtime.
 
 ## Execution Profiles
@@ -65,6 +66,7 @@ the backends have equivalent permission or sandbox systems:
 | Claude Code | Existing permission config | `--permission-mode acceptEdits`; explicit denies remain and other unanswered asks are denied | `--dangerously-skip-permissions` | None |
 | Pi | Existing tool/config behavior | Same native approval-free invocation | Same native approval-free invocation | None |
 | OpenCode | Existing permission config | `--auto`; explicit denies remain | `--auto` plus process-local `OPENCODE_CONFIG_CONTENT={"permission":"allow"}` | None |
+| Goose | Existing `GOOSE_MODE` and config; headless approve modes fail the turn on the first ask | Rejected at startup and by the installer; no Goose mode keeps denies without asking | Process-local `GOOSE_MODE=auto`; `never_allow` is not consulted | None |
 | Codex | Existing approval, sandbox, and network config | `approval_policy="never"`; sandbox/network remain configured | `--dangerously-bypass-approvals-and-sandbox` | Configured for `inherit`/`autonomous`; bypassed for `unrestricted` |
 
 The OpenCode overlay is set only on the spawned process and never rewrites the
@@ -81,7 +83,8 @@ Installers accept `--execution-profile inherit|autonomous|unrestricted` and
 write the shared environment variable into the private env file and same-user
 service configuration. Writing `unrestricted` requires the separate
 `--acknowledge-unrestricted` flag, including in non-interactive and dry-run
-installs.
+installs. The Goose installer refuses `autonomous` because `wn-goose` would
+reject it at startup.
 
 ### Security Boundary
 
@@ -248,6 +251,7 @@ and backend contracts:
 - [`integrations/codex/marmot/README.md`](../codex/marmot/README.md)
 - [`integrations/opencode/marmot/README.md`](../opencode/marmot/README.md)
 - [`integrations/pi/marmot/README.md`](../pi/marmot/README.md)
+- [`integrations/goose/marmot/README.md`](../goose/marmot/README.md)
 
 ## Development
 
@@ -259,18 +263,21 @@ cargo test -p wn-claude
 cargo test -p wn-codex
 cargo test -p wn-opencode
 cargo test -p wn-pi
+cargo test -p wn-goose
 
 just claude-dev-e2e-connector
 just codex-dev-e2e-connector
 just opencode-dev-e2e-connector
 just pi-dev-e2e-connector
+just goose-dev-e2e-connector
 
 just claude-installer-test
 just codex-installer-test
 just opencode-installer-test
 just pi-installer-test
+just goose-installer-test
 ```
 
 The process-level connector tests are ignored by default and use real
 `wn-agent` and connector binaries with fake backend executables. They do not
-install or authenticate the real Claude Code, Codex, OpenCode, or Pi CLIs.
+install or authenticate the real Claude Code, Codex, OpenCode, Pi, or Goose CLIs.
