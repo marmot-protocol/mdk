@@ -30,10 +30,13 @@
   local MLS leaf remains active, without emitting a false restoration event.
   Activity from commits preceding a disband survives a later terminal-cleanup
   failure. Confirmation replay retries share the normal background row and time
-  budget and resume beyond an unchanged deferred prefix.
+  budget and resume beyond an unchanged deferred prefix. An admitted slice makes
+  progress even when storage preparation consumes its wall-time allowance.
 - Quiet projection repair releases the accepted delivery's cursor pin. Resumed
   chat and poll publications wake recipients after source revival and checkpoint;
   projection or checkpoint failures retain that session's notification obligation.
+  Sent wake ownership lasts through partial fanout acceptance and acknowledgement
+  retry, preventing duplicate wakes from resumed publications or direct-send cleanup.
 
 - Identical same-actor fork activity retains its reaction target when a fresh
   canonical commit replaces a withdrawn origin; adoption and revival are atomic.

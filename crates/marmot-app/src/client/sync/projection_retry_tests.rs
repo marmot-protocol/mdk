@@ -1233,7 +1233,18 @@ async fn resumed_publication_wakes_after_revival_and_checkpoint() {
             "withdrawn",
             "forgotten",
             "terminal",
+            "acknowledgement",
+            "direct_acknowledgement",
+            "incomplete_fanout",
         ] {
+            if matches!(fault, "acknowledgement" | "direct_acknowledgement")
+                && !cfg!(feature = "test-policy-overrides")
+            {
+                continue;
+            }
+            if fault == "direct_acknowledgement" && kind != MARMOT_APP_EVENT_KIND_CHAT {
+                continue;
+            }
             let dir = tempfile::tempdir().unwrap();
             let home = AccountHome::open(dir.path());
             let alice = home.create_account("alice").unwrap();
@@ -1271,6 +1282,25 @@ async fn resumed_publication_wakes_after_revival_and_checkpoint() {
                 },
             )
             .unwrap();
+            if fault == "direct_acknowledgement" {
+                client.fail_next_published_app_message_acknowledgement = true;
+                let before = relay.published_event_ids().len();
+                client.send(&group, b"direct wake ownership").await.unwrap();
+                assert_eq!(relay.published_event_ids().len(), before + 2);
+                assert_eq!(client.pending_resumed_message_notifications.len(), 1);
+                assert!(!client.has_pending_runtime_group_subscription_refresh());
+                client
+                    .advance_convergence_after_runtime_sync(&group)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    relay.published_event_ids().len(),
+                    before + 2,
+                    "direct-send cleanup must not duplicate its wake"
+                );
+                assert!(client.pending_resumed_message_notifications.is_empty());
+                continue;
+            }
             let now = unix_now_seconds();
             let tags = if kind == MARMOT_APP_EVENT_KIND_POLL {
                 cgka_traits::poll_tags(
@@ -1311,11 +1341,55 @@ async fn resumed_publication_wakes_after_revival_and_checkpoint() {
                 .await
                 .unwrap();
             assert_eq!(effects.published_app_messages.len(), 1);
+            if fault == "incomplete_fanout" {
+                let original = client
+                    .runtime
+                    .session()
+                    .outbound_fanouts_for_group(&group)
+                    .unwrap()
+                    .remove(0);
+                let mut request = original.request().clone();
+                let cgka_traits::TransportPublishTarget::Group { endpoints, .. } =
+                    &mut request.target
+                else {
+                    panic!("group send")
+                };
+                endpoints.push(cgka_traits::TransportEndpoint(
+                    "wss://second.example".into(),
+                ));
+                let mut partial = cgka_traits::OutboundFanout::stage(
+                    request,
+                    None,
+                    Some(group.clone()),
+                    original.created_at_ms(),
+                )
+                .unwrap();
+                partial
+                    .set_application_message(original.application_message().unwrap().clone())
+                    .unwrap();
+                partial
+                    .record_published_message_id(
+                        effects.published_app_messages[0].message_id.clone(),
+                    )
+                    .unwrap();
+                partial.mark_target_accepted(0).unwrap();
+                client
+                    .runtime
+                    .session()
+                    .delete_outbound_fanout(original.message_id())
+                    .unwrap();
+                client
+                    .runtime
+                    .session()
+                    .put_outbound_fanout(&partial)
+                    .unwrap();
+            }
             let before = relay.published_event_ids().len();
             let connection =
                 super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
             match fault {
                 "terminal" => crate::tests::make_group_terminal(&client, &group, false),
+                "acknowledgement" => client.fail_next_published_app_message_acknowledgement = true,
                 "checkpoint" | "forgotten" => connection.execute_batch("CREATE TRIGGER fail_resumed_checkpoint BEFORE INSERT ON account_groups BEGIN SELECT RAISE(FAIL, 'injected checkpoint'); END;").unwrap(),
                 "revival" => connection.execute_batch("CREATE TRIGGER fail_resumed_revival BEFORE INSERT ON chat_list_rows WHEN EXISTS (SELECT 1 FROM app_events WHERE invalidated = 0 AND source_message_id_hex IS NOT NULL) BEGIN SELECT RAISE(FAIL, 'injected revival'); END;").unwrap(),
                 "withdrawn" => { app.invalidate_timeline_app_event("alice", &group_hex, &event.id, "fork_loser").unwrap(); },
@@ -1370,6 +1444,49 @@ async fn resumed_publication_wakes_after_revival_and_checkpoint() {
                 expected,
                 "kind={kind} fault={fault}"
             );
+            if fault == "incomplete_fanout" {
+                assert_eq!(client.pending_resumed_message_notifications.len(), 1);
+                assert!(!client.has_pending_runtime_group_subscription_refresh());
+                client
+                    .observe_scheduled_convergence_effects(&group, &effects)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    relay.published_event_ids().len(),
+                    expected,
+                    "incomplete fanout metadata must not duplicate its wake"
+                );
+                let mut partial = client
+                    .runtime
+                    .session()
+                    .outbound_fanouts_for_group(&group)
+                    .unwrap()
+                    .remove(0);
+                partial.mark_attempt_started(1).unwrap();
+                client
+                    .runtime
+                    .session()
+                    .put_outbound_fanout(&partial)
+                    .unwrap();
+                partial.mark_target_accepted(1).unwrap();
+                client
+                    .runtime
+                    .session()
+                    .put_outbound_fanout(&partial)
+                    .unwrap();
+            }
+            if matches!(fault, "acknowledgement" | "incomplete_fanout") {
+                assert_eq!(client.pending_resumed_message_notifications.len(), 1);
+                client
+                    .advance_convergence_after_runtime_sync(&group)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    relay.published_event_ids().len(),
+                    expected,
+                    "acknowledgement replay must not duplicate a wake"
+                );
+            }
             assert!(
                 client.pending_resumed_message_notifications.is_empty(),
                 "kind={kind} fault={fault}"

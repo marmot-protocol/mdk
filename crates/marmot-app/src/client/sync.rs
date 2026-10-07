@@ -693,6 +693,14 @@ pub(crate) struct PendingAppliedEffects {
     failed_message_update: Option<Option<storage_sqlite::TimelineProjectionUpdate>>,
 }
 
+/// Session-owned wake state, retained until durable fanout cleanup prevents replay.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingMessageNotification {
+    Waiting,
+    Ready,
+    Sent,
+}
+
 /// Completed work must not run against messages created after a restoration.
 #[derive(Clone, Default)]
 struct EffectProjectionProgress {
@@ -1380,7 +1388,7 @@ impl AppClient {
             || self
                 .pending_resumed_message_notifications
                 .values()
-                .any(|ready| *ready);
+                .any(|state| *state == PendingMessageNotification::Ready);
         if pending {
             self.pending_runtime_group_subscription_refresh = true;
         }
@@ -1394,7 +1402,7 @@ impl AppClient {
             || self
                 .pending_resumed_message_notifications
                 .values()
-                .any(|ready| *ready)
+                .any(|state| *state == PendingMessageNotification::Ready)
     }
 
     /// Retry an ordinary group-subscription rebuild that was deliberately
@@ -2106,7 +2114,7 @@ impl AppClient {
         if routes_dirty || routes_changed {
             self.sync_runtime_groups().await?;
         }
-        Ok(())
+        self.retire_completed_message_notification_ownership()
     }
 
     /// Retain drained native events until every app storage projection succeeds.
@@ -2207,8 +2215,9 @@ impl AppClient {
                     if let Some(ready) = self
                         .pending_resumed_message_notifications
                         .get_mut(&(published.group_id.clone(), published.app_event_id.clone()))
+                        && *ready != PendingMessageNotification::Sent
                     {
-                        *ready = true;
+                        *ready = PendingMessageNotification::Ready;
                     }
                 }
             }
@@ -5323,7 +5332,7 @@ impl AppClient {
         for published in &effects.published_app_messages {
             self.pending_resumed_message_notifications
                 .entry((published.group_id.clone(), published.app_event_id.clone()))
-                .or_insert(false);
+                .or_insert(PendingMessageNotification::Waiting);
         }
         self.retain_effect_projection(effects, "", unix_now_seconds(), false);
         if let Err(error) = fail_if_publish_failed(effects) {
@@ -5380,7 +5389,7 @@ impl AppClient {
         let ready = self
             .pending_resumed_message_notifications
             .iter()
-            .filter(|(_, ready)| **ready)
+            .filter(|(_, state)| **state == PendingMessageNotification::Ready)
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         let mut groups = HashSet::new();
@@ -5411,11 +5420,62 @@ impl AppClient {
                 .iter()
                 .filter(|(candidate, _)| candidate == &group)
             {
-                self.pending_resumed_message_notifications.remove(key);
+                self.pending_resumed_message_notifications
+                    .insert(key.clone(), PendingMessageNotification::Sent);
             }
         }
         for key in completed {
-            self.pending_resumed_message_notifications.remove(&key);
+            if self.pending_resumed_message_notifications.get(&key)
+                != Some(&PendingMessageNotification::Sent)
+            {
+                self.pending_resumed_message_notifications.remove(&key);
+            }
+        }
+        self.retire_completed_message_notification_ownership()
+    }
+
+    /// A direct send owns the same wake as its later accepted-fanout cleanup.
+    pub(super) fn remember_message_notification_sent(&mut self, group: &GroupId, id: &str) {
+        self.pending_resumed_message_notifications.insert(
+            (group.clone(), id.to_owned()),
+            PendingMessageNotification::Sent,
+        );
+        if self
+            .retire_completed_message_notification_ownership()
+            .is_err()
+        {
+            self.pending_runtime_group_subscription_refresh = true;
+        }
+    }
+
+    /// Acknowledgement may partly succeed or retain an incomplete fanout. Only
+    /// its actual absence retires sent ownership, using the affected groups.
+    fn retire_completed_message_notification_ownership(&mut self) -> Result<(), AppError> {
+        let groups = self
+            .pending_resumed_message_notifications
+            .iter()
+            .filter(|(_, state)| **state == PendingMessageNotification::Sent)
+            .map(|((group, _), _)| group.clone())
+            .collect::<HashSet<_>>();
+        for group in groups {
+            let fanouts = match self.runtime.session().outbound_fanouts_for_group(&group) {
+                Ok(fanouts) => fanouts,
+                Err(error) => {
+                    self.pending_runtime_group_subscription_refresh = true;
+                    return Err(error.into());
+                }
+            };
+            let retained = fanouts
+                .iter()
+                .filter_map(|fanout| fanout.application_message())
+                .map(|message| &message.app_event_id)
+                .collect::<HashSet<_>>();
+            self.pending_resumed_message_notifications
+                .retain(|(candidate, id), state| {
+                    candidate != &group
+                        || *state != PendingMessageNotification::Sent
+                        || retained.contains(id)
+                });
         }
         Ok(())
     }

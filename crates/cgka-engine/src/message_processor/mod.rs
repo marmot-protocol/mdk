@@ -3734,9 +3734,11 @@ impl<S: StorageProvider> Engine<S> {
             visited.retain(|id| retained_ids.contains(id));
             records.retain(|record| !visited.contains(&record.id));
         }
-        for record in records {
+        for (index, record) in records.into_iter().enumerate() {
             if let Some(budget) = execution.as_mut() {
-                if budget.exhausted() {
+                // Admission above reserves one complete row: preparation may
+                // consume the deadline, but must not cause endless empty turns.
+                if index != 0 && budget.exhausted() {
                     return Ok(false);
                 }
                 budget.consume_row();

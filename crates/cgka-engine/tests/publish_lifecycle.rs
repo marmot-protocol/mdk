@@ -1072,6 +1072,7 @@ struct ConfirmationFault {
     membership: ProcessedFault,
     after_anchor: Arc<AtomicUsize>,
     replay: ProcessedFault,
+    replay_delay: ProcessedFault,
 }
 
 impl ProcessedFault {
@@ -1183,6 +1184,18 @@ impl MessageStorage for FaultStorage {
             .inner
             .list_messages_in_states(group_id, states, at_or_after_epoch)?;
         self.message_rows.fetch_add(records.len(), Ordering::SeqCst);
+        if states
+            == [
+                MessageState::Created,
+                MessageState::Retryable,
+                MessageState::PeelDeferred,
+            ]
+            && self.confirmation_fault.replay_delay.should_fail()
+        {
+            // Exceed the public background quantum during preparation, before
+            // replay gets the first complete row. The retry must still progress.
+            std::thread::sleep(std::time::Duration::from_millis(600));
+        }
         Ok(records)
     }
     fn put_pending_application_event(
@@ -2421,7 +2434,11 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
         assert!(alice.drain_events().is_empty());
         let mut replay_events = Vec::new();
         let mut turns = 0;
-        for _ in 0..8 {
+        for turn in 0..8 {
+            let delayed_preparation = turn < 2 && !matches!(mode, Advance::DeterministicInputs);
+            if delayed_preparation {
+                fault.replay_delay.arm(1);
+            }
             assert_eq!(
                 alice
                     .prepare_convergence_cutoff_delay_ms(&group_id)
@@ -2444,6 +2461,12 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
                 delivered <= 64,
                 "one background turn exceeded its shared row allowance: {delivered}"
             );
+            if delayed_preparation {
+                assert_eq!(
+                    delivered, 1,
+                    "slow preparation must allow one complete row, then yield"
+                );
+            }
             replay_events.extend(events);
             if retained_ids
                 .iter()
