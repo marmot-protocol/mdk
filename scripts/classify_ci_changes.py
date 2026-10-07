@@ -253,6 +253,7 @@ def classify(paths: list[str], *, force_all: bool = False) -> dict[str, bool]:
             path.startswith((
                 "integrations/terminal-harness/", "integrations/claude/",
                 "integrations/codex/", "integrations/pi/", "integrations/opencode/",
+                "integrations/goose/",
             ))
             for path in normalized
         ),

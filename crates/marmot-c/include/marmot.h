@@ -1139,6 +1139,11 @@ typedef struct MarmotAttachmentTransferSubscription MarmotAttachmentTransferSubs
 typedef struct MarmotBlockListSubscription MarmotBlockListSubscription;
 
 /**
+ * Read-only marker owned by its presented row. Borrow only while the row is live.
+ */
+typedef struct MarmotChatListDraftVersion MarmotChatListDraftVersion;
+
+/**
  * Opaque handle to one account's durable chat-list projection: an
  * initial row snapshot, then row upserts (`next`) or raw deltas
  * including row removals (`next_update`).
@@ -2982,6 +2987,7 @@ typedef struct MarmotConversationPresentation {
 } MarmotConversationPresentation;
 
 typedef struct MarmotPresentedChatRow {
+  struct MarmotChatListDraftVersion *draft_version;
   struct MarmotSelectedChatPreview preview;
   struct MarmotChatListRowActions actions;
   struct MarmotChatListRow row;
@@ -10493,6 +10499,17 @@ MarmotStatus marmot_selected_message_draft(const struct MarmotClient *client,
                                            const char *account_ref,
                                            const char *group_id_hex,
                                            struct MarmotSelectedMessageDraft **out);
+
+/**
+ * Compare an opaque chat-list draft version with a selected revision.
+ * Returns zero for a foreign store/group or a newer draft.
+ * # Safety
+ * revision's owning draft/snapshot and version's owning row remain live;
+ * out is writable. Inputs are borrowed for this call only.
+ */
+MarmotStatus marmot_message_draft_revision_includes_chat_list_version(const struct MarmotMessageDraftRevision *revision,
+                                                                      const struct MarmotChatListDraftVersion *version,
+                                                                      uint8_t *out);
 
 /**
  * Clear only this selected revision; later edits are preserved.

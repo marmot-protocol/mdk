@@ -16,6 +16,7 @@ INSTALLERS = (
     "install-codex-marmot.sh",
     "install-opencode-marmot.sh",
     "install-pi-marmot.sh",
+    "install-goose-marmot.sh",
 )
 SCAN_SUFFIXES = {".md", ".sh", ".yaml", ".yml"}
 SCAN_EXCLUDES = {
@@ -36,6 +37,7 @@ DOCUMENTED_INSTALL_CALLS = {
         "install-codex-marmot.sh": 2,
         "install-opencode-marmot.sh": 1,
         "install-pi-marmot.sh": 1,
+        "install-goose-marmot.sh": 1,
     },
     # The repository-level quickstart owns release commands. The crate-level
     # connector guide intentionally links there rather than duplicating them.
@@ -45,6 +47,7 @@ DOCUMENTED_INSTALL_CALLS = {
     "integrations/codex/marmot/README.md": {"install-codex-marmot.sh": 1},
     "integrations/opencode/marmot/README.md": {"install-opencode-marmot.sh": 2},
     "integrations/pi/marmot/README.md": {"install-pi-marmot.sh": 2},
+    "integrations/goose/marmot/README.md": {"install-goose-marmot.sh": 1},
 }
 # Codex is intentionally absent: its helper definition and only invocation
 # share one fence, so it has no dependent copy-paste fence.
