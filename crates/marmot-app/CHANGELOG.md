@@ -31,8 +31,9 @@
   checkpoint, notification and invitation waits, including cancellation.
 - Maintenance deadline write failures preserve committed effects. Quiet ticks
   and reopen repair missing deadlines and partial completion without another
-  MLS commit or reuse of terminal obligation IDs. Ordinary epoch activity does
-  not postpone an overdue periodic rotation.
+  MLS commit or reuse of terminal obligation IDs. Deadline collision repair
+  keeps the 24–36-day period; ordinary epoch activity does not postpone an
+  overdue periodic rotation.
 - Test-only conformance progress distinguishes bounded confirmation replay
   through unchanged opaque rows from a stalled convergence drain.
 

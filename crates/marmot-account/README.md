@@ -65,8 +65,8 @@ owning group's reconciliation and reconstructs missing deadlines for enrolled li
 Ordinary epoch activity uses the durable rotation baseline; an observed restoration starts a fresh period.
 
 An obligation stays live until its next deadline is durable. After reopen, the canonical leaf hash identifies rotations
-that already committed, so completing their bookkeeping does not publish another MLS commit. Repaired deadlines do not
-reuse failed or completed periodic obligation IDs.
+that already committed, so completing their bookkeeping does not publish another MLS commit. Repaired deadlines stay
+within the 24–36-day policy window and do not reuse failed or completed periodic obligation IDs.
 
 ## KeyPackage generator upgrades
 

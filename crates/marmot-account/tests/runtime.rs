@@ -5653,8 +5653,16 @@ async fn restore_fault_keeps_effects() {
     use cgka_traits::GroupStorage;
     use sha2::{Digest, Sha256};
 
+    const MIN_PERIOD_SECS: u64 = 24 * 24 * 60 * 60;
+    const MAX_PERIOD_SECS: u64 = 36 * 24 * 60 * 60;
+
     for (announce, reopen) in [(true, false), (true, true), (false, true)] {
-        for last_rotation in [None, Some(Timestamp(10))] {
+        for (last_rotation, period_offset) in [
+            (None, 0),
+            (Some(Timestamp(10)), 0),
+            (None, MAX_PERIOD_SECS - MIN_PERIOD_SECS),
+            (Some(Timestamp(10)), MAX_PERIOD_SECS - MIN_PERIOD_SECS),
+        ] {
             let (dir, mut runtime, group, epoch) =
                 manual_only_group_runtime(MaintenanceTiming::default()).await;
             let database = dir.path().join("alice.sqlite");
@@ -5665,10 +5673,10 @@ async fn restore_fault_keeps_effects() {
             runtime = runtime.with_maintenance_sources(
                 wall.clone(),
                 Arc::new(TestMonotonicClock::default()),
-                Arc::new(TestRandom::new(0)),
+                Arc::new(TestRandom::new(period_offset)),
             );
 
-            let candidate = 100_000u64 + 24 * 24 * 60 * 60;
+            let candidate = 100_000u64 + MIN_PERIOD_SECS + period_offset;
             let mut state = runtime
                 .session()
                 .group_maintenance(&group)
@@ -5738,7 +5746,7 @@ async fn restore_fault_keeps_effects() {
             runtime = runtime.with_maintenance_sources(
                 wall.clone(),
                 Arc::new(TestMonotonicClock::default()),
-                Arc::new(TestRandom::new(0)),
+                Arc::new(TestRandom::new(period_offset)),
             );
             if announce {
                 let connection = rusqlite::Connection::open(&database).unwrap();
@@ -5817,7 +5825,7 @@ async fn restore_fault_keeps_effects() {
             runtime = runtime.with_maintenance_sources(
                 wall.clone(),
                 Arc::new(TestMonotonicClock::default()),
-                Arc::new(TestRandom::new(0)),
+                Arc::new(TestRandom::new(period_offset)),
             );
             if reopen {
                 drop(runtime);
@@ -5834,7 +5842,7 @@ async fn restore_fault_keeps_effects() {
                 .with_maintenance_sources(
                     wall.clone(),
                     Arc::new(TestMonotonicClock::default()),
-                    Arc::new(TestRandom::new(0)),
+                    Arc::new(TestRandom::new(period_offset)),
                 );
             }
             runtime.run_due_maintenance().await.unwrap();
@@ -5845,10 +5853,11 @@ async fn restore_fault_keeps_effects() {
                 .unwrap();
             assert!(restored.periodic_enrolled);
             assert_eq!(restored.last_own_leaf_rotation_at, last_rotation);
-            assert_eq!(
-                restored.next_periodic_rotation_at,
-                Some(Timestamp(candidate + 1))
-            );
+            let deadline = restored
+                .next_periodic_rotation_at
+                .expect("restored enrollment must have a deadline")
+                .0;
+            assert!((100_000 + MIN_PERIOD_SECS..=100_000 + MAX_PERIOD_SECS).contains(&deadline));
             assert_eq!(
                 runtime
                     .session()
@@ -5857,7 +5866,7 @@ async fn restore_fault_keeps_effects() {
                 failed
             );
 
-            wall.set(candidate + 1);
+            wall.set(deadline);
             runtime.run_due_maintenance().await.unwrap();
             let obligations = runtime
                 .session()

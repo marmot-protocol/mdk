@@ -3017,10 +3017,13 @@ where
         group_id: &GroupId,
         baseline: Timestamp,
     ) -> AccountResult<Timestamp> {
-        let mut deadline = baseline.0.saturating_add(
+        let earliest = baseline.0.saturating_add(PERIODIC_MIN_SECS);
+        let latest = baseline.0.saturating_add(PERIODIC_MAX_SECS);
+        let first = baseline.0.saturating_add(
             self.maintenance_random
                 .sample_inclusive(PERIODIC_MIN_SECS, PERIODIC_MAX_SECS),
         );
+        let mut deadline = first;
         loop {
             let mut hasher = Sha256::new();
             hasher.update(b"marmot-periodic-self-update-v1");
@@ -3031,9 +3034,17 @@ where
             if self.session.maintenance_obligation(&id)?.is_none() {
                 return Ok(Timestamp(deadline));
             }
-            deadline = deadline.checked_add(1).ok_or_else(|| {
-                cgka_traits::EngineError::Backend("periodic deadline exhausted".into())
-            })?;
+            deadline = if deadline < latest {
+                deadline + 1
+            } else {
+                earliest
+            };
+            if deadline == first {
+                return Err(cgka_traits::EngineError::Backend(
+                    "periodic deadline exhausted".into(),
+                )
+                .into());
+            }
         }
     }
 
