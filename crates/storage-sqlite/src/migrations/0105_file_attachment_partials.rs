@@ -38,7 +38,8 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             UPDATE attachment_partial_usage SET reserved_bytes=reserved_bytes-OLD.total WHERE id=1;
         END;
         CREATE TRIGGER attachment_partial_terminal AFTER UPDATE OF state ON attachment_acquisition
-        WHEN NEW.state IN (3,4,5) BEGIN
+        WHEN NEW.state=3 OR (NEW.state=5 AND NEW.permission_paused=0)
+            OR (NEW.state=4 AND NEW.cancelled=0) BEGIN
             DELETE FROM attachment_partial WHERE token=NEW.token;
         END;",
     ).storage()
@@ -53,8 +54,9 @@ mod tests {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "PRAGMA foreign_keys=ON;
-            CREATE TABLE attachment_acquisition(token BLOB PRIMARY KEY,state INTEGER);
-            INSERT INTO attachment_acquisition VALUES(x'01',1);",
+            CREATE TABLE attachment_acquisition(token BLOB PRIMARY KEY,state INTEGER,
+                cancelled INTEGER NOT NULL DEFAULT 0, permission_paused INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO attachment_acquisition(token,state) VALUES(x'01',1);",
         )
         .unwrap();
         let tx = conn.transaction().unwrap();
@@ -105,9 +107,22 @@ mod tests {
         apply(&tx).unwrap();
         tx.commit().unwrap();
         check(&conn);
-        // Widening the representation must preserve both terminal and source deletion cleanup.
-        conn.execute("UPDATE attachment_acquisition SET state=3", [])
+        // Cancellation and revoked automatic permission preserve resumability.
+        conn.execute("UPDATE attachment_acquisition SET state=4,cancelled=1", [])
             .unwrap();
+        check(&conn);
+        conn.execute(
+            "UPDATE attachment_acquisition SET state=5,cancelled=0,permission_paused=1",
+            [],
+        )
+        .unwrap();
+        check(&conn);
+        // Widening the representation must preserve both terminal and source deletion cleanup.
+        conn.execute(
+            "UPDATE attachment_acquisition SET state=3,permission_paused=0",
+            [],
+        )
+        .unwrap();
         assert_eq!(
             conn.query_row("SELECT count(*) FROM attachment_partial_chunk", [], |r| r
                 .get::<_, i64>(

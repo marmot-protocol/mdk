@@ -56,6 +56,37 @@ pub(super) fn valid_publication_attempt(
 }
 
 impl SqliteAccountStorage {
+    /// Inspect a current checkpoint without reading or allocating its body.
+    /// This is sink selection only; the selected loader still authenticates chunks.
+    pub fn attachment_partial_total(
+        &self,
+        job: &AttachmentAcquisition,
+        now: u64,
+        expected: (&[u8; 32], &[u8; 32]),
+    ) -> StorageResult<Option<u64>> {
+        let conn = self.lock()?;
+        if !valid_attempt(&conn, job, now)? {
+            return Ok(None);
+        }
+        let total = conn
+            .query_row(
+                "SELECT total FROM attachment_partial WHERE token=?1
+             AND ciphertext_digest=?2 AND locator_digest=?3 AND expires_at>?4
+             AND received<=total AND total<=?5",
+                params![
+                    job.reference.token,
+                    &expected.0[..],
+                    &expected.1[..],
+                    u64_to_i64(now)?,
+                    u64_to_i64(MAX_RETAINED_FILE_ATTACHMENT_BYTES)?
+                ],
+                |row| nonnegative(row, 0),
+            )
+            .optional()
+            .storage()?;
+        Ok(total)
+    }
+
     /// Restore a verified ciphertext prefix into a bounded writer rather than
     /// returning a whole-file array. Source/attempt fencing matches legacy load.
     pub fn load_attachment_partial_to_writer(

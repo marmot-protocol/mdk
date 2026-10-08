@@ -33,6 +33,14 @@ const MEDIA_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) const MEDIA_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MEDIA_HTTP_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
 const MEDIA_BLOB_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const FILE_UPLOAD_MIN_BYTES_PER_SECOND: u64 = 256 * 1024;
+
+pub(super) fn file_upload_timeout(body_len: u64) -> Duration {
+    MEDIA_BLOB_TRANSFER_TIMEOUT.max(Duration::from_secs(
+        body_len.div_ceil(FILE_UPLOAD_MIN_BYTES_PER_SECOND),
+    ))
+}
+
 /// A candidate that cannot resolve, connect, return headers, and yield its first
 /// body bytes within this bound gives the next ordered locator a chance. The
 /// candidate transfer deadline and read-idle timeout govern an active body.
@@ -425,6 +433,8 @@ pub(crate) async fn upload_blossom_file(
     let mut sent = 0u64;
     let total = file.len;
     let progress = control.clone();
+    let (upload_progress, mut upload_observer) = tokio::sync::watch::channel(());
+    let stream_progress = upload_progress.clone();
     let stream = tokio_util::io::ReaderStream::with_capacity(
         reader,
         super::file_transfer::FILE_TRANSFER_BUFFER_BYTES,
@@ -438,19 +448,32 @@ pub(crate) async fn upload_blossom_file(
             ))
         } else {
             progress.advance(total.saturating_mul(2).saturating_add(sent));
+            stream_progress.send_replace(());
             Ok(chunk)
         };
         futures::future::ready(result)
     });
     let body = reqwest::Body::wrap_stream(stream);
     let hash = hex::encode(file.digest);
+    let idle = async {
+        loop {
+            if tokio::time::timeout(BODY_IDLE_TIMEOUT, upload_observer.changed())
+                .await
+                .is_err()
+            {
+                return Err(AppError::MediaUploadTimedOut);
+            }
+        }
+    };
     let result = tokio::select! {
+        result = idle => result,
         result = upload_blossom_body(server, body, file.len, &hash, signer, transport,
             BLOSSOM_UPLOAD_CONTENT_TYPE, None, true) => result,
         () = control.cancelled() => {
             return Err(AppError::InvalidEncryptedMedia("media transfer cancelled".into()));
         }
     };
+    drop(upload_progress);
     control.check()?;
     result
 }
@@ -478,7 +501,11 @@ async fn upload_blossom_body(
     let client = upload_transport.client_for_url(&upload_url).await?;
     let response = client
         .put(upload_url.clone())
-        .timeout(MEDIA_BLOB_TRANSFER_TIMEOUT)
+        .timeout(if require_descriptor_digest_and_size {
+            file_upload_timeout(body_len)
+        } else {
+            MEDIA_BLOB_TRANSFER_TIMEOUT
+        })
         .header(reqwest::header::AUTHORIZATION, authorization)
         .header(reqwest::header::CONTENT_TYPE, content_type)
         .header(reqwest::header::CONTENT_LENGTH, body_len)
@@ -1228,15 +1255,17 @@ where
         }
         let partial = match resume {
             Some(resume) => {
-                // Explicit file acquisitions probe through this compatibility
-                // path first. Its array ceiling must not delete a large-file
-                // checkpoint before FileRequired selects the bounded sink.
-                let checkpoint_limit = if resume.automatic {
-                    max_body_bytes
-                } else {
-                    super::file_transfer::MAX_FILE_MEDIA_CIPHERTEXT_BYTES
-                };
-                resume.load(&current, checkpoint_limit).await?
+                // Select the file sink from fenced metadata before the array
+                // loader can read a prefix or clear its durable checkpoint.
+                if !resume.automatic
+                    && resume
+                        .checkpoint_total(&current)
+                        .await?
+                        .is_some_and(|total| total > max_body_bytes)
+                {
+                    return Err(AttachmentDownloadFailure::FileRequired);
+                }
+                resume.load(&current, max_body_bytes).await?
             }
             None => None,
         };

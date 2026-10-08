@@ -50,6 +50,10 @@ pub enum StorageError {
     /// retries with backoff; this variant is what escapes only after those
     /// retries are exhausted, so callers may retry the whole operation or report
     /// it as a transient (not fatal) error.
+    /// A supplied attachment body failed deterministic size or digest validation.
+    /// Retrying identical input cannot repair it; callers must stop that attempt.
+    #[error("invalid attachment body: {0}")]
+    InvalidAttachmentBody(&'static str),
     #[error("backend busy: {0}")]
     Busy(String),
     /// The backend reported a verified corruption code. A wrong encryption key

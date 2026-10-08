@@ -913,6 +913,32 @@ fn file_partial_writer_preserves_large_reservations_and_discards_corrupt_prefixe
             .checkpoint_attachment_partial(&job, &identity, 0, &first, 12, 2 * 1024 * 1024 * 1024)
             .unwrap()
     );
+    assert_eq!(
+        store
+            .attachment_partial_total(
+                &job,
+                12,
+                (&identity.ciphertext_digest, &identity.locator_digest)
+            )
+            .unwrap(),
+        Some(identity.total)
+    );
+    assert_eq!(
+        store
+            .attachment_partial_total(&job, 12, (&identity.ciphertext_digest, &[0; 32]))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .attachment_partial_total(
+                &job,
+                100,
+                (&identity.ciphertext_digest, &identity.locator_digest)
+            )
+            .unwrap(),
+        None
+    );
     // Legacy callers must not erase a checkpoint they cannot load into memory.
     assert!(
         store

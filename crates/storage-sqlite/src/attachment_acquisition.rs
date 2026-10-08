@@ -674,13 +674,13 @@ impl SqliteAccountStorage {
         cancelled: &dyn Fn() -> bool,
     ) -> StorageResult<AttachmentPublishResult> {
         if len > MAX_RETAINED_FILE_ATTACHMENT_BYTES {
-            return Err(invalid("retained attachment exceeds storage bound"));
+            return Err(StorageError::InvalidAttachmentBody(
+                "retained attachment exceeds storage bound",
+            ));
         }
-        let digest: [u8; 32] = job
-            .digest
-            .as_slice()
-            .try_into()
-            .map_err(|_| invalid("attachment plaintext digest mismatch"))?;
+        let digest: [u8; 32] = job.digest.as_slice().try_into().map_err(|_| {
+            StorageError::InvalidAttachmentBody("attachment plaintext digest mismatch")
+        })?;
         let now = u64_to_i64(now)?;
         self.connection.with_transaction(|| {
             let conn = self.lock()?;

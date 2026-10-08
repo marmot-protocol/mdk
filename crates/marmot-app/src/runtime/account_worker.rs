@@ -3776,6 +3776,10 @@ struct MediaHttpDone {
 }
 
 enum MediaHttpCompletion {
+    AttachmentRetained {
+        result: Result<(), AppError>,
+        background_permit: OwnedSemaphorePermit,
+    },
     Attachment {
         job: storage_sqlite::AttachmentAcquisition,
         result: Result<crate::client::AcquiredMediaBody, crate::media::AttachmentDownloadFailure>,
@@ -3990,7 +3994,48 @@ async fn complete_media_http(
             byte_budget,
             background_permit,
         } => {
+            if let Ok(crate::client::AcquiredMediaBody::File(file)) = result {
+                let storage = client.app.account_storage(&client.state.label);
+                let fallback = super::attachment_controls::default_policy(&client.app.config);
+                let tx = media_http.tx.clone();
+                let lifetime = media_http.worker_lifetime.subscribe();
+                let lifecycle = shared.lifecycle();
+                // Keep both permits until storage completion, but return to the
+                // worker immediately. Shutdown is checked between stream chunks.
+                tokio::task::spawn_blocking(move || {
+                    let result = storage.and_then(|storage| {
+                        attachments::complete_acquired_stored(
+                            &storage,
+                            &fallback,
+                            &job,
+                            Ok(crate::client::AcquiredMediaBody::File(file)),
+                            byte_budget,
+                            &|| lifecycle.is_stopping() || lifetime.has_changed().is_err(),
+                        )
+                    });
+                    let _ = tx.send(MediaHttpDone {
+                        permit,
+                        completion: MediaHttpCompletion::AttachmentRetained {
+                            result,
+                            background_permit,
+                        },
+                        cancellation: None,
+                    });
+                });
+                return;
+            }
             if attachments::complete_acquired(client, &job, result, byte_budget).is_err() {
+                tracing::warn!(target: "marmot_app::runtime", method = "attachment_acquisition",
+                    "attachment completion failed; durable lease permits recovery");
+            }
+            shared.attachment_updates.send_modify(|_| {});
+            drop(background_permit);
+        }
+        MediaHttpCompletion::AttachmentRetained {
+            result,
+            background_permit,
+        } => {
+            if result.is_err() {
                 tracing::warn!(target: "marmot_app::runtime", method = "attachment_acquisition",
                     "attachment completion failed; durable lease permits recovery");
             }

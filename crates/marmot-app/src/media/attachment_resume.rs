@@ -206,6 +206,24 @@ impl AttachmentResume {
         Ok(())
     }
 
+    pub(super) async fn checkpoint_total(
+        &self,
+        url: &url::Url,
+    ) -> Result<Option<u64>, AttachmentDownloadFailure> {
+        let this = self.clone();
+        let locator_digest = Sha256::digest(url.as_str().as_bytes()).into();
+        tokio::task::spawn_blocking(move || {
+            this.storage.attachment_partial_total(
+                &this.job,
+                crate::unix_now_seconds(),
+                (&this.ciphertext_digest, &locator_digest),
+            )
+        })
+        .await
+        .map_err(|_| retry("partial checkpoint task failed"))?
+        .map_err(|_| retry("partial checkpoint metadata unavailable"))
+    }
+
     pub(super) async fn load(
         &self,
         url: &url::Url,

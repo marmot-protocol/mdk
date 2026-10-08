@@ -3360,3 +3360,16 @@ async fn automatic_attachment_stops_only_when_every_locator_reports_the_blob_mis
         }
     }
 }
+
+#[test]
+fn large_file_upload_deadline_allows_progress_at_mobile_upload_rates() {
+    assert_eq!(
+        super::blossom::file_upload_timeout(1024),
+        Duration::from_secs(15 * 60)
+    );
+    assert_eq!(
+        super::blossom::file_upload_timeout(758_000_016),
+        Duration::from_secs(2892)
+    );
+    assert!(super::blossom::file_upload_timeout(900 * 1024 * 1024) >= Duration::from_secs(3600));
+}

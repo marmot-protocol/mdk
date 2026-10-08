@@ -483,8 +483,8 @@ fn copy_staged_body(
     retained: &[u8],
     size: u64,
 ) -> StorageResult<()> {
-    let size_usize =
-        usize::try_from(size).map_err(|_| invalid("invalid outgoing attachment size"))?;
+    let size_usize = usize::try_from(size)
+        .map_err(|_| StorageError::InvalidAttachmentBody("invalid outgoing attachment size"))?;
     if size_usize as u64 > MAX_RETAINED_FILE_ATTACHMENT_BYTES {
         return Err(invalid("retained attachment exceeds storage bound"));
     }
@@ -542,10 +542,12 @@ pub(super) fn write_verified_body(
     buffer: &mut [u8],
     cancelled: &dyn Fn() -> bool,
 ) -> StorageResult<()> {
-    let len =
-        usize::try_from(source.len).map_err(|_| invalid("invalid outgoing attachment size"))?;
+    let len = usize::try_from(source.len)
+        .map_err(|_| StorageError::InvalidAttachmentBody("invalid outgoing attachment size"))?;
     if blob.len() != len {
-        return Err(invalid("outgoing attachment reservation length mismatch"));
+        return Err(StorageError::InvalidAttachmentBody(
+            "outgoing attachment reservation length mismatch",
+        ));
     }
     let mut hash = Sha256::new();
     let mut offset = 0usize;
@@ -556,7 +558,9 @@ pub(super) fn write_verified_body(
         let want = buffer.len().min(len - offset);
         let count = read_some(&mut *source.reader, &mut buffer[..want])?;
         if count == 0 {
-            return Err(invalid("outgoing attachment source truncated"));
+            return Err(StorageError::InvalidAttachmentBody(
+                "outgoing attachment source truncated",
+            ));
         }
         hash.update(&buffer[..count]);
         blob.write_at(&buffer[..count], offset).storage()?;
@@ -564,10 +568,14 @@ pub(super) fn write_verified_body(
     }
     let mut probe = [0u8; 1];
     if read_some(&mut *source.reader, &mut probe)? != 0 {
-        return Err(invalid("outgoing attachment source grew"));
+        return Err(StorageError::InvalidAttachmentBody(
+            "outgoing attachment source grew",
+        ));
     }
     if hash.finalize().as_slice() != &source.digest[..] {
-        return Err(invalid("outgoing attachment digest mismatch"));
+        return Err(StorageError::InvalidAttachmentBody(
+            "outgoing attachment digest mismatch",
+        ));
     }
     Ok(())
 }

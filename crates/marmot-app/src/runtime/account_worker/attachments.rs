@@ -413,12 +413,22 @@ pub(super) fn complete_acquired(
     byte_budget: u64,
 ) -> Result<(), AppError> {
     let storage = client.app.account_storage(&client.state.label)?;
+    let fallback = super::super::attachment_controls::default_policy(&client.app.config);
+    complete_acquired_stored(&storage, &fallback, job, result, byte_budget, &|| false)
+}
+
+pub(super) fn complete_acquired_stored(
+    storage: &SqliteAccountStorage,
+    fallback: &storage_sqlite::AttachmentDownloadPolicy,
+    job: &AttachmentAcquisition,
+    result: Result<crate::client::AcquiredMediaBody, AttachmentDownloadFailure>,
+    byte_budget: u64,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), AppError> {
     let now = crate::unix_now_seconds();
     match result {
         Ok(crate::client::AcquiredMediaBody::File(file)) => {
-            let policy = storage.attachment_download_policy(
-                &super::super::attachment_controls::default_policy(&client.app.config),
-            )?;
+            let policy = storage.attachment_download_policy(fallback)?;
             let mut reader = file.reader()?;
             match storage.complete_attachment_acquisition_from_reader(
                 job,
@@ -426,11 +436,14 @@ pub(super) fn complete_acquired(
                 file.len,
                 now,
                 byte_budget.min(policy.retained_bytes),
-                &|| false,
+                cancelled,
             ) {
                 Ok(AttachmentPublishResult::Published | AttachmentPublishResult::Superseded) => {}
+                Err(cgka_traits::StorageError::InvalidAttachmentBody(_)) => {
+                    storage.fail_attachment_acquisition(job, None)?;
+                }
                 _ => {
-                    storage.fail_attachment_acquisition(job, Some(retry_at(&storage, job, now)))?;
+                    storage.fail_attachment_acquisition(job, Some(retry_at(storage, job, now)))?;
                 }
             }
         }
@@ -440,19 +453,17 @@ pub(super) fn complete_acquired(
                 storage.fail_attachment_acquisition(job, None)?;
                 return Ok(());
             }
-            let policy = storage.attachment_download_policy(
-                &super::super::attachment_controls::default_policy(&client.app.config),
-            )?;
+            let policy = storage.attachment_download_policy(fallback)?;
             let byte_budget = byte_budget.min(policy.retained_bytes);
             match storage.complete_attachment_acquisition(job, &plaintext, now, byte_budget) {
                 Ok(AttachmentPublishResult::Published | AttachmentPublishResult::Superseded) => {}
                 Ok(AttachmentPublishResult::CapacityBlocked) | Err(_) => {
-                    storage.fail_attachment_acquisition(job, Some(retry_at(&storage, job, now)))?;
+                    storage.fail_attachment_acquisition(job, Some(retry_at(storage, job, now)))?;
                 }
             }
         }
         Err(AttachmentDownloadFailure::Retry(_)) => {
-            storage.fail_attachment_acquisition(job, Some(retry_at(&storage, job, now)))?;
+            storage.fail_attachment_acquisition(job, Some(retry_at(storage, job, now)))?;
         }
         Err(AttachmentDownloadFailure::SizeLimit(_, limit)) => {
             storage.block_attachment_size_policy(job, limit, now)?;

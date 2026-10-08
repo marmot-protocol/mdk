@@ -342,18 +342,17 @@ fn reader_publication_shares_fences_and_rolls_back_mismatch() {
         .unwrap()
         .unwrap();
     let wrong = b"private retained attachment plaintexX";
-    assert!(
-        store
-            .complete_attachment_acquisition_from_reader(
-                &job,
-                &mut Cursor::new(&wrong[..]),
-                wrong.len() as u64,
-                12,
-                10000,
-                &|| false,
-            )
-            .is_err()
-    );
+    assert!(matches!(
+        store.complete_attachment_acquisition_from_reader(
+            &job,
+            &mut Cursor::new(&wrong[..]),
+            wrong.len() as u64,
+            12,
+            10000,
+            &|| false,
+        ),
+        Err(StorageError::InvalidAttachmentBody(_))
+    ));
     assert!(
         store
             .complete_attachment_acquisition_from_reader(
