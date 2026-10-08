@@ -382,7 +382,7 @@ jobs:
     name: Build workspace tests
     needs: changes
     if: needs.changes.outputs.run_full == 'true'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 30
 
     steps:
@@ -439,7 +439,7 @@ jobs:
   rust-test:
     name: Rust tests (${{ matrix.partition }}/5)
     needs: rust-test-build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -481,7 +481,7 @@ jobs:
     name: Doctests and diagnostic exporters
     needs: changes
     if: needs.changes.outputs.run_full == 'true'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 30
 
     steps:
