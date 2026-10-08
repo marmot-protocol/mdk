@@ -846,6 +846,12 @@ impl cgka_traits::storage::DeferredPeelGenerationStorage for FlakyGroupRecordSto
     }
 }
 
+impl cgka_traits::storage::HistoryAcquisitionHoldStorage for FlakyGroupRecordStorage {
+    fn history_acquisition_held(&self, group_id: &GroupId) -> StorageResult<bool> {
+        self.inner.history_acquisition_held(group_id)
+    }
+}
+
 impl StorageProvider for FlakyGroupRecordStorage {
     type Mls = <SqliteAccountStorage as StorageProvider>::Mls;
 

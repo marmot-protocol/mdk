@@ -24,6 +24,7 @@ enum OutboundQueueReason {
     ForegroundBudgetExhausted,
     SelfRemoveAutoCommit,
     ExplicitQueueRequest,
+    HistoryAcquisitionHold,
 }
 
 impl OutboundQueueReason {
@@ -34,6 +35,7 @@ impl OutboundQueueReason {
             Self::ForegroundBudgetExhausted => "foreground_budget_exhausted",
             Self::SelfRemoveAutoCommit => "self_remove_auto_commit",
             Self::ExplicitQueueRequest => "explicit_queue_request",
+            Self::HistoryAcquisitionHold => "history_acquisition_hold",
         };
         tracing::debug!(
             target: "cgka_engine::message_processor",
@@ -1077,7 +1079,12 @@ impl<S: StorageProvider> Engine<S> {
         if !settled {
             return Ok(Vec::new());
         }
-        if let Some(result) = self.prepare_pending_disband(group_id).await? {
+        // While a history-acquisition hold keeps the epoch (mdk#2086),
+        // disbands, queued group-state intents and maintenance commits wait
+        // for the caller to release the hold. Application messages drain
+        // whenever convergence has settled.
+        let acquisition_held = self.storage.history_acquisition_held(group_id)?;
+        if !acquisition_held && let Some(result) = self.prepare_pending_disband(group_id).await? {
             return Ok(vec![result]);
         }
 
@@ -1089,6 +1096,7 @@ impl<S: StorageProvider> Engine<S> {
         // A persisted fairness slot orders one already-queued administrative
         // evolution before automatic SelfRemove or leave-maintenance mutation.
         if !reservation.is_available()
+            && !acquisition_held
             && self
                 .run_drain_maintenance(group_id, now_ms, LeaveGateCheck::Required)
                 .await?
@@ -1097,6 +1105,9 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(Vec::new());
         }
         for record in queued {
+            if acquisition_held && !matches!(record.intent, SendIntent::AppMessage { .. }) {
+                continue;
+            }
             // A regenerated intent the host has not yet confirmed or retired
             // is still the host's obligation: re-preparing it would publish
             // the same logical message twice (mdk#1472).
@@ -1114,6 +1125,7 @@ impl<S: StorageProvider> Engine<S> {
                 break;
             }
             if !reservation.is_available()
+                && !acquisition_held
                 && self
                     .run_drain_maintenance(group_id, now_ms, LeaveGateCheck::Required)
                     .await?
@@ -1194,7 +1206,7 @@ impl<S: StorageProvider> Engine<S> {
                 break;
             }
         }
-        if reservation.consume_ungranted(self, group_id)? {
+        if reservation.consume_ungranted(self, group_id)? && !acquisition_held {
             // No already-queued admin group-state intent was eligible for the
             // fairness attempt. Do not let unrelated app/leave/maintenance
             // work hold the next inbound generation indefinitely.
@@ -1314,6 +1326,15 @@ impl<S: StorageProvider> Engine<S> {
             .then_some(OutboundQueueReason::ResolvingLocalPublish));
         }
 
+        // A history-acquisition hold keeps the epoch until the caller has the
+        // history it is waiting for (mdk#2086). A local commit would move it
+        // as surely as a remote one, so group-state work queues. Application
+        // messages keep the ordinary convergence gate below: they go out
+        // unless a retained commit is waiting, held or not.
+        let acquisition_held = self.storage.history_acquisition_held(group_id)?;
+        if acquisition_held && !matches!(intent, SendIntent::AppMessage { .. }) {
+            return Ok(Some(OutboundQueueReason::HistoryAcquisitionHold));
+        }
         let now_ms = self.convergence_now_ms();
         // Authenticated convergence and every row not yet tested under the
         // current complete peel-context fingerprint are safety-critical even
@@ -1340,6 +1361,9 @@ impl<S: StorageProvider> Engine<S> {
             AdvanceConvergenceStatus::ForegroundBudgetExhausted => {
                 return Ok(Some(OutboundQueueReason::ForegroundBudgetExhausted));
             }
+        }
+        if acquisition_held {
+            return Ok(None);
         }
         self.stage_due_self_remove_auto_commit(group_id, now_ms)
             .await

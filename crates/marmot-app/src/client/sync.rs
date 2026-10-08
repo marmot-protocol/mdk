@@ -848,6 +848,17 @@ impl AppClient {
         }
     }
 
+    /// Release every hold whose route no automatic recovery still owes, and
+    /// schedule those groups' deferred convergence.
+    pub(crate) fn release_unowed_history_acquisition_holds(
+        &mut self,
+        storage: &storage_sqlite::SqliteAccountStorage,
+    ) -> Result<(), AppError> {
+        self.pending_convergence_groups
+            .extend(storage.release_unowed_history_acquisition_holds()?);
+        Ok(())
+    }
+
     /// Retain engine-provided scheduling edges from an effects batch until the
     /// account worker can arm their group timers.
     pub(crate) fn remember_pending_convergence_groups(
@@ -3332,7 +3343,7 @@ impl AppClient {
     }
 
     fn record_transport_reconciliation_item(
-        &self,
+        &mut self,
         route: &TransportReconciliationRoute,
         item: &TransportReconciliationItem,
     ) {
@@ -3344,6 +3355,13 @@ impl AppClient {
                     .record_transport_reconciliation_item(route, item)
                     .map_err(AppError::from)
             });
+        // An admission that completes a history-acquisition hold makes the
+        // group's deferred convergence due, with or without a later
+        // comparison pass (mdk#2086).
+        if let Ok(released) = &recorded {
+            self.pending_convergence_groups
+                .extend(released.iter().cloned());
+        }
         if recorded.is_err() {
             // The event remains absent from the advertised local set, so a
             // later reconciliation safely re-fetches it. Do not fail an
@@ -3358,7 +3376,7 @@ impl AppClient {
     }
 
     fn record_durable_transport_reconciliation_delivery(
-        &self,
+        &mut self,
         delivery: &cgka_traits::TransportDelivery,
     ) {
         if let Some((route, item)) =

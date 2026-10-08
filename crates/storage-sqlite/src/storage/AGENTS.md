@@ -20,6 +20,7 @@ under `src/`; see [`../../AGENTS.md`](../../AGENTS.md).
 | `convergence_policy.rs` | Opaque per-group convergence policy bytes. |
 | `convergence_passes.rs` | `ConvergencePassStorage`: durable bounded convergence passes. |
 | `deferred_peel_generations.rs` | `DeferredPeelGenerationStorage`: deferred-peel generation barriers. |
+| `history_acquisition_holds.rs` | `HistoryAcquisitionHoldStorage` plus the app's install/settle/release methods: per-group epoch holds and the exact event ids each waits for. `transport_reconciliation.rs` removes an event from every debt when it records it. |
 | `leave_requests.rs`, `disband_requests.rs` | Durable leave and disband requests (plus disband candidates/tombstones). |
 | `maintenance.rs` | `MaintenanceStorage`: maintenance and publication-recovery records. |
 | `test_support.rs` | Shared storage test fixtures. |

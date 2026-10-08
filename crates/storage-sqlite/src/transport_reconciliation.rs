@@ -123,11 +123,13 @@ impl SqliteAccountStorage {
     /// reconciliation. The row is written only after the app confirms the
     /// delivery was durably retained; resource-refused input must remain absent
     /// so a later reconciliation fetches it again.
+    /// Returns the groups whose last active history-acquisition hold this
+    /// admission completed; their deferred convergence is due (mdk#2086).
     pub fn record_transport_reconciliation_item(
         &self,
         route: &TransportReconciliationRoute,
         item: &TransportReconciliationItem,
-    ) -> StorageResult<()> {
+    ) -> StorageResult<Vec<cgka_traits::types::GroupId>> {
         let created_at = i64::try_from(item.created_at).map_err(|_| {
             StorageError::Serialization(
                 "transport reconciliation timestamp exceeds SQLite range".to_owned(),
@@ -146,6 +148,17 @@ impl SqliteAccountStorage {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .storage()?;
+            // Admission is what a history-acquisition hold waits for, even
+            // for an event below the inventory floor (mdk#2086).
+            let released = if route_kind == GROUP_ROUTE_KIND {
+                crate::storage::history_acquisition_holds::admit_history_acquisition_debt_tx(
+                    &tx,
+                    route_id,
+                    &item.event_id,
+                )?
+            } else {
+                Vec::new()
+            };
             let inventory_since =
                 route_state_floor_tx(&tx, route_kind, route_id, configured_floor)?;
             if created_at >= inventory_since {
@@ -162,7 +175,7 @@ impl SqliteAccountStorage {
                 }
             }
             tx.commit().storage()?;
-            Ok(())
+            Ok(released)
         })
     }
 

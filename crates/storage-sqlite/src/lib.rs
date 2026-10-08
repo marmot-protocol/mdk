@@ -123,6 +123,9 @@ pub use shared::{
     PublicDirectoryUserRecord, SqliteSharedStorage, StoredAuditLogSettings,
     StoredRelayTelemetrySettings, StoredUsageDiagnosticsSettings,
 };
+pub use storage::history_acquisition_holds::{
+    HISTORY_ACQUISITION_STALL_PASSES, HistoryAcquisitionSettlement,
+};
 pub use storage::messages::MessageFormatPromotionProgress;
 #[cfg(feature = "storage-format-benchmarks")]
 pub use storage::messages::StorageFormatBenchSizes;

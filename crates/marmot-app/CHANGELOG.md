@@ -173,6 +173,17 @@
   other members received the message while the sender's row stayed failed
   forever, and a sender's poll showed no projection.
 
+- Catch-up no longer loses messages that comparison found but had not yet
+  downloaded. While a group's route still lacks events a comparison named, the
+  group keeps its epoch: commits that arrive first wait, and the group's own
+  changes queue, so older messages can still be decrypted when they arrive.
+  The hold ends when every named event is stored, or when recovery gives up
+  on the route, which shows the "history may be incomplete" notice. After 6
+  passes on which every relay answered but none served those events, the
+  group stops waiting and the route ends with that notice, even if the events
+  arrive later. Chat sent while a held commit waits is queued and goes out
+  once the group catches up (#2086).
+
 ## 0.12.0 - 2026-10-02
 
 ### Added

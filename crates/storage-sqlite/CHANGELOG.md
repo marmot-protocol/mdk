@@ -14,6 +14,15 @@
 
 ### Added
 
+- Migration 0107 adds per-group history-acquisition holds and the exact event
+  ids each one waits for, advancing account storage to schema 107 on first
+  open; downgrade is unsupported. The engine reads holds through
+  `HistoryAcquisitionHoldStorage`. The app installs and settles them with
+  `hold_history_acquisition`, `settle_history_acquisition_route`,
+  `release_history_acquisition_hold` and
+  `release_unowed_history_acquisition_holds`. Recording a transport
+  reconciliation item removes that event from every hold (#2086).
+
 - Test-only `test-migrated-template` feature adds
   `SqliteAccountStorage::in_memory_from_migrated_template`, which copies one
   migrated in-memory database per process instead of replaying every migration

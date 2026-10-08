@@ -7438,6 +7438,8 @@ mod tests {
     use std::sync::Arc;
 
     #[cfg(feature = "test-policy-overrides")]
+    mod catch_up_epoch_hold_tests;
+    #[cfg(feature = "test-policy-overrides")]
     mod integrated_recovery_acceptance_tests;
     #[cfg(feature = "test-policy-overrides")]
     mod local_submission_queue_tests;

@@ -168,6 +168,12 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   only after every retained row tried the final fingerprint (uncontested per-row convergence can otherwise prune the
   only epoch state that decrypts later rows). Live ingest keeps its immediate drain. Regression: the simulator's
   `tests/offline_catchup_regression.rs`.
+- **A history-acquisition hold blocks convergence like the barrier.** `HistoryAcquisitionHoldStorage` covers history
+  the caller knows of but has not downloaded (mdk#2086). The engine only reads it: a held group reports no due
+  convergence, passes wait, and group-state intents, disbands and maintenance commits queue, because a local commit
+  moves the epoch too. Application messages keep the ordinary convergence gate, so they queue only while a retained
+  commit waits. The caller installs and releases it and reschedules the group on release. Regression:
+  `tests/deferred_peel_lifecycle.rs::history_acquisition_hold_*`.
 - **Provenance.** A message readable *only* under a candidate context belongs to an unadopted lineage:
   `ingest_group_message` routes it to the convergence seam, never to direct apply, and derives nothing from it. The
   next pass's OpenMLS replay authenticates it; a failed peel is silence, never a verdict. Tests:
