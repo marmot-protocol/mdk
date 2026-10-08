@@ -391,6 +391,16 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install Linux build dependencies
+        run: |
+          set -euo pipefail
+          apt=(apt-get)
+          if (( EUID != 0 )); then
+            apt=(sudo apt-get)
+          fi
+          "${apt[@]}" update
+          "${apt[@]}" install -y --no-install-recommends build-essential pkg-config perl
+
       - name: Install Rust toolchain
         run: |
           set -euo pipefail
@@ -460,6 +470,16 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install Linux build dependencies
+        run: |
+          set -euo pipefail
+          apt=(apt-get)
+          if (( EUID != 0 )); then
+            apt=(sudo apt-get)
+          fi
+          "${apt[@]}" update
+          "${apt[@]}" install -y --no-install-recommends build-essential pkg-config perl
+
       - name: Install Rust toolchain
         run: |
           set -euo pipefail
@@ -505,6 +525,16 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+
+      - name: Install Linux build dependencies
+        run: |
+          set -euo pipefail
+          apt=(apt-get)
+          if (( EUID != 0 )); then
+            apt=(sudo apt-get)
+          fi
+          "${apt[@]}" update
+          "${apt[@]}" install -y --no-install-recommends build-essential pkg-config perl
 
       - name: Install Rust toolchain
         run: |
