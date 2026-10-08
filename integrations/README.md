@@ -198,9 +198,38 @@ Use `hermes`, `openclaw`, `claude`, `codex`, `harnesses` (OpenCode), `pi`, or `g
 The installers also show these values directly and render a terminal QR when
 `qrencode` is installed.
 
-1. Add the displayed agent identity in White Noise.
-2. Invite it to a direct message or group from the account you authorized.
-3. Send a test message.
+1. Compare the **entire agent npub** displayed on your trusted computer with the
+   account you add in White Noise. Check the account before accepting an
+   agent-created invitation or sending a task. A name, emoji, group title, or
+   public profile is not proof of identity.
+2. Give the verified account a local nickname, where your app supports it. The
+   terminal installers do not publish a public agent profile. Suggested cues
+   are `🧑‍💻 Codex`, `🦀 Claude Code`, `🥧 Pi`, and `🛠️ OpenCode`; different
+   installations can have different private nicknames.
+3. Invite it from the account you authorized. Terminal task groups can use a
+   normal group; ordinary messaging does not require an admin grant.
+4. Send a harmless test prompt with a fresh word you choose, asking the agent
+   to echo that word without running tools or changing files. Check that the
+   backend's reply contains that word and arrives in the same verified group;
+   an older reply or a service-start acknowledgement does not prove this test
+   succeeded.
+
+For terminal harnesses (Claude Code, Codex, OpenCode, and Pi), first select a
+workspace with `/<path>` beneath your home directory. For Codex, choose a Git
+repository. A terminal harness `/status` response alone does not prove that its
+backend can answer a phone prompt. Hermes and OpenClaw use their own gateway
+workspace/session configuration instead of this terminal picker.
+
+Connector files being installed is one milestone; a verified phone-to-backend
+conversation is another. Terminal automatic titles require an instruction plus
+matching group-profile-capable connector and harness releases. They are not enabled by
+the installation steps alone. Once that capability is available, you can grant
+the verified agent admin permission for title edits in a normal group. This
+also allows group and member changes. Direct messages do not provide the same
+editable group-title workflow. See the shared
+[session workflow](terminal-harness/README.md#organize-your-task-groups) and
+[onboarding design](terminal-harness/onboarding-design.md) for the proposed
+defaults and their remaining dependencies.
 
 Hermes and OpenClaw print one final gateway restart command because the installer
 does not restart an existing gateway. Claude Code, Codex, OpenCode, Pi, and Goose services are
