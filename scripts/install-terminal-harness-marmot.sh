@@ -15,6 +15,7 @@ HARNESS_AUTONOMOUS_SUPPORTED=1
 case "$HARNESS_KIND" in
     claude)
         HARNESS_DISPLAY_NAME="Claude Code"
+        HARNESS_EMOJI="🦀"
         HARNESS_ENV_PREFIX="WN_CLAUDE"
         HARNESS_DEFAULT_BIN="claude"
         HARNESS_FALLBACK_BIN_DIR="$HOME/.local/bin"
@@ -25,6 +26,7 @@ case "$HARNESS_KIND" in
         ;;
     codex)
         HARNESS_DISPLAY_NAME="Codex"
+        HARNESS_EMOJI="🧑‍💻"
         HARNESS_ENV_PREFIX="WN_CODEX"
         HARNESS_DEFAULT_BIN="codex"
         HARNESS_FALLBACK_BIN_DIR="$HOME/.local/bin"
@@ -35,6 +37,7 @@ case "$HARNESS_KIND" in
         ;;
     pi)
         HARNESS_DISPLAY_NAME="Pi"
+        HARNESS_EMOJI="🥧"
         HARNESS_ENV_PREFIX="WN_PI"
         HARNESS_DEFAULT_BIN="pi"
         HARNESS_FALLBACK_BIN_DIR="$HOME/.pi/bin"
@@ -45,6 +48,7 @@ case "$HARNESS_KIND" in
         ;;
     opencode)
         HARNESS_DISPLAY_NAME="OpenCode"
+        HARNESS_EMOJI="🛠️"
         HARNESS_ENV_PREFIX="WN_OPENCODE"
         HARNESS_DEFAULT_BIN="opencode"
         HARNESS_FALLBACK_BIN_DIR="$HOME/.opencode/bin"
@@ -55,6 +59,7 @@ case "$HARNESS_KIND" in
         ;;
     goose)
         HARNESS_DISPLAY_NAME="Goose"
+        HARNESS_EMOJI="🪿"
         HARNESS_ENV_PREFIX="WN_GOOSE"
         HARNESS_DEFAULT_BIN="goose"
         HARNESS_FALLBACK_BIN_DIR="$HOME/.local/bin"
@@ -949,14 +954,26 @@ bootstrap_agent() {
 }
 
 print_phone_invite() {
-    if [ -n "$BOOTSTRAP_NPUB" ] && [ -n "$BOOTSTRAP_NPROFILE" ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '\nDry run: no agent identity was created or verified.\n'
+        return
+    fi
+    if [ -n "$BOOTSTRAP_NPUB" ]; then
         cat <<EOF
 
 White Noise agent identity:
   npub: $BOOTSTRAP_NPUB
-  nprofile: $BOOTSTRAP_NPROFILE
 EOF
-        if [ "$DRY_RUN" -eq 0 ] && [ -t 1 ] && command -v qrencode >/dev/null 2>&1; then
+        if [ -n "$BOOTSTRAP_NPROFILE" ]; then
+            printf '  nprofile: %s\n' "$BOOTSTRAP_NPROFILE"
+        fi
+        cat <<EOF
+
+Compare this full npub on your trusted computer with the agent account in
+White Noise before you add it to a group, accept its invite, or send it a task. A matching name,
+emoji, or group title does not verify the account.
+EOF
+        if [ -n "$BOOTSTRAP_NPROFILE" ] && [ -t 1 ] && command -v qrencode >/dev/null 2>&1; then
             printf '%s' "$BOOTSTRAP_NPROFILE" | qrencode -t ANSIUTF8
         fi
     else
@@ -964,6 +981,9 @@ EOF
 
 White Noise agent identity was not returned by this wn-agent release.
 Inspect the bootstrap response at: $MARMOT_HOME/bootstrap.json
+If it contains no npub, update wn-agent and the harness to a matching release
+that returns the public identity, then rerun guided setup.
+Do not start pairing until you can compare the agent's full npub.
 EOF
     fi
 }
@@ -997,9 +1017,12 @@ write_harness_env() {
 
 print_next_steps() {
     print_phone_invite
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '\nInstallation preview. Phone pairing has not been performed.\n'
+    else
+        printf '\nConnector files installed. Phone conversation verification is still required.\n'
+    fi
     cat <<EOF
-
-Install complete.
 
 Terminal harness agent:
   label: $MARMOT_AGENT_LABEL
@@ -1017,10 +1040,8 @@ EOF
 Services were installed and started for the current user.
 
 Next steps:
-  1. Add the agent identity above in White Noise.
-  2. Invite it from an authorized account.
-  3. Send a test message. Use /<path> first to select a working directory.
 EOF
+        print_conversation_steps
     else
         cat <<EOF
 The connector or harness was left stopped by the selected install options.
@@ -1032,12 +1053,47 @@ To run it manually:
   3. In another shell, load the harness environment and start $HARNESS_BINARY:
      . "$MARMOT_HOME/dev/$HARNESS_BINARY.env"
      $HARNESS_BINARY
-  4. Add the agent identity above in White Noise, invite it, and send a test message.
 EOF
+        print_conversation_steps
     fi
     cat <<EOF
 
 Build: ${MARMOT_RELEASE_REPO}@${MARMOT_RELEASE_TAG} (${WN_AGENT_VERSION})
+EOF
+}
+
+print_conversation_steps() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        return
+    fi
+    if [ -z "$BOOTSTRAP_NPUB" ]; then
+        printf '\nPairing is paused: retrieve the full agent npub from bootstrap.json first.\n'
+        return
+    fi
+    cat <<EOF
+  - Add the verified agent account in White Noise. Set a local nickname such
+    as "$HARNESS_EMOJI $HARNESS_DISPLAY_NAME" if your app supports nicknames.
+    This installer does not publish a public agent profile.
+  - From your authorized account, create one normal group with the agent.
+    Admin permission is not required for ordinary messaging.
+  - Send /<path> to select a workspace under your home directory. Choose a
+    fresh word and send "Reply with Connected <my-fresh-word>, without running
+    tools or changing files.", replacing <my-fresh-word> with that word.
+    For Codex, select a Git repository before sending that prompt.
+  - Wait for a backend reply with that fresh word in this group. Until then, the
+    phone-to-backend connection is not verified.
+
+Each group keeps its own session and workspace. Add more groups when you need
+them. /status shows the selected workspace and session; /new starts a fresh
+session in this group while preserving its workspace. /new does not erase
+backend transcript files or cancel work that is already running.
+
+Automatic title updates require matching group-profile-capable wn-agent and
+harness releases plus an instruction to the agent. Once that capability is
+available, you can explicitly grant admin permission for title edits in a
+normal group. That grant also allows group and member changes.
+Installing this connector alone does not enable automatic titles or completion
+alerts.
 EOF
 }
 
