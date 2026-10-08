@@ -26,6 +26,16 @@
 
 ### Fixed
 
+- Commands and maintenance retain committed activity before subscription waits.
+  Manual and scheduled convergence keep subscriber updates owned through route,
+  checkpoint, notification and invitation waits, including cancellation.
+- Maintenance deadline write failures preserve committed effects. Quiet ticks
+  and reopen repair missing deadlines and partial completion without another
+  MLS commit or reuse of terminal obligation IDs. Ordinary epoch activity does
+  not postpone an overdue periodic rotation.
+- Test-only conformance progress distinguishes bounded confirmation replay
+  through unchanged opaque rows from a stalled convergence drain.
+
 - Historical canonical replay clears stale removal metadata when the selected
   local MLS leaf remains active, without emitting a false restoration event.
   Activity from commits preceding a disband survives a later terminal-cleanup

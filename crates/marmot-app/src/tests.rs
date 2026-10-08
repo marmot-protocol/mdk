@@ -18334,7 +18334,7 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
         MixedPublishObservation::Drained => client.observe_drained_session_events(&effects).await,
         MixedPublishObservation::Scheduled => {
             client
-                .observe_scheduled_convergence_effects(&group_id, &effects)
+                .finish_scheduled_convergence_effects(&group_id, &effects)
                 .await
         }
         MixedPublishObservation::Retry => client

@@ -998,9 +998,6 @@ impl AppClient {
         } else {
             self.observe_native_membership_effects_best_effort(effects)
                 .await;
-            // Publication already committed. Retain its activity before a
-            // command's later local refresh can fail and discard these effects.
-            self.queue_own_group_system_projection_updates(effects);
         }
         publish_result
     }
@@ -1020,6 +1017,9 @@ impl AppClient {
                 .expect("new batch")
                 .native_only = true;
         }
+        // Queue the activity suffix behind native cleanup, before either phase
+        // can suspend. Cancellation must not leave it owned by the command.
+        self.queue_own_group_system_projection_updates(effects);
         let routes_dirty = self.retry_applied_effect_projections_buffered().await?;
         let routes_changed = self.refresh_group_routes()?.routing_changed;
         if routes_dirty || routes_changed {
@@ -2180,7 +2180,7 @@ impl AppClient {
             events: events.to_vec(),
             ..Default::default()
         };
-        // The command's native batch already observed these one-shot facts.
+        // The command's native batch already retained these one-shot facts.
         // This entry owns only its unprojected activity suffix.
         self.enqueue_effect_projection(&effects, "", received_at, false);
         if let Some(pending) = self.pending_applied_effects.back_mut() {
@@ -5318,7 +5318,10 @@ impl AppClient {
             .observe_scheduled_convergence_effects(group_id, effects)
             .await;
         self.recover_superseded_invites_best_effort().await;
-        result
+        result?;
+        let mut summary = self.take_pending_applied_sync_summary();
+        self.drain_epoch_stall_escalations(&mut summary);
+        Ok(summary)
     }
 
     /// Project one scheduled convergence batch's effects, split from the
@@ -5328,7 +5331,7 @@ impl AppClient {
         &mut self,
         group_id: &cgka_traits::GroupId,
         effects: &marmot_account::AccountDeviceEffects,
-    ) -> Result<SyncSummary, AppError> {
+    ) -> Result<(), AppError> {
         for published in &effects.published_app_messages {
             self.pending_resumed_message_notifications
                 .entry((published.group_id.clone(), published.app_event_id.clone()))
@@ -5350,37 +5353,23 @@ impl AppClient {
         }
         self.refresh_group(group_id);
 
-        let mut summary = SyncSummary::default();
-        self.prepend_pending_applied_summary(&mut summary);
-        let result = async {
-            let routes_dirty = self.retry_applied_effect_projections(&mut summary).await?;
-            let routes_changed = match self.refresh_group_routes() {
-                Ok(refresh) => refresh.routing_changed,
-                Err(error) => {
-                    self.pending_runtime_group_subscription_refresh = true;
-                    return Err(error);
-                }
-            };
-            if routes_dirty || routes_changed {
-                self.sync_runtime_groups().await?;
+        // Completed deltas stay in the client through route, notification and
+        // invitation awaits; only the returning caller transfers their owner.
+        let routes_dirty = self.retry_applied_effect_projections_buffered().await?;
+        let routes_changed = match self.refresh_group_routes() {
+            Ok(refresh) => refresh.routing_changed,
+            Err(error) => {
+                self.pending_runtime_group_subscription_refresh = true;
+                return Err(error);
             }
-            self.prune_plaintext_retention_for_group(group_id)?;
-            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-            self.publish_checkpointed_resumed_message_notifications()
-                .await
+        };
+        if routes_dirty || routes_changed {
+            self.sync_runtime_groups().await?;
         }
-        .await;
-        if let Err(error) = result {
-            // Finalization and successful event-prefix writes are already
-            // durable. Replaying them may produce no update, so keep their
-            // subscriber output across every later cleanup/checkpoint failure.
-            // The inner observer takes this summary when it retains a failed
-            // batch, leaving nothing to merge twice here.
-            self.pending_applied_sync_summary.merge(summary);
-            return Err(error);
-        }
-        self.drain_epoch_stall_escalations(&mut summary);
-        Ok(summary)
+        self.prune_plaintext_retention_for_group(group_id)?;
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        self.publish_checkpointed_resumed_message_notifications()
+            .await
     }
 
     /// Dispatch only after source finalization and the account checkpoint. A

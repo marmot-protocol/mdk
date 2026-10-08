@@ -2,6 +2,7 @@
 use super::*;
 use crate::tests::ScriptedPushRelayClient;
 use crate::{AccountHome, MarmotApp};
+use cgka_traits::app_event::{GROUP_SYSTEM_TYPE_GROUP_RENAMED, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM};
 use cgka_traits::engine::{GroupEvent, GroupStateChange, GroupStateInvalidationReason};
 use std::sync::Arc;
 
@@ -338,6 +339,161 @@ async fn cancelled_drain_checkpoint_retains_progress_and_notifications() {
             .projection_updates
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn cancelled_commit_keeps_output() {
+    #[derive(Clone, Copy, Debug)]
+    enum Observer {
+        Command,
+        Maintenance,
+        Manual,
+        Scheduled,
+    }
+
+    for observer in [
+        Observer::Command,
+        Observer::Maintenance,
+        Observer::Manual,
+        Observer::Scheduled,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = app.client("alice").await.unwrap();
+        client.prepare_transport().await.unwrap();
+        let telemetry = AppPerformanceTelemetry::default();
+        let group = client
+            .create_group_with_options_and_telemetry(
+                "before rename",
+                &[],
+                Default::default(),
+                &telemetry,
+            )
+            .await
+            .unwrap()
+            .group_id;
+        client
+            .create_group_with_options_and_telemetry(
+                "pending route",
+                &[],
+                Default::default(),
+                &telemetry,
+            )
+            .await
+            .unwrap();
+        client.take_pending_applied_sync_summary();
+        client.take_pending_projection_updates();
+        let mut effects = client
+            .runtime
+            .send(cgka_traits::engine::SendIntent::UpdateGroupData {
+                group_id: group.clone(),
+                name: Some("committed rename".into()),
+                description: None,
+            })
+            .await
+            .unwrap();
+        assert!(effects.failures.is_empty());
+        assert!(!effects.reports.is_empty());
+        assert_eq!(
+            client.runtime.group_record(&group).unwrap().name,
+            "committed rename"
+        );
+        // The existing native-decision fixture forces the post-commit route
+        // refresh while the engine's final canonical copy remains live.
+        effects.events.splice(
+            0..0,
+            [
+                GroupEvent::LocalGroupCopyTerminated {
+                    group_id: group.clone(),
+                    voluntary: false,
+                },
+                GroupEvent::LocalGroupCopyRestored {
+                    group_id: group.clone(),
+                },
+            ],
+        );
+        let published = relay.published_event_ids();
+        relay.block_next_subscribe();
+        {
+            let observe = async {
+                match observer {
+                    Observer::Command => {
+                        client
+                            .observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+                            .await
+                    }
+                    Observer::Maintenance => client
+                        .finish_maintenance_effects(&effects)
+                        .await
+                        .map(|_| ()),
+                    Observer::Manual => client
+                        .observe_convergence_retry_effects(&group, &effects)
+                        .await
+                        .map(|_| ()),
+                    Observer::Scheduled => client
+                        .finish_scheduled_convergence_effects(&group, &effects)
+                        .await
+                        .map(|_| ()),
+                }
+            };
+            tokio::pin!(observe);
+            tokio::select! {
+                result = &mut observe => panic!("{observer:?} returned before subscription blocked: {result:?}"),
+                _ = relay.wait_for_blocked_subscribe() => {},
+                _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("{observer:?} never reached subscription"),
+            }
+        }
+        let mut repaired = client
+            .observe_drained_session_events(&Default::default())
+            .await
+            .unwrap();
+        repaired
+            .projection_updates
+            .extend(client.take_pending_projection_updates());
+        let rows = timeline(&app, &group);
+        let mut activity = rows
+            .messages
+            .iter()
+            .filter(|row| row.kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM);
+        let row = activity
+            .next()
+            .expect("committed rename missing from timeline");
+        assert!(activity.next().is_none(), "{observer:?}");
+        assert_eq!(
+            row.group_system.as_ref().unwrap().system_type,
+            GROUP_SYSTEM_TYPE_GROUP_RENAMED
+        );
+        let mut notified = repaired
+            .projection_updates
+            .iter()
+            .flat_map(|update| &update.timeline_changes)
+            .filter_map(|change| match change {
+                crate::TimelineMessageChange::Upsert { message, .. }
+                    if message.kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM =>
+                {
+                    Some(&message.message_id_hex)
+                }
+                _ => None,
+            });
+        assert_eq!(notified.next(), Some(&row.message_id_hex), "{observer:?}");
+        assert!(notified.next().is_none(), "{observer:?}");
+        assert_eq!(
+            relay.published_event_ids(),
+            published,
+            "projection retry must not republish the MLS commit"
+        );
+        let next = client
+            .observe_drained_session_events(&Default::default())
+            .await
+            .unwrap();
+        assert!(next.projection_updates.iter().flat_map(|update| &update.timeline_changes)
+            .all(|change| !matches!(change, crate::TimelineMessageChange::Upsert { message, .. } if message.kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM)), "{observer:?}");
+    }
 }
 
 #[tokio::test]
@@ -1131,6 +1287,7 @@ async fn accepted_own_activity_survives_later_local_refresh_failure() {
     let mut client = app.client("alice").await.unwrap();
     let group = client.create_group("before refresh", &[]).await.unwrap();
     client.take_pending_projection_updates();
+    client.take_pending_applied_sync_summary();
     let connection =
         super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
     connection.execute_batch("CREATE TRIGGER fail_own_refresh BEFORE INSERT ON account_groups WHEN NEW.profile_name = 'committed rename' BEGIN SELECT RAISE(FAIL, 'injected local refresh'); END;").unwrap();
@@ -1141,7 +1298,6 @@ async fn accepted_own_activity_survives_later_local_refresh_failure() {
             .is_err()
     );
     assert_eq!(timeline(&app, &group).messages.len(), 1);
-    assert_eq!(client.take_pending_projection_updates().len(), 1);
     let published = relay.published_event_ids().len();
     connection
         .execute_batch("DROP TRIGGER fail_own_refresh")
@@ -1149,11 +1305,15 @@ async fn accepted_own_activity_survives_later_local_refresh_failure() {
     client
         .save_state_with_pending_local_group_deletion_frontier_clears()
         .unwrap();
-    let repaired = client
+    let mut repaired = client
         .observe_drained_session_events(&Default::default())
         .await
         .unwrap();
-    assert!(repaired.projection_updates.is_empty());
+    repaired
+        .projection_updates
+        .extend(client.take_pending_projection_updates());
+    assert_eq!(repaired.projection_updates.iter().flat_map(|update| &update.timeline_changes)
+        .filter(|change| matches!(change, crate::TimelineMessageChange::Upsert { message, .. } if message.kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM)).count(), 1);
     assert_eq!(timeline(&app, &group).messages.len(), 1);
     assert_eq!(relay.published_event_ids().len(), published);
 }

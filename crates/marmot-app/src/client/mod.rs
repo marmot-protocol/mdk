@@ -1207,7 +1207,6 @@ impl AppClient {
         // Retention observes recovery evidence once, before any fallible reads.
         // Keep committed activity even if native projection or summary reads fail.
         let observed = self.observe_native_membership_effects(effects).await;
-        self.queue_own_group_system_projection_updates(effects);
         let result = observed.and_then(|()| self.summarize_maintenance(effects));
         self.recover_superseded_invites_best_effort().await;
         result
@@ -5494,9 +5493,10 @@ impl AppClient {
         // Manual and scheduled retries consume the same one-shot native events.
         // Reuse their complete observer, including reportless membership effects,
         // source finalization, route refresh, and persistence before broadcasting.
-        let mut summary = self
-            .observe_scheduled_convergence_effects(group_id, effects)
+        self.observe_scheduled_convergence_effects(group_id, effects)
             .await?;
+        let mut summary = self.take_pending_applied_sync_summary();
+        self.drain_epoch_stall_escalations(&mut summary);
         self.pending_projection_updates
             .extend(std::mem::take(&mut summary.projection_updates));
         self.pending_applied_sync_summary.merge(summary);
