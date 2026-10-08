@@ -227,7 +227,9 @@ retained-epoch window (5) past those messages, which could then never be decrypt
   history, so the hold waits it out. Once the limit is reached, every relay is reachable
   yet none serves the named events, so the debt is abandoned: the group may already be past
   the epoch a late event needs, so a later admission no longer clears it, and the route
-  stays uncertified until recovery parks with its notice. The trade-off is deliberate: a
+  stays uncertified until recovery parks with its notice. Abandonment applies to the
+  debt it covered: an event a later comparison names for the first time is new debt and
+  holds the group again, with a fresh stall count. The trade-off is deliberate: a
   relay that stays down keeps its group held until it returns or recovery parks, rather
   than risk applying commits past history that relay may still deliver.
 

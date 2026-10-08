@@ -17,13 +17,13 @@ CREATE TABLE cgka_history_acquisition_holds (
         CHECK(typeof(stalled_passes) = 'integer' AND stalled_passes >= 0),
     admitted_since_settle INTEGER NOT NULL DEFAULT 0
         CHECK(typeof(admitted_since_settle) = 'integer' AND admitted_since_settle >= 0),
-    released INTEGER NOT NULL DEFAULT 0 CHECK(released IN (0, 1)),
     PRIMARY KEY(group_id, transport_group_id)
 );
 CREATE TABLE cgka_history_acquisition_debt (
     transport_group_id BLOB NOT NULL,
     event_id BLOB NOT NULL CHECK(typeof(event_id) = 'blob' AND length(event_id) = 32),
     group_id BLOB NOT NULL,
+    abandoned INTEGER NOT NULL DEFAULT 0 CHECK(abandoned IN (0, 1)),
     PRIMARY KEY(transport_group_id, event_id, group_id),
     FOREIGN KEY(group_id, transport_group_id)
         REFERENCES cgka_history_acquisition_holds(group_id, transport_group_id)

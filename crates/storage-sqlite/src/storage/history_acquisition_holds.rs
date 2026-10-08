@@ -3,9 +3,11 @@
 //!
 //! A hold keeps the exact event ids a comparison named as missing on one
 //! route (its debt). Recording an event as durably admitted removes it from
-//! every debt, so a hold ends exactly when everything it waited for is held.
-//! The engine only reads whether a group has an active hold; the app owns
-//! installing, settling and releasing them.
+//! every active debt, so a hold ends exactly when everything it waited for is
+//! held. A group is held while it has any active debt. Debt the stall
+//! backstop abandoned no longer holds the epoch but still keeps its route
+//! from certifying. The engine only reads whether a group is held; the app
+//! owns installing, settling and releasing holds.
 use crate::connection::CachedSql;
 use crate::{SqliteAccountStorage, SqliteResultExt};
 use cgka_traits::storage::{HistoryAcquisitionHoldStorage, StorageResult};
@@ -13,13 +15,14 @@ use cgka_traits::types::GroupId;
 use rusqlite::{OptionalExtension, params};
 
 /// Settled passes in a row on which every relay of the route answered but
-/// none served any of its debt, after which the hold stops blocking the epoch.
-/// A pass with any relay down never counts: that relay may be the one holding
-/// the named history, so the hold waits it out. Reaching the limit means every
-/// relay is reachable yet none serves the named events, so the debt is
-/// abandoned: a late admission may already be too late to decrypt and no
-/// longer clears it, the route never certifies again, and recovery ends with
-/// its "history may be incomplete" notice.
+/// none served any of its active debt, after which that debt is abandoned and
+/// stops holding the epoch. A pass with any relay down never counts: that
+/// relay may be the one holding the named history, so the hold waits it out.
+/// Reaching the limit means every relay is reachable yet none serves the
+/// named events. A late admission may then already be too late to decrypt,
+/// so it no longer clears abandoned debt, the route never certifies again,
+/// and recovery ends with its "history may be incomplete" notice. Newly named
+/// events are still active debt and hold the group again.
 pub const HISTORY_ACQUISITION_STALL_PASSES: u64 = 6;
 
 /// What settling one compared route's hold found.
@@ -30,9 +33,9 @@ pub enum HistoryAcquisitionSettlement {
     /// Every event the hold waited for is admitted and the hold is gone.
     /// `group_unheld` says this released the group's last active hold.
     Complete { group_unheld: bool },
-    /// Named events are still missing, so the route must not certify.
-    /// `group_unheld` says the stall backstop just released the group's last
-    /// active hold.
+    /// Named events are still missing, or were abandoned, so the route must
+    /// not certify. `group_unheld` says the stall backstop just released the
+    /// group's last active hold.
     Outstanding { group_unheld: bool },
 }
 
@@ -46,7 +49,9 @@ impl HistoryAcquisitionHoldStorage for SqliteAccountStorage {
 impl SqliteAccountStorage {
     /// Hold `group_id`'s epoch until every event in `event_ids` that route
     /// `transport_group_id` named is durably admitted. Events already admitted
-    /// are not debt. A hold left with no debt is removed.
+    /// are not debt, and an event the backstop abandoned stays abandoned. A
+    /// newly named event restarts the route's stall count. A hold left with
+    /// no debt is removed.
     pub fn hold_history_acquisition(
         &self,
         group_id: &GroupId,
@@ -64,23 +69,34 @@ impl SqliteAccountStorage {
                 params![group_id.as_slice(), transport_group_id.as_slice()],
             )
             .storage()?;
+            let mut named = 0usize;
             for event_id in event_ids {
+                named += conn
+                    .execute_cached(
+                        "INSERT OR IGNORE INTO cgka_history_acquisition_debt
+                         (transport_group_id, event_id, group_id)
+                         SELECT ?1, ?2, ?3 WHERE NOT EXISTS (
+                             SELECT 1 FROM transport_reconciliation_items
+                             WHERE route_kind = 1 AND route_id = ?1 AND event_id = ?2
+                         )",
+                        params![
+                            transport_group_id.as_slice(),
+                            event_id.as_slice(),
+                            group_id.as_slice()
+                        ],
+                    )
+                    .storage()?;
+            }
+            if named > 0 {
                 conn.execute_cached(
-                    "INSERT OR IGNORE INTO cgka_history_acquisition_debt
-                     (transport_group_id, event_id, group_id)
-                     SELECT ?1, ?2, ?3 WHERE NOT EXISTS (
-                         SELECT 1 FROM transport_reconciliation_items
-                         WHERE route_kind = 1 AND route_id = ?1 AND event_id = ?2
-                     )",
-                    params![
-                        transport_group_id.as_slice(),
-                        event_id.as_slice(),
-                        group_id.as_slice()
-                    ],
+                    "UPDATE cgka_history_acquisition_holds
+                     SET stalled_passes = 0, admitted_since_settle = 0
+                     WHERE group_id = ?1 AND transport_group_id = ?2",
+                    params![group_id.as_slice(), transport_group_id.as_slice()],
                 )
                 .storage()?;
             }
-            if debt(&conn, group_id.as_slice(), transport_group_id)? == 0 {
+            if debt(&conn, group_id.as_slice(), transport_group_id, false)? == 0 {
                 delete_hold(&conn, group_id.as_slice(), transport_group_id)?;
             }
             Ok(())
@@ -98,26 +114,29 @@ impl SqliteAccountStorage {
     ) -> StorageResult<HistoryAcquisitionSettlement> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            let row: Option<(i64, i64, bool)> = conn
+            let group = group_id.as_slice();
+            let row: Option<(i64, i64)> = conn
                 .query_row_cached(
-                    "SELECT stalled_passes, admitted_since_settle, released
+                    "SELECT stalled_passes, admitted_since_settle
                      FROM cgka_history_acquisition_holds
                      WHERE group_id = ?1 AND transport_group_id = ?2",
-                    params![group_id.as_slice(), transport_group_id.as_slice()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    params![group, transport_group_id.as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()
                 .storage()?;
-            let Some((stalled, admitted, released)) = row else {
+            let Some((stalled, admitted)) = row else {
                 return Ok(HistoryAcquisitionSettlement::Unheld);
             };
-            if debt(&conn, group_id.as_slice(), transport_group_id)? == 0 {
-                delete_hold(&conn, group_id.as_slice(), transport_group_id)?;
+            let held_before = group_held(&conn, group)?;
+            if debt(&conn, group, transport_group_id, false)? == 0 {
+                delete_hold(&conn, group, transport_group_id)?;
                 return Ok(HistoryAcquisitionSettlement::Complete {
-                    group_unheld: !released && !group_held(&conn, group_id.as_slice())?,
+                    group_unheld: held_before && !group_held(&conn, group)?,
                 });
             }
-            let stalled = if admitted > 0 {
+            let active = debt(&conn, group, transport_group_id, true)?;
+            let stalled = if admitted > 0 || active == 0 {
                 0
             } else if every_relay_answered {
                 stalled.saturating_add(1)
@@ -125,21 +144,28 @@ impl SqliteAccountStorage {
                 stalled
             };
             let stall_limit = i64::try_from(HISTORY_ACQUISITION_STALL_PASSES).unwrap_or(i64::MAX);
-            let newly_released = !released && stalled >= stall_limit;
+            let abandon = active > 0 && stalled >= stall_limit;
+            if abandon {
+                conn.execute_cached(
+                    "UPDATE cgka_history_acquisition_debt SET abandoned = 1
+                     WHERE group_id = ?1 AND transport_group_id = ?2",
+                    params![group, transport_group_id.as_slice()],
+                )
+                .storage()?;
+            }
             conn.execute_cached(
                 "UPDATE cgka_history_acquisition_holds
-                 SET stalled_passes = ?3, admitted_since_settle = 0, released = ?4
+                 SET stalled_passes = ?3, admitted_since_settle = 0
                  WHERE group_id = ?1 AND transport_group_id = ?2",
                 params![
-                    group_id.as_slice(),
+                    group,
                     transport_group_id.as_slice(),
-                    stalled,
-                    released || newly_released
+                    if abandon { 0 } else { stalled }
                 ],
             )
             .storage()?;
             Ok(HistoryAcquisitionSettlement::Outstanding {
-                group_unheld: newly_released && !group_held(&conn, group_id.as_slice())?,
+                group_unheld: held_before && !group_held(&conn, group)?,
             })
         })
     }
@@ -153,9 +179,9 @@ impl SqliteAccountStorage {
     ) -> StorageResult<bool> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            let active = hold_active(&conn, group_id.as_slice(), transport_group_id)?;
+            let held_before = group_held(&conn, group_id.as_slice())?;
             delete_hold(&conn, group_id.as_slice(), transport_group_id)?;
-            Ok(active && !group_held(&conn, group_id.as_slice())?)
+            Ok(held_before && !group_held(&conn, group_id.as_slice())?)
         })
     }
 
@@ -169,7 +195,7 @@ impl SqliteAccountStorage {
             let conn = self.lock()?;
             let unowed = conn
                 .prepare_cached(
-                    "SELECT hold.group_id, hold.transport_group_id, hold.released
+                    "SELECT hold.group_id, hold.transport_group_id
                      FROM cgka_history_acquisition_holds hold
                      WHERE NOT EXISTS (
                          SELECT 1 FROM account_recovery_scopes scope
@@ -183,24 +209,21 @@ impl SqliteAccountStorage {
                 )
                 .storage()?
                 .query_map([], |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, bool>(2)?,
-                    ))
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
                 })
                 .storage()?
                 .collect::<Result<Vec<_>, _>>()
                 .storage()?;
             let mut released = Vec::new();
-            for (group_id, transport_group_id, was_released) in unowed {
+            for (group_id, transport_group_id) in unowed {
+                let held_before = group_held(&conn, &group_id)?;
                 conn.execute_cached(
                     "DELETE FROM cgka_history_acquisition_holds
                      WHERE group_id = ?1 AND transport_group_id = ?2",
                     params![group_id, transport_group_id],
                 )
                 .storage()?;
-                if !was_released
+                if held_before
                     && released.last() != Some(&group_id)
                     && !group_held(&conn, &group_id)?
                 {
@@ -212,62 +235,62 @@ impl SqliteAccountStorage {
     }
 }
 
-/// Remove `event_id` from every active hold's debt on `transport_group_id`
-/// once it is durably admitted, inside the transaction that records the
-/// admission. A released hold's debt is abandoned and stays. A hold left with
-/// no debt ends here, whether or not a comparison pass follows; returns the
-/// groups this left with no active hold.
+/// Remove `event_id` from every active debt on `transport_group_id` once it
+/// is durably admitted, inside the transaction that records the admission.
+/// Abandoned debt stays. Only the holds that owed the event count it as
+/// progress. A hold left with no debt ends here, whether or not a comparison
+/// pass follows; returns the groups this left with no active hold.
 pub(crate) fn admit_history_acquisition_debt_tx(
     conn: &rusqlite::Connection,
     transport_group_id: &[u8],
     event_id: &[u8; 32],
 ) -> StorageResult<Vec<GroupId>> {
-    let removed = conn
-        .execute_cached(
-            "DELETE FROM cgka_history_acquisition_debt
-             WHERE transport_group_id = ?1 AND event_id = ?2
-                 AND group_id IN (
-                     SELECT group_id FROM cgka_history_acquisition_holds
-                     WHERE transport_group_id = ?1 AND released = 0
-                 )",
-            params![transport_group_id, event_id.as_slice()],
-        )
-        .storage()?;
-    if removed == 0 {
-        return Ok(Vec::new());
-    }
-    conn.execute_cached(
-        "UPDATE cgka_history_acquisition_holds
-         SET admitted_since_settle = admitted_since_settle + 1
-         WHERE transport_group_id = ?1",
-        params![transport_group_id],
-    )
-    .storage()?;
-    let complete = conn
+    let owed_by = conn
         .prepare_cached(
-            "SELECT hold.group_id, hold.released FROM cgka_history_acquisition_holds hold
-             WHERE hold.transport_group_id = ?1 AND NOT EXISTS (
-                 SELECT 1 FROM cgka_history_acquisition_debt debt
-                 WHERE debt.group_id = hold.group_id
-                     AND debt.transport_group_id = hold.transport_group_id
-             )",
+            "SELECT group_id FROM cgka_history_acquisition_debt
+             WHERE transport_group_id = ?1 AND event_id = ?2 AND abandoned = 0
+             ORDER BY group_id",
         )
         .storage()?
-        .query_map(params![transport_group_id], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, bool>(1)?))
+        .query_map(params![transport_group_id, event_id.as_slice()], |row| {
+            row.get::<_, Vec<u8>>(0)
         })
         .storage()?
         .collect::<Result<Vec<_>, _>>()
         .storage()?;
     let mut released = Vec::new();
-    for (group_id, was_released) in complete {
+    for group_id in owed_by {
+        let held_before = group_held(conn, &group_id)?;
         conn.execute_cached(
-            "DELETE FROM cgka_history_acquisition_holds
-             WHERE group_id = ?1 AND transport_group_id = ?2",
-            params![group_id, transport_group_id],
+            "DELETE FROM cgka_history_acquisition_debt
+             WHERE transport_group_id = ?1 AND event_id = ?2 AND group_id = ?3",
+            params![transport_group_id, event_id.as_slice(), group_id],
         )
         .storage()?;
-        if !was_released && !group_held(conn, &group_id)? {
+        conn.execute_cached(
+            "UPDATE cgka_history_acquisition_holds
+             SET admitted_since_settle = admitted_since_settle + 1
+             WHERE transport_group_id = ?1 AND group_id = ?2",
+            params![transport_group_id, group_id],
+        )
+        .storage()?;
+        let remaining: i64 = conn
+            .query_row_cached(
+                "SELECT count(*) FROM cgka_history_acquisition_debt
+                 WHERE transport_group_id = ?1 AND group_id = ?2",
+                params![transport_group_id, group_id],
+                |row| row.get(0),
+            )
+            .storage()?;
+        if remaining == 0 {
+            conn.execute_cached(
+                "DELETE FROM cgka_history_acquisition_holds
+                 WHERE transport_group_id = ?1 AND group_id = ?2",
+                params![transport_group_id, group_id],
+            )
+            .storage()?;
+        }
+        if held_before && !group_held(conn, &group_id)? {
             released.push(GroupId::new(group_id));
         }
     }
@@ -277,8 +300,8 @@ pub(crate) fn admit_history_acquisition_debt_tx(
 fn group_held(conn: &rusqlite::Connection, group_id: &[u8]) -> StorageResult<bool> {
     Ok(conn
         .query_row_cached(
-            "SELECT 1 FROM cgka_history_acquisition_holds
-             WHERE group_id = ?1 AND released = 0 LIMIT 1",
+            "SELECT 1 FROM cgka_history_acquisition_debt
+             WHERE group_id = ?1 AND abandoned = 0 LIMIT 1",
             params![group_id],
             |_| Ok(()),
         )
@@ -287,32 +310,18 @@ fn group_held(conn: &rusqlite::Connection, group_id: &[u8]) -> StorageResult<boo
         .is_some())
 }
 
-fn hold_active(
-    conn: &rusqlite::Connection,
-    group_id: &[u8],
-    transport_group_id: &[u8; 32],
-) -> StorageResult<bool> {
-    Ok(conn
-        .query_row_cached(
-            "SELECT 1 FROM cgka_history_acquisition_holds
-             WHERE group_id = ?1 AND transport_group_id = ?2 AND released = 0",
-            params![group_id, transport_group_id.as_slice()],
-            |_| Ok(()),
-        )
-        .optional()
-        .storage()?
-        .is_some())
-}
-
+/// Debt `transport_group_id` holds for `group_id`: only the active part when
+/// `active_only`, otherwise abandoned debt too.
 fn debt(
     conn: &rusqlite::Connection,
     group_id: &[u8],
     transport_group_id: &[u8; 32],
+    active_only: bool,
 ) -> StorageResult<i64> {
     conn.query_row_cached(
         "SELECT count(*) FROM cgka_history_acquisition_debt
-         WHERE group_id = ?1 AND transport_group_id = ?2",
-        params![group_id, transport_group_id.as_slice()],
+         WHERE group_id = ?1 AND transport_group_id = ?2 AND (abandoned = 0 OR NOT ?3)",
+        params![group_id, transport_group_id.as_slice(), active_only],
         |row| row.get(0),
     )
     .storage()
@@ -530,5 +539,83 @@ mod tests {
         assert!(store.history_acquisition_held(&owed.id).unwrap());
         assert!(!store.history_acquisition_held(&parked.id).unwrap());
         assert!(store.history_acquisition_held(&unowed.id).unwrap());
+    }
+
+    fn stall_out(store: &SqliteAccountStorage, group: &GroupId, route: [u8; 32]) {
+        for _ in 0..HISTORY_ACQUISITION_STALL_PASSES {
+            settle(store, group, route, true);
+        }
+    }
+
+    #[test]
+    fn new_history_after_the_backstop_holds_the_group_again() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group = sample_group(gid(1), 4, 0);
+        store.put_group(&group).unwrap();
+        store
+            .hold_history_acquisition(&group.id, &[7; 32], &[[1; 32]])
+            .unwrap();
+        stall_out(&store, &group.id, [7; 32]);
+        assert!(!store.history_acquisition_held(&group.id).unwrap());
+
+        // A comparison that names only the abandoned event again does not
+        // hold the group: nothing new is known to be missing.
+        store
+            .hold_history_acquisition(&group.id, &[7; 32], &[[1; 32]])
+            .unwrap();
+        assert!(!store.history_acquisition_held(&group.id).unwrap());
+
+        // A newly named event is protected like any other missing history.
+        store
+            .hold_history_acquisition(&group.id, &[7; 32], &[[1; 32], [2; 32]])
+            .unwrap();
+        assert!(store.history_acquisition_held(&group.id).unwrap());
+        // Its stall count starts over rather than inheriting the backstop.
+        for _ in 1..HISTORY_ACQUISITION_STALL_PASSES {
+            settle(&store, &group.id, [7; 32], true);
+        }
+        assert!(store.history_acquisition_held(&group.id).unwrap());
+
+        // Its arrival releases the group, but the abandoned event still keeps
+        // the route from certifying.
+        assert_eq!(admit(&store, [7; 32], [2; 32]), vec![group.id.clone()]);
+        assert!(!store.history_acquisition_held(&group.id).unwrap());
+        assert_eq!(
+            settle(&store, &group.id, [7; 32], true),
+            HistoryAcquisitionSettlement::Outstanding {
+                group_unheld: false
+            }
+        );
+        assert!(admit(&store, [7; 32], [1; 32]).is_empty());
+        assert_eq!(
+            settle(&store, &group.id, [7; 32], true),
+            HistoryAcquisitionSettlement::Outstanding {
+                group_unheld: false
+            }
+        );
+    }
+
+    #[test]
+    fn an_admission_only_counts_for_holds_that_owed_it() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let owed = sample_group(gid(1), 4, 0);
+        let other = sample_group(gid(2), 4, 0);
+        store.put_group(&owed).unwrap();
+        store.put_group(&other).unwrap();
+        store
+            .hold_history_acquisition(&owed.id, &[7; 32], &[[1; 32], [2; 32]])
+            .unwrap();
+        store
+            .hold_history_acquisition(&other.id, &[7; 32], &[[3; 32]])
+            .unwrap();
+        for _ in 1..HISTORY_ACQUISITION_STALL_PASSES {
+            settle(&store, &other.id, [7; 32], true);
+        }
+        // An event only `owed` waited for must not reset `other`'s count.
+        admit(&store, [7; 32], [1; 32]);
+        assert_eq!(
+            settle(&store, &other.id, [7; 32], true),
+            HistoryAcquisitionSettlement::Outstanding { group_unheld: true }
+        );
     }
 }
