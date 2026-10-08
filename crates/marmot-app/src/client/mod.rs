@@ -535,6 +535,13 @@ pub struct AppClient {
     /// sync summary so live chat-list/group-state subscriptions observe the
     /// applied commits.
     pub(crate) pending_applied_sync_summary: crate::SyncSummary,
+    /// Committed batches retained until every app projection write succeeds.
+    pub(super) pending_applied_effects: std::collections::VecDeque<sync::PendingAppliedEffects>,
+    /// Publication wake ownership through source finalization and durable fanout cleanup.
+    pub(super) pending_resumed_message_notifications:
+        HashMap<(GroupId, String), sync::PendingMessageNotification>,
+    /// Hydrated groups whose canonical push cleanup needs a bounded retry.
+    pub(super) pending_push_leaf_reconciliations: std::collections::HashSet<GroupId>,
     /// App-visible outputs ingested during a sync whose account-projection
     /// checkpoint failed. A retained client keeps the matching projected state
     /// and outbox acknowledgements, then returns this summary after its next
@@ -1197,40 +1204,19 @@ impl AppClient {
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<crate::MaintenanceRunSummary, AppError> {
-        let result = self.observe_recovery_evidence_then_summarize_maintenance(effects);
+        // Retention observes recovery evidence once, before any fallible reads.
+        // Keep committed activity even if native projection or summary reads fail.
+        let observed = self.observe_native_membership_effects(effects).await;
+        let result = observed.and_then(|()| self.summarize_maintenance(effects));
         self.recover_superseded_invites_best_effort().await;
         result
     }
 
-    /// Observe one maintenance tick's recovery evidence, then summarize the
-    /// tick — split from the tick itself so the pair is exercisable against a
-    /// given batch of effects.
-    ///
-    /// A maintenance tick publishes: it drains a recovered staged evolution and
-    /// confirms it, so this batch can carry an `EpochChanged` for a group the
-    /// stall detector is tracking. That passage is one-shot in these effects and
-    /// reaches the detector nowhere else — a tick's own recovery is invisible to
-    /// every delivery-driven seam.
-    ///
-    /// Hence the order the name states, and the reason this is one function
-    /// rather than two calls at the seam: the summary build reads storage and so
-    /// can return early, and an `Err` reached before the observation would drop
-    /// that passage for good. It is the same hazard
-    /// [`Self::observe_recovery_evidence_then_fail_if_publish_failed`] exists
-    /// for, and it gets the same answer — a name that fixes the order.
-    ///
-    /// A tick can also *arm*, from a `TransportObjectResourceRefused` riding the
-    /// same batch. Nothing executes that arm here: the worker does not run the
-    /// pending backfill after a tick, so the intent waits for the next
-    /// delivery-driven seam to drain it. The arm and its audit row are durable
-    /// meanwhile, so the wait costs latency, not the recovery.
-    pub(crate) fn observe_recovery_evidence_then_summarize_maintenance(
+    /// Build maintenance counters after retaining the tick's committed effects.
+    fn summarize_maintenance(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<crate::MaintenanceRunSummary, AppError> {
-        self.observe_recovery_evidence(effects);
-        self.observe_recovery_health(effects)?;
-        self.queue_own_group_system_projection_updates(effects);
         let summary = self.runtime.maintenance_run_summary(effects)?;
         // The summary includes this pass's failed executions. Backlog counts only
         // durable failed obligations; reuse this read instead of rescanning state.
@@ -2645,6 +2631,7 @@ impl AppClient {
             // `&mut self`.
             Ok(effects) => self
                 .observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+                .await
                 .map(|()| effects),
             Err(error) => Err(error),
         };
@@ -2681,7 +2668,6 @@ impl AppClient {
             self.refresh_group(group_id);
             self.prune_plaintext_retention_for_group(group_id)?;
             self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-            self.queue_own_group_system_projection_updates(&effects);
             Ok::<_, AppError>(())
         })();
         record_app_performance(
@@ -2764,13 +2750,13 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.cleanup_stale_push_tokens_best_effort(group_id);
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
         self.publish_targeted_group_state_wake_best_effort(
             group_id,
             wake_snapshot,
@@ -2836,7 +2822,8 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -2954,24 +2941,8 @@ impl AppClient {
         self.pending_recovery_capacity_writes.remove(group_id);
         self.encrypted_media_not_required_epochs.remove(&group_hex);
         self.pending_convergence_groups.remove(group_id);
-        for summary in [
-            &mut self.pending_applied_sync_summary,
-            &mut self.pending_failed_sync_summary,
-        ] {
-            summary.joined_groups.retain(|group| group != group_id);
-            summary
-                .messages
-                .retain(|message| &message.group_id != group_id);
-            summary
-                .events
-                .retain(|event| crate::groups::event_group_id(event) != Some(group_id));
-            summary
-                .projection_updates
-                .retain(|update| update.group_id_hex != group_hex);
-            summary
-                .epoch_stall_escalations
-                .retain(|event| &event.group_id != group_id);
-        }
+        self.forget_pending_effect_projections(group_id);
+        self.pending_push_leaf_reconciliations.remove(group_id);
         self.app.presentation_signals.wake();
         // Deletion already committed. A failed transport refresh must not make
         // the caller believe the group still exists; ordinary maintenance retries.
@@ -3092,6 +3063,14 @@ impl AppClient {
                 return Err(error);
             }
         };
+        // A committed deletion supersedes every previously admitted projection
+        // for this group, including a cached decision to cross an older frontier.
+        self.forget_pending_effect_projections(group_id);
+        self.pending_group_projection_updates.remove(&group_id_hex);
+        self.pending_local_group_deletion_frontier_clears
+            .remove(&group_id_hex);
+        self.pending_projection_updates
+            .retain(|update| update.group_id_hex != group_id_hex);
         if was_live {
             // The wipe has committed. Route restoration is a best-effort
             // post-success step: a transient adapter failure must not report
@@ -3163,7 +3142,8 @@ impl AppClient {
                     audit_context.clone(),
                 )
                 .await?;
-            self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+            self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+                .await?;
             Ok::<_, AppError>(effects)
         }
         .await
@@ -3183,7 +3163,6 @@ impl AppClient {
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
         // A local leave / decline is a voluntary departure, recorded as `Left`
         // so the chat list can distinguish it from an involuntary removal. The
         // inbound `observe_account_device_effects` path records this for an
@@ -3590,12 +3569,12 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
         self.publish_targeted_group_state_wake_best_effort(
             group_id,
             wake_snapshot,
@@ -3659,12 +3638,12 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -3717,13 +3696,13 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.prune_plaintext_retention_for_group(group_id)?;
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -3788,12 +3767,12 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -3832,12 +3811,12 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -4398,19 +4377,7 @@ impl AppClient {
         // Finalization skips an already-completed local projection, repairs
         // failed source writes, and forwards sibling updates before retiring
         // the accepted fanouts.
-        let finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
-        self.pending_projection_updates.extend(finalize_updates);
-        // A send that lands while inbound convergence input is retained folds
-        // those commits before publishing, so `effects.events` can carry peer
-        // state changes (e.g. a mid-window group rename). Observe them through
-        // the same pipeline as inbound deliveries — state group refresh plus
-        // kind-1210 system-row synthesis (replacing the narrower
-        // `queue_own_group_system_projection_updates`) — and buffer the summary
-        // for the account worker to broadcast; dropping the events here leaves
-        // storage renamed while chat-list/group-state subscribers never wake.
-        // Best-effort: a projection failure must not fail a completed publish.
-        self.observe_send_applied_effects_best_effort(&effects)
-            .await;
+        self.retry_send_applied_effects_best_effort().await;
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         if published.is_some() && notification_trigger_for_intent(&intent).is_some() {
             // A checkpoint is needed only when another transport wait follows;
@@ -4423,6 +4390,7 @@ impl AppClient {
                 notifications::NotificationTrigger::NewMessage,
             )
             .await;
+            self.remember_message_notification_sent(group_id, &app_event_id);
         }
         Ok((
             event,
@@ -4464,23 +4432,11 @@ impl AppClient {
         group_id: &GroupId,
         app_event_id: &str,
     ) -> Result<(), AppError> {
-        self.observe_recovery_evidence(effects);
-        self.remember_pending_convergence_groups(effects);
-        match self
-            .invalidate_failed_app_message_projections(effects, Some((group_id, app_event_id)))
-        {
-            Ok(failed_updates) => self.pending_projection_updates.extend(failed_updates),
-            Err(error) => {
-                // A sibling projection failure must not retract the current
-                // send when its own fanout was accepted or retained.
-                tracing::warn!(
-                    target: "marmot_app::messages",
-                    method = "send_app_event_with_local_projection",
-                    error_kind = error.privacy_safe_kind(),
-                    "failed to invalidate a terminally failed sibling from a send batch"
-                );
-            }
-        }
+        let mut retained = effects.clone();
+        retained
+            .failed_app_messages
+            .retain(|failed| failed.group_id != *group_id || failed.app_event_id != app_event_id);
+        self.retain_applied_effects(&retained);
         // Every attempted application fanout lands in exactly one of the
         // published, unresolved, or failed lists. A send in none of them was
         // never fanned out: unsettled convergence or an in-flight publication
@@ -4514,23 +4470,7 @@ impl AppClient {
         // remains visibly pending until an unrelated recovery pass. Keep this
         // best-effort so projection trouble cannot mask the primary publish
         // failure.
-        self.remember_published_reports(effects);
-        match self.finalize_published_app_message_source_retention(effects) {
-            Ok(updates) => self.pending_projection_updates.extend(updates),
-            Err(error) => {
-                tracing::warn!(
-                    target: "marmot_app::messages",
-                    method = "send_app_event_with_local_projection",
-                    error_kind = error.privacy_safe_kind(),
-                    "failed to finalize a successful sibling from a failed send batch"
-                );
-            }
-        }
-        // The send itself failed to reach anyone, but any peer commits it
-        // folded are durably applied — broadcast them before surfacing the
-        // publish failure, best-effort so a projection error cannot mask
-        // the primary error.
-        self.observe_send_applied_effects_best_effort(effects).await;
+        self.retry_send_applied_effects_best_effort().await;
         if let Err(_save_err) = self.save_state_with_pending_local_group_deletion_frontier_clears()
         {
             tracing::warn!(
@@ -5313,13 +5253,13 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         let summary = send_summary_from_effects(&effects);
         self.refresh_group(group_id);
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
         Ok(summary)
     }
 
@@ -5569,36 +5509,26 @@ impl AppClient {
         self.sync_runtime_groups().await?;
         let effects = self.runtime.advance_convergence(group_id).await?;
         self.observe_convergence_retry_effects(group_id, &effects)
+            .await
     }
 
     /// Project one convergence retry's effects, split from the advance itself so
     /// the projection is exercisable against a given batch of effects.
-    pub(crate) fn observe_convergence_retry_effects(
+    pub(crate) async fn observe_convergence_retry_effects(
         &mut self,
         group_id: &GroupId,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<SendSummary, AppError> {
-        // Observe before the publish gate, for the reason spelled out in
-        // `observe_drained_session_events`.
-        self.observe_recovery_evidence(effects);
-        self.remember_published_reports(effects);
-        // This is the path that releases sends the engine had retained, so its
-        // finalize updates carry the pending -> delivered flip for each of them.
-        // Buffer these updates for the account worker, as the direct send path
-        // does for sibling completions and deferred source repairs. Dropping
-        // them leaves subscribers pending even though storage is delivered.
-        let finalize_updates = self.finalize_published_app_message_source_retention(effects)?;
-        self.pending_projection_updates.extend(finalize_updates);
-        let failed_updates = self.invalidate_failed_app_message_projections(effects, None)?;
-        self.pending_projection_updates.extend(failed_updates);
-        // A manual retry can complete one frozen fanout while another publish
-        // in the same convergence batch fails. Finalize that success before
-        // surfacing the unrelated failure because its fanout is already gone.
-        fail_if_publish_failed(effects)?;
-        self.refresh_group(group_id);
-        self.prune_plaintext_retention_for_group(group_id)?;
-        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(effects);
+        // Manual and scheduled retries consume the same one-shot native events.
+        // Reuse their complete observer, including reportless membership effects,
+        // source finalization, route refresh, and persistence before broadcasting.
+        self.observe_scheduled_convergence_effects(group_id, effects)
+            .await?;
+        let mut summary = self.take_pending_applied_sync_summary();
+        self.drain_epoch_stall_escalations(&mut summary);
+        self.pending_projection_updates
+            .extend(std::mem::take(&mut summary.projection_updates));
+        self.pending_applied_sync_summary.merge(summary);
         Ok(send_summary_from_effects(effects))
     }
 
@@ -5664,7 +5594,8 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         let group_metadata = self.runtime.group_record(group_id).ok();
@@ -5677,7 +5608,6 @@ impl AppClient {
         );
         self.mark_group_projection_dirty(group_id);
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -6637,7 +6567,8 @@ impl AppClient {
                 // same gate, so no publishing seam reaches the bare check.
                 recover_post_canonical_result(
                     "classify_founding_welcome_publish",
-                    self.observe_recovery_evidence_then_fail_if_publish_failed(&effects),
+                    self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+                        .await,
                 );
                 recover_post_canonical_result(
                     "record_founding_welcome_delivery_failures",
@@ -6648,7 +6579,6 @@ impl AppClient {
                 );
                 self.record_human_action_succeeded(&work.group_id, &work.audit_context, &effects);
                 self.remember_published_reports(&effects);
-                self.queue_own_group_system_projection_updates(&effects);
             }
             UnpublishedWelcomeKind::Invite {
                 welcomes,

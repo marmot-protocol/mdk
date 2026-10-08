@@ -21,6 +21,9 @@ between engine, peeler, transport adapter, storage, and caller imports from here
 - Cross-boundary value types: `TransportMessage`, `TransportEnvelope`, `TransportAccountActivation`,
   `TransportPublishRequest`, `TransportDelivery`, `PeeledMessage`, `EncryptedPayload`, `SendIntent`, `SendResult`,
   `AutoPublish`, `GroupEvent`, `PendingStateRef`, `MessageId`, `GroupId`, `MemberId`, `EpochId`, `Group`, `Member`.
+  `GroupEvent` separates renderable account activity from device-local termination,
+  restoration and leaf-destination cleanup. Consumers must not reconstruct these
+  effects from newer engine state. `GroupMemberLeaf` names account and leaf index.
 - App-component value types: `AppComponentSet`, `AppComponentData`, and typed component states (`NostrRoutingV1`,
   `GroupProfileV1`, `GroupLifecycleV1`, `GroupAvatarUrlV1`, `GroupBlossomImageV1`, frozen `BlobStoreEndpointV1` /
   `EncryptedMediaPolicyV1`, current `BlobStoreEndpointV2` / `EncryptedMediaPolicyV2`), plus the public-IP / loopback

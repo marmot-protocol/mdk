@@ -1491,6 +1491,7 @@ impl AppRuntimeHarness {
                     },
                     received_payloads: layered.application.visible_plaintexts,
                     added_members: Vec::new(),
+                    withdrawn_added_members: Vec::new(),
                     removed_members: Vec::new(),
                     epoch_changes: Vec::new(),
                     app_invalidations: Vec::new(),

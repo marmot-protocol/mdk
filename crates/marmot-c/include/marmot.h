@@ -525,6 +525,21 @@ typedef enum MarmotMarkdownNostrHrp {
 } MarmotMarkdownNostrHrp;
 
 /**
+ * Timestamp presentation style; hosts format using the device locale and time zone.
+ */
+typedef enum MarmotMarkdownTimestampStyle {
+  MARMOT_MARKDOWN_TIMESTAMP_STYLE_SHORT_TIME,
+  MARMOT_MARKDOWN_TIMESTAMP_STYLE_LONG_TIME,
+  MARMOT_MARKDOWN_TIMESTAMP_STYLE_SHORT_DATE,
+  MARMOT_MARKDOWN_TIMESTAMP_STYLE_LONG_DATE,
+  MARMOT_MARKDOWN_TIMESTAMP_STYLE_SHORT_DATE_TIME,
+  MARMOT_MARKDOWN_TIMESTAMP_STYLE_LONG_DATE_TIME,
+  MARMOT_MARKDOWN_TIMESTAMP_STYLE_COMPACT_DATE_TIME,
+  MARMOT_MARKDOWN_TIMESTAMP_STYLE_COMPACT_DATE_TIME_SECONDS,
+  MARMOT_MARKDOWN_TIMESTAMP_STYLE_RELATIVE,
+} MarmotMarkdownTimestampStyle;
+
+/**
  * How a fenced/indented code block was written.
  */
 typedef enum MarmotMarkdownCodeBlockKind {
@@ -2495,6 +2510,10 @@ typedef enum MarmotMarkdownInline_Tag {
   MARMOT_MARKDOWN_INLINE_MATH,
   MARMOT_MARKDOWN_INLINE_NOSTR_MENTION,
   MARMOT_MARKDOWN_INLINE_NOSTR_URI,
+  /**
+   * Signed Unix seconds and presentation style, without an allocated label.
+   */
+  MARMOT_MARKDOWN_INLINE_TIMESTAMP,
 } MarmotMarkdownInline_Tag;
 
 typedef struct MarmotMarkdownInline_Text_Body {
@@ -2560,6 +2579,11 @@ typedef struct MarmotMarkdownInline_NostrUri_Body {
   struct MarmotMarkdownNostrEntity entity;
 } MarmotMarkdownInline_NostrUri_Body;
 
+typedef struct MarmotMarkdownInline_Timestamp_Body {
+  int64_t unix_seconds;
+  enum MarmotMarkdownTimestampStyle style;
+} MarmotMarkdownInline_Timestamp_Body;
+
 typedef struct MarmotMarkdownInline {
   MarmotMarkdownInline_Tag tag;
   union {
@@ -2574,6 +2598,7 @@ typedef struct MarmotMarkdownInline {
     MarmotMarkdownInline_Math_Body MATH;
     MarmotMarkdownInline_NostrMention_Body NOSTR_MENTION;
     MarmotMarkdownInline_NostrUri_Body NOSTR_URI;
+    MarmotMarkdownInline_Timestamp_Body TIMESTAMP;
   };
 } MarmotMarkdownInline;
 
@@ -4570,6 +4595,9 @@ typedef enum MarmotGroupEventKind_Tag {
   MARMOT_GROUP_EVENT_KIND_GROUP_UNRECOVERABLE,
   MARMOT_GROUP_EVENT_KIND_PENDING_COMMIT_RECOVERED,
   MARMOT_GROUP_EVENT_KIND_GROUP_HYDRATION_RECOVERED,
+  MARMOT_GROUP_EVENT_KIND_LOCAL_GROUP_COPY_TERMINATED,
+  MARMOT_GROUP_EVENT_KIND_LOCAL_GROUP_COPY_RESTORED,
+  MARMOT_GROUP_EVENT_KIND_GROUP_MEMBER_LEAVES_REMOVED,
 } MarmotGroupEventKind_Tag;
 
 typedef struct MarmotGroupEventKind_GroupJoined_Body {
@@ -4645,6 +4673,14 @@ typedef struct MarmotGroupEventKind_GroupHydrationRecovered_Body {
   uint64_t recovered_epoch;
 } MarmotGroupEventKind_GroupHydrationRecovered_Body;
 
+typedef struct MarmotGroupEventKind_LocalGroupCopyTerminated_Body {
+  bool voluntary;
+} MarmotGroupEventKind_LocalGroupCopyTerminated_Body;
+
+typedef struct MarmotGroupEventKind_GroupMemberLeavesRemoved_Body {
+  uint64_t epoch;
+} MarmotGroupEventKind_GroupMemberLeavesRemoved_Body;
+
 typedef struct MarmotGroupEventKind {
   MarmotGroupEventKind_Tag tag;
   union {
@@ -4660,6 +4696,8 @@ typedef struct MarmotGroupEventKind {
     MarmotGroupEventKind_GroupStateRevalidated_Body GROUP_STATE_REVALIDATED;
     MarmotGroupEventKind_PendingCommitRecovered_Body PENDING_COMMIT_RECOVERED;
     MarmotGroupEventKind_GroupHydrationRecovered_Body GROUP_HYDRATION_RECOVERED;
+    MarmotGroupEventKind_LocalGroupCopyTerminated_Body LOCAL_GROUP_COPY_TERMINATED;
+    MarmotGroupEventKind_GroupMemberLeavesRemoved_Body GROUP_MEMBER_LEAVES_REMOVED;
   };
 } MarmotGroupEventKind;
 

@@ -21,7 +21,8 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [bounded chat screens](#bounded-chat-screens), [prepared conversation windows](#prepared-conversation-windows),
   [live timeline updates](#live-timeline-updates), [durable avatar access](#durable-avatar-access)
 - Messages and moderation: [deletion provenance and custom events](#deletion-provenance-and-custom-events),
-  [group-system previews](#group-system-previews), [group reporting](#group-reporting),
+  [group-system previews](#group-system-previews),
+  [device-local membership events](#device-local-membership-events), [group reporting](#group-reporting),
   [history may be incomplete notices](#history-may-be-incomplete-notices)
 - Media: [bounded attachment history](#bounded-attachment-history), [local attachment access](#local-attachment-access)
 - Audit logs: [audit v5 recording and delivery](#audit-v5-recording-and-delivery),
@@ -180,6 +181,37 @@ Configure consent-gated analytics, audit uploads and relay telemetry deliberatel
 are not credentials. Never log message bodies, asset references, keys, account/group identifiers,
 raw DTO stringification or relay URLs as performance labels. Use bounded performance operations
 and aggregate snapshots; keep secrets out of diagnostics and host callback errors.
+
+### Markdown rendering
+
+Render the typed Markdown tokens on message, timeline and reply-preview records.
+`parseMarkdown` returns the same AST for draft previews and custom renderers.
+`MarkdownInlineFfi.Timestamp` carries signed `unixSeconds` (Swift `Int64`, Kotlin
+`Long`) and a `MarkdownTimestampStyleFfi`, with no formatted text. Timestamp syntax
+is `<t:UNIX_SECONDS>` or `<t:UNIX_SECONDS:STYLE>`; the parser resolves an omitted
+style to `ShortDateTime`. Invalid timestamp syntax remains literal text.
+
+| Style token | Enum variant | Display |
+| --- | --- | --- |
+| `t` | `ShortTime` | Time without seconds |
+| `T` | `LongTime` | Time including seconds |
+| `d` | `ShortDate` | Short date |
+| `D` | `LongDate` | Long date |
+| `f` (default) | `ShortDateTime` | Long date and time without seconds |
+| `F` | `LongDateTime` | Weekday, long date and time without seconds |
+| `s` | `CompactDateTime` | Short date and time without seconds |
+| `S` | `CompactDateTimeSeconds` | Short date and time including seconds |
+| `R` | `Relative` | Time relative to the current clock |
+
+Use native date/time formatters with the device's current locale and timezone at
+render time, including its date order and 12/24-hour preference. The parser and
+bindings do not own a clock, timezone, formatter or refresh task. Refresh displayed
+timestamps when locale, timezone or system clock changes and when the app resumes;
+visible `Relative` nodes also need time-driven refresh even if the message tokens
+are unchanged. A host may provide a localized absolute-time tooltip or accessibility
+description. Keep the timestamp and typed style in display caches rather than
+persisting formatted strings. The native renderer is supplied by the host app,
+not this crate.
 
 ### Compatibility
 
@@ -699,6 +731,17 @@ also carry their ordered `tags`, so clients can render app-defined event types w
 raw events. Deleted rows expose no raw tags in timeline reads, moderation reads, or conversation windows.
 MDK-owned kinds continue to use prepared fields and references there. Custom-event tag changes invalidate
 the conversion cache. Custom events do not change chat-list activity or notification policy.
+
+
+## Device-local membership events
+
+The group-event firehose distinguishes account-level timeline activity from
+`LocalGroupCopyTerminated`, `LocalGroupCopyRestored`, and
+`GroupMemberLeavesRemoved`. MDK applies their membership, pending-send and
+notification effects before host delivery; these events create no system row.
+Use them to refresh presentation, and handle the new variants when regenerating
+Swift/Kotlin bindings. Retained-history engine rollback is separate from automatic
+terminal-copy recovery through the managed scheduler.
 
 ## Group-system previews
 
