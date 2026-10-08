@@ -16,6 +16,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `projection_version`. Release a list with `marmot_public_event_cache_read_list_free` and a single row with
   `marmot_public_event_cache_read_free`; embedded records have no separate free. These additive exports require the
   matching generated header and library; existing record layouts are unchanged.
+- The C event surface appends local-copy termination/restoration and removed-device-leaf
+  events; existing discriminants remain unchanged. Recompile with the matching
+  header and native library and handle the new event kinds. Restoration describes
+  retained-history repair, not automatic scheduler restoration of removed copies.
 
 - `MarmotPresentedChatRow` gains a nullable row-owned `MarmotChatListDraftVersion` handle and
   `marmot_message_draft_revision_includes_chat_list_version` compares it against
@@ -25,6 +29,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   headers/libraries; the row layout and comparison signature change. Identical-text
   saves emit a replacement snapshot because their draft revision changes. See the
   shared chat-list contract.
+- Append `MarmotMarkdownInline::Timestamp` with signed `int64_t` Unix seconds
+  and `MarmotMarkdownTimestampStyle` for local-time timestamp display nodes.
+  Existing inline discriminants are unchanged; the new payload owns no
+  allocations. Recompile consumers against the regenerated `marmot.h` and ship
+  the matching library; older headers cannot handle the new tag. Hosts format
+  labels with the device locale/time zone and refresh visible relative labels.
 - Add `marmot_message_reactions` and the owned
   `MarmotTimelineUserReactionList` root/free for complete exact-message details.
   Existing record layouts are unchanged; the new symbols require matching
@@ -51,6 +61,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   request, without relay URLs or relay-supplied text.
 - Account onboarding can establish inbox-list absence from a completed read of
   freshly discovered outboxes even when a discovery indexer is unavailable.
+
+- Group activity preserves per-commit reaction targets across author and peer
+  replay, including before disband. See `marmot-app`'s Unreleased fixes for
+  projection and push-token behavior.
 
 ## [0.12.0] - 2026-10-02
 

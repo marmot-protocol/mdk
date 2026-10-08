@@ -3686,9 +3686,9 @@ impl MarmotRelayPlaneAccountAdapter {
     /// ingest is durable, or its consumer dropped it on purpose, as a
     /// duplicate or as input the account keeps no trace of by design. Its
     /// consumer calls this before the save that follows, so a committed
-    /// delivery never holds the cursor back. A delivery whose ingest failed
-    /// is never released: it caps every commit until a redelivery of the
-    /// same event is released or its queue generation ends. An event this
+    /// delivery never holds the cursor back. A failed ingest keeps its pin
+    /// until a redelivery succeeds, retained post-ingest projection completes,
+    /// or its queue generation ends. An event this
     /// queue holds no pin for, such as one read back from the spill, has
     /// nothing to release.
     pub(crate) fn release_account_delivery(&self, id: &MessageId) {

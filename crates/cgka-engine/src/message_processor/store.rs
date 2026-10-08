@@ -34,14 +34,17 @@ fn fresh_deferred_peel_lifecycle(
     }
 }
 
-/// Durable half of `Engine::retire_deferred_peel_rows_for_terminal_group`:
+/// Durable deferred-row cleanup for local termination and disband:
 /// flip every `PeelDeferred` row of a terminal group to `Failed` and hand back
 /// what was retired, for the caller's in-memory reconciliation. Takes `&S` so
 /// it runs inside the caller's storage transaction.
 ///
+/// Terminal groups cannot enter the convergence sweep, so their deferred rows
+/// must release account capacity here. Failed rows remain failed if a removed
+/// copy is later restored, matching discarded outbound intents.
+///
 /// All rows flip or none do, and that is a contract on the caller: run this
-/// inside a transaction — the disband settle's own, or the one
-/// `Engine::retire_deferred_peel_rows_for_terminal_group` opens. Without one,
+/// inside the disband settlement or local termination transaction. Without one,
 /// each write autocommits, so a mid-loop failure would leave earlier rows
 /// durably `Failed` while the error skips the in-memory release: those rows
 /// would keep their capacity slot with no transition audit, and a retry
@@ -1036,51 +1039,7 @@ impl<S: StorageProvider> Engine<S> {
             .is_some_and(|timestamp| group.transport_message_predates_local_copy(timestamp))
     }
 
-    /// Retire this group's whole `PeelDeferred` backlog because the local copy
-    /// has become terminal — removed or disbanded.
-    ///
-    /// Why nothing else will: the only production driver that reaches the
-    /// deferred-peel sweep is `advance_convergence_inputs`, and its single
-    /// door is `prepare_convergence_input_advance`, whose terminal gate
-    /// refuses a terminal group before any sweep runs. A *disbanded* copy is
-    /// refused twice over (its `EpochState::Disbanded` also fails that
-    /// function's `Stable` check), but a *removed* copy stays `Stable` — the
-    /// terminal gate is the whole reason its rows never come back. (The `pub`
-    /// `retry_deferred_peels` would sweep a removed group happily; no
-    /// production path calls it.) So without this the rows sit forever holding
-    /// their share of the account byte budget — reconstructed from durable
-    /// rows on every open — and their per-group row slots.
-    ///
-    /// Silent by construction: the rows leave the retry lifecycle the way
-    /// [`Self::mark_raw_transport_message_failed_if_awaiting_retry`] retires
-    /// one, with no `TransportObjectResourceRefused` — nothing was refused,
-    /// the group they belonged to is gone.
-    ///
-    /// The tradeoff, taken deliberately: `removed` is reversible (branch
-    /// selection can supersede the removal that set it — see
-    /// `cgka_traits::group::Group::removed` and the heal in
-    /// `distributed_convergence::emit_convergence_events`), and a `Failed` row
-    /// blocks same-id redelivery, so a heal cannot get these rows back. That
-    /// is the same bet
-    /// [`Self::discard_queued_outbound_intents_for_removed_group`] already
-    /// makes beside every call site here, and the window is narrow because
-    /// the terminal gate refuses further advances until the heal lands.
-    pub(crate) fn retire_deferred_peel_rows_for_terminal_group(
-        &mut self,
-        group_id: &GroupId,
-    ) -> Result<(), EngineError> {
-        // One durable unit: see the free function's contract. Nesting is
-        // safe — the SQLite backend reuses a same-thread outer transaction
-        // rather than beginning a second one — so a caller that already holds
-        // one loses nothing by coming through here.
-        let retired = self.storage.with_transaction(|storage| {
-            fail_deferred_peel_rows_in_terminal_group(storage, group_id)
-        })?;
-        self.release_retired_deferred_peel_rows(&retired);
-        Ok(())
-    }
-
-    /// In-memory half of [`Self::retire_deferred_peel_rows_for_terminal_group`]:
+    /// In-memory half of [`fail_deferred_peel_rows_in_terminal_group`]:
     /// return each retired row's capacity slot and record the transition.
     ///
     /// Split from the durable half so a caller already inside a storage

@@ -403,6 +403,9 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     maintenance_paused: bool,
     maintenance_activity: std::sync::Mutex<MaintenanceActivity>,
     maintenance_quiet_monotonic: HashMap<cgka_traits::MessageId, Duration>,
+    /// Secondary maintenance writes must not discard committed session effects.
+    /// Keep their group-scoped reconciliation owned until a quiet retry succeeds.
+    pending_leaf_reconciliations: HashMap<GroupId, Option<Timestamp>>,
     /// Exact Welcome events whose relay-only publish phase currently runs
     /// outside the serialized account owner. Other maintenance/manual retry
     /// paths skip these ids until their results are reconciled, preventing two
@@ -433,6 +436,7 @@ where
             maintenance_paused: false,
             maintenance_activity: std::sync::Mutex::new(MaintenanceActivity::default()),
             maintenance_quiet_monotonic: HashMap::new(),
+            pending_leaf_reconciliations: HashMap::new(),
             detached_welcome_publishes: HashSet::new(),
             finish_stage_failure: None,
         }
@@ -479,7 +483,9 @@ where
 
     /// Abandon a group locally without sending a leave or disband.
     pub fn forget_group_local(&mut self, group_id: &GroupId) -> AccountResult<bool> {
-        Ok(self.session.forget_group_local(group_id)?)
+        let forgotten = self.session.forget_group_local(group_id)?;
+        self.pending_leaf_reconciliations.remove(group_id);
+        Ok(forgotten)
     }
 
     pub fn group_record(&self, group_id: &GroupId) -> AccountResult<Group> {
@@ -1504,6 +1510,7 @@ where
         use sha2::{Digest, Sha256};
 
         self.sweep_expired_key_package_private_material()?;
+        self.reconcile_confirmed_own_leaf_rotations(&[]);
         let mut output = AccountDeviceEffects::default();
         // Hydration recreates the publication edge for a surviving staged
         // evolution. Consume that edge before consulting the semantic
@@ -1587,6 +1594,9 @@ where
         } else {
             self.session.live_group_ids()?
         } {
+            if self.pending_leaf_reconciliations.contains_key(&group_id) {
+                continue;
+            }
             let Some(Some(mut state)) =
                 skips_group_this_tick(self.session.group_maintenance(&group_id))?
             else {
@@ -1605,15 +1615,10 @@ where
             if has_active {
                 continue;
             }
-            if state.next_periodic_rotation_at.is_none()
-                && let Some(last_rotation) = state.last_own_leaf_rotation_at
-            {
-                state.next_periodic_rotation_at = Some(Timestamp(
-                    last_rotation.0.saturating_add(
-                        self.maintenance_random
-                            .sample_inclusive(PERIODIC_MIN_SECS, PERIODIC_MAX_SECS),
-                    ),
-                ));
+            if state.next_periodic_rotation_at.is_none() {
+                let baseline = Self::periodic_baseline(&state, &active_obligations, None, now);
+                state.next_periodic_rotation_at =
+                    Some(self.fresh_periodic_deadline(&group_id, baseline)?);
                 self.session.put_group_maintenance(&state)?;
             }
             if state
@@ -1659,6 +1664,12 @@ where
         let mut obligations = self.session.maintenance_obligations()?;
         obligations.sort_by_key(|obligation| obligation.created_at);
         for mut obligation in obligations {
+            if self
+                .pending_leaf_reconciliations
+                .contains_key(&obligation.group_id)
+            {
+                continue;
+            }
             if matches!(
                 obligation.phase,
                 MaintenancePhase::Complete | MaintenancePhase::Failed
@@ -1691,6 +1702,18 @@ where
             if self.session.leave_in_progress(&obligation.group_id)?
                 || self.session.disbanding_in_progress(&obligation.group_id)?
             {
+                continue;
+            }
+            if let Some(baseline) = &obligation.own_leaf_baseline_hash
+                && baseline.as_slice()
+                    != self.session.own_leaf_hash(&obligation.group_id)?.as_slice()
+            {
+                // A reopen can lose the event, but not the live obligation's
+                // evidence that the selected local leaf already rotated.
+                self.pending_leaf_reconciliations
+                    .entry(obligation.group_id.clone())
+                    .or_insert(None);
+                self.reconcile_confirmed_own_leaf_rotations(&[]);
                 continue;
             }
             let original_obligation = obligation.clone();
@@ -1878,9 +1901,7 @@ where
                                     activity.failed_attempts.saturating_add(1);
                             }
                             output.absorb_account_effects(retried);
-                            if confirmed {
-                                self.complete_maintenance_obligation(&mut obligation, now)?;
-                            } else {
+                            if !confirmed {
                                 obligation.phase = MaintenancePhase::PendingPublication;
                                 obligation.attempt_count =
                                     obligation.attempt_count.saturating_add(1);
@@ -1954,9 +1975,7 @@ where
                         activity.failed_attempts = activity.failed_attempts.saturating_add(1);
                     }
                     output.absorb_account_effects(effects);
-                    if confirmed {
-                        self.complete_maintenance_obligation(&mut obligation, now)?;
-                    } else {
+                    if !confirmed {
                         obligation.phase = MaintenancePhase::PendingPublication;
                         obligation.attempt_count = obligation.attempt_count.saturating_add(1);
                         self.put_maintenance_obligation_if_changed(
@@ -2115,22 +2134,20 @@ where
         obligation: &mut MaintenanceObligation,
         completed_at: Timestamp,
     ) -> AccountResult<()> {
+        if let Some(mut state) = self.session.group_maintenance(&obligation.group_id)? {
+            state.last_own_leaf_rotation_at = Some(completed_at);
+            state.next_periodic_rotation_at = if state.periodic_enrolled {
+                Some(self.fresh_periodic_deadline(&obligation.group_id, completed_at)?)
+            } else {
+                None
+            };
+            self.session.put_group_maintenance(&state)?;
+        }
+        // Keep a live retry owner until the deadline write has succeeded.
         obligation.phase = MaintenancePhase::Complete;
         obligation.last_failure_code = None;
         self.persist_maintenance_obligation(obligation)?;
         self.maintenance_quiet_monotonic.remove(&obligation.id);
-        if let Some(mut state) = self.session.group_maintenance(&obligation.group_id)? {
-            state.last_own_leaf_rotation_at = Some(completed_at);
-            state.next_periodic_rotation_at = state.periodic_enrolled.then(|| {
-                Timestamp(
-                    completed_at.0.saturating_add(
-                        self.maintenance_random
-                            .sample_inclusive(PERIODIC_MIN_SECS, PERIODIC_MAX_SECS),
-                    ),
-                )
-            });
-            self.session.put_group_maintenance(&state)?;
-        }
         Ok(())
     }
 
@@ -2309,7 +2326,7 @@ where
             .push(PendingResolution::RolledBack { pending });
         output.absorb_session_effects(rollback_effects, &mut queue);
         self.publish_queue(&mut output, &mut queue, None).await?;
-        self.reconcile_confirmed_own_leaf_rotations(&output.events)?;
+        self.reconcile_confirmed_own_leaf_rotations(&output.events);
         let superseded = self.reconcile_superseded_maintenance(&output.events)?;
         output.superseded_intents.extend(superseded);
         Ok(output)
@@ -2691,7 +2708,7 @@ where
         let mut queue = VecDeque::new();
         output.absorb_session_effects(effects, &mut queue);
         self.publish_queue(&mut output, &mut queue, context).await?;
-        self.reconcile_confirmed_own_leaf_rotations(&output.events)?;
+        self.reconcile_confirmed_own_leaf_rotations(&output.events);
         let superseded = self.reconcile_superseded_maintenance(&output.events)?;
         output.superseded_intents.extend(superseded);
         Ok(output)
@@ -2868,74 +2885,167 @@ where
             }
         }
         self.publish_queue(&mut output, &mut queue, None).await?;
-        self.reconcile_confirmed_own_leaf_rotations(&output.events)?;
+        self.reconcile_confirmed_own_leaf_rotations(&output.events);
         let superseded = self.reconcile_superseded_maintenance(&output.events)?;
         output.superseded_intents.extend(superseded);
         Ok((output, blocked_groups))
     }
 
-    fn reconcile_confirmed_own_leaf_rotations(
+    /// Reconcile against the final canonical local leaf after all batch effects,
+    /// since branch selection can restore a copy terminated earlier in the batch.
+    fn reconcile_confirmed_own_leaf_rotations(&mut self, events: &[GroupEvent]) {
+        for event in events {
+            let (group_id, restored_at) = match event {
+                GroupEvent::EpochChanged { group_id, .. }
+                | GroupEvent::LocalGroupCopyTerminated { group_id, .. } => (group_id, None),
+                GroupEvent::LocalGroupCopyRestored { group_id } => {
+                    (group_id, Some(self.wall_clock.now()))
+                }
+                _ => continue,
+            };
+            if let Some(owned) = self.pending_leaf_reconciliations.get_mut(group_id) {
+                if restored_at.is_some() {
+                    *owned = restored_at;
+                }
+            } else {
+                self.pending_leaf_reconciliations
+                    .insert(group_id.clone(), restored_at);
+            }
+        }
+        let mut pending = std::mem::take(&mut self.pending_leaf_reconciliations);
+        pending.retain(|group_id, restored_at| {
+            if self
+                .reconcile_own_leaf_group(group_id, *restored_at)
+                .is_err()
+            {
+                tracing::warn!(target: TRACE_TARGET,
+                    method = "reconcile_confirmed_own_leaf_rotations",
+                    error_kind = "maintenance_reconciliation_retry",
+                    "committed group maintenance reconciliation remains owned for retry");
+                return true;
+            }
+            false
+        });
+        self.pending_leaf_reconciliations = pending;
+    }
+
+    fn reconcile_own_leaf_group(
         &mut self,
-        events: &[GroupEvent],
+        group_id: &GroupId,
+        restored_at: Option<Timestamp>,
     ) -> AccountResult<()> {
-        let changed_groups = events
-            .iter()
-            .filter_map(|event| match event {
-                GroupEvent::EpochChanged { group_id, .. } => Some(group_id.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let mut unique_changed_groups = Vec::new();
         let now = self.wall_clock.now();
-        for group_id in changed_groups {
-            if unique_changed_groups.contains(&group_id) {
-                continue;
-            }
-            unique_changed_groups.push(group_id.clone());
-            let self_id = self.session.self_id();
-            let local_member_present = self
+        // A surviving sibling keeps the account in the roster, but it
+        // cannot supply this copy's removed local leaf for rotation.
+        let local_member_present = !self.session.group_record(group_id)?.is_terminal()
+            && self
                 .session
-                .members(&group_id)?
-                .iter()
-                .any(|member| member.id == self_id);
-            if !local_member_present {
-                for mut obligation in self.session.maintenance_obligations_for_group(&group_id)? {
-                    if matches!(
-                        obligation.phase,
-                        MaintenancePhase::Complete | MaintenancePhase::Failed
-                    ) {
-                        continue;
-                    }
-                    obligation.phase = MaintenancePhase::Failed;
-                    obligation.last_failure_code = Some("local_member_removed".into());
-                    self.persist_maintenance_obligation(&obligation)?;
-                    self.maintenance_quiet_monotonic.remove(&obligation.id);
-                }
-                if let Some(mut state) = self.session.group_maintenance(&group_id)? {
-                    state.periodic_enrolled = false;
-                    state.next_periodic_rotation_at = None;
-                    self.session.put_group_maintenance(&state)?;
-                }
-                continue;
-            }
-            let current = self.session.own_leaf_hash(&group_id)?;
-            for mut obligation in self.session.maintenance_obligations_for_group(&group_id)? {
+                .canonical_group_membership(group_id)?
+                .local_leaf_active;
+        if !local_member_present {
+            for mut obligation in self.session.maintenance_obligations_for_group(group_id)? {
                 if matches!(
                     obligation.phase,
                     MaintenancePhase::Complete | MaintenancePhase::Failed
                 ) {
                     continue;
                 }
-                if obligation
-                    .own_leaf_baseline_hash
-                    .as_ref()
-                    .is_some_and(|baseline| baseline.as_slice() != current.as_slice())
-                {
-                    self.complete_maintenance_obligation(&mut obligation, now)?;
-                }
+                obligation.phase = MaintenancePhase::Failed;
+                obligation.last_failure_code = Some("local_member_removed".into());
+                self.persist_maintenance_obligation(&obligation)?;
+                self.maintenance_quiet_monotonic.remove(&obligation.id);
+            }
+            if let Some(mut state) = self.session.group_maintenance(group_id)? {
+                // Enrollment is policy, not current membership. Preserve it
+                // for a later canonical restoration; terminal groups are
+                // excluded from the maintenance tick's live group set.
+                state.next_periodic_rotation_at = None;
+                self.session.put_group_maintenance(&state)?;
+            }
+            return Ok(());
+        }
+        let obligations = self.session.maintenance_obligations_for_group(group_id)?;
+        if let Some(mut state) = self.session.group_maintenance(group_id)?
+            && state.periodic_enrolled
+            && state.next_periodic_rotation_at.is_none()
+        {
+            let baseline = Self::periodic_baseline(&state, &obligations, restored_at, now);
+            state.next_periodic_rotation_at =
+                Some(self.fresh_periodic_deadline(group_id, baseline)?);
+            self.session.put_group_maintenance(&state)?;
+        }
+        let current = self.session.own_leaf_hash(group_id)?;
+        for mut obligation in obligations {
+            if matches!(
+                obligation.phase,
+                MaintenancePhase::Complete | MaintenancePhase::Failed
+            ) {
+                continue;
+            }
+            if obligation
+                .own_leaf_baseline_hash
+                .as_ref()
+                .is_some_and(|baseline| baseline.as_slice() != current.as_slice())
+            {
+                self.complete_maintenance_obligation(&mut obligation, now)?;
             }
         }
         Ok(())
+    }
+
+    fn periodic_baseline(
+        state: &cgka_traits::maintenance::GroupMaintenanceState,
+        obligations: &[MaintenanceObligation],
+        restored_at: Option<Timestamp>,
+        now: Timestamp,
+    ) -> Timestamp {
+        if let Some(restored_at) = restored_at {
+            return restored_at;
+        }
+        if obligations.iter().any(|obligation| {
+            obligation.group_id == state.group_id
+                && obligation.phase == MaintenancePhase::Failed
+                && obligation.last_failure_code.as_deref() == Some("local_member_removed")
+        }) {
+            return now;
+        }
+        state.last_own_leaf_rotation_at.unwrap_or(now)
+    }
+
+    fn fresh_periodic_deadline(
+        &mut self,
+        group_id: &GroupId,
+        baseline: Timestamp,
+    ) -> AccountResult<Timestamp> {
+        let earliest = baseline.0.saturating_add(PERIODIC_MIN_SECS);
+        let latest = baseline.0.saturating_add(PERIODIC_MAX_SECS);
+        let first = baseline.0.saturating_add(
+            self.maintenance_random
+                .sample_inclusive(PERIODIC_MIN_SECS, PERIODIC_MAX_SECS),
+        );
+        let mut deadline = first;
+        loop {
+            let mut hasher = Sha256::new();
+            hasher.update(b"marmot-periodic-self-update-v1");
+            hasher.update((group_id.as_slice().len() as u64).to_be_bytes());
+            hasher.update(group_id.as_slice());
+            hasher.update(deadline.to_be_bytes());
+            let id = cgka_traits::MessageId::new(hasher.finalize().to_vec());
+            if self.session.maintenance_obligation(&id)?.is_none() {
+                return Ok(Timestamp(deadline));
+            }
+            deadline = if deadline < latest {
+                deadline + 1
+            } else {
+                earliest
+            };
+            if deadline == first {
+                return Err(cgka_traits::EngineError::Backend(
+                    "periodic deadline exhausted".into(),
+                )
+                .into());
+            }
+        }
     }
 
     /// Retire the evolutions behind commits this batch announced as
