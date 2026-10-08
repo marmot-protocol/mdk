@@ -139,6 +139,9 @@ impl SqliteAccountStorage {
                 )
                 .storage()?;
             }
+            // Trim only after app_stickers identifies the incoming winner.
+            // The cover is not in app_stickers, so pass it explicitly too.
+            trim_sticker_asset_history_tx(&conn, pack)?;
             Ok(true)
         })
     }
@@ -527,13 +530,14 @@ fn insert_sticker_assets_tx(
         )
         .storage()?;
     }
-    if pack_wins_replacement {
-        trim_sticker_asset_history_tx(conn, &pack.coordinate)?;
-    }
     Ok(())
 }
 
-fn trim_sticker_asset_history_tx(conn: &Connection, coordinate: &str) -> StorageResult<()> {
+fn trim_sticker_asset_history_tx(
+    conn: &Connection,
+    current_pack: &StoredStickerPack,
+) -> StorageResult<()> {
+    let coordinate = &current_pack.coordinate;
     let count = conn
         .query_row(
             "SELECT COUNT(*) FROM app_sticker_assets WHERE pack_coordinate = ?1",
@@ -545,6 +549,8 @@ fn trim_sticker_asset_history_tx(conn: &Connection, coordinate: &str) -> Storage
     if excess <= 0 {
         return Ok(());
     }
+    let cover_shortcode = current_pack.cover.as_ref().map(|cover| cover.shortcode.as_str());
+    let cover_sha256 = current_pack.cover.as_ref().map(|cover| cover.sha256.as_str());
     conn.execute(
         "DELETE FROM app_sticker_assets
          WHERE pack_coordinate = ?1
@@ -558,9 +564,15 @@ fn trim_sticker_asset_history_tx(conn: &Connection, coordinate: &str) -> Storage
                        AND current.shortcode = assets.shortcode
                        AND current.sha256 = assets.sha256
                  )
-               LIMIT ?2
+                 AND (
+                     ?2 IS NULL
+                     OR assets.shortcode != ?2
+                     OR assets.sha256 != ?3
+                 )
+               ORDER BY assets.rowid ASC
+               LIMIT ?4
            )",
-        params![coordinate, excess],
+        params![coordinate, cover_shortcode, cover_sha256, excess],
     )
     .storage()?;
     Ok(())
@@ -1039,6 +1051,45 @@ mod tests {
             retained <= MAX_STICKER_ASSET_HISTORY_ROWS,
             "winning versions retained {retained} historical assets"
         );
+    }
+
+    #[test]
+    fn history_trim_preserves_every_asset_of_a_large_winning_pack() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let coordinate = pack(&"11".repeat(32), 1, &"01".repeat(32)).coordinate;
+        let large_pack = |event_byte: &str, created_at: u64, hash_offset: u64| {
+            let mut value = pack(&event_byte.repeat(32), created_at, &format!("{hash_offset:064x}"));
+            value.coordinate = coordinate.clone();
+            value.cover = Some(sticker("cover", &format!("{:064x}", hash_offset + 200)));
+            value.stickers = (0_u64..200)
+                .map(|index| {
+                    sticker(
+                        &format!("sticker_{index}"),
+                        &format!("{:064x}", hash_offset + index),
+                    )
+                })
+                .collect();
+            value
+        };
+        let first = large_pack("11", 1, 1);
+        assert!(store.replace_sticker_pack_if_newer(&first).unwrap());
+        let winner = large_pack("22", 2, 1_000);
+        assert!(store.replace_sticker_pack_if_newer(&winner).unwrap());
+
+        for asset in winner
+            .stickers
+            .iter()
+            .chain(winner.cover.iter())
+        {
+            assert!(
+                store
+                    .sticker_for_ref(&coordinate, &asset.shortcode, &asset.sha256)
+                    .unwrap()
+                    .is_some(),
+                "winning asset {} was evicted while trimming",
+                asset.shortcode
+            );
+        }
     }
 
     #[test]
