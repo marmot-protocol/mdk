@@ -58,6 +58,16 @@ A production Nostr implementation should derive those answers from Nostr state r
 transport adapter family, so the account runtime can ask the active transport to publish a KeyPackage without knowing
 whether that means Marmot Nostr kind `30443`, another relay-plane format, or a future non-Nostr transport.
 
+## Own-leaf maintenance
+
+Secondary maintenance write failures do not discard committed session effects. `run_due_maintenance` retries the
+owning group's reconciliation and reconstructs missing deadlines for enrolled live copies after restoration or reopen.
+Ordinary epoch activity uses the durable rotation baseline; an observed restoration starts a fresh period.
+
+An obligation stays live until its next deadline is durable. After reopen, the canonical leaf hash identifies rotations
+that already committed, so completing their bookkeeping does not publish another MLS commit. Repaired deadlines do not
+reuse failed or completed periodic obligation IDs.
+
 ## KeyPackage generator upgrades
 
 The lifecycle records the KeyPackage generator revision independently of app versions. Records written before revision

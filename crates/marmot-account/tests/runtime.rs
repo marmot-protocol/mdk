@@ -5645,3 +5645,411 @@ async fn later_restoration_reschedules_periodic_maintenance_without_reviving_fai
         }
     }
 }
+
+/// A committed restoration is not rolled back by its secondary deadline write.
+/// Quiet recovery must also work after losing both the announcement and runtime.
+#[tokio::test]
+async fn restore_fault_keeps_effects() {
+    use cgka_traits::GroupStorage;
+    use sha2::{Digest, Sha256};
+
+    for (announce, reopen) in [(true, false), (true, true), (false, true)] {
+        for last_rotation in [None, Some(Timestamp(10))] {
+            let (dir, mut runtime, group, epoch) =
+                manual_only_group_runtime(MaintenanceTiming::default()).await;
+            let database = dir.path().join("alice.sqlite");
+            let key_text = "marmot maintenance timing group key";
+            let key = SqlCipherKey::new(key_text).unwrap();
+            let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+            let wall = Arc::new(TestWallClock::new(100_000));
+            runtime = runtime.with_maintenance_sources(
+                wall.clone(),
+                Arc::new(TestMonotonicClock::default()),
+                Arc::new(TestRandom::new(0)),
+            );
+
+            let candidate = 100_000u64 + 24 * 24 * 60 * 60;
+            let mut state = runtime
+                .session()
+                .group_maintenance(&group)
+                .unwrap()
+                .unwrap();
+            state.periodic_enrolled = true;
+            state.last_own_leaf_rotation_at = last_rotation;
+            state.next_periodic_rotation_at = Some(Timestamp(candidate));
+            runtime.session().put_group_maintenance(&state).unwrap();
+            let manual_id = runtime.schedule_manual_self_update(&group).unwrap();
+            let mut periodic = runtime
+                .session()
+                .maintenance_obligation(&manual_id)
+                .unwrap()
+                .unwrap();
+            let mut hasher = Sha256::new();
+            hasher.update(b"marmot-periodic-self-update-v1");
+            hasher.update((group.as_slice().len() as u64).to_be_bytes());
+            hasher.update(group.as_slice());
+            hasher.update(candidate.to_be_bytes());
+            periodic.id = MessageId::new(hasher.finalize().to_vec());
+            periodic.trigger = cgka_traits::MaintenanceTrigger::Periodic;
+            runtime
+                .session()
+                .put_maintenance_obligation(&periodic)
+                .unwrap();
+
+            let live = storage.get_group(&group).unwrap();
+            let mut removed = live.clone();
+            removed.removed = true;
+            storage.put_group(&removed).unwrap();
+            runtime
+                .publish_session_effects(cgka_session::SessionEffects {
+                    events: vec![GroupEvent::LocalGroupCopyTerminated {
+                        group_id: group.clone(),
+                        voluntary: false,
+                    }],
+                    publish: vec![],
+                    queued: vec![],
+                    pending_convergence: vec![],
+                })
+                .await
+                .unwrap();
+            let failed = runtime
+                .session()
+                .maintenance_obligations_for_group(&group)
+                .unwrap();
+            assert_eq!(failed.len(), 2);
+            assert!(
+                failed
+                    .iter()
+                    .all(|item| item.phase == cgka_traits::MaintenancePhase::Failed)
+            );
+            assert_eq!(
+                runtime
+                    .session()
+                    .group_maintenance(&group)
+                    .unwrap()
+                    .unwrap()
+                    .next_periodic_rotation_at,
+                None
+            );
+
+            // Existing retained-history fixture: the durable marker has already
+            // restored membership before the runtime observes the announcement.
+            storage.put_group(&live).unwrap();
+            runtime = runtime.with_maintenance_sources(
+                wall.clone(),
+                Arc::new(TestMonotonicClock::default()),
+                Arc::new(TestRandom::new(0)),
+            );
+            if announce {
+                let connection = rusqlite::Connection::open(&database).unwrap();
+                connection.pragma_update(None, "key", key_text).unwrap();
+                connection
+                    .execute_batch(
+                        "CREATE TRIGGER fail_restoration_deadline
+                     BEFORE INSERT ON cgka_group_maintenance
+                     BEGIN SELECT RAISE(FAIL, 'injected restoration deadline fault'); END;",
+                    )
+                    .unwrap();
+
+                // Carry a real accepted rename through the same batch so this
+                // proves consumer-visible committed effects, not just an echo.
+                let mut effects = runtime
+                    .session_mut()
+                    .send(SendIntent::UpdateGroupData {
+                        group_id: group.clone(),
+                        name: Some("restored committed name".into()),
+                        description: None,
+                    })
+                    .await
+                    .unwrap();
+                effects.events.push(GroupEvent::LocalGroupCopyRestored {
+                    group_id: group.clone(),
+                });
+                let published = runtime.publish_session_effects(effects).await.unwrap();
+                assert!(
+                    published
+                        .pending
+                        .iter()
+                        .any(|item| matches!(item, PendingResolution::Confirmed { .. }))
+                );
+                assert!(published.events.iter().any(|event| matches!(event,
+                    GroupEvent::LocalGroupCopyRestored { group_id } if group_id == &group)));
+                assert_eq!(
+                    runtime.group_record(&group).unwrap().name,
+                    "restored committed name"
+                );
+                assert_eq!(runtime.session().epoch(&group).unwrap().0, epoch.0 + 1);
+                assert!(!runtime.group_record(&group).unwrap().removed);
+                assert!(
+                    runtime
+                        .session()
+                        .canonical_group_membership(&group)
+                        .unwrap()
+                        .local_leaf_active
+                );
+                assert_eq!(
+                    runtime
+                        .session()
+                        .group_maintenance(&group)
+                        .unwrap()
+                        .unwrap()
+                        .next_periodic_rotation_at,
+                    None
+                );
+
+                // While the fault remains, the owned secondary action does not
+                // undo membership or allow new maintenance work for this group.
+                runtime.run_due_maintenance().await.unwrap();
+                assert_eq!(
+                    runtime
+                        .session()
+                        .maintenance_obligations_for_group(&group)
+                        .unwrap(),
+                    failed
+                );
+                connection
+                    .execute_batch("DROP TRIGGER fail_restoration_deadline;")
+                    .unwrap();
+            }
+
+            // Repeat the old periodic deadline exactly; collision avoidance,
+            // rather than a different random sample, must give it a fresh ID.
+            runtime = runtime.with_maintenance_sources(
+                wall.clone(),
+                Arc::new(TestMonotonicClock::default()),
+                Arc::new(TestRandom::new(0)),
+            );
+            if reopen {
+                drop(runtime);
+                runtime = AccountDeviceRuntime::new(
+                    current_session(&database, &key, b"alice"),
+                    RecordingAdapter::default(),
+                    StaticTransportRouting::new(vec![]).with_group_route(
+                        group.clone(),
+                        group.as_slice().to_vec(),
+                        vec![TransportEndpoint("wss://group-a.example".into())],
+                    ),
+                    RecordingKeyPackages::default(),
+                )
+                .with_maintenance_sources(
+                    wall.clone(),
+                    Arc::new(TestMonotonicClock::default()),
+                    Arc::new(TestRandom::new(0)),
+                );
+            }
+            runtime.run_due_maintenance().await.unwrap();
+            let restored = runtime
+                .session()
+                .group_maintenance(&group)
+                .unwrap()
+                .unwrap();
+            assert!(restored.periodic_enrolled);
+            assert_eq!(restored.last_own_leaf_rotation_at, last_rotation);
+            assert_eq!(
+                restored.next_periodic_rotation_at,
+                Some(Timestamp(candidate + 1))
+            );
+            assert_eq!(
+                runtime
+                    .session()
+                    .maintenance_obligations_for_group(&group)
+                    .unwrap(),
+                failed
+            );
+
+            wall.set(candidate + 1);
+            runtime.run_due_maintenance().await.unwrap();
+            let obligations = runtime
+                .session()
+                .maintenance_obligations_for_group(&group)
+                .unwrap();
+            assert!(obligations.iter().any(|item| item.trigger
+                == cgka_traits::MaintenanceTrigger::Periodic
+                && item.phase != cgka_traits::MaintenancePhase::Failed
+                && item.id != periodic.id));
+            for original in failed {
+                assert_eq!(
+                    runtime
+                        .session()
+                        .maintenance_obligation(&original.id)
+                        .unwrap(),
+                    Some(original)
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn epoch_keeps_periodic_baseline() {
+    let (_dir, mut runtime, group, _) =
+        manual_only_group_runtime(MaintenanceTiming::default()).await;
+    let deadline = 10u64 + 24 * 24 * 60 * 60;
+    let wall = Arc::new(TestWallClock::new(deadline + 100));
+    runtime = runtime.with_maintenance_sources(
+        wall,
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+    let mut state = runtime
+        .session()
+        .group_maintenance(&group)
+        .unwrap()
+        .unwrap();
+    state.periodic_enrolled = true;
+    state.last_own_leaf_rotation_at = Some(Timestamp(10));
+    state.next_periodic_rotation_at = None;
+    runtime.session().put_group_maintenance(&state).unwrap();
+
+    let effects = runtime
+        .send(SendIntent::UpdateGroupData {
+            group_id: group.clone(),
+            name: Some("ordinary committed rename".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        effects
+            .pending
+            .iter()
+            .any(|resolution| matches!(resolution, PendingResolution::Confirmed { .. }))
+    );
+    assert_eq!(
+        runtime.group_record(&group).unwrap().name,
+        "ordinary committed rename"
+    );
+    assert_eq!(
+        runtime
+            .session()
+            .group_maintenance(&group)
+            .unwrap()
+            .unwrap()
+            .next_periodic_rotation_at,
+        Some(Timestamp(deadline))
+    );
+
+    runtime.run_due_maintenance().await.unwrap();
+    assert!(
+        runtime
+            .session()
+            .maintenance_obligations_for_group(&group)
+            .unwrap()
+            .iter()
+            .any(
+                |obligation| obligation.trigger == cgka_traits::MaintenanceTrigger::Periodic
+                    && obligation.phase == cgka_traits::MaintenancePhase::Quiet
+            )
+    );
+}
+
+#[tokio::test]
+async fn periodic_fault_keeps_effects() {
+    for reopen in [false, true] {
+        let (dir, mut runtime, group, epoch) =
+            manual_only_group_runtime(MaintenanceTiming::immediate()).await;
+        let database = dir.path().join("alice.sqlite");
+        let key_text = "marmot maintenance timing group key";
+        let key = SqlCipherKey::new(key_text).unwrap();
+        let wall = Arc::new(TestWallClock::new(100_000));
+        runtime = runtime.with_maintenance_sources(
+            wall.clone(),
+            Arc::new(TestMonotonicClock::default()),
+            Arc::new(TestRandom::new(0)),
+        );
+        let mut state = runtime
+            .session()
+            .group_maintenance(&group)
+            .unwrap()
+            .unwrap();
+        state.periodic_enrolled = true;
+        state.last_own_leaf_rotation_at = Some(Timestamp(10));
+        state.next_periodic_rotation_at = Some(Timestamp(100_000));
+        runtime.session().put_group_maintenance(&state).unwrap();
+        runtime.run_due_maintenance().await.unwrap();
+        let before = runtime
+            .session()
+            .maintenance_obligations_for_group(&group)
+            .unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].phase, cgka_traits::MaintenancePhase::Jitter);
+        let id = before[0].id.clone();
+        let confirmed_at = before[0].not_before.unwrap();
+        wall.set(confirmed_at.0);
+
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection.pragma_update(None, "key", key_text).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_completed_rotation
+             BEFORE INSERT ON cgka_group_maintenance
+             BEGIN SELECT RAISE(FAIL, 'injected completion state fault'); END;",
+            )
+            .unwrap();
+        let effects = runtime.run_due_maintenance().await.unwrap();
+        assert!(
+            effects
+                .pending
+                .iter()
+                .any(|resolution| matches!(resolution, PendingResolution::Confirmed { .. }))
+        );
+        assert_eq!(runtime.session().epoch(&group).unwrap().0, epoch.0 + 1);
+        assert_ne!(
+            runtime
+                .session()
+                .maintenance_obligation(&id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            cgka_traits::MaintenancePhase::Complete
+        );
+        connection
+            .execute_batch("DROP TRIGGER fail_completed_rotation;")
+            .unwrap();
+
+        if reopen {
+            drop(runtime);
+            runtime = AccountDeviceRuntime::new(
+                current_session(&database, &key, b"alice"),
+                RecordingAdapter::default(),
+                StaticTransportRouting::new(vec![]).with_group_route(
+                    group.clone(),
+                    group.as_slice().to_vec(),
+                    vec![TransportEndpoint("wss://group-a.example".into())],
+                ),
+                RecordingKeyPackages::default(),
+            )
+            .with_maintenance_sources(
+                wall.clone(),
+                Arc::new(TestMonotonicClock::default()),
+                Arc::new(TestRandom::new(0)),
+            )
+            .with_maintenance_timing(MaintenanceTiming::immediate());
+        }
+        runtime.run_due_maintenance().await.unwrap();
+        let complete = runtime
+            .session()
+            .maintenance_obligation(&id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(complete.phase, cgka_traits::MaintenancePhase::Complete);
+        let repaired = runtime
+            .session()
+            .group_maintenance(&group)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired.last_own_leaf_rotation_at, Some(confirmed_at));
+        let deadline = repaired.next_periodic_rotation_at.unwrap();
+        assert!(deadline.0 >= confirmed_at.0 + 24 * 24 * 60 * 60);
+        assert!(deadline.0 <= confirmed_at.0 + 36 * 24 * 60 * 60);
+        runtime.run_due_maintenance().await.unwrap();
+        assert_eq!(runtime.session().epoch(&group).unwrap().0, epoch.0 + 1);
+        assert_eq!(
+            runtime
+                .session()
+                .maintenance_obligations_for_group(&group)
+                .unwrap(),
+            vec![complete]
+        );
+    }
+}
