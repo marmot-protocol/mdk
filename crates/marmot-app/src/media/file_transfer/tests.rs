@@ -106,9 +106,10 @@ fn rejected_tag_never_returns_plaintext_and_cleans_private_partial() {
     // hash check, is the boundary exercised here.
     encrypted.digest = Sha256::digest(bytes(&encrypted)).into();
     let before = std::fs::read_dir(directory.path()).unwrap().count();
+    let plaintext_directory = directory.path().join("never-created-plaintext");
     let outcome = decrypt_file(
         &encrypted,
-        directory.path(),
+        &plaintext_directory,
         &key,
         &nonce,
         b"metadata",
@@ -116,6 +117,10 @@ fn rejected_tag_never_returns_plaintext_and_cleans_private_partial() {
         &control,
     );
     assert!(outcome.is_err());
+    assert!(
+        !plaintext_directory.exists(),
+        "rejected plaintext never reaches disk"
+    );
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), before);
 }
 
@@ -135,10 +140,11 @@ fn ciphertext_digest_plaintext_digest_and_length_are_verified_independently() {
         &control,
     )
     .unwrap();
+    let plaintext_directory = directory.path().join("never-created-plaintext");
     assert!(
         decrypt_file(
             &encrypted,
-            directory.path(),
+            &plaintext_directory,
             &key,
             &nonce,
             b"metadata",
@@ -152,7 +158,7 @@ fn ciphertext_digest_plaintext_digest_and_length_are_verified_independently() {
     assert!(
         decrypt_file(
             &encrypted,
-            directory.path(),
+            &plaintext_directory,
             &key,
             &nonce,
             b"metadata",
@@ -166,7 +172,7 @@ fn ciphertext_digest_plaintext_digest_and_length_are_verified_independently() {
     assert!(
         decrypt_file(
             &encrypted,
-            directory.path(),
+            &plaintext_directory,
             &key,
             &nonce,
             b"metadata",
@@ -174,6 +180,10 @@ fn ciphertext_digest_plaintext_digest_and_length_are_verified_independently() {
             &control
         )
         .is_err()
+    );
+    assert!(
+        !plaintext_directory.exists(),
+        "failed hashes/length never create plaintext"
     );
 }
 

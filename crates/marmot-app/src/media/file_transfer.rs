@@ -398,8 +398,10 @@ pub(crate) fn encrypt_file(
     Ok(output)
 }
 
-/// Unauthenticated plaintext stays in an inaccessible private temporary file.
-/// Only an authenticated, hash-verified complete result is returned to callers.
+/// Authenticate and hash the complete private ciphertext into a discard sink
+/// before creating a plaintext snapshot. A crash during this first pass leaves
+/// ciphertext only. The second bounded pass rechecks authentication and hashes
+/// before returning the verified snapshot; neither pass retains a whole array.
 pub(crate) fn decrypt_file(
     encrypted: &PrivateMediaFile,
     directory: &Path,
@@ -409,6 +411,52 @@ pub(crate) fn decrypt_file(
     plaintext_hash: [u8; 32],
     control: &MediaFileTransferControl,
 ) -> Result<PrivateMediaFile, AppError> {
+    decrypt_file_to_writer(
+        encrypted,
+        key,
+        nonce,
+        aad,
+        plaintext_hash,
+        control,
+        &mut std::io::sink(),
+    )?;
+    control.check()?;
+    let mut output = PrivateMediaFile::create(directory)?;
+    decrypt_file_to_writer(
+        encrypted,
+        key,
+        nonce,
+        aad,
+        plaintext_hash,
+        control,
+        &mut output.file,
+    )?;
+    control.check()?;
+    output.file.flush().map_err(staging_error)?;
+    output.len = output
+        .file
+        .as_file()
+        .metadata()
+        .map_err(staging_error)?
+        .len();
+    if output.len != encrypted.len - MEDIA_AEAD_TAG_BYTES {
+        return Err(AppError::InvalidEncryptedMedia(
+            "media plaintext length mismatch".into(),
+        ));
+    }
+    output.digest = plaintext_hash;
+    Ok(output)
+}
+
+fn decrypt_file_to_writer(
+    encrypted: &PrivateMediaFile,
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    plaintext_hash: [u8; 32],
+    control: &MediaFileTransferControl,
+    output: &mut dyn Write,
+) -> Result<(), AppError> {
     control.check()?;
     let body_len = encrypted
         .len
@@ -433,7 +481,6 @@ pub(crate) fn decrypt_file(
     cipher.pad(false);
     cipher.aad_update(aad).map_err(crypto_error)?;
     cipher.set_tag(&tag).map_err(crypto_error)?;
-    let mut output = PrivateMediaFile::create(directory)?;
     let mut buffer = Zeroizing::new(vec![0; FILE_TRANSFER_BUFFER_BYTES]);
     let mut decrypted = Zeroizing::new(vec![0; FILE_TRANSFER_BUFFER_BYTES + 16]);
     let mut ciphertext_hash = Sha256::new();
@@ -450,7 +497,6 @@ pub(crate) fn decrypt_file(
             .update(&buffer[..take], &mut decrypted)
             .map_err(crypto_error)?;
         output
-            .file
             .write_all(&decrypted[..written])
             .map_err(staging_error)?;
         hash.update(&decrypted[..written]);
@@ -465,7 +511,6 @@ pub(crate) fn decrypt_file(
     }
     let written = cipher.finalize(&mut decrypted).map_err(crypto_error)?;
     output
-        .file
         .write_all(&decrypted[..written])
         .map_err(staging_error)?;
     hash.update(&decrypted[..written]);
@@ -476,20 +521,7 @@ pub(crate) fn decrypt_file(
         ));
     }
     control.check()?;
-    output.file.flush().map_err(staging_error)?;
-    output.len = output
-        .file
-        .as_file()
-        .metadata()
-        .map_err(staging_error)?
-        .len();
-    if output.len != body_len {
-        return Err(AppError::InvalidEncryptedMedia(
-            "media plaintext length mismatch".into(),
-        ));
-    }
-    output.digest = digest;
-    Ok(output)
+    Ok(())
 }
 
 /// Prepare every snapshot and ciphertext (hashing each source before key/AAD

@@ -4141,15 +4141,23 @@ async fn account_local_ready_before_subscribe_body() {
     relay.block_next_subscribe();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
-    let runtime = MarmotAppRuntime::new(app);
-
+    let runtime = Arc::new(MarmotAppRuntime::new(app));
+    let reconcile_runtime = runtime.clone();
+    let reconcile = tokio::spawn(async move { reconcile_runtime.reconcile_accounts().await });
+    // Cold account/database setup is not the condition this test times. Once
+    // registration enters the explicit barrier, readiness must complete while
+    // registration stays blocked; an awaited registration still fails below.
     tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        runtime.reconcile_accounts(),
+        std::time::Duration::from_secs(30),
+        relay.wait_for_blocked_subscribe(),
     )
     .await
-    .expect("local account readiness must not wait for relay registration")
-    .unwrap();
+    .expect("subscription registration should reach its controlled barrier");
+    tokio::time::timeout(std::time::Duration::from_secs(5), reconcile)
+        .await
+        .expect("local account readiness must not wait for relay registration")
+        .expect("account reconciliation task must finish")
+        .unwrap();
     assert_eq!(runtime.accounts().managed_accounts().unwrap().len(), 1);
     assert!(
         tokio::time::timeout(
@@ -4161,13 +4169,6 @@ async fn account_local_ready_before_subscribe_body() {
         .unwrap()
         .is_empty()
     );
-
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        relay.wait_for_blocked_subscribe(),
-    )
-    .await
-    .expect("subscription registration should continue after local readiness");
 
     let telemetry = runtime
         .shared_services()

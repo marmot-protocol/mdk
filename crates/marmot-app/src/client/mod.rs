@@ -387,7 +387,7 @@ async fn run_file_upload(
 }
 
 /// File-backed twin of [`stage_uploaded_media`]: the same prune, quota, disk
-/// reserve and atomic stage+bind transaction, but each body streams from its
+/// reserve and atomic binding, but each body streams from its
 /// private snapshot in bounded chunks. The exact uploaded `imeta` descriptors
 /// are bound; a descriptor whose plaintext digest differs from its snapshot is
 /// refused before any write. Refusal affects optional retention only.
@@ -465,18 +465,48 @@ fn stage_uploaded_media_files(
             digest: file.digest,
         })
         .collect::<Vec<_>>();
-    cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
-        let tokens = storage.stage_attachment_upload_files(
-            &hex::encode(group.as_slice()),
-            source_epoch,
-            &mut sources,
-            now,
-            policy.retained_bytes,
-            &|| control.is_cancelled(),
-        )?;
-        storage.bind_attachment_uploads(&tokens, &slots)?;
-        Ok::<_, AppError>(tokens)
-    })
+    stage_and_bind_media_files(
+        &storage,
+        &hex::encode(group.as_slice()),
+        source_epoch,
+        &mut sources,
+        now,
+        policy.retained_bytes,
+        control,
+        &slots,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_and_bind_media_files(
+    storage: &storage_sqlite::SqliteAccountStorage,
+    group: &str,
+    source_epoch: u64,
+    sources: &mut [storage_sqlite::AttachmentUploadSource<'_>],
+    now: u64,
+    byte_budget: u64,
+    control: &crate::MediaFileTransferControl,
+    slots: &[(serde_json::Value, [u8; 32])],
+) -> Result<Vec<Vec<u8>>, AppError> {
+    // Staging owns its short chunk transactions. An outer transaction here
+    // would retain the account connection throughout every file read/hash.
+    let tokens = storage.stage_attachment_upload_files(
+        group,
+        source_epoch,
+        sources,
+        now,
+        byte_budget,
+        &|| control.is_cancelled(),
+    )?;
+    // Binding is already an atomic, short transaction. On refusal, compensate
+    // the unowned reservation without replacing the primary binding error.
+    if let Err(error) = storage.bind_attachment_uploads(&tokens, slots) {
+        let cleanup = storage
+            .abandon_attachment_uploads(&tokens)
+            .map_err(AppError::from);
+        return Err(preserve_encrypted_media_upload_error(error.into(), cleanup));
+    }
+    Ok(tokens)
 }
 
 pub(crate) struct EncryptedMediaDownloadHttp {
