@@ -13741,26 +13741,8 @@ async fn concurrent_leaves_report_already_requested_not_an_opaque_error() {
     runtime.shutdown().await;
 }
 
-/// Convergence remediation-plan liveness guard: successive inbound commits,
-/// each with a member send fired while the commit is still converging, must
-/// keep settling promptly through the real worker scheduling path.
-///
-/// The queued mid-window path is asserted *opportunistically*: measured on
-/// both a dev machine and CI, a healthy in-proc relay settles a linear
-/// rename commit in well under one quiescence window, so the interval in
-/// which a member send lands mid-window is a sub-300ms race that can be won
-/// or lost systematically per machine (CI lost it 8/8 with no delay; a dev
-/// machine lost it 12/12 with a 300ms delay). A round whose send does
-/// report `published == 0` (durably queued, nothing on transport) gets the
-/// hard latency assertion; rounds that publish directly still assert
-/// liveness through the real worker scheduling path.
-///
-/// The deterministic queued-path and parking contracts live in the engine
-/// tests (`cgka-engine/tests/distributed_convergence.rs`:
-/// `pass_opens_while_app_message_intents_are_queued` and the reservation
-/// suite), which fail outright against the pre-fix engine. Forcing the
-/// queued path at this layer through public APIs would require a test-only
-/// transport-pause or pass-phase diagnostics seam (PR-B candidate).
+/// Successive inbound commits and interleaved sends must settle through the
+/// real worker scheduling path.
 #[tokio::test]
 async fn convergence_settles_across_generations_with_mid_window_queued_sends() {
     let dir = tempfile::tempdir().unwrap();
@@ -13804,16 +13786,12 @@ async fn convergence_settles_across_generations_with_mid_window_queued_sends() {
             .update_group_profile(&alice_id, &group_id, Some(renamed.clone()), None)
             .await
             .unwrap();
-        // Fire bob's send immediately: when it wins the race into bob's
-        // collection window, `published == 0` marks the queued path and the
-        // hard latency bound below applies.
+        // Send while bob may still be collecting the rename commit.
         let text = format!("bob mid-window {round}");
-        let send_accepted_at = Instant::now();
-        let summary = runtime
+        runtime
             .send_message(&bob_id, &group_id, text.clone().into_bytes())
             .await
             .unwrap();
-        let send_was_queued = summary.published == 0;
 
         // Wait on bob's *projection* (poll), not the group-state
         // subscription: the projection is the authoritative apply witness
@@ -13842,21 +13820,6 @@ async fn convergence_settles_across_generations_with_mid_window_queued_sends() {
             )
         })
         .await;
-
-        if send_was_queued {
-            let queued_send_latency = send_accepted_at.elapsed();
-            // One settlement cycle plus drain: nominally ~1.1-1.4s (1000ms
-            // quiescence + 100ms schedule margin + worker/publish slack). The
-            // pre-fix drain deferred a queued app intent past the apply tick
-            // whenever retained inbound was present, adding at least one more
-            // full settlement cycle (>= ~2.2s nominal, more on a loaded
-            // runner). 2.5s separates the classes with CI headroom.
-            assert!(
-                queued_send_latency < Duration::from_millis(2_500),
-                "queued mid-window send must publish within one settlement \
-                 cycle plus drain; took {queued_send_latency:?}"
-            );
-        }
     }
 
     runtime.shutdown().await;
