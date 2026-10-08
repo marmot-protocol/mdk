@@ -27,14 +27,10 @@ impl std::fmt::Debug for AttachmentUploadSource<'_> {
 }
 
 impl SqliteAccountStorage {
-    /// File-backed variant of [`Self::stage_attachment_uploads`]. Shares its
-    /// group, count and quota admission, but never assembles a body in memory:
-    /// each body is a `zeroblob` tail column filled through incremental BLOB
-    /// writes of at most [`ATTACHMENT_STAGING_CHUNK_BYTES`]. A short, growing,
-    /// unreadable or digest-mismatched source, or `cancelled()` returning true
-    /// between chunks, rolls back the whole batch (including caller
-    /// transactions that nest it). Bodies are bounded by
-    /// `MAX_RETAINED_FILE_ATTACHMENT_BYTES`; legacy array staging retains its smaller cap.
+    /// Reserve the complete outgoing batch, then import private snapshots in
+    /// short, bounded transactions. Tokens become bindable only after every
+    /// body verifies. Errors release the whole batch; an enclosing caller
+    /// transaction retains its original atomic commit/rollback semantics.
     pub fn stage_attachment_upload_files(
         &self,
         group: &str,
@@ -44,47 +40,15 @@ impl SqliteAccountStorage {
         byte_budget: u64,
         cancelled: &dyn Fn() -> bool,
     ) -> StorageResult<Vec<Vec<u8>>> {
-        if sources.is_empty()
-            || sources.len() > 64
-            || sources
-                .iter()
-                .any(|source| source.len == 0 || source.len > MAX_RETAINED_FILE_ATTACHMENT_BYTES)
-        {
-            return Err(invalid("invalid outgoing attachment batch"));
-        }
-        let incoming = sources
-            .iter()
-            .try_fold(0u64, |sum, source| sum.checked_add(source.len))
-            .ok_or_else(|| invalid("outgoing attachment size overflow"))?;
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            let accepted: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM account_groups WHERE group_id_hex=?1)", [group], |row| row.get(0)).storage()?;
-            if !accepted {
-                return Err(invalid("outgoing attachment group unavailable"));
-            }
-            let (used, partial, count): (u64, u64, i64) = conn.query_row("SELECT (SELECT byte_count FROM attachment_retention_usage WHERE id=1),(SELECT reserved_bytes FROM attachment_partial_usage WHERE id=1),(SELECT count(*) FROM outgoing_attachment_uploads)", [], |r| Ok((nonnegative(r, 0)?, nonnegative(r, 1)?, r.get(2)?))).storage()?;
-            if used.saturating_add(partial).saturating_add(incoming) > byte_budget
-                || count + sources.len() as i64 > MAX_STAGED_UPLOADS
-            {
-                return Err(invalid("outgoing attachment retention capacity unavailable"));
-            }
-            let mut buffer = Zeroizing::new(vec![0u8; ATTACHMENT_STAGING_CHUNK_BYTES]);
-            let mut tokens = Vec::with_capacity(sources.len());
-            for source in sources.iter_mut() {
-                if cancelled() {
-                    return Err(invalid("outgoing attachment staging cancelled"));
-                }
-                let token: Vec<u8> = conn.query_row("SELECT randomblob(16)", [], |r| r.get(0)).storage()?;
-                conn.execute("INSERT INTO outgoing_attachment_uploads(token,group_id_hex,source_epoch,plaintext_digest,bytes,expires_at) VALUES(?1,?2,?3,?4,x'',?5)", params![token, group, u64_to_i64(source_epoch)?, &source.digest[..], u64_to_i64(now.saturating_add(UPLOAD_TTL_SECONDS))?]).storage()?;
-                conn.execute("INSERT INTO outgoing_attachment_upload_bodies(token,byte_len,bytes) VALUES(?1,?2,zeroblob(?2))", params![token, u64_to_i64(source.len)?]).storage()?;
-                let rowid: i64 = conn.query_row("SELECT rowid FROM outgoing_attachment_upload_bodies WHERE token=?1", [&token], |r| r.get(0)).storage()?;
-                let mut blob = conn.blob_open("main", BODY_TABLE, "bytes", rowid, false).storage()?;
-                write_verified_body(&mut blob, source, &mut buffer, cancelled)?;
-                blob.close().storage()?;
-                tokens.push(token);
-            }
-            Ok(tokens)
-        })
+        super::file_staging::stage(
+            self,
+            group,
+            source_epoch,
+            sources,
+            now,
+            byte_budget,
+            cancelled,
+        )
     }
 
     /// Privately reserve a bounded successful-upload batch for optional retention.
@@ -217,9 +181,10 @@ impl SqliteAccountStorage {
         now: u64,
         fallback_budget: u64,
     ) -> StorageResult<usize> {
+        let verified_files = super::file_staging::verify(self, group, message)?;
         self.connection.with_transaction(|| {
             let conn=self.lock()?;
-            let mut stmt=conn.prepare("SELECT h.message_id_hex,h.attachment_index,h.source_message_id_hex,h.source_epoch,h.sender,h.timeline_at,h.received_at,h.slot_json,u.token,u.plaintext_digest,coalesce((SELECT ub.byte_len FROM outgoing_attachment_upload_bodies ub WHERE ub.token=u.token),length(u.bytes)),u.quarantined
+            let mut stmt=conn.prepare("SELECT h.message_id_hex,h.attachment_index,h.source_message_id_hex,h.source_epoch,h.sender,h.timeline_at,h.received_at,h.slot_json,u.token,u.plaintext_digest,coalesce((SELECT uf.byte_len FROM outgoing_attachment_upload_files uf WHERE uf.token=u.token),(SELECT ub.byte_len FROM outgoing_attachment_upload_bodies ub WHERE ub.token=u.token),length(u.bytes)),u.quarantined
                 FROM attachment_history h JOIN app_events a USING(group_id_hex,message_id_hex)
                 JOIN account_groups g USING(group_id_hex)
                 JOIN outgoing_attachment_uploads u ON u.group_id_hex=h.group_id_hex AND u.source_epoch=h.source_epoch AND u.slot_json=h.slot_json
@@ -237,7 +202,7 @@ impl SqliteAccountStorage {
                 let digest:[u8;32]=digest.try_into().map_err(|_|invalid("invalid outgoing attachment digest"))?;
                 let AttachmentDemand::Requested(asset)=self.request_attachment_acquisition(group,&entry,digest,now)? else {continue;};
                 let conn=self.lock()?;
-                let eligible:bool=conn.query_row("SELECT cancelled=0 AND (state<>4 OR body_completed=1) AND NOT(?2 AND explicit_request=1 AND body_completed=0) FROM attachment_acquisition WHERE token=?1",params![asset.token,quarantined],|r|r.get(0)).storage()?;
+                let eligible:bool=conn.query_row("SELECT NOT EXISTS(SELECT 1 FROM retained_attachment_files f WHERE f.token=?1 AND f.completed=0) AND cancelled=0 AND (state<>4 OR body_completed=1) AND NOT(?2 AND explicit_request=1 AND body_completed=0) FROM attachment_acquisition WHERE token=?1",params![asset.token,quarantined],|r|r.get(0)).storage()?;
                 if !eligible {continue;}
                 // The staged bytes already reserve their quota. Convert once the
                 // complete message is processed; repeated slots need extra quota.
@@ -249,10 +214,11 @@ impl SqliteAccountStorage {
                     conn.execute("UPDATE attachment_acquisition SET automatic_history=1,body_completed=1,state=4,due=NULL,attempt=NULL WHERE token=?1",[&asset.token]).storage()?;
                     continue;
                 }
-                if !already && (quarantined || !verify_staged_upload(&conn,&token,&digest,size)?) {
+                if !already && (quarantined || !verify_staged_upload(&conn,&token,&digest,size,&verified_files)?) {
                     // Discard proven-corrupt bytes, keeping only metadata until
                     // every live source has a durable unavailable receipt.
                     conn.execute("DELETE FROM outgoing_attachment_upload_bodies WHERE token=?1",[&token]).storage()?;
+                    conn.execute("DELETE FROM outgoing_attachment_upload_files WHERE token=?1",[&token]).storage()?;
                     conn.execute("UPDATE outgoing_attachment_uploads SET bytes=x'',quarantined=1 WHERE token=?1",[&token]).storage()?;
                     conn.execute("UPDATE attachment_acquisition SET automatic_history=1,body_completed=1,state=4,due=NULL,attempt=NULL WHERE token=?1",[&asset.token]).storage()?;
                     continue;
@@ -429,7 +395,23 @@ fn verify_staged_upload(
     token: &[u8],
     digest: &[u8; 32],
     size: u64,
+    verified: &super::file_staging::Verification,
 ) -> StorageResult<bool> {
+    let file: Option<(Vec<u8>, u64, bool)> = conn
+        .query_row(
+            "SELECT nonce,byte_len,completed FROM outgoing_attachment_upload_files WHERE token=?1",
+            [token],
+            |r| Ok((r.get(0)?, nonnegative(r, 1)?, r.get(2)?)),
+        )
+        .optional()
+        .storage()?;
+    if let Some((nonce, len, completed)) = file {
+        return Ok(completed
+            && len == size
+            && verified
+                .get(token)
+                .is_some_and(|(checked, valid)| checked == &nonce && *valid));
+    }
     let (table, rowid) = staged_body(conn, token)?;
     let blob = conn
         .blob_open("main", table, "bytes", rowid, true)
@@ -488,6 +470,27 @@ fn copy_staged_body(
     if size_usize as u64 > MAX_RETAINED_FILE_ATTACHMENT_BYTES {
         return Err(invalid("retained attachment exceeds storage bound"));
     }
+    let file: Option<(Vec<u8>, u64, bool)> = conn
+        .query_row(
+            "SELECT nonce,byte_len,completed FROM outgoing_attachment_upload_files WHERE token=?1",
+            [staged],
+            |r| Ok((r.get(0)?, nonnegative(r, 1)?, r.get(2)?)),
+        )
+        .optional()
+        .storage()?;
+    if let Some((nonce, len, completed)) = file {
+        if !completed || len != size {
+            return Err(invalid("outgoing attachment file unavailable"));
+        }
+        conn.execute(
+            "INSERT INTO retained_attachment_bytes(token,byte_len,bytes) VALUES(?1,0,x'')",
+            [retained],
+        )
+        .storage()?;
+        // Shared immutable chunks avoid a second whole-file SQLCipher copy.
+        conn.execute("INSERT INTO retained_attachment_files(token,nonce,attempt,byte_len,completed) VALUES(?1,?2,zeroblob(16),?3,1)",params![retained,nonce,u64_to_i64(size)?]).storage()?;
+        return Ok(());
+    }
     let (table, rowid) = staged_body(conn, staged)?;
     conn.execute(
         "INSERT INTO retained_attachment_bytes(token,byte_len,bytes) VALUES(?1,?2,zeroblob(?2))",
@@ -534,53 +537,7 @@ fn copy_staged_body(
     Ok(())
 }
 
-/// Fill one reserved body from a private snapshot in bounded chunks. Rejects
-/// short or growing input, unreadable sources, cancellation and digest mismatch.
-pub(super) fn write_verified_body(
-    blob: &mut rusqlite::blob::Blob<'_>,
-    source: &mut AttachmentUploadSource<'_>,
-    buffer: &mut [u8],
-    cancelled: &dyn Fn() -> bool,
-) -> StorageResult<()> {
-    let len = usize::try_from(source.len)
-        .map_err(|_| StorageError::InvalidAttachmentBody("invalid outgoing attachment size"))?;
-    if blob.len() != len {
-        return Err(StorageError::InvalidAttachmentBody(
-            "outgoing attachment reservation length mismatch",
-        ));
-    }
-    let mut hash = Sha256::new();
-    let mut offset = 0usize;
-    while offset < len {
-        if cancelled() {
-            return Err(invalid("outgoing attachment staging cancelled"));
-        }
-        let want = buffer.len().min(len - offset);
-        let count = read_some(&mut *source.reader, &mut buffer[..want])?;
-        if count == 0 {
-            return Err(StorageError::InvalidAttachmentBody(
-                "outgoing attachment source truncated",
-            ));
-        }
-        hash.update(&buffer[..count]);
-        blob.write_at(&buffer[..count], offset).storage()?;
-        offset += count;
-    }
-    let mut probe = [0u8; 1];
-    if read_some(&mut *source.reader, &mut probe)? != 0 {
-        return Err(StorageError::InvalidAttachmentBody(
-            "outgoing attachment source grew",
-        ));
-    }
-    if hash.finalize().as_slice() != &source.digest[..] {
-        return Err(StorageError::InvalidAttachmentBody(
-            "outgoing attachment digest mismatch",
-        ));
-    }
-    Ok(())
-}
-
-fn read_some(reader: &mut dyn std::io::Read, buffer: &mut [u8]) -> StorageResult<usize> {
+pub(super) fn read_some(reader: &mut dyn std::io::Read, buffer: &mut [u8]) -> StorageResult<usize> {
     loop {
         match reader.read(buffer) {
             Ok(count) => return Ok(count),

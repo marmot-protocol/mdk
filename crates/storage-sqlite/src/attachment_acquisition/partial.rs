@@ -281,9 +281,14 @@ impl SqliteAccountStorage {
                 |r| nonnegative(r, 0),
             )
             .storage()?;
+        let own_import: u64 = conn.query_row(
+            "SELECT coalesce((SELECT byte_len FROM retained_attachment_files WHERE token=?1 AND completed=0),0)",
+            [&reference.token], |r| nonnegative(r,0),
+        ).storage()?;
         let required = if own > 0 { own.min(maximum) } else { maximum };
         Ok(reserved_bytes(&conn)?
             .saturating_sub(own)
+            .saturating_sub(own_import)
             .saturating_add(required)
             <= budget)
     }

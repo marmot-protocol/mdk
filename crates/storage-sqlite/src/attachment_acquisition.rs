@@ -580,6 +580,12 @@ impl SqliteAccountStorage {
                 .storage()?;
                 return Ok(None);
             }
+            // A new admitted attempt discards a crash-interrupted import, never
+            // another active lease or a verified retained body.
+            conn.execute(
+                "DELETE FROM retained_attachment_bytes WHERE token=?1 AND EXISTS(SELECT 1 FROM retained_attachment_files f WHERE f.token=?1 AND f.completed=0)",
+                [&reference.token],
+            ).storage()?;
             conn.execute(
                 "UPDATE attachment_acquisition SET state=1,due=?2,attempt=randomblob(16),progress_phase=0,body_completed=CASE WHEN automatic_history=0 THEN 0 ELSE body_completed END,
                     progress_epoch=progress_epoch+1,progress_received=0,progress_total=NULL,
@@ -658,12 +664,11 @@ impl SqliteAccountStorage {
         })
     }
 
-    /// File-backed publication with the same store, attempt, source and quota
-    /// fences as [`Self::complete_attachment_acquisition`], in bounded memory:
-    /// a `zeroblob` tail value is filled in chunks of at most
-    /// [`ATTACHMENT_STAGING_CHUNK_BYTES`] and the parser digest is verified
-    /// before commit. Short, growing, unreadable, mismatched or cancelled input
-    /// rolls the reservation back. The reader must be authenticated plaintext.
+    /// Import authenticated plaintext in bounded, separately committed chunks.
+    /// The full quota is reserved first, but bytes remain unreadable until EOF
+    /// and the digest verify. Every chunk and final publication recheck the
+    /// source/attempt fence; failed imports release only their own reservation.
+    /// An enclosing caller transaction still owns atomic commit/rollback.
     pub fn complete_attachment_acquisition_from_reader(
         &self,
         job: &AttachmentAcquisition,
@@ -673,50 +678,7 @@ impl SqliteAccountStorage {
         byte_budget: u64,
         cancelled: &dyn Fn() -> bool,
     ) -> StorageResult<AttachmentPublishResult> {
-        if len > MAX_RETAINED_FILE_ATTACHMENT_BYTES {
-            return Err(StorageError::InvalidAttachmentBody(
-                "retained attachment exceeds storage bound",
-            ));
-        }
-        let digest: [u8; 32] = job.digest.as_slice().try_into().map_err(|_| {
-            StorageError::InvalidAttachmentBody("attachment plaintext digest mismatch")
-        })?;
-        let now = u64_to_i64(now)?;
-        self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            if let Some(refused) = publication_refusal(&conn, job, now, len, byte_budget)? {
-                return Ok(refused);
-            }
-            conn.execute(
-                "INSERT INTO retained_attachment_bytes(token,byte_len,bytes) VALUES(?1,?2,zeroblob(?2))",
-                params![job.reference.token, u64_to_i64(len)?],
-            )
-            .storage()?;
-            let rowid: i64 = conn
-                .query_row(
-                    "SELECT rowid FROM retained_attachment_bytes WHERE token=?1",
-                    [&job.reference.token],
-                    |r| r.get(0),
-                )
-                .storage()?;
-            let mut blob = conn
-                .blob_open("main", "retained_attachment_bytes", "bytes", rowid, false)
-                .storage()?;
-            let mut source = AttachmentUploadSource {
-                reader,
-                len,
-                digest,
-            };
-            let mut buffer = Zeroizing::new(vec![0u8; ATTACHMENT_STAGING_CHUNK_BYTES]);
-            outgoing::write_verified_body(&mut blob, &mut source, &mut buffer, cancelled)?;
-            blob.close().storage()?;
-            conn.execute(
-                "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL WHERE token=?1",
-                [&job.reference.token],
-            )
-            .storage()?;
-            Ok(AttachmentPublishResult::Published)
-        })
+        file_import::complete(self, job, reader, len, now, byte_budget, cancelled)
     }
 
     /// None blocks until an explicit retry; Some schedules a later attempt. Never
@@ -853,7 +815,7 @@ impl SqliteAccountStorage {
         }
         let row = conn.query_row(
             "SELECT state,attempts,due,
-                COALESCE((SELECT length(bytes) FROM retained_attachment_bytes b WHERE b.token=q.token),0)
+                CASE WHEN q.state=3 THEN COALESCE((SELECT byte_len FROM retained_attachment_files f WHERE f.token=q.token AND f.completed=1),(SELECT length(bytes) FROM retained_attachment_bytes b WHERE b.token=q.token),0) ELSE 0 END
              FROM attachment_acquisition q WHERE token=?1",
             [&reference.token],
             |r| Ok((
@@ -923,6 +885,9 @@ impl SqliteAccountStorage {
             let Some(row_id) = row_id else {
                 return Ok(None);
             };
+            if let Some(bytes) = file_import::read(conn, &reference.token, offset, limit)? {
+                return Ok(Some(bytes));
+            }
             let blob = conn
                 .blob_open("main", "retained_attachment_bytes", "bytes", row_id, true)
                 .storage()?;
@@ -1029,6 +994,9 @@ mod tests;
 
 mod partial;
 pub use partial::{ATTACHMENT_CHECKPOINT_BYTES, AttachmentPartial, AttachmentPartialIdentity};
+
+mod file_import;
+mod file_staging;
 
 mod access;
 pub use access::RetainedAttachmentAsset;

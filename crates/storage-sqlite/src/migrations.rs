@@ -217,6 +217,8 @@ mod migration_0103_outgoing_attachment_upload_bodies;
 mod migration_0104_file_attachment_retention;
 #[path = "migrations/0105_file_attachment_partials.rs"]
 mod migration_0105_file_attachment_partials;
+#[path = "migrations/0106_retained_attachment_chunks.rs"]
+mod migration_0106_retained_attachment_chunks;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -757,6 +759,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 105,
         name: "0105_file_attachment_partials",
         apply: migration_0105_file_attachment_partials::apply,
+    },
+    Migration {
+        version: 106,
+        name: "0106_retained_attachment_chunks",
+        apply: migration_0106_retained_attachment_chunks::apply,
     },
 ];
 
