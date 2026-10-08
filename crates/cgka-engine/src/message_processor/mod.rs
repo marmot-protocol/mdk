@@ -287,7 +287,7 @@ pub(crate) struct DeferredPeelGroupState {
     /// Examined rows in the current confirmation retry sweep. Preserve storage's
     /// arrival order while skipping a deferred prefix on subsequent slices.
     /// Pruned against retained rows each slice and cleared when the sweep ends.
-    confirmation_replay_visited: HashSet<MessageId>,
+    pub(crate) confirmation_replay_visited: HashSet<MessageId>,
     /// Cached count of retained `PeelDeferred` rows backing the flood cap.
     /// Refreshed from storage on every sweep; adjusted at the deferral /
     /// terminal transition sites in between.
@@ -4218,6 +4218,140 @@ mod deferred_peel_accounting_tests {
             MessageState::PeelDeferred
         );
         assert!(!engine.pending_confirmation_replays.contains(&group_id));
+
+        #[cfg(feature = "test-conformance-snapshot")]
+        {
+            // Keep the 65 now-opaque rows and extend the same fairness fixture
+            // beyond the simulator's eight 64-row drain rounds. Every row is
+            // already PeelDeferred, so visiting it does not alter durable state.
+            for index in 65..1_024u32 {
+                let id = MessageId::new(index.to_be_bytes().to_vec());
+                let msg = TransportMessage {
+                    id: id.clone(),
+                    payload: vec![0x42],
+                    timestamp: Timestamp(1),
+                    causal_deps: vec![],
+                    source: TransportSource("test".into()),
+                    envelope: TransportEnvelope::GroupMessage {
+                        transport_group_id: group_id.as_slice().to_vec(),
+                    },
+                };
+                engine
+                    .storage
+                    .put_message(&MessageRecord {
+                        id,
+                        group_id: group_id.clone(),
+                        epoch: EpochId(0),
+                        state: MessageState::PeelDeferred,
+                        payload: StoredMessagePayload::raw_transport(msg).encode().unwrap(),
+                        deferred_peel: None,
+                    })
+                    .unwrap();
+            }
+            engine.pending_confirmation_replays.insert(group_id.clone());
+            engine.schedule_pending_convergence_group(&group_id);
+            let initial = engine
+                .conformance_structural_progress_snapshot(&group_id)
+                .unwrap();
+            assert_eq!(initial.confirmation_replay_completed_rows, 0);
+            assert_eq!(
+                initial.pending_work.stored_transport_deferred_messages,
+                1_024
+            );
+            for slice in 1..=8 {
+                assert!(
+                    !engine
+                        .advance_convergence_inputs_until_settled(&group_id, 0)
+                        .await
+                        .unwrap()
+                );
+                let current = engine
+                    .conformance_structural_progress_snapshot(&group_id)
+                    .unwrap();
+                assert_eq!(current.confirmation_replay_completed_rows, slice * 64);
+                assert_eq!(current.current_epoch, initial.current_epoch);
+                assert_eq!(current.lifecycle, initial.lifecycle);
+                assert_eq!(current.pending_work, initial.pending_work);
+                assert_eq!(
+                    current.deferred_peel_completed_context_attempts,
+                    initial.deferred_peel_completed_context_attempts
+                );
+                assert_eq!(current.pass_generation, initial.pass_generation);
+                assert_eq!(current.pass_phase, initial.pass_phase);
+                assert_eq!(
+                    current.terminal_unrecoverable,
+                    initial.terminal_unrecoverable
+                );
+            }
+            // Retiring a visited row must not report that
+            // row as completed retained work; the existing pending counts also
+            // witness these durable transitions.
+            let visited = engine
+                .deferred_peel
+                .get(&group_id)
+                .unwrap()
+                .confirmation_replay_visited
+                .iter()
+                .min_by(|left, right| left.as_slice().cmp(right.as_slice()))
+                .unwrap()
+                .clone();
+            engine
+                .update_stored_message_state(&visited, MessageState::Failed)
+                .unwrap();
+            let after_retirement = engine
+                .conformance_structural_progress_snapshot(&group_id)
+                .unwrap();
+            assert_eq!(after_retirement.confirmation_replay_completed_rows, 511);
+            assert_eq!(
+                after_retirement
+                    .pending_work
+                    .stored_transport_deferred_messages,
+                1_023
+            );
+            let mut arriving = engine.storage.get_message(&ids[1]).unwrap();
+            arriving.id = MessageId::new(u32::MAX.to_be_bytes().to_vec());
+            let mut transport = StoredMessagePayload::decode(&arriving.payload)
+                .unwrap()
+                .as_raw_transport()
+                .unwrap()
+                .clone();
+            transport.id = arriving.id.clone();
+            arriving.payload = StoredMessagePayload::raw_transport(transport)
+                .encode()
+                .unwrap();
+            engine.storage.put_message(&arriving).unwrap();
+            let after_arrival = engine
+                .conformance_structural_progress_snapshot(&group_id)
+                .unwrap();
+            assert_eq!(after_arrival.confirmation_replay_completed_rows, 511);
+            assert_eq!(
+                after_arrival
+                    .pending_work
+                    .stored_transport_deferred_messages,
+                1_024
+            );
+            for _ in 0..=1_024 / MAX_DEFERRED_ROWS_PER_SWEEP {
+                if !engine.pending_confirmation_replays.contains(&group_id) {
+                    break;
+                }
+                let mut execution = DeferredPeelExecution::Background {
+                    deadline: None,
+                    rows_remaining: MAX_DEFERRED_ROWS_PER_SWEEP,
+                };
+                engine
+                    .retry_pending_confirmation_replay(&group_id, &mut execution)
+                    .await
+                    .unwrap();
+            }
+            assert!(!engine.pending_confirmation_replays.contains(&group_id));
+            assert_eq!(
+                engine
+                    .conformance_structural_progress_snapshot(&group_id)
+                    .unwrap()
+                    .confirmation_replay_completed_rows,
+                0
+            );
+        }
     }
 
     #[tokio::test]
