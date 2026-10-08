@@ -373,14 +373,20 @@ fn sticker_only_tag_change_invalidates_prepared_conversion() {
     row.tags = vec![sticker("wave")];
     let first = cache.row(&row, false);
     assert_eq!(
-        first.sticker.as_ref().map(|sticker| sticker.shortcode.as_str()),
+        first
+            .sticker
+            .as_ref()
+            .map(|sticker| sticker.shortcode.as_str()),
         Some("wave")
     );
     assert_eq!(cache.conversions, 1);
     row.tags = vec![sticker("nod")];
     let second = cache.row(&row, false);
     assert_eq!(
-        second.sticker.as_ref().map(|sticker| sticker.shortcode.as_str()),
+        second
+            .sticker
+            .as_ref()
+            .map(|sticker| sticker.shortcode.as_str()),
         Some("nod")
     );
     assert_eq!(

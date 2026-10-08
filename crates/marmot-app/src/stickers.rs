@@ -1779,7 +1779,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn image_inspection_enforces_dimensions_and_animation_limits() {
         assert_eq!(

@@ -2004,7 +2004,11 @@ fn refresh_chat_list_last_message_after_secure_prune_tx(
                 sender,
                 plaintext,
                 kind,
-                if deleted == 0 { tags_json } else { "[]".to_owned() },
+                if deleted == 0 {
+                    tags_json
+                } else {
+                    "[]".to_owned()
+                },
                 timeline_at,
                 deleted,
                 media_json,
