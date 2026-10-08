@@ -7819,6 +7819,12 @@ async fn self_removal_suppresses_account_unread_while_peer_removal_advances_it()
     loop {
         bob.sync().await.unwrap();
         carol.sync().await.unwrap();
+        if unread_for(&bob_account.account_id_hex) != 2 {
+            bob.retry_group_convergence(&group_id).await.unwrap();
+        }
+        if unread_for(&carol_account.account_id_hex) != 0 {
+            carol.retry_group_convergence(&group_id).await.unwrap();
+        }
         // Carol's self-removal must zero her summary. Bob remains a member, so
         // the peer-removal system row advances his existing unread count.
         if unread_for(&carol_account.account_id_hex) == 0
@@ -8420,7 +8426,12 @@ async fn relay_app_runtime_synthesizes_system_row_for_retention_change() {
     assert_eq!(parsed.old_retention_seconds, Some(0));
     assert_eq!(parsed.new_retention_seconds, Some(60));
 
-    bob.sync().await.unwrap();
+    sync_to_epoch(
+        &mut bob,
+        &group_id,
+        alice.group_mls_state(&group_id).unwrap().epoch,
+    )
+    .await;
     let bob_timeline = MarmotApp::with_relay(dir.path(), url)
         .timeline_messages_with_query(
             "bob",
@@ -9189,7 +9200,12 @@ async fn retained_media_rehydrates_a_retired_current_epoch_before_the_group_adva
         .update_message_retention(&group_id, retention_seconds)
         .await
         .unwrap();
-    bob.sync().await.unwrap();
+    sync_to_epoch(
+        &mut bob,
+        &group_id,
+        alice.group_mls_state(&group_id).unwrap().epoch,
+    )
+    .await;
 
     let expired = alice
         .upload_media(
@@ -9285,7 +9301,12 @@ async fn retained_media_rehydrates_a_retired_current_epoch_before_the_group_adva
         .await
         .unwrap();
 
-    bob.sync().await.unwrap();
+    sync_to_epoch(
+        &mut bob,
+        &group_id,
+        alice.group_mls_state(&group_id).unwrap().epoch,
+    )
+    .await;
     let download = bob
         .download_media(&group_id, retained_reference)
         .await
