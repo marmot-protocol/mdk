@@ -678,7 +678,30 @@ impl SqliteAccountStorage {
         byte_budget: u64,
         cancelled: &dyn Fn() -> bool,
     ) -> StorageResult<AttachmentPublishResult> {
-        file_import::complete(self, job, reader, len, now, byte_budget, cancelled)
+        let started = std::time::Instant::now();
+        self.complete_attachment_acquisition_from_reader_with_clock(
+            job,
+            reader,
+            len,
+            &|| now.saturating_add(started.elapsed().as_secs()),
+            byte_budget,
+            cancelled,
+        )
+    }
+
+    /// Import using a fresh Unix-seconds clock at every chunk and publication
+    /// gate, after acquiring storage. The clock must be non-blocking. Runtime
+    /// callers use their wall clock; deterministic tests can advance it during I/O.
+    pub fn complete_attachment_acquisition_from_reader_with_clock(
+        &self,
+        job: &AttachmentAcquisition,
+        reader: &mut dyn std::io::Read,
+        len: u64,
+        clock: &dyn Fn() -> u64,
+        byte_budget: u64,
+        cancelled: &dyn Fn() -> bool,
+    ) -> StorageResult<AttachmentPublishResult> {
+        file_import::complete(self, job, reader, len, clock, byte_budget, cancelled)
     }
 
     /// None blocks until an explicit retry; Some schedules a later attempt. Never

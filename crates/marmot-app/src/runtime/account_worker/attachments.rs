@@ -430,11 +430,11 @@ pub(super) fn complete_acquired_stored(
         Ok(crate::client::AcquiredMediaBody::File(file)) => {
             let policy = storage.attachment_download_policy(fallback)?;
             let mut reader = file.reader()?;
-            match storage.complete_attachment_acquisition_from_reader(
+            match storage.complete_attachment_acquisition_from_reader_with_clock(
                 job,
                 &mut reader,
                 file.len,
-                now,
+                &crate::unix_now_seconds,
                 byte_budget.min(policy.retained_bytes),
                 cancelled,
             ) {

@@ -36,7 +36,7 @@ pub(super) fn complete(
     job: &AttachmentAcquisition,
     reader: &mut dyn std::io::Read,
     len: u64,
-    now: u64,
+    clock: &dyn Fn() -> u64,
     budget: u64,
     cancelled: &dyn Fn() -> bool,
 ) -> StorageResult<AttachmentPublishResult> {
@@ -49,9 +49,9 @@ pub(super) fn complete(
         job.digest.as_slice().try_into().map_err(|_| {
             StorageError::InvalidAttachmentBody("attachment plaintext digest mismatch")
         })?;
-    let now = u64_to_i64(now)?;
     let reservation = store.connection.with_transaction(|| {
         let conn = store.lock()?;
+        let now = u64_to_i64(clock())?;
         if let Some(refused) = publication_refusal(&conn, job, now, len, budget)? {
             return Ok(Err(refused));
         }
@@ -112,7 +112,8 @@ pub(super) fn complete(
             }
             // This import already reserves its full length. Do not charge it
             // again, but retain all source, permission, lease and quota checks.
-            if let Some(refused) = publication_refusal(&conn, job, now, 0, budget)? {
+            if let Some(refused) = publication_refusal(&conn, job, u64_to_i64(clock())?, 0, budget)?
+            {
                 return Ok(Some(refused));
             }
             for (index, chunk) in buffer[..count]
@@ -155,7 +156,7 @@ pub(super) fn complete(
         if !owns(&conn, job, &reservation.nonce)? {
             return Ok(AttachmentPublishResult::Superseded);
         }
-        if let Some(refused) = publication_refusal(&conn, job, now, 0, budget)? {
+        if let Some(refused) = publication_refusal(&conn, job, u64_to_i64(clock())?, 0, budget)? {
             return Ok(refused);
         }
         conn.execute(

@@ -97,46 +97,135 @@ impl SqliteAccountStorage {
         expected: (&[u8; 32], &[u8; 32]),
         writer: &mut dyn std::io::Write,
     ) -> StorageResult<Option<(AttachmentPartialIdentity, u64)>> {
-        self.connection.with_transaction(|| {
+        let metadata = |conn: &Connection| {
+            conn.query_row(
+                "SELECT ciphertext_digest,locator_digest,etag,total,received,expires_at
+                 FROM attachment_partial WHERE token=?1",
+                [&job.reference.token],
+                |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, Vec<u8>>(1)?,
+                        r.get::<_, String>(2)?,
+                        nonnegative(r, 3)?,
+                        nonnegative(r, 4)?,
+                        nonnegative(r, 5)?,
+                    ))
+                },
+            )
+            .optional()
+            .storage()
+        };
+        let snapshot = self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            if !valid_attempt(&conn, job, now)? { return Ok(None); }
-            let row = conn.query_row("SELECT ciphertext_digest,locator_digest,etag,total,received,expires_at FROM attachment_partial WHERE token=?1",
-                [&job.reference.token], |r| Ok((r.get::<_,Vec<u8>>(0)?,r.get::<_,Vec<u8>>(1)?,r.get::<_,String>(2)?,nonnegative(r,3)?,nonnegative(r,4)?,nonnegative(r,5)?)))
-                .optional().storage()?;
-            let Some((cipher, locator, etag, total, received, expiry)) = row else { return Ok(None); };
-            if cipher != expected.0 || locator != expected.1 { return Ok(None); }
-            if expiry <= now || total > max_bytes || total > MAX_RETAINED_FILE_ATTACHMENT_BYTES || received > total {
-                conn.execute("DELETE FROM attachment_partial WHERE token=?1", [&job.reference.token]).storage()?;
+            if !valid_attempt(&conn, job, now)? {
                 return Ok(None);
             }
-            let mut statement = conn.prepare("SELECT offset,bytes,digest FROM attachment_partial_chunk WHERE token=?1 ORDER BY offset").storage()?;
-            let mut rows = statement.query([&job.reference.token]).storage()?;
-            let mut copied = 0u64;
-            let mut corrupt = false;
-            while let Some(row) = rows.next().storage()? {
-                let offset = nonnegative(row,0).storage()?;
-                let chunk: Vec<u8> = row.get(1).storage()?;
-                let digest: Vec<u8> = row.get(2).storage()?;
-                if offset != copied || chunk.is_empty() || chunk.len() > ATTACHMENT_CHECKPOINT_BYTES
-                    || copied.saturating_add(chunk.len() as u64) > received || Sha256::digest(&chunk).as_slice() != digest {
-                    corrupt = true;
-                    break;
+            let Some(row) = metadata(&conn)? else {
+                return Ok(None);
+            };
+            if row.0 != expected.0 || row.1 != expected.1 {
+                return Ok(None);
+            }
+            if row.5 <= now
+                || row.3 > max_bytes
+                || row.3 > MAX_RETAINED_FILE_ATTACHMENT_BYTES
+                || row.4 > row.3
+            {
+                conn.execute(
+                    "DELETE FROM attachment_partial WHERE token=?1",
+                    [&job.reference.token],
+                )
+                .storage()?;
+                return Ok(None);
+            }
+            Ok(Some(row))
+        })?;
+        let Some(snapshot) = snapshot else {
+            return Ok(None);
+        };
+        let identity = AttachmentPartialIdentity {
+            ciphertext_digest: snapshot
+                .0
+                .clone()
+                .try_into()
+                .map_err(|_| invalid("invalid partial digest"))?,
+            locator_digest: snapshot
+                .1
+                .clone()
+                .try_into()
+                .map_err(|_| invalid("invalid partial locator"))?,
+            etag: snapshot.2.clone(),
+            total: snapshot.3,
+        };
+        // Recheck the frozen representation as well as the attempt/source before
+        // each bounded read and once after the last caller write. Neither the
+        // account guard nor its transaction survives into hashing or caller I/O.
+        let mut copied = 0u64;
+        let mut previous_offset = -1i64;
+        loop {
+            let next = self.connection.with_transaction(|| {
+                let conn = self.lock()?;
+                if !valid_attempt(&conn, job, now)? || metadata(&conn)?.as_ref() != Some(&snapshot)
+                {
+                    return Ok(None);
                 }
-                writer.write_all(&chunk).map_err(|_| invalid("partial checkpoint copy failed"))?;
-                copied += chunk.len() as u64;
-            }
-            drop(rows);
-            drop(statement);
-            if corrupt || copied != received {
-                conn.execute("DELETE FROM attachment_partial WHERE token=?1", [&job.reference.token]).storage()?;
+                let chunk = conn
+                    .query_row(
+                        "SELECT offset,bytes,digest FROM attachment_partial_chunk
+                     WHERE token=?1 AND offset>?2 ORDER BY offset LIMIT 1",
+                        params![job.reference.token, previous_offset],
+                        |r| {
+                            Ok((
+                                nonnegative(r, 0)?,
+                                r.get::<_, Vec<u8>>(1)?,
+                                r.get::<_, Vec<u8>>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .storage()?;
+                Ok(Some(chunk))
+            })?;
+            let Some(next) = next else {
+                return Ok(None);
+            };
+            let corrupt = match &next {
+                Some((offset, bytes, digest)) => {
+                    *offset != copied
+                        || bytes.is_empty()
+                        || bytes.len() > ATTACHMENT_CHECKPOINT_BYTES
+                        || copied.saturating_add(bytes.len() as u64) > snapshot.4
+                        || Sha256::digest(bytes).as_slice() != digest
+                }
+                None => copied != snapshot.4,
+            };
+            if corrupt {
+                // A cancelled loader must not clear a replacement checkpoint.
+                self.connection.with_transaction(|| {
+                    let conn = self.lock()?;
+                    if valid_attempt(&conn, job, now)?
+                        && metadata(&conn)?.as_ref() == Some(&snapshot)
+                    {
+                        conn.execute(
+                            "DELETE FROM attachment_partial WHERE token=?1",
+                            [&job.reference.token],
+                        )
+                        .storage()?;
+                    }
+                    Ok(())
+                })?;
                 return Ok(None);
             }
-            Ok(Some((AttachmentPartialIdentity {
-                ciphertext_digest: cipher.try_into().map_err(|_| invalid("invalid partial digest"))?,
-                locator_digest: locator.try_into().map_err(|_| invalid("invalid partial locator"))?,
-                etag, total,
-            }, copied)))
-        })
+            let Some((offset, bytes, _)) = next else {
+                return Ok(Some((identity, copied)));
+            };
+            writer
+                .write_all(&bytes)
+                .map_err(|_| invalid("partial checkpoint copy failed"))?;
+            previous_offset = u64_to_i64(offset)?;
+            copied += bytes.len() as u64;
+        }
     }
 
     /// Append at an exact offset, in bounded chunks. A new zero-offset checkpoint

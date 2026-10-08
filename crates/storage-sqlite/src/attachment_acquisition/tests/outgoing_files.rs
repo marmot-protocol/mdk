@@ -24,6 +24,280 @@ impl Read for HeldReader {
     }
 }
 
+struct HeldWriter {
+    bytes: Vec<u8>,
+    entered: Option<std::sync::mpsc::Sender<()>>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl std::io::Write for HeldWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if let Some(entered) = self.entered.take() {
+            entered.send(()).unwrap();
+            self.release
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn partial_writer_rejects_overlapping_authenticated_chunks() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "overlap");
+    let asset = request(&store, "overlap");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    let identity = partial_identity(10);
+    assert!(
+        store
+            .checkpoint_attachment_partial(&job, &identity, 0, b"abc", 12, 100)
+            .unwrap()
+    );
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO attachment_partial_chunk(token,offset,bytes,digest) VALUES(?1,1,?2,?3)",
+            params![job.reference.token, b"bc", Sha256::digest(b"bc").as_slice()],
+        )
+        .unwrap();
+    assert!(
+        store
+            .load_attachment_partial_to_writer(
+                &job,
+                12,
+                100,
+                (&identity.ciphertext_digest, &identity.locator_digest),
+                &mut std::io::sink(),
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(partial_usage(&store), 0);
+}
+
+#[test]
+fn held_partial_restore_allows_account_read_and_removal_without_publishing_bytes() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "held-restore");
+    let asset = request(&store, "held-restore");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    let identity = partial_identity(BODY.len() as u64);
+    assert!(
+        store
+            .checkpoint_attachment_partial(&job, &identity, 0, BODY, 12, 10000)
+            .unwrap()
+    );
+    let (entered, waiting) = std::sync::mpsc::channel();
+    let (release, resume) = std::sync::mpsc::channel();
+    let worker_store = store.clone();
+    let restore = std::thread::spawn(move || {
+        let mut writer = HeldWriter {
+            bytes: Vec::new(),
+            entered: Some(entered),
+            release: resume,
+        };
+        let loaded = worker_store
+            .load_attachment_partial_to_writer(
+                &job,
+                12,
+                10000,
+                (&identity.ciphertext_digest, &identity.locator_digest),
+                &mut writer,
+            )
+            .unwrap();
+        let published = worker_store
+            .complete_attachment_acquisition(&job, &writer.bytes, 12, 10000)
+            .unwrap();
+        (loaded, published)
+    });
+    waiting
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let probe_store = store.clone();
+    let (finished, done) = std::sync::mpsc::channel();
+    let probe = std::thread::spawn(move || {
+        assert!(count(&probe_store, "account_groups") > 0);
+        assert!(
+            probe_store
+                .remove_local_attachment(GROUP, "held-restore", 0)
+                .unwrap()
+        );
+        finished.send(()).unwrap();
+    });
+    let progressed = done.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
+    release.send(()).unwrap();
+    let (loaded, published) = restore.join().unwrap();
+    probe.join().unwrap();
+    assert!(
+        progressed,
+        "account read and removal must finish before the writer resumes"
+    );
+    assert!(
+        loaded.is_none(),
+        "removed checkpoint must not finish restore"
+    );
+    assert_eq!(published, AttachmentPublishResult::Superseded);
+    assert!(
+        store
+            .read_retained_attachment(&asset, 12, 0, 100)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(count(&store, "attachment_partial_chunk"), 0);
+}
+
+#[test]
+fn held_file_import_rejects_lease_elapsed_during_reader_io() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "elapsed-import");
+    let asset = request(&store, "elapsed-import");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 13)
+        .unwrap()
+        .unwrap();
+    let (entered, waiting) = std::sync::mpsc::channel();
+    let (release, resume) = std::sync::mpsc::channel();
+    let worker_store = store.clone();
+    let import = std::thread::spawn(move || {
+        let mut reader = HeldReader {
+            reader: Cursor::new(BODY.to_vec()),
+            entered: Some(entered),
+            release: resume,
+            hold_at: 0,
+        };
+        worker_store
+            .complete_attachment_acquisition_from_reader(
+                &job,
+                &mut reader,
+                BODY.len() as u64,
+                12,
+                10000,
+                &|| false,
+            )
+            .unwrap()
+    });
+    waiting
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    // Exercise the existing timestamp API: caller I/O, not maintenance or a
+    // replacement attempt, carries the import across its one-second lease.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    release.send(()).unwrap();
+    assert_eq!(import.join().unwrap(), AttachmentPublishResult::Superseded);
+    assert!(
+        store
+            .read_retained_attachment(&asset, 13, 0, 100)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(usage(&store), 0);
+    assert_eq!(count(&store, "retained_attachment_files"), 0);
+    assert_eq!(count(&store, "retained_attachment_chunks"), 0);
+    assert_eq!(count(&store, "attachment_chunk_bodies"), 0);
+}
+
+fn held_file_import_deadline_control(source_expiry: bool, hold_at: u64, finish_time: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "expired-import");
+    let asset = request(&store, "expired-import");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, if source_expiry { 100 } else { 13 })
+        .unwrap()
+        .unwrap();
+    if source_expiry {
+        sql(&store, "UPDATE attachment_acquisition SET expires_at=13");
+    }
+    let clock = std::sync::Arc::new(AtomicU64::new(12));
+    let worker_clock = clock.clone();
+    let (entered, waiting) = std::sync::mpsc::channel();
+    let (release, resume) = std::sync::mpsc::channel();
+    let worker_store = store.clone();
+    let import = std::thread::spawn(move || {
+        let mut reader = HeldReader {
+            reader: Cursor::new(BODY.to_vec()),
+            entered: Some(entered),
+            release: resume,
+            hold_at,
+        };
+        worker_store
+            .complete_attachment_acquisition_from_reader_with_clock(
+                &job,
+                &mut reader,
+                BODY.len() as u64,
+                &|| worker_clock.load(Ordering::SeqCst),
+                10000,
+                &|| false,
+            )
+            .unwrap()
+    });
+    waiting
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(count(&store, "retained_attachment_chunks") > 0, hold_at > 0);
+    // No maintenance or replacement: the exact deadline alone invalidates the
+    // chunk/final gate, while a constant valid clock remains a positive control.
+    clock.store(finish_time, Ordering::SeqCst);
+    release.send(()).unwrap();
+    let outcome = import.join().unwrap();
+    if finish_time == 12 {
+        assert_eq!(outcome, AttachmentPublishResult::Published);
+        assert_eq!(read(&store, &asset), BODY);
+        assert_eq!(usage(&store), BODY.len() as u64);
+    } else {
+        assert_eq!(outcome, AttachmentPublishResult::Superseded);
+        assert!(
+            store
+                .read_retained_attachment(&asset, finish_time, 0, 100)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(usage(&store), 0);
+        assert_eq!(count(&store, "retained_attachment_files"), 0);
+        assert_eq!(count(&store, "retained_attachment_chunks"), 0);
+        assert_eq!(count(&store, "attachment_chunk_bodies"), 0);
+    }
+}
+
+#[test]
+fn held_file_import_rejects_source_expiry_during_eof_io() {
+    held_file_import_deadline_control(true, BODY.len() as u64, 13);
+}
+
+#[test]
+fn held_file_import_rejects_source_expiry_before_chunk_commit() {
+    held_file_import_deadline_control(true, 0, 13);
+}
+
+#[test]
+fn held_file_import_rejects_lease_expiry_during_eof_io() {
+    held_file_import_deadline_control(false, BODY.len() as u64, 13);
+}
+
+#[test]
+fn held_file_import_rejects_lease_expiry_before_chunk_commit() {
+    held_file_import_deadline_control(false, 0, 13);
+}
+
+#[test]
+fn held_file_import_publishes_with_valid_clock() {
+    held_file_import_deadline_control(true, BODY.len() as u64, 12);
+    held_file_import_deadline_control(false, 0, 12);
+}
+
 #[test]
 fn held_file_import_allows_account_read_and_removal_without_publishing_bytes() {
     let store = SqliteAccountStorage::in_memory().unwrap();
