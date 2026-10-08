@@ -41,6 +41,22 @@ pub(super) fn file_upload_timeout(body_len: u64) -> Duration {
     ))
 }
 
+pub(super) async fn file_upload_idle_timeout(
+    mut progress: tokio::sync::watch::Receiver<()>,
+) -> AppError {
+    // Connection/setup remains bounded by the request deadline. Start the
+    // body-idle clock only after the first non-empty chunk is consumed.
+    if progress.changed().await.is_err() {
+        return AppError::MediaUploadTimedOut;
+    }
+    loop {
+        match tokio::time::timeout(BODY_IDLE_TIMEOUT, progress.changed()).await {
+            Ok(Ok(())) => {}
+            _ => return AppError::MediaUploadTimedOut,
+        }
+    }
+}
+
 /// A candidate that cannot resolve, connect, return headers, and yield its first
 /// body bytes within this bound gives the next ordered locator a chance. The
 /// candidate transfer deadline and read-idle timeout govern an active body.
@@ -433,7 +449,7 @@ pub(crate) async fn upload_blossom_file(
     let mut sent = 0u64;
     let total = file.len;
     let progress = control.clone();
-    let (upload_progress, mut upload_observer) = tokio::sync::watch::channel(());
+    let (upload_progress, upload_observer) = tokio::sync::watch::channel(());
     let stream_progress = upload_progress.clone();
     let stream = tokio_util::io::ReaderStream::with_capacity(
         reader,
@@ -448,25 +464,17 @@ pub(crate) async fn upload_blossom_file(
             ))
         } else {
             progress.advance(total.saturating_mul(2).saturating_add(sent));
-            stream_progress.send_replace(());
+            if !chunk.is_empty() {
+                stream_progress.send_replace(());
+            }
             Ok(chunk)
         };
         futures::future::ready(result)
     });
     let body = reqwest::Body::wrap_stream(stream);
     let hash = hex::encode(file.digest);
-    let idle = async {
-        loop {
-            if tokio::time::timeout(BODY_IDLE_TIMEOUT, upload_observer.changed())
-                .await
-                .is_err()
-            {
-                return Err(AppError::MediaUploadTimedOut);
-            }
-        }
-    };
     let result = tokio::select! {
-        result = idle => result,
+        error = file_upload_idle_timeout(upload_observer) => Err(error),
         result = upload_blossom_body(server, body, file.len, &hash, signer, transport,
             BLOSSOM_UPLOAD_CONTENT_TYPE, None, true) => result,
         () = control.cancelled() => {

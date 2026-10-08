@@ -2622,7 +2622,6 @@ dependencies = [
 [[package]]
 name = "hpke-rs-libcrux"
 version = "0.7.0"
-
 dependencies = [
  "hpke-rs-crypto",
  "libcrux-aead",

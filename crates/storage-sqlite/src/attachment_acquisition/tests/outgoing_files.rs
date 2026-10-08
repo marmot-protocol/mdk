@@ -250,9 +250,13 @@ fn generated_758_mb_reader_retention_is_available_above_legacy_array_limit() {
     struct Generated {
         remaining: u64,
         largest: usize,
+        started: Option<std::sync::mpsc::Sender<()>>,
     }
     impl Read for Generated {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(started) = self.started.take() {
+                started.send(()).unwrap();
+            }
             self.largest = self.largest.max(buf.len());
             let take = self.remaining.min(buf.len() as u64) as usize;
             buf[..take].fill(0x37);
@@ -260,10 +264,22 @@ fn generated_758_mb_reader_retention_is_available_above_legacy_array_limit() {
             Ok(take)
         }
     }
+    let (started, importing) = std::sync::mpsc::channel();
+    let probe = store.clone();
+    let account_read = std::thread::spawn(move || {
+        importing
+            .recv_timeout(std::time::Duration::from_secs(180))
+            .unwrap();
+        let start = std::time::Instant::now();
+        assert!(count(&probe, "account_groups") > 0);
+        start.elapsed()
+    });
     let mut reader = Generated {
         remaining: LEN,
         largest: 0,
+        started: Some(started),
     };
+    let import_started = std::time::Instant::now();
     assert_eq!(
         store
             .complete_attachment_acquisition_from_reader(
@@ -276,6 +292,13 @@ fn generated_758_mb_reader_retention_is_available_above_legacy_array_limit() {
             )
             .unwrap(),
         AttachmentPublishResult::Published
+    );
+    let import_time = import_started.elapsed();
+    let account_read_wait = account_read.join().unwrap();
+    println!(
+        "large_retention_measurement bytes={LEN} import_ms={} concurrent_account_read_wait_ms={}",
+        import_time.as_millis(),
+        account_read_wait.as_millis()
     );
     assert!(reader.largest <= ATTACHMENT_STAGING_CHUNK_BYTES);
     assert_eq!(usage(&store), LEN);

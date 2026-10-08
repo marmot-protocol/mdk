@@ -3373,3 +3373,31 @@ fn large_file_upload_deadline_allows_progress_at_mobile_upload_rates() {
     );
     assert!(super::blossom::file_upload_timeout(900 * 1024 * 1024) >= Duration::from_secs(3600));
 }
+
+#[tokio::test(start_paused = true)]
+async fn file_upload_idle_watchdog_allows_setup_then_rejects_a_stalled_body() {
+    let (progress, observer) = tokio::sync::watch::channel(());
+    let watchdog = tokio::spawn(super::blossom::file_upload_idle_timeout(observer));
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(31)).await;
+    assert!(
+        !watchdog.is_finished(),
+        "setup must use the request deadline"
+    );
+    progress.send_replace(());
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(29)).await;
+    assert!(!watchdog.is_finished());
+    progress.send_replace(());
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(29)).await;
+    assert!(
+        !watchdog.is_finished(),
+        "body progress resets the idle clock"
+    );
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(matches!(
+        watchdog.await.unwrap(),
+        AppError::MediaUploadTimedOut
+    ));
+}
