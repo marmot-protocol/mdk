@@ -17,6 +17,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   headers/libraries; the row layout and comparison signature change. Identical-text
   saves emit a replacement snapshot because their draft revision changes. See the
   shared chat-list contract.
+- Append `MarmotMarkdownInline::Timestamp` with signed `int64_t` Unix seconds
+  and `MarmotMarkdownTimestampStyle` for local-time timestamp display nodes.
+  Existing inline discriminants are unchanged; the new payload owns no
+  allocations. Recompile consumers against the regenerated `marmot.h` and ship
+  the matching library; older headers cannot handle the new tag. Hosts format
+  labels with the device locale/time zone and refresh visible relative labels.
 - Add `marmot_message_reactions` and the owned
   `MarmotTimelineUserReactionList` root/free for complete exact-message details.
   Existing record layouts are unchanged; the new symbols require matching
