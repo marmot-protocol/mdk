@@ -676,21 +676,60 @@ impl AppClient {
             .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))
     }
 
-    pub(crate) fn cleanup_stale_push_tokens_best_effort(&self, group_id: &GroupId) {
-        let Ok(account) = self.app.account_home().account(&self.state.label) else {
-            return;
-        };
-        let Ok(members) = self.runtime.members(group_id) else {
-            return;
-        };
-        let active_members = members
-            .into_iter()
-            .map(|member| hex::encode(member.id.as_slice()))
+    pub(crate) fn cleanup_stale_push_tokens_best_effort(&mut self, group_id: &GroupId) {
+        match self.reconcile_push_token_leaves(group_id) {
+            Ok(()) => {
+                self.pending_push_leaf_reconciliations.remove(group_id);
+            }
+            Err(_) => {
+                self.pending_push_leaf_reconciliations
+                    .insert(group_id.clone());
+                tracing::warn!(target: "marmot_app::push",
+                    method = "cleanup_stale_push_tokens_best_effort",
+                    error_code = "leaf_reconciliation_failed",
+                    "retained canonical push reconciliation for retry");
+            }
+        }
+    }
+
+    /// Read current membership again on retry; never turn an unavailable tree
+    /// into an empty roster or apply a roster captured before a later join.
+    fn reconcile_push_token_leaves(&self, group_id: &GroupId) -> Result<(), AppError> {
+        let record = self.runtime.group_record(group_id)?;
+        if record.removed || record.disbanded.is_some() {
+            return Ok(());
+        }
+        let membership = self
+            .runtime
+            .session()
+            .canonical_group_membership(group_id)?;
+        self.app.reconcile_group_push_token_leaves(
+            &self.state.label,
+            &hex::encode(group_id.as_slice()),
+            &membership.member_leaves,
+        )?;
+        Ok(())
+    }
+
+    /// Retry only groups whose earlier canonical sweep failed.
+    pub(crate) fn retry_pending_push_leaf_reconciliations(&mut self) -> Result<(), AppError> {
+        let groups = self
+            .pending_push_leaf_reconciliations
+            .iter()
+            .cloned()
             .collect::<Vec<_>>();
-        let group_id_hex = hex::encode(group_id.as_slice());
-        let _ =
-            self.app
-                .remove_stale_group_push_tokens(&account.label, &group_id_hex, &active_members);
+        let mut first_error = None;
+        for group_id in groups {
+            match self.reconcile_push_token_leaves(&group_id) {
+                Ok(()) => {
+                    self.pending_push_leaf_reconciliations.remove(&group_id);
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 }
 

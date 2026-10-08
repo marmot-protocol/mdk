@@ -107,17 +107,6 @@ pub(crate) fn hydration_quarantine_group_digest(group_id: &GroupId) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// OpenMLS-backed CGKA engine. Construct via [`EngineBuilder`].
-/// A group-state change effected by a locally staged commit, buffered until
-/// publish confirmation merges that commit. `actor` attributes the change: for
-/// our own invite/remove/profile commits it is the local member; for an
-/// auto-committed peer SelfRemove it is the leaving member, not us.
-#[derive(Clone)]
-pub(crate) struct PendingGroupStateChange {
-    pub(crate) actor: Option<MemberId>,
-    pub(crate) change: GroupStateChange,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct ScheduledSelfRemoveAutoCommit {
     pub(crate) group_id: GroupId,
@@ -126,6 +115,8 @@ pub(crate) struct ScheduledSelfRemoveAutoCommit {
     pub(crate) due_at_ms: u64,
 }
 
+/// Coordinates authenticated group evolution, durable replay and native events
+/// over the caller-provided storage backend and transport peeler.
 pub struct Engine<S: StorageProvider> {
     pub(crate) storage: S,
     pub(crate) crypto: RustCrypto,
@@ -164,13 +155,6 @@ pub struct Engine<S: StorageProvider> {
     /// internal signal lets the account scheduler reset its quiet window
     /// without exposing proposals as user-visible group events.
     pub(crate) valid_proposal_groups: HashSet<GroupId>,
-    /// Group-state changes effected by a locally staged commit, with the actor
-    /// to attribute each to. Buffered here because publish-before-apply defers
-    /// the OpenMLS merge: the `GroupEvent::GroupStateChanged` events are emitted
-    /// in `do_confirm_published`, once the pending commit is actually merged,
-    /// and dropped in `do_publish_failed`.
-    pub(crate) pending_state_changes: HashMap<PendingStateRef, Vec<PendingGroupStateChange>>,
-
     /// MessageIds the engine has ingested. Backs the typed duplicate exclusion.
     ///
     /// Bounded hot-process cache behind storage-backed duplicate evidence:
@@ -214,6 +198,11 @@ pub struct Engine<S: StorageProvider> {
     /// SelfRemove auto-commit schedule) rather than returned as
     /// `IngestOutcome::Buffered`.
     pub(crate) pending_convergence_groups: HashSet<GroupId>,
+
+    /// Session-only retries for inbound replay that failed after durable
+    /// publish confirmation. The input rows remain durable; this marker
+    /// avoids scanning every group on ordinary convergence advancement.
+    pub(crate) pending_confirmation_replays: HashSet<GroupId>,
 
     /// Queued intents regenerated into standalone publish work. The session
     /// reads these associations when it builds `PublishWork`, then deletes
@@ -631,7 +620,6 @@ impl<S: StorageProvider> EngineBuilder<S> {
             auto_publish_buf: VecDeque::new(),
             auto_proposal_buf: VecDeque::new(),
             valid_proposal_groups: HashSet::new(),
-            pending_state_changes: HashMap::new(),
             seen_message_ids: BoundedIdSet::with_capacity(DEDUP_CACHE_CAPACITY),
             retryable_unpersisted_ingest_id: None,
             last_ingest_left_object_unpersisted: false,
@@ -640,6 +628,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             leaving_groups: HashSet::new(),
             scheduled_self_remove_auto_commits: HashMap::new(),
             pending_convergence_groups: HashSet::new(),
+            pending_confirmation_replays: HashSet::new(),
             queued_intent_by_message: HashMap::new(),
             queued_intent_by_pending: HashMap::new(),
             // Keep the in-memory app-message window aligned with MLS
@@ -1656,9 +1645,10 @@ impl<S: StorageProvider> Engine<S> {
     ///
     /// A settle commits the guard durably, but the live `GroupDisbanded` it
     /// emits only reaches the application through a later drain that can drop
-    /// the whole batch without a crash — `observe_drained_session_events` runs
-    /// `fail_if_publish_failed(effects)?` before it projects any event. A
-    /// settle-time marker could therefore suppress an announcement the
+    /// the whole batch on a projection failure or process death. App-side
+    /// session retries preserve drained batches after unrelated publish failures,
+    /// but do not durably acknowledge native state events. A settle-time marker
+    /// could therefore suppress an announcement the
     /// application never received. Marking at replay time instead guarantees
     /// live delivery plus exactly one belt-and-braces replay, then silence.
     ///
@@ -1668,8 +1658,8 @@ impl<S: StorageProvider> Engine<S> {
     /// *account open* — before any drain exists to consume the event it
     /// announces. The window in which the replay can be lost is therefore
     /// `[account open, first successful drained projection]`: it spans app
-    /// startup, and **one** process death (or one drained batch that fails its
-    /// publish gate) is enough to close it with the event unprojected. That is
+    /// startup, and **one** process death is enough to close it with the event
+    /// unprojected. That is
     /// wider than a same-drain window, which is exactly why the consequences
     /// below have to be reconciled from durable state rather than from this
     /// event.
@@ -3102,6 +3092,7 @@ impl<S: StorageProvider> Engine<S> {
             .retain(|_, group| group != group_id);
         self.route_backfill_pending.remove(group_id);
         self.pending_convergence_groups.remove(group_id);
+        self.pending_confirmation_replays.remove(group_id);
         self.unhydrated_groups.remove(group_id);
         self.quarantined_groups.remove(group_id);
         self.leaving_groups.remove(group_id);
@@ -3119,8 +3110,6 @@ impl<S: StorageProvider> Engine<S> {
             .retain(|_, (group, _)| group != group_id);
         self.pending_origin_commits
             .retain(|reference, _| !pending.contains(reference));
-        self.pending_state_changes
-            .retain(|reference, _| !pending.contains(reference));
         self.auto_publish_buf
             .retain(|work| !pending.contains(&work.pending));
         self.auto_proposal_buf.retain(|message| {
@@ -3129,7 +3118,14 @@ impl<S: StorageProvider> Engine<S> {
                 if routes.contains(transport_group_id) || transport_group_id == group_id.as_slice())
         });
         self.events_buf.retain(|event| match event {
-            GroupEvent::GroupCreated { group_id: group }
+            GroupEvent::LocalGroupCopyTerminated {
+                group_id: group, ..
+            }
+            | GroupEvent::LocalGroupCopyRestored { group_id: group }
+            | GroupEvent::GroupMemberLeavesRemoved {
+                group_id: group, ..
+            }
+            | GroupEvent::GroupCreated { group_id: group }
             | GroupEvent::GroupJoined {
                 group_id: group, ..
             }

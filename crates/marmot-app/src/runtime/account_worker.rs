@@ -1363,7 +1363,7 @@ async fn run_app_runtime_account_worker(
                                     ));
                                 }
                             },
-                            received = client.receive_next_delivery() => {
+                            received = client.receive_next_delivery(), if !client.has_pending_effect_projections() => {
                                 match received {
                                     Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(delivery)) => {
                                         // Once claimed, finish engine ingest and projection
@@ -1789,14 +1789,14 @@ async fn run_app_runtime_account_worker(
                 None => Ok(true),
             };
             if !matches!(turn, Ok(false)) {
-                let job = comparison_recovery
+                let mut job = comparison_recovery
                     .take()
                     .expect("settling comparison exists");
                 let result = match (turn, job.failure) {
                     (Err(error), _) | (_, Some(error)) => Err(client.fail_comparison_grant(
                         job.grant,
                         job.execution,
-                        job.admission.as_ref(),
+                        job.admission.as_mut(),
                         error,
                     )),
                     _ if job.abandoned => client.abandon_comparison_grant(job.grant, job.execution),
@@ -2225,7 +2225,7 @@ async fn run_app_runtime_account_worker(
                     phase.finish(TelemetryOutcome::Success);
                 }
             }
-            received = client.receive_next_delivery() => {
+            received = client.receive_next_delivery(), if !client.has_pending_effect_projections() => {
                 #[cfg(test)]
                 if let Ok(crate::relay_plane::AccountDeliveryReceive::Delivery(delivery)) = &received
                     && let (Ok(event_id), Some(subscription_id)) = (
@@ -2381,6 +2381,15 @@ async fn run_app_runtime_account_worker(
                             &account_label,
                             account_error_message("runtime receive failed", &err),
                         );
+                        if client.arm_failed_receive_projection_retry() {
+                            // Reopening cannot reconstruct consumed activity events
+                            // or the output of a batch awaiting its state checkpoint.
+                            // Keep the owning client for the bounded projection retry.
+                            scheduled_runtime_group_subscription_refresh.observe_pending(
+                                true, &command_tx,
+                            );
+                            continue 'worker;
+                        }
                         // The account-session ownership guard is held by
                         // `AppClient`. Destroy the failed engine before the
                         // backoff as well as before hydrating its replacement;
@@ -9569,6 +9578,32 @@ mod tests {
             .may_change_push_registration_work(),
             "unrelated convergence commands must not arm push maintenance"
         );
+    }
+
+    /// A runnable retained replay wakes once; failures use bounded error
+    /// backoff rather than repeatedly rearming the short Ready deadline.
+    #[tokio::test(start_paused = true)]
+    async fn ready_replay_timer_backs_off_and_disarms_after_success() {
+        let group = test_group_id(42);
+        let mut scheduled = ScheduledConvergence::new(Duration::ZERO);
+        scheduled.schedule_after_pass(&group, ConvergenceScheduleState::Ready);
+        for delay in [
+            MIN_CONVERGENCE_SETTLEMENT_DELAY,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        ] {
+            assert_eq!(scheduled.timer.deadline() - TokioInstant::now(), delay);
+            tokio::time::advance(delay - Duration::from_millis(1)).await;
+            assert!(!scheduled.timer.is_elapsed());
+            tokio::time::advance(Duration::from_millis(1)).await;
+            scheduled.timer.as_mut().await;
+            assert_eq!(scheduled.take_ready(), Some(group.clone()));
+            scheduled.schedule_retry_groups([group.clone()]);
+        }
+        scheduled.schedule_after_pass(&group, ConvergenceScheduleState::Idle);
+        assert!(scheduled.deadlines.is_empty());
+        assert!(scheduled.retry_attempts.is_empty());
+        assert_eq!(scheduled.take_ready(), None);
     }
 
     #[tokio::test]

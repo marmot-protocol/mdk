@@ -31,6 +31,14 @@
   retained bodies and ciphertext checkpoints while widening file-backed
   representation bounds, without increasing user quotas. (#2175)
 
+### Fixed
+
+- Canonical push-token reconciliation removes absent account/device-leaf pairs
+  atomically with departed-account tombstones. A surviving sibling retains its
+  destinations and anti-resurrection tombstones; other groups are untouched.
+  Roster membership is materialized once per deletion statement instead of
+  rescanning the JSON roster for every stored destination.
+
 ## 0.12.0 - 2026-10-02
 
 Account storage advances from migration 98 through 101 on first open; downgrade

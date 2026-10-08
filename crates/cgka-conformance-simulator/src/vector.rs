@@ -972,6 +972,10 @@ pub struct ClientObservation {
     pub received_payloads: Vec<String>,
     #[serde(default)]
     pub added_members: Vec<String>,
+    /// Additions in this event window withdrawn by the final verdict for their origin commit.
+    /// Raw additions and removals remain unchanged; withdrawal is not a new removal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub withdrawn_added_members: Vec<String>,
     pub removed_members: Vec<String>,
     #[serde(default)]
     pub epoch_changes: Vec<EpochChangeObservation>,
@@ -1203,6 +1207,7 @@ pub fn observe_client(label: impl Into<String>, client: &mut HarnessClient) -> C
                 _ => None,
             })
             .collect(),
+        withdrawn_added_members: withdrawn_added_members(&events),
         added_members: events
             .iter()
             .filter_map(|e| match e {
@@ -1244,6 +1249,39 @@ pub fn observe_client(label: impl Into<String>, client: &mut HarnessClient) -> C
             .filter_map(observe_convergence_decision)
             .collect(),
     }
+}
+
+/// Project withdrawals without inventing a member-removal activity on the winning branch.
+fn withdrawn_added_members(events: &[GroupEvent]) -> Vec<String> {
+    let mut withdrawn = std::collections::HashSet::new();
+    for event in events {
+        match event {
+            GroupEvent::GroupStateInvalidated {
+                invalidated_commit_id,
+                ..
+            } => {
+                withdrawn.insert(invalidated_commit_id);
+            }
+            GroupEvent::GroupStateRevalidated {
+                revalidated_commit_id,
+                ..
+            } => {
+                withdrawn.remove(revalidated_commit_id);
+            }
+            _ => {}
+        }
+    }
+    events
+        .iter()
+        .filter_map(|event| match event {
+            GroupEvent::GroupStateChanged {
+                change: GroupStateChange::MemberAdded { member },
+                origin_commit_id: Some(origin),
+                ..
+            } if withdrawn.contains(origin) => Some(observe_member_id(member.as_slice())),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Capture the normal application/event observation plus the adopted exact
@@ -1307,6 +1345,7 @@ mod tests {
             event_counts: ClientEventCounts::default(),
             received_payloads: Vec::new(),
             added_members: Vec::new(),
+            withdrawn_added_members: Vec::new(),
             removed_members: Vec::new(),
             epoch_changes: Vec::new(),
             app_invalidations: Vec::new(),
@@ -1968,6 +2007,43 @@ mod tests {
         );
 
         assert!(failures.is_empty(), "unexpected failures: {failures:#?}");
+    }
+
+    #[test]
+    fn member_activity_withdrawal_tracks_origin_and_last_verdict() {
+        use cgka_traits::engine::GroupStateInvalidationReason;
+        use cgka_traits::{EpochId, GroupId, MemberId, MessageId};
+        let group_id = GroupId::new(vec![1]);
+        let origin = MessageId::new(vec![2]);
+        let mut events = vec![GroupEvent::GroupStateChanged {
+            group_id: group_id.clone(),
+            epoch: EpochId(2),
+            actor: Some(MemberId::new(vec![3])),
+            change: GroupStateChange::MemberAdded {
+                member: MemberId::new(b"eve".to_vec()),
+            },
+            origin_commit_id: Some(origin.clone()),
+        }];
+        events.push(GroupEvent::GroupStateInvalidated {
+            group_id: group_id.clone(),
+            epoch: EpochId(1),
+            invalidated_commit_id: MessageId::new(vec![4]),
+            reason: GroupStateInvalidationReason::SupersededByBranchSelection,
+        });
+        assert!(withdrawn_added_members(&events).is_empty());
+        events.push(GroupEvent::GroupStateInvalidated {
+            group_id: group_id.clone(),
+            epoch: EpochId(1),
+            invalidated_commit_id: origin.clone(),
+            reason: GroupStateInvalidationReason::SupersededByBranchSelection,
+        });
+        assert_eq!(withdrawn_added_members(&events), vec!["eve"]);
+        events.push(GroupEvent::GroupStateRevalidated {
+            group_id,
+            epoch: EpochId(1),
+            revalidated_commit_id: origin,
+        });
+        assert!(withdrawn_added_members(&events).is_empty());
     }
 
     #[test]
