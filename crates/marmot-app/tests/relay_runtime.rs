@@ -559,6 +559,21 @@ async fn mock_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
     (relay, app, url)
 }
 
+async fn sync_to_epoch(client: &mut marmot_app::AppClient, group: &GroupId, epoch: u64) {
+    timeout(Duration::from_secs(20), async {
+        loop {
+            client.sync().await.unwrap();
+            client.retry_group_convergence(group).await.unwrap();
+            if client.group_mls_state(group).unwrap().epoch >= epoch {
+                return;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("recipient did not settle the committed group epoch");
+}
+
 async fn mock_audit_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
     let (relay, url) = mock_relay().await;
     let app = MarmotApp::try_with_relays_and_account_home_and_config(
@@ -9102,7 +9117,12 @@ async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext
     assert_eq!(bob_reference.source_epoch, reference.source_epoch);
 
     alice.update_message_retention(&group_id, 60).await.unwrap();
-    bob.sync().await.unwrap();
+    sync_to_epoch(
+        &mut bob,
+        &group_id,
+        alice.group_mls_state(&group_id).unwrap().epoch,
+    )
+    .await;
     let later_epoch_download = bob
         .download_media(&group_id, reference.clone())
         .await
@@ -9343,7 +9363,12 @@ async fn encrypted_media_endpoint_updates_are_full_replacement_and_admin_only() 
         )
         .await
         .unwrap();
-    bob.sync().await.unwrap();
+    sync_to_epoch(
+        &mut bob,
+        &group_id,
+        alice.group_mls_state(&group_id).unwrap().epoch,
+    )
+    .await;
 
     let bob_group = app.group("bob", &group_id_hex).unwrap().unwrap();
     assert_eq!(
