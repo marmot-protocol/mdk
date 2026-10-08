@@ -394,6 +394,14 @@ jobs:
       - name: Install Rust toolchain
         run: |
           set -euo pipefail
+          cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          export PATH="$cargo_bin:$PATH"
+          echo "$cargo_bin" >> "$GITHUB_PATH"
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+              https://sh.rustup.rs --output "$RUNNER_TEMP/rustup-init.sh"
+            sh "$RUNNER_TEMP/rustup-init.sh" -y --default-toolchain none --no-modify-path
+          fi
           toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
           rustup toolchain install "$toolchain" --profile minimal
           rustup default "$toolchain"
@@ -455,6 +463,14 @@ jobs:
       - name: Install Rust toolchain
         run: |
           set -euo pipefail
+          cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          export PATH="$cargo_bin:$PATH"
+          echo "$cargo_bin" >> "$GITHUB_PATH"
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+              https://sh.rustup.rs --output "$RUNNER_TEMP/rustup-init.sh"
+            sh "$RUNNER_TEMP/rustup-init.sh" -y --default-toolchain none --no-modify-path
+          fi
           toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
           rustup toolchain install "$toolchain" --profile minimal
           rustup default "$toolchain"
@@ -493,6 +509,14 @@ jobs:
       - name: Install Rust toolchain
         run: |
           set -euo pipefail
+          cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          export PATH="$cargo_bin:$PATH"
+          echo "$cargo_bin" >> "$GITHUB_PATH"
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+              https://sh.rustup.rs --output "$RUNNER_TEMP/rustup-init.sh"
+            sh "$RUNNER_TEMP/rustup-init.sh" -y --default-toolchain none --no-modify-path
+          fi
           toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
           rustup toolchain install "$toolchain" --profile minimal
           rustup default "$toolchain"
