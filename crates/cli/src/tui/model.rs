@@ -2877,9 +2877,8 @@ pub(crate) fn group_system_summary(value: &Value, plaintext: &str) -> Option<Str
     let content: Value = serde_json::from_str(plaintext).ok()?;
     let system_type = content.get("system_type").and_then(Value::as_str)?;
     let data = content.get("data");
-    // `actor` is absent for unattributed changes (e.g. a convergence reorg,
-    // where the committer isn't resolved). Render the passive voice then rather
-    // than implying an unknown actor performed the action.
+    // Older unattributed activity has no `actor`. Render passive voice when
+    // attribution is unavailable; canonical commit activity carries its actor.
     let actor = non_empty_value_string(value, "from_display_name").or_else(|| {
         value_string(value, "from")
             .filter(|from| !from.is_empty())

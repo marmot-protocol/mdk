@@ -637,7 +637,10 @@ fn normalized_relay_hint_duplicates_are_deduplicated_before_verification_and_app
     app.ingest_push_gossip_message(
         "alice",
         &message,
-        std::slice::from_ref(&owner_id),
+        &[cgka_traits::engine::GroupMemberLeaf {
+            member: cgka_traits::MemberId::new(owner.public_key().to_bytes().to_vec()),
+            leaf_index: 1,
+        }],
         ProtocolProfile::Current,
     )
     .unwrap();
@@ -753,7 +756,10 @@ fn mixed_entry_permutations_apply_the_same_valid_winner() {
         app.ingest_push_gossip_message(
             "alice",
             &message,
-            std::slice::from_ref(&owner_id),
+            &[cgka_traits::engine::GroupMemberLeaf {
+                member: cgka_traits::MemberId::new(owner.public_key().to_bytes().to_vec()),
+                leaf_index: 1,
+            }],
             ProtocolProfile::Current,
         )
         .unwrap();

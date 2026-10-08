@@ -186,6 +186,7 @@ impl ScriptedConvergenceDrain {
             lifecycle: cgka_traits::engine_state::GroupLifecycleState::Stable,
             pending_work,
             deferred_peel_completed_context_attempts: 0,
+            confirmation_replay_completed_rows: 0,
             pass_generation: Some(self.generation),
             pass_phase: Some(ConvergencePassPhase::Resolving),
             earliest_next_wake_monotonic_ms: None,
@@ -366,8 +367,8 @@ fn merge_histogram(target: &mut HistogramSnapshot, source: &HistogramSnapshot) {
 
 /// Rejects only an exact full-slice repeat of scheduled structural state.
 ///
-/// A durable pass-generation or retained-row context-attempt change counts as
-/// progress. More complex cycles
+/// A durable pass-generation, retained-row context-attempt, or process-local
+/// confirmation replay completion change counts as progress. More complex cycles
 /// remain the scenario fixed-point driver's responsibility; this local guard
 /// exists to catch a scheduler that repeatedly re-arms the same state without
 /// turning the per-tick work bound into a convergence deadline.
@@ -388,11 +389,11 @@ fn ensure_convergence_drain_progress(
     Ok(())
 }
 
-/// Projects a snapshot onto durable fields that are stable across clocks.
+/// Projects a snapshot onto work-state fields that are stable across clocks.
 ///
 /// Clock readings, derived wake/runnable values, and the one-shot schedule
 /// edge are observations of when work runs, not whether the drain changed its
-/// durable state.
+/// durable state or process-local confirmation replay cursor.
 fn convergence_drain_progress_key(
     snapshot: &ConformanceStructuralProgressSnapshot,
 ) -> ConvergenceDrainProgressKey {
@@ -403,19 +404,21 @@ fn convergence_drain_progress_key(
         lifecycle: snapshot.lifecycle,
         pending_work,
         deferred_peel_completed_context_attempts: snapshot.deferred_peel_completed_context_attempts,
+        confirmation_replay_completed_rows: snapshot.confirmation_replay_completed_rows,
         pass_generation: snapshot.pass_generation,
         pass_phase: snapshot.pass_phase,
         terminal_unrecoverable: snapshot.terminal_unrecoverable,
     }
 }
 
-/// Durable convergence state used by the local no-progress guard.
+/// Durable convergence state and replay completion used by the local no-progress guard.
 #[derive(PartialEq, Eq)]
 struct ConvergenceDrainProgressKey {
     current_epoch: u64,
     lifecycle: cgka_traits::engine_state::GroupLifecycleState,
     pending_work: cgka_engine::conformance_snapshot::ConformancePendingWorkSnapshot,
     deferred_peel_completed_context_attempts: u64,
+    confirmation_replay_completed_rows: usize,
     pass_generation: Option<u64>,
     pass_phase: Option<ConvergencePassPhase>,
     terminal_unrecoverable: bool,
@@ -580,6 +583,155 @@ mod tests {
             &current,
         )
         .expect_err("retained rows without new attempts still cannot spin");
+    }
+
+    /// Confirmation replay visits opaque rows without durable disposition changes.
+    #[tokio::test]
+    async fn opaque_replay_keeps_progress() {
+        use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
+        use cgka_traits::transport::{Timestamp, TransportSource};
+
+        // The peeler models opaque ciphertext, not scheduler output. All
+        // replay, snapshots, scheduling and guard assessment use the real engine.
+        struct OpaquePeeler(NostrMlsPeeler);
+        #[async_trait::async_trait]
+        impl TransportPeeler for OpaquePeeler {
+            async fn peel_group_message(
+                &self,
+                _: &TransportMessage,
+                _: &GroupContextSnapshot,
+            ) -> Result<PeeledMessage, PeelerError> {
+                Err(PeelerError::DecryptFailed)
+            }
+            async fn peel_welcome(
+                &self,
+                msg: &TransportMessage,
+            ) -> Result<PeeledMessage, PeelerError> {
+                self.0.peel_welcome(msg).await
+            }
+            async fn wrap_group_message(
+                &self,
+                payload: &EncryptedPayload,
+                context: &GroupContextSnapshot,
+            ) -> Result<TransportMessage, PeelerError> {
+                self.0.wrap_group_message(payload, context).await
+            }
+            async fn wrap_group_message_with_metadata(
+                &self,
+                payload: &EncryptedPayload,
+                context: &GroupContextSnapshot,
+                metadata: &GroupMessageMetadata,
+            ) -> Result<TransportMessage, PeelerError> {
+                self.0
+                    .wrap_group_message_with_metadata(payload, context, metadata)
+                    .await
+            }
+            async fn wrap_welcome(
+                &self,
+                payload: &EncryptedPayload,
+                recipient: &MemberId,
+            ) -> Result<TransportMessage, PeelerError> {
+                self.0.wrap_welcome(payload, recipient).await
+            }
+        }
+        let bus = TransportBus::ordered();
+        let mut client = ClientBuilder::new(b"opaque-confirmation-guard".to_vec())
+            .protocol_profile(ProtocolProfile::Current)
+            .storage_mode(HarnessStorageMode::InMemorySqlite)
+            .attach(&bus);
+        client.engine = Some(
+            EngineBuilder::new(client.storage().clone())
+                .identity(client.member_id().as_slice().to_vec())
+                .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+                    keys: client.signer.clone(),
+                }))
+                .protocol_profile(ProtocolProfile::Current)
+                .supported_app_components(harness_supported_app_components())
+                .peeler(Box::new(OpaquePeeler(
+                    NostrMlsPeeler::new().with_welcome_signer(client.signer.clone()),
+                )))
+                .build()
+                .unwrap(),
+        );
+        let (group_id, founding_pending) = client
+            .create_group_with_admins_maybe_pending(
+                "opaque replay",
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await;
+        assert!(founding_pending.is_none());
+        let pending = client.self_update().await;
+        // A malformed retained payload fails the synchronous replay after
+        // confirmation is durable. Repair it terminally before background retry.
+        let mut broken = MessageRecord {
+            id: MessageId::new(vec![0xff; 32]),
+            group_id: group_id.clone(),
+            epoch: EpochId(0),
+            state: MessageState::Retryable,
+            payload: vec![0xff],
+            deferred_peel: None,
+        };
+        client.storage().put_message(&broken).unwrap();
+        for index in 0..1_024u32 {
+            let id = MessageId::new(index.to_be_bytes().to_vec());
+            let msg = TransportMessage {
+                id: id.clone(),
+                payload: vec![0x42],
+                timestamp: Timestamp(1),
+                causal_deps: vec![],
+                source: TransportSource("test".into()),
+                envelope: TransportEnvelope::GroupMessage {
+                    transport_group_id: deterministic_nostr_group_id(
+                        &client.identity,
+                        "opaque replay",
+                    )
+                    .to_vec(),
+                },
+            };
+            client
+                .storage()
+                .put_message(&MessageRecord {
+                    id,
+                    group_id: group_id.clone(),
+                    epoch: EpochId(0),
+                    state: MessageState::PeelDeferred,
+                    payload: StoredMessagePayload::raw_transport(msg).encode().unwrap(),
+                    deferred_peel: None,
+                })
+                .unwrap();
+        }
+        client.confirm(pending).await;
+        broken.state = MessageState::Failed;
+        client.storage().put_message(&broken).unwrap();
+        client.capture_engine_events();
+        let initial = client.harness_convergence_progress(&group_id).unwrap();
+        assert_eq!(initial.confirmation_replay_completed_rows, 0);
+        assert_eq!(
+            initial.pending_work.stored_transport_deferred_messages,
+            1_024
+        );
+        let mut outcomes = Vec::new();
+        client.drive_due_convergence(&mut outcomes).await;
+        assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+        let current = client.harness_convergence_progress(&group_id).unwrap();
+        assert_eq!(current.confirmation_replay_completed_rows, 512);
+        assert!(current.pending_work.scheduled_convergence_groups > 0);
+        let mut without_replay_witness = current.clone();
+        without_replay_witness.confirmation_replay_completed_rows = 0;
+        assert!(
+            convergence_drain_progress_key(&initial)
+                == convergence_drain_progress_key(&without_replay_witness),
+            "only the confirmation replay witness explains these eight productive rounds"
+        );
+        ensure_convergence_drain_progress(
+            HARNESS_CONVERGENCE_DRAIN_PASSES,
+            true,
+            &current,
+            &current,
+        )
+        .expect_err("a truly unchanged runnable replay still cannot spin");
     }
 
     /// Twelve retained-history rounds can span an eight- plus four-pass slice.
@@ -849,6 +1001,7 @@ mod tests {
             lifecycle: GroupLifecycleState::Stable,
             pending_work: ConformancePendingWorkSnapshot::default(),
             deferred_peel_completed_context_attempts: 0,
+            confirmation_replay_completed_rows: 0,
             pass_generation: Some(pass_generation),
             pass_phase: Some(ConvergencePassPhase::Resolving),
             earliest_next_wake_monotonic_ms: None,

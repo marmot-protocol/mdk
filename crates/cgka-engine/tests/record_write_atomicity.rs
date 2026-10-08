@@ -346,6 +346,8 @@ struct FaultStorage {
     release_fault: LeaveWriteFault,
     preparation_delay: PreparationDelay,
     retained_anchor_rewinds: RetainedAnchorRewindCounter,
+    termination_fault: LeaveWriteFault,
+    post_commit_disband_read_fault: LeaveWriteFault,
 }
 
 impl GroupStorage for FaultStorage {
@@ -540,6 +542,11 @@ impl OutboundIntentStorage for FaultStorage {
         self.inner.list_queued_outbound_intents(group_id)
     }
     fn delete_queued_outbound_intent(&self, id: &MessageId) -> StorageResult<()> {
+        if self.termination_fault.should_fail() {
+            return Err(StorageError::Busy(
+                "injected termination cleanup failure".into(),
+            ));
+        }
         self.inner.delete_queued_outbound_intent(id)
     }
     fn put_own_commit_intent(
@@ -609,6 +616,11 @@ impl LeaveRequestStorage for FaultStorage {
         self.inner.leave_request(group_id)
     }
     fn clear_leave_request(&self, group_id: &GroupId) -> StorageResult<()> {
+        if self.termination_fault.should_fail() {
+            return Err(StorageError::Busy(
+                "injected termination cleanup failure".into(),
+            ));
+        }
         self.inner.clear_leave_request(group_id)
     }
 }
@@ -637,6 +649,14 @@ impl DisbandCandidateStorage for FaultStorage {
         self.inner.disband_candidate(group_id, commit_id)
     }
     fn list_disband_candidates(&self, group_id: &GroupId) -> StorageResult<Vec<DisbandCandidate>> {
+        if self.post_commit_disband_read_fault.remaining() > 0
+            && self.inner.get_group(group_id)?.removed
+            && self.post_commit_disband_read_fault.should_fail()
+        {
+            return Err(StorageError::Busy(
+                "injected post-commit disband read failure".into(),
+            ));
+        }
         self.inner.list_disband_candidates(group_id)
     }
     fn clear_disband_candidates(&self, group_id: &GroupId) -> StorageResult<()> {
@@ -840,6 +860,8 @@ fn build_fault_selfremove_client(
         release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        termination_fault: LeaveWriteFault::default(),
+        post_commit_disband_read_fault: LeaveWriteFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(id))
@@ -1309,6 +1331,8 @@ fn build_release_fault_client(
         release_fault,
         preparation_delay: PreparationDelay::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        termination_fault: LeaveWriteFault::default(),
+        post_commit_disband_read_fault: LeaveWriteFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(id))
@@ -1336,6 +1360,8 @@ fn build_capability_fault_client(
         release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        termination_fault: LeaveWriteFault::default(),
+        post_commit_disband_read_fault: LeaveWriteFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(id))
@@ -1364,6 +1390,8 @@ fn build_leave_write_fault_client(
         release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        termination_fault: LeaveWriteFault::default(),
+        post_commit_disband_read_fault: LeaveWriteFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(identity))
@@ -2179,6 +2207,8 @@ async fn slow_preparation_case(
         release_fault: LeaveWriteFault::default(),
         preparation_delay: delay.clone(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        termination_fault: LeaveWriteFault::default(),
+        post_commit_disband_read_fault: LeaveWriteFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(b"slow-preparation"))
@@ -2251,6 +2281,8 @@ async fn past_peel_backlog_case(
         release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
         retained_anchor_rewinds: rewinds.clone(),
+        termination_fault: LeaveWriteFault::default(),
+        post_commit_disband_read_fault: LeaveWriteFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(b"past-peel-backlog"))
@@ -2610,6 +2642,8 @@ async fn setup_own_intent_fault_case(
         release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        termination_fault: LeaveWriteFault::default(),
+        post_commit_disband_read_fault: LeaveWriteFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(b"own-intent-fault"))
@@ -2819,6 +2853,8 @@ async fn a_failed_terminal_retirement_leaves_every_row_deferred_for_the_next_pas
         release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        termination_fault: LeaveWriteFault::default(),
+        post_commit_disband_read_fault: LeaveWriteFault::default(),
     })
     .legacy_compatibility_profile()
     .identity(pad32(b"carol-retire-atomic"))
@@ -2974,5 +3010,515 @@ async fn a_failed_terminal_retirement_leaves_every_row_deferred_for_the_next_pas
             IngestOutcome::TransportDeferred { .. }
         ),
         "the completed retirement released the account bytes"
+    );
+}
+
+/// A copy that discovers its previously silent eviction must not commit its
+/// removed marker until every terminal cleanup write succeeds. Both a queued
+/// send and an empty queue must yield exactly one native termination on retry.
+#[tokio::test]
+async fn eviction_realization_retries_all_cleanup_before_announcing_termination() {
+    for (queued_count, fault_write) in [(1, 1), (1, 2), (0, 1)] {
+        let termination_fault = LeaveWriteFault::default();
+        let inner = SqliteAccountStorage::in_memory().unwrap();
+        let handle = inner.clone();
+        let mut bob = EngineBuilder::new(FaultStorage {
+            inner,
+            fault: PutGroupFault::default(),
+            capability_fault: CapabilityWriteFault::default(),
+            leave_write_fault: LeaveWriteFault::default(),
+            intent_write_fault: LeaveWriteFault::default(),
+            failed_state_fault: FailedStateWriteFault::default(),
+            release_fault: LeaveWriteFault::default(),
+            preparation_delay: PreparationDelay::default(),
+            retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+            termination_fault: termination_fault.clone(),
+            post_commit_disband_read_fault: LeaveWriteFault::default(),
+        })
+        .legacy_compatibility_profile()
+        .identity(pad32(b"eviction-atomic-bob"))
+        .account_identity_proof_signer(proof_signer(b"eviction-atomic-bob"))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+        let mut alice = build_selfremove_client(b"eviction-atomic-alice");
+        let bob_kp = bob.fresh_key_package().await.unwrap();
+        let (group_id, created) = alice
+            .create_group(CreateGroupRequest {
+                name: "atomic eviction".into(),
+                description: String::new(),
+                members: vec![bob_kp],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } = created
+        else {
+            panic!("group creation");
+        };
+        alice.confirm_published(pending).await.unwrap();
+        bob.join_welcome(welcomes.remove(0)).await.unwrap();
+        let SendResult::GroupEvolution { msg, pending, .. } = alice
+            .send(SendIntent::RemoveMembers {
+                group_id: group_id.clone(),
+                members: vec![bob.self_id()],
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("removal commit");
+        };
+        alice.confirm_published(pending).await.unwrap();
+        bob.ingest(TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        })
+        .await
+        .unwrap();
+        bob.converge_stored_openmls_messages_at(&group_id, 1_000_000)
+            .unwrap();
+        assert!(handle.get_group(&group_id).unwrap().removed);
+        bob.drain_events();
+
+        // Reproduce a pre-fix stored copy: MLS proves removal, but its record
+        // and queued work have not yet been reconciled.
+        let mut record = handle.get_group(&group_id).unwrap();
+        record.removed = false;
+        record.members = vec![Member {
+            id: bob.self_id(),
+            credential: bob.self_id().as_slice().to_vec(),
+        }];
+        handle.put_group(&record).unwrap();
+        handle
+            .put_leave_request(&LeaveRequest {
+                group_id: group_id.clone(),
+                requested_at_ms: 1,
+                last_proposed_epoch: None,
+            })
+            .unwrap();
+        for tag in 0..queued_count {
+            handle
+                .put_queued_outbound_intent(&QueuedOutboundIntent {
+                    id: MessageId::new(vec![tag as u8; 32]),
+                    group_id: group_id.clone(),
+                    intent: SendIntent::SelfUpdate {
+                        group_id: group_id.clone(),
+                    },
+                    created_at_ms: 1,
+                    reissue_attempts: 0,
+                })
+                .unwrap();
+        }
+        let input = next_routed_commit(&mut alice, &group_id).await;
+        termination_fault.arm_on_write(fault_write);
+        let error = bob.ingest(input.clone()).await.unwrap_err();
+        assert!(format!("{error:?}").contains("injected termination cleanup failure"));
+        assert!(
+            !handle.get_group(&group_id).unwrap().removed,
+            "failed cleanup must not suppress retry"
+        );
+        assert_eq!(handle.get_group(&group_id).unwrap().members, record.members);
+        assert_eq!(
+            handle
+                .list_queued_outbound_intents(&group_id)
+                .unwrap()
+                .len(),
+            queued_count
+        );
+        assert!(handle.leave_request(&group_id).unwrap().is_some());
+        assert!(
+            bob.drain_events().is_empty(),
+            "failed transaction cannot announce removal"
+        );
+
+        bob.ingest(input.clone()).await.unwrap();
+        assert!(handle.get_group(&group_id).unwrap().removed);
+        assert!(
+            handle
+                .list_queued_outbound_intents(&group_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(handle.leave_request(&group_id).unwrap().is_none());
+        let events = bob.drain_events();
+        assert_eq!(events.iter().filter(|event| matches!(event,
+            cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated { group_id: id, voluntary: true }
+            if id == &group_id)).count(), 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    cgka_traits::engine::GroupEvent::GroupStateChanged {
+                        change: cgka_traits::engine::GroupStateChange::MemberLeft { .. },
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        bob.ingest(input).await.unwrap();
+        assert!(
+            bob.drain_events().is_empty(),
+            "completed realization stays idempotent"
+        );
+    }
+}
+
+/// Canonical removal and its terminal cleanup commit together, including the pass.
+#[tokio::test]
+async fn convergence_membership_cleanup_rolls_back_canonical_apply_on_failure() {
+    for (queued_count, fault_write) in [(1, 1), (1, 2), (0, 1)] {
+        assert_convergence_membership_fault(queued_count, fault_write, false).await;
+    }
+}
+
+#[tokio::test]
+async fn convergence_membership_events_survive_post_commit_disband_read_failure() {
+    assert_convergence_membership_fault(1, 0, true).await;
+}
+
+async fn assert_convergence_membership_fault(
+    queued_count: usize,
+    fault_write: usize,
+    post_commit: bool,
+) {
+    let termination_fault = LeaveWriteFault::default();
+    let post_commit_disband_read_fault = LeaveWriteFault::default();
+    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let handle = inner.clone();
+    let mut bob = EngineBuilder::new(FaultStorage {
+        inner,
+        fault: PutGroupFault::default(),
+        capability_fault: CapabilityWriteFault::default(),
+        leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: LeaveWriteFault::default(),
+        failed_state_fault: FailedStateWriteFault::default(),
+        release_fault: LeaveWriteFault::default(),
+        preparation_delay: PreparationDelay::default(),
+        retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        termination_fault: termination_fault.clone(),
+        post_commit_disband_read_fault: post_commit_disband_read_fault.clone(),
+    })
+    .legacy_compatibility_profile()
+    .identity(pad32(b"eviction-atomic-bob"))
+    .account_identity_proof_signer(proof_signer(b"eviction-atomic-bob"))
+    .feature_registry(selfremove_registry())
+    .peeler(Box::new(MockPeeler))
+    .build()
+    .unwrap();
+    let mut alice = build_selfremove_client(b"eviction-atomic-alice");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "atomic eviction".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated {
+        pending,
+        mut welcomes,
+    } = created
+    else {
+        panic!("group creation");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    let SendResult::GroupEvolution { msg, pending, .. } = alice
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![bob.self_id()],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("removal commit");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.ingest(TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..msg
+    })
+    .await
+    .unwrap();
+    bob.drain_events();
+    let before = handle.get_group(&group_id).unwrap();
+    handle
+        .put_leave_request(&LeaveRequest {
+            group_id: group_id.clone(),
+            requested_at_ms: 1,
+            last_proposed_epoch: None,
+        })
+        .unwrap();
+    for tag in 0..queued_count {
+        handle
+            .put_queued_outbound_intent(&QueuedOutboundIntent {
+                id: MessageId::new(vec![tag as u8; 32]),
+                group_id: group_id.clone(),
+                intent: SendIntent::SelfUpdate {
+                    group_id: group_id.clone(),
+                },
+                created_at_ms: 1,
+                reissue_attempts: 0,
+            })
+            .unwrap();
+    }
+    if post_commit {
+        post_commit_disband_read_fault.arm_on_write(1);
+        let error = bob
+            .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("injected post-commit disband read failure"));
+        assert!(handle.get_group(&group_id).unwrap().removed);
+        assert!(
+            handle
+                .list_queued_outbound_intents(&group_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(handle.leave_request(&group_id).unwrap().is_none());
+        let events = bob.drain_events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated { .. }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    cgka_traits::engine::GroupEvent::GroupMemberLeavesRemoved { .. }
+                ))
+                .count(),
+            1
+        );
+        bob.advance_convergence(&group_id).await.unwrap();
+        assert!(!bob.drain_events().iter().any(|event| matches!(
+            event,
+            cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated { .. }
+                | cgka_traits::engine::GroupEvent::GroupMemberLeavesRemoved { .. }
+        )));
+        return;
+    }
+    termination_fault.arm_on_write(fault_write);
+    let error = bob
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .unwrap_err();
+    assert!(format!("{error:?}").contains("injected termination cleanup failure"));
+    assert_eq!(handle.get_group(&group_id).unwrap(), before);
+    assert_eq!(bob.epoch(&group_id).unwrap(), before.epoch);
+    assert_eq!(
+        handle
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .len(),
+        queued_count
+    );
+    assert!(handle.leave_request(&group_id).unwrap().is_some());
+    assert!(
+        !handle
+            .convergence_pass(&group_id)
+            .unwrap()
+            .unwrap()
+            .fairness_slot_available
+    );
+    assert!(bob.drain_events().is_empty());
+    bob.converge_stored_openmls_messages_at(&group_id, 2_000_000)
+        .unwrap();
+    assert!(handle.get_group(&group_id).unwrap().removed);
+    assert!(
+        handle
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(handle.leave_request(&group_id).unwrap().is_none());
+    let events = bob.drain_events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event,
+            cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated { group_id: id, .. }
+            if id == &group_id))
+            .count(),
+        1
+    );
+}
+
+/// A terminal cleanup fault cannot erase activity from earlier canonical commits.
+#[tokio::test]
+async fn disband_cleanup_failure_preserves_earlier_canonical_activity_once() {
+    use cgka_engine::ManualConvergenceClock;
+    use cgka_traits::engine::{GroupEvent, GroupStateChange};
+    use cgka_traits::group::ProtocolProfile;
+
+    let clock = ManualConvergenceClock::new(0, 10_000);
+    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(pad32(b"alice-disband-cleanup"))
+        .account_identity_proof_signer(proof_signer(b"alice-disband-cleanup"))
+        .protocol_profile(ProtocolProfile::Current)
+        .convergence_clock(Arc::new(clock.clone()))
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    let termination_fault = LeaveWriteFault::default();
+    let inner = SqliteAccountStorage::in_memory().unwrap();
+    let handle = inner.clone();
+    let mut bob = EngineBuilder::new(FaultStorage {
+        inner,
+        fault: PutGroupFault::default(),
+        capability_fault: CapabilityWriteFault::default(),
+        leave_write_fault: LeaveWriteFault::default(),
+        intent_write_fault: LeaveWriteFault::default(),
+        failed_state_fault: FailedStateWriteFault::default(),
+        release_fault: LeaveWriteFault::default(),
+        preparation_delay: PreparationDelay::default(),
+        retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        termination_fault: termination_fault.clone(),
+        post_commit_disband_read_fault: LeaveWriteFault::default(),
+    })
+    .identity(pad32(b"bob-disband-cleanup"))
+    .account_identity_proof_signer(proof_signer(b"bob-disband-cleanup"))
+    .protocol_profile(ProtocolProfile::Current)
+    .peeler(Box::new(MockPeeler))
+    .build()
+    .unwrap();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "before rename".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+        panic!("current-profile founding group");
+    };
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    bob.drain_events();
+    let SendResult::GroupEvolution {
+        msg: mut rename,
+        pending,
+        ..
+    } = alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("committed before disband".into()),
+            description: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("rename commit");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    alice
+        .send(SendIntent::Disband {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let mut prepared = None;
+    for _ in 0..8 {
+        let sends = alice.advance_convergence(&group_id).await.unwrap();
+        if let [SendResult::GroupEvolution { msg, pending, .. }] = sends.as_slice() {
+            prepared = Some((msg.clone(), *pending));
+            break;
+        }
+        assert!(sends.is_empty());
+        clock.advance_ms(1_000);
+    }
+    let (mut disband, pending) = prepared.expect("scheduled disband");
+    alice.confirm_published(pending).await.unwrap();
+    for message in [&mut rename, &mut disband] {
+        message.envelope = TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        };
+    }
+    let rename_id = content_hex(&rename);
+    bob.buffer_openmls_convergence_message_at(&group_id, disband, 1_000)
+        .unwrap();
+    bob.buffer_openmls_convergence_message_at(&group_id, rename, 1_000)
+        .unwrap();
+    // clear_leave_request runs after writing the terminal tombstone and group
+    // record, but all terminal cleanup rolls back together on this fault.
+    termination_fault.arm_on_write(1);
+    let error = bob
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .unwrap_err();
+    assert!(format!("{error:?}").contains("injected termination cleanup failure"));
+    assert!(handle.disband_tombstone(&group_id).unwrap().is_none());
+    assert!(handle.get_group(&group_id).unwrap().disbanded.is_none());
+    let prefix = bob.drain_events();
+    let activity: Vec<_> = prefix
+        .iter()
+        .filter_map(|event| match event {
+            GroupEvent::GroupStateChanged {
+                change,
+                actor,
+                origin_commit_id,
+                ..
+            } => Some((change, actor, origin_commit_id)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        activity.len(),
+        1,
+        "only the committed rename may be announced"
+    );
+    assert!(
+        matches!(activity[0].0, GroupStateChange::GroupRenamed { name, .. }
+        if name == "committed before disband")
+    );
+    assert_eq!(activity[0].1.as_ref(), Some(&alice.self_id()));
+    assert_eq!(
+        activity[0].2.as_ref().map(|id| hex::encode(id.as_slice())),
+        Some(rename_id),
+    );
+    bob.converge_stored_openmls_messages_at(&group_id, 2_000_000)
+        .unwrap();
+    // The completed pass has to reopen and cross its own collection cutoff.
+    bob.converge_stored_openmls_messages_at(&group_id, 3_000_000)
+        .unwrap();
+    assert!(handle.disband_tombstone(&group_id).unwrap().is_some());
+    let suffix = bob.drain_events();
+    let changes: Vec<_> = suffix
+        .iter()
+        .filter_map(|event| match event {
+            GroupEvent::GroupStateChanged { change, .. } => Some(change),
+            _ => None,
+        })
+        .collect();
+    assert!(matches!(&changes[..], [GroupStateChange::GroupDisbanded]));
+    bob.advance_convergence(&group_id).await.unwrap();
+    assert!(
+        !bob.drain_events()
+            .iter()
+            .any(|event| matches!(event, GroupEvent::GroupStateChanged { .. }))
     );
 }

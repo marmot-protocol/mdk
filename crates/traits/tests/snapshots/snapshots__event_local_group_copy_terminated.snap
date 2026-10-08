@@ -1,0 +1,15 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "GroupEvent::LocalGroupCopyTerminated { group_id: gid(), voluntary: true }"
+---
+{
+  "LocalGroupCopyTerminated": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "voluntary": true
+  }
+}

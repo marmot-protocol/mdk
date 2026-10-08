@@ -60,6 +60,7 @@ pub mod group_state_changes;
 pub mod identity;
 pub mod key_package;
 pub mod maintenance;
+mod membership_effects;
 pub(crate) mod message_disposition;
 pub mod message_processor;
 pub(crate) mod mls_group_cache;

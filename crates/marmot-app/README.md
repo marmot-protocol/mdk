@@ -198,6 +198,12 @@ targets.
 chats. Clients render accept/decline UI from the group record: accept clears `pending_confirmation`; decline publishes a
 leave, clears the pending flag, and archives the local projection so normal chat lists hide it.
 
+**Committed group activity.** Commands and maintenance retain native cleanup and commit activity before subscription
+work can suspend. Manual and scheduled convergence retain subscriber deltas through route refresh, checkpoints,
+notifications and invitation recovery. Quiet observations return repaired deltas once without republishing the accepted
+MLS commit. Cancellation preserves the owning client's pending work; these queues are session-local, not a crash-durable
+event journal.
+
 ## Conversations
 
 - **Drafts.** Rust app/runtime draft commands expose selected metadata, conditional save/clear, keyed attachment bytes,

@@ -21,7 +21,8 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [bounded chat screens](#bounded-chat-screens), [prepared conversation windows](#prepared-conversation-windows),
   [live timeline updates](#live-timeline-updates), [durable avatar access](#durable-avatar-access)
 - Messages and moderation: [deletion provenance and custom events](#deletion-provenance-and-custom-events),
-  [group-system previews](#group-system-previews), [group reporting](#group-reporting),
+  [group-system previews](#group-system-previews),
+  [device-local membership events](#device-local-membership-events), [group reporting](#group-reporting),
   [history may be incomplete notices](#history-may-be-incomplete-notices)
 - Media: [bounded attachment history](#bounded-attachment-history), [local attachment access](#local-attachment-access)
 - Audit logs: [audit v5 recording and delivery](#audit-v5-recording-and-delivery),
@@ -730,6 +731,17 @@ also carry their ordered `tags`, so clients can render app-defined event types w
 raw events. Deleted rows expose no raw tags in timeline reads, moderation reads, or conversation windows.
 MDK-owned kinds continue to use prepared fields and references there. Custom-event tag changes invalidate
 the conversion cache. Custom events do not change chat-list activity or notification policy.
+
+
+## Device-local membership events
+
+The group-event firehose distinguishes account-level timeline activity from
+`LocalGroupCopyTerminated`, `LocalGroupCopyRestored`, and
+`GroupMemberLeavesRemoved`. MDK applies their membership, pending-send and
+notification effects before host delivery; these events create no system row.
+Use them to refresh presentation, and handle the new variants when regenerating
+Swift/Kotlin bindings. Retained-history engine rollback is separate from automatic
+terminal-copy recovery through the managed scheduler.
 
 ## Group-system previews
 

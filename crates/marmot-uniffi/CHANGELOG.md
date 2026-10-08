@@ -4,6 +4,11 @@
 
 ### Breaking changes
 
+- Native lifecycle events add `LocalGroupCopyTerminated`, `LocalGroupCopyRestored`,
+  and `GroupMemberLeavesRemoved`. Update exhaustive Swift/Kotlin event handling
+  and regenerate bindings with the matching native library. Restoration describes
+  retained-history repair, not automatic scheduler restoration of removed copies.
+
 - The optional opaque `ChatListDraftVersionFfi` object in
   `PresentedChatRowFfi.draft_version` correlates the presented row's draft
   metadata with a captured composer revision through
@@ -37,6 +42,12 @@
 
 - `retired_relay_hosts()` no longer includes `relay.damus.io`, and
   `classify_relay_endpoints` now reports it as `Allowed`.
+
+### Fixed
+
+- Group activity uses shared per-commit reaction targets for authors and peers,
+  including commits preceding a disband. See `marmot-app`'s Unreleased fixes
+  for projection and push-token behavior.
 
 ## 0.12.0 - 2026-10-02
 
