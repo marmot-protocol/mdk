@@ -189,8 +189,15 @@ impl MarmotApp {
             if !deletion_coverage {
                 return Err(recovery_incomplete());
             }
-            let (records, evidence) =
+            let (mut records, evidence) =
                 without_revoked_slot_winners(account, observed, &deletions, freshness);
+            // Final admission revalidates MLS lifetime on the real wall clock.
+            // It may reject this identity after a slow deletion read, but must
+            // never select a different fresh slot whose deletion was not read.
+            // Preserve rejected-future metadata for the existing diagnostic
+            // cache fallback, whose exact target was checked above.
+            records
+                .retain(|record| !freshness.accepts(record) || record.event.id == target.event_id);
             return Ok(RecoveredKeyPackageRecords {
                 freshness,
                 records,

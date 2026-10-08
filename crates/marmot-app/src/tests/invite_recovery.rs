@@ -1,4 +1,5 @@
 use super::*;
+use tokio::time::{sleep, timeout};
 
 const DISCOVERY: &str = "wss://directory.example";
 const OUTBOX: &str = "wss://outbox.example";
@@ -1150,4 +1151,225 @@ async fn invite_recovery_membership_keeps_checked_candidate_across_clock_boundar
 #[tokio::test]
 async fn invite_recovery_direct_lookup_keeps_checked_candidate_across_clock_boundary() {
     assert_recovery_keeps_checked_candidate_across_clock_boundary(false).await;
+}
+
+fn package_expiring_at(
+    app: &MarmotApp,
+    account: &AccountSummary,
+    expires: u64,
+) -> cgka_traits::engine::KeyPackage {
+    use cgka_engine::account_identity_proof::account_identity_proof_component;
+    use cgka_traits::app_components::{
+        ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID, default_group_components,
+        encode_components_list,
+    };
+    use openmls::extensions::{AppDataDictionary, AppDataDictionaryExtension, Extension};
+    use openmls::prelude::{
+        BasicCredential, Capabilities, Ciphersuite, CredentialWithKey, ExtensionType, Extensions,
+        KeyPackage as MlsKeyPackage, Lifetime, MlsMessageOut,
+    };
+    use openmls_basic_credential::SignatureKeyPair;
+    use tls_codec::Serialize;
+
+    let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+    let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
+    let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+    let identity = hex::decode(&account.account_id_hex).unwrap();
+    let proof_signer = app
+        .account_signer_for_summary(account)
+        .unwrap()
+        .as_proof_signer();
+    let proof = account_identity_proof_component(
+        &identity,
+        &signer.to_public_vec(),
+        ciphersuite,
+        ciphersuite.signature_algorithm(),
+        expires.saturating_sub(10),
+        proof_signer.as_ref(),
+    )
+    .unwrap();
+    let mut components = default_group_components();
+    components.insert(APP_COMPONENTS_COMPONENT_ID);
+    components.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID);
+    let mut dictionary = AppDataDictionary::new();
+    dictionary.insert(
+        APP_COMPONENTS_COMPONENT_ID,
+        encode_components_list(&components),
+    );
+    dictionary.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, proof);
+    let proof = Extension::AppDataDictionary(AppDataDictionaryExtension::new(dictionary));
+    let bundle = MlsKeyPackage::builder()
+        .leaf_node_capabilities(Capabilities::new(
+            None,
+            Some(&[ciphersuite]),
+            Some(&[ExtensionType::AppDataDictionary]),
+            Some(&[openmls::prelude::ProposalType::AppDataUpdate]),
+            None,
+        ))
+        .leaf_node_extensions(Extensions::single(proof).unwrap())
+        .key_package_lifetime(Lifetime::init(expires.saturating_sub(3600), expires))
+        .mark_as_last_resort()
+        .build(
+            ciphersuite,
+            &provider,
+            &signer,
+            CredentialWithKey {
+                credential: BasicCredential::new(identity).into(),
+                signature_key: signer.public().into(),
+            },
+        )
+        .unwrap();
+    let message: MlsMessageOut = bundle.key_package().clone().into();
+    cgka_traits::engine::KeyPackage::new(message.tls_serialize_detached().unwrap())
+        .with_protocol_profile(cgka_traits::group::ProtocolProfile::Current)
+}
+
+async fn assert_recovery_does_not_switch_after_mls_expiry(membership: bool) {
+    let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
+    let account = &accounts[0];
+    let mut alternative = package(&fetcher, account);
+    let expires = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 10;
+    let mut checked =
+        member_resolution_key_package_event(account, package_expiring_at(&app, account, expires));
+    checked.tags.iter_mut().find(|tag| tag[0] == "d").unwrap()[1] = "expiring-checked-slot".into();
+    checked
+        .tags
+        .push(vec!["client".into(), "WhiteNoise".into()]);
+    alternative
+        .tags
+        .iter_mut()
+        .find(|tag| tag[0] == "d")
+        .unwrap()[1] = "unchecked-revoked-slot".into();
+    let sign = |event: NostrTransportEvent| {
+        let signed = EventBuilder::new(Kind::from(KIND_MARMOT_KEY_PACKAGE as u16), event.content)
+            .tags(event.tags.into_iter().map(|tag| Tag::parse(tag).unwrap()))
+            .custom_created_at(NostrTimestamp::from_secs(event.created_at))
+            .finalize(
+                &app.account_home()
+                    .load_signing_keys(&account.label)
+                    .unwrap(),
+            )
+            .unwrap();
+        NostrTransportEvent::from_nostr_event(&signed).unwrap()
+    };
+    let checked = sign(checked);
+    let alternative = sign(alternative);
+    let deleted = signed_deletion(
+        &app,
+        account,
+        "e",
+        alternative.id.clone(),
+        alternative.created_at,
+    );
+    {
+        let mut routes = fetcher.events_by_endpoint.lock().unwrap();
+        routes
+            .get_mut(DISCOVERY)
+            .unwrap()
+            .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        routes
+            .get_mut(DISCOVERY)
+            .unwrap()
+            .extend([checked.clone(), alternative.clone()]);
+        routes.get_mut(OUTBOX).unwrap().push(deleted);
+    }
+    let records = [checked.clone(), alternative.clone()]
+        .into_iter()
+        .map(|event| RelayEventRecord {
+            event,
+            endpoints: vec![TransportEndpoint(DISCOVERY.into())],
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        crate::key_package_records::preferred_fresh_key_package_from_records(
+            &account.account_id_hex,
+            &records,
+            app.directory_freshness(),
+            None,
+        )
+        .unwrap()
+        .value
+        .unwrap()
+        .fetched
+        .key_package_event_id,
+        checked.id
+    );
+    let (entered, release) = fetcher.hold_fetches_for_kind(5);
+    let lookup = {
+        let app = app.clone();
+        let account_id = account.account_id_hex.clone();
+        tokio::spawn(async move {
+            if membership {
+                app.resolve_member_key_packages(&[&account_id])
+                    .await
+                    .map(|_| ())
+            } else {
+                app.fetch_latest_key_package_for_account_id(&account_id, vec![])
+                    .await
+                    .map(|_| ())
+            }
+        })
+    };
+    timeout(Duration::from_secs(8), entered.notified())
+        .await
+        .unwrap();
+    // Advance the actual MLS lifetime boundary; the event timestamp clock is
+    // deliberately unchanged. Tokio's paused clock cannot exercise this check.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    sleep(Duration::from_secs(expires.saturating_sub(now) + 1)).await;
+    assert_eq!(
+        crate::key_package_records::preferred_fresh_key_package_from_records(
+            &account.account_id_hex,
+            &records,
+            app.directory_freshness(),
+            None,
+        )
+        .unwrap()
+        .value
+        .unwrap()
+        .fetched
+        .key_package_event_id,
+        alternative.id
+    );
+    release.notify_one();
+    // A successful baseline also persists directory metadata through SQLCipher;
+    // leave its bounded blocking work time to finish on shared CI hosts.
+    let result = timeout(Duration::from_secs(30), lookup)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        result.is_err(),
+        "expiry must fail closed rather than return an unchecked, revoked slot"
+    );
+    let requests = fetcher.requests.lock().unwrap();
+    assert!(
+        !requests
+            .iter()
+            .flat_map(|request| &request.queries)
+            .any(|query| {
+                query.kind == 5
+                    && query
+                        .reference
+                        .as_ref()
+                        .is_some_and(|(name, value)| *name == 'e' && value == &alternative.id)
+            })
+    );
+}
+
+#[tokio::test]
+async fn invite_recovery_direct_lookup_does_not_switch_after_mls_expiry() {
+    assert_recovery_does_not_switch_after_mls_expiry(false).await;
+}
+
+#[tokio::test]
+async fn invite_recovery_membership_does_not_switch_after_mls_expiry() {
+    assert_recovery_does_not_switch_after_mls_expiry(true).await;
 }

@@ -928,12 +928,10 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         // Discovered targets belong to this bounded read, not the long-lived
         // client pool. Closing the owned client also stops reconnects for
         // failed relays without removing another caller's active relay.
-        let client = anonymous_directory_client();
         let mut tasks = JoinSet::new();
         for relay_url in relay_urls.iter().cloned() {
-            let client = client.clone();
             let queries = request.queries.clone();
-            tasks.spawn(async move { strict_fetch_endpoint(client, relay_url, queries).await });
+            tasks.spawn(async move { strict_fetch_endpoint(relay_url, queries).await });
         }
 
         let mut outcome = DirectoryFetchOutcome {
@@ -952,7 +950,6 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         if relay_urls.is_empty() {
             outcome.complete = false;
         }
-        client.shutdown().await;
         Ok(outcome)
     }
 }
@@ -969,10 +966,18 @@ fn directory_closed_reason(reason: &str) -> DirectoryInspectionError {
 }
 
 async fn strict_fetch_endpoint(
-    client: NostrSdkClient,
     relay_url: RelayUrl,
     queries: Vec<DirectoryEventQuery>,
 ) -> DirectoryFetchOutcome {
+    // Exactly one bounded subscription owns this connection and its wire
+    // counter. Cancellation/early failure closes it through the scoped guard.
+    let wire = super::directory_wire::DirectoryWireTransport::default();
+    let owned = ScopedInspectionClient(
+        NostrSdkClient::builder()
+            .websocket_transport(wire.clone())
+            .build(),
+    );
+    let client = &owned.0;
     let endpoint = TransportEndpoint(relay_url.to_string());
     if !matches!(client.relay(&relay_url).await, Ok(Some(_)))
         && client.add_relay(relay_url.clone()).await.is_err()
@@ -1020,6 +1025,7 @@ async fn strict_fetch_endpoint(
     let mut records = Vec::new();
     let mut seen_event_ids = HashSet::new();
     let mut query_counts = vec![0usize; queries.len()];
+    let mut admitted_messages = 0usize;
     let complete = timeout(DIRECTORY_RELAY_FETCH_WAIT, async {
         loop {
             let received = match notifications.next().await {
@@ -1032,15 +1038,21 @@ async fn strict_fetch_endpoint(
                         RelayMessage::Event {
                             subscription_id: received_id,
                             event,
-                        } if received_id.as_ref() == &subscription_id => Some(event.into_owned()),
+                        } if received_id.as_ref() == &subscription_id => {
+                            admitted_messages += 1;
+                            Some(event.into_owned())
+                        }
                         RelayMessage::EndOfStoredEvents(received_id)
                             if received_id.as_ref() == &subscription_id =>
                         {
                             // A filter that reaches its limit cannot establish absence.
-                            break queries
-                                .iter()
-                                .zip(&query_counts)
-                                .all(|(query, count)| *count < query.limit);
+                            // A frame discarded before notifications cannot
+                            // establish negative coverage, even after EOSE.
+                            break wire.event_count() == admitted_messages
+                                && queries
+                                    .iter()
+                                    .zip(&query_counts)
+                                    .all(|(query, count)| *count < query.limit);
                         }
                         RelayMessage::Closed {
                             subscription_id: received_id,
@@ -1342,6 +1354,74 @@ mod tests {
             !result.complete,
             "one saturated filter must not be hidden by the combined limit"
         );
+    }
+
+    #[tokio::test]
+    async fn strict_directory_sdk_tag_drop_cannot_certify_deletion_absence() {
+        use futures::{SinkExt, StreamExt};
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Tag};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let keys = Keys::generate();
+        let target = "ab".repeat(32);
+        let mut tags = vec![Tag::custom("e", [target.clone()])];
+        tags.extend((0..2000).map(|_| Tag::custom("x", ["padding"])));
+        let deletion = EventBuilder::new(Kind::from(5), "")
+            .tags(tags)
+            .finalize(&keys)
+            .unwrap();
+        assert!(deletion.verify().is_ok());
+        assert_eq!(deletion.tags.len(), 2001);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = socket.next().await {
+                let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if request[0] != "REQ" {
+                    continue;
+                }
+                for response in [
+                    serde_json::json!(["EVENT", request[1], deletion]),
+                    serde_json::json!(["EOSE", request[1]]),
+                ] {
+                    socket
+                        .send(Message::Text(response.to_string().into()))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let request = DirectoryFetchRequest::new(
+            vec![endpoint],
+            vec![DirectoryEventQuery::deletion_reference(
+                &keys.public_key().to_hex(),
+                'e',
+                target,
+                None,
+            )],
+        )
+        .unwrap();
+        let outcome = timeout(
+            Duration::from_secs(8),
+            NostrSdkDirectoryRelayFetcher::standalone()
+                .fetch_directory_events_with_completion(request),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            outcome.records.is_empty(),
+            "SDK tag admission limit stays enabled"
+        );
+        assert!(
+            !outcome.complete,
+            "a discarded signed deletion cannot become complete empty evidence"
+        );
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
