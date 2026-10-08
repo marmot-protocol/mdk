@@ -13,6 +13,7 @@ use marmot_markdown::{
     CodeBlockKind as MdCodeBlockKind, Document as MdDocument, Inline as MdInline,
     LinkDestinationKind as MdLinkDestinationKind, ListItem as MdListItem, ListKind as MdListKind,
     NostrEntity as MdNostrEntity, NostrHrp as MdNostrHrp, TableCell as MdTableCell,
+    TimestampStyle as MdTimestampStyle,
 };
 
 const MAX_FFI_MARKDOWN_DEPTH: usize = 128;
@@ -157,6 +158,34 @@ pub enum MarkdownInlineFfi {
     NostrUri {
         entity: MarkdownNostrEntityFfi,
     },
+    /// Signed Unix seconds and a display style, formatted by the host at render time.
+    Timestamp {
+        unix_seconds: i64,
+        style: MarkdownTimestampStyleFfi,
+    },
+}
+
+/// Timestamp display styles, using the device locale and timezone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MarkdownTimestampStyleFfi {
+    /// `t`: time without seconds.
+    ShortTime,
+    /// `T`: time including seconds.
+    LongTime,
+    /// `d`: short date.
+    ShortDate,
+    /// `D`: long date.
+    LongDate,
+    /// `f` or omitted: long date and time without seconds.
+    ShortDateTime,
+    /// `F`: weekday, long date and time without seconds.
+    LongDateTime,
+    /// `s`: short date and time without seconds.
+    CompactDateTime,
+    /// `S`: short date and time including seconds.
+    CompactDateTimeSeconds,
+    /// `R`: time relative to the host's current clock; refresh while visible.
+    Relative,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -435,6 +464,29 @@ fn markdown_inline_from_md(value: MdInline, depth: usize) -> MarkdownInlineFfi {
         MdInline::NostrUri(entity) => MarkdownInlineFfi::NostrUri {
             entity: entity.into(),
         },
+        MdInline::Timestamp {
+            unix_seconds,
+            style,
+        } => MarkdownInlineFfi::Timestamp {
+            unix_seconds,
+            style: style.into(),
+        },
+    }
+}
+
+impl From<MdTimestampStyle> for MarkdownTimestampStyleFfi {
+    fn from(value: MdTimestampStyle) -> Self {
+        match value {
+            MdTimestampStyle::ShortTime => Self::ShortTime,
+            MdTimestampStyle::LongTime => Self::LongTime,
+            MdTimestampStyle::ShortDate => Self::ShortDate,
+            MdTimestampStyle::LongDate => Self::LongDate,
+            MdTimestampStyle::ShortDateTime => Self::ShortDateTime,
+            MdTimestampStyle::LongDateTime => Self::LongDateTime,
+            MdTimestampStyle::CompactDateTime => Self::CompactDateTime,
+            MdTimestampStyle::CompactDateTimeSeconds => Self::CompactDateTimeSeconds,
+            MdTimestampStyle::Relative => Self::Relative,
+        }
     }
 }
 

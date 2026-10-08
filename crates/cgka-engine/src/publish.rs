@@ -97,6 +97,18 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
             .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
         let has_pending_commit = mls_group.pending_commit().is_some();
+        let previous_membership = self.canonical_membership_snapshot(&group_id)?;
+        let activity_before =
+            crate::openmls_projection::group_activity::GroupActivitySnapshot::capture(&mls_group);
+        let (additions, leavers) = if let Some(staged) = mls_group.pending_commit() {
+            (
+                crate::openmls_projection::group_activity::staged_additions(staged)
+                    .map_err(|error| EngineError::Backend(error.to_string()))?,
+                crate::openmls_projection::group_activity::staged_leavers(&mls_group, staged),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         // Snapshot the pre-commit epoch as a fork-recovery anchor. Done outside
         // the durable transaction below; the write is keyed by epoch and
@@ -117,6 +129,7 @@ impl<S: StorageProvider> Engine<S> {
         // idempotent. This is the fix for the prior orphan, where the
         // `Processed` write ran AFTER the slot was consumed and a lock there
         // left an unrecoverable `UnknownPending` on retry.
+        let mut membership_effects = None;
         self.storage
             .with_transaction(|storage| -> Result<(), EngineError> {
                 let mut own_commit_stamp = None;
@@ -253,11 +266,26 @@ impl<S: StorageProvider> Engine<S> {
                 if let Some(fanout) = confirmed_fanout.as_ref() {
                     storage.put_outbound_fanout(fanout)?;
                 }
+                // Anchor retention and native membership work can fail too.
+                // Keep them in the merge transaction so retry still sees the
+                // original source tree and attached staged commit.
+                self.retain_current_epoch_snapshot_on_storage(storage, &group_id)?;
+                if kind != crate::epoch_manager::PendingKind::Disband {
+                    let after = crate::membership_effects::MembershipSnapshot::capture(
+                        &mls_group,
+                        self.identity.self_id(),
+                        g.removed,
+                    );
+                    membership_effects =
+                        Some(self.prepare_canonical_membership_effects_on_storage(
+                            storage,
+                            &group_id,
+                            &previous_membership,
+                            &after,
+                        )?);
+                }
                 Ok(())
             })?;
-
-        // Post-merge fork-recovery anchor (idempotent, own transaction).
-        self.retain_current_epoch_snapshot_for_group(&group_id)?;
 
         // #740 rotation: a confirmed local UpdateAppComponents commit may have
         // changed this group's Nostr routing component; additively refresh the
@@ -342,22 +370,46 @@ impl<S: StorageProvider> Engine<S> {
         };
         self.events_buf.push_back(event.clone());
         if kind == crate::epoch_manager::PendingKind::Disband {
-            self.pending_state_changes.remove(&pending);
             self.schedule_pending_convergence_group(&replay_group_id);
             return Ok(event);
         }
-        if let Some(changes) = self.pending_state_changes.remove(&pending) {
-            for pending_change in changes {
+        if kind == crate::epoch_manager::PendingKind::GroupEvolution {
+            for (actor, change) in activity_before.changes(
+                &crate::openmls_projection::group_activity::GroupActivitySnapshot::capture(
+                    &mls_group,
+                ),
+                self.identity.self_id(),
+                &additions,
+                &leavers,
+            ) {
                 self.push_group_state_change(
                     &replay_group_id,
                     new_epoch,
-                    pending_change.actor,
-                    pending_change.change,
+                    Some(actor),
+                    change,
                     origin_commit_id.clone(),
                 );
             }
         }
-        self.replay_buffered_messages(&replay_group_id).await?;
+        if let Some(prepared) = membership_effects {
+            self.finish_canonical_membership_effects(&replay_group_id, prepared);
+        }
+        if let Err(error) = self.replay_buffered_messages(&replay_group_id).await {
+            // The pending slot is consumed and confirmation is durable. A
+            // failed replay remains retained work, not a failed publication.
+            self.pending_confirmation_replays
+                .insert(replay_group_id.clone());
+            self.schedule_pending_convergence_group(&replay_group_id);
+            tracing::warn!(
+                target: "cgka_engine::publish",
+                method = "do_confirm_published_with_fanout",
+                error_code = "buffered_replay_failed",
+                transient = error.is_transient(),
+                "buffered inbound replay deferred after successful confirmation"
+            );
+        } else {
+            self.pending_confirmation_replays.remove(&replay_group_id);
+        }
         Ok(event)
     }
 
@@ -519,7 +571,6 @@ impl<S: StorageProvider> Engine<S> {
                 Some(crate::audit_helpers::pending_kind_str(kind)),
             ),
         );
-        self.pending_state_changes.remove(&pending);
         if kind == crate::epoch_manager::PendingKind::Disband {
             self.schedule_pending_convergence_group(&group_id);
         }

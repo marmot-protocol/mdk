@@ -52,6 +52,7 @@ pub use markdown::{
     MarkdownAlignmentFfi, MarkdownAutolinkKindFfi, MarkdownBlockFfi, MarkdownCodeBlockKindFfi,
     MarkdownDocumentFfi, MarkdownInlineFfi, MarkdownLinkDestinationKindFfi, MarkdownListItemFfi,
     MarkdownListKindFfi, MarkdownNostrEntityFfi, MarkdownNostrHrpFfi, MarkdownTableCellFfi,
+    MarkdownTimestampStyleFfi,
 };
 pub use secret_store::SecretStore;
 pub use subscriptions::ConversationWindowSubscription;
