@@ -671,7 +671,7 @@ impl MarmotApp {
         let selection = latest_fresh_key_package_from_records(
             account_id_hex,
             records.records,
-            self.directory_freshness(),
+            records.freshness,
         )?;
         let from_cache = selection.value.is_none();
         let mut fetched = fresh_or_cached_key_package(account_id_hex, selection, cached_entry)?;
@@ -1263,6 +1263,14 @@ impl MarmotApp {
     }
 
     pub(crate) fn directory_freshness(&self) -> DirectoryFreshness {
+        #[cfg(test)]
+        if let Some(clock) = &self.directory_test_clock {
+            return DirectoryFreshness {
+                max_created_at: clock
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .saturating_add(self.config.directory_max_future_skew.as_secs()),
+            };
+        }
         DirectoryFreshness::from_now(self.config.directory_max_future_skew)
     }
 

@@ -1008,7 +1008,7 @@ impl MarmotApp {
                             let mut fetched = preferred_fresh_key_package_from_records(
                                 &target.account_id_hex,
                                 &records.records,
-                                app.directory_freshness(),
+                                records.freshness,
                                 requirements,
                             )?
                             .value

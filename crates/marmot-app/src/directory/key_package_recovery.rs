@@ -12,12 +12,15 @@ use crate::key_package_records::{
     without_revoked_slot_winners,
 };
 use crate::relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord};
-use crate::{AppError, MarmotApp};
+use crate::{AppError, DirectoryFreshness, MarmotApp};
 
 const RECOVERY_ENDPOINT_LIMIT: usize = 8;
 const RECOVERY_CANDIDATE_LIMIT: usize = 12;
 
 pub(super) struct RecoveredKeyPackageRecords {
+    /// Admission cutoff shared with final selection: time passing during a
+    /// deletion lookup must never admit a different, unchecked candidate.
+    pub(super) freshness: DirectoryFreshness,
     pub(super) records: Vec<DirectoryRelayEventRecord>,
     pub(super) cache_evidence: Option<KeyPackageRecoveryEvidence>,
 }
@@ -49,15 +52,12 @@ impl MarmotApp {
             requirements,
             cached_target,
         } = request;
-        if preferred_fresh_key_package_from_records(
-            account,
-            &observed,
-            self.directory_freshness(),
-            requirements,
-        )
-        .is_ok_and(|selection| selection.value.is_some())
+        let freshness = self.directory_freshness();
+        if preferred_fresh_key_package_from_records(account, &observed, freshness, requirements)
+            .is_ok_and(|selection| selection.value.is_some())
         {
             return Ok(RecoveredKeyPackageRecords {
+                freshness,
                 records: observed,
                 cache_evidence: None,
             });
@@ -109,18 +109,14 @@ impl MarmotApp {
         for round in 0..=RECOVERY_CANDIDATE_LIMIT {
             // Preserve every newest slot as a barrier, including malformed,
             // incompatible and already-revoked replacements.
-            let (records, evidence) = without_revoked_slot_winners(
-                account,
-                observed.clone(),
-                &deletions,
-                self.directory_freshness(),
-            );
+            let (records, evidence) =
+                without_revoked_slot_winners(account, observed.clone(), &deletions, freshness);
             // A known validation error precedes an incomplete negative lookup;
             // it never authorizes returning an unproven usable package.
             let selection = preferred_fresh_key_package_from_records(
                 account,
                 &records,
-                self.directory_freshness(),
+                freshness,
                 requirements,
             )?;
             let target = selection
@@ -140,6 +136,7 @@ impl MarmotApp {
                     return Err(recovery_incomplete());
                 }
                 return Ok(RecoveredKeyPackageRecords {
+                    freshness,
                     records,
                     cache_evidence: Some(evidence),
                 });
@@ -177,12 +174,8 @@ impl MarmotApp {
                     }
                     Err(_) => deletion_coverage = false,
                 }
-                let (_, gathered) = without_revoked_slot_winners(
-                    account,
-                    observed.clone(),
-                    &deletions,
-                    self.directory_freshness(),
-                );
+                let (_, gathered) =
+                    without_revoked_slot_winners(account, observed.clone(), &deletions, freshness);
                 // A verified positive is sufficient to reject a candidate,
                 // even if another route failed or the existence limit was hit.
                 if !gathered.allows_target(&target) {
@@ -196,13 +189,10 @@ impl MarmotApp {
             if !deletion_coverage {
                 return Err(recovery_incomplete());
             }
-            let (records, evidence) = without_revoked_slot_winners(
-                account,
-                observed,
-                &deletions,
-                self.directory_freshness(),
-            );
+            let (records, evidence) =
+                without_revoked_slot_winners(account, observed, &deletions, freshness);
             return Ok(RecoveredKeyPackageRecords {
+                freshness,
                 records,
                 cache_evidence: Some(evidence),
             });

@@ -1027,3 +1027,127 @@ async fn invite_recovery_diagnostic_cache_event_ids_are_canonical_or_ineligible(
         }
     }
 }
+
+async fn assert_recovery_keeps_checked_candidate_across_clock_boundary(membership: bool) {
+    let (_directory, mut app, accounts, fetcher) = discovery_fixture(1).await;
+    let account = &accounts[0];
+    let published = package(&fetcher, account);
+    let now = published.created_at;
+    let clock = Arc::new(std::sync::atomic::AtomicU64::new(now));
+    app.directory_test_clock = Some(clock.clone());
+    let future_at = now + app.config.directory_max_future_skew.as_secs() + 1;
+    let sign_candidate = |slot: &str, created_at: u64| {
+        let mut tags = published.tags.clone();
+        tags.iter_mut().find(|tag| tag[0] == "d").unwrap()[1] = slot.into();
+        let event = EventBuilder::new(
+            Kind::from(KIND_MARMOT_KEY_PACKAGE as u16),
+            &published.content,
+        )
+        .tags(tags.into_iter().map(|tag| Tag::parse(tag).unwrap()))
+        .custom_created_at(NostrTimestamp::from_secs(created_at))
+        .finalize(
+            &app.account_home()
+                .load_signing_keys(&account.label)
+                .unwrap(),
+        )
+        .unwrap();
+        NostrTransportEvent::from_nostr_event(&event).unwrap()
+    };
+    let checked = sign_candidate("checked-slot", now);
+    let future = sign_candidate("future-slot", future_at);
+    let deletion = signed_deletion(&app, account, "e", future.id.clone(), future_at);
+    {
+        let mut routes = fetcher.events_by_endpoint.lock().unwrap();
+        routes
+            .get_mut(DISCOVERY)
+            .unwrap()
+            .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        routes
+            .get_mut(DISCOVERY)
+            .unwrap()
+            .extend([checked.clone(), future.clone()]);
+        routes.get_mut(OUTBOX).unwrap().push(deletion);
+    }
+    let (entered, release) = fetcher.hold_fetches_for_kind(5);
+    let lookup = {
+        let app = app.clone();
+        let account_id = account.account_id_hex.clone();
+        tokio::spawn(async move {
+            if membership {
+                let packages = app
+                    .resolve_member_key_packages(&[&account_id])
+                    .await
+                    .unwrap();
+                hex::encode(packages[0].source.as_ref().unwrap().event_id.as_slice())
+            } else {
+                app.fetch_latest_key_package_for_account_id(&account_id, vec![])
+                    .await
+                    .unwrap()
+                    .key_package_event_id
+            }
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    // This advances the actual selection clock, not just Tokio's timeout clock.
+    clock.store(now + 2, std::sync::atomic::Ordering::SeqCst);
+    let records = [checked.clone(), future.clone()]
+        .into_iter()
+        .map(|event| RelayEventRecord {
+            event,
+            endpoints: vec![TransportEndpoint(DISCOVERY.into())],
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        crate::key_package_records::preferred_fresh_key_package_from_records(
+            &account.account_id_hex,
+            &records,
+            app.directory_freshness(),
+            None,
+        )
+        .unwrap()
+        .value
+        .unwrap()
+        .fetched
+        .key_package_event_id,
+        future.id
+    );
+    release.notify_one();
+    let returned = tokio::time::timeout(Duration::from_secs(5), lookup)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        returned, checked.id,
+        "must return the deletion-checked identity"
+    );
+    let requests = fetcher.requests.lock().unwrap();
+    let proof_queries = requests
+        .iter()
+        .flat_map(|request| &request.queries)
+        .filter(|query| query.kind == 5)
+        .collect::<Vec<_>>();
+    assert!(proof_queries.iter().any(|query| {
+        query
+            .reference
+            .as_ref()
+            .is_some_and(|(name, value)| *name == 'e' && value == &checked.id)
+    }));
+    assert!(!proof_queries.iter().any(|query| {
+        query
+            .reference
+            .as_ref()
+            .is_some_and(|(name, value)| *name == 'e' && value == &future.id)
+    }));
+}
+
+#[tokio::test]
+async fn invite_recovery_membership_keeps_checked_candidate_across_clock_boundary() {
+    assert_recovery_keeps_checked_candidate_across_clock_boundary(true).await;
+}
+
+#[tokio::test]
+async fn invite_recovery_direct_lookup_keeps_checked_candidate_across_clock_boundary() {
+    assert_recovery_keeps_checked_candidate_across_clock_boundary(false).await;
+}
