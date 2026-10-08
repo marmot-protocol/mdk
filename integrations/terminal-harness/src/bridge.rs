@@ -507,6 +507,15 @@ async fn acquire_dispatch_permit(
 async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut permit: GroupPermit) {
     let mut inbound = inbound;
     let disposition = classify_prompt(&inbound.text);
+    // Literal (`//`) forwards preserve the caller's bytes after slash stripping.
+    // Backend control routing remains available through the task-local context.
+    let mut add_control_instructions = !matches!(
+        disposition,
+        PromptDisposition::Forward {
+            allow_workdir_picker: false,
+            ..
+        }
+    );
     if is_inspect_disposition(&disposition) {
         match disposition {
             PromptDisposition::HarnessCommand(command) => {
@@ -687,6 +696,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
             };
             retrying = true;
             inbound.media = record.media.clone();
+            add_control_instructions = !record.omit_control_instructions;
             Some((record.cwd, Some(record.session_id), record.prompt))
         }
         PromptDisposition::Forward {
@@ -740,6 +750,10 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
         .as_ref()
         .and_then(|record| record.goal.as_deref());
     let (recovery_prompt, prompt) = prepare_prompt(goal, prompt);
+    let recovery_prompt = RecoveryPrompt {
+        text: recovery_prompt,
+        omit_control_instructions: !add_control_instructions,
+    };
 
     info!(
         target: TRACE_TARGET,
@@ -828,18 +842,31 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
         idle_timeout: ctx.cfg.backend_idle_timeout,
         cwd: cwd.clone(),
         session_id,
-        prompt,
+        prompt: if add_control_instructions {
+            format!("{prompt}{}", crate::group_profile::INSTRUCTIONS)
+        } else {
+            prompt
+        },
         artifact_output,
     };
     let (tx, mut rx) = mpsc::channel(16);
     let backend = ctx.backend.clone();
+    let control_context = crate::GroupProfileContext {
+        socket: ctx.cfg.socket.clone(),
+        auth_token: ctx.cfg.auth_token.clone(),
+        account_id_hex: inbound.account_ref.clone(),
+        group_id_hex: inbound.group_ref.clone(),
+        request_timeout: ctx.cfg.request_timeout,
+    };
     let runner = tokio::spawn(async move {
         // The staging lease lives in the backend task so its paths cannot
         // disappear while that task still has access to them.
         let _attachment_batch = attachment_batch;
-        backend
-            .run_with_attachments(invocation, attachments, tx)
-            .await
+        crate::with_group_profile_context(
+            control_context,
+            backend.run_with_attachments(invocation, attachments, tx),
+        )
+        .await
     });
     // Dropping a JoinHandle detaches its task. Abort explicitly when this
     // message handler is cancelled so the task drops its staging lease too.
@@ -1777,6 +1804,11 @@ fn status_text(ctx: &BridgeContext, record: Option<&SessionRecord>) -> String {
     )
 }
 
+struct RecoveryPrompt {
+    text: String,
+    omit_control_instructions: bool,
+}
+
 fn prepare_prompt(goal: Option<&str>, prompt: String) -> (String, String) {
     // Recovery persists the original user prompt. Persisting the expanded form
     // would prepend a standing goal again when `/retry-last` re-enters this path.
@@ -1829,7 +1861,7 @@ async fn finish_success(
     inbound: InboundPrompt,
     known_session: Option<SessionRecord>,
     cwd: PathBuf,
-    recovery_prompt: String,
+    recovery_prompt: RecoveryPrompt,
     outcome: Outcome,
     delivery: DeliveryReport,
 ) {
@@ -2030,7 +2062,7 @@ fn recovery_kind_for_outcome(outcome: &Outcome) -> RecoveryKind {
 async fn persist_recovery_record(
     recovery: &RecoveryStore,
     group_ref: &str,
-    prompt: String,
+    prompt: RecoveryPrompt,
     media: Vec<AgentControlMediaRef>,
     cwd: PathBuf,
     session_id: String,
@@ -2040,7 +2072,8 @@ async fn persist_recovery_record(
         .set(
             group_ref,
             RecoveryRecord {
-                prompt,
+                prompt: prompt.text,
+                omit_control_instructions: prompt.omit_control_instructions,
                 media,
                 cwd,
                 session_id,
@@ -2062,7 +2095,7 @@ async fn handle_backend_run_failure(
     group_ref: &str,
     known_session: Option<&SessionRecord>,
     cwd: PathBuf,
-    prompt: String,
+    prompt: RecoveryPrompt,
     media: Vec<AgentControlMediaRef>,
     failure: &RunFailure,
 ) -> String {
@@ -2097,7 +2130,8 @@ async fn handle_backend_run_failure(
         HarnessError::BackendTimedOut => {
             if let Some(session_id) = resumable_session {
                 let record = RecoveryRecord {
-                    prompt,
+                    prompt: prompt.text,
+                    omit_control_instructions: prompt.omit_control_instructions,
                     media,
                     cwd,
                     session_id,
@@ -3568,6 +3602,7 @@ mod tests {
                 "group",
                 RecoveryRecord {
                     prompt: "private prompt".to_owned(),
+                    omit_control_instructions: false,
                     cwd: repo.clone(),
                     session_id: "session".to_owned(),
                     media: Vec::new(),
@@ -3917,6 +3952,7 @@ mod tests {
                 "group",
                 RecoveryRecord {
                     prompt: "private prompt".to_owned(),
+                    omit_control_instructions: false,
                     media: vec![media],
                     cwd: repo,
                     session_id: "session".to_owned(),
@@ -3943,6 +3979,94 @@ mod tests {
         );
     }
 
+    struct RecoverableFailureBackend {
+        failure_mode: u8,
+    }
+
+    #[async_trait]
+    impl Backend for RecoverableFailureBackend {
+        async fn run(
+            &self,
+            _invocation: Invocation,
+            _tx: mpsc::Sender<RunnerEvent>,
+        ) -> std::result::Result<Outcome, RunFailure> {
+            if self.failure_mode != 0 {
+                return Err(RunFailure {
+                    error: if self.failure_mode == 1 {
+                        HarnessError::BackendTimedOut
+                    } else {
+                        HarnessError::BackendStream
+                    },
+                    observed_session: Some("saved-session".to_owned()),
+                });
+            }
+            Ok(Outcome {
+                observed_session: Some("saved-session".to_owned()),
+                exit_code: Some(1),
+                error_summary: None,
+                no_side_effects_proven: true,
+                stderr: String::new(),
+                elapsed_ms: 1,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn literal_retry_after_restart_preserves_exact_prompt() {
+        for failure_mode in 0..3 {
+            for goal in [None, Some("finish the task")] {
+                for literal in [true, false] {
+                    let root = tempfile::tempdir().unwrap();
+                    let home = root.path().join("home");
+                    let repo = home.join("repo");
+                    std::fs::create_dir_all(&repo).unwrap();
+                    let config = test_config(root.path());
+                    let server = spawn_final_server(&config.socket);
+                    let ctx = test_context_with_backend(
+                        root.path(),
+                        &home,
+                        config.clone(),
+                        Arc::new(RecoverableFailureBackend { failure_mode }),
+                    );
+                    ctx.sessions
+                        .set_workdir("group", repo.canonicalize().unwrap())
+                        .await
+                        .unwrap();
+                    ctx.sessions
+                        .set_goal("group", goal.map(str::to_owned))
+                        .await
+                        .unwrap();
+                    let (input, original) = if literal {
+                        ("  //status \n", "  /status \n")
+                    } else {
+                        ("ordinary task", "ordinary task")
+                    };
+                    dispatch_test_message(ctx.clone(), "failure", input).await;
+                    let saved = ctx.recovery.get("group").await.unwrap();
+                    assert_eq!(saved.prompt, original);
+                    assert_eq!(saved.omit_control_instructions, literal);
+                    drop(ctx);
+                    let backend = Arc::new(RecordingBackend::default());
+                    let restarted =
+                        test_context_with_backend(root.path(), &home, config, backend.clone());
+                    dispatch_test_message(restarted, "retry", "/retry-last").await;
+                    let invocations = backend.invocations.lock().await;
+                    assert_eq!(invocations.len(), 1);
+                    assert_eq!(invocations[0].session_id.as_deref(), Some("saved-session"));
+                    let mut expected = goal.map_or_else(
+                        || original.to_owned(),
+                        |goal| commands::apply_goal(goal, original),
+                    );
+                    if !literal {
+                        expected.push_str(crate::group_profile::INSTRUCTIONS);
+                    }
+                    assert_eq!(invocations[0].prompt.as_bytes(), expected.as_bytes());
+                    server.abort();
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn bridge_literal_and_goal_invoke_backend_once_with_exact_prompt() {
         let root = tempfile::tempdir().unwrap();
@@ -3957,22 +4081,39 @@ mod tests {
             .unwrap();
 
         dispatch_test_message(ctx.clone(), "literal", "  //status \n").await;
+        dispatch_test_message(ctx.clone(), "ordinary", "update the group name").await;
         dispatch_test_message(ctx.clone(), "set-goal", "/goal finish the migration").await;
         dispatch_test_message(ctx.clone(), "prompt", "check status").await;
+        dispatch_test_message(ctx.clone(), "literal-with-goal", "//status").await;
 
         let invocations = backend.invocations.lock().await;
-        assert_eq!(invocations.len(), 2);
-        assert_eq!(invocations[0].prompt, "  /status \n");
+        assert_eq!(invocations.len(), 4);
+        assert_eq!(invocations[0].prompt.as_bytes(), b"  /status \n");
         assert_eq!(
             invocations[1].prompt,
-            commands::apply_goal("finish the migration", "check status")
+            format!(
+                "update the group name{}",
+                crate::group_profile::INSTRUCTIONS
+            )
         );
         assert_eq!(
-            invocations[1]
+            invocations[2].prompt,
+            format!(
+                "{}{}",
+                commands::apply_goal("finish the migration", "check status"),
+                crate::group_profile::INSTRUCTIONS
+            )
+        );
+        assert_eq!(
+            invocations[2]
                 .prompt
                 .matches("Standing goal for this chat")
                 .count(),
             1
+        );
+        assert_eq!(
+            invocations[3].prompt,
+            commands::apply_goal("finish the migration", "/status")
         );
         drop(invocations);
         server.abort();
@@ -4749,7 +4890,10 @@ mod tests {
         persist_recovery_record(
             &store,
             "group",
-            "private prompt".to_owned(),
+            RecoveryPrompt {
+                text: "private prompt".to_owned(),
+                omit_control_instructions: false,
+            },
             Vec::new(),
             dir.path().join("repo"),
             "session".to_owned(),
@@ -4898,6 +5042,7 @@ mod tests {
         let recovery = RecoveryStore::load(dir.path().join("recovery.json")).unwrap();
         let record = RecoveryRecord {
             prompt: "private prompt".to_owned(),
+            omit_control_instructions: false,
             media: Vec::new(),
             cwd: home.join("repo").join("..").join("repo"),
             session_id: "session".to_owned(),
@@ -4955,7 +5100,10 @@ mod tests {
             "group1",
             Some(&known_session),
             home,
-            "prompt".to_owned(),
+            RecoveryPrompt {
+                text: "prompt".to_owned(),
+                omit_control_instructions: false,
+            },
             Vec::new(),
             &RunFailure {
                 error: HarnessError::AttachmentInvalid,
@@ -4989,7 +5137,10 @@ mod tests {
             "group1",
             None,
             home.clone(),
-            "private prompt".to_owned(),
+            RecoveryPrompt {
+                text: "private prompt".to_owned(),
+                omit_control_instructions: false,
+            },
             Vec::new(),
             &failure,
         )
@@ -5204,7 +5355,10 @@ mod tests {
             "group1",
             store.get("group1").await.as_ref(),
             home.join("repo"),
-            "private prompt".to_owned(),
+            RecoveryPrompt {
+                text: "private prompt".to_owned(),
+                omit_control_instructions: false,
+            },
             media.clone(),
             &failure,
         )
@@ -5238,7 +5392,10 @@ mod tests {
             "group2",
             None,
             home.clone(),
-            "private prompt".to_owned(),
+            RecoveryPrompt {
+                text: "private prompt".to_owned(),
+                omit_control_instructions: false,
+            },
             Vec::new(),
             &RunFailure {
                 error: HarnessError::BackendStream,
@@ -5259,6 +5416,7 @@ mod tests {
                 "group",
                 RecoveryRecord {
                     prompt: "private prompt".to_owned(),
+                    omit_control_instructions: false,
                     media: Vec::new(),
                     cwd: dir.path().join("repo"),
                     session_id: "session".to_owned(),

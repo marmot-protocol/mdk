@@ -134,7 +134,10 @@ pub(crate) fn chat_list_trigger_from_event(event: &MarmotAppEvent) -> ChatListUp
             GroupEvent::GroupCreated { .. } | GroupEvent::GroupJoined { .. } => {
                 ChatListUpdateTrigger::NewGroup
             }
-            GroupEvent::GroupStateChanged { .. }
+            GroupEvent::LocalGroupCopyTerminated { .. }
+            | GroupEvent::LocalGroupCopyRestored { .. }
+            | GroupEvent::GroupMemberLeavesRemoved { .. }
+            | GroupEvent::GroupStateChanged { .. }
             | GroupEvent::EpochChanged { .. }
             | GroupEvent::CommitRolledBack { .. }
             | GroupEvent::GroupStateInvalidated { .. }
@@ -166,7 +169,10 @@ pub(crate) fn chat_list_trigger_from_event(event: &MarmotAppEvent) -> ChatListUp
 
 fn group_id_from_event(event: &GroupEvent) -> &GroupId {
     match event {
-        GroupEvent::GroupCreated { group_id }
+        GroupEvent::LocalGroupCopyTerminated { group_id, .. }
+        | GroupEvent::LocalGroupCopyRestored { group_id }
+        | GroupEvent::GroupMemberLeavesRemoved { group_id, .. }
+        | GroupEvent::GroupCreated { group_id }
         | GroupEvent::GroupJoined { group_id, .. }
         | GroupEvent::TransportObjectResourceRefused { group_id, .. }
         | GroupEvent::MessageReceived { group_id, .. }

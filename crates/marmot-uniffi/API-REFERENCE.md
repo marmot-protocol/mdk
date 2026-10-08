@@ -1141,6 +1141,16 @@ pub fn parse_markdown(&self, text: String) -> MarkdownDocumentFfi
 
 Parse plaintext message content into the same Markdown AST returned on message and timeline records. Useful for draft previews and host-side fallback rendering.
 
+Local-time timestamps are `MarkdownInlineFfi::Timestamp { unix_seconds: i64, style:
+MarkdownTimestampStyleFfi }`, preserving signed seconds and a typed style rather
+than formatted text. The nine styles are `ShortTime`, `LongTime`, `ShortDate`,
+`LongDate`, `ShortDateTime` (the parser's default), `LongDateTime`, `CompactDateTime`,
+`CompactDateTimeSeconds` and `Relative`. Invalid syntax remains literal text.
+Hosts format using the device locale/timezone at render time, refresh after
+locale/timezone/clock changes and resume, and refresh visible `Relative` nodes as
+time passes. See [Markdown rendering](README.md#markdown-rendering) for the style
+mapping and optional absolute-time tooltip/accessibility guidance.
+
 [Source](src/commands/directory.rs#L66)
 
 ### `Marmot::user_profile`
@@ -2363,6 +2373,17 @@ send time, and an accepted open poll remains votable after conversation reclassi
 
 [Source](src/commands/message.rs#L254)
 
+### `Marmot::message_reactions`
+
+```rust
+pub fn message_reactions( &self, account_ref: String, group_id_hex: String, message_id_hex: String, ) -> Result<Vec<crate::conversions::TimelineUserReactionFfi>, MarmotKitError>
+```
+
+Read every effective user/emoji pair for an exact account/group/message. Use for reaction details, because conversation references contain only a bounded preview. Returns one local snapshot, ordered by timestamp/sender/emoji, with duplicate events collapsed to the latest pair. Blocked reactors and hidden, deleted, invalidated or retention-pruned targets are excluded. Run off the UI thread, refresh on installed conversation revisions, and discard results when the owning screen closes. No network work, localization or durable client cache is involved; records are caller-owned. See [conversation details](CONVERSATION-WINDOW.md#complete-reaction-details).
+
+[Source](src/commands/timeline.rs#L19)
+
+
 ### `Marmot::poll_votes`
 
 **Current.** Use for a "View votes" sheet that lists who chose each option.
@@ -2380,7 +2401,7 @@ last vote's `voted_at` and `voter_account_id_hex` while `has_more_after` is true
 votes from former members are not bounded by the current group size. Re-read from the start when the poll row is
 reprojected, and run this synchronous query off the UI thread. See [Polls](POLLS.md).
 
-[Source](src/commands/timeline.rs#L54)
+[Source](src/commands/timeline.rs#L83)
 
 ### `Marmot::messages`
 
@@ -3237,7 +3258,7 @@ pub fn message_edit_history( &self, account_ref: String, group_id_hex: String, t
 
 Accepted edit versions, oldest first within a latest-first page (1..=100). Supply both cursor fields from the first version to load older versions. Run this synchronous details query off the UI thread; screens already carry effective content.
 
-[Source](src/commands/timeline.rs#L12)
+[Source](src/commands/timeline.rs#L41)
 
 ### `Marmot::timeline_messages`
 
@@ -3249,7 +3270,7 @@ pub fn timeline_messages( &self, account_ref: String, query: TimelineMessageQuer
 
 Materialized conversation timeline for a group or account-wide tail.
 
-[Source](src/commands/timeline.rs#L99)
+[Source](src/commands/timeline.rs#L128)
 
 </details>
 
@@ -3339,6 +3360,21 @@ pub fn subscribe_blocked_users( &self, account_ref: String, ) -> Result<Arc<Bloc
 Observe block-list snapshots.
 
 [Source](src/commands/user_blocks.rs#L90)
+
+</details>
+
+<details>
+<summary>conversions/conversation_window.rs</summary>
+
+### `MessageDraftRevisionFfi::includes_chat_list_version`
+
+```rust
+pub fn includes_chat_list_version(&self, version: Arc<ChatListDraftVersionFfi>) -> bool
+```
+
+Compare a chat-list row’s opaque `draft_version` with this captured composer revision. True means the same account store/group and a version no newer than this revision; false includes foreign store/group metadata and newer identical edits. This is presentation correlation, not mutation authorization. Keep both values device-local and use revision-checked cleanup. See [pending-send draft presentation](CHAT-LIST-ROWS.md#pending-send-draft-presentation-unreleased).
+
+[Source](src/conversions/conversation_window.rs#L340)
 
 </details>
 
@@ -3449,7 +3485,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options. Existing constructors are compatibility wrappers around this entry point.
 
-[Source](src/lib.rs#L242)
+[Source](src/lib.rs#L243)
 
 ### `Marmot::new_with_options`
 
@@ -3461,7 +3497,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L258)
+[Source](src/lib.rs#L259)
 
 ### `Marmot::new`
 
@@ -3473,7 +3509,7 @@ pub fn new(root_path: String, relay_urls: Vec<String>) -> Result<Arc<Self>, Marm
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) via the default keychain-backed account home — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L286)
+[Source](src/lib.rs#L287)
 
 ### `Marmot::new_with_secret_store`
 
@@ -3485,7 +3521,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L304)
+[Source](src/lib.rs#L305)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -3497,7 +3533,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L334)
+[Source](src/lib.rs#L335)
 
 ### `Marmot::new_with_client_name`
 
@@ -3509,7 +3545,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels are omitted. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L353)
+[Source](src/lib.rs#L354)
 
 ### `Marmot::start`
 
@@ -3521,7 +3557,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L390)
+[Source](src/lib.rs#L391)
 
 ### `Marmot::shutdown`
 
@@ -3533,7 +3569,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L402)
+[Source](src/lib.rs#L403)
 
 ### `Marmot::shutdown_and_close`
 
@@ -3545,7 +3581,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L437)
+[Source](src/lib.rs#L438)
 
 ### `Marmot::storage_is_closed`
 
@@ -3557,7 +3593,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L445)
+[Source](src/lib.rs#L446)
 
 ### `Marmot::is_stopping`
 
@@ -3569,7 +3605,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L452)
+[Source](src/lib.rs#L453)
 
 </details>
 

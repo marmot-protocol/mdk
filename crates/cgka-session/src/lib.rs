@@ -1301,6 +1301,14 @@ impl AccountDeviceSession {
         Ok(self.engine.group_authority(group_id)?)
     }
 
+    /// Canonical leaf membership for device-scoped projection and token reconciliation.
+    pub fn canonical_group_membership(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<cgka_engine::group_authority::CanonicalGroupMembership> {
+        Ok(self.engine.canonical_group_membership(group_id)?)
+    }
+
     /// Compose host-owned persisted reads with compact live authority using
     /// this session's exact store and one deferred snapshot. The callback is
     /// synchronous/read-only; it must not access a different account store or

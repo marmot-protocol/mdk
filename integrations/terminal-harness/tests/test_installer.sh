@@ -5,7 +5,8 @@ set -euo pipefail
 # do not inherit an operator-selected profile from the test runner.
 unset MARMOT_HARNESS_EXECUTION_PROFILE
 
-kind="${1:?usage: test_installer.sh claude|codex|pi|opencode}"
+kind="${1:?usage: test_installer.sh claude|codex|pi|opencode|goose}"
+writable_profiles="autonomous unrestricted"
 case "$kind" in
     claude)
         connector_emoji="🦀"
@@ -42,6 +43,16 @@ case "$kind" in
         agent_service="wn-agent-harnesses.service"
         agent_launchd="org.marmot.wn-agent.harnesses"
         agent_label="terminal-harness-agent"
+        ;;
+    goose)
+        connector_emoji="🪿"
+        env_prefix="WN_GOOSE"
+        display_name="Goose"
+        default_home="$HOME/.marmot-agents/goose"
+        agent_service="wn-agent-goose.service"
+        agent_launchd="org.marmot.wn-agent.goose"
+        agent_label="goose-harness-agent"
+        writable_profiles="unrestricted"
         ;;
     *) echo "unsupported harness: $kind" >&2; exit 64 ;;
 esac
@@ -315,7 +326,7 @@ grep -F "Environment=\"$profile_env=inherit\"" "$unit_dir/$harness_service" >/de
 grep -F "$profile_env=inherit" \
     "$fixture_root/marmot-home/dev/$harness_binary.env" >/dev/null
 
-for profile in autonomous unrestricted; do
+for profile in $writable_profiles; do
     profile_log="$fixture_root/systemctl-profile-$profile.log"
     profile_args=(--execution-profile "$profile")
     if [ "$profile" = unrestricted ]; then
@@ -411,7 +422,7 @@ installer_stdin_dry_run="$(
     bash -s -- --dry-run --yes --no-service --allow-welcomer "$allow_hex" < "$shared_installer"
 )"
 
-for profile in inherit autonomous unrestricted; do
+for profile in inherit $writable_profiles; do
     profile_args=(--execution-profile "$profile")
     if [ "$profile" = unrestricted ]; then
         profile_args+=(--acknowledge-unrestricted)
@@ -439,6 +450,24 @@ env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
     || unacknowledged_status=$?
 [ "$unacknowledged_status" -ne 0 ]
 grep -F -- "--acknowledge-unrestricted is required" "$unacknowledged_stderr" >/dev/null
+
+if [ "$kind" = goose ]; then
+    autonomous_status=0
+    autonomous_stderr="$fixture_root/unsupported-autonomous.err"
+    env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
+        WN_AGENT_SHA="$fixture_version" \
+        MARMOT_RELEASE_TAG="wn-agent-v$fixture_version-test" \
+        "$installer" --dry-run --yes --no-service --allow-welcomer "$allow_hex" \
+            --execution-profile autonomous >/dev/null 2>"$autonomous_stderr" \
+        || autonomous_status=$?
+    [ "$autonomous_status" -ne 0 ]
+    grep -F "does not support the autonomous execution profile" "$autonomous_stderr" >/dev/null
+    goose_help="$("$installer" --help)"
+    case "$goose_help" in
+        *"--execution-profile PROFILE  inherit or unrestricted"*) ;;
+        *) echo "goose installer help advertises an unsupported execution profile" >&2; exit 1 ;;
+    esac
+fi
 
 custom_root="$fixture_parent/custom"
 installer_custom_socket_dry_run="$(

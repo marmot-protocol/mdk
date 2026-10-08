@@ -60,10 +60,12 @@ cargo test -p wn-claude
 cargo test -p wn-codex
 cargo test -p wn-opencode
 cargo test -p wn-pi
+cargo test -p wn-goose
 just claude-dev-e2e-connector
 just codex-dev-e2e-connector
 just opencode-dev-e2e-connector
 just pi-dev-e2e-connector
+just goose-dev-e2e-connector
 ```
 
 Run the matching `just <harness>-installer-test` recipes when changing installer

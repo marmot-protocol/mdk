@@ -4,6 +4,8 @@ Multi-account app runtime bridge (`MarmotApp`, `MarmotAppRuntime`) beneath `wn`,
 the human overview and host-facing API contracts (storage tiers, KeyPackage inventory, directory search, app-owned
 components, full-history repair, notices, blocking, moderation) see [`README.md`](README.md); do not restate them here.
 
+Implement shared behavior here, following [MDK's host boundary](../../docs/marmot-architecture/overview/app-core-boundary.md#host-app-boundary).
+
 ## Scope and module rules
 
 - Own the app-facing runtime that ties `AccountHome`, SQLCipher session storage, Nostr peeling, and Nostr transport

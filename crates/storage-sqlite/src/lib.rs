@@ -102,10 +102,10 @@ pub use connection::{
     SqliteTimingOperation, open_hardened_sqlcipher,
 };
 pub use message_drafts::{
-    MessageDraftCommitObserver, MessageDraftRevision, MessageDraftRevisionError,
-    SelectedMessageDraft, SelectedMessageDraftAttachment, SelectedMessageDraftContent,
-    StoredMessageDraft, StoredMessageDraftAttachment, StoredMessageDraftAttachmentSummary,
-    StoredMessageDraftSummary,
+    ChatListDraftVersion, MessageDraftCommitObserver, MessageDraftRevision,
+    MessageDraftRevisionError, SelectedMessageDraft, SelectedMessageDraftAttachment,
+    SelectedMessageDraftContent, StoredMessageDraft, StoredMessageDraftAttachment,
+    StoredMessageDraftAttachmentSummary, StoredMessageDraftSummary,
 };
 pub use openmls_storage::SqliteOpenMlsStorageError;
 pub use pending_welcome_delivery::PendingWelcomeDeliveryRecord;

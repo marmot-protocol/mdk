@@ -2,10 +2,52 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Native lifecycle events add `LocalGroupCopyTerminated`, `LocalGroupCopyRestored`,
+  and `GroupMemberLeavesRemoved`. Update exhaustive Swift/Kotlin event handling
+  and regenerate bindings with the matching native library. Restoration describes
+  retained-history repair, not automatic scheduler restoration of removed copies.
+
+- The optional opaque `ChatListDraftVersionFfi` object in
+  `PresentedChatRowFfi.draft_version` correlates the presented row's draft
+  metadata with a captured composer revision through
+  `MessageDraftRevisionFfi::includes_chat_list_version`. Regenerate Swift/Kotlin
+  bindings with the matching library. Host-constructed row records must pass
+  `nil` (Swift), `null` (Kotlin), or a version for the new optional field. Keep
+  these opaque versions device-local and use revision-checked draft cleanup
+  after local send acceptance. Identical-text saves advance the draft revision
+  and emit a complete replacement presented-list snapshot.
+- Attachment history adds `AttachmentRoleFfi` and the required, defaultless
+  `AttachmentEntryFfi.role` field. Regenerate Swift/Kotlin bindings with the
+  matching native library and update host record constructors and fixtures.
+  Gallery clients can exclude `InlineEmoji`; preserve slots and continue paging
+  after filtered pages as described in [the handoff](ATTACHMENT-HISTORY.md).
+
+### Added
+
+- Markdown tokens expose local-time timestamps through
+  `MarkdownInlineFfi::Timestamp { unix_seconds, style }` and all nine typed
+  `MarkdownTimestampStyleFfi` variants. Seconds remain signed and unformatted;
+  native renderers own locale/timezone formatting and visible relative-time
+  refresh. Update exhaustive inline switches with matching generated bindings.
+- `Marmot::message_reactions` returns complete local reaction details for one exact
+  account/group/message, with one effective entry per sender/emoji and no
+  conversation-preview cap. Missing, hidden, deleted, invalidated and
+  retention-pruned targets return no participants; blocked reactors are excluded.
+  The read performs no network work or conversation-history scan.
+  Regenerate matching Swift/Kotlin bindings to call `messageReactions`.
+
 ### Changed
 
 - `retired_relay_hosts()` no longer includes `relay.damus.io`, and
   `classify_relay_endpoints` now reports it as `Allowed`.
+
+### Fixed
+
+- Group activity uses shared per-commit reaction targets for authors and peers,
+  including commits preceding a disband. See `marmot-app`'s Unreleased fixes
+  for projection and push-token behavior.
 
 ## 0.12.0 - 2026-10-02
 

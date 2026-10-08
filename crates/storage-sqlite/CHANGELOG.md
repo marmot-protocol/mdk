@@ -2,12 +2,28 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Migration 0102 advances account storage to schema 102 on first open and
+  invalidates attachment-history versions when source emoji tags change.
+  Downgrade is unsupported. The public `AttachmentHistoryEntry` adds the required
+  `emoji_tags` field; update Rust struct literals. Selected entries read these
+  canonical source tags in the page snapshot without a history backfill.
+
 ### Added
 
 - Test-only `test-migrated-template` feature adds
   `SqliteAccountStorage::in_memory_from_migrated_template`, which copies one
   migrated in-memory database per process instead of replaying every migration
   for each open. Harnesses that open thousands of databases use it.
+
+### Fixed
+
+- Canonical push-token reconciliation removes absent account/device-leaf pairs
+  atomically with departed-account tombstones. A surviving sibling retains its
+  destinations and anti-resurrection tombstones; other groups are untouched.
+  Roster membership is materialized once per deletion statement instead of
+  rescanning the JSON roster for every stored destination.
 
 ## 0.12.0 - 2026-10-02
 

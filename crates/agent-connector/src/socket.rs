@@ -33,6 +33,8 @@ pub(crate) fn bind_connector_socket_with_owned_home(
     socket_mode: u32,
     owned_home: Option<&Path>,
 ) -> Result<(UnixListener, fs_private::UnixSocketInode), ConnectorError> {
+    fs_private::validate_private_unix_socket_path(socket)
+        .map_err(|_| ConnectorError::SocketPathTooLong)?;
     let _parent_guard = socket
         .parent()
         .map(|parent| prepare_socket_dir(parent, socket_dir_mode, owned_home))

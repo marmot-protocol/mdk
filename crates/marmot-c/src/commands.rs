@@ -88,7 +88,7 @@ use crate::types::telemetry::{
 };
 use crate::types::timeline::{
     MarmotPollType, MarmotPollVotePage, MarmotTimelineMessageQuery, MarmotTimelineMessageRecord,
-    MarmotTimelinePage,
+    MarmotTimelinePage, MarmotTimelineUserReactionList,
 };
 use crate::types::user_blocks::MarmotBlockedUserList;
 use crate::{MarmotClient, client_ref, ffi_guard, write_out};
@@ -522,6 +522,11 @@ macro_rules! c_cmd {
 }
 
 c_cmd! {
+    /// Read every effective sender/emoji pair for one visible message, off the UI thread.
+    /// Local snapshot; re-read on conversation changes. Missing/hidden/deleted/invalidated
+    /// targets yield an empty list. Free with `marmot_timeline_user_reaction_list_free`.
+    sync fn marmot_message_reactions(account_ref: str, group_id_hex: str, message_id_hex: str) -> rec(MarmotTimelineUserReactionList) = message_reactions;
+
     /// Read a bounded range (1..=1048576 bytes) from a local reference. No network fallback.
     /// Rechecks source visibility/expiry on every call. Offset at/beyond EOF returns
     /// available=true and empty bytes. An obsolete or wrong-account reference is unavailable.
@@ -2516,7 +2521,7 @@ pub unsafe extern "C" fn marmot_send_custom_event(
     })
 }
 
-/// Create an encrypted NIP-88 poll in a group conversation. Option ids use `"0"`
+/// Create an encrypted NIP-88 poll in a direct or group conversation. Option ids use `"0"`
 /// through `"9"`. Free `out` with `marmot_send_summary_free`.
 ///
 /// # Safety

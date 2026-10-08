@@ -178,13 +178,14 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Test Claude Code, Codex, Pi, and OpenCode installers
+      - name: Test Claude Code, Codex, Pi, OpenCode, and Goose installers
         run: |
           set -euo pipefail
           integrations/terminal-harness/tests/test_installer.sh claude
           integrations/terminal-harness/tests/test_installer.sh codex
           integrations/terminal-harness/tests/test_installer.sh pi
           integrations/terminal-harness/tests/test_installer.sh opencode
+          integrations/terminal-harness/tests/test_installer.sh goose
 
   rust-wasm-check:
     name: Rust WASM check
