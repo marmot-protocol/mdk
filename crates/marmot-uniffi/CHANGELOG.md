@@ -52,6 +52,9 @@
 
 ### Fixed
 
+- Android build preflight drains `rustup` output before accepting an installed
+  target, avoiding false missing-target errors from a broken pipe.
+
 - Group activity uses shared per-commit reaction targets for authors and peers,
   including commits preceding a disband. See `marmot-app`'s Unreleased fixes
   for projection and push-token behavior.
