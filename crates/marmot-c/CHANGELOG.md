@@ -12,11 +12,15 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 - File-backed media upload inputs, token-aware upload calls and operation
   cancellation/progress handles. New symbols and borrowed input records require
   matching headers/libraries; existing byte-array APIs retain their bounds.
+- Add `marmot_propose_onboarding_relay_repair` and nested typed relay-repair
+  preview records. `MarmotOnboardingRepairProposal` gains an optional
+  `relay_repair` pointer; regenerate and recompile with the matching header
+  and library. The preview is non-publishing, and `ManualReview` has no
+  approvable action.
 - The C event surface appends local-copy termination/restoration and removed-device-leaf
   events; existing discriminants remain unchanged. Recompile with the matching
   header and native library and handle the new event kinds. Restoration describes
   retained-history repair, not automatic scheduler restoration of removed copies.
-
 - `MarmotPresentedChatRow` gains a nullable row-owned `MarmotChatListDraftVersion` handle and
   `marmot_message_draft_revision_includes_chat_list_version` compares it against
   a borrowed selected revision. Both inputs are opaque read-only borrows; only
@@ -40,6 +44,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   Local-key accounts and separate remote signers can run in the same client.
 
 ### Changed
+
+- Relay-repair C preview content, tag fields and optional endpoints use JSON
+  string literals to preserve embedded NULs and all UTF-8 bytes. Decode once
+  with a length-aware parser before consent or editing. Pointer layouts and
+  snapshot frees are unchanged, but consumers must adopt the new encoding.
 
 - `MarmotAttachmentEntry` adds `role: MarmotAttachmentRole` (`Shared` or
   `InlineEmoji`) for gallery filtering without changing slot or acquisition identity.

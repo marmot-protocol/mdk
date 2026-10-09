@@ -34,6 +34,8 @@
 //! - `opt_rec f: M from F` — `Option<record>` → nullable owned `*mut M`.
 //! - `vec f/f_len: M from F` — `Vec<record>` → owned `(ptr, len)` pair.
 //! - `str_vec f/f_len` — `Vec<String>` → owned `(char**, len)` pair.
+//! - `json_str`, `json_opt_str`, `json_str_vec` — corresponding string forms
+//!   encoded as JSON string literals, preserving embedded NULs losslessly.
 //! - `bytes f/f_len` — `Vec<u8>` → owned `(u8*, len)` pair.
 //!
 //! cbindgen sees the expanded items (macro expansion is enabled in
@@ -67,6 +69,43 @@ macro_rules! c_mirror {
         )?
 
         $(crate::macros::c_list!($list, $name, $ffi, free $list_free);)?
+    };
+
+    (@munch [$($m:tt)*] $name:ident, $ffi:ty, $value:ident, $this:ident,
+        {$($sf:tt)*} {$($lets:tt)*} {$($names:tt)*} {$($fr:tt)*}
+        $(#[$fm:meta])* json_str $f:ident, $($rest:tt)*
+    ) => {
+        c_mirror!(@munch [$($m)*] $name, $ffi, $value, $this,
+            {$($sf)* $(#[$fm])* pub $f: *mut ::std::ffi::c_char,}
+            {$($lets)* let $f = crate::memory::owned_c_string(serde_json::to_string(&$value.$f).expect("JSON string encoding is infallible"));}
+            {$($names)* $f,}
+            {$($fr)* crate::memory::free_c_string($this.$f);}
+            $($rest)*);
+    };
+
+    (@munch [$($m:tt)*] $name:ident, $ffi:ty, $value:ident, $this:ident,
+        {$($sf:tt)*} {$($lets:tt)*} {$($names:tt)*} {$($fr:tt)*}
+        $(#[$fm:meta])* json_opt_str $f:ident, $($rest:tt)*
+    ) => {
+        c_mirror!(@munch [$($m)*] $name, $ffi, $value, $this,
+            {$($sf)* $(#[$fm])* pub $f: *mut ::std::ffi::c_char,}
+            {$($lets)* let $f = crate::memory::owned_opt_c_string($value.$f.map(|text| serde_json::to_string(&text).expect("JSON string encoding is infallible")));}
+            {$($names)* $f,}
+            {$($fr)* crate::memory::free_c_string($this.$f);}
+            $($rest)*);
+    };
+
+    (@munch [$($m:tt)*] $name:ident, $ffi:ty, $value:ident, $this:ident,
+        {$($sf:tt)*} {$($lets:tt)*} {$($names:tt)*} {$($fr:tt)*}
+        $(#[$fm:meta])* json_str_vec $f:ident/$fl:ident, $($rest:tt)*
+    ) => {
+        c_mirror!(@munch [$($m)*] $name, $ffi, $value, $this,
+            {$($sf)* $(#[$fm])* pub $f: *mut *mut ::std::ffi::c_char, pub $fl: usize,}
+            {$($lets)* let ($f, $fl) = crate::memory::owned_vec(
+                $value.$f.into_iter().map(|text| crate::memory::owned_c_string(serde_json::to_string(&text).expect("JSON string encoding is infallible"))).collect::<Vec<_>>());}
+            {$($names)* $f, $fl,}
+            {$($fr)* crate::memory::free_vec($this.$f, $this.$fl);}
+            $($rest)*);
     };
 
     // Terminal: emit struct, From, CFree from the four accumulators.

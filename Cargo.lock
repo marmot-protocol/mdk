@@ -3775,6 +3775,7 @@ dependencies = [
  "openmls_rust_crypto",
  "openssl",
  "opentelemetry-proto",
+ "parking_lot",
  "prost",
  "psl",
  "rand 0.8.6",
