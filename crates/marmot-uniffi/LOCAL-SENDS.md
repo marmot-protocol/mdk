@@ -118,11 +118,13 @@ submission needs freshly prepared references and a new token.
 `upload_media_files_with_client_token` has the same admission contract for
 file-backed attachments (`source_path` instead of a plaintext byte array). Every
 attachment is snapshotted, encrypted and uploaded before admission. Its
-`MediaFileTransferControlFfi` is the only cancellation input: cancelling before
-admission returns an error and admits nothing, and an upload that already
-completed is left unreferenced on the server. Dropping the host's wait is not a
-cancellation. Once the message is admitted, cancelling has no effect; use
-`local_send_status` and timeline delivery as for any token-bound send.
+`MediaFileTransferControlFfi` is the only cancellation input. Cancellation
+observed before admission starts returns an error and admits nothing; an upload
+that already completed is left unreferenced on the server. Dropping the host's
+wait is not cancellation. Once admission starts it is not interruptible, even
+before durable acceptance returns; use `local_send_status` and timeline delivery
+as for any token-bound send. File-backed uploads have no fixed worker-response
+timeout; per-endpoint network deadlines still apply.
 
 ## Conversation windows and draft cost
 

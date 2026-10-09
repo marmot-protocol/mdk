@@ -9384,7 +9384,7 @@ MarmotStatus marmot_verify_public_nostr_event_json(const char *event_json, uint8
 MarmotStatus marmot_media_file_transfer_control_new(struct MarmotMediaFileTransferControl **out);
 
 /**
- * Cancel before durable admission; already admitted delivery stays owned by the local-send queue.
+ * Cancel before admission starts; once admission starts, delivery belongs to the local-send queue.
  * # Safety
  * control must be live; no concurrent free.
  */

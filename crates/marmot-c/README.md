@@ -188,6 +188,9 @@ valid until return. Create one `MarmotMediaFileTransferControl` per call, query 
 cancel it from another thread, and free it only after all calls on the handle
 have returned. Results use the existing upload/submission deep-free functions.
 No host path is included in published attachment metadata.
+File-backed calls have no fixed worker-response timeout; per-endpoint network
+deadlines still apply. Cancellation observed before message admission starts
+prevents publication; admission is not interruptible once started.
 
 ## Local sends
 

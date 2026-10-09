@@ -119,6 +119,26 @@ int main(int argc, char **argv) {
     }
     const char *home = argv[1];
 
+    /* ---- file-transfer cancellation and progress (no client) ---------- */
+    MarmotMediaFileTransferControl *control = NULL;
+    check(marmot_media_file_transfer_control_new(&control) == MARMOT_STATUS_OK,
+          "file control creation");
+    uint8_t cancelled = 255;
+    check(marmot_media_file_transfer_control_is_cancelled(control, &cancelled) == MARMOT_STATUS_OK,
+          "file control cancellation read");
+    check(cancelled == 0, "file control starts active");
+    uint64_t processed = UINT64_MAX;
+    check(marmot_media_file_transfer_control_processed_bytes(control, &processed) == MARMOT_STATUS_OK,
+          "file control progress read");
+    check(processed == 0, "no bytes processed before transfer");
+    check(marmot_media_file_transfer_control_cancel(control) == MARMOT_STATUS_OK,
+          "file control cancellation");
+    check(marmot_media_file_transfer_control_is_cancelled(control, &cancelled) == MARMOT_STATUS_OK,
+          "cancelled file control read");
+    check(cancelled == 1, "file control cancellation persists");
+    marmot_media_file_transfer_control_free(control);
+    marmot_media_file_transfer_control_free(NULL);
+
     /* ---- argument validation + NULL-free discipline (no client) ------- */
     MarmotClient *client = NULL;
     MarmotStatus st = marmot_client_new(NULL, NULL, 0, &client);

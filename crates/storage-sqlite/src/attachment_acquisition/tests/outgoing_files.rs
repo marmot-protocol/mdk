@@ -209,6 +209,64 @@ fn held_file_import_rejects_lease_elapsed_during_reader_io() {
     assert_eq!(count(&store, "attachment_chunk_bodies"), 0);
 }
 
+#[test]
+fn restore_rechecks_deadlines() {
+    struct DelayedWriter(Vec<u8>);
+    impl std::io::Write for DelayedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    for deadline in ["lease", "source", "checkpoint"] {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        seed(&store, deadline);
+        let asset = request(&store, deadline);
+        let job = store
+            .claim_attachment_acquisition(&asset, 12, if deadline == "lease" { 13 } else { 100 })
+            .unwrap()
+            .unwrap();
+        let identity = partial_identity(BODY.len() as u64);
+        assert!(
+            store
+                .checkpoint_attachment_partial(&job, &identity, 0, BODY, 12, 10000)
+                .unwrap()
+        );
+        match deadline {
+            "source" => sql(&store, "UPDATE attachment_acquisition SET expires_at=13"),
+            "checkpoint" => sql(&store, "UPDATE attachment_partial SET expires_at=13"),
+            _ => {}
+        }
+        let mut writer = DelayedWriter(Vec::new());
+        let restored = store
+            .load_attachment_partial_to_writer(
+                &job,
+                12,
+                10000,
+                (&identity.ciphertext_digest, &identity.locator_digest),
+                &mut writer,
+            )
+            .unwrap();
+        assert_eq!(
+            writer.0, BODY,
+            "the final caller write crossed the deadline"
+        );
+        assert!(
+            restored.is_none(),
+            "{deadline} must fence the restored prefix"
+        );
+        if deadline == "checkpoint" {
+            assert_eq!(partial_usage(&store), 0);
+        }
+    }
+}
+
 fn held_file_import_deadline_control(source_expiry: bool, hold_at: u64, finish_time: u64) {
     use std::sync::atomic::{AtomicU64, Ordering};
     let store = SqliteAccountStorage::in_memory().unwrap();
@@ -633,6 +691,100 @@ fn shared_file_promotion_keeps_one_body_and_charges_each_source() {
     store.remove_local_attachment(GROUP, "file-b", 0).unwrap();
     assert_eq!(usage(&store), 0);
     assert_eq!(count(&store, "attachment_chunk_bodies"), 0);
+}
+
+#[test]
+fn promotion_defers_late_binding() {
+    promotion_snapshot_control(PromotionInterleave::LateBinding);
+}
+
+#[test]
+fn promotion_rechecks_expiry() {
+    promotion_snapshot_control(PromotionInterleave::Expiry);
+}
+
+enum PromotionInterleave {
+    LateBinding,
+    Expiry,
+}
+
+fn promotion_snapshot_control(interleave: PromotionInterleave) {
+    use crate::SqliteTimingOperation;
+    use cgka_traits::storage::StorageProvider;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let expires = matches!(interleave, PromotionInterleave::Expiry);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("promotion.sqlite");
+    let key = SqlCipherKey::new("synthetic-late-binding").unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    sent(&store, "late-binding");
+    let mut tokens = stage(&store, BODY, BODY.len() as u64, digest(), 10000, &|| false).unwrap();
+    tokens.extend(stage(&store, BODY, BODY.len() as u64, digest(), 10000, &|| false).unwrap());
+    tokens.sort();
+    let slot = selected("late-binding").slot;
+    store
+        .bind_attachment_uploads(&tokens[1..], &[(slot.clone(), digest())])
+        .unwrap();
+    if expires {
+        store
+            .bind_attachment_uploads(&tokens[..1], &[(slot.clone(), digest())])
+            .unwrap();
+        sql(&store, "UPDATE app_events SET retention_expires_at=13");
+    }
+    let writer = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let (snapshot_taken, waiting) = std::sync::mpsc::channel();
+    let reads = AtomicUsize::new(0);
+    store.set_timing_observer(Some(std::sync::Arc::new(move |operation, _, _| {
+        // The second acquisition reads the first body chunk: the candidate
+        // snapshot is frozen. Observation sends only; it never blocks.
+        if operation == SqliteTimingOperation::ConnectionWait
+            && reads.fetch_add(1, Ordering::SeqCst) == 1
+        {
+            snapshot_taken.send(()).unwrap();
+        }
+    })));
+    let worker_store = store.clone();
+    // WAL allows verification reads while this separate writer prevents
+    // promotion's BEGIN until the late binding has committed.
+    let promotion = writer
+        .with_transaction(|writer| -> StorageResult<_> {
+            let promotion = std::thread::spawn(move || {
+                worker_store.promote_attachment_uploads(GROUP, "late-binding", 12, 10000)
+            });
+            waiting
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            writer.bind_attachment_uploads(&tokens[..1], &[(slot, digest())])?;
+            if expires {
+                std::thread::sleep(std::time::Duration::from_millis(1100));
+            }
+            Ok(promotion)
+        })
+        .unwrap();
+    let promoted = promotion.join().unwrap().unwrap();
+    store.set_timing_observer(None);
+    assert_eq!(promoted, usize::from(!expires));
+    let quarantined: bool = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT quarantined FROM outgoing_attachment_uploads WHERE token=?1",
+            [&tokens[0]],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!quarantined, "a late binding is not a corrupt body");
+    assert_eq!(usage(&store), 2 * BODY.len() as u64);
+    if expires {
+        assert_eq!(count(&store, "attachment_acquisition"), 0);
+    } else {
+        let asset = store
+            .retained_attachment_asset(GROUP, "late-binding", "source-late-binding", 0, 12)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read(&store, &asset.reference), BODY);
+    }
 }
 
 fn sent(store: &SqliteAccountStorage, message: &str) {

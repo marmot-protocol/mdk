@@ -95,7 +95,7 @@ pub unsafe extern "C" fn marmot_media_file_transfer_control_new(
         MarmotStatus::Ok
     })
 }
-/// Cancel before durable admission; already admitted delivery stays owned by the local-send queue.
+/// Cancel before admission starts; once admission starts, delivery belongs to the local-send queue.
 /// # Safety
 /// control must be live; no concurrent free.
 #[unsafe(no_mangle)]
@@ -251,6 +251,9 @@ mod tests {
     use super::*;
     #[test]
     fn file_control_and_upload_out_preflight_are_null_safe() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let before = crate::memory::audit::live_allocations();
         unsafe {
             assert_eq!(
                 marmot_media_file_transfer_control_new(std::ptr::null_mut()),
@@ -309,6 +312,8 @@ mod tests {
                 MarmotStatus::NullPointer
             );
         }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), before);
         assert!(marmot_max_file_media_ciphertext_bytes() > 758_000_000);
     }
 }

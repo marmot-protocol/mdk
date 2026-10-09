@@ -9,6 +9,8 @@
   Downgrade is unsupported. The public `AttachmentHistoryEntry` adds the required
   `emoji_tags` field; update Rust struct literals. Selected entries read these
   canonical source tags in the page snapshot without a history backfill.
+- Migrations 0103 through 0106 advance account storage to schema 106 on first
+  open. Older binaries reject the upgraded database; downgrade is unsupported.
 
 ### Added
 
@@ -16,17 +18,15 @@
   `SqliteAccountStorage::in_memory_from_migrated_template`, which copies one
   migrated in-memory database per process instead of replaying every migration
   for each open. Harnesses that open thousands of databases use it.
-- Migration 0103 adds `outgoing_attachment_upload_bodies`, a narrow
-  never-updated body table for file-backed outgoing staging.
-  `SqliteAccountStorage::stage_attachment_upload_files` stages
+- `SqliteAccountStorage::stage_attachment_upload_files` stages
   `AttachmentUploadSource` readers and
   `complete_attachment_acquisition_from_reader` publishes authenticated
-  plaintext readers. Migration 0106 moves file bodies into shared immutable
-  `ATTACHMENT_STAGING_CHUNK_BYTES` (64 KiB) chunks with nonce-bound reservations
-  and short transactions, releasing the account lock during caller I/O.
-  Length, digest, cancellation and source/attempt validity gate publication;
-  failed imports release their own reservations. Outgoing promotion shares
-  verified chunks without copying the whole body. Bodies
+  plaintext readers. Both reserve the complete quota, verify length and digest,
+  and write protected `ATTACHMENT_STAGING_CHUNK_BYTES` (64 KiB) chunks with
+  nonce-bound reservations and short transactions, releasing the account lock
+  during caller I/O. Failed or cancelled imports release their reservations.
+  Migration 0106 lets outgoing file promotion share immutable chunks with retained
+  sources; legacy staged arrays use bounded incremental BLOB copies. File bodies
   use `MAX_RETAINED_FILE_ATTACHMENT_BYTES` (900 MiB); legacy arrays retain
   `MAX_RETAINED_ATTACHMENT_BYTES` (512 MiB). Migrations 0104/0105 preserve
   retained bodies and ciphertext checkpoints while widening file-backed
@@ -34,6 +34,11 @@
 
 ### Fixed
 
+- Outgoing promotion defers file bodies bound after its verification snapshot
+  without quarantining them or hiding a verified same-slot sibling. Source
+  expiry admission includes time spent verifying and waiting for storage.
+- File-backed checkpoint restore rechecks lease, source expiry and checkpoint
+  expiry after caller writes, including time spent copying the prefix.
 - Canonical push-token reconciliation removes absent account/device-leaf pairs
   atomically with departed-account tombstones. A surviving sibling retains its
   destinations and anti-resurrection tombstones; other groups are untouched.

@@ -1859,6 +1859,8 @@ impl AccountManager {
             })
             .await
             .map_err(|_| AppError::TransportClosed)?;
+        // File preparation and ordered endpoint attempts can outlast the legacy
+        // worker wait. Keep ownership until completion; HTTP bounds each attempt.
         let result = file_account_worker_response(response).await?;
         if result.sent.is_some() {
             self.schedule_audit_log_tracker_update("upload_media_send");

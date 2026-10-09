@@ -59,6 +59,8 @@
 
 ### Fixed
 
+- File-transfer cancellation documentation identifies admission start as the
+  last interruptible boundary, not the later durable acceptance.
 - Android build preflight drains `rustup` output before accepting an installed
   target, avoiding false missing-target errors from a broken pipe.
 
