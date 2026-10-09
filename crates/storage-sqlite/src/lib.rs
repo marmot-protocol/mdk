@@ -83,7 +83,8 @@ pub use chat_list::{
     AccountAttentionTotal, AccountUnreadTotal, ChatConversationKind, ChatListAttachmentKind,
     ChatListAvatar, ChatListCursor, ChatListMessageDeliveryState, ChatListMessagePreview,
     ChatListPage, ChatListPageDirection, ChatListPageError, ChatListPageQuery, ChatListQuery,
-    ChatListRow, ChatListView, ChatListWindowQuery, ChatListWindowRead, ChatPinError, ChatPinState,
+    ChatListRow, ChatListSelectionError, ChatListSelectionSnapshot, ChatListView,
+    ChatListWindowQuery, ChatListWindowRead, ChatPinError, ChatPinState,
     ExistingDirectConversation, conversation_kind, select_reusable_direct_conversation,
 };
 pub use chat_presentation::{
