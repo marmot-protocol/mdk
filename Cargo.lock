@@ -2744,7 +2744,6 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rustls",
- "rustls-native-certs",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -3778,7 +3777,7 @@ dependencies = [
  "openssl",
  "opentelemetry-proto",
  "parking_lot",
- "prost 0.14.3",
+ "prost",
  "psl",
  "rand 0.8.6",
  "reqwest",
@@ -4492,7 +4491,7 @@ checksum = "56d658ba1faf63f7b9c492cfbe6e0ec365440a16132d3270c1065f7b33f1b638"
 dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
- "prost 0.14.3",
+ "prost",
 ]
 
 [[package]]
@@ -4992,35 +4991,12 @@ dependencies = [
 
 [[package]]
 name = "prost"
-version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
-dependencies = [
- "bytes",
- "prost-derive 0.13.5",
-]
-
-[[package]]
-name = "prost"
 version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2ea70524a2f82d518bce41317d0fae74151505651af45faf1ffbd6fd33f0568"
 dependencies = [
  "bytes",
- "prost-derive 0.14.3",
-]
-
-[[package]]
-name = "prost-derive"
-version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
-dependencies = [
- "anyhow",
- "itertools 0.10.5",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
+ "prost-derive",
 ]
 
 [[package]]
@@ -5524,7 +5500,6 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rustls",
- "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -6219,15 +6194,8 @@ name = "sonar-stickers"
 version = "0.1.0"
 source = "git+https://github.com/hedwig-corp/bitchat-to-sonar?rev=162ac26c88b351dfa3f35d8f098c00a18ae46114#162ac26c88b351dfa3f35d8f098c00a18ae46114"
 dependencies = [
- "aes",
- "base64",
- "cbc",
  "hex",
- "hkdf 0.12.4",
- "hmac 0.12.1",
  "nostr 0.44.8",
- "prost 0.13.5",
- "reqwest",
  "serde",
  "sha2 0.10.9",
  "thiserror 2.0.18",
