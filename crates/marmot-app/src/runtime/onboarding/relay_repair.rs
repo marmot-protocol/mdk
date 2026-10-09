@@ -9,7 +9,7 @@ fn relay_tag_name(step: OnboardingStep) -> &'static str {
     }
 }
 
-fn relay_tag(step: OnboardingStep, fields: Vec<String>) -> OnboardingRelayTag {
+pub(super) fn relay_tag(step: OnboardingStep, fields: Vec<String>) -> OnboardingRelayTag {
     let relevant = fields
         .first()
         .is_some_and(|name| name == relay_tag_name(step));
@@ -37,7 +37,7 @@ fn relay_tag(step: OnboardingStep, fields: Vec<String>) -> OnboardingRelayTag {
     }
 }
 
-fn tag_change(
+pub(super) fn tag_change(
     tag: &OnboardingRelayTag,
     disposition: OnboardingRelayTagDisposition,
     before_index: Option<usize>,
@@ -55,7 +55,7 @@ fn tag_change(
     }
 }
 
-fn manual_review(
+pub(super) fn manual_review(
     event: Option<&NostrTransportEvent>,
     before_tags: Vec<OnboardingRelayTag>,
 ) -> OnboardingRelayRepair {
@@ -344,6 +344,7 @@ impl AccountManager {
         let manual = repair.mode == OnboardingRelayRepairMode::ManualReview;
         // A typed preview replaces any earlier append-only editor proposal.
         c.append_relays = false;
+        c.manual_relay_edit = false;
         c.snapshot.proposal = Some(OnboardingRepairProposal {
             step,
             revision: c

@@ -2310,7 +2310,7 @@ async fn defaults_append_relay_roles() {
             tags.len(),
             if step == OnboardingStep::Relays { 8 } else { 5 }
         );
-        // Explicit editor selections still replace rather than append.
+        // Explicit edits replace known endpoint roles but retain opaque tags.
         let replaced = manager
             .propose_onboarding_relays(
                 &id,
@@ -2333,7 +2333,21 @@ async fn defaults_append_relay_roles() {
         let checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
         let (tags, _, _) =
             relay_repair_event(&checkpoint, checkpoint.snapshot.proposal.as_ref().unwrap());
-        assert_eq!(tags.len(), 1);
+        let mut expected = if step == OnboardingStep::Relays {
+            vec![event.tags[6].clone()]
+        } else {
+            Vec::new()
+        };
+        expected.push(vec![
+            if step == OnboardingStep::Relays {
+                "r"
+            } else {
+                "relay"
+            }
+            .into(),
+            "wss://edit.example".into(),
+        ]);
+        assert_eq!(tags, expected);
     }
     runtime.shutdown_and_close().await.unwrap();
 }
@@ -5715,4 +5729,344 @@ async fn recovery_sign_out_refreshes_attention_before_worker_reap_finishes() {
     recovery.await.unwrap();
     runtime.shutdown_and_close().await.unwrap();
     removed.expect("signed-out account must disappear before worker cleanup finishes");
+}
+
+#[tokio::test]
+async fn manual_relay_edit_restart_preserves_preview_and_retries_exact_signed_event() {
+    let (directory, first, network, keys, id) = fixture().await;
+    let source = signed(
+        &keys,
+        10002,
+        vec![
+            vec!["client".into(), "keep".into()],
+            vec![
+                "r".into(),
+                "wss://read.example".into(),
+                "READ".into(),
+                "extension".into(),
+            ],
+            vec!["r".into(), "wss://write.example".into(), "write".into()],
+            vec!["r".into(), "wss://read.example".into(), "read".into()],
+            vec!["r".into(), retired_relay_fixture_endpoint()],
+        ],
+        "opaque content",
+        unix_now_seconds() - 1,
+    );
+    *network.events.lock() = vec![source.clone()];
+    let mut checkpoint = first
+        .accounts()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    checkpoint.set(OnboardingStep::Relays, OnboardingStatus::NeedsInput, vec![]);
+    checkpoint.records[OnboardingStep::Relays.index()] = Some(source.clone());
+    first.accounts().save_onboarding(&mut checkpoint).unwrap();
+    let preview = first
+        .accounts()
+        .propose_onboarding_relays(
+            &id,
+            OnboardingStep::Relays,
+            Some((
+                vec!["wss://read.example".into()],
+                vec!["wss://write.example".into()],
+            )),
+        )
+        .await
+        .unwrap();
+    let repair = preview
+        .proposal
+        .as_ref()
+        .unwrap()
+        .relay_repair
+        .as_ref()
+        .unwrap();
+    assert_eq!(repair.mode, OnboardingRelayRepairMode::RemovalOnly);
+    assert!(network.attempts.lock().is_empty());
+    let checkpoint = first
+        .accounts()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(checkpoint.version, 7);
+    let mut old_version = checkpoint.clone();
+    old_version.version = 6;
+    assert!(decode_onboarding_checkpoint(&serde_json::to_vec(&old_version).unwrap(), &id).is_err());
+    first.shutdown_and_close().await.unwrap();
+
+    let second = runtime(directory.path(), network.clone());
+    let restored = second.accounts().onboarding_snapshot(&id).unwrap().unwrap();
+    assert_eq!(restored.proposal, preview.proposal);
+    assert!(
+        second
+            .accounts()
+            .approve_onboarding_repair(&id, preview.revision - 1)
+            .await
+            .is_err()
+    );
+    assert!(network.attempts.lock().is_empty());
+    network.zero_acks.store(true, Ordering::SeqCst);
+    second
+        .accounts()
+        .approve_onboarding_repair(&id, preview.revision)
+        .await
+        .unwrap();
+    let published = network.attempts.lock()[0].clone();
+    assert_eq!(published.content, source.content);
+    assert_eq!(published.tags, source.tags[..4].to_vec());
+    second.shutdown_and_close().await.unwrap();
+
+    let third = runtime(directory.path(), network.clone());
+    third
+        .accounts()
+        .retry_onboarding_step(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    {
+        let attempts = network.attempts.lock();
+        assert!(attempts.len() >= 2 && attempts.iter().all(|event| event == &published));
+    }
+    third.shutdown_and_close().await.unwrap();
+}
+
+#[test]
+fn manual_relay_edit_preserves_untouched_tags_and_narrows_only_selected_roles() {
+    let keys = nostr::prelude::Keys::generate();
+    let source = signed(
+        &keys,
+        10002,
+        vec![
+            vec!["r".into(), "wss://both.example".into()],
+            vec!["client".into(), "keep".into()],
+            vec![
+                "r".into(),
+                "wss://write.example".into(),
+                "WRITE".into(),
+                "extra".into(),
+            ],
+            vec!["r".into(), "wss://write.example".into(), "write".into()],
+            vec![
+                "r".into(),
+                "wss://future.example".into(),
+                "future-role".into(),
+                "opaque".into(),
+            ],
+        ],
+        "opaque",
+        10,
+    );
+    let preview = relay_edits::manual_relay_edit(
+        OnboardingStep::Relays,
+        Some(&source),
+        &["wss://both.example".into(), "wss://new.example".into()],
+        &["wss://write.example".into(), "wss://new.example".into()],
+    );
+    assert_eq!(preview.mode, OnboardingRelayRepairMode::RemovalAndAdditive);
+    assert_eq!(preview.proposed_content, "opaque");
+    let mut expected = source.tags.clone();
+    expected[0].push("read".into());
+    expected.push(vec!["r".into(), "wss://new.example".into()]);
+    assert_eq!(
+        preview
+            .after_tags
+            .iter()
+            .map(|tag| tag.fields.clone())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    let unchanged = relay_edits::manual_relay_edit(
+        OnboardingStep::Relays,
+        Some(&source),
+        &["wss://both.example".into()],
+        &["wss://both.example".into(), "wss://write.example".into()],
+    );
+    assert_eq!(unchanged.mode, OnboardingRelayRepairMode::ManualReview);
+}
+
+#[test]
+fn manual_relay_edit_matches_equivalent_urls_without_rewriting_signed_tags() {
+    let keys = nostr::prelude::Keys::generate();
+    for (step, kind, name, role) in [
+        (OnboardingStep::Relays, 10002, "r", Some("read")),
+        (OnboardingStep::InboxRelays, 10050, "relay", None),
+    ] {
+        let mut tag = vec![name.into(), "wss://KEEP.example:443/".into()];
+        if let Some(role) = role {
+            tag.push(role.into());
+        }
+        tag.push("extension".into());
+        let source = signed(&keys, kind, vec![tag.clone(), tag], "opaque", 10);
+        let preview = relay_edits::manual_relay_edit(
+            step,
+            Some(&source),
+            &["wss://keep.example".into()],
+            &[],
+        );
+        assert_eq!(preview.mode, OnboardingRelayRepairMode::ManualReview);
+        assert_eq!(
+            preview
+                .after_tags
+                .iter()
+                .map(|tag| tag.fields.clone())
+                .collect::<Vec<_>>(),
+            source.tags,
+        );
+    }
+    let added = relay_edits::manual_relay_edit(
+        OnboardingStep::Relays,
+        None,
+        &[
+            "wss://KEEP.example:443/".into(),
+            "wss://keep.example".into(),
+        ],
+        &["wss://keep.example/".into()],
+    );
+    assert_eq!(added.after_tags.len(), 1);
+    assert_eq!(added.after_tags[0].role, OnboardingRelayTagRole::Unmarked);
+    assert_eq!(
+        added.after_tags[0].endpoint.as_deref(),
+        Some("wss://KEEP.example:443/")
+    );
+}
+
+#[tokio::test]
+async fn manual_relay_edit_inbox_preview_preserves_extensions_and_rejects_tampering() {
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let source = signed(
+        &keys,
+        10050,
+        vec![
+            vec!["relay".into(), "wss://keep.example".into(), "extra".into()],
+            vec!["client".into(), "keep".into()],
+            vec!["relay".into(), "wss://keep.example".into()],
+            vec!["relay".into(), retired_relay_fixture_endpoint()],
+        ],
+        "opaque inbox",
+        unix_now_seconds() - 1,
+    );
+    *network.events.lock() = vec![source.clone()];
+    let mut checkpoint = runtime
+        .accounts()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    checkpoint.records[OnboardingStep::InboxRelays.index()] = Some(source.clone());
+    checkpoint.set(
+        OnboardingStep::InboxRelays,
+        OnboardingStatus::NeedsInput,
+        vec![],
+    );
+    runtime.accounts().save_onboarding(&mut checkpoint).unwrap();
+    let preview = runtime
+        .accounts()
+        .propose_onboarding_relays(
+            &id,
+            OnboardingStep::InboxRelays,
+            Some((vec!["wss://keep.example".into()], vec![])),
+        )
+        .await
+        .unwrap();
+    let repair = preview
+        .proposal
+        .as_ref()
+        .unwrap()
+        .relay_repair
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        repair
+            .after_tags
+            .iter()
+            .map(|tag| tag.fields.clone())
+            .collect::<Vec<_>>(),
+        source.tags[..3]
+    );
+    let original = runtime
+        .accounts()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    for variant in 0..4 {
+        let mut changed = original.clone();
+        let proposal = changed.snapshot.proposal.as_mut().unwrap();
+        match variant {
+            0 => proposal
+                .relay_repair
+                .as_mut()
+                .unwrap()
+                .proposed_content
+                .push_str("changed"),
+            1 => proposal.relay_repair = None,
+            2 => proposal.read_relays.clear(),
+            _ => {
+                proposal.read_relays = vec![retired_relay_fixture_endpoint()];
+                proposal.relay_repair = Some(relay_edits::manual_relay_edit(
+                    OnboardingStep::InboxRelays,
+                    Some(&source),
+                    &proposal.read_relays,
+                    &[],
+                ));
+            }
+        }
+        runtime
+            .accounts()
+            .app
+            .account_home()
+            .set_account_onboarding(&id, &serde_json::to_vec(&changed).unwrap())
+            .unwrap();
+        assert!(
+            runtime
+                .accounts()
+                .approve_onboarding_repair(&id, preview.revision)
+                .await
+                .is_err()
+        );
+        assert!(network.attempts.lock().is_empty());
+    }
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn manual_relay_edit_unchanged_selection_cannot_publish() {
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let source = signed(
+        &keys,
+        10002,
+        vec![vec!["r".into(), "wss://keep.example".into()]],
+        "",
+        unix_now_seconds() - 1,
+    );
+    let mut checkpoint = runtime
+        .accounts()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    checkpoint.records[OnboardingStep::Relays.index()] = Some(source);
+    checkpoint.set(OnboardingStep::Relays, OnboardingStatus::NeedsInput, vec![]);
+    runtime.accounts().save_onboarding(&mut checkpoint).unwrap();
+    let preview = runtime
+        .accounts()
+        .propose_onboarding_relays(
+            &id,
+            OnboardingStep::Relays,
+            Some((
+                vec!["wss://keep.example".into()],
+                vec!["wss://keep.example".into()],
+            )),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !preview.steps[OnboardingStep::Relays.index()]
+            .actions
+            .contains(&OnboardingAction::ApproveRepair)
+    );
+    assert!(
+        runtime
+            .accounts()
+            .approve_onboarding_repair(&id, preview.revision)
+            .await
+            .is_err()
+    );
+    assert!(network.attempts.lock().is_empty());
+    runtime.shutdown_and_close().await.unwrap();
 }
