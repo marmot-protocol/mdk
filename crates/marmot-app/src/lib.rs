@@ -497,6 +497,8 @@ pub struct MarmotApp {
     member_key_package_prewarm_cache: Arc<Mutex<directory::MemberKeyPackagePrewarmCache>>,
     legacy_directory_cache_checked: Arc<Mutex<bool>>,
     #[cfg(test)]
+    directory_test_clock: Option<Arc<std::sync::atomic::AtomicU64>>,
+    #[cfg(test)]
     directory_cache_open_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     directory_handle_acquire_count: Arc<std::sync::atomic::AtomicUsize>,
@@ -1517,6 +1519,8 @@ impl MarmotApp {
             )),
             legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
             #[cfg(test)]
+            directory_test_clock: None,
+            #[cfg(test)]
             directory_cache_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             directory_handle_acquire_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1605,6 +1609,8 @@ impl MarmotApp {
                 directory::MemberKeyPackagePrewarmCache::default(),
             )),
             legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
+            #[cfg(test)]
+            directory_test_clock: None,
             #[cfg(test)]
             directory_cache_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -1894,6 +1900,9 @@ impl MarmotApp {
             cursor_audit_placements,
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),
+            pending_applied_effects: Default::default(),
+            pending_resumed_message_notifications: Default::default(),
+            pending_push_leaf_reconciliations: Default::default(),
             pending_failed_sync_summary: SyncSummary::default(),
             explicit_history_window_certified: false,
             recovery_job_network_cut: false,
@@ -3675,9 +3684,10 @@ impl MarmotApp {
     }
 
     /// Ingest inbound push-token gossip (kinds 447/448/449) into
-    /// `group_push_tokens`. `active_member_ids` is the carrying group's current
-    /// MLS member set; entries are owner-authenticated and bound to it by
-    /// [`notifications::verify_push_gossip_for_profile`] before the spec's
+    /// `group_push_tokens`. `active_leaves` is the carrying group's current
+    /// authenticated account/device roster. Owners are verified by
+    /// [`notifications::verify_push_gossip_for_profile`]; token upserts must also
+    /// name a live device leaf before the spec's
     /// `(owner_ts, record_digest)` ordering primitive and tombstones (enforced by
     /// the storage `apply_*` calls) decide what mutates state. Because authority
     /// comes from each record's `owner_sig`, a kind 448 may carry — and apply —
@@ -3686,7 +3696,7 @@ impl MarmotApp {
         &self,
         account_ref: &str,
         message: &ReceivedMessage,
-        active_member_ids: &[String],
+        active_leaves: &[cgka_traits::engine::GroupMemberLeaf],
         profile: cgka_traits::group::ProtocolProfile,
     ) -> Result<(), AppError> {
         let account = self.account_home().account(account_ref)?;
@@ -3695,16 +3705,29 @@ impl MarmotApp {
         let storage = self.account_storage(&account.label)?;
         let action =
             notifications::parse_push_gossip(message.kind, &group_id_hex, &message.plaintext)?;
+        let active_leaves = active_leaves
+            .iter()
+            .map(|leaf| (hex::encode(leaf.member.as_slice()), leaf.leaf_index))
+            .collect::<std::collections::HashSet<_>>();
+        let active_member_ids = active_leaves
+            .iter()
+            .map(|(member, _)| member.clone())
+            .collect::<Vec<_>>();
         let action = notifications::verify_push_gossip_for_profile(
             action,
             &group_id_hex,
-            active_member_ids,
+            &active_member_ids,
             profile,
         );
         match action {
             notifications::PushGossipAction::Upsert(records) => {
                 for record in records {
-                    storage.apply_group_push_token(&account_group_push_token_from_app(&record))?;
+                    // A valid account signature does not make a departed
+                    // sibling leaf eligible for a notification destination.
+                    if active_leaves.contains(&(record.member_id_hex.clone(), record.leaf_index)) {
+                        storage
+                            .apply_group_push_token(&account_group_push_token_from_app(&record))?;
+                    }
                 }
             }
             notifications::PushGossipAction::Remove(removals) => {
@@ -3726,16 +3749,26 @@ impl MarmotApp {
         Ok(())
     }
 
-    pub(crate) fn remove_group_push_tokens_for_member(
+    /// Apply immutable engine leaf-departure facts through the account-scoped storage boundary.
+    pub(crate) fn remove_group_push_tokens_for_leaves(
         &self,
         account_ref: &str,
         group_id_hex: &str,
-        member_id_hex: &str,
+        leaves: &[cgka_traits::engine::GroupMemberLeaf],
+        departed_members: &[MemberId],
     ) -> Result<(), AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
+        let leaves = leaves
+            .iter()
+            .map(|leaf| (hex::encode(leaf.member.as_slice()), leaf.leaf_index))
+            .collect::<Vec<_>>();
+        let departed_members = departed_members
+            .iter()
+            .map(|member| hex::encode(member.as_slice()))
+            .collect::<Vec<_>>();
         self.account_storage(&account.label)?
-            .remove_group_push_tokens_for_member(group_id_hex, member_id_hex)?;
+            .remove_group_push_tokens_for_leaves(group_id_hex, &leaves, &departed_members)?;
         Ok(())
     }
 
@@ -3904,6 +3937,24 @@ impl MarmotApp {
                 DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER,
             )?;
         Ok(())
+    }
+
+    /// Reconcile hydrated canonical device leaves through account-scoped storage.
+    pub(crate) fn reconcile_group_push_token_leaves(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        leaves: &[cgka_traits::engine::GroupMemberLeaf],
+    ) -> Result<usize, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        let leaves = leaves
+            .iter()
+            .map(|leaf| (hex::encode(leaf.member.as_slice()), leaf.leaf_index))
+            .collect::<Vec<_>>();
+        Ok(self
+            .account_storage(&account.label)?
+            .reconcile_group_push_token_leaves(group_id_hex, &leaves)?)
     }
 
     pub(crate) fn remove_stale_group_push_tokens(

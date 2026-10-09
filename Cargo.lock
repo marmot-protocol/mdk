@@ -2607,7 +2607,6 @@ dependencies = [
 [[package]]
 name = "hpke-rs-libcrux"
 version = "0.7.0"
-
 dependencies = [
  "hpke-rs-crypto",
  "libcrux-aead",
@@ -3756,6 +3755,9 @@ dependencies = [
  "nostr 0.45.5",
  "nostr-relay-builder",
  "nostr-sdk",
+ "openmls",
+ "openmls_basic_credential",
+ "openmls_rust_crypto",
  "opentelemetry-proto",
  "prost",
  "psl",
@@ -3769,6 +3771,7 @@ dependencies = [
  "storage-sqlite",
  "tempfile",
  "thiserror 2.0.18",
+ "tls_codec",
  "tokio",
  "tokio-tungstenite 0.26.2",
  "tokio-util",

@@ -43,30 +43,9 @@ Prerequisites:
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
 Versioned `wn-agent-v*` releases publish `wn-agent`, `wn-goose`, checksums, and
-a same-user service installer. Verify the installer before executing it:
+a same-user service installer. Define the [verified installer helper](../../README.md#verified-installer-helper) first, then run this command in the same shell with `install_verified`:
 
 ```sh
-install_verified() (
-  set -eu
-  installer_url="$1"
-  checksum_url="$2"
-  shift 2
-  installer_script="${installer_url##*/}"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
-  curl -fsSL "$installer_url" -o "$tmpdir/$installer_script"
-  curl -fsSL "$checksum_url" -o "$tmpdir/$installer_script.sha256"
-  if command -v shasum >/dev/null 2>&1; then
-    (cd "$tmpdir" && shasum -a 256 -c "$installer_script.sha256")
-  elif command -v sha256sum >/dev/null 2>&1; then
-    (cd "$tmpdir" && sha256sum -c "$installer_script.sha256")
-  else
-    echo "error: need shasum or sha256sum to verify the installer" >&2
-    exit 1
-  fi
-  bash "$tmpdir/$installer_script" "$@"
-)
-
 base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
 install_verified "$base_url/install-goose-marmot.sh" \
   "$base_url/install-goose-marmot.sh.sha256" \

@@ -1,5 +1,6 @@
 mod cache;
 mod cached_search;
+mod key_package_recovery;
 mod member_key_packages;
 mod methods;
 mod open_ranking;

@@ -10,7 +10,8 @@ engine behavior.
   `Inline` nodes.
 - Recognizes Nostr entities inline: bare `@npub1…` handles (`Inline::NostrMention`) and explicit `nostr:<hrp>1…`
   references (`Inline::NostrUri`), and classifies private-key destinations as sensitive.
-- Does not parse general HTML. Tag-like sequences stay literal text; only autolinks and the `<details>` extension get
+- Parses local-time timestamps into `Inline::Timestamp` with Unix seconds and a typed display style.
+- Does not parse general HTML. Tag-like sequences stay literal text; only autolinks, timestamps and the `<details>` extension get
   structured treatment.
 - Keeps dependencies minimal (`serde` only in normal builds).
 
@@ -77,6 +78,45 @@ This is a block-oriented extension, not a general HTML parser:
 - Body blank-line counts align with `body` and saturate at
   `MAX_SOURCE_BLANK_LINES`. Delimiter-only lines are not blocks. Blanks before
   the closer stay inside the disclosure.
+
+## Device-local timestamps
+
+`<t:1791280800:F>` produces `Timestamp { unix_seconds: 1791280800, style: LongDateTime }`.
+The instant stays unchanged when the user travels. The renderer formats it using the device's current timezone and
+locale, including daylight-saving rules at that instant.
+
+Timestamp syntax uses seconds, not milliseconds. These case-sensitive styles are supported:
+
+| Style | AST style | Display |
+| --- | --- | --- |
+| `t` | `ShortTime` | Hours and minutes |
+| `T` | `LongTime` | Hours, minutes and seconds |
+| `d` | `ShortDate` | Numeric date |
+| `D` | `LongDate` | Long date with a month name |
+| `f` (default) | `ShortDateTime` | Long date and short time |
+| `F` | `LongDateTime` | Weekday, long date and short time |
+| `s` | `CompactDateTime` | Numeric date and short time |
+| `S` | `CompactDateTimeSeconds` | Numeric date and time including seconds |
+| `R` | `Relative` | Live relative time, such as `in 30 minutes` or `2 hours ago` |
+
+`<t:1791280800>` is equivalent to `<t:1791280800:f>`. Signed decimal `i64` seconds are accepted, including dates
+before 1970. Unknown styles, overflow, whitespace inside a token, and malformed tokens remain literal text.
+Escaped/entity-encoded tokens, code and math do not become timestamps. Timestamps can appear in formatted text,
+link labels, headings, tables and details summaries.
+
+The parser does not read a clock or cache a formatted string. Renderers must:
+
+- Format absolute styles with current device locale, timezone and hour-cycle preferences.
+- Reformat visible timestamps after timezone, locale or clock changes and on resume. Recreate cached formatters
+  when their device settings change; reparsing the message is unnecessary.
+- Refresh visible `Relative` nodes as time passes, in both past and future directions. Use the current clock each
+  time; calendar phrases such as `next Monday` depend on the local calendar and locale.
+- Provide an absolute local date/time for relative-node tooltips or accessibility descriptions.
+- Keep out-of-range instants inert and readable if the platform formatter cannot represent them; do not crash or
+  wrap seconds when converting to platform time units.
+
+The AST and bindings provide the instant and style, not a timer or a UI widget. This repository does not contain
+the mobile timestamp renderer.
 
 ## Run the tests
 

@@ -19,12 +19,65 @@ canonical [White Noise + Agents quickstart](../../README.md#get-started-white-no
 
 ## Contents
 
+- [What you can do](#what-you-can-do)
+- [First-install checklist](#first-install-checklist)
 - [Install (Claude Code Already Installed)](#install-claude-code-already-installed)
 - [Manual Setup](#manual-setup)
 - [Chat Commands](#chat-commands)
 - [Configuration](#configuration)
 - [Security Notes](#security-notes)
 - [Development](#development)
+
+## What you can do
+
+For task titles and progress reactions, use the shared
+[recommended chat setup](../../README.md#recommended-chat-setup), including
+admin promotion and the phone acceptance test. Agent policy is in
+[the integration instructions](../../AGENTS.md#suggested-agent-chat-instructions).
+Each ordinary turn exposes the shared `wn-agent group-profile` route for
+admin name/description updates. Verify that the installed release includes it,
+`wn-agent` is on the backend's PATH, and the backend's shell/sandbox policy permits
+access to the connector socket. See [Admin group profile updates](#admin-group-profile-updates).
+Progress reactions require a separately configured tool; the harness has none built in.
+
+- **Work through Claude Code from your phone.** Send a prompt from an authorized
+  White Noise account and use the backend's configured model and tools.
+  Every allowed message activates the harness; mentioning the agent is not required.
+
+- **Continue or reset the conversation.** Claude Code keeps a private UUID session for each chat and resumes that exact session. Completed main-conversation assistant text, including messages between tool calls, reaches the phone; reasoning and tool output do not.
+  `/new` resets the backend session while retaining the project.
+
+- **Know the file contract.** This adapter accepts text-only prompts. Any attachment batch, including its caption, is rejected before the backend runs. Generated-file return is not implemented.
+
+Project selection (`/cd`), standing instructions (`/goal`), and recovery
+commands share the [terminal-harness command guide](../../terminal-harness/README.md#chat-commands).
+
+Tool access, credentials and model choices come from the backend's native
+configuration and the [execution profile](../../terminal-harness/README.md#execution-profiles).
+The harness does not implement mention activation, reaction tools
+or live previews. An interactive backend's slash commands are not automatically
+available through this chat; shared harness commands are handled locally.
+
+## First-install checklist
+
+Follow the [shared terminal-harness first-install guide](../../terminal-harness/README.md#first-installation-and-verification)
+before the release command below. It covers the two services, matching home and
+socket, sender authorization, manual environment loading, independent instance
+state, execution policy and the required phone/model round trip.
+
+Verify Claude Code's native login and an ordinary local print-mode turn under
+the service user. `WN_CLAUDE_BIN` / `--claude-bin` selects its executable; the
+connector does not provision credentials, change model settings or reproduce
+interactive TUI onboarding. Select a trusted project before prompting: print
+mode skips the workspace-trust dialog, and `inherit` can deny unanswered
+permission requests. Choose another execution profile only as an explicit
+operator decision, not as an installation workaround.
+
+Use a text-only first phone prompt. This backend rejects any non-empty
+attachment batch before Claude Code starts, including the accompanying text;
+there is no generated-file export or `MEDIA:` handling. The shared harness has
+other backends with file support, but their capabilities are not inherited by
+`wn-claude`. Do not resume its connector-owned UUID in another Claude client.
 
 ## Install (Claude Code Already Installed)
 
@@ -38,29 +91,16 @@ Prerequisites:
 Versioned `wn-agent-v*` releases publish `wn-agent`, `wn-claude`, checksums, and
 a same-user service installer. Verify the installer before executing it:
 
-```sh
-install_verified() (
-  set -eu
-  installer_url="$1"
-  checksum_url="$2"
-  shift 2
-  installer_script="${installer_url##*/}"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
-  curl -fsSL "$installer_url" -o "$tmpdir/$installer_script"
-  curl -fsSL "$checksum_url" -o "$tmpdir/$installer_script.sha256"
-  if command -v shasum >/dev/null 2>&1; then
-    (cd "$tmpdir" && shasum -a 256 -c "$installer_script.sha256")
-  elif command -v sha256sum >/dev/null 2>&1; then
-    (cd "$tmpdir" && sha256sum -c "$installer_script.sha256")
-  else
-    echo "error: need shasum or sha256sum to verify the installer" >&2
-    exit 1
-  fi
-  bash "$tmpdir/$installer_script" "$@"
-)
+First copy the [verified installer helper](../../README.md#verified-installer-helper)
+into this shell. Then select the release documented here:
 
+```sh
 base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
+```
+
+Run this example in the same shell where `install_verified` was defined.
+
+```sh
 install_verified "$base_url/install-claude-marmot.sh" \
   "$base_url/install-claude-marmot.sh.sha256" \
   --yes --allow-welcomer npub1...
@@ -88,18 +128,28 @@ inherited-pipe descendants as well as the direct process.
 Install and authenticate Claude Code normally, then run an isolated `wn-agent`
 identity and the harness:
 
+In terminal 1, run the daemon only if its service is not already running:
+
 ```sh
 export MARMOT_HOME="$HOME/.marmot-agents/claude"
 export MARMOT_AGENT_SOCKET="$MARMOT_HOME/dev/wn-agent.sock"
-export WN_CLAUDE_ALLOWED_SENDERS_HEX="..."
-
+export WN_CLAUDE_ALLOWED_SENDERS_HEX="<phone-public-key-as-64-hex-characters>"
 wn-agent --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
+```
 
+In terminal 2, export the same settings again, bootstrap the single sender in
+this example, then start the harness only if its service is not already running:
+
+```sh
+export MARMOT_HOME="$HOME/.marmot-agents/claude"
+export MARMOT_AGENT_SOCKET="$MARMOT_HOME/dev/wn-agent.sock"
+export WN_CLAUDE_ALLOWED_SENDERS_HEX="<phone-public-key-as-64-hex-characters>"
 wn-agent bootstrap --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" \
-  --label claude-harness-agent --allow-welcomer "$WN_CLAUDE_ALLOWED_SENDERS_HEX" --qr
-
+  --label claude-harness-agent --allow-welcomer "$WN_CLAUDE_ALLOWED_SENDERS_HEX" \
+  --relay wss://relay.eu.whitenoise.chat \
+  --relay wss://relay.us.whitenoise.chat --qr
 wn-claude
 ```
 
