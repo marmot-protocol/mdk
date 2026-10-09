@@ -13,8 +13,8 @@
 
 - `MarmotAppRuntime::create_identity_local_ready_with_initial_profile` makes a
   caller-selected profile the first public kind-0 of a generated account, so
-  contacts never see the key-derived default name. A resumed setup adopts it
-  only before bootstrap publication starts.
+  contacts never see the key-derived default name. A resumed setup that
+  already cached a profile returns the one its bootstrap publishes.
 
 - `AccountManager::propose_onboarding_relay_repair` previews exact ordered
   tags, content and minimal relay changes without signing or publishing.

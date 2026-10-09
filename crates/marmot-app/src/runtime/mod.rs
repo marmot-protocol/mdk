@@ -5340,9 +5340,9 @@ impl MarmotAppRuntime {
     ///
     /// The profile replaces the key-derived default before any bootstrap
     /// record can reach a relay, so recipients never see a temporary name.
-    /// A resumed setup adopts it only while bootstrap publication has not
-    /// started; once a profile may be public, later changes are ordinary
-    /// profile edits.
+    /// A resumed setup that already cached a profile keeps it once local
+    /// readiness may have scheduled publication, and returns the profile that
+    /// publication sends; later changes are ordinary profile edits.
     pub async fn create_identity_local_ready_with_initial_profile(
         &self,
         mut request: AccountSetupRequest,
@@ -5605,39 +5605,37 @@ impl MarmotAppRuntime {
 
         let profile_started = Instant::now();
         let profile_result = (|| {
-            // Before bootstrap publication starts, no kind-0 can be public, so
-            // a caller-selected profile still replaces any cached default.
-            if let Some(mut profile) = initial_profile.filter(|_| {
-                matches!(
-                    phase,
-                    AccountSetupPhase::LocalStateCreated | AccountSetupPhase::LocalReady
-                )
-            }) {
-                stamp_published_profile_created_at(&mut profile, unix_now_seconds());
-                self.accounts
-                    .app
-                    .remember_directory_profile(&account.account_id_hex, &profile)?;
-                Ok(profile)
-            } else if let Some(profile) = self
+            let cached = self
                 .accounts
                 .app
                 .directory_entry_for_account_id(&account.account_id_hex)?
-                .and_then(|entry| entry.profile)
-            {
-                Ok(profile)
-            } else {
-                let pseudonym = default_profile_pseudonym(&account.account_id_hex);
-                let profile = UserProfileMetadata {
-                    name: Some(pseudonym.clone()),
-                    display_name: Some(pseudonym),
-                    created_at: unix_now_seconds(),
-                    ..UserProfileMetadata::default()
-                };
-                self.accounts
-                    .app
-                    .remember_directory_profile(&account.account_id_hex, &profile)?;
-                Ok::<_, AppError>(profile)
-            }
+                .and_then(|entry| entry.profile);
+            // Only `LocalStateCreated` excludes a background bootstrap, which
+            // captures the cached profile off this lock before it records
+            // publication. Later, return what that bootstrap publishes.
+            let profile = match (cached, initial_profile) {
+                (Some(cached), Some(_)) if phase != AccountSetupPhase::LocalStateCreated => {
+                    return Ok(cached);
+                }
+                (None, None) => {
+                    let pseudonym = default_profile_pseudonym(&account.account_id_hex);
+                    UserProfileMetadata {
+                        name: Some(pseudonym.clone()),
+                        display_name: Some(pseudonym),
+                        created_at: unix_now_seconds(),
+                        ..UserProfileMetadata::default()
+                    }
+                }
+                (Some(cached), None) => return Ok(cached),
+                (_, Some(mut selected)) => {
+                    stamp_published_profile_created_at(&mut selected, unix_now_seconds());
+                    selected
+                }
+            };
+            self.accounts
+                .app
+                .remember_directory_profile(&account.account_id_hex, &profile)?;
+            Ok::<_, AppError>(profile)
         })();
         self.shared.app_performance_telemetry().record(
             AppPerformanceOperation::AccountSetupProfileLocal,
