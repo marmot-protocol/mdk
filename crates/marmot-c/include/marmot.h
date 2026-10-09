@@ -178,6 +178,9 @@ enum MarmotStatus
    */
   MARMOT_STATUS_ATTACHMENT_ACCOUNT_SIGNED_OUT = 94,
   MARMOT_STATUS_INVALID_APP_COMPONENT = 95,
+  MARMOT_STATUS_CHAT_SELECTION_CLOSED = 96,
+  MARMOT_STATUS_CHAT_SELECTION_STALE = 97,
+  MARMOT_STATUS_CHAT_SELECTION_INVALID_PAGE = 98,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -1184,6 +1187,8 @@ typedef struct MarmotBlockListSubscription MarmotBlockListSubscription;
  * Read-only marker owned by its presented row. Borrow only while the row is live.
  */
 typedef struct MarmotChatListDraftVersion MarmotChatListDraftVersion;
+
+typedef struct MarmotChatListSelection MarmotChatListSelection;
 
 /**
  * Opaque handle to one account's durable chat-list projection: an
@@ -5360,6 +5365,17 @@ typedef struct MarmotAccountAttentionSnapshot {
   struct MarmotAccountAttentionEntry *accounts;
   uintptr_t accounts_len;
 } MarmotAccountAttentionSnapshot;
+
+typedef struct MarmotChatSelectionSummary {
+  uint64_t revision;
+  uint64_t count;
+} MarmotChatSelectionSummary;
+
+typedef struct MarmotChatSelectionPage {
+  struct MarmotChatSelectionSummary summary;
+  char **group_ids;
+  uintptr_t group_ids_len;
+} MarmotChatSelectionPage;
 
 typedef struct MarmotConversationWindowRevision {
   char *generation;
@@ -10630,6 +10646,71 @@ MarmotStatus marmot_chat_list_window_subscription_return_to_top(const struct Mar
                                                                 struct MarmotChatListWindowSnapshot **out);
 
 /**
+ * Capture all eligible IDs in one fixed native view; no display-row hydration.
+ * # Safety
+ * client and account_ref must be live; out must be writable. View is a validated
+ * MarmotChatListView discriminant. Free the returned handle before its client.
+ */
+MarmotStatus marmot_capture_chat_list_selection(const struct MarmotClient *client,
+                                                const char *account_ref,
+                                                uint32_t view,
+                                                struct MarmotChatListSelection **out);
+
+/**
+ * Complete count and revision; deep-free with marmot_chat_selection_summary_free.
+ * # Safety
+ * selection must be live for the call and out writable.
+ */
+MarmotStatus marmot_chat_list_selection_count(const struct MarmotChatListSelection *selection,
+                                              struct MarmotChatSelectionSummary **out);
+
+/**
+ * At most 200 frozen IDs; revision must match the current selection.
+ * Deep-free the page with marmot_chat_selection_page_free.
+ * # Safety
+ * selection must be live for the call and out writable.
+ */
+MarmotStatus marmot_chat_list_selection_page(const struct MarmotChatListSelection *selection,
+                                             uint64_t revision,
+                                             uint64_t offset,
+                                             uint32_t limit,
+                                             struct MarmotChatSelectionPage **out);
+
+/**
+ * Remove one frozen ID, never add an externally supplied ID. Returns new count/revision.
+ * # Safety
+ * selection and borrowed group_id_hex must be live; out writable.
+ */
+MarmotStatus marmot_chat_list_selection_deselect(const struct MarmotChatListSelection *selection,
+                                                 uint64_t revision,
+                                                 const char *group_id_hex,
+                                                 struct MarmotChatSelectionSummary **out);
+
+/**
+ * Remove no-longer-eligible IDs before an action. All old pages become stale;
+ * each command still enforces its own authorization and mutation preconditions.
+ * # Safety
+ * selection must be live for the call and out writable.
+ */
+MarmotStatus marmot_chat_list_selection_revalidate(const struct MarmotChatListSelection *selection,
+                                                   uint64_t revision,
+                                                   struct MarmotChatSelectionSummary **out);
+
+/**
+ * Idempotent close, without freeing the handle. Pending operations return closed.
+ * # Safety
+ * selection must be live for the call.
+ */
+MarmotStatus marmot_chat_list_selection_close(const struct MarmotChatListSelection *selection);
+
+/**
+ * Close and free; NULL is a no-op. Previously returned results remain caller-owned.
+ * # Safety
+ * selection must be NULL or a library-owned handle with no active calls.
+ */
+void marmot_chat_list_selection_free(struct MarmotChatListSelection *selection);
+
+/**
  * Take the initial snapshot once; a second call returns CLOSED. Result must be deep-freed.
  * # Safety
  * sub must be live and out writable.
@@ -11808,6 +11889,26 @@ void marmot_presented_chat_list_snapshot_free(struct MarmotPresentedChatListSnap
  * this library.
  */
 void marmot_presented_chat_list_update_free(struct MarmotPresentedChatListUpdate *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_chat_selection_summary_free(struct MarmotChatSelectionSummary *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_chat_selection_page_free(struct MarmotChatSelectionPage *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL

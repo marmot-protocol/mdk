@@ -81,13 +81,16 @@ lease and is never persisted.
 `chat_list_selection_count` returns the full frozen count; `chat_list_selection_page` returns at most 200 IDs from
 an offset in the captured order. New arrivals, activity reordering and window eviction do not expand that intent.
 `revalidate_chat_list_selection` returns its still-eligible subset in the original order, never adding new IDs.
+`deselect_chat_list_selection_id` removes an explicitly unchecked ID after validating the store lifetime;
+an absent/foreign ID is a no-op and cannot expand intent.
 Use the returned snapshot for subsequent validation to retain removals. Batch actions must revalidate first and
 still enforce their own mutation preconditions: this read is not an atomic authorization for a later write.
 
 Capture and revalidation use O(eligible IDs) work and memory, independently of profile/history size; each page
-copies at most 200 IDs. This storage primitive does not implement automatic-folder expressions, binding handles
-or host selection UI. Those callers must retain account/view generations, explicit cancellation and progress
-while resolving complete intent instead of deriving it from visible rows.
+copies at most 200 IDs. The app runtime's `capture_chat_list_selection` exposes a lifecycle-bound fixed-view
+handle with count, bounded pages, deselection, remove-only revalidation and close. Automatic-folder expressions
+and host selection UI remain separate contracts. Callers must retain account/view generations and resolve
+complete intent instead of deriving it from visible rows.
 
 ## Migrations
 

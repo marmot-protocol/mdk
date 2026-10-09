@@ -43,6 +43,61 @@ fn install_mock_keyring() {
     });
 }
 
+#[tokio::test]
+async fn chat_selection_binding_count_page_close_and_unknown_account() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().unwrap();
+    let kit = Marmot::new(
+        tmp.path().to_string_lossy().into_owned(),
+        vec!["wss://relay.invalid.test".into()],
+    )
+    .unwrap();
+    assert!(matches!(
+        kit.capture_chat_list_selection("missing".into(), marmot_uniffi::ChatListViewFfi::Chats)
+            .await,
+        Err(MarmotKitError::UnknownAccount { .. })
+    ));
+    let account = AccountHome::open_with_default_keychain(tmp.path())
+        .unwrap()
+        .create_nostr_account()
+        .unwrap();
+    let selection = kit
+        .capture_chat_list_selection(account.label, marmot_uniffi::ChatListViewFfi::Chats)
+        .await
+        .unwrap();
+    assert_eq!(
+        selection.count().await.unwrap(),
+        marmot_uniffi::ChatSelectionSummaryFfi {
+            revision: 0,
+            count: 0
+        }
+    );
+    assert!(
+        selection
+            .page(0, 0, 200)
+            .await
+            .unwrap()
+            .group_ids
+            .is_empty()
+    );
+    assert!(matches!(
+        selection.page(0, 0, 201).await,
+        Err(MarmotKitError::ChatSelectionInvalidPage)
+    ));
+    assert_eq!(selection.revalidate(0).await.unwrap().revision, 1);
+    assert!(matches!(
+        selection.page(0, 0, 1).await,
+        Err(MarmotKitError::ChatSelectionStale)
+    ));
+    selection.close();
+    selection.close();
+    assert!(matches!(
+        selection.count().await,
+        Err(MarmotKitError::ChatSelectionClosed)
+    ));
+    kit.shutdown_and_close().await.unwrap();
+}
+
 struct CapturedAuditUpload {
     method: String,
     path: String,

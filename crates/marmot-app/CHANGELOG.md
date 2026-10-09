@@ -11,6 +11,12 @@
 
 ### Added
 
+- `MarmotAppRuntime::capture_chat_list_selection` exposes complete frozen
+  fixed-view selection independently of display pagination. Handles serialize
+  revision-fenced count/page/deselect/revalidate commands and close on reset,
+  shutdown or explicit cancellation. Revalidation only removes IDs and does
+  not grant mutation authority. Automatic-folder predicates remain separate.
+
 - `AccountManager::propose_onboarding_relay_repair` previews exact ordered
   tags, content and minimal relay changes without signing or publishing.
   Approval retains the existing revision and source-event checks; typed

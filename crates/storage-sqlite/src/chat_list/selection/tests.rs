@@ -33,6 +33,44 @@ fn ids(store: &SqliteAccountStorage, snapshot: &ChatListSelectionSnapshot) -> Ve
 }
 
 #[test]
+fn explicit_deselection_only_removes_and_checks_the_store_lifetime() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    for id in ["01", "02"] {
+        seed(&store, id, false, "member", 0, false);
+    }
+    let mut selection = store
+        .chat_list_selection_snapshot(ChatListView::Chats)
+        .unwrap();
+    assert!(
+        !store
+            .deselect_chat_list_selection_id(&mut selection, "ff")
+            .unwrap()
+    );
+    assert!(
+        store
+            .deselect_chat_list_selection_id(&mut selection, "01")
+            .unwrap()
+    );
+    assert!(
+        !store
+            .deselect_chat_list_selection_id(&mut selection, "01")
+            .unwrap()
+    );
+    assert_eq!(ids(&store, &selection), ["02"]);
+    let foreign = SqliteAccountStorage::in_memory().unwrap();
+    assert!(matches!(
+        foreign.deselect_chat_list_selection_id(&mut selection, "02"),
+        Err(ChatListSelectionError::StaleSelection)
+    ));
+    assert_eq!(ids(&store, &selection), ["02"]);
+    store.close().unwrap();
+    assert!(matches!(
+        store.deselect_chat_list_selection_id(&mut selection, "02"),
+        Err(ChatListSelectionError::Storage(StorageError::Closed(_)))
+    ));
+}
+
+#[test]
 fn complete_selection_is_independent_of_the_display_limit() {
     for count in [0, 1, 49, 50, 51, 100, 101, 201, 500] {
         let store = SqliteAccountStorage::in_memory().unwrap();

@@ -9,6 +9,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Fixed-view `MarmotChatListSelection` capture/count/page/deselect/revalidate/
+  close/free calls and owned summary/page deep frees. Append selection closed,
+  stale and invalid-page statuses96–98 without changing existing values.
+  Capture and local mutations preflight output pointers; close is terminal.
+  Rebuild with matching headers/libraries. Automatic-folder predicates remain separate.
+
 - File-backed media upload inputs, token-aware upload calls and operation
   cancellation/progress handles. New symbols and borrowed input records require
   matching headers/libraries; existing byte-array APIs retain their bounds.

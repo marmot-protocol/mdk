@@ -32,6 +32,13 @@ runtime-owned subscriptions plus typed events; explicit catch-up remains availab
 The runtime exposes account status, group listing/showing, message listing, and snapshot-plus-live subscription APIs,
 so CLI, TUI, and native surfaces never open the databases directly.
 
+`capture_chat_list_selection` captures complete fixed-view intent separately
+from display windows. Its account-local handle provides revision-fenced counts,
+bounded ID pages, deselection, remove-only revalidation and terminal close.
+Reset/shutdown invalidates pending results. Automatic-folder predicates and
+bulk-command authorization remain separate; see the
+[shared selection contract](../marmot-uniffi/CHAT-LIST-ROWS.md#complete-fixed-view-selection).
+
 **Startup.** `MarmotAppRuntime::start()` returns at local readiness: persisted account sessions are hydrated and
 worker-routed local reads are available. Relay activation, group-subscription registration, shared-directory
 synchronization, and initial catch-up continue asynchronously. Hosts should render local chat projections at that

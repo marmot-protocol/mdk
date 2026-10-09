@@ -657,6 +657,11 @@ Existing chat-list APIs remain available.
 independent account attention. See the [native handoff contract](../../docs/marmot-architecture/further-context/chat-projections-native.md)
 for paging, sequence handling, cancellation, C ownership, and compatibility.
 
+`captureChatListSelection` provides complete frozen fixed-view intent separately
+from display windows. Its handle supplies revision-fenced count/pages,
+deselection, remove-only revalidation and terminal close. Automatic-folder
+predicates remain a separate contract; see [complete fixed-view selection](CHAT-LIST-ROWS.md#complete-fixed-view-selection).
+
 ## Prepared conversation windows
 
 `openConversationWindow` combines history, header/capabilities, visible identities,

@@ -322,6 +322,27 @@ pub enum MarmotKitError {
     ConversationWindowMessageNotRetained,
     #[error("invalid app component: {details}")]
     InvalidAppComponent { details: String },
+    #[error("chat selection is closed; capture a new selection")]
+    ChatSelectionClosed,
+    #[error("chat selection changed; use the current revision")]
+    ChatSelectionStale,
+    #[error("chat selection pages require 1 to 200 IDs and an offset within the selection")]
+    ChatSelectionInvalidPage,
+}
+
+impl From<marmot_app::ChatSelectionError> for MarmotKitError {
+    fn from(value: marmot_app::ChatSelectionError) -> Self {
+        use marmot_app::ChatListSelectionError as S;
+        use marmot_app::ChatSelectionError as E;
+        match value {
+            E::Closed | E::Selection(S::StaleSelection) => Self::ChatSelectionClosed,
+            E::StaleRevision => Self::ChatSelectionStale,
+            E::Selection(S::InvalidPage) => Self::ChatSelectionInvalidPage,
+            E::Selection(S::ProjectionNotReady) => Self::ChatPresentationNotReady,
+            E::Selection(S::Storage(error)) => AppError::from(error).into(),
+            E::App(error) => error.into(),
+        }
+    }
 }
 
 impl From<AppError> for MarmotKitError {
@@ -1043,6 +1064,30 @@ impl From<marmot_app::ChatListWindowError> for MarmotKitError {
 #[cfg(test)]
 mod screen_error_tests {
     use super::*;
+    #[test]
+    fn chat_selection_errors_preserve_revision_close_and_retryable_preparation() {
+        use marmot_app::{ChatListSelectionError as S, ChatSelectionError as E};
+        assert!(matches!(
+            MarmotKitError::from(E::Closed),
+            MarmotKitError::ChatSelectionClosed
+        ));
+        assert!(matches!(
+            MarmotKitError::from(E::StaleRevision),
+            MarmotKitError::ChatSelectionStale
+        ));
+        assert!(matches!(
+            MarmotKitError::from(E::Selection(S::StaleSelection)),
+            MarmotKitError::ChatSelectionClosed
+        ));
+        assert!(matches!(
+            MarmotKitError::from(E::Selection(S::InvalidPage)),
+            MarmotKitError::ChatSelectionInvalidPage
+        ));
+        assert!(matches!(
+            MarmotKitError::from(E::Selection(S::ProjectionNotReady)),
+            MarmotKitError::ChatPresentationNotReady
+        ));
+    }
     #[test]
     fn conversation_errors_preserve_retry_revision_and_close_classification() {
         use marmot_app::ConversationWindowError as W;

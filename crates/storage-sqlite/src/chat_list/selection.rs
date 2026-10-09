@@ -111,6 +111,21 @@ impl SqliteAccountStorage {
         })
     }
 
+    /// Explicit deselection only removes an existing frozen ID. It never
+    /// consults display rows or admits IDs supplied by a different account.
+    pub fn deselect_chat_list_selection_id(
+        &self,
+        selection: &mut ChatListSelectionSnapshot,
+        group_id_hex: &str,
+    ) -> Result<bool, ChatListSelectionError> {
+        self.check_selection_lifetime(selection)?;
+        self.connection
+            .with_deferred_read(|conn| check_epoch(conn, selection))?;
+        let before = selection.group_ids.len();
+        selection.group_ids.retain(|id| id != group_id_hex);
+        Ok(selection.group_ids.len() != before)
+    }
+
     fn check_selection_lifetime(
         &self,
         selection: &ChatListSelectionSnapshot,

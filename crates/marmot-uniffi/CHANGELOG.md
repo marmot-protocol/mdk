@@ -28,6 +28,12 @@
 
 ### Added
 
+- `capture_chat_list_selection` and the `ChatListSelection` object expose complete
+  fixed-view count, revision-fenced ID pages, deselection, remove-only action
+  revalidation and terminal close. Three typed selection errors distinguish
+  closed intent, stale revision and invalid pages. Folder predicates remain
+  separate; use matching generated bindings and native libraries.
+
 - `Marmot::propose_onboarding_relay_repair` previews a lossless relay-list repair
   without signing or publishing. `OnboardingRepairProposalFfi.relay_repair` carries
   the typed before/after tags, exact diff, restored capabilities and ManualReview
