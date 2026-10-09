@@ -25,8 +25,8 @@ fn relay_tag(step: OnboardingStep, fields: Vec<String>) -> OnboardingRelayTag {
     } else {
         match fields.get(2).map(String::as_str) {
             None => OnboardingRelayTagRole::Unmarked,
-            Some("read") => OnboardingRelayTagRole::Read,
-            Some("write") => OnboardingRelayTagRole::Write,
+            Some(marker) if marker.eq_ignore_ascii_case("read") => OnboardingRelayTagRole::Read,
+            Some(marker) if marker.eq_ignore_ascii_case("write") => OnboardingRelayTagRole::Write,
             _ => OnboardingRelayTagRole::Other,
         }
     };

@@ -330,7 +330,9 @@ Imported identities can use the durable preflight API instead of `login`:
    explicit `continue_onboarding_without`. Empty follow lists are valid.
 4. `propose_onboarding_relay_repair` previews the smallest safe change to a
    general or inbox relay declaration, preserving the original ordered tags,
-   duplicate/custom entries, direction markers, and content. Show its typed
+   duplicate/custom entries, direction markers, and content. NIP-65 read/write
+   markers are interpreted case-insensitively; their spelling and trailing
+   extension fields remain unchanged in the preview and published event. Show its typed
    before/after diff and repair mode. `ManualReview` cannot be approved; prefill
    a manual editor from the original tags or offer a separately labeled reset.
    No proposal signs or publishes until explicit approval. The older
