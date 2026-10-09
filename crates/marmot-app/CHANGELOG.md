@@ -21,6 +21,21 @@
   conversation-preview cap. Missing, hidden, deleted, invalidated and
   retention-pruned targets return no participants; blocked reactors are excluded.
   The read performs no network work or conversation-history scan.
+- `MarmotAppRuntime::upload_media_files` and
+  `upload_media_files_with_client_token` upload file-backed attachments
+  (`MediaFileUploadRequest`, `MediaFileTransferControl`) without whole-file
+  byte arrays: sources are snapshotted and encrypted into owner-only files
+  under the account's `media-staging/` before the first PUT, with the existing
+  wire format, ordered server fallback on identical ciphertext and the
+  existing publication and local-send admission. Optional retention streams
+  into SQLCipher through `stage_attachment_upload_files` and stays bounded by
+  the file-backed 900 MiB ceiling while preserving the account quota.
+  Explicit large acquisitions use private file sinks, bounded authenticated
+  decryption and ciphertext Range checkpoints. Legacy arrays retain their
+  smaller limits. Cancellation observed before admission starts publishes
+  nothing; admission itself is not interruptible. File uploads wait for their
+  size-bounded endpoint attempts without the legacy 16-minute response timeout.
+  File uploads require the server descriptor's `sha256` and `size`. (#2175)
 
 ### Changed
 
@@ -31,6 +46,11 @@
 
 ### Fixed
 
+- File acquisition enforces disk reserve with or without resumable validators,
+  saves interrupted ciphertext tails, retries a rejected resumed representation
+  from zero without consuming redirect hops, and discards responses exceeding
+  their advertised total. Completed files keep progress in ciphertext units.
+  Cancelled file upload completion releases staging even when `send` is false.
 - Lossless relay repairs accept case-insensitive NIP-65 read/write markers,
   matching relay-list inspection while preserving their original spelling
   and extension fields through approval and publication.

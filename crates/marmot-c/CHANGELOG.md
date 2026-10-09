@@ -9,6 +9,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- File-backed media upload inputs, token-aware upload calls and operation
+  cancellation/progress handles. New symbols and borrowed input records require
+  matching headers/libraries; existing byte-array APIs retain their bounds.
 - Add `marmot_propose_onboarding_relay_repair` and nested typed relay-repair
   preview records. `MarmotOnboardingRepairProposal` gains an optional
   `relay_repair` pointer; regenerate and recompile with the matching header

@@ -713,6 +713,7 @@ fn storage_error_kind(error: &StorageError) -> &'static str {
         StorageError::Capacity(_) => "storage_capacity",
         StorageError::Closed(_) => "storage_closed",
         StorageError::UnsupportedSchemaVersion { .. } => "storage_unsupported_schema_version",
+        StorageError::InvalidAttachmentBody(_) => "storage_invalid_attachment_body",
         StorageError::Backend(_) => "storage_backend",
         StorageError::Serialization(_) => "storage_serialization",
     }

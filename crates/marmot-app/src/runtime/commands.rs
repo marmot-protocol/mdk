@@ -1827,12 +1827,40 @@ impl AccountManager {
             .send(AccountWorkerCommand::UploadMedia {
                 admission,
                 group_id: group_id.clone(),
-                request,
+                request: crate::media::file_transfer::MediaUploadPayload::Bytes(request),
                 respond,
             })
             .await
             .map_err(|_| AppError::TransportClosed)?;
         let result = long_account_worker_response(response).await?;
+        if result.sent.is_some() {
+            self.schedule_audit_log_tracker_update("upload_media_send");
+        }
+        Ok(result)
+    }
+
+    pub(crate) async fn upload_media_files(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        request: crate::MediaFileUploadRequest,
+        control: std::sync::Arc<crate::MediaFileTransferControl>,
+    ) -> Result<MediaUploadResult, AppError> {
+        control.check()?;
+        let (command, admission) = self.media_worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::UploadMedia {
+                admission,
+                group_id: group_id.clone(),
+                request: crate::media::file_transfer::MediaUploadPayload::Files(request, control),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        // File preparation and ordered endpoint attempts can outlast the legacy
+        // worker wait. Keep ownership until completion; HTTP bounds each attempt.
+        let result = response.await.map_err(|_| AppError::TransportClosed)??;
         if result.sent.is_some() {
             self.schedule_audit_log_tracker_update("upload_media_send");
         }

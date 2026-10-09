@@ -1229,6 +1229,11 @@ typedef struct MarmotEventsSubscription MarmotEventsSubscription;
 typedef struct MarmotGroupStateSubscription MarmotGroupStateSubscription;
 
 /**
+ * One operation's control. Query/cancel concurrently; never free during any call on the handle.
+ */
+typedef struct MarmotMediaFileTransferControl MarmotMediaFileTransferControl;
+
+/**
  * Opaque token owned by its SelectedMessageDraft; borrow only while that draft remains live.
  */
 typedef struct MarmotMessageDraftRevision MarmotMessageDraftRevision;
@@ -4519,6 +4524,35 @@ typedef struct MarmotReportDismissalPage {
   uintptr_t labels_len;
   char *next_cursor;
 } MarmotReportDismissalPage;
+
+/**
+ * Borrowed private input. Its path is local only and is never published.
+ */
+typedef struct MarmotMediaFileUploadAttachmentRequest {
+  const char *source_path;
+  /**
+   * Nonzero requires the immutable snapshot to contain exactly expected_size bytes.
+   */
+  uint8_t has_expected_size;
+  uint64_t expected_size;
+  const char *file_name;
+  const char *media_type;
+  const char *dim;
+  const char *thumbhash;
+} MarmotMediaFileUploadAttachmentRequest;
+
+/**
+ * Borrowed input batch. Snapshots are copied before the first network side effect.
+ */
+typedef struct MarmotMediaFileUploadRequest {
+  const struct MarmotMediaFileUploadAttachmentRequest *attachments;
+  uintptr_t attachments_len;
+  const char *caption;
+  uint8_t send;
+  const char *blossom_server;
+  const struct MarmotStringArray *message_tags;
+  uintptr_t message_tags_len;
+} MarmotMediaFileUploadRequest;
 
 /**
  * Stable stream and start-message identifiers.
@@ -9341,6 +9375,74 @@ MarmotStatus marmot_report_message(const struct MarmotClient *client,
  * Input is borrowed and never retained.
  */
 MarmotStatus marmot_verify_public_nostr_event_json(const char *event_json, uint8_t *out);
+
+/**
+ * Create a control; free it with marmot_media_file_transfer_control_free after upload returns.
+ * # Safety
+ * out must be writable.
+ */
+MarmotStatus marmot_media_file_transfer_control_new(struct MarmotMediaFileTransferControl **out);
+
+/**
+ * Cancel before admission starts; once admission starts, delivery belongs to the local-send queue.
+ * # Safety
+ * control must be live; no concurrent free.
+ */
+MarmotStatus marmot_media_file_transfer_control_cancel(const struct MarmotMediaFileTransferControl *control);
+
+/**
+ * Read cancellation as uint8_t (0 or 1).
+ * # Safety
+ * control must be live; out writable; no concurrent free.
+ */
+MarmotStatus marmot_media_file_transfer_control_is_cancelled(const struct MarmotMediaFileTransferControl *control,
+                                                             uint8_t *out);
+
+/**
+ * Read monotonic processed bytes, not a percentage (preparation and retries can exceed file length).
+ * # Safety
+ * control must be live; out writable; no concurrent free.
+ */
+MarmotStatus marmot_media_file_transfer_control_processed_bytes(const struct MarmotMediaFileTransferControl *control,
+                                                                uint64_t *out);
+
+/**
+ * Free a control; NULL is accepted.
+ * # Safety
+ * control must be NULL or live, with all calls on it finished.
+ */
+void marmot_media_file_transfer_control_free(struct MarmotMediaFileTransferControl *control);
+
+/**
+ * Return the per-batch ciphertext implementation bound, including each attachment's AEAD tag.
+ */
+uint64_t marmot_max_file_media_ciphertext_bytes(void);
+
+/**
+ * Blocking file-backed upload. Results use marmot_media_upload_result_free; inputs remain borrowed.
+ * # Safety
+ * client/control must be live; strings/request valid until return; out writable. No concurrent frees.
+ */
+MarmotStatus marmot_upload_media_files(const struct MarmotClient *client,
+                                       const char *account_ref,
+                                       const char *group_id_hex,
+                                       const struct MarmotMediaFileUploadRequest *request,
+                                       const struct MarmotMediaFileTransferControl *control,
+                                       struct MarmotMediaUploadResult **out);
+
+/**
+ * Blocking token-aware twin. Keep one token for the logical submission; probe local-send status after interruption.
+ * Results use marmot_media_upload_submission_free; input paths are copied, never published.
+ * # Safety
+ * Same input/lifetime requirements as marmot_upload_media_files, plus a valid client_token string.
+ */
+MarmotStatus marmot_upload_media_files_with_client_token(const struct MarmotClient *client,
+                                                         const char *account_ref,
+                                                         const char *group_id_hex,
+                                                         const struct MarmotMediaFileUploadRequest *request,
+                                                         const struct MarmotMediaFileTransferControl *control,
+                                                         const char *client_token,
+                                                         struct MarmotMediaUploadSubmission **out);
 
 /**
  * Create an offline session from a bunker URI, client pairing config, or durable

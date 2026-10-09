@@ -7851,14 +7851,62 @@ async fn publish_nip65_and_inbox(
     .unwrap();
 }
 
+/// Deterministic publication targets for the relay-list preservation test.
+/// `None` refuses all writes; `Some(url)` refuses NIP-65 declarations adopting
+/// that URL while accepting seeds and removals. Reads remain available.
+#[derive(Debug)]
+struct RelayListTestWritePolicy(Option<String>);
+
+impl nostr_relay_builder::builder::WritePolicy for RelayListTestWritePolicy {
+    fn admit_event<'a>(
+        &'a self,
+        event: &'a nostr_relay_builder::prelude::Event,
+        _addr: &'a std::net::SocketAddr,
+    ) -> nostr_relay_builder::prelude::BoxedFuture<'a, nostr_relay_builder::builder::PolicyResult>
+    {
+        Box::pin(async move {
+            let reject = match &self.0 {
+                None => true,
+                Some(url) => {
+                    event.kind.as_u16() == 10002
+                        && event.tags.iter().any(|tag| {
+                            let tag = tag.as_slice();
+                            tag.first().is_some_and(|name| name == "r") && tag.get(1) == Some(url)
+                        })
+                }
+            };
+            if reject {
+                nostr_relay_builder::builder::PolicyResult::Reject("fixture write refusal".into())
+            } else {
+                nostr_relay_builder::builder::PolicyResult::Accept
+            }
+        })
+    }
+}
+
+async fn relay_list_test_relay(
+    rejected_nip65_url: Option<String>,
+) -> (nostr_relay_builder::LocalRelay, String) {
+    let relay = nostr_relay_builder::LocalRelay::new(
+        nostr_relay_builder::RelayBuilder::default()
+            .write_policy(RelayListTestWritePolicy(rejected_nip65_url)),
+    );
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    (relay, url)
+}
+
 #[tokio::test]
 async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() {
     let dir = tempfile::tempdir().unwrap();
-    let (_relay, relay_url) = mock_relay_url().await;
-    let (_read_relay, read_url) = mock_relay_url().await;
-    let (_write_relay, write_url) = mock_relay_url().await;
-    let (_inbox_relay, inbox_url) = mock_relay_url().await;
     let (_added_relay, added_url) = mock_relay_url().await;
+    // Seed on the primary relay. For the NIP-65 add, both old outbox relays
+    // refuse that declaration, so only the newly adopted relay can acknowledge
+    // it. This makes the route assertion below independent of quorum races.
+    let (_relay, relay_url) = relay_list_test_relay(Some(added_url.clone())).await;
+    let (_write_relay, write_url) = relay_list_test_relay(None).await;
+    let (_read_relay, read_url) = mock_relay_url().await;
+    let (_inbox_relay, inbox_url) = mock_relay_url().await;
     let (_inbox_added_relay, inbox_added_url) = mock_relay_url().await;
     let account_home = AccountHome::open(dir.path());
     let account = account_home.create_account("agent").unwrap();
@@ -7931,6 +7979,16 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
         relay_lists.inbox
     );
 
+    // Publications require one acknowledgement, not an acknowledgement from
+    // every endpoint. Read all possible accepting relays: querying only the
+    // primary relay can legitimately return its older replaceable event.
+    let publication_route = vec![
+        relay_endpoint.clone(),
+        crate::validation::endpoint(&write_url),
+        crate::validation::endpoint(&added_url),
+        crate::validation::endpoint(&inbox_added_url),
+    ];
+
     // Publication requires one acknowledgement, not every routed relay's ACK.
     // Also, an overlapping directory read can share a pre-edit query. Wait for
     // this relay to expose the acknowledged revision before checking its tags.
@@ -7939,7 +7997,7 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
             let status = app
                 .fetch_current_account_relay_list_status_for_account_id(
                     &account.account_id_hex,
-                    vec![relay_endpoint.clone()],
+                    publication_route.clone(),
                     Some("nip65"),
                 )
                 .await
@@ -8018,7 +8076,7 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
     let published = app
         .fetch_current_account_relay_list_status_for_account_id(
             &account.account_id_hex,
-            vec![relay_endpoint.clone()],
+            publication_route,
             Some("nip65"),
         )
         .await

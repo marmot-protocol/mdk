@@ -231,6 +231,10 @@ pub use groups::{
 pub use ids::{
     account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
 };
+pub use media::file_transfer::{
+    MAX_FILE_MEDIA_CIPHERTEXT_BYTES, MediaFileTransferControl, MediaFileUploadAttachmentRequest,
+    MediaFileUploadRequest,
+};
 pub use media::{
     DEFAULT_BLOSSOM_SERVER_URL, DEFAULT_BLOSSOM_SERVER_URLS, ENCRYPTED_MEDIA_VERSION,
     EncryptedMediaVersion, MAX_ENCRYPTED_MEDIA_BLOB_BYTES, MAX_GROUP_IMAGE_BYTES,
@@ -395,8 +399,9 @@ const APP_RUNTIME_LOCAL_WORKER_RESPONSE_WAIT: Duration = Duration::from_secs(10)
 /// Default deadline for worker commands that may sign, publish, or perform a
 /// bounded relay exchange.
 const APP_RUNTIME_WORKER_RESPONSE_WAIT: Duration = Duration::from_secs(2 * 60);
-/// Media commands have their own 15-minute transfer cap; leave one minute for
-/// queueing, projection, and response delivery around that bounded operation.
+/// Legacy media commands have a 15-minute transfer cap; leave one minute for
+/// queueing, projection, and response delivery. File uploads wait for their
+/// size-bounded endpoint attempts instead of using this outer deadline.
 const APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT: Duration = Duration::from_secs(16 * 60);
 /// Cap for advisory account-setup steps (directory discovery/refresh): their
 /// results are best-effort, so a slow indexer must not stall login.
