@@ -43,12 +43,12 @@ fn quorum_app() -> (
     (directory, app, relay, account.label)
 }
 
-/// Wait until every `kind` record was also sent to `SLOW` on its own, then
-/// require that the retry carried the identical signed event.
+/// Wait until `SLOW` accepted every `kind` record on its own, then require
+/// that the retry carried the identical signed event.
 async fn assert_completed_to_slow_relay(relay: &ScriptedPushRelayClient, kinds: &[u64]) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let routes = relay.attempted_routes();
+            let routes = relay.accepted_routes();
             if kinds
                 .iter()
                 .all(|kind| routes.contains(&(*kind, vec![endpoint(SLOW)])))
@@ -61,8 +61,8 @@ async fn assert_completed_to_slow_relay(relay: &ScriptedPushRelayClient, kinds: 
     .await
     .unwrap_or_else(|_| {
         panic!(
-            "quorum-cancelled relay never received kinds {kinds:?}; routes: {:?}",
-            relay.attempted_routes()
+            "quorum-cancelled relay never accepted kinds {kinds:?}; routes: {:?}",
+            relay.accepted_routes()
         )
     });
     let events = relay.attempted_events();
@@ -178,4 +178,41 @@ async fn fully_acknowledged_profile_save_schedules_no_completion() {
         vec![(KIND_NOSTR_METADATA, vec![endpoint(FAST), endpoint(SLOW)])],
         "relays that acknowledged must not be sent the record again"
     );
+}
+
+#[tokio::test]
+async fn successive_saves_of_one_kind_author_strictly_increasing_timestamps() {
+    let (_directory, app, relay, label) = quorum_app();
+
+    for name in ["First", "Second", "Third"] {
+        app.publish_user_profile(
+            &label,
+            UserProfileMetadata {
+                name: Some(name.into()),
+                ..UserProfileMetadata::default()
+            },
+            two_relay_bootstrap(),
+        )
+        .await
+        .unwrap();
+        app.publish_account_follow_list(&label, &[], two_relay_bootstrap())
+            .await
+            .unwrap();
+    }
+
+    // Relays keep the lower event id on a `created_at` tie, so a completion
+    // that lands after a same-second newer save could otherwise win.
+    for kind in [KIND_NOSTR_METADATA, KIND_NOSTR_CONTACT_LIST] {
+        let mut authored = Vec::new();
+        for event in relay.attempted_events() {
+            if event.kind == kind && !authored.iter().any(|(id, _)| *id == event.id) {
+                authored.push((event.id, event.created_at));
+            }
+        }
+        assert_eq!(authored.len(), 3, "kind {kind} authors one event per save");
+        assert!(
+            authored.windows(2).all(|pair| pair[0].1 < pair[1].1),
+            "kind {kind} versions must have strictly increasing created_at: {authored:?}"
+        );
+    }
 }

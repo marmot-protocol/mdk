@@ -530,6 +530,9 @@ pub struct MarmotApp {
     /// pool instead of constructing another TCP/TLS/WebSocket stack.
     account_publish_clients: Arc<Mutex<HashMap<String, Arc<dyn NostrRelayClient>>>>,
     public_indexer_copy_tasks: Arc<Mutex<PublicIndexerCopyTasks>>,
+    /// Newest `created_at` this process authored per (account, replaceable
+    /// kind); see `sign_replaceable_identity_event`.
+    replaceable_identity_created_at: Arc<Mutex<HashMap<(String, u64), u64>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1646,6 +1649,7 @@ impl MarmotApp {
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
+            replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1737,6 +1741,7 @@ impl MarmotApp {
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
+            replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -2281,8 +2286,9 @@ impl MarmotApp {
         // the exact events the operational relays acknowledged.
         let nostr_signer = signer.as_nostr_signer();
         for request in &mut requests {
-            request.event =
-                sign_account_publication_event(nostr_signer.clone(), &request.event).await?;
+            request.event = self
+                .sign_replaceable_identity_event(nostr_signer.clone(), &request.event)
+                .await?;
         }
         let relay_client = self.relay_client_for_account_id(&account.account_id_hex, nostr_signer);
         let record_kinds = [
@@ -2790,8 +2796,9 @@ impl MarmotApp {
         // Sign before sending so indexer copies and quorum completion carry
         // the exact events the operational relays acknowledged.
         for request in &mut requests {
-            request.event =
-                sign_account_publication_event(nostr_signer.clone(), &request.event).await?;
+            request.event = self
+                .sign_replaceable_identity_event(nostr_signer.clone(), &request.event)
+                .await?;
         }
         let outcomes = relay_client
             .publish_events_for_account(&account_id, &requests)
@@ -3010,6 +3017,37 @@ impl MarmotApp {
     pub(crate) fn spawn_public_indexer_copy(&self, copy: PublicIndexerCopy) {
         let account_id_hex = hex::encode(copy.account_id.as_slice());
         self.spawn_account_publication_copy(account_id_hex, copy.run());
+    }
+
+    /// Sign a replaceable identity record (kind 0, kind 3, relay lists) with a
+    /// `created_at` strictly after the previous version this process authored
+    /// for the same account and kind. Relays keep the lower event id on a
+    /// timestamp tie, so a same-second older version delivered late by quorum
+    /// completion could otherwise replace a newer save.
+    pub(crate) async fn sign_replaceable_identity_event(
+        &self,
+        signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
+        event: &NostrTransportEvent,
+    ) -> Result<NostrTransportEvent, AppError> {
+        let created_at = {
+            let mut latest = self
+                .replaceable_identity_created_at
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let newest = latest
+                .entry((event.pubkey.clone(), event.kind))
+                .or_insert(0);
+            *newest = event.created_at.max(newest.saturating_add(1));
+            *newest
+        };
+        let event = NostrTransportEvent::new_unsigned_at(
+            event.pubkey.clone(),
+            event.kind,
+            event.tags.clone(),
+            event.content.clone(),
+            created_at,
+        );
+        sign_account_publication_event(signer, &event).await
     }
 
     pub(crate) fn spawn_quorum_cancelled_delivery(&self, delivery: QuorumCancelledDelivery) {

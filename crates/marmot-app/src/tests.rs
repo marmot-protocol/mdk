@@ -529,6 +529,7 @@ pub(crate) struct ScriptedPushRelayClient {
     fail_publish_unavailable: std::sync::atomic::AtomicBool,
     fail_publish_kind: std::sync::Mutex<Option<u64>>,
     accept_first_endpoint_only: std::sync::atomic::AtomicBool,
+    accepted_publish_routes: std::sync::Mutex<Vec<(u64, Vec<TransportEndpoint>)>>,
     batch_calls: std::sync::atomic::AtomicUsize,
     publish_started: tokio::sync::Notify,
     publish_release: tokio::sync::Notify,
@@ -924,6 +925,10 @@ impl ScriptedPushRelayClient {
         self.attempted_publish_routes.lock().unwrap().clone()
     }
 
+    pub(crate) fn accepted_routes(&self) -> Vec<(u64, Vec<TransportEndpoint>)> {
+        self.accepted_publish_routes.lock().unwrap().clone()
+    }
+
     pub(crate) fn attempted_events(&self) -> Vec<NostrTransportEvent> {
         self.attempted_events.lock().unwrap().clone()
     }
@@ -1309,13 +1314,19 @@ impl NostrRelayClient for ScriptedPushRelayClient {
             .unwrap_or(true)
         {
             self.published_events.lock().unwrap().push(event.clone());
-            if self
+            let accepted = if self
                 .accept_first_endpoint_only
                 .load(std::sync::atomic::Ordering::SeqCst)
             {
-                return Ok(NostrPublishOutcome::accepted(endpoints.first().cloned()));
-            }
-            Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
+                endpoints.first().cloned().into_iter().collect()
+            } else {
+                endpoints.to_vec()
+            };
+            self.accepted_publish_routes
+                .lock()
+                .unwrap()
+                .push((event.kind, accepted.clone()));
+            Ok(NostrPublishOutcome::accepted(accepted))
         } else {
             Err(cgka_traits::TransportAdapterError::Publish(
                 "injected publish failure".to_owned(),

@@ -905,7 +905,9 @@ impl MarmotApp {
         let nostr_signer = signer.as_nostr_signer();
         // Sign before sending so indexer copies and quorum completion carry
         // the exact event the account relays acknowledged.
-        event = crate::sign_account_publication_event(nostr_signer.clone(), &event).await?;
+        event = self
+            .sign_replaceable_identity_event(nostr_signer.clone(), &event)
+            .await?;
         let relay_client = self.relay_client_for_account_id(&account.account_id_hex, nostr_signer);
         let outcome = relay_client
             .publish_event_for_account(&account_id, &endpoints, &event, 1)
@@ -990,16 +992,17 @@ impl MarmotApp {
             .collect();
         let nostr_signer = signer.as_nostr_signer();
         // Sign before sending so quorum completion resends the exact event.
-        let event = crate::sign_account_publication_event(
-            nostr_signer.clone(),
-            &NostrTransportEvent::new_unsigned(
-                account.account_id_hex.clone(),
-                KIND_NOSTR_CONTACT_LIST,
-                tags,
-                String::new(),
-            ),
-        )
-        .await?;
+        let event = self
+            .sign_replaceable_identity_event(
+                nostr_signer.clone(),
+                &NostrTransportEvent::new_unsigned(
+                    account.account_id_hex.clone(),
+                    KIND_NOSTR_CONTACT_LIST,
+                    tags,
+                    String::new(),
+                ),
+            )
+            .await?;
         let relay_client = self.relay_client_for_account_id(&account.account_id_hex, nostr_signer);
         let outcome = relay_client.publish_event(&endpoints, &event, 1).await?;
         let mut completion = crate::QuorumCancelledDelivery::new(
