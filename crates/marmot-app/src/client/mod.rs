@@ -4058,7 +4058,7 @@ impl AppClient {
         // Capture the human-action descriptor before `Unreact` is rewritten to
         // `DeleteReactions` below, so the audit log records the user's actual
         // intent.
-        let audit_context = Self::message_human_action_context(&intent);
+        let mut audit_context = Self::message_human_action_context(&intent);
         let sender = self
             .app
             .account_home()
@@ -4212,6 +4212,12 @@ impl AppClient {
 
         let group_id_hex = hex::encode(group_id.as_slice());
         let app_event_id = event.id.clone();
+        audit_context
+            .get_or_insert_with(Default::default)
+            .operation_id = Some(marmot_forensics::application_send_operation_id(
+            group_id.as_slice(),
+            &app_event_id,
+        ));
 
         let should_project_locally = !notifications::is_push_gossip_kind(event.kind);
         if should_project_locally {

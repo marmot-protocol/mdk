@@ -982,6 +982,82 @@ fn a_cohort_over_its_tombstone_cap_is_evicted_whole() {
 }
 
 #[test]
+fn batch_cohort_eviction_cannot_be_undone_by_later_deletions() {
+    for reverse_deletions in [false, true] {
+        let (_dir, cache) = fixture();
+        let now = 7000;
+        let keys = Keys::generate();
+        let naddr = address(&keys, 30023);
+        let retained = signed(&keys, 30023, 5000, "retained selection");
+        cache
+            .admit_state(&naddr, &[retained.as_json()], now)
+            .unwrap();
+        for i in 0..MAX_COHORT_TOMBSTONES as u64 {
+            let version = signed(&keys, 30023, 1000 + i, &format!("version {i}"));
+            let request = deletion(&keys, 2000 + i, vec![e_tag(&version)]);
+            assert!(is_deleted(
+                &cache
+                    .admit_state(
+                        &id_reference(&version),
+                        &[version.as_json(), request.as_json()],
+                        now
+                    )
+                    .unwrap()
+            ));
+        }
+        assert_eq!(
+            MAX_COHORT_TOMBSTONES,
+            count(&cache, "public_event_tombstones")
+        );
+        let first = signed(&keys, 30023, 5001, "first new version");
+        let second = signed(&keys, 30023, 5002, "second new version");
+        let mut requests = [
+            deletion(&keys, 6000, vec![e_tag(&first)]).as_json(),
+            deletion(&keys, 6001, vec![e_tag(&second)]).as_json(),
+        ];
+        if reverse_deletions {
+            requests.reverse();
+        }
+        assert_eq!(
+            PublicEventCacheResult::Missing,
+            cache
+                .admit_state(
+                    &naddr,
+                    &[
+                        first.as_json(),
+                        second.as_json(),
+                        requests[0].clone(),
+                        requests[1].clone()
+                    ],
+                    now
+                )
+                .unwrap(),
+            "no deletion may recreate evidence for a cohort evicted in this batch"
+        );
+        assert_eq!(0, count(&cache, "public_event_tombstones"));
+        assert_eq!(0, count(&cache, "public_event_previews"));
+        for version in [&first, &second] {
+            assert_eq!(
+                PublicEventCacheResult::Missing,
+                cache.lookup_state(&id_reference(version), now).unwrap()
+            );
+        }
+        // Eviction ends all local evidence together; both versions can return
+        // in a later admission, rather than one being fenced by a partial cohort.
+        for version in [&first, &second] {
+            assert_eq!(
+                Some(version.id.to_hex()),
+                present_id(
+                    &cache
+                        .admit_state(&id_reference(version), &[version.as_json()], now)
+                        .unwrap()
+                )
+            );
+        }
+    }
+}
+
+#[test]
 fn public_event_preview_regression_tombstone_authentication_precedes_projection() {
     let provenance =
         ProvenanceKey::derive(&SqlCipherKey::new("projection-order-test").unwrap()).unwrap();

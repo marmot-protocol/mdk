@@ -3284,6 +3284,9 @@ typedef struct MarmotPublicEventCacheKey {
    *Only meaningful when the matching `has_` flag is set.
    */
   uint32_t kind;
+  /**
+   *NULL or a JSON string literal; decode once preserving embedded NULs.
+   */
   char *identifier;
 } MarmotPublicEventCacheKey;
 

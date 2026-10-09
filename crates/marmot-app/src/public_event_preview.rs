@@ -1166,7 +1166,7 @@ impl PublicEventCache {
             .iter()
             .filter(|event| event.kind.as_u16() == KIND_DELETION)
         {
-            evicted.extend(Self::apply_deletion(
+            Self::apply_deletion(
                 &tx,
                 provenance,
                 deletion,
@@ -1174,7 +1174,8 @@ impl PublicEventCache {
                 &coordinates,
                 selected_target.as_deref(),
                 now,
-            )?);
+                &mut evicted,
+            )?;
         }
 
         let previous =
@@ -1754,8 +1755,9 @@ impl PublicEventCache {
         Ok(None)
     }
 
-    /// Apply one verified kind-5 request. Returns cohorts evicted whole
-    /// because their evidence exceeded the per-cohort cap.
+    /// Apply one verified kind-5 request. Cohorts evicted anywhere in this
+    /// admission cannot regain partial evidence from a later deletion.
+    #[allow(clippy::too_many_arguments)]
     fn apply_deletion(
         conn: &Connection,
         provenance: &ProvenanceKey,
@@ -1764,10 +1766,10 @@ impl PublicEventCache {
         coordinates: &HashSet<String>,
         selected_target: Option<&str>,
         now: u64,
-    ) -> Result<HashSet<String>, AppError> {
-        let mut evicted = HashSet::new();
+        evicted: &mut HashSet<String>,
+    ) -> Result<(), AppError> {
         if deletion.as_json().len() > MAX_EVENT_BYTES {
-            return Ok(evicted);
+            return Ok(());
         }
         let deleter = deletion.pubkey.to_hex();
         for tag in deletion.tags.iter() {
@@ -1821,7 +1823,7 @@ impl PublicEventCache {
                 _ => {}
             }
         }
-        Ok(evicted)
+        Ok(())
     }
 
     /// The stored selection of a coordinate, re-verified against its key.

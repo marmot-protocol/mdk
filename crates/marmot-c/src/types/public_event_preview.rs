@@ -37,7 +37,8 @@ c_mirror! {
         opt_str event_id_hex,
         opt_str author_pubkey_hex,
         opt_copy has_kind/kind: u32,
-        opt_str identifier,
+        #[doc = "NULL or a JSON string literal; decode once preserving embedded NULs."]
+        json_opt_str identifier,
     }
 }
 
@@ -79,6 +80,140 @@ mod tests {
     use super::*;
     use crate::memory::{audit, boxed};
     use marmot_uniffi::conversions::UserProfileMetadataFfi;
+
+    #[derive(Default)]
+    struct TestSecrets(std::sync::Mutex<std::collections::HashMap<String, String>>);
+
+    impl marmot_uniffi::SecretStore for TestSecrets {
+        fn has_secret_for_label(
+            &self,
+            label: String,
+        ) -> Result<bool, marmot_uniffi::MarmotKitError> {
+            Ok(self.0.lock().unwrap().contains_key(&label))
+        }
+        fn has_secret_for_account_id(
+            &self,
+            _: String,
+        ) -> Result<bool, marmot_uniffi::MarmotKitError> {
+            Ok(false)
+        }
+        fn write_secret(
+            &self,
+            label: String,
+            _: String,
+            secret: String,
+        ) -> Result<(), marmot_uniffi::MarmotKitError> {
+            self.0.lock().unwrap().insert(label, secret);
+            Ok(())
+        }
+        fn load_secret(
+            &self,
+            label: String,
+            _: String,
+        ) -> Result<String, marmot_uniffi::MarmotKitError> {
+            self.0.lock().unwrap().get(&label).cloned().ok_or_else(|| {
+                marmot_uniffi::MarmotKitError::SecretNotFound {
+                    details: "test credential missing".into(),
+                }
+            })
+        }
+        fn remove_secret(
+            &self,
+            label: String,
+            _: String,
+        ) -> Result<(), marmot_uniffi::MarmotKitError> {
+            self.0.lock().unwrap().remove(&label);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn public_event_naddr_identifiers_preserve_nuls_through_c_reads() {
+        use nostr::nips::nip19::{Nip19Coordinate, ToBech32};
+        use nostr::prelude::{Coordinate, Keys, Kind};
+        use std::ffi::{CStr, CString};
+        use std::sync::Arc;
+
+        let root = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let kit = {
+            let _enter = runtime.enter();
+            marmot_uniffi::Marmot::new_with_secret_store(
+                root.path().to_str().unwrap().to_owned(),
+                vec!["wss://relay.example.org".into()],
+                Arc::new(TestSecrets::default()),
+            )
+            .unwrap()
+        };
+        let keys = Keys::generate();
+        let account = runtime
+            .block_on(kit.begin_onboarding(
+                keys.secret_key().to_bech32().unwrap(),
+                marmot_uniffi::conversions::OnboardingOptionsFfi {
+                    default_relays: vec!["wss://relay.example.org".into()],
+                    discovery_relays: vec![],
+                    inbox_relays: vec![],
+                },
+            ))
+            .unwrap();
+        let identifiers = ["a\0b", "ab"];
+        let references: Vec<CString> = identifiers
+            .iter()
+            .map(|identifier| {
+                CString::new(
+                    Nip19Coordinate::new(
+                        Coordinate::new(Kind::from(30023), keys.public_key())
+                            .identifier(*identifier),
+                        [],
+                    )
+                    .to_bech32()
+                    .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_ne!(references[0], references[1]);
+        let borrowed: Vec<_> = references
+            .iter()
+            .map(|reference| reference.as_ptr())
+            .collect();
+        let account_ref = CString::new(account.account_id_hex).unwrap();
+        let client = crate::MarmotClient {
+            runtime,
+            marmot: kit,
+        };
+        let _lock = audit::test_lock();
+        let before = audit::live_allocations();
+        let mut reads = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                crate::commands::marmot_cached_public_event_previews(
+                    &raw const client,
+                    account_ref.as_ptr(),
+                    borrowed.as_ptr(),
+                    borrowed.len(),
+                    &raw mut reads,
+                )
+            },
+            crate::MarmotStatus::Ok
+        );
+        unsafe {
+            assert_eq!((*reads).len, 2);
+            for (index, identifier) in identifiers.iter().enumerate() {
+                let read = &*(*reads).items.add(index);
+                assert_eq!(read.state, MarmotPublicEventCacheState::Missing);
+                assert_eq!(read.key.key_type, MarmotPublicEventCacheKeyType::Coordinate);
+                let encoded = CStr::from_ptr(read.key.identifier).to_str().unwrap();
+                assert_eq!(
+                    serde_json::from_str::<String>(encoded).unwrap(),
+                    *identifier
+                );
+            }
+            marmot_public_event_cache_read_list_free(reads);
+        }
+        assert_eq!(audit::live_allocations(), before);
+        client.block_on(client.marmot.shutdown_and_close()).unwrap();
+    }
 
     fn key(event_id: Option<&str>) -> PublicEventCacheKeyFfi {
         match event_id {

@@ -83,13 +83,13 @@ mod chat_list_window;
 mod conversation_window;
 mod public_event_preview;
 mod worker_startup;
-pub(crate) use conversation_window::SendCapture;
 pub use conversation_window::{
     CONVERSATION_WINDOW_MAX_ROWS, ConversationAnchor, ConversationOpenAnchorOutcome,
     ConversationOpenQuery, ConversationOpenReadState, ConversationOpenTarget,
     ConversationPageDirection, ConversationWindowError, ConversationWindowHandle,
     ConversationWindowRevision, ConversationWindowSnapshot, RuntimeConversationWindowSubscription,
 };
+pub(crate) use conversation_window::{SendCapture, publish_conversation_captures_from_session};
 pub(crate) mod attachment_controls;
 pub(crate) mod attachment_permission;
 pub use attachment_controls::{
@@ -112,6 +112,7 @@ mod avatar_access;
 pub use avatar_access::{LocalAvatarRead, MAX_AVATAR_BATCH_BYTES, MAX_AVATAR_BATCH_ITEMS};
 mod commands;
 mod event_routing;
+mod local_submission_queue;
 mod local_submissions;
 mod onboarding;
 mod presentation;
@@ -364,6 +365,9 @@ pub struct RuntimeSharedServices {
     #[cfg(test)]
     pub(crate) ordinary_delivery_dropped: Arc<Notify>,
     local_submission_wakeups: watch::Sender<()>,
+    // Private bounded observations and weak per-account gate lookup. This
+    // global mutex is never held during storage, engine, or network work.
+    local_submission_queue: Arc<StdMutex<local_submission_queue::LocalSubmissionQueue>>,
     attachment_transfer: Arc<tokio::sync::Semaphore>,
     attachment_updates: watch::Sender<()>,
     attachment_cancellations: watch::Sender<()>,
@@ -479,6 +483,7 @@ impl Default for RuntimeSharedServices {
             ordinary_delivery_dropped: Arc::new(Notify::new()),
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
             local_submission_wakeups: watch::channel(()).0,
+            local_submission_queue: Arc::new(StdMutex::new(Default::default())),
             attachment_updates: watch::channel(()).0,
             attachment_cancellations: watch::channel(()).0,
             attachment_permissions: attachment_permission::Permissions::default(),
@@ -509,6 +514,13 @@ impl Default for RuntimeSharedServices {
 }
 
 impl RuntimeSharedServices {
+    fn local_submission_gate(&self, account: &str) -> Arc<Mutex<()>> {
+        self.local_submission_queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .account_gate(account)
+    }
+
     pub(crate) fn recovery_credit_pool(
         &self,
     ) -> Arc<account_worker::recovery_credits::RecoveryCreditPool> {
@@ -570,6 +582,7 @@ impl RuntimeSharedServices {
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
             attachment_updates: watch::channel(()).0,
             local_submission_wakeups: watch::channel(()).0,
+            local_submission_queue: Arc::new(StdMutex::new(Default::default())),
             attachment_cancellations: watch::channel(()).0,
             attachment_permissions: attachment_permission::Permissions::default(),
             relay_plane: app.relay_plane.clone(),
@@ -5878,6 +5891,11 @@ impl MarmotAppRuntime {
     pub async fn shutdown(&self) {
         let started_at = Instant::now();
         self.shared.lifecycle().begin_shutdown();
+        self.shared
+            .local_submission_queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         for task in self.accounts.app.abort_all_public_indexer_copies() {
             let _ = task.await;
         }
@@ -5988,6 +6006,11 @@ impl MarmotAppRuntime {
 
     async fn run_terminal_shutdown_and_close(self) -> Result<(), AppError> {
         self.shared.lifecycle().begin_shutdown();
+        self.shared
+            .local_submission_queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         let indexer_copies = self.accounts.app.abort_all_public_indexer_copies();
         #[cfg(test)]
         self.stall_shutdown_phase_for_test(ShutdownTestPhase::StorageClose)
@@ -6429,10 +6452,33 @@ impl AccountManager {
             // storage connection (and directory cache) keeps pointing at the
             // unlinked inode and a later re-import silently splits writes
             // across a stale handle.
-            self.app.drop_account_caches(&account.label);
-            self.app
-                .remove_account_key_package_artifacts(&account.label)?;
-            self.app.account_home().remove_account(&account.label)?;
+            {
+                // A committed removal and observation cancellation cannot be
+                // overtaken by an already-owned local admission. No network
+                // or async cleanup runs while this account gate is held.
+                let gate = self.shared.local_submission_gate(&account.account_id_hex);
+                let _admission = gate.lock().await;
+                self.app.drop_account_caches(&account.label);
+                self.app
+                    .remove_account_key_package_artifacts(&account.label)?;
+                let removed = self.app.account_home().remove_account(&account.label);
+                if removed.is_ok()
+                    || matches!(
+                        self.app.account_home().account(&account.label),
+                        Err(AccountHomeError::UnknownAccount(_))
+                    )
+                {
+                    // Secret cleanup may fail after the live-directory rename.
+                    // Cancel only a confirmed removal, including that case;
+                    // pre-commit and ambiguous failures retain live-row timing.
+                    self.shared
+                        .local_submission_queue
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .cancel_account(&account.account_id_hex);
+                }
+                removed?;
+            }
             for task in self
                 .app
                 .abort_public_indexer_copies_for_account(&account.account_id_hex)
@@ -6521,12 +6567,30 @@ impl AccountManager {
                 self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
                 self.ensure_worker_reaped(&account.account_id_hex).await?;
             }
-            self.app.drop_account_caches(&account.label);
-            self.app
-                .remove_account_key_package_artifacts(&account.label)?;
-            self.app
-                .account_home()
-                .reset_incomplete_setup_preserving_credential(&account.label)?;
+            {
+                let gate = self.shared.local_submission_gate(&account.account_id_hex);
+                let _admission = gate.lock().await;
+                self.app.drop_account_caches(&account.label);
+                self.app
+                    .remove_account_key_package_artifacts(&account.label)?;
+                let removed = self
+                    .app
+                    .account_home()
+                    .reset_incomplete_setup_preserving_credential(&account.label);
+                if removed.is_ok()
+                    || matches!(
+                        self.app.account_home().account(&account.label),
+                        Err(AccountHomeError::UnknownAccount(_))
+                    )
+                {
+                    self.shared
+                        .local_submission_queue
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .cancel_account(&account.account_id_hex);
+                }
+                removed?;
+            }
             Ok(())
         }
         .await
@@ -8490,6 +8554,11 @@ impl AccountManager {
 
     pub async fn shutdown(&self) {
         self.shared.lifecycle().begin_shutdown();
+        self.shared
+            .local_submission_queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         for task in self.app.abort_all_public_indexer_copies() {
             let _ = task.await;
         }

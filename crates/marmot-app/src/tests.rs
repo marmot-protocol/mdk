@@ -6,6 +6,7 @@ pub(crate) mod invite_recovery;
 mod key_package_inventory;
 mod key_package_selection;
 mod message_journeys;
+mod publication_progress;
 mod report_backfill;
 mod user_blocks;
 
@@ -505,9 +506,9 @@ pub(crate) struct ScriptedPushRelayClient {
     published_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     attempted_events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     attempted_publish_routes: std::sync::Mutex<Vec<(u64, Vec<TransportEndpoint>)>>,
-    block_indexer_publish: std::sync::atomic::AtomicBool,
+    pub(crate) block_indexer_publish: std::sync::atomic::AtomicBool,
     indexer_publish_started: tokio::sync::Notify,
-    indexer_publish_release: tokio::sync::Notify,
+    pub(crate) indexer_publish_release: tokio::sync::Notify,
     subscriptions: std::sync::Mutex<Vec<NostrSubscription>>,
     scoped_subscriptions: std::sync::Mutex<Vec<(String, NostrSubscription)>>,
     subscription_attempts: std::sync::Mutex<Vec<NostrSubscription>>,

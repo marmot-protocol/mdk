@@ -31,6 +31,9 @@
 
 ### Fixed
 
+- Public-event cache cohort eviction suppresses every later deletion and preview write in the same admission,
+  preventing deletion-order-dependent partial evidence after the tombstone cap is exceeded.
+
 - Lossless relay repairs accept case-insensitive NIP-65 read/write markers,
   matching relay-list inspection while preserving their original spelling
   and extension fields through approval and publication.

@@ -3335,11 +3335,14 @@ impl MarmotRelayPlaneAccountAdapter {
                         }
                     }
                     if outcome.accepted.len() >= required_acks {
-                        // Like the SDK, quorum cancels unresolved anonymous
-                        // attempts. Already-observed auth rejections still get
-                        // their concurrent retry within the original budget.
+                        // Quorum cancels unfinished publications, including
+                        // authenticated fallbacks. Their initial rejection no
+                        // longer proves non-exposure: retain the same unknown
+                        // evidence as deadline cancellation for exact-event retry.
                         publishes.clear();
                         pending.clear();
+                        retries.clear();
+                        outcome.failed.extend(retrying.drain().map(unknown));
                     }
                 }
                 Ok(None) => {}

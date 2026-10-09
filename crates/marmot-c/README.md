@@ -202,7 +202,10 @@ owned `MarmotPublicEventCacheRead`; release it with `marmot_public_event_cache_r
 
 Each row's `state` is a `MarmotPublicEventCacheState`: `preview` is non-NULL exactly for `Present`, `deletion` exactly
 for `AuthoritativeDeleted`, and both are NULL for `Missing` and `Busy`. `Busy` is retryable contention, not a miss.
-`key.key_type` selects which key fields are set; `has_kind` qualifies `kind`. The parent free releases the key, preview,
+`key.key_type` selects which key fields are set; `has_kind` qualifies `kind`. A coordinate's `key.identifier` is a
+JSON string literal, not raw text. Decode it once and preserve embedded NULs and UTF-8 lengths when comparing keys;
+for example, identifiers `a\0b` and `ab` remain distinct. Non-coordinate keys have a NULL identifier.
+The parent free releases the key, preview,
 author profile and deletion. Keep results with their account.
 
 ## Public event verification
