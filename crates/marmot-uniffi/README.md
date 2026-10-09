@@ -407,7 +407,7 @@ resuming an approved, unsigned proposal as a destructive replacement. Preparing
 an exact lossless relay repair upgrades the checkpoint to version 6, preserving
 that version through approval, signing and completion. Version 3/4/5 readers
 reject it rather than discard the typed preview and publish replacement tags.
-Explicit relay edits now return the same typed before/after preview. Retained
+Explicit relay edits return the same typed before/after preview. Retained
 endpoint roles keep their original tag occurrences, order and extension fields;
 unrelated tags and content remain unchanged. An unchanged selection returns
 `ManualReview` without an approval action. These manual previews use checkpoint

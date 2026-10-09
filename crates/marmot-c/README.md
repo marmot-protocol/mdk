@@ -155,10 +155,9 @@ publish it or treat it as a full reset. Free the snapshot with
 remains a separate revision- and recovery-epoch-bound call.
 
 Explicit `marmot_propose_onboarding_relays` selections also return the typed
-preview: retained endpoint roles preserve their tag occurrences, order and extra
-fields, with unrelated tags and content unchanged. A no-op selection returns
-`ManualReview` without approval. These proposals persist as checkpoint version 7;
-older readers reject them. The C signatures and ownership rules are unchanged.
+preview. See the shared [manual-edit preservation and checkpoint compatibility
+contract](../marmot-uniffi/README.md#explicit-recovery-and-checkpoint-compatibility).
+The C signatures and snapshot ownership rules are unchanged.
 
 C relay-repair previews encode `original_content`, `proposed_content`, every
 `fields` element in tags and changes, and each non-NULL `endpoint` as a JSON
