@@ -644,6 +644,103 @@ impl PublicIndexerCopy {
     }
 }
 
+/// Background completion for replaceable identity records (kind 0, kind 3,
+/// relay lists) saved with a one-acknowledgement quorum. Reaching the quorum
+/// aborts sends still in flight, and a relay left unsent keeps serving the
+/// previous version to every reader that queries it (mdk#2216). Each
+/// cancelled relay gets one bounded send of the identical signed event after
+/// the save has already returned.
+pub(crate) struct QuorumCancelledDelivery {
+    relay_client: Arc<dyn NostrRelayClient>,
+    account_id: MemberId,
+    requests: Vec<NostrEventPublishRequest>,
+}
+
+impl QuorumCancelledDelivery {
+    pub(crate) fn new(relay_client: Arc<dyn NostrRelayClient>, account_id: MemberId) -> Self {
+        Self {
+            relay_client,
+            account_id,
+            requests: Vec::new(),
+        }
+    }
+
+    /// Queue `event` for every attempted endpoint the quorum outcome neither
+    /// accepted nor reported as failed. A reported failure already used the
+    /// transport's own retries; only cancellation left a relay unattempted.
+    pub(crate) fn add(
+        &mut self,
+        event: &NostrTransportEvent,
+        attempted: &[TransportEndpoint],
+        outcome: &transport_nostr_adapter::NostrPublishOutcome,
+    ) {
+        // Re-signing would create a different event, not complete this one.
+        if event.sig.is_none() {
+            debug_assert!(false, "quorum completion requires a pre-signed event");
+            return;
+        }
+        let mut settled = outcome
+            .accepted
+            .iter()
+            .map(|receipt| relay_endpoint_key(&receipt.endpoint))
+            .chain(
+                outcome
+                    .failed
+                    .iter()
+                    .map(|failure| relay_endpoint_key(&failure.endpoint)),
+            )
+            .collect::<HashSet<_>>();
+        for endpoint in attempted {
+            if settled.insert(relay_endpoint_key(endpoint)) {
+                self.requests.push(NostrEventPublishRequest {
+                    endpoints: vec![endpoint.clone()],
+                    event: event.clone(),
+                    required_acks: 1,
+                });
+            }
+        }
+    }
+
+    async fn run(self) {
+        let outcomes = self
+            .relay_client
+            .publish_events_for_account(&self.account_id, &self.requests)
+            .await;
+        let delivered = outcomes
+            .iter()
+            .filter(|outcome| {
+                outcome
+                    .as_ref()
+                    .is_ok_and(|outcome| !outcome.accepted.is_empty())
+            })
+            .count();
+        let undelivered = self.requests.len().saturating_sub(delivered);
+        if undelivered == 0 {
+            tracing::debug!(
+                target: "marmot_app::directory",
+                method = "complete_quorum_cancelled_delivery",
+                delivered,
+                "replaceable identity records reached quorum-cancelled relays"
+            );
+        } else {
+            tracing::warn!(
+                target: "marmot_app::directory",
+                method = "complete_quorum_cancelled_delivery",
+                delivered,
+                undelivered,
+                "replaceable identity records did not reach every quorum-cancelled relay"
+            );
+        }
+    }
+}
+
+/// Compare relay endpoints the way the transport reports them in receipts.
+fn relay_endpoint_key(endpoint: &TransportEndpoint) -> String {
+    nostr::prelude::RelayUrl::parse(endpoint.as_str())
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| endpoint.0.clone())
+}
+
 /// A relay list the account is missing. Typed so FFI clients can localize
 /// each kind without parsing protocol-jargon strings (mdk#565).
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -2180,15 +2277,12 @@ impl MarmotApp {
             ),
             required_acks: 1,
         });
+        // Sign before sending so indexer copies and quorum completion carry
+        // the exact events the operational relays acknowledged.
         let nostr_signer = signer.as_nostr_signer();
-        if !indexer_endpoints.is_empty() {
-            for request in requests
-                .iter_mut()
-                .filter(|request| request.event.kind != KIND_NOSTR_CONTACT_LIST)
-            {
-                request.event =
-                    sign_account_publication_event(nostr_signer.clone(), &request.event).await?;
-            }
+        for request in &mut requests {
+            request.event =
+                sign_account_publication_event(nostr_signer.clone(), &request.event).await?;
         }
         let relay_client = self.relay_client_for_account_id(&account.account_id_hex, nostr_signer);
         let record_kinds = [
@@ -2221,15 +2315,19 @@ impl MarmotApp {
             .max()
             .unwrap_or_default();
         let default_profile_duration = batch.request_durations[3];
-        let mut outcomes = outcomes.into_iter();
-        for record_kind in record_kinds {
-            let outcome = outcomes.next().expect("checked bootstrap outcome count");
-            if outcome?.accepted.is_empty() {
+        let mut completion = QuorumCancelledDelivery::new(relay_client.clone(), account_id.clone());
+        for ((record_kind, outcome), request) in
+            record_kinds.into_iter().zip(outcomes).zip(&requests)
+        {
+            let outcome = outcome?;
+            if outcome.accepted.is_empty() {
                 return Err(AppError::Publish(format!(
                     "relay acknowledged zero events for bootstrap record {record_kind}"
                 )));
             }
+            completion.add(&request.event, &request.endpoints, &outcome);
         }
+        self.spawn_quorum_cancelled_delivery(completion);
         let relays = bootstrap
             .default_relays
             .iter()
@@ -2689,11 +2787,11 @@ impl MarmotApp {
                 required_acks: 1,
             });
         }
-        if !indexer_endpoints.is_empty() {
-            for request in &mut requests {
-                request.event =
-                    sign_account_publication_event(nostr_signer.clone(), &request.event).await?;
-            }
+        // Sign before sending so indexer copies and quorum completion carry
+        // the exact events the operational relays acknowledged.
+        for request in &mut requests {
+            request.event =
+                sign_account_publication_event(nostr_signer.clone(), &request.event).await?;
         }
         let outcomes = relay_client
             .publish_events_for_account(&account_id, &requests)
@@ -2703,15 +2801,17 @@ impl MarmotApp {
                 "relay-list publication returned incomplete outcomes".into(),
             ));
         }
-        let mut outcomes = outcomes.into_iter();
-        for _ in list_kinds {
-            let outcome = outcomes.next().expect("checked relay-list outcome count");
-            if outcome?.accepted.is_empty() {
+        let mut completion = QuorumCancelledDelivery::new(relay_client.clone(), account_id.clone());
+        for (outcome, request) in outcomes.into_iter().zip(&requests) {
+            let outcome = outcome?;
+            if outcome.accepted.is_empty() {
                 return Err(AppError::Publish(
                     "relay acknowledged zero account relay-list events".to_owned(),
                 ));
             }
+            completion.add(&request.event, &request.endpoints, &outcome);
         }
+        self.spawn_quorum_cancelled_delivery(completion);
 
         // The signed replaceable events above are the authoritative effect of
         // this operation. Persist their declared state directly after every
@@ -2909,6 +3009,24 @@ impl MarmotApp {
 
     pub(crate) fn spawn_public_indexer_copy(&self, copy: PublicIndexerCopy) {
         let account_id_hex = hex::encode(copy.account_id.as_slice());
+        self.spawn_account_publication_copy(account_id_hex, copy.run());
+    }
+
+    pub(crate) fn spawn_quorum_cancelled_delivery(&self, delivery: QuorumCancelledDelivery) {
+        if delivery.requests.is_empty() {
+            return;
+        }
+        let account_id_hex = hex::encode(delivery.account_id.as_slice());
+        self.spawn_account_publication_copy(account_id_hex, delivery.run());
+    }
+
+    /// Track a best-effort copy of already-acknowledged public records so
+    /// account removal and shutdown abort it with the indexer copies.
+    fn spawn_account_publication_copy(
+        &self,
+        account_id_hex: String,
+        copy: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
         let mut tasks = self
             .public_indexer_copy_tasks
             .lock()
@@ -2921,7 +3039,7 @@ impl MarmotApp {
         }
         let handles = tasks.by_account.entry(account_id_hex).or_default();
         handles.retain(|handle| !handle.is_finished());
-        handles.push(tokio::spawn(copy.run()));
+        handles.push(tokio::spawn(copy));
     }
 
     pub(crate) fn abort_public_indexer_copies_for_account(

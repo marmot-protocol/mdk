@@ -903,18 +903,22 @@ impl MarmotApp {
         );
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
         let nostr_signer = signer.as_nostr_signer();
-        if !indexers.is_empty() {
-            event = crate::sign_account_publication_event(nostr_signer.clone(), &event).await?;
-        }
+        // Sign before sending so indexer copies and quorum completion carry
+        // the exact event the account relays acknowledged.
+        event = crate::sign_account_publication_event(nostr_signer.clone(), &event).await?;
         let relay_client = self.relay_client_for_account_id(&account.account_id_hex, nostr_signer);
         let outcome = relay_client
             .publish_event_for_account(&account_id, &endpoints, &event, 1)
-            .await;
-        if outcome?.accepted.is_empty() {
+            .await?;
+        if outcome.accepted.is_empty() {
             return Err(AppError::Publish(
                 "no account relay acknowledged profile metadata".into(),
             ));
         }
+        let mut completion =
+            crate::QuorumCancelledDelivery::new(relay_client.clone(), account_id.clone());
+        completion.add(&event, &endpoints, &outcome);
+        self.spawn_quorum_cancelled_delivery(completion);
         if let Some(copy) =
             crate::PublicIndexerCopy::new(relay_client, account_id, vec![event], indexers)
         {
@@ -984,15 +988,26 @@ impl MarmotApp {
             .iter()
             .map(|account_id| vec!["p".to_owned(), account_id.clone()])
             .collect();
-        let event = NostrTransportEvent::new_unsigned(
-            account.account_id_hex.clone(),
-            KIND_NOSTR_CONTACT_LIST,
-            tags,
-            String::new(),
+        let nostr_signer = signer.as_nostr_signer();
+        // Sign before sending so quorum completion resends the exact event.
+        let event = crate::sign_account_publication_event(
+            nostr_signer.clone(),
+            &NostrTransportEvent::new_unsigned(
+                account.account_id_hex.clone(),
+                KIND_NOSTR_CONTACT_LIST,
+                tags,
+                String::new(),
+            ),
+        )
+        .await?;
+        let relay_client = self.relay_client_for_account_id(&account.account_id_hex, nostr_signer);
+        let outcome = relay_client.publish_event(&endpoints, &event, 1).await?;
+        let mut completion = crate::QuorumCancelledDelivery::new(
+            relay_client,
+            MemberId::new(hex::decode(&account.account_id_hex)?),
         );
-        self.relay_client_for_account_id(&account.account_id_hex, signer.as_nostr_signer())
-            .publish_event(&endpoints, &event, 1)
-            .await?;
+        completion.add(&event, &endpoints, &outcome);
+        self.spawn_quorum_cancelled_delivery(completion);
         // Publishing a local kind-3 list must make its own cached edge set
         // immediately available to the bindings, without admitting every
         // followed account as a watched directory entry.

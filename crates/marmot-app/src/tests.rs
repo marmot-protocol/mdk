@@ -7,6 +7,7 @@ mod key_package_inventory;
 mod key_package_selection;
 mod message_journeys;
 mod publication_progress;
+mod replaceable_delivery;
 mod report_backfill;
 mod user_blocks;
 
@@ -527,6 +528,7 @@ pub(crate) struct ScriptedPushRelayClient {
     reject_next_publish: std::sync::atomic::AtomicBool,
     fail_publish_unavailable: std::sync::atomic::AtomicBool,
     fail_publish_kind: std::sync::Mutex<Option<u64>>,
+    accept_first_endpoint_only: std::sync::atomic::AtomicBool,
     batch_calls: std::sync::atomic::AtomicUsize,
     publish_started: tokio::sync::Notify,
     publish_release: tokio::sync::Notify,
@@ -911,6 +913,21 @@ impl ScriptedPushRelayClient {
         self.fail_publish_kind.lock().unwrap().take();
     }
 
+    /// Model one-ack quorum cancellation: multi-endpoint publishes report only
+    /// their first endpoint, and the others neither accept nor fail.
+    pub(crate) fn accept_first_endpoint_only(&self) {
+        self.accept_first_endpoint_only
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn attempted_routes(&self) -> Vec<(u64, Vec<TransportEndpoint>)> {
+        self.attempted_publish_routes.lock().unwrap().clone()
+    }
+
+    pub(crate) fn attempted_events(&self) -> Vec<NostrTransportEvent> {
+        self.attempted_events.lock().unwrap().clone()
+    }
+
     pub(crate) async fn wait_for_blocked_publish(&self) {
         self.publish_started.notified().await;
     }
@@ -1292,6 +1309,12 @@ impl NostrRelayClient for ScriptedPushRelayClient {
             .unwrap_or(true)
         {
             self.published_events.lock().unwrap().push(event.clone());
+            if self
+                .accept_first_endpoint_only
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(NostrPublishOutcome::accepted(endpoints.first().cloned()));
+            }
             Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
         } else {
             Err(cgka_traits::TransportAdapterError::Publish(
