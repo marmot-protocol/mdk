@@ -309,8 +309,9 @@ pub struct NotificationUpdate {
     pub group_name: Option<String>,
     pub is_dm: bool,
     /// True when this notification's receiving account is mentioned by a NIP-27
-    /// pubkey-reference (`p`) tag or an inline nostr pubkey entity (a bare
-    /// `@npub1…` handle or an explicit `nostr:` URI) on the inbound app event.
+    /// pubkey-reference (`p`) tag or an attention-bearing inline pubkey mention
+    /// (such as `@npub1…`) on the inbound app event. An untagged informational
+    /// `nostr:npub` or `nostr:nprofile` link alone does not set this flag.
     /// This is computed from event semantics, not the rendered preview text.
     /// A durable chat mute still emits direct mentions with this flag set;
     /// blocked senders remain suppressed before an update is emitted.
