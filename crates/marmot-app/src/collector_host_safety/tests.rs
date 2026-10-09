@@ -240,19 +240,41 @@ struct ForbiddenDns(Arc<AtomicUsize>);
 // never observe changes to their process-wide network policy.
 #[tokio::test]
 async fn socks5_pins_dns_fail_closed() {
+    use crate::relay_plane::{
+        DirectoryEventQuery, DirectoryFetchRequest, DirectoryRelayFetcher,
+        NostrSdkDirectoryRelayFetcher,
+    };
+    use cgka_traits::TransportEndpoint;
+    use futures::{SinkExt, StreamExt};
+
     const CHILD: &str = "WN_PROXY_ROUTING_TEST_CHILD";
     const MODE: &str = "WN_PROXY_ROUTING_TEST_MODE";
     const USERNAME: &str = "proxy-ü:@/%";
     const PASSWORD: &str = "proxy-secret:@/%";
+    let directory = |relay: String| async move {
+        let request = DirectoryFetchRequest::new(
+            vec![TransportEndpoint(relay)],
+            vec![DirectoryEventQuery::new(
+                0,
+                vec![nostr_sdk::prelude::Keys::generate().public_key().to_hex()],
+                10,
+            )],
+        )
+        .unwrap();
+        NostrSdkDirectoryRelayFetcher::standalone()
+            .fetch_directory_events_with_completion(request)
+            .await
+            .unwrap()
+    };
     if let Ok(origin) = std::env::var(CHILD) {
         let mode = std::env::var(MODE).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let pin = resolve(
-            &format!("http://localhost:{origin}/metrics"),
-            &["127.0.0.1"],
-        )
-        .await
-        .unwrap();
+        // Builder fixture only: production resolution rejects loopback answers
+        // for ordinary hostnames. An unresolvable name proves use of the pin.
+        let pin = PinnedCollector {
+            url: Url::parse(&format!("http://pin-only.invalid:{origin}/metrics")).unwrap(),
+            addrs: vec![format!("127.0.0.1:{origin}").parse().unwrap()],
+        };
         if mode == "partial" || mode == "orphan" {
             assert!(pin.build_client().is_err());
             let relays = crate::network_proxy::nostr_builder().build();
@@ -265,6 +287,7 @@ async fn socks5_pins_dns_fail_closed() {
                     .is_err()
             );
             relays.shutdown().await;
+            assert!(!directory(relay).await.complete);
             return;
         }
         let client = pin
@@ -296,6 +319,9 @@ async fn socks5_pins_dns_fail_closed() {
             .await;
         assert_eq!(connection.is_err(), mode == "rejected");
         relays.shutdown().await;
+        let outcome = directory(relay).await;
+        assert_eq!(outcome.complete, mode != "rejected");
+        assert!(outcome.records.is_empty());
 
         // The proxy has closed. A new connection must fail, even though a
         // direct origin listener is reachable and NO_PROXY matches everything.
@@ -321,8 +347,8 @@ async fn socks5_pins_dns_fail_closed() {
                 return;
             }
             let serve = async {
-                let mut relay_socket = None;
-                for relay in [false, true] {
+                let mut relay_sockets = Vec::new();
+                for route in ["http", "relay", "directory"] {
                     let (mut stream, _) = proxy.accept().await.unwrap();
                     let mut greeting = [0; 2];
                     stream.read_exact(&mut greeting).await.unwrap();
@@ -364,7 +390,7 @@ async fn socks5_pins_dns_fail_closed() {
                     let mut request = [0; 4];
                     stream.read_exact(&mut request).await.unwrap();
                     assert_eq!(&request[..3], &[5, 1, 0]);
-                    if relay {
+                    if route != "http" {
                         assert_eq!(request[3], 3, "relay DNS must be proxy-side");
                         let len = stream.read_u8().await.unwrap() as usize;
                         let mut domain = vec![0; len];
@@ -375,7 +401,28 @@ async fn socks5_pins_dns_fail_closed() {
                             .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
                             .await
                             .unwrap();
-                        relay_socket = Some(tokio_tungstenite::accept_async(stream).await.unwrap());
+                        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                        if route == "directory" {
+                            loop {
+                                let message = socket.next().await.unwrap().unwrap();
+                                let Some(text) = message.to_text().ok() else {
+                                    continue;
+                                };
+                                let request: serde_json::Value =
+                                    serde_json::from_str(text).unwrap();
+                                if request[0] != "REQ" {
+                                    continue;
+                                }
+                                socket
+                                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                                        serde_json::json!(["EOSE", request[1]]).to_string().into(),
+                                    ))
+                                    .await
+                                    .unwrap();
+                                break;
+                            }
+                        }
+                        relay_sockets.push(socket);
                     } else {
                         assert_eq!(
                             request[3], 1,
@@ -396,7 +443,9 @@ async fn socks5_pins_dns_fail_closed() {
                         }
                         let headers = String::from_utf8(headers).unwrap().to_lowercase();
                         assert!(headers.starts_with("post /metrics http/1.1\r\n"));
-                        assert!(headers.contains(&format!("host: localhost:{origin_port}\r\n")));
+                        assert!(
+                            headers.contains(&format!("host: pin-only.invalid:{origin_port}\r\n"))
+                        );
                         stream
                         .write_all(
                             b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
@@ -405,7 +454,7 @@ async fn socks5_pins_dns_fail_closed() {
                         .unwrap();
                     }
                 }
-                relay_socket
+                relay_sockets
             };
             let socket = tokio::time::timeout(Duration::from_secs(20), serve)
                 .await
@@ -455,13 +504,13 @@ async fn socks5_pins_dns_fail_closed() {
         if mode != "partial" && mode != "orphan" {
             shutdown.send(()).unwrap();
         }
-        server.await.unwrap();
         assert!(
             output.status.success(),
             "{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        server.await.unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(100), origin.accept())
                 .await

@@ -969,14 +969,12 @@ async fn strict_fetch_endpoint(
     relay_url: RelayUrl,
     queries: Vec<DirectoryEventQuery>,
 ) -> DirectoryFetchOutcome {
-    // Exactly one bounded subscription owns this connection and its wire
+    // One bounded subscription owns this connection and its pre-admission wire
     // counter. Cancellation/early failure closes it through the scoped guard.
-    let wire = super::directory_wire::DirectoryWireTransport::default();
-    let owned = ScopedInspectionClient(
-        NostrSdkClient::builder()
-            .websocket_transport(wire.clone())
-            .build(),
-    );
+    let builder = crate::network_proxy::nostr_builder();
+    let wire =
+        super::directory_wire::DirectoryWireTransport::new(builder.websocket_transport.clone());
+    let owned = ScopedInspectionClient(builder.websocket_transport(wire.clone()).build());
     let client = &owned.0;
     let endpoint = TransportEndpoint(relay_url.to_string());
     if !matches!(client.relay(&relay_url).await, Ok(Some(_)))
