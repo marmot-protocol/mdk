@@ -22,11 +22,10 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, watch};
+use transport_nostr_adapter::network_proxy as process_proxy;
 use zeroize::{Zeroize, Zeroizing};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
-#[path = "../../network_proxy.rs"]
-mod process_proxy;
 const LOGOUT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PAYLOAD: usize = 2 * 1024 * 1024;
 const PERMS: &str = "sign_event:450,sign_event:30443,sign_event:13,sign_event:22242,sign_event:10002,sign_event:10050,sign_event:5,sign_event:0,sign_event:3,sign_event:10000,sign_event:24242,sign_event:451,nip44_encrypt,nip44_decrypt,nip04_decrypt";
@@ -483,7 +482,7 @@ struct Transport {
     configured: Vec<RelayUrl>,
 }
 impl Transport {
-    fn new(proxy: Option<process_proxy::ProxyConfig>) -> Self {
+    fn new(proxy: Option<Arc<process_proxy::ProxyConfig>>) -> Self {
         let client = process_proxy::nostr_builder(Ok(proxy)).build();
         let notifications = client.notifications();
         Self {
@@ -770,7 +769,7 @@ async fn run_transport(
     session: Arc<Session>,
     mut commands: mpsc::Receiver<Command>,
     mut cancel: watch::Receiver<bool>,
-    proxy: Option<process_proxy::ProxyConfig>,
+    proxy: Option<Arc<process_proxy::ProxyConfig>>,
 ) {
     let mut transport = Transport::new(proxy);
     loop {

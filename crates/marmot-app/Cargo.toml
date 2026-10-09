@@ -22,7 +22,6 @@ media-benchmarks = []
 
 [dependencies]
 async-trait.workspace = true
-async-wsocket.workspace = true
 base64.workspace = true
 chrono.workspace = true
 cgka-engine.workspace = true
@@ -58,8 +57,6 @@ storage-sqlite.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["fs", "net", "io-util"] }
-tokio-socks.workspace = true
-tokio-tungstenite.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 transport-nostr-adapter = { workspace = true, features = ["sdk"] }
@@ -72,6 +69,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+tokio-tungstenite.workspace = true
 keyring-core.workspace = true
 marmot-forensics.workspace = true
 nostr-relay-builder.workspace = true

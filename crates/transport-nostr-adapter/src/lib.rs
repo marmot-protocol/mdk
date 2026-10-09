@@ -68,6 +68,9 @@ fn inbound_wire_metadata(
 
 mod acquisition;
 mod key_package;
+#[cfg(feature = "sdk")]
+#[doc(hidden)]
+pub mod network_proxy;
 mod publish_accounting;
 mod relay_list;
 #[cfg(feature = "sdk")]

@@ -19,11 +19,9 @@ default = []
 alloc-audit = []
 
 [dependencies]
-async-wsocket.workspace = true
 marmot-uniffi.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "rt-multi-thread", "time"] }
-tokio-socks.workspace = true
-tokio-tungstenite.workspace = true
+transport-nostr-adapter = { workspace = true, features = ["sdk"] }
 libc.workspace = true
 # Holds a host-supplied secret-key hex only as long as the boundary needs it.
 zeroize.workspace = true
