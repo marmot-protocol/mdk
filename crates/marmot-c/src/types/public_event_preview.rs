@@ -151,7 +151,7 @@ mod tests {
                 keys.secret_key().to_bech32().unwrap(),
                 marmot_uniffi::conversions::OnboardingOptionsFfi {
                     default_relays: vec!["wss://relay.example.org".into()],
-                    discovery_relays: vec![],
+                    discovery_relays: vec!["wss://index.example.org".into()],
                     inbox_relays: vec![],
                 },
             ))
