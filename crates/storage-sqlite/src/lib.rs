@@ -47,6 +47,7 @@ mod prepared_group_image_upload;
 mod query_work_test_support;
 mod recovery_health;
 mod shared;
+mod stickers;
 mod storage;
 mod timeline;
 mod user_blocks;
@@ -122,6 +123,10 @@ pub use shared::{
     DirectoryPresentation, DirectoryPresentationChanges, PublicDirectoryProfileRecord,
     PublicDirectoryUserRecord, SqliteSharedStorage, StoredAuditLogSettings,
     StoredRelayTelemetrySettings, StoredUsageDiagnosticsSettings,
+};
+pub use stickers::{
+    StoredInstalledStickerState, StoredSticker, StoredStickerInstallOperation,
+    StoredStickerOutboxEvent, StoredStickerPack, StoredStickerPackVersion,
 };
 pub use storage::messages::MessageFormatPromotionProgress;
 #[cfg(feature = "storage-format-benchmarks")]

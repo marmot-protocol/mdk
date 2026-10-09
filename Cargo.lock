@@ -3767,6 +3767,7 @@ dependencies = [
  "marmot-account",
  "marmot-forensics",
  "marmot-markdown",
+ "nostr 0.44.8",
  "nostr 0.45.5",
  "nostr-relay-builder",
  "nostr-sdk",
@@ -3785,6 +3786,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sonar-stickers",
  "storage-sqlite",
  "tempfile",
  "thiserror 2.0.18",
@@ -6185,6 +6187,19 @@ checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "sonar-stickers"
+version = "0.1.0"
+source = "git+https://github.com/hedwig-corp/bitchat-to-sonar?rev=162ac26c88b351dfa3f35d8f098c00a18ae46114#162ac26c88b351dfa3f35d8f098c00a18ae46114"
+dependencies = [
+ "hex",
+ "nostr 0.44.8",
+ "serde",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "url",
 ]
 
 [[package]]

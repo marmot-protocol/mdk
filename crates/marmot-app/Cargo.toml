@@ -53,6 +53,8 @@ secp256k1 = "0.30"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+sonar-stickers.workspace = true
+nostr044 = { package = "nostr", version = "0.44", default-features = false, features = ["std"] }
 storage-sqlite.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true

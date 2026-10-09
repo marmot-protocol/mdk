@@ -207,6 +207,7 @@ mod tests {
             plaintext: "latest".into(),
             media_json: None,
             kind: 9,
+            tags: Vec::new(),
             timeline_at: 7,
             retention_seconds: None,
             retention_expires_at: None,

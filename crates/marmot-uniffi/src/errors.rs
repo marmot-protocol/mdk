@@ -274,6 +274,16 @@ pub enum MarmotKitError {
     /// repair arrives on a remote member's schedule.
     #[error("group {group_id_hex} is unrecoverable and needs to be re-joined before sending")]
     GroupUnrecoverableRepairRequired { group_id_hex: String },
+    #[error("invalid sticker data: {details}")]
+    InvalidSticker { details: String },
+    #[error("sticker pack or asset is unavailable")]
+    StickerNotFound,
+    #[error("sticker network operation failed: {details}")]
+    StickerNetwork { details: String },
+    #[error("sticker import failed: {details}")]
+    StickerImport { details: String },
+    #[error("Signal sticker import is unavailable for external-signing accounts")]
+    StickerImportUnsupported,
     #[error("marmot runtime error: {details}")]
     Runtime { details: String },
     /// The account worker is completing an exclusive catch-up and definitely
@@ -515,6 +525,17 @@ impl From<&AppError> for MarmotKitError {
             },
             AppError::ExternalSignerMismatch => Self::ExternalSignerMismatch,
             AppError::ExternalSignerRejected => Self::ExternalSignerRejected,
+            AppError::InvalidSticker(details) => Self::InvalidSticker {
+                details: details.clone(),
+            },
+            AppError::StickerNotFound => Self::StickerNotFound,
+            AppError::StickerRelay(details) => Self::StickerNetwork {
+                details: details.clone(),
+            },
+            AppError::StickerImport(details) => Self::StickerImport {
+                details: details.clone(),
+            },
+            AppError::StickerExternalSignerImportUnsupported => Self::StickerImportUnsupported,
             other => Self::Runtime {
                 details: other.to_string(),
             },

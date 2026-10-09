@@ -17,8 +17,8 @@ use cgka_traits::{
 use futures::{Stream, StreamExt, stream::FuturesUnordered};
 use nostr_sdk::NotificationUpdate;
 use nostr_sdk::prelude::{
-    Client as NostrSdkClient, ClientNotification, Filter, Kind, PublicKey, RelayMessage, RelayUrl,
-    SubscriptionId, Timestamp as NostrTimestamp,
+    Client as NostrSdkClient, ClientNotification, Event, Filter, Kind, PublicKey, RelayMessage,
+    RelayUrl, SubscriptionId, Timestamp as NostrTimestamp,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -74,6 +74,7 @@ pub(crate) use transport_nostr_adapter::{
 pub(crate) const ACCOUNT_DELIVERY_BUFFER: usize = 1024;
 const DIRECTORY_EVENT_BUFFER: usize = 1024;
 pub(crate) const DIRECTORY_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
+const PUBLIC_EVENT_FETCH_WAIT: Duration = Duration::from_secs(8);
 const RELAY_PLANE_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 const RELAY_PLANE_TASK_ABORT_WAIT: Duration = Duration::from_millis(250);
 const RELAY_NOTIFICATION_RESTART_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
@@ -1793,6 +1794,95 @@ impl MarmotRelayPlane {
             .directory
             .fetch_events(DirectoryFetchRequest::new(endpoints, queries)?)
             .await
+    }
+
+    /// One-shot fetch for bounded public protocol projections such as sticker
+    /// packs. Every endpoint passes through the same relay-safety chokepoint as
+    /// account and directory traffic. A short-lived SDK client prevents a
+    /// discovery filter from inheriting the active account/group subscriptions
+    /// of the long-lived transport pool.
+    pub(crate) async fn fetch_public_events(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        filter: Filter,
+    ) -> Result<Vec<Event>, String> {
+        let endpoints = self
+            .inner
+            .relay_safety
+            .sanitize_endpoints(endpoints, "public event fetch")
+            .map_err(|_| "public event fetch: relay endpoints rejected".to_owned())?;
+        if endpoints.is_empty() {
+            return Err("public event fetch: no relay endpoints".to_owned());
+        }
+        let relay_urls = endpoints
+            .iter()
+            .map(|endpoint| {
+                RelayUrl::parse(endpoint.as_str())
+                    .map_err(|_| "public event fetch: invalid relay endpoint".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let client = NostrSdkClient::builder().build();
+        let mut connected_relays = Vec::with_capacity(relay_urls.len());
+        for relay_url in relay_urls {
+            if client.add_relay(relay_url.clone()).await.is_err() {
+                continue;
+            }
+            if client
+                .try_connect_relay(relay_url.clone(), DIRECTORY_RELAY_CONNECT_WAIT)
+                .await
+                .is_ok()
+            {
+                connected_relays.push(relay_url);
+            }
+        }
+        if connected_relays.is_empty() {
+            return Err("public event fetch: no relay connected".to_owned());
+        }
+        let targets = connected_relays
+            .into_iter()
+            .map(|relay_url| (relay_url, vec![filter.clone()]))
+            .collect::<Vec<_>>();
+        client
+            .fetch_events(targets)
+            .timeout(PUBLIC_EVENT_FETCH_WAIT)
+            .await
+            .map(|events| events.into_iter().collect())
+            .map_err(|_| "public event fetch failed".to_owned())
+    }
+
+    /// Publish an already-signed public event through the shared SDK transport.
+    /// The adapter owns bounded retries, write-only relay lifecycle, stable
+    /// privacy-safe errors, and acknowledgement accounting.
+    pub(crate) async fn publish_public_event(
+        &self,
+        account_id_hex: &str,
+        endpoints: Vec<TransportEndpoint>,
+        event: &Event,
+    ) -> Result<NostrPublishOutcome, String> {
+        let endpoints = self
+            .inner
+            .relay_safety
+            .sanitize_endpoints(endpoints, "public event publish")
+            .map_err(|_| "public event publish: relay endpoints rejected".to_owned())?;
+        if endpoints.is_empty() {
+            return Err("public event publish: no relay endpoints".to_owned());
+        }
+        let relay_client = self
+            .inner
+            .transport
+            .sdk_relay_client
+            .as_ref()
+            .ok_or_else(|| "public event publish requires SDK relay plane".to_owned())?;
+        let event = NostrTransportEvent::from_nostr_event(event)
+            .map_err(|_| "public event publish: invalid signed event".to_owned())?;
+        let account_id = cgka_traits::MemberId::new(
+            hex::decode(account_id_hex)
+                .map_err(|_| "public event publish: invalid account".to_owned())?,
+        );
+        relay_client
+            .publish_event_for_account(&account_id, &endpoints, &event, 1)
+            .await
+            .map_err(|_| "public event publish failed".to_owned())
     }
 
     pub(crate) async fn fetch_directory_events_with_completion(

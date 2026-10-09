@@ -648,6 +648,26 @@ pub(crate) async fn fetch_blossom_blob(
     fetch_blossom_blob_with_transport(url, &transport).await
 }
 
+/// Hardened bounded Blossom fetch shared by encrypted media and smaller public
+/// assets such as stickers. Callers choose a domain-specific byte ceiling;
+/// URL, redirect, DNS/IP pinning, timeout, proxy, and content-encoding policy
+/// remain identical to [`fetch_blossom_blob`].
+pub(crate) async fn fetch_blossom_blob_limited(
+    url: &str,
+    max_bytes: u64,
+    allow_loopback_http: bool,
+) -> Result<Vec<u8>, AppError> {
+    let transport = BlossomHttpTransport::new(allow_loopback_http).with_download_limit(max_bytes);
+    fetch_blossom_blob_bounded(
+        url,
+        &transport,
+        None,
+        tokio::time::Instant::now() + BLOSSOM_CANDIDATE_STARTUP_TIMEOUT,
+        max_bytes,
+    )
+    .await
+}
+
 /// Fetch a bounded blob through a caller-owned transport without collecting
 /// telemetry, primarily for internal callers and deterministic tests.
 #[cfg(any(test, feature = "media-benchmarks"))]

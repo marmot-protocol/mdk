@@ -3,11 +3,12 @@
 use marmot_app::{
     AppDisbandRequest, ChatConversationKind, ChatListAttachmentKind, ChatListAvatar,
     ChatListMessageDeliveryState, ChatListMessagePreview, ChatListRow, ChatNotificationSettings,
-    ChatPinState, ExistingDirectConversation, RuntimeChatListUpdate,
+    ChatPinState, ExistingDirectConversation, RuntimeChatListUpdate, sticker_ref_from_tags,
 };
 
 use super::common::{SelfMembershipFfi, markdown_content_tokens};
 use super::group::GroupLifecycleStateFfi;
+use crate::conversions::StickerRefFfi;
 use crate::markdown::MarkdownDocumentFfi;
 
 /// Group avatar reference. `image_key_hex` is the symmetric key that decrypts
@@ -61,6 +62,7 @@ pub struct ChatListMessagePreviewFfi {
     pub plaintext: String,
     pub content_tokens: MarkdownDocumentFfi,
     pub kind: u64,
+    pub sticker: Option<StickerRefFfi>,
     pub timeline_at: u64,
     /// This message's pinned source-epoch retention. `None` is unknown (safe
     /// retain); `Some(0)` means retention was explicitly disabled.
@@ -120,6 +122,7 @@ impl From<ChatListMessageDeliveryState> for ChatListMessageDeliveryStateFfi {
 impl From<ChatListMessagePreview> for ChatListMessagePreviewFfi {
     fn from(value: ChatListMessagePreview) -> Self {
         let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
+        let sticker = sticker_ref_from_tags(value.kind, &value.tags).map(Into::into);
         Self {
             group_system: value.group_system.map(Into::into),
             message_id_hex: value.message_id_hex,
@@ -128,6 +131,7 @@ impl From<ChatListMessagePreview> for ChatListMessagePreviewFfi {
             plaintext: value.plaintext,
             content_tokens,
             kind: value.kind,
+            sticker,
             timeline_at: value.timeline_at,
             retention_seconds: value.retention_seconds,
             retention_expires_at: value.retention_expires_at,
@@ -486,6 +490,7 @@ mod tests {
                 sender: "sender".to_owned(),
                 sender_display_name: None,
                 plaintext: "hello".to_owned(),
+                tags: Vec::new(),
                 kind: 9,
                 // Deliberately not the timestamp used to pin the deadline.
                 timeline_at: 999,

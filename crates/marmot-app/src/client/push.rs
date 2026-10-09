@@ -739,6 +739,7 @@ pub(crate) fn notification_trigger_for_intent(
     match intent {
         AppMessageIntent::Chat { .. }
         | AppMessageIntent::TaggedChat { .. }
+        | AppMessageIntent::Sticker { .. }
         | AppMessageIntent::Reply { .. }
         | AppMessageIntent::Media { .. }
         | AppMessageIntent::Poll { .. }

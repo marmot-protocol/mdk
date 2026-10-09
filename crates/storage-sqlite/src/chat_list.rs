@@ -21,7 +21,7 @@ use cgka_traits::app_event::{
     GROUP_SYSTEM_TYPE_MEMBER_LEFT, GROUP_SYSTEM_TYPE_MEMBER_REMOVED, GROUP_SYSTEM_TYPE_TAG,
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
 };
-use cgka_traits::storage::StorageResult;
+use cgka_traits::storage::{StorageError, StorageResult};
 pub use pages::{
     ChatListCursor, ChatListPage, ChatListPageDirection, ChatListPageError, ChatListPageQuery,
     ChatListView,
@@ -286,6 +286,8 @@ pub struct ChatListMessagePreview {
     pub sender_display_name: Option<String>,
     pub plaintext: String,
     pub kind: u64,
+    #[serde(default)]
+    pub tags: Vec<Vec<String>>,
     pub timeline_at: u64,
     /// This message's pinned source-epoch retention. `None` is unknown (safe
     /// retain); `Some(0)` means retention was explicitly disabled.
@@ -1404,6 +1406,21 @@ fn chat_list_projection_complete_tx(tx: &Connection) -> StorageResult<bool> {
     )? {
         return Ok(false);
     }
+    // Migration 0046 added `last_message_tags_json` as nullable. Existing
+    // rows with a last message have NULL tags until rebuilt, so detect them
+    // here and force a rebuild.
+    if projection_has_rows_tx(
+        tx,
+        "SELECT EXISTS(
+                SELECT 1
+                FROM chat_list_rows AS row
+                WHERE row.last_message_id_hex IS NOT NULL
+                   AND row.last_message_tags_json IS NULL
+             )",
+        [],
+    )? {
+        return Ok(false);
+    }
     if projection_has_rows_tx(
         tx,
         "SELECT EXISTS(
@@ -1545,6 +1562,10 @@ fn write_chat_list_row_for_group_tx(
 ) -> StorageResult<()> {
     let latest = latest_chat_list_activity_tx(tx, &group.group_id_hex)?;
     let latest_message = latest.as_ref().map(|latest| &latest.preview);
+    let latest_tags_json = latest_message
+        .map(|message| serde_json::to_string(&message.tags))
+        .transpose()
+        .map_err(|err| StorageError::Serialization(err.to_string()))?;
     let accepted_activity_insert_order =
         latest_accepted_activity_insert_order_tx(tx, &group.group_id_hex)?.unwrap_or(0);
     let read_state = read_state_tx(tx, &group.group_id_hex)?;
@@ -1565,8 +1586,8 @@ fn write_chat_list_row_for_group_tx(
             avatar_image_hash_hex, avatar_image_key_hex, avatar_image_nonce_hex,
             avatar_image_upload_key_hex, avatar_media_type,
             last_message_id_hex, last_message_sender, last_message_preview,
-            last_message_kind, last_message_timeline_at, last_message_deleted,
-            last_message_media_json, last_message_delivery_state,
+            last_message_kind, last_message_tags_json, last_message_timeline_at,
+            last_message_deleted, last_message_media_json, last_message_delivery_state,
             unread_count, manually_marked_unread, unread_mention_count,
             first_unread_message_id_hex,
             last_read_message_id_hex, last_read_timeline_at,
@@ -1576,7 +1597,7 @@ fn write_chat_list_row_for_group_tx(
          VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
             ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-            ?21, ?22, ?23, ?24, ?25, ?26, ?27, 0, ?28, ?29, ?30, ?31
+            ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, 0, ?29, ?30, ?31, ?32
          )
          ON CONFLICT(group_id_hex) DO UPDATE SET
             archived = excluded.archived,
@@ -1593,6 +1614,7 @@ fn write_chat_list_row_for_group_tx(
             last_message_sender = excluded.last_message_sender,
             last_message_preview = excluded.last_message_preview,
             last_message_kind = excluded.last_message_kind,
+            last_message_tags_json = excluded.last_message_tags_json,
             last_message_timeline_at = excluded.last_message_timeline_at,
             last_message_deleted = excluded.last_message_deleted,
             last_message_media_json = excluded.last_message_media_json,
@@ -1651,6 +1673,7 @@ fn write_chat_list_row_for_group_tx(
             latest_message.map(|message| message.sender.as_str()),
             latest_message.map(|message| message.plaintext.as_str()),
             optional_u64_to_i64(latest_message.map(|message| message.kind))?,
+            latest_tags_json.as_deref(),
             optional_u64_to_i64(latest_message.map(|message| message.timeline_at))?,
             latest_message
                 .map(|message| bool_i64(message.deleted))
@@ -2166,7 +2189,7 @@ fn latest_chat_list_activity_tx(
     let preview_eligibility = chat_list_preview_eligibility_sql("preview.", "?1");
     let sql = format!(
         "SELECT preview.message_id_hex, preview.sender, preview.plaintext,
-                preview.kind, preview.timeline_at, preview.deleted,
+                preview.kind, preview.tags_json, preview.timeline_at, preview.deleted,
                 preview.media_json, preview.direction,
                 preview.source_message_id_hex, preview.invalidation_status,
                 preview.timeline_order_class, preview.timeline_order_primary,
@@ -2192,10 +2215,10 @@ fn latest_chat_list_activity_tx(
         Ok(LatestChatListMessage {
             preview: chat_list_message_from_row(row)?,
             canonical_order_prefix: (
-                row.get::<_, i64>(10)?.try_into().unwrap_or_default(),
                 row.get::<_, i64>(11)?.try_into().unwrap_or_default(),
                 row.get::<_, i64>(12)?.try_into().unwrap_or_default(),
                 row.get::<_, i64>(13)?.try_into().unwrap_or_default(),
+                row.get::<_, i64>(14)?.try_into().unwrap_or_default(),
             ),
         })
     })
@@ -2250,9 +2273,17 @@ fn timeline_message_for_read_marker_tx(
 }
 
 fn chat_list_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatListMessagePreview> {
-    let direction = row.get::<_, String>(7)?;
-    let source_message_id_hex = row.get::<_, Option<String>>(8)?;
-    let invalidation_status = row.get::<_, Option<String>>(9)?;
+    let deleted = row.get::<_, i64>(6)? != 0;
+    let tags = if deleted {
+        Vec::new()
+    } else {
+        serde_json::from_str(&row.get::<_, String>(4)?).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err))
+        })?
+    };
+    let direction = row.get::<_, String>(8)?;
+    let source_message_id_hex = row.get::<_, Option<String>>(9)?;
+    let invalidation_status = row.get::<_, Option<String>>(10)?;
     let delivery_state = if direction != "sent" {
         ChatListMessageDeliveryState::NotApplicable
     } else if invalidation_status.as_deref() == Some("local_publish_failed") {
@@ -2269,19 +2300,20 @@ fn chat_list_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatL
         sender_display_name: None,
         plaintext: row.get(2)?,
         kind: row.get::<_, i64>(3)?.try_into().unwrap_or_default(),
-        timeline_at: row.get::<_, i64>(4)?.try_into().unwrap_or_default(),
+        tags,
+        timeline_at: row.get::<_, i64>(5)?.try_into().unwrap_or_default(),
         retention_seconds: row
             .get::<_, Option<i64>>("retention_seconds")?
             .and_then(|value| value.try_into().ok()),
         retention_expires_at: row
             .get::<_, Option<i64>>("retention_expires_at")?
             .and_then(|value| value.try_into().ok()),
-        deleted: row.get::<_, i64>(5)? != 0,
-        deletion_source: crate::DeletionSource::from_storage(&row.get::<_, String>(14)?),
+        deleted,
+        deletion_source: crate::DeletionSource::from_storage(&row.get::<_, String>(15)?),
         attachment_kind: None,
         attachment_count: 0,
         delivery_state,
-        media_json: row.get(6)?,
+        media_json: row.get(7)?,
     })
 }
 
@@ -2517,7 +2549,7 @@ macro_rules! chat_list_columns {
             row.avatar_image_nonce_hex, row.avatar_image_upload_key_hex,
             row.avatar_media_type, CASE WHEN row.last_message_sender IN (SELECT public_key FROM user_blocks) THEN NULL ELSE row.last_message_id_hex END,
             row.last_message_sender, row.last_message_preview,
-            row.last_message_kind, row.last_message_timeline_at,
+            row.last_message_kind, row.last_message_tags_json, row.last_message_timeline_at,
             row.last_message_deleted, row.last_message_media_json,
             row.last_message_delivery_state, row.unread_count,
             row.manually_marked_unread, row.unread_mention_count,
@@ -2600,7 +2632,7 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
             .unwrap_or_default(),
         &row.get::<_, Option<String>>(13)?.unwrap_or_default(),
         row.get("authenticated_group_system")?,
-        row.get::<_, bool>(16)?,
+        row.get::<_, bool>(17)?,
     );
     let deletion_source =
         crate::DeletionSource::from_storage(row.get_ref("deletion_source")?.as_str()?);
@@ -2610,6 +2642,7 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
     let retention_expires_at = row
         .get::<_, Option<i64>>("retention_expires_at")?
         .and_then(|value| value.try_into().ok());
+    let deleted = row.get::<_, i64>(17).unwrap_or_default() != 0;
     let last_message = last_message_id_hex.map(|message_id_hex| ChatListMessagePreview {
         retention_seconds,
         retention_expires_at,
@@ -2623,41 +2656,49 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
             .unwrap_or_default()
             .and_then(|value| value.try_into().ok())
             .unwrap_or_default(),
+        tags: if deleted {
+            Vec::new()
+        } else {
+            row.get::<_, Option<String>>("last_message_tags_json")
+                .unwrap_or_default()
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default()
+        },
         timeline_at: row
-            .get::<_, Option<i64>>(15)
+            .get::<_, Option<i64>>(16)
             .unwrap_or_default()
             .and_then(|value| value.try_into().ok())
             .unwrap_or_default(),
-        deleted: row.get::<_, i64>(16).unwrap_or_default() != 0,
+        deleted,
         deletion_source,
         attachment_kind: None,
         attachment_count: 0,
         delivery_state: ChatListMessageDeliveryState::from_storage(
-            &row.get::<_, String>(18).unwrap_or_default(),
+            &row.get::<_, String>(19).unwrap_or_default(),
         ),
-        media_json: row.get(17).unwrap_or_default(),
+        media_json: row.get(18).unwrap_or_default(),
     });
-    let raw_unread_count = row.get::<_, i64>(19)?;
+    let raw_unread_count = row.get::<_, i64>(20)?;
     let unread_count = raw_unread_count
         .try_into()
-        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(19, raw_unread_count))?;
-    let manually_marked_unread = row.get::<_, i64>(20)? != 0;
-    let raw_unread_mention_count = row.get::<_, i64>(21)?;
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(20, raw_unread_count))?;
+    let manually_marked_unread = row.get::<_, i64>(21)? != 0;
+    let raw_unread_mention_count = row.get::<_, i64>(22)?;
     let unread_mention_count = raw_unread_mention_count
         .try_into()
-        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(21, raw_unread_mention_count))?;
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(22, raw_unread_mention_count))?;
     let member_count = row
-        .get::<_, Option<i64>>(29)?
+        .get::<_, Option<i64>>(30)?
         .and_then(|value| u64::try_from(value).ok());
-    let mute_row_exists = row.get::<_, i64>(30)? != 0;
-    let stored_muted_until_ms = row.get::<_, Option<i64>>(31)?;
-    let lifecycle_state = if row.get::<_, i64>(32)? != 0 {
+    let mute_row_exists = row.get::<_, i64>(31)? != 0;
+    let stored_muted_until_ms = row.get::<_, Option<i64>>(32)?;
+    let lifecycle_state = if row.get::<_, i64>(33)? != 0 {
         cgka_traits::GroupLifecycleState::Disbanded
     } else {
         cgka_traits::GroupLifecycleState::Stable
     };
     let muted = chat_mute_is_effective(mute_row_exists, stored_muted_until_ms, now_ms);
-    let pinned = row.get::<_, i64>(33)? != 0;
+    let pinned = row.get::<_, i64>(34)? != 0;
     let pinned_position = row
         .get::<_, Option<i64>>("pinned_position")?
         .and_then(|value| u32::try_from(value).ok());
@@ -2686,15 +2727,15 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
         manually_marked_unread,
         unread_mention_count,
         has_unread_mention: unread_mention_count > 0,
-        first_unread_message_id_hex: row.get(22)?,
-        last_read_message_id_hex: row.get(23)?,
+        first_unread_message_id_hex: row.get(23)?,
+        last_read_message_id_hex: row.get(24)?,
         last_read_timeline_at: row
-            .get::<_, Option<i64>>(24)?
+            .get::<_, Option<i64>>(25)?
             .and_then(|value| value.try_into().ok()),
-        conversation_created_at: row.get::<_, i64>(25)?.try_into().unwrap_or_default(),
-        activity_sort_at: row.get::<_, i64>(26)?.try_into().unwrap_or_default(),
-        updated_at: row.get::<_, i64>(27)?.try_into().unwrap_or_default(),
-        self_membership: SelfMembership::from_storage(&row.get::<_, String>(28)?),
+        conversation_created_at: row.get::<_, i64>(26)?.try_into().unwrap_or_default(),
+        activity_sort_at: row.get::<_, i64>(27)?.try_into().unwrap_or_default(),
+        updated_at: row.get::<_, i64>(28)?.try_into().unwrap_or_default(),
+        self_membership: SelfMembership::from_storage(&row.get::<_, String>(29)?),
         conversation_kind: conversation_kind(&group_name, member_count),
         muted,
         muted_until_ms: muted.then_some(stored_muted_until_ms).flatten(),
