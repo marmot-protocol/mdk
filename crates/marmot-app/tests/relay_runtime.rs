@@ -4999,6 +4999,83 @@ async fn push_registration_settings_accept_apns_fcm_and_redact_tokens() {
     runtime.shutdown().await;
 }
 
+/// Wait for the durable Welcome projection before a lifecycle share targets it.
+async fn wait_for_push_group_member(app: &MarmotApp, account: &str, group: &GroupId) {
+    let group_hex = hex::encode(group.as_slice());
+    timeout(Duration::from_secs(20), async {
+        loop {
+            if app
+                .group(account, &group_hex)
+                .unwrap()
+                .is_some_and(|group| group.self_membership == SelfMembership::Member)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the recipient must install the Welcome before explicit token gossip");
+}
+
+/// Catch-up completion is not a push publication or recipient-ingestion fence.
+/// Observe the exact canonical token state without initiating another retry.
+async fn wait_for_group_push_registration(
+    runtime: &MarmotAppRuntime,
+    account: &str,
+    group: &GroupId,
+    fingerprint: Option<&str>,
+) -> marmot_app::GroupPushDebugInfo {
+    let mut last_counts = (0, 0, 0);
+    let result = timeout(Duration::from_secs(20), async {
+        loop {
+            let view = runtime.group_push_debug_info(account, group).await.unwrap();
+            last_counts = (
+                view.total_token_count,
+                view.active_token_count,
+                view.stale_token_count,
+            );
+            let matches = match fingerprint {
+                Some(fingerprint) => {
+                    view.active_token_count == 1
+                        && view
+                            .tokens
+                            .first()
+                            .is_some_and(|token| token.token_fingerprint == fingerprint)
+                }
+                None => view.active_token_count == 0,
+            };
+            if matches {
+                return view;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    result.unwrap_or_else(|_| {
+        panic!(
+            "canonical push token state did not converge: total={} active={} stale={}",
+            last_counts.0, last_counts.1, last_counts.2,
+        )
+    })
+}
+
+/// A scheduled retry may already have completed the revision before the RPC;
+/// either way the explicit attempt must leave no failed or pending work.
+fn assert_push_share_complete(outcome: marmot_app::PushRegistrationShareOutcome) {
+    assert_eq!(
+        outcome.status,
+        marmot_app::PushRegistrationShareStatus::Complete
+    );
+    assert_eq!(outcome.pending_groups, 0);
+    assert_eq!(outcome.failed_groups, 0);
+    assert_eq!(outcome.succeeded_groups, outcome.attempted_groups);
+    assert!(
+        outcome.attempted_groups <= 1,
+        "the fixture has one joined group"
+    );
+}
+
 #[tokio::test]
 async fn push_token_gossip_register_replace_and_remove_lifecycle() {
     let dir = tempfile::tempdir().unwrap();
@@ -5021,6 +5098,7 @@ async fn push_token_gossip_register_replace_and_remove_lifecycle() {
         )
         .await
         .unwrap();
+    wait_for_push_group_member(&app, &bob.account.label, &group_id).await;
     let server_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
 
     app.set_native_push_enabled(&bob.account.account_id_hex, true)
@@ -5034,15 +5112,19 @@ async fn push_token_gossip_register_replace_and_remove_lifecycle() {
             Some(url.clone()),
         )
         .unwrap();
-    runtime
+    let share = runtime
         .share_push_registration(&bob.account.account_id_hex)
         .await
         .unwrap();
+    assert_push_share_complete(share);
     runtime.catch_up_accounts().await.unwrap();
-    let alice_view = runtime
-        .group_push_debug_info(&alice.account.account_id_hex, &group_id)
-        .await
-        .unwrap();
+    let alice_view = wait_for_group_push_registration(
+        &runtime,
+        &alice.account.account_id_hex,
+        &group_id,
+        Some(&first.token_fingerprint),
+    )
+    .await;
     assert_eq!(alice_view.active_token_count, 1);
     assert_eq!(
         alice_view.tokens[0].token_fingerprint,
@@ -5058,15 +5140,19 @@ async fn push_token_gossip_register_replace_and_remove_lifecycle() {
             Some(url),
         )
         .unwrap();
-    runtime
+    let share = runtime
         .share_push_registration(&bob.account.account_id_hex)
         .await
         .unwrap();
+    assert_push_share_complete(share);
     runtime.catch_up_accounts().await.unwrap();
-    let alice_view = runtime
-        .group_push_debug_info(&alice.account.account_id_hex, &group_id)
-        .await
-        .unwrap();
+    let alice_view = wait_for_group_push_registration(
+        &runtime,
+        &alice.account.account_id_hex,
+        &group_id,
+        Some(&second.token_fingerprint),
+    )
+    .await;
     assert_eq!(alice_view.active_token_count, 1);
     assert_eq!(
         alice_view.tokens[0].token_fingerprint,
@@ -5078,10 +5164,9 @@ async fn push_token_gossip_register_replace_and_remove_lifecycle() {
         .await
         .unwrap();
     runtime.catch_up_accounts().await.unwrap();
-    let alice_view = runtime
-        .group_push_debug_info(&alice.account.account_id_hex, &group_id)
-        .await
-        .unwrap();
+    let alice_view =
+        wait_for_group_push_registration(&runtime, &alice.account.account_id_hex, &group_id, None)
+            .await;
     assert_eq!(alice_view.active_token_count, 0);
 
     // Push-token gossip (kinds 447 update / 448 list / 449 removal) is protocol
@@ -5109,6 +5194,84 @@ async fn push_token_gossip_register_replace_and_remove_lifecycle() {
         );
     }
 
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn push_registration_before_join_is_automatically_shared_without_catch_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    // Settle initial account startup before creating any group so the no-op
+    // share below cannot be deferred until after the Welcome arrives.
+    runtime.catch_up_accounts().await.unwrap();
+    app.set_native_push_enabled(&bob.account.account_id_hex, true)
+        .unwrap();
+    let registration = app
+        .upsert_push_registration(
+            &bob.account.account_id_hex,
+            PushPlatform::Fcm,
+            "registration-before-group-join",
+            &nostr::prelude::Keys::generate().public_key().to_hex(),
+            Some(url),
+        )
+        .unwrap();
+    let share = runtime
+        .share_push_registration(&bob.account.account_id_hex)
+        .await
+        .unwrap();
+    assert_push_share_complete(share);
+    assert_eq!(share.attempted_groups, 0);
+    assert_eq!(share.succeeded_groups, 0);
+    assert!(
+        app.push_registration(&bob.account.account_id_hex)
+            .unwrap()
+            .unwrap()
+            .last_shared_at_ms
+            .is_none(),
+        "the pre-group no-op must not claim that a token was published"
+    );
+
+    let group = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "automatic push after join",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    // No host retry/share/catch-up follows creation: the worker-owned receive
+    // tail must discover and drain the new group's durable push outbox itself.
+    wait_for_push_group_member(&app, &bob.account.label, &group).await;
+    let view = wait_for_group_push_registration(
+        &runtime,
+        &alice.account.account_id_hex,
+        &group,
+        Some(&registration.token_fingerprint),
+    )
+    .await;
+    assert_eq!(view.active_token_count, 1);
+    assert_eq!(
+        view.tokens[0].token_fingerprint,
+        registration.token_fingerprint
+    );
+    assert!(
+        app.push_registration(&bob.account.account_id_hex)
+            .unwrap()
+            .unwrap()
+            .last_shared_at_ms
+            .is_some(),
+        "automatic publication must commit durable share completion"
+    );
     runtime.shutdown().await;
 }
 

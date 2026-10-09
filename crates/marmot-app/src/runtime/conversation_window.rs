@@ -26,6 +26,7 @@ pub use storage_sqlite::{
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+const REFRESH_DELAY: Duration = Duration::from_millis(10);
 // Before first authority, a busy worker may enrich the local window later.
 // Bound that display wait, not the lifetime of an established window command.
 const AUTHORITY_WAIT: Duration = Duration::from_millis(50);
@@ -254,48 +255,77 @@ impl AppClient {
     pub(crate) fn publish_conversation_captures(&mut self, group: &GroupId) {
         self.conversation_captures
             .retain(|capture| capture.strong_count() > 0);
-        let observers: Vec<_> = self
-            .conversation_captures
-            .iter()
-            .filter_map(Weak::upgrade)
-            .filter(|observer| observer.group == *group)
-            .collect();
-        for observer in observers {
-            let (query, generation) = {
-                let state = observer.state.lock().unwrap_or_else(|e| e.into_inner());
-                (state.query.clone(), state.generation)
-            };
-            // Use the same live engine/account read boundary as a normal window
-            // capture. Never combine frozen permissions with newer account rows.
-            // Best effort: the normal read path still owns capture errors.
-            let latest_query = ConversationWindowQuery {
-                opening: ConversationOpenQuery {
-                    target: ConversationOpenTarget::Latest,
-                    limit: query.opening.limit,
-                },
-                before_anchor: None,
-            };
-            // A history observer costs one extra coherent authority/account
-            // capture per send, even if the user never returns to the tail.
-            // Bound that speculative work to one same-limit tail viewport;
-            // latest observers still require only their current-query capture.
-            let latest = if latest_query != query {
-                capture_conversation(self, &observer.group, latest_query.clone(), &observer.epoch)
-                    .ok()
-                    .map(|capture| (latest_query, capture))
-            } else {
-                None
-            };
-            if let Ok(captured) =
-                capture_conversation(self, &observer.group, query, &observer.epoch)
-            {
-                let mut state = observer.state.lock().unwrap_or_else(|e| e.into_inner());
-                if state.generation == generation {
-                    state.generation += 1;
-                    state.pending = Some(captured);
-                    state.latest = latest;
-                    observer.changed.send_replace(());
-                }
+        publish_conversation_captures_from_session(
+            &self.conversation_captures,
+            self.runtime.session(),
+            &self.app,
+            &self.state.label,
+            group,
+        );
+    }
+}
+
+/// Capture only at a live engine boundary. Weak registrations do not retain
+/// closed windows across a network wait; each upgrade lasts one checkpoint.
+pub(crate) fn publish_conversation_captures_from_session(
+    observers: &[Weak<SendCapture>],
+    session: &cgka_session::AccountDeviceSession,
+    app: &MarmotApp,
+    label: &str,
+    group: &GroupId,
+) {
+    let observers: Vec<_> = observers
+        .iter()
+        .filter_map(Weak::upgrade)
+        .filter(|observer| observer.group == *group)
+        .collect();
+    for observer in observers {
+        let (query, generation) = {
+            let state = observer.state.lock().unwrap_or_else(|e| e.into_inner());
+            (state.query.clone(), state.generation)
+        };
+        // Use the same live engine/account read boundary as a normal window
+        // capture. Never combine frozen permissions with newer account rows.
+        // Best effort: the normal read path still owns capture errors.
+        let latest_query = ConversationWindowQuery {
+            opening: ConversationOpenQuery {
+                target: ConversationOpenTarget::Latest,
+                limit: query.opening.limit,
+            },
+            before_anchor: None,
+        };
+        // A history observer costs one extra coherent authority/account
+        // capture per send, even if the user never returns to the tail.
+        // Bound that speculative work to one same-limit tail viewport;
+        // latest observers still require only their current-query capture.
+        let latest = if latest_query != query {
+            capture_conversation_from_session(
+                session,
+                app,
+                label,
+                &observer.group,
+                latest_query.clone(),
+                &observer.epoch,
+            )
+            .ok()
+            .map(|capture| (latest_query, capture))
+        } else {
+            None
+        };
+        if let Ok(captured) = capture_conversation_from_session(
+            session,
+            app,
+            label,
+            &observer.group,
+            query,
+            &observer.epoch,
+        ) {
+            let mut state = observer.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.generation == generation {
+                state.generation += 1;
+                state.pending = Some(captured);
+                state.latest = latest;
+                observer.changed.send_replace(());
             }
         }
     }
@@ -308,34 +338,50 @@ pub(super) fn capture_conversation(
     query: ConversationWindowQuery,
     epoch: &[u8],
 ) -> Result<CapturedConversation, ConversationWindowError> {
+    capture_conversation_from_session(
+        client.runtime.session(),
+        &client.app,
+        &client.state.label,
+        group,
+        query,
+        epoch,
+    )
+}
+
+/// Read fresh compact authority and account rows in one snapshot. A missing
+/// keyed read projection may be repaired locally outside that snapshot; cold
+/// engine authority never triggers hydration or uses cached permissions.
+fn capture_conversation_from_session(
+    session: &cgka_session::AccountDeviceSession,
+    app: &MarmotApp,
+    label: &str,
+    group: &GroupId,
+    query: ConversationWindowQuery,
+    epoch: &[u8],
+) -> Result<CapturedConversation, ConversationWindowError> {
     let group_hex = hex::encode(group.as_slice());
     let capture = || {
-        client
-            .runtime
-            .session()
-            .with_group_authority_snapshot(group, |storage, authority| {
-                if storage.chat_presentation_version()?.store_epoch != epoch {
-                    return Err(ConversationWindowError::Closed);
-                }
-                let mut account =
-                    storage.conversation_account_snapshot(&group_hex, query.clone())?;
-                // A startup migration can still carry Member until its owner backfills.
-                // Use this capture's compact live membership, without loading another roster.
-                // Live removal facts do not distinguish voluntary departure from eviction.
-                // Removed is the conservative fallback only for stale Member rows; explicit
-                // Leaving/Left/Removed/Disbanded projection states remain authoritative.
-                let facts = authority.facts;
-                if account.presentation_input.self_membership == crate::SelfMembership::Member
-                    && (facts.removed
-                        || (!facts.is_member && !facts.disbanded && !facts.unrecoverable))
-                {
-                    account.presentation_input.self_membership = crate::SelfMembership::Removed;
-                }
-                Ok(CapturedConversation {
-                    account,
-                    authority: Some(authority),
-                })
+        session.with_group_authority_snapshot(group, |storage, authority| {
+            if storage.chat_presentation_version()?.store_epoch != epoch {
+                return Err(ConversationWindowError::Closed);
+            }
+            let mut account = storage.conversation_account_snapshot(&group_hex, query.clone())?;
+            // A startup migration can still carry Member until its owner backfills.
+            // Use this capture's compact live membership, without loading another roster.
+            // Live removal facts do not distinguish voluntary departure from eviction.
+            // Removed is the conservative fallback only for stale Member rows; explicit
+            // Leaving/Left/Removed/Disbanded projection states remain authoritative.
+            let facts = authority.facts;
+            if account.presentation_input.self_membership == crate::SelfMembership::Member
+                && (facts.removed || (!facts.is_member && !facts.disbanded && !facts.unrecoverable))
+            {
+                account.presentation_input.self_membership = crate::SelfMembership::Removed;
+            }
+            Ok(CapturedConversation {
+                account,
+                authority: Some(authority),
             })
+        })
     };
     match capture() {
         Err(ConversationWindowError::App(error))
@@ -353,14 +399,13 @@ pub(super) fn capture_conversation(
         Err(ConversationWindowError::NotReady) => {
             // Readiness belongs to the existing keyed projection owner. Repair
             // outside the read boundary, only when missing/dirty; never mark read.
-            let storage = client.app.account_storage(&client.state.label)?;
+            let storage = app.account_storage(label)?;
             if storage.chat_presentation_version()?.store_epoch != epoch {
                 return Err(ConversationWindowError::Closed);
             }
-            let local = client
-                .app
+            let local = app
                 .account_home()
-                .account(&client.state.label)
+                .account(label)
                 .map_err(AppError::from)?
                 .account_id_hex;
             storage.refresh_chat_list_row(
@@ -1084,7 +1129,9 @@ async fn run(
     let mut dirty = true; // enrich the initial local snapshot without delaying it
     let mut authority_pending = false;
     let mut failed = false;
-    let mut retry_delayed = false;
+    // A dirty interval owns one deadline. Repeated checkpoint notifications
+    // may advance it but cannot debounce a usable snapshot until a burst ends.
+    let mut refresh_at = tokio::time::Instant::now() + REFRESH_DELAY;
     let mut last_good_position = position.clone();
     // First published sequence showing the viewport the latest command moved to.
     // A move kept through a quiet failure takes effect when a retry publishes it.
@@ -1099,14 +1146,37 @@ async fn run(
             _ = updates.closed() => return,
             _ = std::future::ready(()), if deferred_command.is_some() => deferred_command.take(),
             command = commands.recv() => { let Some(command) = command else { return; }; Some(command) },
-            _ = send_updates.changed() => { dirty = true; continue; },
-            result = worker_updates.changed(), if worker_updates_open => {
-                if result.is_err() { worker_updates_open = false; }
-                else { dirty = true; }
+            // A ready refresh outranks hot watches, while lifecycle and
+            // explicit viewport commands retain their existing priority.
+            _ = tokio::time::sleep_until(refresh_at), if dirty || authority_pending => None,
+            _ = send_updates.changed() => {
+                let checkpoint_ready = {
+                    let state = reader.send_capture.state.lock().unwrap_or_else(|e| e.into_inner());
+                    state.query == position && state.pending.is_some()
+                };
+                let next = tokio::time::Instant::now() + REFRESH_DELAY;
+                if !dirty && !authority_pending { refresh_at = next; }
+                else if checkpoint_ready { refresh_at = refresh_at.min(next); }
+                dirty = true;
                 continue;
             },
-            _ = tokio::time::sleep(if retry_delayed || (authority_pending && !dirty) { RETRY_DELAY } else { Duration::from_millis(10) }), if dirty || authority_pending => None,
-            _ = sources.invalidated(&reader, &current), if !dirty => { dirty = true; continue; },
+            result = worker_updates.changed(), if worker_updates_open => {
+                if result.is_err() { worker_updates_open = false; }
+                else {
+                    if !dirty {
+                        let next = tokio::time::Instant::now() + REFRESH_DELAY;
+                        refresh_at = if authority_pending { refresh_at.min(next) } else { next };
+                    }
+                    dirty = true;
+                }
+                continue;
+            },
+            _ = sources.invalidated(&reader, &current), if !dirty => {
+                let next = tokio::time::Instant::now() + REFRESH_DELAY;
+                refresh_at = if authority_pending { refresh_at.min(next) } else { next };
+                dirty = true;
+                continue;
+            },
         };
         let next = match command
             .as_ref()
@@ -1194,7 +1264,12 @@ async fn run(
                 // finitely many checkpoints, each before a transport wait.
                 dirty = checkpoint;
                 failed = false;
-                retry_delayed = false;
+                refresh_at = tokio::time::Instant::now()
+                    + if authority_pending && !dirty {
+                        RETRY_DELAY
+                    } else {
+                        REFRESH_DELAY
+                    };
             }
             Err(error) => {
                 let terminal = error.terminal();
@@ -1220,7 +1295,7 @@ async fn run(
                     position = last_good_position.clone();
                     dirty = true;
                     failed = true;
-                    retry_delayed = true;
+                    refresh_at = tokio::time::Instant::now() + RETRY_DELAY;
                 }
                 if terminal {
                     if let Some(observation) = reader.authority_ready.take() {
@@ -1238,7 +1313,7 @@ async fn run(
                     // Quiet NotReady retries must not suppress a later real
                     // storage error that the receiver has not yet seen.
                     failed |= !waiting;
-                    retry_delayed = true;
+                    refresh_at = tokio::time::Instant::now() + RETRY_DELAY;
                 }
             }
         }

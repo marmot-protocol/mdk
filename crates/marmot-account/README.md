@@ -84,6 +84,21 @@ Embedders that use `AccountDeviceRuntime` directly must drive maintenance themse
 - Paused maintenance can finish a prepared current-revision publication, but waits for resume before replacing an
   older pending revision, because that requires generating new private material.
 
+## Queued sends and relay retries
+
+Frozen relay events retain their original bytes, targets and retry order until each outstanding obligation resolves.
+Once a group's required acknowledgements and MLS confirmation are complete, a secondary relay's replication retry no
+longer blocks new engine-queued application sends. This uses the same publication boundary as foreground sends.
+An unmet quorum or pending MLS confirmation still blocks the queued drain, including obligations behind an older
+completed-quorum event. Incoming convergence can settle while that publication barrier remains.
+
+Ordinary lower-level convergence calls still await due relay attempts. Owners using
+`advance_convergence_with_publication_progress_and_yield` can supply a signal that ends optional secondary waits
+after required acknowledgements and MLS confirmation. The signal remains latched for that pass; a later quiet pass
+can resume replication. A cancelled attempt keeps its exact bytes and targets, conservative exposure state, and
+ordinary retry backoff. An attempt skipped before starting keeps its existing deadline. This does not cancel engine
+steps, bypass required publication barriers, or guarantee zero network delay or universal per-relay FIFO delivery.
+
 ## What it does not do
 
 - No UI projection or message database (see `marmot-app`).

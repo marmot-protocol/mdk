@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::{GroupId, MessageId, SecretBytes};
+use futures::FutureExt;
 use marmot_account::{AccountHomeError, AccountSetupKind, AccountSetupPhase, AccountSetupState};
 use marmot_forensics::EpochBackfillExecutionSeam;
 use rand::RngCore;
@@ -1211,6 +1212,9 @@ async fn run_app_runtime_account_worker(
     // join the startup FIFO. During an off-worker comparison the worker can
     // serve eligible live commands without passing ownership of `client` to
     // the network job. Deferred commands replay in arrival order after catch-up.
+    let mut local_submission_wakeups = shared.local_submission_wakeups.subscribe();
+    let mut local_submission_due = true;
+    let mut local_submission_retry_at = TokioInstant::now();
     let sync_started_at = Instant::now();
     let startup_stage_telemetry = shared.app_performance_telemetry();
     let mut startup_explicit_shutdown = false;
@@ -1477,6 +1481,21 @@ async fn run_app_runtime_account_worker(
                                     ),
                                 }
                             }
+                            _ = local_submission_wakeups.changed() => {
+                                local_submission_due = true;
+                            }
+                            _ = tokio::time::sleep_until(local_submission_retry_at),
+                                if local_submission_due && deferred.is_empty() && !lifecycle.is_stopping() => {
+                                let retry = publish_next_local_submission(
+                                    &mut client, &app, &shared, &events,
+                                    &account_id_hex, &account_label,
+                                ).await;
+                                local_submission_due = retry.is_some();
+                                if let Some(delay) = retry {
+                                    local_submission_retry_at = TokioInstant::now() + delay;
+                                    schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
+                                }
+                            }
                         }
                     };
                     let result = match completed {
@@ -1721,13 +1740,10 @@ async fn run_app_runtime_account_worker(
         client.has_pending_runtime_group_subscription_refresh(),
         &command_tx,
     );
-    // Automatic gossip is best-effort network work. Run it only after startup
-    // callers have received their deferred responses so a degraded relay cannot
-    // extend account-open latency.
-    let push_work_pending = client
-        .retry_pending_push_registration_shares_best_effort()
-        .await;
-    scheduled_push_retry.schedule_after_attempt(push_work_pending, &command_tx);
+    // Automatic gossip must not postpone the first durable drain behind
+    // unrelated network I/O. The durable outbox arms the existing retry timer;
+    // explicit registration and departure commands retain their own semantics.
+    scheduled_push_retry.observe_pending(client.has_pending_push_registration_work(), &command_tx);
     publish_client_pending_applied_summary(&mut client, &events, &account_id_hex, &account_label);
 
     // #637: mutations replayed during deferred startup (e.g. a queued SendMessage
@@ -1746,9 +1762,6 @@ async fn run_app_runtime_account_worker(
     let mut legacy_message_promotion = LegacyMessagePromotionSchedule::new();
     let mut presentation_maintenance = super::presentation::PresentationMaintenance::default();
     let mut presentation_wakeups = app.presentation_signals.subscribe_work();
-    let mut local_submission_wakeups = shared.local_submission_wakeups.subscribe();
-    let mut local_submission_due = true;
-    let mut local_submission_retry_at = TokioInstant::now();
     let mut presentation_due = true;
     let mut avatar_due = true;
     let mut attachment_due = true;
@@ -1772,6 +1785,7 @@ async fn run_app_runtime_account_worker(
         });
 
     let mut yield_to_convergence = false;
+    let mut local_submission_service_owed = false;
     let mut comparison_recovery: Option<ComparisonRecoveryJob> = None;
     'worker: loop {
         // A pass whose network wait ended admits its owned batch a few events
@@ -1874,6 +1888,13 @@ async fn run_app_runtime_account_worker(
         }
         let ready_command =
             ready_command_index(&pending, &media_http, comparison_recovery.is_some());
+        #[cfg(test)]
+        tests::secondary_retry_scheduler_tests::record_turn(
+            &account_id_hex,
+            pending.len(),
+            commands.len(),
+            yield_to_convergence,
+        );
         tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
@@ -1989,6 +2010,8 @@ async fn run_app_runtime_account_worker(
                 yield_to_convergence = true;
                 match command {
                     Some((command, approved_pending)) => {
+                        #[cfg(test)]
+                        tests::secondary_retry_scheduler_tests::record_command(&account_id_hex, &command);
                         // ready_command_index has already approved pending work
                         // before the CatchUp barrier. Apply this extra gate only
                         // to fresh channel arrivals, or the earlier work would
@@ -2075,9 +2098,38 @@ async fn run_app_runtime_account_worker(
                     None => break 'worker,
                 }
             }
+            // A completed optional retry owes durable admission one turn once
+            // its finite command predecessors have drained. Keep the existing
+            // command/convergence alternation, including blocked predecessors.
+            _ = tokio::time::sleep_until(local_submission_retry_at),
+                if local_submission_service_owed && local_submission_due
+                    && pending.is_empty() && commands.is_empty()
+                    && !lifecycle.is_stopping() => {
+                // Recheck after polling the deadline: a buffered command may
+                // have arrived while the normal command arm was fairness-gated.
+                if !pending.is_empty() || !commands.is_empty() { continue 'worker; }
+                let retry = publish_next_local_submission(
+                    &mut client, &app, &shared, &events,
+                    &account_id_hex, &account_label,
+                ).await;
+                local_submission_service_owed = false;
+                local_submission_due = retry.is_some();
+                if let Some(delay) = retry {
+                    local_submission_retry_at = TokioInstant::now() + delay;
+                    schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
+                }
+            }
             _ = scheduled_convergence.timer.as_mut(), if !scheduled_convergence_held_for_test(&account_id_hex) => {
                 yield_to_convergence = false;
                 let Some(group_id) = scheduled_convergence.take_ready() else { continue };
+                let secondary_retry_yield = wait_for_local_submission_or_shutdown(
+                    app.clone(),
+                    account_label.clone(),
+                    shared.local_submission_gate(&account_id_hex),
+                    shared.local_submission_wakeups.subscribe(),
+                    lifecycle.subscribe_shutdown(),
+                ).boxed().shared();
+                let yield_observation = secondary_retry_yield.clone();
                 let mut phase = Some(shared.app_performance_telemetry().observe(RuntimeOp::WorkerConvergence));
                 // Recovery owns the live client, but member/roster reads can
                 // use the last committed snapshot while its relay I/O waits.
@@ -2101,7 +2153,23 @@ async fn run_app_runtime_account_worker(
                             Ok(_) => {
                                 // Shutdown is safe here: no engine snapshot guard is live.
                                 if lifecycle.is_stopping() { return; }
-                                match client.advance_convergence_after_runtime_sync(&group_id).await {
+                                let progress = Arc::new(ProjectionPublicationProgress::new(
+                                    events.clone(), &account_id_hex, &account_label,
+                                ));
+                                let progress_sink = progress.clone();
+                                let on_publication = Arc::new(move |update| {
+                                    progress_sink.publish(update);
+                                });
+                                let result = client.advance_convergence_with_projection_progress_and_yield(
+                                    &group_id, Some(on_publication), secondary_retry_yield,
+                                ).await;
+                                record_runtime_publication(
+                                    &client,
+                                    marmot_forensics::v5::RuntimePublicationCategory::ProjectionUpdate,
+                                    None,
+                                    progress.take_publication(),
+                                );
+                                match result {
                                     Ok(summary) => {
                                         publish_app_runtime_summary_with_v5(&client, &events, &account_id_hex, &account_label, &summary);
                                         // A pass that superseded one of this
@@ -2220,6 +2288,17 @@ async fn run_app_runtime_account_worker(
                     &account_label,
                 ))
                 .await;
+                if yield_observation.peek().is_some() {
+                    local_submission_service_owed = true;
+                    // Never erase the ordinary drain's contention/completion
+                    // backoff merely because another optional pass yielded.
+                    if !local_submission_due {
+                        local_submission_due = true;
+                        local_submission_retry_at = TokioInstant::now();
+                    }
+                }
+                #[cfg(test)]
+                tests::secondary_retry_scheduler_tests::pass_tail(&account_id_hex).await;
 
                 if let Some(phase) = phase {
                     phase.finish(TelemetryOutcome::Success);
@@ -2627,32 +2706,17 @@ async fn run_app_runtime_account_worker(
                 }
             }
             _ = local_submission_wakeups.changed() => { local_submission_due = true; }
-            _ = tokio::time::sleep_until(local_submission_retry_at), if local_submission_due => {
-                local_submission_due = false;
-                if let Ok(storage) = app.account_storage(&account_label)
-                    && let Ok(Some(submission)) = storage.next_local_submission()
-                {
-                    let execution = shared.app_performance_telemetry().observe(RuntimeOp::SendExecution);
-                    let started = Instant::now();
-                    client.send_telemetry = Some(shared.app_performance_telemetry());
-                    let result = client.publish_local_submission(&submission, |update| {
-                        publish_app_runtime_projection_update(&events, &account_id_hex, &account_label, update);
-                    }).await;
-                    client.send_telemetry = None;
-                    execution.finish_app(&result);
-                    shared.app_performance_telemetry().record(AppPerformanceOperation::OutboundMessageSend, started.elapsed(), result.is_ok());
-                    // A failed completion write must not strand later app-owned
-                    // rows until maintenance. Bound retries too: a pre-engine
-                    // failure can leave this same row at the head of the queue.
-                    let finished = app.finish_local_message(&account_label, &submission, &result);
-                    local_submission_due = true;
-                    local_submission_retry_at = TokioInstant::now()
-                        + if finished.is_err() { Duration::from_millis(100) } else { Duration::ZERO };
-                    if let Ok(Some(update)) = finished {
-                        publish_app_runtime_projection_update(&events, &account_id_hex, &account_label, update);
-                    }
-                    publish_client_pending_projection_updates(&mut client, &events, &account_id_hex, &account_label);
-                    publish_client_pending_applied_summary(&mut client, &events, &account_id_hex, &account_label);
+            _ = tokio::time::sleep_until(local_submission_retry_at),
+                if local_submission_due && (!local_submission_service_owed
+                    || (pending.is_empty() && commands.is_empty())) => {
+                let retry = publish_next_local_submission(
+                    &mut client, &app, &shared, &events,
+                    &account_id_hex, &account_label,
+                ).await;
+                local_submission_service_owed = false;
+                local_submission_due = retry.is_some();
+                if let Some(delay) = retry {
+                    local_submission_retry_at = TokioInstant::now() + delay;
                     schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
                 }
             }
@@ -5953,6 +6017,112 @@ fn group_recovery_after_hydration(
     client.group_recovery_status(group_id)
 }
 
+/// Observe committed same-account work before waiting on its coalesced signal.
+/// The receiver is created before this future's first queue check, so an admission
+/// racing the check cannot be lost. Other accounts' wakes do not preempt this owner.
+async fn wait_for_local_submission_or_shutdown(
+    app: MarmotApp,
+    account_label: String,
+    admission_gate: Arc<tokio::sync::Mutex<()>>,
+    mut wakeups: watch::Receiver<()>,
+    mut stopping: watch::Receiver<bool>,
+) {
+    loop {
+        if *stopping.borrow() {
+            return;
+        }
+        // Storage failure also yields optional network work. The normal owner
+        // retains error handling; this observer must never reopen after shutdown.
+        {
+            let Ok(_admission) = admission_gate.try_lock() else {
+                // Admission owns this account's storage; never park the owner
+                // behind it merely to decide whether optional work can wait.
+                return;
+            };
+            if !app
+                .account_storage(&account_label)
+                .and_then(|storage| storage.next_local_submission().map_err(Into::into))
+                .is_ok_and(|submission| submission.is_none())
+            {
+                return;
+            }
+        }
+        tokio::select! {
+            biased;
+            _ = wait_for_runtime_shutdown(&mut stopping) => return,
+            result = wakeups.changed() => if result.is_err() { return; },
+        }
+    }
+}
+
+/// Publishes one durable submission under the account owner and returns its next drain delay.
+/// Startup and steady state use the same completion, retry and projection boundary.
+async fn publish_next_local_submission(
+    client: &mut AppClient,
+    app: &MarmotApp,
+    shared: &RuntimeSharedServices,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+) -> Option<Duration> {
+    #[cfg(test)]
+    tests::secondary_retry_scheduler_tests::record_drain(account_id_hex);
+    let (submission, queued) = {
+        // Account-local admission may be waiting on storage. Do not park this
+        // executor thread or the worker's shutdown/read serving behind it.
+        let gate = shared.local_submission_gate(account_id_hex);
+        let Ok(_admission) = gate.try_lock() else {
+            return Some(Duration::from_millis(100));
+        };
+        let storage = app.account_storage(account_label).ok()?;
+        let submission = storage.next_local_submission().ok()??;
+        let queued = shared
+            .local_submission_queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take(
+                account_id_hex,
+                &submission.group_id_hex,
+                &submission.message_id_hex,
+            );
+        (submission, queued)
+    };
+    if let Some(queued) = queued {
+        queued.finish(&shared.app_performance_telemetry());
+    }
+    let execution = shared
+        .app_performance_telemetry()
+        .observe(RuntimeOp::SendExecution);
+    let started = Instant::now();
+    client.send_telemetry = Some(shared.app_performance_telemetry());
+    let result = client
+        .publish_local_submission(&submission, |update| {
+            publish_app_runtime_projection_update(events, account_id_hex, account_label, update);
+        })
+        .await;
+    client.send_telemetry = None;
+    execution.finish_app(&result);
+    shared.app_performance_telemetry().record(
+        AppPerformanceOperation::OutboundMessageSend,
+        started.elapsed(),
+        result.is_ok(),
+    );
+    // A failed completion write must not strand later app-owned rows until
+    // maintenance; bound retries when this row remains at the queue's head.
+    let finished = app.finish_local_message(account_label, &submission, &result);
+    let retry = if finished.is_err() {
+        Duration::from_millis(100)
+    } else {
+        Duration::ZERO
+    };
+    if let Ok(Some(update)) = finished {
+        publish_app_runtime_projection_update(events, account_id_hex, account_label, update);
+    }
+    publish_client_pending_projection_updates(client, events, account_id_hex, account_label);
+    publish_client_pending_applied_summary(client, events, account_id_hex, account_label);
+    Some(retry)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn send_message_on_worker(
     client: &mut AppClient,
@@ -6295,7 +6465,7 @@ const CONVERGENCE_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 const CONVERGENCE_UNSETTLED_MAX_REARMS: u32 = 10;
 
 #[cfg(test)]
-static HELD_SCHEDULED_CONVERGENCE_ACCOUNTS: std::sync::LazyLock<Mutex<HashSet<String>>> =
+pub(crate) static HELD_SCHEDULED_CONVERGENCE_ACCOUNTS: std::sync::LazyLock<Mutex<HashSet<String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
 
 #[cfg(test)]
@@ -6594,8 +6764,8 @@ fn retry_delay_for_attempt(attempt: u32) -> Duration {
 
 /// Finish the original Receive arm after its recovery outcome is reported.
 /// The same tail runs immediately for inline/deferred work or when the owned
-/// comparison joins; the push retry always reads the client's current durable
-/// intent rather than storing a delivery-specific snapshot in the network job.
+/// comparison joins; automatic push work schedules from the current durable
+/// intent instead of awaiting an unrelated gossip batch on the receive path.
 struct ReceiveTailContext<'a> {
     events: &'a broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &'a str,
@@ -6615,12 +6785,10 @@ async fn finish_receive_after_recovery(
         context.shared.schedule_audit_log_tracker_update("receive");
     }
     if retry_push_registration {
-        let pending = client
-            .retry_pending_push_registration_shares_best_effort()
-            .await;
-        context
-            .scheduled_push_retry
-            .schedule_after_attempt(pending, context.command_tx);
+        context.scheduled_push_retry.observe_pending(
+            client.has_pending_push_registration_work(),
+            context.command_tx,
+        );
         publish_client_pending_applied_summary(
             client,
             context.events,
@@ -6838,6 +7006,50 @@ struct RuntimeSummaryPublication {
     attempted: u64,
     accepted: u64,
     no_subscribers: u64,
+}
+
+/// Broadcast committed projection progress without retaining snapshots. Only
+/// bounded aggregate counts remain for the existing v5 publication outcome.
+struct ProjectionPublicationProgress {
+    events: broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: String,
+    account_label: String,
+    publication: std::sync::Mutex<RuntimeSummaryPublication>,
+}
+
+impl ProjectionPublicationProgress {
+    fn new(
+        events: broadcast::Sender<MarmotAppEvent>,
+        account_id_hex: &str,
+        account_label: &str,
+    ) -> Self {
+        Self {
+            events,
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+            publication: Default::default(),
+        }
+    }
+
+    fn publish(&self, update: AppProjectionUpdate) {
+        let accepted = publish_app_runtime_projection_update(
+            &self.events,
+            &self.account_id_hex,
+            &self.account_label,
+            update,
+        );
+        let mut publication = self.publication.lock().unwrap();
+        publication.attempted += 1;
+        if accepted {
+            publication.accepted += 1;
+        } else {
+            publication.no_subscribers += 1;
+        }
+    }
+
+    fn take_publication(&self) -> RuntimeSummaryPublication {
+        std::mem::take(&mut *self.publication.lock().unwrap())
+    }
 }
 
 fn publish_app_runtime_summary(
@@ -7183,8 +7395,12 @@ mod tests {
     #[cfg(feature = "test-policy-overrides")]
     mod integrated_recovery_acceptance_tests;
     #[cfg(feature = "test-policy-overrides")]
+    mod local_submission_queue_tests;
+    mod publication_progress_tests;
+    #[cfg(feature = "test-policy-overrides")]
     mod receive_comparison_resume_tests;
     mod resource_bounds_tests;
+    pub(super) mod secondary_retry_scheduler_tests;
     mod selective_history_tests;
     mod worker_comparison_resume_tests;
     mod worker_recovery_resume_tests;
@@ -9526,6 +9742,89 @@ mod tests {
 
         scheduled.schedule_after_attempt(false, &commands);
         assert!(!scheduled.is_armed());
+    }
+
+    #[tokio::test]
+    async fn receive_tail_schedules_pending_push_gossip_without_awaiting_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = app.client(&account.label).await.unwrap();
+        client.create_group("push retry", &[]).await.unwrap();
+        app.set_native_push_enabled(&account.label, true).unwrap();
+        app.upsert_push_registration(
+            &account.label,
+            crate::PushPlatform::Fcm,
+            "synthetic-token",
+            &nostr::prelude::Keys::generate().public_key().to_hex(),
+            None,
+        )
+        .unwrap();
+        assert!(client.has_pending_push_registration_work());
+        let shared = RuntimeSharedServices::default();
+        let (events, _) = broadcast::channel(8);
+        let (commands, mut received) = mpsc::channel(2);
+        let mut scheduled = ScheduledPushRegistrationRetry::new();
+        relay.block_next_publish();
+        let responsive = {
+            let mut tail = std::pin::pin!(finish_receive_after_recovery(
+                &mut client,
+                ReceiveTailContext {
+                    events: &events,
+                    account_id_hex: &account.account_id_hex,
+                    account_label: &account.label,
+                    shared: &shared,
+                    scheduled_push_retry: &mut scheduled,
+                    command_tx: &commands,
+                },
+                false,
+                true,
+            ));
+            let responsive = timeout(Duration::from_secs(1), tail.as_mut()).await.is_ok();
+            if !responsive {
+                // A regression must release the held engine step before dropping it.
+                relay.release_publish();
+                tail.as_mut().await;
+            }
+            responsive
+        };
+        assert!(
+            responsive,
+            "automatic receive gossip cannot occupy the account owner"
+        );
+        assert!(scheduled.is_armed());
+        assert!(client.has_pending_push_registration_work());
+        let AccountWorkerCommand::RetryPushRegistration { respond } =
+            received.recv().await.unwrap()
+        else {
+            panic!("durable pending work must enqueue its bounded retry")
+        };
+        let retry = tokio::spawn(async move {
+            let pending = client
+                .retry_pending_push_registration_shares_best_effort()
+                .await;
+            let _ = respond.send(pending);
+            pending
+        });
+        timeout(Duration::from_secs(2), relay.wait_for_blocked_publish())
+            .await
+            .expect("network publication starts only on the scheduled retry");
+        relay.release_publish();
+        assert!(
+            !timeout(Duration::from_secs(2), retry)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert!(
+            !app.has_pending_push_registration_work(&account.label)
+                .unwrap()
+        );
+        scheduled.disarm();
     }
 
     #[tokio::test]

@@ -1106,7 +1106,14 @@ impl<S: StorageProvider> Engine<S> {
         context: Option<AuditEventContext>,
         acceptance: SendAcceptance,
     ) -> Result<SendResult, EngineError> {
-        let operation_id = self.next_audit_operation_id();
+        // Extracting the validated inner id decodes the application payload.
+        // Keep that forensic-only work off the ordinary no-recorder path.
+        let application_operation = self
+            .recorder
+            .is_enabled()
+            .then(|| crate::audit_helpers::application_send_operation_id(&intent))
+            .flatten();
+        let operation_id = application_operation.unwrap_or_else(|| self.next_audit_operation_id());
         let intent_kind = crate::audit_helpers::send_intent_kind_str(&intent).to_string();
         let group_ref = crate::audit_helpers::send_intent_group_ref(&intent);
         let recipient_group_id = crate::audit_helpers::send_intent_group_id(&intent);
