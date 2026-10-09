@@ -5292,9 +5292,6 @@ impl AppClient {
         mut result: MediaUploadResult,
         upload_tokens: Vec<Vec<u8>>,
     ) -> Result<MediaUploadResult, AppError> {
-        if !finish.should_send {
-            return Ok(result);
-        }
         if let Some(control) = &finish.control
             && let Err(error) = control.check()
         {
@@ -5308,6 +5305,9 @@ impl AppClient {
                             .map_err(AppError::from)
                     }),
             ));
+        }
+        if !finish.should_send {
+            return Ok(result);
         }
         let attachments = result
             .attachments

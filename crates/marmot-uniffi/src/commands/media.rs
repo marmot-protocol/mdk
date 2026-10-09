@@ -165,8 +165,9 @@ impl Marmot {
     /// first upload, so large attachments never cross the FFI as byte arrays.
     /// Ordered server fallback re-sends the identical ciphertext. `control`
     /// reports progress and cancels preparation, transfer and fallback; a
-    /// cancellation observed before publication returns an error and nothing
-    /// is published. The resulting references and sent message are identical
+    /// cancellation observed before message admission starts returns an error
+    /// and nothing is published. Admission is not interruptible once started.
+    /// The resulting references and sent message are identical
     /// to `upload_media`'s.
     pub async fn upload_media_files(
         &self,

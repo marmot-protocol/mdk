@@ -41,8 +41,8 @@ impl MarmotAppRuntime {
 
     /// File-backed twin of [`Self::upload_media_with_client_token`]. Snapshots
     /// and ciphertext are prepared from `source_path` before any PUT; nothing
-    /// is admitted until every upload completed. Cancelling `control` before
-    /// durable admission prevents publication and releases optional staging;
+    /// is admitted until every upload completed. Cancellation observed before
+    /// admission starts prevents publication and releases optional staging;
     /// once admission starts it is not interruptible, and the existing durable
     /// queue then owns delivery (including uncertain-delivery recovery).
     pub async fn upload_media_files_with_client_token(

@@ -369,6 +369,58 @@ async fn cancelled_file_upload_is_refused_without_upload_or_admission() {
     let _ = server.await;
 }
 
+#[tokio::test]
+async fn cancelled_finish_frees_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = client
+        .create_group("cancelled completion", &[])
+        .await
+        .unwrap();
+    let storage = app.account_storage("alice").unwrap();
+    let bytes = b"completed upload";
+    let (reference, _) = crate::media::tests::attachment_worker_fixture(bytes);
+    let result = MediaUploadResult {
+        attachments: vec![crate::media::MediaUploadAttachmentResult {
+            reference,
+            encrypted_size_bytes: bytes.len() as u64 + 16,
+        }],
+        sent: None,
+    };
+    for should_send in [false, true] {
+        let tokens = storage
+            .stage_attachment_uploads(
+                &hex::encode(group.as_slice()),
+                3,
+                &[bytes],
+                crate::unix_now_seconds(),
+                1024,
+            )
+            .unwrap();
+        assert_eq!(
+            storage.retained_attachment_byte_count().unwrap(),
+            bytes.len() as u64
+        );
+        let control = Arc::new(crate::MediaFileTransferControl::default());
+        control.cancel();
+        let mut completion = finish();
+        completion.group_id = group.clone();
+        completion.should_send = should_send;
+        completion.control = Some(control);
+        let error = client
+            .finish_encrypted_media_upload(completion, result.clone(), tokens)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::InvalidEncryptedMedia(_)));
+        assert_eq!(storage.retained_attachment_byte_count().unwrap(), 0);
+    }
+}
+
 /// Real direct and durable-token sends remain confirmed when optional retention refuses or fails.
 #[tokio::test]
 async fn outgoing_publication_survives_retention_pressure_and_sql_faults() {

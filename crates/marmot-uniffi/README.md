@@ -845,6 +845,11 @@ outcome before another upload. Keep the host source valid until return, use one
 only dropping the host's wait. All sources are privately snapshotted before PUT.
 The counter is monotonic processed bytes, not a percentage.
 
+Cancellation observed before message admission starts prevents publication.
+Admission is not interruptible once started, including while durable acceptance
+is pending. File-backed uploads have no fixed worker-response timeout;
+per-endpoint network deadlines still apply.
+
 `maxFileMediaCiphertextBytes` includes a 16-byte AEAD tag for each attachment in
 the batch. This is a finite implementation bound, not a claimed server maximum.
 Uploads try policy endpoints in order; ordinary rejection or invalid descriptors

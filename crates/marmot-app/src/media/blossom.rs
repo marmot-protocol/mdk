@@ -677,7 +677,8 @@ pub(crate) async fn fetch_blossom_file_with_transport(
         .map_err(|_| AppError::UnsafeMediaFetch("unsafe Blossom file URL".into()))?;
     let deadline = tokio::time::Instant::now() + transport.transfer_timeout;
     let mut restarted_range = false;
-    for hop in 0..=BLOSSOM_REDIRECT_LIMIT {
+    let mut redirects = 0;
+    loop {
         control.check()?;
         let prefix = observation
             .load_file(&current, max_bytes, directory.to_path_buf())
@@ -744,7 +745,7 @@ pub(crate) async fn fetch_blossom_file_with_transport(
             () = control.cancelled() => return Err(AttachmentDownloadFailure::Stop(AppError::InvalidEncryptedMedia("media transfer cancelled".into()))),
         };
         if response.status().is_redirection() {
-            if hop == BLOSSOM_REDIRECT_LIMIT {
+            if redirects >= BLOSSOM_REDIRECT_LIMIT {
                 return Err(AttachmentDownloadFailure::Stop(AppError::BlobStore(
                     "file redirect limit exceeded".into(),
                 )));
@@ -758,6 +759,7 @@ pub(crate) async fn fetch_blossom_file_with_transport(
                 .join(location)
                 .map_err(|_| AppError::BlobStore("invalid file redirect".into()))?;
             validate_blossom_redirect_target(&current, &next, transport.allow_loopback_http)?;
+            redirects += 1;
             current = next;
             continue;
         }
@@ -846,6 +848,7 @@ pub(crate) async fn fetch_blossom_file_with_transport(
                 total.unwrap_or(limit + 1),
             ));
         }
+        observation.file_capacity(total.unwrap_or(0)).await?;
         let identity =
             etag.zip(total)
                 .map(|(etag, total)| storage_sqlite::AttachmentPartialIdentity {
@@ -889,6 +892,7 @@ pub(crate) async fn fetch_blossom_file_with_transport(
         .map_err(|_| AppError::BlockingTask("file prefix verification failed".into()))??;
         let mut pending = Vec::with_capacity(storage_sqlite::ATTACHMENT_CHECKPOINT_BYTES);
         let mut saved = output.len as usize;
+        let mut capacity_checked = output.len;
         let mut reported = tokio::time::Instant::now();
         let mut body_started = false;
         // Restoring/hashing a large local prefix must not consume the first
@@ -905,10 +909,23 @@ pub(crate) async fn fetch_blossom_file_with_transport(
             };
             let chunk = tokio::select! {
                 result = tokio::time::timeout_at(read_deadline, response.chunk()) => {
-                    result.map_err(|_| AppError::BlobStore("file download stalled".into()))?
-                        .map_err(reqwest_blob_error)?
+                    match result {
+                        Ok(result) => result.map_err(|error| AttachmentDownloadFailure::from(reqwest_blob_error(error))),
+                        Err(_) => Err(AppError::BlobStore("file download stalled".into()).into()),
+                    }
                 }
                 () = control.cancelled() => return Err(AttachmentDownloadFailure::Stop(AppError::InvalidEncryptedMedia("media transfer cancelled".into()))),
+            };
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    if let Some(identity) = &identity
+                        && !pending.is_empty()
+                    {
+                        observation.save(identity.clone(), saved, pending).await?;
+                    }
+                    return Err(error);
+                }
             };
             let Some(chunk) = chunk else {
                 break;
@@ -924,6 +941,18 @@ pub(crate) async fn fetch_blossom_file_with_transport(
                         limit + 1,
                     )
                 })?;
+            if total.is_some_and(|total| output.len > total) {
+                observation.clear(Some(&current)).await?;
+                return Err(AttachmentDownloadFailure::Stop(AppError::BlobStore(
+                    "file response exceeds size bound".into(),
+                )));
+            }
+            // Bodies without validators cannot checkpoint, but still consume
+            // private disk space and must preserve the same reserve.
+            if output.len - capacity_checked >= storage_sqlite::ATTACHMENT_CHECKPOINT_BYTES as u64 {
+                observation.file_capacity(output.len).await?;
+                capacity_checked = output.len;
+            }
             for part in chunk.chunks(super::file_transfer::FILE_TRANSFER_BUFFER_BYTES) {
                 control.check()?;
                 writer
@@ -960,20 +989,27 @@ pub(crate) async fn fetch_blossom_file_with_transport(
         drop(writer);
         control.check()?;
         if total.is_some_and(|expected| expected != output.len) {
+            if let Some(identity) = &identity
+                && !pending.is_empty()
+            {
+                observation.save(identity.clone(), saved, pending).await?;
+            }
             return Err(AppError::BlobStore("file response truncated".into()).into());
         }
         output.digest = hash.finalize().into();
         if output.digest != expected_hash {
             observation.clear(Some(&current)).await?;
-            return Err(AttachmentDownloadFailure::Stop(
-                AppError::MediaDownloadFailed("media ciphertext hash mismatch".into()),
-            ));
+            let error = AppError::MediaDownloadFailed("media ciphertext hash mismatch".into());
+            // A saved prefix can be stale despite valid Range headers. Clear it
+            // and permit a fresh durable retry, as the in-memory sink does.
+            return Err(if partial_response {
+                AttachmentDownloadFailure::Retry(error)
+            } else {
+                AttachmentDownloadFailure::Stop(error)
+            });
         }
         return Ok(output);
     }
-    Err(AttachmentDownloadFailure::Stop(AppError::BlobStore(
-        "file redirect limit exceeded".into(),
-    )))
 }
 
 /// Fetch a bounded blob while recording privacy-safe transport phase totals.

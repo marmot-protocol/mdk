@@ -862,6 +862,9 @@ pub(crate) async fn download_file(
                 continue;
             }
         };
+        observation
+            .file_capacity(encrypted.len.saturating_sub(MEDIA_AEAD_TAG_BYTES))
+            .await?;
         let decryption_directory = directory.clone();
         let decryption_control = control.clone();
         let key = key.clone();

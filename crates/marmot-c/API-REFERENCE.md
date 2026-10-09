@@ -5182,7 +5182,7 @@ and MLS membership policy. Pair this header with the exact matching library.
 </details>
 
 <details>
-<summary>File-backed media upload and operation control</summary>
+<summary>Audit v5 configuration and tracker results</summary>
 
 ### `marmot_audit_log_tracker_update_result_v5_free`
 
@@ -5245,7 +5245,7 @@ Return the finite per-batch ciphertext implementation bound, including a 16-byte
 MarmotStatus marmot_media_file_transfer_control_cancel(const struct MarmotMediaFileTransferControl *control);
 ```
 
-Cancel snapshot preparation, transfer or fallback before durable admission. Already admitted delivery remains owned by the local-send queue. May run concurrently with the upload; never free the control while any call on it is active.
+Cancel snapshot preparation, transfer or fallback. Cancellation observed before message admission starts prevents publication; admission is not interruptible once started, even before durable acceptance returns. Delivery then belongs to the local-send queue. May run concurrently with the upload; never free the control while any call on it is active.
 
 [Header contract](include/marmot.h#L9391)
 
@@ -5305,7 +5305,7 @@ Blocking file-backed upload using borrowed regular-file inputs, privately snapsh
 MarmotStatus marmot_upload_media_files_with_client_token(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const struct MarmotMediaFileUploadRequest *request, const struct MarmotMediaFileTransferControl *control, const char *client_token, struct MarmotMediaUploadSubmission **out);
 ```
 
-Token-aware blocking twin: upload all files, then optionally admit the resulting message when `send` is set. Keep one token for the logical submission and probe `marmot_local_send_status` after an interrupted/unknown outcome before reuploading. Input and control lifetimes match `marmot_upload_media_files`; free the result with `marmot_media_upload_submission_free`. Admission does not certify relay delivery.
+Token-aware blocking twin: upload all files, then optionally admit the resulting message when `send` is set. Keep one token for the logical submission and probe `marmot_local_send_status` after an interrupted/unknown outcome before reuploading. Input and control lifetimes match `marmot_upload_media_files`; free the result with `marmot_media_upload_submission_free`. Admission is not interruptible once started and does not certify relay delivery. There is no fixed worker-response timeout; per-endpoint network deadlines still apply.
 
 [Header contract](include/marmot.h#L9439)
 

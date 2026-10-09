@@ -160,6 +160,29 @@ impl AttachmentResume {
         Ok(())
     }
 
+    fn check_file_capacity(&self, bytes: u64) -> Result<(), AttachmentDownloadFailure> {
+        let policy = self
+            .storage
+            .attachment_download_policy(&self.policy)
+            .map_err(|_| retry("attachment publication policy unavailable"))?;
+        let free = fs4::available_space(&self.directory).unwrap_or(0);
+        if free < policy.disk_reserve.saturating_add(bytes.saturating_mul(4)) {
+            return Err(retry("insufficient disk space for attachment publication"));
+        }
+        Ok(())
+    }
+
+    /// Check staging headroom without recording a completed-body receipt.
+    pub(super) async fn file_capacity(
+        self: &Arc<Self>,
+        bytes: u64,
+    ) -> Result<(), AttachmentDownloadFailure> {
+        let this = Arc::clone(self);
+        tokio::task::spawn_blocking(move || this.check_file_capacity(bytes))
+            .await
+            .map_err(|_| retry("attachment capacity task failed"))?
+    }
+
     pub(crate) async fn progress(
         &self,
         received: u64,
@@ -316,6 +339,15 @@ impl AttachmentResume {
         let this = self.clone();
         let locator_digest: [u8; 32] = Sha256::digest(url.as_str().as_bytes()).into();
         tokio::task::spawn_blocking(move || {
+            let total = this
+                .storage
+                .attachment_partial_total(
+                    &this.job,
+                    crate::unix_now_seconds(),
+                    (&this.ciphertext_digest, &locator_digest),
+                )
+                .map_err(|_| retry("partial checkpoint metadata unavailable"))?;
+            this.check_file_capacity(total.unwrap_or(0))?;
             let mut file = super::file_transfer::PrivateMediaFile::create(&directory)?;
             let mut writer = file.writer()?;
             let part = this

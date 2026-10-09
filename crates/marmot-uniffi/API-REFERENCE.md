@@ -2179,7 +2179,9 @@ pub async fn upload_media_files( &self, account_ref: String, group_id_hex: Strin
 
 File-backed `upload_media` for large attachments. Each `source_path` (a regular file, not a symlink; `expected_size` must match when set) is snapshotted and encrypted into owner-only temporary files under the account directory with 64 KiB buffers before the first PUT, so plaintext never crosses the FFI as a byte array. Ordered server fallback re-sends identical ciphertext from offset 0; a server whose descriptor omits or mismatches `sha256`/`size` fails over. The batch ciphertext ceiling is `max_file_media_ciphertext_bytes()`, including each 16-byte AEAD tag. Optional local retention uses the file-backed bound and existing account quota; a retention failure does not reject an otherwise successful upload. Explicit large acquisitions stream ciphertext into private files and authenticate it before bounded local publication; resumable ciphertext checkpoints never grant readable plaintext. Legacy array APIs retain their smaller bounds. `control` reports monotonic `processed_bytes` and cancels preparation, transfer and fallback. There is no dedicated cancellation error variant: after an error, `control.is_cancelled()` distinguishes requested cancellation (`InvalidMediaReference`, detail `media transfer cancelled`). Snapshots are deleted on completion or failure; after a crash, the next account worker start or file upload removes snapshots older than 24 hours.
 
-[Source](src/commands/media.rs#L171)
+File-backed uploads have no fixed worker-response timeout; per-endpoint network deadlines still apply. Cancellation observed before message admission starts prevents publication. Admission is not interruptible once started, including while durable acceptance is pending.
+
+[Source](src/commands/media.rs#L172)
 
 ### `Marmot::download_media`
 
@@ -2191,7 +2193,7 @@ pub async fn download_media( &self, account_ref: String, group_id_hex: String, r
 
 Fetch an encrypted media blob and decrypt it using the group's encrypted media component secret.
 
-[Source](src/commands/media.rs#L201)
+[Source](src/commands/media.rs#L202)
 
 ### `Marmot::list_media`
 
@@ -2203,7 +2205,7 @@ pub fn list_media( &self, account_ref: String, group_id_hex: String, limit: Opti
 
 Typed media references projected from group message history. Host apps can pass a returned `reference` back to `download_media`.
 
-[Source](src/commands/media.rs#L222)
+[Source](src/commands/media.rs#L223)
 
 </details>
 
@@ -3442,7 +3444,7 @@ Create one control per file-backed operation; it is never reused across operatio
 pub fn cancel(&self)
 ```
 
-Request cancellation. Preparation, body transfer and server fallback stop at the next chunk; nothing is published when cancellation is observed before message admission. It cannot retract an already admitted message.
+Request cancellation. Preparation, body transfer and server fallback stop at the next chunk; nothing is published when cancellation is observed before message admission starts. Admission is not interruptible once started, even before durable acceptance returns; cancellation cannot retract an admitted message.
 
 [Source](src/conversions/media.rs#L382)
 
@@ -4385,7 +4387,7 @@ See [local sends](LOCAL-SENDS.md) for cancellation and epoch-bound media handlin
 pub async fn upload_media_files_with_client_token( &self, account_ref: String, group_id_hex: String, request: MediaFileUploadRequestFfi, control: Arc<MediaFileTransferControlFfi>, client_token: String, ) -> Result<MediaUploadSubmissionFfi, MarmotKitError>
 ```
 
-File-backed `upload_media_with_client_token`: every attachment is prepared and uploaded before durable token admission. Cancelling `control` before admission returns an error and admits nothing; once accepted, cancellation no longer applies and the message follows `local_send_status` and timeline delivery, including uncertain-delivery handling. Admission rejects references from a source epoch that is no longer current.
+File-backed `upload_media_with_client_token`: every attachment is prepared and uploaded before durable token admission. Cancellation observed before admission starts returns an error and admits nothing. Once admission starts it is not interruptible, even before durable acceptance returns; follow `local_send_status` and timeline delivery, including uncertain-delivery handling. Admission rejects references from a source epoch that is no longer current. There is no fixed worker-response timeout; per-endpoint network deadlines still apply.
 
 [Source](src/commands/local_submissions.rs#L152)
 

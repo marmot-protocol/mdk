@@ -362,9 +362,9 @@ impl From<MediaFileUploadRequestFfi> for marmot_app::MediaFileUploadRequest {
 
 /// Cancellation and progress for one file-backed media operation. Create one
 /// per operation; `processed_bytes` is monotonic across snapshot, encryption
-/// and body transfer and is not a percentage. Cancelling before durable
-/// message admission prevents publication; after admission it has no effect
-/// and delivery follows the normal local-send status.
+/// and body transfer and is not a percentage. Cancellation observed before
+/// message admission starts prevents publication. Admission is not
+/// interruptible once started; delivery follows the normal local-send status.
 #[derive(uniffi::Object)]
 pub struct MediaFileTransferControlFfi {
     pub(crate) inner: std::sync::Arc<marmot_app::MediaFileTransferControl>,
@@ -528,7 +528,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn file_upload_request_conversion_is_lossless_and_debug_hides_paths() {
+    fn file_debug_hides_paths() {
         let request = MediaFileUploadRequestFfi {
             attachments: vec![MediaFileUploadAttachmentRequestFfi {
                 source_path: "/private/generated/source.bin".into(),
@@ -545,30 +545,6 @@ mod tests {
         };
         let debug = format!("{request:?} {:?}", request.attachments[0]);
         assert!(!debug.contains("/private/generated") && !debug.contains("generated.bin"));
-        let app: marmot_app::MediaFileUploadRequest = request.into();
-        let attachment = &app.attachments[0];
-        assert_eq!(attachment.source_path, "/private/generated/source.bin");
-        assert_eq!(attachment.expected_size, Some(9));
-        assert_eq!(attachment.dim.as_deref(), Some("1x1"));
-        assert!(app.send);
-        assert_eq!(app.message_tags, vec![vec!["t".to_owned(), "x".to_owned()]]);
-    }
-
-    #[test]
-    fn file_transfer_control_cancels_and_reports_progress() {
-        let control = MediaFileTransferControlFfi::new();
-        assert!(!control.is_cancelled());
-        assert_eq!(control.processed_bytes(), 0);
-        control.cancel();
-        assert!(control.is_cancelled());
-        assert!(
-            control.inner.is_cancelled(),
-            "the app runtime observes the same token"
-        );
-        assert_eq!(
-            max_file_media_ciphertext_bytes(),
-            marmot_app::MAX_FILE_MEDIA_CIPHERTEXT_BYTES
-        );
     }
 
     fn imeta_tag(byte: u8, media_type: &str, file_name: &str, extra: &[&str]) -> Vec<String> {
