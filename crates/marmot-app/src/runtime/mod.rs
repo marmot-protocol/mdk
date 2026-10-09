@@ -8694,6 +8694,14 @@ pub(crate) async fn local_account_worker_response<T>(
     account_worker_response_with_wait(response, APP_RUNTIME_LOCAL_WORKER_RESPONSE_WAIT).await
 }
 
+/// File preparation, endpoint fallback and queueing own their deadlines. Do not
+/// abandon their response while a valid upload can still publish or be admitted.
+pub(crate) async fn file_account_worker_response<T>(
+    response: oneshot::Receiver<Result<T, AppError>>,
+) -> Result<T, AppError> {
+    response.await.map_err(|_| AppError::TransportClosed)?
+}
+
 pub(crate) async fn long_account_worker_response<T>(
     response: oneshot::Receiver<Result<T, AppError>>,
 ) -> Result<T, AppError> {
@@ -8898,3 +8906,35 @@ fn group_contributes_co_members(group: &AppGroupRecord) -> bool {
 }
 
 mod moderation;
+
+#[cfg(test)]
+mod file_response_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn file_response_survives_legacy_timeout_and_preserves_terminal_outcome() {
+        let (send, response) = oneshot::channel::<Result<u64, AppError>>();
+        let waiting = tokio::spawn(file_account_worker_response(response));
+        tokio::task::yield_now().await;
+        tokio::time::advance(APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT + Duration::from_secs(1)).await;
+        assert!(
+            !waiting.is_finished(),
+            "valid file work still owns its response"
+        );
+        send.send(Ok(42)).unwrap();
+        assert_eq!(waiting.await.unwrap().unwrap(), 42);
+
+        let (send, response) = oneshot::channel::<Result<u64, AppError>>();
+        send.send(Err(AppError::MediaUploadTimedOut)).unwrap();
+        assert!(matches!(
+            file_account_worker_response(response).await,
+            Err(AppError::MediaUploadTimedOut)
+        ));
+        let (send, response) = oneshot::channel::<Result<u64, AppError>>();
+        drop(send);
+        assert!(matches!(
+            file_account_worker_response(response).await,
+            Err(AppError::TransportClosed)
+        ));
+    }
+}

@@ -21,11 +21,12 @@
   `SqliteAccountStorage::stage_attachment_upload_files` stages
   `AttachmentUploadSource` readers and
   `complete_attachment_acquisition_from_reader` publishes authenticated
-  plaintext readers; both write through `zeroblob` reservations and
-  incremental BLOB I/O in `ATTACHMENT_STAGING_CHUNK_BYTES` (64 KiB) chunks,
-  verify length and digest, and roll back on short, growing, mismatched or
-  cancelled input. Outgoing promotion now copies staged bodies into retained
-  bytes through the same bounded path instead of `INSERT ... SELECT`. Bodies
+  plaintext readers. Migration 0106 moves file bodies into shared immutable
+  `ATTACHMENT_STAGING_CHUNK_BYTES` (64 KiB) chunks with nonce-bound reservations
+  and short transactions, releasing the account lock during caller I/O.
+  Length, digest, cancellation and source/attempt validity gate publication;
+  failed imports release their own reservations. Outgoing promotion shares
+  verified chunks without copying the whole body. Bodies
   use `MAX_RETAINED_FILE_ATTACHMENT_BYTES` (900 MiB); legacy arrays retain
   `MAX_RETAINED_ATTACHMENT_BYTES` (512 MiB). Migrations 0104/0105 preserve
   retained bodies and ciphertext checkpoints while widening file-backed

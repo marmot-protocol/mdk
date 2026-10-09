@@ -13,9 +13,10 @@ use cgka_traits::{GroupId, SecretBytes};
 use tokio::sync::{mpsc, oneshot};
 
 use super::{
-    AccountManager, AccountWorkerCommand, account_worker_response, group_contributes_co_members,
-    local_account_worker_response, long_account_worker_catch_up_response,
-    long_account_worker_response, publish_app_runtime_group_state_updated,
+    AccountManager, AccountWorkerCommand, account_worker_response, file_account_worker_response,
+    group_contributes_co_members, local_account_worker_response,
+    long_account_worker_catch_up_response, long_account_worker_response,
+    publish_app_runtime_group_state_updated,
 };
 use crate::app_telemetry::AppPerformanceOperation;
 use crate::messages::AppMessageIntent;
@@ -1858,7 +1859,7 @@ impl AccountManager {
             })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        let result = long_account_worker_response(response).await?;
+        let result = file_account_worker_response(response).await?;
         if result.sent.is_some() {
             self.schedule_audit_log_tracker_update("upload_media_send");
         }

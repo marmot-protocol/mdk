@@ -965,9 +965,12 @@ pub(crate) async fn fetch_blossom_file_with_transport(
         output.digest = hash.finalize().into();
         if output.digest != expected_hash {
             observation.clear(Some(&current)).await?;
-            return Err(AttachmentDownloadFailure::Stop(
-                AppError::MediaDownloadFailed("media ciphertext hash mismatch".into()),
-            ));
+            let error = AppError::MediaDownloadFailed("media ciphertext hash mismatch".into());
+            return Err(if partial_response {
+                AttachmentDownloadFailure::Retry(error)
+            } else {
+                AttachmentDownloadFailure::Stop(error)
+            });
         }
         return Ok(output);
     }

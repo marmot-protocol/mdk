@@ -127,6 +127,19 @@ impl AttachmentResume {
         }
         Ok(())
     }
+    /// Final progress keeps ciphertext units; only the receipt uses plaintext length.
+    pub(crate) async fn completed_file_body(
+        &self,
+        plaintext_len: usize,
+    ) -> Result<(), AttachmentDownloadFailure> {
+        let ciphertext_len = (plaintext_len as u64)
+            .checked_add(16)
+            .ok_or_else(|| stop("attachment length overflow"))?;
+        self.progress(ciphertext_len, Some(ciphertext_len), false)
+            .await?;
+        self.completed_body(plaintext_len).await
+    }
+
     pub(crate) async fn completed_body(
         &self,
         plaintext_len: usize,

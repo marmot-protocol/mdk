@@ -558,8 +558,7 @@ impl EncryptedMediaDownloadHttp {
                     Arc::new(resume.clone()),
                 )
                 .await?;
-                resume.progress(file.len, Some(file.len), false).await?;
-                resume.completed_body(file.len as usize).await?;
+                resume.completed_file_body(file.len as usize).await?;
                 Ok(AcquiredMediaBody::File(file))
             }
             Err(error) => Err(error),

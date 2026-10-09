@@ -5182,7 +5182,7 @@ and MLS membership policy. Pair this header with the exact matching library.
 </details>
 
 <details>
-<summary>File-backed media upload and operation control</summary>
+<summary>Audit v5 tracker results and subscription errors</summary>
 
 ### `marmot_audit_log_tracker_update_result_v5_free`
 

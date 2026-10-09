@@ -63,16 +63,18 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
         "DROP TABLE retained_attachment_bytes;
         ALTER TABLE retained_attachment_bytes_next RENAME TO retained_attachment_bytes;
         CREATE TRIGGER attachment_bytes_added AFTER INSERT ON retained_attachment_bytes BEGIN
+            UPDATE retained_attachment_bytes SET byte_len=length(NEW.bytes)
+                WHERE token=NEW.token AND NEW.byte_len<0;
             UPDATE attachment_retention_usage SET byte_count=byte_count+
                 CASE WHEN NEW.byte_len<0 THEN length(NEW.bytes) ELSE NEW.byte_len END WHERE id=1;
         END;
         CREATE TRIGGER attachment_bytes_removed AFTER DELETE ON retained_attachment_bytes BEGIN
             UPDATE attachment_retention_usage SET byte_count=byte_count-
-                CASE WHEN OLD.byte_len<0 THEN length(OLD.bytes) ELSE OLD.byte_len END WHERE id=1;
+                OLD.byte_len WHERE id=1;
         END;
         CREATE TRIGGER attachment_bytes_updated AFTER UPDATE OF bytes ON retained_attachment_bytes BEGIN
             UPDATE attachment_retention_usage SET byte_count=byte_count-
-                CASE WHEN OLD.byte_len<0 THEN length(OLD.bytes) ELSE OLD.byte_len END+
+                OLD.byte_len+
                 CASE WHEN NEW.byte_len<0 THEN length(NEW.bytes) ELSE NEW.byte_len END WHERE id=1;
         END;",
     ).storage()?;
@@ -124,6 +126,38 @@ mod tests {
             )
             .unwrap(),
             4
+        );
+        // Legacy callers omit byte_len. Normalize it on insert so deletion
+        // accounting never references OLD.bytes (SQLite loads that entire blob).
+        conn.execute("INSERT INTO attachment_acquisition VALUES(x'02')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO retained_attachment_bytes(token,bytes) VALUES(x'02',zeroblob(8192))",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT byte_len FROM retained_attachment_bytes WHERE token=x'02'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            8192
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT byte_count FROM attachment_retention_usage",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            8196
+        );
+        let deletion: String = conn.query_row("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='attachment_bytes_removed'", [], |r|r.get(0)).unwrap();
+        assert!(
+            !deletion.contains("OLD.bytes"),
+            "deletion must use stored metadata"
         );
         conn.execute("DELETE FROM attachment_acquisition", [])
             .unwrap();

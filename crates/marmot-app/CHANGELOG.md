@@ -34,6 +34,9 @@
   decryption and ciphertext Range checkpoints. Legacy arrays retain their
   smaller limits. Cancellation before admission publishes nothing.
   File uploads require the server descriptor's `sha256` and `size`. (#2175)
+  Completion preserves ciphertext progress, a corrupt resumed suffix clears its
+  checkpoint and retries, and file-upload responses outlive the legacy fixed
+  caller timeout while the operation retains cancellation and transfer deadlines.
 
 ### Changed
 
