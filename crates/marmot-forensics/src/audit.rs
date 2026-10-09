@@ -97,6 +97,24 @@ pub fn member_ref_hex(member_identity: &[u8]) -> MemberRefHex {
     hex::encode(&hasher.finalize()[..16])
 }
 
+/// Stable diagnostic identity for one logical application send in one group.
+///
+/// Callers supply the validated inner application-event id, which survives
+/// durable queuing, re-encryption and frozen transport retries. The result is
+/// a domain-separated digest, never the raw event or group id. It belongs in
+/// [`AuditEventContext::operation_id`], not in an outbound message inventory;
+/// v5 applies its ordinary operation-reference protection on export.
+/// Individual preparation/publication attempts remain separate audit rows.
+pub fn application_send_operation_id(group_id: &[u8], app_event_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"marmot-audit-application-send/v1\0");
+    hasher.update((group_id.len() as u64).to_be_bytes());
+    hasher.update(group_id);
+    hasher.update((app_event_id.len() as u64).to_be_bytes());
+    hasher.update(app_event_id.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 /// Hex-encoded 32-byte SHA-256 digest.
 pub type DigestHex = String;
 

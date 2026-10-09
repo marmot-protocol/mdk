@@ -30,6 +30,23 @@ use crate::convergence::{
 use crate::epoch_manager::PendingKind;
 use openmls::prelude::Proposal;
 
+/// Recover a logical send identity from an id-validated application payload.
+/// Audit extraction is best effort; validation and rejection stay on the
+/// ordinary send path, including for malformed payloads.
+pub(crate) fn application_send_operation_id(intent: &SendIntent) -> Option<String> {
+    let SendIntent::AppMessage {
+        group_id, payload, ..
+    } = intent
+    else {
+        return None;
+    };
+    let event = cgka_traits::MarmotAppEvent::decode(payload).ok()?;
+    Some(marmot_forensics::application_send_operation_id(
+        group_id.as_slice(),
+        &event.id,
+    ))
+}
+
 pub(crate) fn pending_kind_str(kind: PendingKind) -> &'static str {
     match kind {
         PendingKind::CreateGroup => "create_group",

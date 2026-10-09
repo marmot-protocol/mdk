@@ -36,7 +36,37 @@ so CLI, TUI, and native surfaces never open the databases directly.
 worker-routed local reads are available. Relay activation, group-subscription registration, shared-directory
 synchronization, and initial catch-up continue asynchronously. Hosts should render local chat projections at that
 point, show network progress separately, and let later relay events refresh or reorder rows. Mutating worker commands
-received during initial catch-up are deferred and replayed in order once the live client is ready.
+received during initial catch-up are deferred and replayed in order once the live client is ready. While an owned
+comparison's network request runs outside the worker, an empty deferred queue permits both direct sends and durable
+local submissions to use the live client. Durable submissions retain the same completion, retry and projection path
+as steady-state sends; they do not bypass an earlier deferred command. Automatic push-registration gossip after startup
+or a receive/recovery pass arms the durable retry timer rather than awaiting the gossip batch before servicing sends.
+Inline activation, KeyPackage maintenance, explicit push commands and a running scheduled push retry can still delay
+sends.
+
+Engine-queued sends receive an ordinary worker wakeup when their group's required publication acknowledgements and
+MLS confirmation are complete, even if a secondary relay still has a later replication retry scheduled. The runtime
+keeps the original relay event and retry deadline. Unmet required acknowledgements and pending MLS confirmation keep
+their publication barrier.
+
+A new same-account durable admission also lets the managed worker yield a scheduled secondary retry that is already
+waiting on a relay. This applies only after required acknowledgements and MLS confirmation are complete. Unfinished
+attempts remain conservatively recorded as possibly exposed and retry their exact saved bytes after backoff. The
+worker finishes its current local effects before servicing the new send; required publication and confirmation work
+is not cancelled. After a yielded pass, one durable submission receives service ahead of overdue secondary retry
+passes once the finite backlog of deferred and buffered worker commands has drained. Earlier blocked commands keep
+their ordering, and a temporarily unavailable submission keeps its existing retry deadline. This does not prioritize
+durable sends over an indefinitely replenished command stream.
+
+For new durable admissions in the current runtime, `send_queue` and `outbound_message_queue_wait` measure the interval
+from the committed admission to its first worker execution. Execution and publication remain separate measurements.
+Repeated tokens and completion retries do not restart that observation. The private correlation map is bounded to
+1,024 observations per runtime; capacity omissions and shutdown cancellation count as cancelled observations, without
+a successful queue-duration sample. A retained admission can remain observed across sign-out within the same runtime.
+Permanent account removal cancels its remaining observations. Admission and selection use per-account gates;
+observing a send does not add a cross-account database lock.
+Rows restored in a new runtime have no original monotonic admission instant and produce no fabricated queue-duration
+sample. These measurements do not include host rendering or every subsequent engine/retry wait.
 
 **Per-account worker isolation.** A failed account open does not discard a sibling that reached local readiness.
 
