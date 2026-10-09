@@ -1,8 +1,8 @@
-//! Shared private process proxy policy for SDK consumers. Included as a private
-//! module by each crate rather than exposing network configuration as public API.
+//! Shared process proxy policy for MDK's SDK and HTTP consumers.
 
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
 
 use async_wsocket::Message;
@@ -13,16 +13,27 @@ use tokio_socks::tcp::Socks5Stream;
 use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
 use zeroize::Zeroizing;
 
-pub(super) const CONFIG_ERROR: &str = "invalid SOCKS5 configuration: WN_SOCKS5_PROXY requires a numeric IP and nonzero port; WN_SOCKS5_USERNAME and WN_SOCKS5_PASSWORD must both be empty or both be 1..255 UTF-8 bytes without NUL, with a proxy endpoint";
+// Match nostr-sdk's private default transport header. The socket regression
+// compares both transports so an SDK upgrade cannot silently diverge.
+const SDK_USER_AGENT: &str = "nostr-sdk/0.45.4";
 
-pub(super) struct ProxyConfig {
-    pub(super) addr: SocketAddr,
-    pub(super) credentials: Option<Credentials>,
+/// Privacy-safe error for invalid process proxy configuration.
+pub const CONFIG_ERROR: &str = "invalid SOCKS5 configuration: WN_SOCKS5_PROXY requires a numeric IP and nonzero port; WN_SOCKS5_USERNAME and WN_SOCKS5_PASSWORD must both be empty or both be 1..255 UTF-8 bytes without NUL, with a proxy endpoint";
+
+/// Validated SOCKS5 endpoint and optional credentials.
+pub struct ProxyConfig {
+    /// Numeric proxy endpoint; never resolved through DNS.
+    pub addr: SocketAddr,
+    /// RFC 1929 credentials, when authentication is enabled.
+    pub credentials: Option<Credentials>,
 }
 
-pub(super) struct Credentials {
-    pub(super) username: Zeroizing<String>,
-    pub(super) password: Zeroizing<String>,
+/// Validated RFC 1929 credentials, zeroized when released.
+pub struct Credentials {
+    /// Username as 1..255 UTF-8 bytes without NUL.
+    pub username: Zeroizing<String>,
+    /// Password as 1..255 UTF-8 bytes without NUL.
+    pub password: Zeroizing<String>,
 }
 
 fn env_value(name: &str) -> Result<Zeroizing<String>, &'static str> {
@@ -49,7 +60,15 @@ fn credentials(
     Ok(Some(Credentials { username, password }))
 }
 
-pub(super) fn socks5_proxy() -> Result<Option<ProxyConfig>, &'static str> {
+/// Snapshot the process proxy policy on first use, including invalid settings.
+/// Later environment changes cannot alter any MDK consumer's routing.
+pub fn socks5_proxy() -> Result<Option<Arc<ProxyConfig>>, &'static str> {
+    static POLICY: LazyLock<Result<Option<Arc<ProxyConfig>>, &'static str>> =
+        LazyLock::new(read_proxy_env);
+    POLICY.clone()
+}
+
+fn read_proxy_env() -> Result<Option<Arc<ProxyConfig>>, &'static str> {
     let endpoint = env_value("WN_SOCKS5_PROXY")?;
     let credentials = credentials(
         env_value("WN_SOCKS5_USERNAME")?,
@@ -63,7 +82,7 @@ pub(super) fn socks5_proxy() -> Result<Option<ProxyConfig>, &'static str> {
         };
     }
     let addr = parse_proxy(&endpoint)?;
-    Ok(Some(ProxyConfig { addr, credentials }))
+    Ok(Some(Arc::new(ProxyConfig { addr, credentials })))
 }
 
 fn parse_proxy(endpoint: &str) -> Result<SocketAddr, &'static str> {
@@ -74,21 +93,19 @@ fn parse_proxy(endpoint: &str) -> Result<SocketAddr, &'static str> {
         .ok_or(CONFIG_ERROR)
 }
 
-pub(super) fn apply_proxy(builder: ClientBuilder, config: Option<ProxyConfig>) -> ClientBuilder {
+/// Apply a validated policy to an SDK builder.
+pub fn apply_proxy(builder: ClientBuilder, config: Option<Arc<ProxyConfig>>) -> ClientBuilder {
     match config {
-        Some(ProxyConfig {
-            addr,
-            credentials: Some(credentials),
-        }) => builder.websocket_transport(AuthenticatedTransport { addr, credentials }),
-        Some(ProxyConfig {
-            addr,
-            credentials: None,
-        }) => builder.proxy(nostr_sdk::proxy::Proxy::all(addr)),
+        Some(config) if config.credentials.is_some() => {
+            builder.websocket_transport(AuthenticatedTransport { config })
+        }
+        Some(config) => builder.proxy(nostr_sdk::proxy::Proxy::all(config.addr)),
         None => builder,
     }
 }
 
-pub(super) fn nostr_builder(config: Result<Option<ProxyConfig>, &'static str>) -> ClientBuilder {
+/// Build an SDK client, refusing connections when configuration is invalid.
+pub fn nostr_builder(config: Result<Option<Arc<ProxyConfig>>, &'static str>) -> ClientBuilder {
     let builder = Client::builder();
     match config {
         Ok(config) => apply_proxy(builder, config),
@@ -120,14 +137,13 @@ impl WebSocketTransport for BlockedTransport {
 }
 
 struct AuthenticatedTransport {
-    addr: SocketAddr,
-    credentials: Credentials,
+    config: Arc<ProxyConfig>,
 }
 
 impl std::fmt::Debug for AuthenticatedTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthenticatedTransport")
-            .field("addr", &self.addr)
+            .field("addr", &self.config.addr)
             .finish_non_exhaustive()
     }
 }
@@ -162,11 +178,17 @@ impl WebSocketTransport for AuthenticatedTransport {
             })?;
             // A domain target performs no client-side DNS resolution. Connection
             // and authentication errors have no direct-connection retry path.
+            let credentials = self.config.credentials.as_ref().ok_or_else(|| {
+                Error::transport(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    CONFIG_ERROR,
+                ))
+            })?;
             let tcp = Socks5Stream::connect_with_password(
-                self.addr,
+                self.config.addr,
                 (host, port),
-                &self.credentials.username,
-                &self.credentials.password,
+                &credentials.username,
+                &credentials.password,
             )
             .await
             .map_err(|_| {
@@ -181,11 +203,7 @@ impl WebSocketTransport for AuthenticatedTransport {
                 .map_err(Error::transport)?;
             request.headers_mut().insert(
                 "user-agent",
-                tungstenite::http::HeaderValue::from_static(concat!(
-                    env!("CARGO_PKG_NAME"),
-                    "/",
-                    env!("CARGO_PKG_VERSION")
-                )),
+                tungstenite::http::HeaderValue::from_static(SDK_USER_AGENT),
             );
             // Reuse the SDK's underlying WebSocket/TLS implementation and trust
             // roots; its higher-level stream constructor is not public.

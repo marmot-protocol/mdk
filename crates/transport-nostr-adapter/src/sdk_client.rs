@@ -30,6 +30,7 @@ use transport_nostr_peeler::{
     KIND_MARMOT_GROUP_MESSAGE, MarmotNostrSigner, NostrTransportEvent, SdkSigner,
 };
 
+use crate::network_proxy as process_proxy;
 use crate::{
     NostrAcquisitionCancellation, NostrAcquisitionEnd, NostrAcquisitionEndpoint,
     NostrAcquisitionError, NostrAcquisitionLimits, NostrAcquisitionRequest, NostrAcquisitionResult,
@@ -40,8 +41,6 @@ use crate::{
 };
 
 const SDK_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
-#[path = "../../network_proxy.rs"]
-mod process_proxy;
 /// Keep the SDK's own reconnect sleep aligned with MDK's durable transport
 /// retry budget. The SDK default adaptively grows to 60 seconds, which leaves
 /// queued messages idle long after mobile connectivity has returned.

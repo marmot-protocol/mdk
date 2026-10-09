@@ -4,9 +4,7 @@
 use std::net::SocketAddr;
 
 use nostr_sdk::prelude::ClientBuilder;
-
-#[path = "../../network_proxy.rs"]
-mod process_proxy;
+use transport_nostr_adapter::network_proxy as process_proxy;
 
 pub(crate) fn socks5_proxy() -> Result<Option<SocketAddr>, &'static str> {
     process_proxy::socks5_proxy().map(|config| config.map(|config| config.addr))
@@ -33,7 +31,7 @@ pub(crate) fn http_builder(
             // reqwest retains the original URL for TLS/SNI and the Host header.
             let mut proxy = reqwest::Proxy::all(format!("socks5://{}", config.addr))
                 .map_err(|_| process_proxy::CONFIG_ERROR)?;
-            if let Some(credentials) = config.credentials {
+            if let Some(credentials) = &config.credentials {
                 proxy = proxy.basic_auth(&credentials.username, &credentials.password);
             }
             Ok(builder.proxy(proxy))

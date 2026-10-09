@@ -111,3 +111,6 @@ where
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod proxy_tests;

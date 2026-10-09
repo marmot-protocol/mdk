@@ -89,7 +89,7 @@ For where the code lives (`src/runtime/`, `src/client/`, `src/directory/`, `src/
 
 ## SOCKS5 routing
 
-Set the process environment before constructing the runtime:
+Set the process environment before the first network-policy use (including runtime or NIP-46 client construction):
 
 | Variable | Value |
 | --- | --- |
@@ -100,7 +100,9 @@ Set the process environment before constructing the runtime:
 Unset or empty values select direct routing when all three variables are empty. With a proxy endpoint, leave both
 credential variables empty for anonymous SOCKS5, or supply both for RFC 1929 username/password authentication. Each
 credential must contain 1 to 255 UTF-8 bytes without NUL. Partial credentials, credentials without an endpoint,
-hostnames, URL-form endpoints, and zero ports are rejected. Do not change these variables while the runtime is active.
+hostnames, URL-form endpoints, and zero ports are rejected. The first use snapshots the policy for the entire process,
+including invalid configuration. Later environment changes, including clearing these variables, do not change routing
+or unblock an invalid policy. Restart the process to apply a different configuration.
 
 The policy covers relay publishing, account receive/history pools, directory relay clients (including completion-aware
 reads), C NIP-46 signer sessions, and the shared HTTP clients for media, Open Ranking, and collectors (including audit

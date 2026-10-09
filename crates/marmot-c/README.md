@@ -323,6 +323,11 @@ their normal login path in the same client. The session pins three separate keys
 the client communication key, the remote signer's communication key, and the
 user's account key. Only the last identifies the MDK account.
 
+NIP-46 sessions use the shared [SOCKS5 routing policy](../marmot-app/README.md#socks5-routing).
+Invalid `WN_SOCKS5_*` configuration makes `marmot_nip46_new` fail with
+`MARMOT_STATUS_INVALID_ARGUMENT`, without connecting directly. The process policy is frozen at first use;
+clearing or correcting the environment afterward does not unblock it.
+
 1. Create an offline handle with `marmot_nip46_new`. Configuration accepts a bunker
    link in `uri`, or a `relays` array with an optional `name` for client pairing.
    For pairing, get the credential-bearing link with `marmot_nip46_uri` and show
