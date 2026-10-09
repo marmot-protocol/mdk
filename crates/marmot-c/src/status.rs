@@ -136,6 +136,8 @@ pub enum MarmotStatus {
     /// A signed-out account cannot grant automatic network permission.
     AttachmentAccountSignedOut = 94,
     InvalidAppComponent = 95,
+    ObsoleteKeyPackage = 96,
+    MemberDiscoveryIncomplete = 97,
 }
 
 thread_local! {
@@ -233,6 +235,8 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::MediaAttachmentRejected { .. } => MarmotStatus::MediaAttachmentRejected,
         MarmotKitError::MediaUnfetchable { .. } => MarmotStatus::MediaUnfetchable,
         MarmotKitError::MediaDownloadFailed { .. } => MarmotStatus::MediaDownloadFailed,
+        MarmotKitError::ObsoleteKeyPackage { .. } => MarmotStatus::ObsoleteKeyPackage,
+        MarmotKitError::MemberDiscoveryIncomplete { .. } => MarmotStatus::MemberDiscoveryIncomplete,
         MarmotKitError::InvalidKeyPackageEvent { .. } => MarmotStatus::InvalidKeyPackageEvent,
         MarmotKitError::FollowListUnavailable => MarmotStatus::FollowListUnavailable,
         MarmotKitError::RuntimeBusy => MarmotStatus::RuntimeBusy,
@@ -384,6 +388,12 @@ mod tests {
             MarmotKitError::InvalidIdentity {
                 details: "d".into(),
             },
+            MarmotKitError::ObsoleteKeyPackage {
+                account: "a".into(),
+            },
+            MarmotKitError::MemberDiscoveryIncomplete {
+                account: "a".into(),
+            },
             MarmotKitError::InvalidKeyPackageEvent {
                 details: "d".into(),
             },
@@ -485,7 +495,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            86,
+            88,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
@@ -497,6 +507,20 @@ mod tests {
             status_from_error(&MarmotKitError::BlockPublicationUncertain) as i32,
             80
         );
+        assert_eq!(
+            status_from_error(&MarmotKitError::ObsoleteKeyPackage {
+                account: "private".into()
+            }) as i32,
+            96
+        );
+        assert!(!take_last_error().unwrap().contains("private"));
+        assert_eq!(
+            status_from_error(&MarmotKitError::MemberDiscoveryIncomplete {
+                account: "private".into()
+            }) as i32,
+            97
+        );
+        assert!(!take_last_error().unwrap().contains("private"));
         let mut seen = std::collections::BTreeSet::new();
         for err in &variants {
             let status = status_from_error(err);

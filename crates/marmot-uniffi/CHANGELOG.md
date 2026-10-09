@@ -4,6 +4,13 @@
 
 ### Breaking changes
 
+- `MarmotKitError` gains `ObsoleteKeyPackage { account }` and
+  `MemberDiscoveryIncomplete { account }`; update exhaustive Swift/Kotlin error
+  switches. Recipient fields support focused recovery guidance; Display omits
+  identity. No new query types or legacy-package admission. An unfinished empty
+  batch can invoke the existing per-member fallback.
+
+
 - `OnboardingRepairProposalFfi.relay_repair` is a new optional field without
   a binding default. Regenerate matching Swift/Kotlin bindings and pass `nil`
   (Swift) or `null` (Kotlin) in host record initializers without a typed preview.

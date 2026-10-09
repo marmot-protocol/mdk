@@ -22,7 +22,7 @@ use transport_nostr_adapter::{
 
 use crate::key_package_records::{
     fresh_relay_list_status_from_records, merge_relay_list_status,
-    preferred_fresh_key_package_from_records,
+    preferred_member_key_package_from_records,
 };
 use crate::relay_plane::{DirectoryEventQuery, DirectoryFetchOutcome};
 use crate::{AccountRelayListStatus, AppError, FetchedKeyPackage, MarmotApp};
@@ -866,7 +866,7 @@ impl MarmotApp {
                 async move {
                     let result = app
                         .relay_plane
-                        .fetch_directory_events(endpoints, vec![query])
+                        .fetch_directory_events_with_completion(endpoints, vec![query])
                         .await
                         .map_err(|error| {
                             AppError::RelayDirectory(format!("fetch key packages: {error}"))
@@ -882,13 +882,13 @@ impl MarmotApp {
         let mut fallback = Vec::new();
         let mut fallback_records = BTreeMap::new();
         for (indices, result) in batches {
-            let Ok(records) = result else {
+            let Ok(fetched) = result else {
                 fallback.extend(indices);
                 continue;
             };
             let multiple_authors = indices.len() > 1;
             let mut records_by_author = BTreeMap::<_, Vec<_>>::new();
-            for record in records {
+            for record in fetched.records {
                 records_by_author
                     .entry(record.event.pubkey.clone())
                     .or_default()
@@ -897,7 +897,7 @@ impl MarmotApp {
             for index in indices {
                 let account_id = &targets[index].account_id_hex;
                 let account_records = records_by_author.remove(account_id).unwrap_or_default();
-                let selected = preferred_fresh_key_package_from_records(
+                let selected = preferred_member_key_package_from_records(
                     account_id,
                     &account_records,
                     self.directory_freshness(),
@@ -1002,10 +1002,11 @@ impl MarmotApp {
                                         discovery: &app.directory_source_relays(&[]),
                                         requirements,
                                         cached_target: None,
+                                        member_diagnostics: true,
                                     },
                                 )
                                 .await?;
-                            let mut fetched = preferred_fresh_key_package_from_records(
+                            let mut fetched = preferred_member_key_package_from_records(
                                 &target.account_id_hex,
                                 &records.records,
                                 records.freshness,

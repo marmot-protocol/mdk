@@ -26,6 +26,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- Invitation JSON errors distinguish obsolete KeyPackages from incomplete discovery, identify the recipient and offer update or retry guidance.
+
 - A sent message the engine queued while the group was converging is no longer
   marked failed when an unrelated publish in the same batch fails, and a sent
   row already marked failed revives once a relay accepts its fanout. Before,

@@ -651,6 +651,7 @@ impl MarmotApp {
             .map(crate::key_package_records::KeyPackageRecoveryTarget::from_cached);
         let records = self
             .recover_key_package_records(super::key_package_recovery::KeyPackageRecoveryRequest {
+                member_diagnostics: false,
                 account: account_id_hex,
                 searched: &source_relays,
                 observed: outcome.records,

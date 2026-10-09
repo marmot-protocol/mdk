@@ -269,7 +269,7 @@ async fn invite_recovery_unknown_coverage_is_retryable_and_can_recover_after_rou
     assert!(matches!(
         app.resolve_member_key_packages(&[&accounts[0].account_id_hex])
             .await,
-        Err(AppError::RelayDirectory(_))
+        Err(AppError::MemberDiscoveryIncomplete(_))
     ));
     *fetcher.incomplete_endpoint.lock().unwrap() = None;
     app.resolve_member_key_packages(&[&accounts[0].account_id_hex])
@@ -734,7 +734,7 @@ async fn invite_recovery_incomplete_supplement_cannot_authorize_a_usable_copy() 
     assert!(matches!(
         app.resolve_member_key_packages(&[&accounts[0].account_id_hex])
             .await,
-        Err(AppError::RelayDirectory(_))
+        Err(AppError::MemberDiscoveryIncomplete(_))
     ));
 }
 
@@ -912,7 +912,7 @@ async fn invite_recovery_candidate_budget_does_not_accept_an_unchecked_survivor(
     assert!(matches!(
         app.resolve_member_key_packages(&[&account.account_id_hex])
             .await,
-        Err(AppError::RelayDirectory(_))
+        Err(AppError::MemberDiscoveryIncomplete(_))
     ));
 }
 

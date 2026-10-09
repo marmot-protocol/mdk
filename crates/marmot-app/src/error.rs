@@ -224,6 +224,12 @@ pub enum AppError {
     ExternalSignerMismatch,
     #[error("external signer request was rejected or cancelled by the user")]
     ExternalSignerRejected,
+    /// Only validated legacy publications remain in the searched newest slots.
+    #[error("member has only obsolete KeyPackages on the searched relays")]
+    ObsoleteKeyPackage(String),
+    /// The bounded lookup could not establish missing or obsolete-only packages.
+    #[error("member discovery did not complete")]
+    MemberDiscoveryIncomplete(String),
     #[error("invalid Marmot KeyPackage event: {0}")]
     InvalidKeyPackageEvent(String),
     #[error("no directory entry for account")]
@@ -462,6 +468,8 @@ impl AppError {
             Self::ExternalSignerUnavailable(_) => "external_signer_unavailable",
             Self::ExternalSignerMismatch => "external_signer_mismatch",
             Self::ExternalSignerRejected => "external_signer_rejected",
+            Self::ObsoleteKeyPackage(_) => "obsolete_key_package",
+            Self::MemberDiscoveryIncomplete(_) => "member_discovery_incomplete",
             Self::InvalidKeyPackageEvent(_) => "invalid_key_package_event",
             Self::MissingDirectoryEntry(_) => "missing_directory_entry",
             Self::InvalidDirectorySearch(_) => "invalid_directory_search",
@@ -536,7 +544,9 @@ impl AppError {
             Self::Session(error) => session_error_class(error),
             Self::Account(error) => account_sync_error_class(error),
             Self::Transport(error) => transport_error_class(error),
-            Self::RelayDirectory(_) => SyncErrorClass::RelayDirectory,
+            Self::RelayDirectory(_) | Self::MemberDiscoveryIncomplete(_) => {
+                SyncErrorClass::RelayDirectory
+            }
             Self::AccountCatchUp(error) => error.classification().error_class,
             Self::FullHistoryRepairIncomplete { reason, .. } => match reason {
                 FullHistoryRepairIncompleteReason::Cancelled => SyncErrorClass::Cancelled,
@@ -553,7 +563,8 @@ impl AppError {
             | Self::InvalidAppMessagePayload(_)
             | Self::InvalidAppComponent(_)
             | Self::InvalidNostrRouting(_)
-            | Self::InvalidKeyPackageEvent(_) => SyncErrorClass::Protocol,
+            | Self::InvalidKeyPackageEvent(_)
+            | Self::ObsoleteKeyPackage(_) => SyncErrorClass::Protocol,
             _ => SyncErrorClass::Unknown,
         }
     }
@@ -753,6 +764,27 @@ mod tests {
         assert!(matches!(error.as_engine_error(),
             Some(EngineError::InvalidKeyPackageCapabilities { member: rejected }) if rejected == &member));
         assert!(!error.to_string().contains(&hex::encode(member.as_slice())));
+    }
+
+    #[test]
+    fn invitation_diagnostics_have_private_stable_kinds_and_distinct_retry_classes() {
+        let recipient = "private-recipient";
+        for (error, kind, class) in [
+            (
+                AppError::ObsoleteKeyPackage(recipient.into()),
+                "obsolete_key_package",
+                crate::SyncErrorClass::Protocol,
+            ),
+            (
+                AppError::MemberDiscoveryIncomplete(recipient.into()),
+                "member_discovery_incomplete",
+                crate::SyncErrorClass::RelayDirectory,
+            ),
+        ] {
+            assert_eq!(error.privacy_safe_kind(), kind);
+            assert_eq!(error.sync_error_class(), class);
+            assert!(!error.to_string().contains(recipient));
+        }
     }
 
     #[test]

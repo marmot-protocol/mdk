@@ -266,6 +266,10 @@ remains retained. On refresh failure, keep the local result.
 Free either list with `marmot_account_key_package_inventory_entry_list_free`.
 Each entry embeds the existing `MarmotAccountKeyPackage` record plus `MarmotAccountKeyPackageLocalState`.
 
+### Invitation lookup errors
+
+`MARMOT_STATUS_OBSOLETE_KEY_PACKAGE` identifies validated legacy-only packages on the searched relays. `MARMOT_STATUS_MEMBER_DISCOVERY_INCOMPLETE` means missing or obsolete-only packages could not be established. Preserve these distinct recovery actions without parsing detail strings. Details omit the recipient identity. See the [shared invitation lookup contract](../marmot-uniffi/README.md#invitation-lookup-errors).
+
 ## Selected chat-list presentation
 
 `marmot_presented_chat_list` and `marmot_presented_chat_list_row` return complete existing row fields

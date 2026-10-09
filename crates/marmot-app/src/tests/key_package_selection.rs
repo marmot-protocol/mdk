@@ -361,7 +361,11 @@ async fn failed_preference_refetch_preserves_only_usable_current_batch_packages(
                 .err()
                 .expect("unusable batch material must not become a fallback");
             match batch_case {
-                "absent" => assert!(matches!(error, AppError::RelayDirectory(_))),
+                "absent" => assert!(matches!(
+                    error,
+                    AppError::MemberDiscoveryIncomplete(ref id)
+                        if id == &account.account_id_hex
+                )),
                 "malformed" => assert!(matches!(error, AppError::InvalidKeyPackageEvent(_))),
                 "incompatible" => assert!(matches!(
                     error,

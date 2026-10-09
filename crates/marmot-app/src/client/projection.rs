@@ -1420,6 +1420,8 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::ExternalSignerUnavailable(_) => "read_marker_failed:external_signer_unavailable",
         AppError::ExternalSignerMismatch => "read_marker_failed:external_signer_mismatch",
         AppError::ExternalSignerRejected => "read_marker_failed:external_signer_rejected",
+        AppError::ObsoleteKeyPackage(_) => "read_marker_failed:obsolete_key_package",
+        AppError::MemberDiscoveryIncomplete(_) => "read_marker_failed:member_discovery_incomplete",
         AppError::InvalidKeyPackageEvent(_) => "read_marker_failed:invalid_key_package_event",
         AppError::MissingDirectoryEntry(_) => "read_marker_failed:missing_directory_entry",
         AppError::InvalidDirectorySearch(_) => "read_marker_failed:invalid_directory_search",

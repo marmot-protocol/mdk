@@ -9,6 +9,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Append invitation diagnostic statuses `MARMOT_STATUS_OBSOLETE_KEY_PACKAGE` (96) and `MARMOT_STATUS_MEMBER_DISCOVERY_INCOMPLETE` (97). Existing status values remain unchanged; detail strings omit recipient identity.
+
+
 - Add `marmot_propose_onboarding_relay_repair` and nested typed relay-repair
   preview records. `MarmotOnboardingRepairProposal` gains an optional
   `relay_repair` pointer; regenerate and recompile with the matching header

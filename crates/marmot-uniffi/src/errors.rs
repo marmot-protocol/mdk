@@ -94,6 +94,10 @@ pub enum MarmotKitError {
     /// host apps can present a setup/invite state without string matching.
     #[error("invalid key package event: {details}")]
     InvalidKeyPackageEvent { details: String },
+    #[error("obsolete key package")]
+    ObsoleteKeyPackage { account: String },
+    #[error("discovery incomplete")]
+    MemberDiscoveryIncomplete { account: String },
     #[error("missing key package for {account}")]
     MissingKeyPackage { account: String },
     /// The invite target has no kind-10050 inbox endpoint that this device can
@@ -470,6 +474,12 @@ impl From<&AppError> for MarmotKitError {
             },
             AppError::IdentityKeyMismatch => Self::InvalidIdentity {
                 details: "public identity does not match the imported private key".into(),
+            },
+            AppError::ObsoleteKeyPackage(account) => Self::ObsoleteKeyPackage {
+                account: account.clone(),
+            },
+            AppError::MemberDiscoveryIncomplete(account) => Self::MemberDiscoveryIncomplete {
+                account: account.clone(),
             },
             AppError::InvalidKeyPackageEvent(details) => Self::InvalidKeyPackageEvent {
                 details: details.clone(),
@@ -961,6 +971,23 @@ mod tests {
             MarmotKitError::MissingMemberInboxRoute { account: recipient }
                 if recipient == account
         ));
+    }
+
+    #[test]
+    fn invitation_diagnostics_preserve_recipient_without_displaying_identity() {
+        let account = "11".repeat(32);
+        for error in [
+            AppError::ObsoleteKeyPackage(account.clone()),
+            AppError::MemberDiscoveryIncomplete(account.clone()),
+        ] {
+            let ffi: MarmotKitError = error.into();
+            assert!(!ffi.to_string().contains(&account));
+            assert!(matches!(ffi,
+                MarmotKitError::ObsoleteKeyPackage { account: recipient }
+                | MarmotKitError::MemberDiscoveryIncomplete { account: recipient }
+                if recipient == account
+            ));
+        }
     }
 
     #[test]

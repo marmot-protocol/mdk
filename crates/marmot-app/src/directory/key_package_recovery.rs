@@ -9,7 +9,7 @@ use transport_nostr_adapter::KIND_MARMOT_KEY_PACKAGE;
 
 use crate::key_package_records::{
     KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget, preferred_fresh_key_package_from_records,
-    without_revoked_slot_winners,
+    preferred_member_key_package_from_records, without_revoked_slot_winners,
 };
 use crate::relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord};
 use crate::{AppError, DirectoryFreshness, MarmotApp};
@@ -26,6 +26,9 @@ pub(super) struct RecoveredKeyPackageRecords {
 }
 
 pub(super) struct KeyPackageRecoveryRequest<'a> {
+    /// Membership callers need typed compatibility and incomplete-lookup errors.
+    /// Public directory reads retain their existing diagnostic contract.
+    pub(super) member_diagnostics: bool,
     pub(super) account: &'a str,
     pub(super) searched: &'a [TransportEndpoint],
     pub(super) observed: Vec<DirectoryRelayEventRecord>,
@@ -44,6 +47,7 @@ impl MarmotApp {
         request: KeyPackageRecoveryRequest<'_>,
     ) -> Result<RecoveredKeyPackageRecords, AppError> {
         let KeyPackageRecoveryRequest {
+            member_diagnostics,
             account,
             searched,
             mut observed,
@@ -113,12 +117,18 @@ impl MarmotApp {
                 without_revoked_slot_winners(account, observed.clone(), &deletions, freshness);
             // A known validation error precedes an incomplete negative lookup;
             // it never authorizes returning an unproven usable package.
-            let selection = preferred_fresh_key_package_from_records(
-                account,
-                &records,
-                freshness,
-                requirements,
-            )?;
+            let select = if member_diagnostics {
+                preferred_member_key_package_from_records
+            } else {
+                preferred_fresh_key_package_from_records
+            };
+            let selection = select(account, &records, freshness, requirements);
+            let selection = match selection {
+                Err(AppError::ObsoleteKeyPackage(_)) if !package_coverage => {
+                    return Err(AppError::MemberDiscoveryIncomplete(account.to_owned()));
+                }
+                result => result?,
+            };
             let target = selection
                 .value
                 .as_ref()
@@ -133,7 +143,7 @@ impl MarmotApp {
                 });
             let Some(target) = target else {
                 if !package_coverage {
-                    return Err(recovery_incomplete());
+                    return Err(recovery_incomplete(account, member_diagnostics));
                 }
                 return Ok(RecoveredKeyPackageRecords {
                     freshness,
@@ -142,7 +152,7 @@ impl MarmotApp {
                 });
             };
             if round == RECOVERY_CANDIDATE_LIMIT || !package_coverage || routes.is_empty() {
-                return Err(recovery_incomplete());
+                return Err(recovery_incomplete(account, member_diagnostics));
             }
             let queries = vec![
                 DirectoryEventQuery::deletion_reference(
@@ -187,7 +197,7 @@ impl MarmotApp {
                 continue;
             }
             if !deletion_coverage {
-                return Err(recovery_incomplete());
+                return Err(recovery_incomplete(account, member_diagnostics));
             }
             let (mut records, evidence) =
                 without_revoked_slot_winners(account, observed, &deletions, freshness);
@@ -204,7 +214,7 @@ impl MarmotApp {
                 cache_evidence: Some(evidence),
             });
         }
-        Err(recovery_incomplete())
+        Err(recovery_incomplete(account, member_diagnostics))
     }
 }
 
@@ -219,7 +229,10 @@ fn distinct_recovery_routes<'a>(
         .collect()
 }
 
-fn recovery_incomplete() -> AppError {
+fn recovery_incomplete(account: &str, member_diagnostics: bool) -> AppError {
+    if member_diagnostics {
+        return AppError::MemberDiscoveryIncomplete(account.to_owned());
+    }
     AppError::RelayDirectory(
         "invitation key recovery could not establish complete lookup and deletion coverage".into(),
     )
