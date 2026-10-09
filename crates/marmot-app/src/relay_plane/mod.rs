@@ -41,6 +41,7 @@ use crate::directory::DirectorySyncPlan;
 
 mod delivery_spill;
 mod directory;
+mod directory_wire;
 mod public_event_query;
 mod public_event_transport;
 #[cfg(test)]

@@ -20,6 +20,7 @@ storage, QUIC previews, or backend-specific CLI semantics.
 - [Execution Profiles](#execution-profiles)
 - [Shared Behavior](#shared-behavior)
 - [Chat Commands](#chat-commands)
+- [Organize Your Task Groups](#organize-your-task-groups)
 - [Development](#development)
 
 ## First installation and verification
@@ -373,6 +374,63 @@ and backend contracts:
 - [`integrations/opencode/marmot/README.md`](../opencode/marmot/README.md)
 - [`integrations/pi/marmot/README.md`](../pi/marmot/README.md)
 - [`integrations/goose/marmot/README.md`](../goose/marmot/README.md)
+
+## Organize Your Task Groups
+
+Start with one verified normal group containing you and your connector. Add
+more groups with that same connector account as you need parallel conversations.
+Each group has its own stored workdir, backend session, and standing goal. You
+do not need another connector installation or a public agent profile for each
+group. Keep different connector installations distinguishable with local
+nicknames, where your app supports them, after verifying their full public keys.
+
+Use `/status` to inspect a group's stored workspace and session; it is not a
+guarantee that work is idle or that backend authentication succeeds. Allow a
+running task to finish before reusing a group. `/new` starts a new logical
+session in the preserved workspace when the command is handled; it does not
+cancel an in-flight backend or erase backend transcript files. Ordinary prompts
+resume the stored session, so the backend's supported compaction can happen
+without replacing the group. `/goal` instructions survive `/new` and compaction.
+
+### Optional Completion Mentions
+
+To request the advisory mention-based workaround in one group, send a standing
+goal with your **own full npub**, for example:
+
+```text
+/goal On the final answer that completes my request, mention @npub1<your-full-public-key> once. Keep progress updates and questions free of this completion mention. If I send a follow-up while work remains, continue that work before sending the final answer.
+```
+
+Replace the placeholder with the public key of the account whose notifications
+you want. If the group already has a goal, include this preference in that goal:
+`/goal <text>` replaces the existing value. `/goal clear` removes the whole goal.
+Keep keys and policy out of the group title. This is an advisory instruction to
+the backend, not a connector-enforced completion event. It can fail or be
+overridden; notification settings and delivery still determine whether you are
+alerted. Completed assistant text blocks can arrive before a backend turn ends,
+so adding mentions to every delivered block would create false completion alerts.
+
+The shared [Markdown tokenizer](../../crates/marmot-markdown/src/inline.rs)
+recognizes `@npub` mentions. Android exposes a Mentions notification channel
+separately from ordinary group messages. Configure it in the app or Android
+notification settings and check a test mention on your phone before relying on
+it; this candidate does not include device notification verification. Do not
+assume that iOS has the same Android OS channel controls.
+
+### Task Titles
+
+For manual titles today, or once automatic title support is available, a short
+title can help you find the right group. Agent-driven edits need a callable
+current-group profile update operation and admin permission.
+Use a stable connector cue first (`🧑‍💻`, `🦀`, `🥧`, or `🛠️`), then a consistent
+project emoji when the project is known, and a short task label. Omit an unknown
+project cue instead of guessing. Keep the last task title when work finishes;
+activity status should not replace the task label.
+
+Automatic title instructions need a matching release with callable harness
+support; availability of the underlying group-profile protocol alone is not
+sufficient. The [onboarding design](onboarding-design.md) distinguishes this
+proposed default from the currently available manual workflow.
 
 ## Development
 
