@@ -1,7 +1,7 @@
 ---
 title: "Dial Safety"
 created: 2026-07-04
-updated: 2026-09-15
+updated: 2026-10-09
 tags: [marmot, overview, security, network, ssrf, transport]
 status: overview
 ---
@@ -47,8 +47,8 @@ loopback / private / link-local / CGNAT / metadata endpoint is an SSRF vector, a
 | Transport | Where the discipline lives |
 | --- | --- |
 | Blossom media (reqwest, download + upload) | `crates/marmot-app/src/media/blossom.rs`: `media_http_client_for_url` → `validate_blossom_fetch_url` + `resolve_media_host` (per-address `reject_non_public_ip`, `resolve_to_addrs` pin, connect/read/total timeouts, per-redirect re-validation). |
-| OTLP and product analytics (reqwest, push) | `crates/marmot-app/src/collector_host_safety.rs`: structural URL gate → resolve once per attempt → validate every address → `resolve_to_addrs` pin; redirects and proxies disabled, TLS trust/SNI from the configured URL, 10s connect and 30s request limits. The 30s enclosing resolve+send deadline is OTLP-only; product analytics resolves then sends and uses a separate 2s explicit-flush wrapper. |
-| Forensic audit-log upload (reqwest, POST) | Same `collector_host_safety.rs` helper from `crates/marmot-app/src/audit_log.rs`: structural URL gate plus retired-host rejection → resolve/validate/pin per attempt → no redirects, proxies, or pooling. TLS verification stays on. Audit keeps a 60s request override and enclosing network deadline instead of the helper's 30s collector default. |
+| OTLP and product analytics (reqwest, push) | `crates/marmot-app/src/collector_host_safety.rs`: structural URL gate → resolve once per attempt → validate every address → `resolve_to_addrs` pin; redirects and system proxies disabled, TLS trust/SNI from the configured URL, 10s connect and 30s request limits. The 30s enclosing resolve+send deadline is OTLP-only; product analytics resolves then sends and uses a separate 2s explicit-flush wrapper. |
+| Forensic audit-log upload (reqwest, POST) | Same `collector_host_safety.rs` helper from `crates/marmot-app/src/audit_log.rs`: structural URL gate plus retired-host rejection → resolve/validate/pin per attempt → no redirects, system proxies, or pooling. TLS verification stays on. Audit keeps a 60s request override and enclosing network deadline instead of the helper's 30s collector default. |
 | Agent-stream broker watch (quinn) | `crates/marmot-app/src/runtime/agent_stream_watch.rs`: `resolve_broker_addr` validates + pins; `broker_trust_for_candidate` keys `InsecureLocal` on the literal candidate host + `insecure_local`. |
 | Agent-connector broker dial (quinn) | `crates/marmot-app/src/runtime/agent_publisher.rs` reuses runtime broker validation + pinning and TLS trust selection, gated on `AgentConnectorConfig::allow_insecure_local_broker` + literal loopback. |
 | CLI stream (quinn) | `crates/cli/src/commands/stream.rs`: `resolve_quic_candidate_addr` (`socket_addr_is_unsafe`); explicit `stream send` `--connect` (direct and `--broker`) uses `broker_trust` / `stream_trust` → `ensure_public_quic_endpoint` (`reject_non_public_socket_addr(addr, false)`) or `ensure_insecure_local_endpoint`. A family-matched unspecified client bind is source routing only, not destination authorization. |
@@ -56,8 +56,12 @@ loopback / private / link-local / CGNAT / metadata endpoint is an SSRF vector, a
 | QUIC broker client connect timeout | Shared QUIC-preview hardening (`connect_with_timeout` / `QUIC_PREVIEW_CONNECT_TIMEOUT`, #710), applied at both broker client connects in `crates/transport-quic-broker/src/client.rs`. |
 
 Collector and forensic-audit HTTP details — structural URL gates, per-attempt resolve/validate/pin, disabled
-redirects and proxies, timeout budgets, retired-host rejection, and context-free errors — live in
+redirects and system proxies, timeout budgets, retired-host rejection, and context-free errors — live in
 [Dial Safety Collector Inventory](../further-context/dial-safety-collector-inventory.md).
+
+The explicit [SOCKS5 policy](../../../crates/marmot-app/README.md#socks5-routing) sends validated HTTP IP pins through
+a trusted proxy without proxy-side DNS. Relay hostnames use proxy-side DNS and retain the Nostr residual below.
+Runtime QUIC agent previews reject SOCKS5 mode rather than bypassing it.
 
 The broker TLS client (`crates/transport-quic-broker/src/tls.rs`) keeps a resolved-address backstop
 (`InsecureLocalRequiresLoopback`): even if a caller mis-selects `InsecureLocal`, a non-loopback resolved address is

@@ -98,7 +98,10 @@ psl = "2"
 chacha20poly1305 = "0.10"
 openssl = { version = "0.10", features = ["vendored"] }
 bytes = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "socks"] }
+async-wsocket = "0.17"
+tokio-socks = "0.5.2"
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 zeroize = "1"
 keyring-core = "1"
 quinn = { version = "0.11", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-ring"] }

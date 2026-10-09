@@ -258,7 +258,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   resolution requires it, and export points carry only a `relay` label. Keep the OTLP wire encoding and HTTP push behind
   the `otlp-export` feature; keep the privacy-critical mapping (`build_export_batch`) and the opt-in gate in the default
   build. Keep per-attempt collector DNS validation and pinning in `collector_host_safety.rs`: validate
-  every address, pin reqwest, disable redirects/proxies, and retain TLS verification. Only exact `localhost` or a
+  every address, pin reqwest, disable redirects/system proxies, and retain TLS verification. Explicit SOCKS5 routing
+  must send the validated IP rather than delegate HTTP DNS to the proxy. Only exact `localhost` or a
   loopback IP literal is a local-test endpoint, and all its addresses must be loopback. The default build includes this
   helper so forensic audit uploads share it; do not feature-gate the module or introduce a second uploader. See
   `docs/marmot-architecture/relay-observability.md`, `audit-logging.md`, and `overview/dial-safety.md`.

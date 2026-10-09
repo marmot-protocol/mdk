@@ -1423,7 +1423,7 @@ impl MarmotRelayPlane {
             .transport
             .sdk_relay_client
             .as_ref()
-            .map(|_| NostrSdkRelayClient::from_builder(NostrSdkClient::builder()));
+            .map(|_| NostrSdkRelayClient::from_builder(crate::network_proxy::nostr_builder()));
         MarmotRelayPlaneAccountAdapter {
             account_id,
             relay_plane: self.clone(),
