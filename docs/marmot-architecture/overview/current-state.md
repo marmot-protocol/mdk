@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-10-02
+updated: 2026-10-09
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -364,8 +364,12 @@ local visibility via `wn relay-stats`, an opt-in index→identity resolution bou
 opt-in OTLP exporter (wire encoding behind the `marmot-app` `otlp-export` feature) — all aggregate, off by default, and
 carrying relay identity as the sole label. Wiring its periodic push into a long-running host against the production
 first-party endpoint remains ops work; see [`../relay-observability.md`](../relay-observability.md). Each OTLP attempt
-now validates every resolved collector address and pins the client, with redirects and proxies disabled. The existing
+now validates every resolved collector address and pins the client, with redirects and system proxies disabled. The existing
 explicit loopback-test endpoint contract remains local-only; see [Dial Safety](dial-safety.md).
+Optional process-wide [SOCKS5 routing](../../../crates/marmot-app/README.md#socks5-routing) supports anonymous and
+username/password proxies for runtime relay clients, C NIP-46 sessions, and shared HTTP paths. HTTP retains validated
+IP pins; relay DNS runs at the proxy. Invalid configuration and proxy failures never select direct routing, and
+runtime QUIC agent previews are unavailable in this mode.
 - **Nostr account transport shape** — the likely production shape includes a Nostr user directory, account bootstrap for
   relay-list events, a shared multi-account relay plane, `marmot.transport.nostr.routing.v1` group routing, and explicit
   relay URL safety policy. This is captured as a working note in

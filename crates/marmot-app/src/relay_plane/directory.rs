@@ -667,7 +667,7 @@ impl DirectoryRelayPlane {
 // challenge must not trigger a failed authentication attempt that
 // closes the SDK's active fetch before its events arrive.
 pub(super) fn anonymous_directory_client() -> NostrSdkClient {
-    NostrSdkClient::builder().build()
+    crate::network_proxy::nostr_builder().build()
 }
 
 impl NostrSdkDirectoryRelayFetcher {
@@ -829,7 +829,7 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         use DirectoryInspectionError::*;
         // The signer belongs to this request only, never to a shared mutable
         // directory client that could authenticate as another account.
-        let builder = NostrSdkClient::builder();
+        let builder = crate::network_proxy::nostr_builder();
         let client = ScopedInspectionClient(match signer {
             Some(signer) => builder
                 .authenticator(nostr_sdk::authenticator::SignerAuthenticator::new(

@@ -40,6 +40,8 @@ use crate::{
 };
 
 const SDK_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
+#[path = "../../network_proxy.rs"]
+mod process_proxy;
 /// Keep the SDK's own reconnect sleep aligned with MDK's durable transport
 /// retry budget. The SDK default adaptively grows to 60 seconds, which leaves
 /// queued messages idle long after mobile connectivity has returned.
@@ -678,7 +680,8 @@ impl NostrSdkRelayClient {
     /// a registered immutable client; the root's anonymous client never
     /// inherits credentials or handles account traffic.
     pub fn multi_account() -> Self {
-        let mut this = Self::new(Client::builder().build());
+        let mut this =
+            Self::new(process_proxy::nostr_builder(process_proxy::socks5_proxy()).build());
         this.require_account_context = true;
         this
     }
@@ -733,6 +736,11 @@ impl NostrSdkRelayClient {
         let builder = Client::builder().authenticator(
             nostr_sdk::authenticator::SignerAuthenticator::new(SdkSigner(signer.clone())),
         );
+        // Account receive/history pools are independent SDK clients, so they
+        // must carry the explicit process routing policy as well.
+        let proxy = process_proxy::socks5_proxy()
+            .map_err(|detail| TransportAdapterError::Subscription(detail.to_owned()))?;
+        let builder = process_proxy::apply_proxy(builder, proxy);
         let mut context = Self::from_builder(builder);
         context.signer = Some(SdkSigner(signer));
         context.account_id = Some(account_id.clone());

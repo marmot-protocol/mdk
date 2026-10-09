@@ -173,12 +173,12 @@ async fn open_ranking_http_client(url: &Url) -> Result<reqwest::Client, String> 
     {
         return Err("Open Ranking provider URL is unsafe".to_owned());
     }
-    let mut builder = reqwest::Client::builder()
+    let mut builder = crate::network_proxy::http_builder(reqwest::Client::builder())
+        .map_err(str::to_owned)?
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(OPEN_RANKING_TIMEOUT)
         .read_timeout(OPEN_RANKING_TIMEOUT)
         .timeout(OPEN_RANKING_TIMEOUT)
-        .no_proxy()
         .no_gzip()
         .no_brotli()
         .no_zstd()

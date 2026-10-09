@@ -8,6 +8,7 @@ the generic account, session, and engine crates. Read this if you are building a
 ## Contents
 
 - [Runtime overview](#runtime-overview)
+- [SOCKS5 routing](#socks5-routing)
 - [Local storage](#local-storage)
 - [Account bootstrap and KeyPackages](#account-bootstrap-and-keypackages)
 - [User directory and search](#user-directory-and-search)
@@ -85,6 +86,30 @@ database and releases file locks; `shutdown` alone does not. See
 
 For where the code lives (`src/runtime/`, `src/client/`, `src/directory/`, `src/media/`, and so on) see
 [`AGENTS.md`](AGENTS.md).
+
+## SOCKS5 routing
+
+Set the process environment before constructing the runtime:
+
+| Variable | Value |
+| --- | --- |
+| `WN_SOCKS5_PROXY` | Numeric IP address and nonzero port, such as `127.0.0.1:9050` or `[::1]:9050`. |
+| `WN_SOCKS5_USERNAME` | Optional SOCKS5 username. |
+| `WN_SOCKS5_PASSWORD` | Optional SOCKS5 password. |
+
+Unset or empty values select direct routing when all three variables are empty. With a proxy endpoint, leave both
+credential variables empty for anonymous SOCKS5, or supply both for RFC 1929 username/password authentication. Each
+credential must contain 1 to 255 UTF-8 bytes without NUL. Partial credentials, credentials without an endpoint,
+hostnames, URL-form endpoints, and zero ports are rejected. Do not change these variables while the runtime is active.
+
+The policy covers relay publishing, account receive/history pools, directory relay clients, C NIP-46 signer sessions,
+and the shared HTTP clients for media, Open Ranking, and collectors (including audit uploads). Relay hostnames are
+resolved by the proxy. HTTP clients still resolve and validate destinations locally, then send the pinned IP through
+SOCKS5 while retaining the original HTTP Host header and TLS identity. The proxy is an explicitly trusted egress.
+
+`ALL_PROXY` cannot replace this policy and `NO_PROXY` cannot bypass it. Invalid configuration, connection failure,
+and authentication rejection do not fall back to direct connections. QUIC agent preview publishing and watching
+are unavailable with SOCKS5 enabled because this TCP proxy path cannot carry QUIC.
 
 ## Local storage
 

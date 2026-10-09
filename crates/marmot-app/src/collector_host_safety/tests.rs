@@ -235,6 +235,242 @@ async fn every_attempt_resolves_fresh_and_checks_host_and_port() {
 }
 
 struct ForbiddenDns(Arc<AtomicUsize>);
+
+// Run the environment-sensitive consumer in a subprocess so parallel tests
+// never observe changes to their process-wide network policy.
+#[tokio::test]
+async fn socks5_pins_dns_fail_closed() {
+    const CHILD: &str = "WN_PROXY_ROUTING_TEST_CHILD";
+    const MODE: &str = "WN_PROXY_ROUTING_TEST_MODE";
+    const USERNAME: &str = "proxy-ü:@/%";
+    const PASSWORD: &str = "proxy-secret:@/%";
+    if let Ok(origin) = std::env::var(CHILD) {
+        let mode = std::env::var(MODE).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pin = resolve(
+            &format!("http://localhost:{origin}/metrics"),
+            &["127.0.0.1"],
+        )
+        .await
+        .unwrap();
+        if mode == "partial" || mode == "orphan" {
+            assert!(pin.build_client().is_err());
+            let relays = crate::network_proxy::nostr_builder().build();
+            let relay = format!("ws://127.0.0.1:{origin}");
+            relays.add_relay(&relay).await.unwrap();
+            assert!(
+                relays
+                    .try_connect_relay(&relay, Duration::from_secs(5))
+                    .await
+                    .is_err()
+            );
+            relays.shutdown().await;
+            return;
+        }
+        let client = pin
+            .build_client_from(
+                reqwest::Client::builder().dns_resolver(Arc::new(ForbiddenDns(calls.clone()))),
+            )
+            .unwrap();
+        let response = client.post(pin.url.clone()).send().await;
+        if mode == "rejected" {
+            assert!(response.is_err());
+        } else {
+            assert!(response.unwrap().status().is_success());
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "SOCKS must use the validated pin"
+        );
+
+        let relays = crate::network_proxy::nostr_builder().build();
+        let relay = if mode == "rejected" {
+            format!("ws://127.0.0.1:{origin}")
+        } else {
+            "ws://proxy-dns.invalid".to_owned()
+        };
+        relays.add_relay(&relay).await.unwrap();
+        let connection = relays
+            .try_connect_relay(&relay, Duration::from_secs(5))
+            .await;
+        assert_eq!(connection.is_err(), mode == "rejected");
+        relays.shutdown().await;
+
+        // The proxy has closed. A new connection must fail, even though a
+        // direct origin listener is reachable and NO_PROXY matches everything.
+        let client = pin.build_client().unwrap();
+        assert!(client.post(pin.url).send().await.is_err());
+        return;
+    }
+
+    for mode in [
+        "anonymous",
+        "authenticated",
+        "rejected",
+        "partial",
+        "orphan",
+    ] {
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_port = origin.local_addr().unwrap().port();
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let (shutdown, finished) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            if mode == "partial" || mode == "orphan" {
+                return;
+            }
+            let serve = async {
+                let mut relay_socket = None;
+                for relay in [false, true] {
+                    let (mut stream, _) = proxy.accept().await.unwrap();
+                    let mut greeting = [0; 2];
+                    stream.read_exact(&mut greeting).await.unwrap();
+                    assert_eq!(greeting[0], 5);
+                    let mut methods = vec![0; greeting[1] as usize];
+                    stream.read_exact(&mut methods).await.unwrap();
+                    if mode == "anonymous" {
+                        assert!(methods.contains(&0));
+                        stream.write_all(&[5, 0]).await.unwrap();
+                    } else {
+                        assert!(
+                            methods.contains(&2),
+                            "client must offer RFC1929 authentication"
+                        );
+                        stream.write_all(&[5, 2]).await.unwrap();
+                        assert_eq!(stream.read_u8().await.unwrap(), 1);
+                        let len = stream.read_u8().await.unwrap() as usize;
+                        let mut username = vec![0; len];
+                        stream.read_exact(&mut username).await.unwrap();
+                        let len = stream.read_u8().await.unwrap() as usize;
+                        let mut password = vec![0; len];
+                        stream.read_exact(&mut password).await.unwrap();
+                        assert!(username == USERNAME.as_bytes(), "unexpected username bytes");
+                        if mode == "rejected" {
+                            assert!(
+                                password != PASSWORD.as_bytes(),
+                                "test must provide rejected credentials"
+                            );
+                            stream.write_all(&[1, 1]).await.unwrap();
+                            assert!(
+                                stream.read_u8().await.is_err(),
+                                "no CONNECT after authentication rejection"
+                            );
+                            continue;
+                        }
+                        assert!(password == PASSWORD.as_bytes(), "unexpected password bytes");
+                        stream.write_all(&[1, 0]).await.unwrap();
+                    }
+                    let mut request = [0; 4];
+                    stream.read_exact(&mut request).await.unwrap();
+                    assert_eq!(&request[..3], &[5, 1, 0]);
+                    if relay {
+                        assert_eq!(request[3], 3, "relay DNS must be proxy-side");
+                        let len = stream.read_u8().await.unwrap() as usize;
+                        let mut domain = vec![0; len];
+                        stream.read_exact(&mut domain).await.unwrap();
+                        assert_eq!(domain, b"proxy-dns.invalid");
+                        assert_eq!(stream.read_u16().await.unwrap(), 80);
+                        stream
+                            .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                            .await
+                            .unwrap();
+                        relay_socket = Some(tokio_tungstenite::accept_async(stream).await.unwrap());
+                    } else {
+                        assert_eq!(
+                            request[3], 1,
+                            "HTTP must send the vetted IP, not the hostname"
+                        );
+                        let mut ip = [0; 4];
+                        stream.read_exact(&mut ip).await.unwrap();
+                        assert_eq!(ip, [127, 0, 0, 1]);
+                        assert_eq!(stream.read_u16().await.unwrap(), origin_port);
+                        stream
+                            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+                            .await
+                            .unwrap();
+                        let mut headers = Vec::new();
+                        while !headers.ends_with(b"\r\n\r\n") {
+                            headers.push(stream.read_u8().await.unwrap());
+                            assert!(headers.len() < 8192);
+                        }
+                        let headers = String::from_utf8(headers).unwrap().to_lowercase();
+                        assert!(headers.starts_with("post /metrics http/1.1\r\n"));
+                        assert!(headers.contains(&format!("host: localhost:{origin_port}\r\n")));
+                        stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    }
+                }
+                relay_socket
+            };
+            let socket = tokio::time::timeout(Duration::from_secs(20), serve)
+                .await
+                .unwrap();
+            // Refuse subsequent HTTP attempts, but keep the relay alive until
+            // the client has observed its completed WebSocket handshake.
+            drop(proxy);
+            finished.await.unwrap();
+            drop(socket);
+        });
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "collector_host_safety::tests::socks5_pins_dns_fail_closed",
+                    "--nocapture",
+                ])
+                .env(CHILD, origin_port.to_string())
+                .env(MODE, mode)
+                .env(
+                    "WN_SOCKS5_PROXY",
+                    if mode == "orphan" {
+                        String::new()
+                    } else {
+                        proxy_addr.to_string()
+                    },
+                )
+                .env(
+                    "WN_SOCKS5_USERNAME",
+                    if mode == "anonymous" { "" } else { USERNAME },
+                )
+                .env(
+                    "WN_SOCKS5_PASSWORD",
+                    match mode {
+                        "anonymous" | "partial" => "",
+                        "rejected" => "incorrect",
+                        _ => PASSWORD,
+                    },
+                )
+                .env("ALL_PROXY", "http://127.0.0.1:1")
+                .env("NO_PROXY", "*")
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        if mode != "partial" && mode != "orphan" {
+            shutdown.send(()).unwrap();
+        }
+        server.await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), origin.accept())
+                .await
+                .is_err(),
+            "explicit proxy failure must not dial the origin directly"
+        );
+    }
+}
+
 impl reqwest::dns::Resolve for ForbiddenDns {
     fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
         self.0.fetch_add(1, Ordering::SeqCst);

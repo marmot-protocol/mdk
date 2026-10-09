@@ -1748,11 +1748,11 @@ fn build_pinned_media_http_client_from_builder(
     pin: Option<(String, Vec<SocketAddr>)>,
     read_timeout: Option<Duration>,
 ) -> Result<reqwest::Client, AppError> {
-    let mut builder = builder
+    let mut builder = crate::network_proxy::http_builder(builder)
+        .map_err(crate::network_proxy::config_error)?
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(MEDIA_HTTP_CONNECT_TIMEOUT)
         .timeout(MEDIA_HTTP_TOTAL_TIMEOUT)
-        .no_proxy()
         .no_gzip()
         .no_brotli()
         .no_zstd()
