@@ -48,8 +48,8 @@
 
 - Explicit onboarding relay edits now preview and publish the selected endpoint
   changes without rebuilding untouched tags: mixed NIP-65 roles, duplicate
-  occurrences, tag extensions, unrelated tags and event content survive. No-op
-  selections cannot publish. Approval revalidates the exact preview and current
+  occurrences, tag extensions, unrelated tags and event content survive, including
+  when a host supplies an equivalent URL spelling. No-op selections cannot publish. Approval revalidates the exact preview and current
   endpoint policy; restart retries the same persisted signed event. Manual edit
   checkpoints use version 7, which older readers reject; no database migration
   or binding signature change is required. Follow-up to #1979.

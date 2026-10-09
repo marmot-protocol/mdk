@@ -20,17 +20,19 @@ pub(super) fn manual_relay_edit(
                 .collect()
         })
         .unwrap_or_default();
+    let read_keys: HashSet<_> = reads.iter().map(|endpoint| relay_key(endpoint)).collect();
+    let write_keys: HashSet<_> = writes.iter().map(|endpoint| relay_key(endpoint)).collect();
     let mut after = Vec::new();
     let mut changes = Vec::new();
     for (index, tag) in before.iter().enumerate() {
         let read = tag
             .endpoint
             .as_ref()
-            .is_some_and(|value| reads.contains(value));
+            .is_some_and(|value| read_keys.contains(&relay_key(value)));
         let write = tag
             .endpoint
             .as_ref()
-            .is_some_and(|value| writes.contains(value));
+            .is_some_and(|value| write_keys.contains(&relay_key(value)));
         let retained = match tag.role {
             OnboardingRelayTagRole::Other => true,
             OnboardingRelayTagRole::Read | OnboardingRelayTagRole::Inbox => read,
@@ -62,15 +64,16 @@ pub(super) fn manual_relay_edit(
             }
         }
     }
-    let mut selected = reads.to_vec();
-    for endpoint in writes {
-        if !selected.contains(endpoint) {
-            selected.push(endpoint.clone());
+    let mut selected = HashSet::new();
+    for endpoint in reads.iter().chain(writes) {
+        let key = relay_key(endpoint);
+        if !selected.insert(key.clone()) {
+            continue;
         }
-    }
-    for endpoint in selected {
         let has_read = after.iter().any(|tag| {
-            tag.endpoint.as_ref() == Some(&endpoint)
+            tag.endpoint
+                .as_ref()
+                .is_some_and(|value| relay_key(value) == key)
                 && matches!(
                     tag.role,
                     OnboardingRelayTagRole::Read
@@ -79,14 +82,16 @@ pub(super) fn manual_relay_edit(
                 )
         });
         let has_write = after.iter().any(|tag| {
-            tag.endpoint.as_ref() == Some(&endpoint)
+            tag.endpoint
+                .as_ref()
+                .is_some_and(|value| relay_key(value) == key)
                 && matches!(
                     tag.role,
                     OnboardingRelayTagRole::Write | OnboardingRelayTagRole::Unmarked
                 )
         });
-        let add_read = reads.contains(&endpoint) && !has_read;
-        let add_write = writes.contains(&endpoint) && !has_write;
+        let add_read = read_keys.contains(&key) && !has_read;
+        let add_write = write_keys.contains(&key) && !has_write;
         if !add_read && !add_write {
             continue;
         }
@@ -97,7 +102,7 @@ pub(super) fn manual_relay_edit(
                 "r"
             }
             .into(),
-            endpoint,
+            endpoint.clone(),
         ];
         if step == OnboardingStep::Relays && add_read != add_write {
             fields.push(if add_read { "read" } else { "write" }.into());

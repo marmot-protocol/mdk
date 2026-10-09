@@ -5882,6 +5882,52 @@ fn manual_relay_edit_preserves_untouched_tags_and_narrows_only_selected_roles() 
     assert_eq!(unchanged.mode, OnboardingRelayRepairMode::ManualReview);
 }
 
+#[test]
+fn manual_relay_edit_matches_equivalent_urls_without_rewriting_signed_tags() {
+    let keys = nostr::prelude::Keys::generate();
+    for (step, kind, name, role) in [
+        (OnboardingStep::Relays, 10002, "r", Some("read")),
+        (OnboardingStep::InboxRelays, 10050, "relay", None),
+    ] {
+        let mut tag = vec![name.into(), "wss://KEEP.example:443/".into()];
+        if let Some(role) = role {
+            tag.push(role.into());
+        }
+        tag.push("extension".into());
+        let source = signed(&keys, kind, vec![tag.clone(), tag], "opaque", 10);
+        let preview = relay_edits::manual_relay_edit(
+            step,
+            Some(&source),
+            &["wss://keep.example".into()],
+            &[],
+        );
+        assert_eq!(preview.mode, OnboardingRelayRepairMode::ManualReview);
+        assert_eq!(
+            preview
+                .after_tags
+                .iter()
+                .map(|tag| tag.fields.clone())
+                .collect::<Vec<_>>(),
+            source.tags,
+        );
+    }
+    let added = relay_edits::manual_relay_edit(
+        OnboardingStep::Relays,
+        None,
+        &[
+            "wss://KEEP.example:443/".into(),
+            "wss://keep.example".into(),
+        ],
+        &["wss://keep.example/".into()],
+    );
+    assert_eq!(added.after_tags.len(), 1);
+    assert_eq!(added.after_tags[0].role, OnboardingRelayTagRole::Unmarked);
+    assert_eq!(
+        added.after_tags[0].endpoint.as_deref(),
+        Some("wss://KEEP.example:443/")
+    );
+}
+
 #[tokio::test]
 async fn manual_relay_edit_inbox_preview_preserves_extensions_and_rejects_tampering() {
     let (_dir, runtime, network, keys, id) = fixture().await;

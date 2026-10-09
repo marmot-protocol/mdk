@@ -408,8 +408,8 @@ an exact lossless relay repair upgrades the checkpoint to version 6, preserving
 that version through approval, signing and completion. Version 3/4/5 readers
 reject it rather than discard the typed preview and publish replacement tags.
 Explicit relay edits return the same typed before/after preview. Retained
-endpoint roles keep their original tag occurrences, order and extension fields;
-unrelated tags and content remain unchanged. An unchanged selection returns
+endpoint roles keep their original tag occurrences, order and extension fields,
+even when selected with equivalent URL spelling; unrelated tags and content remain unchanged. An unchanged selection returns
 `ManualReview` without an approval action. These manual previews use checkpoint
 version 7 because version 6 readers can only revalidate automatic minimal repairs.
 No binding signature changes are required. Downgrading once any of these formats
