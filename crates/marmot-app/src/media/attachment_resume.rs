@@ -133,7 +133,7 @@ impl AttachmentResume {
         plaintext_len: usize,
     ) -> Result<(), AttachmentDownloadFailure> {
         let ciphertext_len = (plaintext_len as u64)
-            .checked_add(16)
+            .checked_add(super::file_transfer::MEDIA_AEAD_TAG_BYTES)
             .ok_or_else(|| stop("attachment length overflow"))?;
         self.progress(ciphertext_len, Some(ciphertext_len), false)
             .await?;

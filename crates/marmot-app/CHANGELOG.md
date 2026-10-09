@@ -36,9 +36,6 @@
   nothing; admission itself is not interruptible. File uploads wait for their
   size-bounded endpoint attempts without the legacy 16-minute response timeout.
   File uploads require the server descriptor's `sha256` and `size`. (#2175)
-  Completion preserves ciphertext progress, a corrupt resumed suffix clears its
-  checkpoint and retries, and file-upload responses outlive the legacy fixed
-  caller timeout while the operation retains cancellation and transfer deadlines.
 
 ### Changed
 
@@ -52,8 +49,8 @@
 - File acquisition enforces disk reserve with or without resumable validators,
   saves interrupted ciphertext tails, retries a rejected resumed representation
   from zero without consuming redirect hops, and discards responses exceeding
-  their advertised total. Cancelled file upload completion releases staging even
-  when `send` is false.
+  their advertised total. Completed files keep progress in ciphertext units.
+  Cancelled file upload completion releases staging even when `send` is false.
 - Lossless relay repairs accept case-insensitive NIP-65 read/write markers,
   matching relay-list inspection while preserving their original spelling
   and extension fields through approval and publication.

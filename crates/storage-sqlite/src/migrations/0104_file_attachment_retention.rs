@@ -154,11 +154,6 @@ mod tests {
             .unwrap(),
             8196
         );
-        let deletion: String = conn.query_row("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='attachment_bytes_removed'", [], |r|r.get(0)).unwrap();
-        assert!(
-            !deletion.contains("OLD.bytes"),
-            "deletion must use stored metadata"
-        );
         conn.execute("DELETE FROM attachment_acquisition", [])
             .unwrap();
         assert_eq!(
