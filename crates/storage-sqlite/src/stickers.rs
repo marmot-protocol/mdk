@@ -8,7 +8,8 @@ use crate::{SqliteAccountStorage, SqliteResultExt, bool_i64, u64_to_i64, usize_t
 
 /// Historical exact-hash rows retained per pack, including the current version.
 /// Older hashes beyond this stop being recorded. Current-pack rows are never
-/// dropped by the cap.
+/// dropped by the cap, and exact references held by retained messages are
+/// neither dropped nor refused by it: they evict unreferenced history instead.
 const MAX_STICKER_ASSET_HISTORY_ROWS: i64 = 400;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -494,20 +495,37 @@ fn insert_sticker_assets_tx(
     if let Some(cover) = &pack.cover {
         assets.push(cover.clone());
     }
+    // A losing event is only worth recording for the exact references that
+    // retained messages still need. Those stay insertable at the cap: they are
+    // bounded by the retained messages themselves, and the trim path already
+    // keeps them past the cap. Make room by evicting unreferenced history that
+    // is neither current nor the current cover, never by refusing the row.
+    let retained = if pack_wins_replacement {
+        HashSet::new()
+    } else {
+        retained_sticker_asset_refs_tx(conn, &pack.coordinate)?
+    };
+    let mut protected = retained.clone();
+    if !pack_wins_replacement
+        && let Some(cover) = current_sticker_cover_ref_tx(conn, &pack.coordinate)?
+    {
+        protected.insert(cover);
+    }
     for sticker in assets {
         // History is exact-hash lookup, not an unbounded archive. Always record
         // the incoming pack's own assets. Refuse only an older hash once this
         // pack already holds the cap, so a losing event cannot grow the table.
         if !pack_wins_replacement {
-            let historical = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM app_sticker_assets WHERE pack_coordinate = ?1",
-                    params![&pack.coordinate],
-                    |row| row.get::<_, i64>(0),
-                )
-                .storage()?;
-            if historical >= MAX_STICKER_ASSET_HISTORY_ROWS {
+            let key = (sticker.shortcode.clone(), sticker.sha256.clone());
+            if sticker_asset_exists_tx(conn, &pack.coordinate, &key)? {
                 continue;
+            }
+            let historical = sticker_asset_history_count_tx(conn, &pack.coordinate)?;
+            if historical >= MAX_STICKER_ASSET_HISTORY_ROWS {
+                if !retained.contains(&key) {
+                    continue;
+                }
+                evict_sticker_asset_history_tx(conn, &pack.coordinate, 1, &protected)?;
             }
         }
         conn.execute(
@@ -538,13 +556,7 @@ fn trim_sticker_asset_history_tx(
     current_pack: &StoredStickerPack,
 ) -> StorageResult<()> {
     let coordinate = &current_pack.coordinate;
-    let count = conn
-        .query_row(
-            "SELECT COUNT(*) FROM app_sticker_assets WHERE pack_coordinate = ?1",
-            params![coordinate],
-            |row| row.get::<_, i64>(0),
-        )
-        .storage()?;
+    let count = sticker_asset_history_count_tx(conn, coordinate)?;
     let excess = count - MAX_STICKER_ASSET_HISTORY_ROWS;
     if excess <= 0 {
         return Ok(());
@@ -553,6 +565,64 @@ fn trim_sticker_asset_history_tx(
     if let Some(cover) = &current_pack.cover {
         protected.insert((cover.shortcode.clone(), cover.sha256.clone()));
     }
+    evict_sticker_asset_history_tx(conn, coordinate, excess, &protected)?;
+    Ok(())
+}
+
+fn sticker_asset_history_count_tx(conn: &Connection, coordinate: &str) -> StorageResult<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM app_sticker_assets WHERE pack_coordinate = ?1",
+        params![coordinate],
+        |row| row.get::<_, i64>(0),
+    )
+    .storage()
+}
+
+fn sticker_asset_exists_tx(
+    conn: &Connection,
+    coordinate: &str,
+    (shortcode, sha256): &(String, String),
+) -> StorageResult<bool> {
+    conn.query_row(
+        "SELECT 1 FROM app_sticker_assets
+         WHERE pack_coordinate = ?1 AND shortcode = ?2 AND sha256 = ?3",
+        params![coordinate, shortcode, sha256],
+        |_| Ok(()),
+    )
+    .optional()
+    .storage()
+    .map(|row| row.is_some())
+}
+
+/// The current pack's cover is not in `app_stickers`, so eviction must learn
+/// it from the stored pack row to keep the current version fully resolvable.
+fn current_sticker_cover_ref_tx(
+    conn: &Connection,
+    coordinate: &str,
+) -> StorageResult<Option<(String, String)>> {
+    let cover_json = conn
+        .query_row(
+            "SELECT cover_json FROM app_sticker_packs WHERE coordinate = ?1",
+            params![coordinate],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .storage()?
+        .flatten();
+    Ok(cover_json
+        .and_then(|json| serde_json::from_str::<StoredSticker>(&json).ok())
+        .map(|cover| (cover.shortcode, cover.sha256)))
+}
+
+/// Delete up to `excess` oldest history rows that are neither part of the
+/// current pack nor in `protected`. Returns how many rows were removed; fewer
+/// than `excess` means every remaining row is still needed.
+fn evict_sticker_asset_history_tx(
+    conn: &Connection,
+    coordinate: &str,
+    excess: i64,
+    protected: &HashSet<(String, String)>,
+) -> StorageResult<i64> {
     let mut statement = conn
         .prepare(
             "SELECT rowid, shortcode, sha256 FROM app_sticker_assets
@@ -593,7 +663,7 @@ fn trim_sticker_asset_history_tx(
         .storage()?;
         removed += 1;
     }
-    Ok(())
+    Ok(removed)
 }
 
 fn retained_sticker_asset_refs_tx(
@@ -1349,6 +1419,95 @@ mod tests {
                 .is_some(),
             "a retained message must keep its exact historical sticker asset"
         );
+    }
+
+    #[test]
+    fn retained_reference_lands_from_a_losing_pack_once_history_is_full() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let current = pack(&"ff".repeat(32), 1_000, &"aa".repeat(32));
+        let coordinate = current.coordinate.clone();
+        assert!(store.replace_sticker_pack_if_newer(&current).unwrap());
+        for index in 0..MAX_STICKER_ASSET_HISTORY_ROWS {
+            let older = pack(&format!("{index:064x}"), 10, &format!("{:064x}", index + 1));
+            assert!(!store.replace_sticker_pack_if_newer(&older).unwrap());
+        }
+        let history_rows = |store: &SqliteAccountStorage| {
+            store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM app_sticker_assets WHERE pack_coordinate = ?1",
+                    rusqlite::params![coordinate],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(history_rows(&store), MAX_STICKER_ASSET_HISTORY_ROWS);
+
+        // A retained message references a hash that no stored version holds.
+        let referenced_hash = format!("{:064x}", 9_000);
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO message_timeline (
+                group_id_hex, message_id_hex, direction, sender, plaintext, kind,
+                tags_json, timeline_at, received_at, reactions_json, deleted
+             ) VALUES ('group', 'message', 'received', 'alice', '', 9, ?1, 1, 1, '{}', 0)",
+                rusqlite::params![
+                    serde_json::to_string(&vec![vec![
+                        "sticker",
+                        coordinate.as_str(),
+                        "wave",
+                        referenced_hash.as_str(),
+                    ]])
+                    .unwrap()
+                ],
+            )
+            .unwrap();
+        assert!(
+            store
+                .sticker_for_ref(&coordinate, "wave", &referenced_hash)
+                .unwrap()
+                .is_none()
+        );
+
+        // Its authorizing pack event arrives late and loses NIP-01 ordering.
+        let losing = pack(&"ee".repeat(32), 10, &referenced_hash);
+        assert!(!store.replace_sticker_pack_if_newer(&losing).unwrap());
+
+        assert!(
+            store
+                .sticker_for_ref(&coordinate, "wave", &referenced_hash)
+                .unwrap()
+                .is_some(),
+            "a retained exact reference must land even when history is full"
+        );
+        assert!(
+            store
+                .sticker_for_ref(&coordinate, "cover", &referenced_hash)
+                .unwrap()
+                .is_none(),
+            "unreferenced assets of a losing pack stay refused at the cap"
+        );
+        assert_eq!(
+            history_rows(&store),
+            MAX_STICKER_ASSET_HISTORY_ROWS,
+            "the retained row replaces unreferenced history instead of growing it"
+        );
+        let stored = store.sticker_pack(&coordinate).unwrap().unwrap();
+        assert_eq!(stored.version, current.version);
+        assert_eq!(stored.stickers, current.stickers);
+        assert_eq!(stored.cover, current.cover);
+        for sticker in current.stickers.iter().chain(current.cover.iter()) {
+            assert!(
+                store
+                    .sticker_for_ref(&coordinate, &sticker.shortcode, &sticker.sha256)
+                    .unwrap()
+                    .is_some(),
+                "current assets are never evicted for a losing event"
+            );
+        }
     }
 
     #[test]

@@ -114,9 +114,9 @@ pub use conversions::{
     PushRegistrationSyncResultFfi, RelayEndpointClassificationFfi, RelayEndpointPolicyFfi,
     RelayTelemetryResourceFfi, RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi,
     RetentionSweepGroupOutcomeFfi, RetentionSweepReportFfi, RetentionSweepStatusFfi,
-    SecureDeleteExpiredResultFfi, StickerAssetFfi, StickerFfi, StickerImportResultFfi,
-    StickerPackFfi, StickerRefFfi, StickerSyncResultFfi, TimelineMessageChangeFfi,
-    TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
+    RuntimeProjectionUpdateFfi, SecureDeleteExpiredResultFfi, StickerAssetFfi, StickerFfi,
+    StickerImportResultFfi, StickerPackFfi, StickerRefFfi, StickerSyncResultFfi,
+    TimelineMessageChangeFfi, TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
     TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
     TimelineRemoveReasonFfi, TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi,
     TimelineUserReactionFfi, TransportFanoutStatusFfi, UsageDiagnosticsDecisionFfi,
@@ -501,6 +501,18 @@ pub use commands::AttachmentTransferSubscription;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Crate-root re-exports are public API for Rust consumers. Each type
+    /// named here must stay importable from the root, not only through
+    /// `conversions`, so an additive export list change cannot drop one.
+    #[test]
+    fn crate_root_keeps_pre_existing_public_exports() {
+        fn importable<T>() {}
+        importable::<crate::RuntimeProjectionUpdateFfi>();
+        importable::<crate::TimelineProjectionUpdateFfi>();
+        importable::<crate::TimelineSubscriptionUpdateFfi>();
+        importable::<crate::StickerPackFfi>();
+    }
 
     #[test]
     fn runtime_options_defaults_and_combined_policies() {

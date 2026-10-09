@@ -3576,7 +3576,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options. Existing constructors are compatibility wrappers around this entry point.
 
-[Source](src/lib.rs#L246)
+[Source](src/lib.rs#L247)
 
 ### `Marmot::new_with_options`
 
@@ -3588,7 +3588,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L262)
+[Source](src/lib.rs#L263)
 
 ### `Marmot::new`
 
@@ -3600,7 +3600,7 @@ pub fn new(root_path: String, relay_urls: Vec<String>) -> Result<Arc<Self>, Marm
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) via the default keychain-backed account home — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L290)
+[Source](src/lib.rs#L291)
 
 ### `Marmot::new_with_secret_store`
 
@@ -3612,7 +3612,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L308)
+[Source](src/lib.rs#L309)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -3624,7 +3624,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L338)
+[Source](src/lib.rs#L339)
 
 ### `Marmot::new_with_client_name`
 
@@ -3636,7 +3636,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels are omitted. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L357)
+[Source](src/lib.rs#L358)
 
 ### `Marmot::start`
 
@@ -3648,7 +3648,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L394)
+[Source](src/lib.rs#L395)
 
 ### `Marmot::shutdown`
 
@@ -3660,7 +3660,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L406)
+[Source](src/lib.rs#L407)
 
 ### `Marmot::shutdown_and_close`
 
@@ -3672,7 +3672,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L441)
+[Source](src/lib.rs#L442)
 
 ### `Marmot::storage_is_closed`
 
@@ -3684,7 +3684,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L449)
+[Source](src/lib.rs#L450)
 
 ### `Marmot::is_stopping`
 
@@ -3696,7 +3696,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L456)
+[Source](src/lib.rs#L457)
 
 </details>
 
@@ -4448,7 +4448,7 @@ pub async fn fetch_sticker_asset( &self, account_ref: String, sticker_ref: Stick
 
 Downloads one exact sticker after the account has its `(coordinate, shortcode, hash)` mapping. Hosts pass the typed reference from a timeline row; MDK never asks the host to parse tags. A missing mapping returns `StickerNotFound` rather than fetching an unvalidated URL.
 
-[Source](src/commands/sticker.rs#L100)
+[Source](src/commands/sticker.rs#L104)
 
 ### `Marmot::fetch_sticker_pack`
 
@@ -4468,7 +4468,7 @@ pub async fn import_signal_sticker_pack( &self, account_ref: String, signal_link
 
 Validates a canonical HTTPS Signal pack link, then refuses before any network call. The pinned importer dials Signal's CDN without address pinning, so this command does not download, upload, or publish until that fetch can be injected. The Signal key stays in memory only and is not persisted.
 
-[Source](src/commands/sticker.rs#L87)
+[Source](src/commands/sticker.rs#L91)
 
 ### `Marmot::install_sticker_pack`
 

@@ -27,6 +27,7 @@ use zeroize::Zeroizing;
 
 use crate::external_signer::AccountSigner;
 use crate::media::fetch_blossom_blob_limited;
+use crate::relay_plane::DirectoryEventQuery;
 use crate::{AppError, MarmotApp, ReceivedMessage, unix_now_seconds};
 
 const MAX_STICKER_ASSET_BYTES: u64 = 4 * 1024 * 1024;
@@ -479,7 +480,7 @@ impl MarmotApp {
         let context = self.sticker_context(account_ref)?;
         let mutation_lock = self.sticker_mutation_lock(&context.label);
         let _guard = mutation_lock.lock().await;
-        rebase_and_flush_sticker_outbox_best_effort(self, &context).await?;
+        let rebased = rebase_and_flush_sticker_outbox_best_effort(self, &context).await?;
         if context.storage.sticker_pack(coordinate)?.is_none() {
             fetch_pack_into_storage(self, &context, coordinate, &parsed.relay_hints).await?;
         } else {
@@ -497,7 +498,7 @@ impl MarmotApp {
         context
             .storage
             .enqueue_sticker_install_operation(coordinate, true, unix_now_seconds())?;
-        tolerate_offline(publish_pending_installed_list(self, &context).await)?;
+        publish_installed_list_if_rebased(self, &context, rebased).await?;
         app_pack_for_context(&context, coordinate)
     }
 
@@ -510,13 +511,13 @@ impl MarmotApp {
         let context = self.sticker_context(account_ref)?;
         let mutation_lock = self.sticker_mutation_lock(&context.label);
         let _guard = mutation_lock.lock().await;
-        rebase_and_flush_sticker_outbox_best_effort(self, &context).await?;
+        let rebased = rebase_and_flush_sticker_outbox_best_effort(self, &context).await?;
         context.storage.enqueue_sticker_install_operation(
             &coordinate,
             false,
             unix_now_seconds(),
         )?;
-        tolerate_offline(publish_pending_installed_list(self, &context).await)
+        publish_installed_list_if_rebased(self, &context, rebased).await
     }
 
     /// Signal import is refused before any network call.
@@ -671,15 +672,38 @@ fn ingest_pack_events(
 /// Refresh the remote installed-list winner before flushing any locally
 /// outboxed kind-10031 event. If the account is offline, leave both outbox and
 /// operations untouched so the next successful refresh can rebase first.
+///
+/// Returns whether the remote base was refreshed. A caller that then publishes
+/// the installed list must gate on it: a list signed over a stale base plus
+/// local intent would replace concurrent remote installs and uninstalls.
 async fn rebase_and_flush_sticker_outbox_best_effort(
     app: &MarmotApp,
     context: &StickerAccountContext,
-) -> Result<(), AppError> {
+) -> Result<bool, AppError> {
     match refresh_installed_base(app, context).await {
-        Ok(()) => tolerate_offline(flush_sticker_outbox(app, context).await),
-        Err(AppError::StickerRelay(_)) => Ok(()),
+        Ok(()) => {
+            tolerate_offline(flush_sticker_outbox(app, context).await)?;
+            Ok(true)
+        }
+        Err(AppError::StickerRelay(_)) => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+/// Publish the rebased installed list only when this call refreshed the remote
+/// base first. Otherwise the local operation stays persisted and
+/// [`MarmotApp::sync_sticker_packs`] (or the next successful rebase) publishes
+/// it over the current remote winner. A publish that would succeed while the
+/// read failed is exactly the case that erases another device's changes.
+async fn publish_installed_list_if_rebased(
+    app: &MarmotApp,
+    context: &StickerAccountContext,
+    rebased: bool,
+) -> Result<(), AppError> {
+    if !rebased {
+        return Ok(());
+    }
+    tolerate_offline(publish_pending_installed_list(app, context).await)
 }
 
 fn validate_install_capacity(desired: &[String], coordinate: &str) -> Result<(), AppError> {
@@ -689,22 +713,43 @@ fn validate_install_capacity(desired: &[String], coordinate: &str) -> Result<(),
     Ok(())
 }
 
+/// Read the account's current kind-10031 winner with completion evidence.
+///
+/// A plain bounded fetch reports a timed-out or relay-closed subscription as
+/// an empty success. For the installed list that is indistinguishable from
+/// "nothing published yet", and a base of nothing plus local intent is exactly
+/// the stale list that erases another device's changes once published. Only a
+/// read every outbox relay finished counts as a refresh.
 async fn refresh_installed_base(
     app: &MarmotApp,
     context: &StickerAccountContext,
 ) -> Result<(), AppError> {
-    let author = PublicKey::parse(&context.account_id_hex)
+    PublicKey::parse(&context.account_id_hex)
         .map_err(|_| invalid_sticker("invalid account identity"))?;
-    let filter = Filter::new()
-        .author(author)
-        .kind(Kind::Custom(USER_STICKER_PACKS_KIND))
-        .limit(16);
-    let mut candidates = app
+    let outcome = app
         .relay_plane
-        .fetch_public_events(context.endpoints.clone(), filter)
+        .fetch_directory_events_with_completion(
+            context.endpoints.clone(),
+            vec![DirectoryEventQuery::new(
+                u64::from(USER_STICKER_PACKS_KIND),
+                vec![context.account_id_hex.clone()],
+                16,
+            )],
+        )
         .await
-        .map_err(AppError::StickerRelay)?
+        .map_err(AppError::StickerRelay)?;
+    if !outcome.complete {
+        return Err(AppError::StickerRelay(
+            "installed sticker list read did not complete".into(),
+        ));
+    }
+    let mut candidates = outcome
+        .records
         .into_iter()
+        .filter_map(|record| {
+            let json = serde_json::to_string(&record.event).ok()?;
+            Event::from_json(json).ok()
+        })
         .filter(|event| {
             event.pubkey.to_hex() == context.account_id_hex
                 && event.kind == Kind::Custom(USER_STICKER_PACKS_KIND)
