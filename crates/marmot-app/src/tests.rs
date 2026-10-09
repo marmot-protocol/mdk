@@ -6610,6 +6610,81 @@ async fn partial_generated_bootstrap_keeps_the_journaled_identity_for_retry() {
 }
 
 #[tokio::test]
+async fn generated_identity_publishes_supplied_initial_profile_as_first_kind0() {
+    let directory = tempfile::tempdir().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let chosen = UserProfileMetadata {
+        name: Some("Chosen Heron".into()),
+        display_name: Some("Chosen Heron".into()),
+        ..UserProfileMetadata::default()
+    };
+
+    let local = runtime
+        .create_identity_local_ready_with_initial_profile(
+            AccountSetupRequest {
+                default_relays: vec![TransportEndpoint("wss://relay.example".into())],
+                bootstrap_relays: vec![TransportEndpoint("wss://relay.example".into())],
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            },
+            chosen.clone(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime
+            .account_setup_readiness(&local.account.label)
+            .unwrap()
+            != AccountSetupReadiness::NetworkReady
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background setup must reach network readiness");
+
+    let pseudonym = default_profile_pseudonym(&local.account.account_id_hex);
+    let returned = local
+        .profile
+        .expect("local-ready setup returns its profile");
+    assert_eq!(returned.name.as_deref(), Some("Chosen Heron"));
+    assert_eq!(returned.display_name.as_deref(), Some("Chosen Heron"));
+    assert_ne!(
+        returned.created_at, 0,
+        "a zero stamp would lose to any stale relay copy"
+    );
+    let cached = app
+        .directory_entry_for_account_id(&local.account.account_id_hex)
+        .unwrap()
+        .and_then(|entry| entry.profile)
+        .unwrap();
+    assert_eq!(cached.name.as_deref(), Some("Chosen Heron"));
+    let kind0 = relay
+        .attempted_events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.kind == KIND_NOSTR_METADATA)
+        .map(|event| event.content.clone())
+        .collect::<Vec<_>>();
+    assert!(!kind0.is_empty(), "bootstrap must publish kind-0 metadata");
+    for content in &kind0 {
+        assert!(
+            content.contains("Chosen Heron"),
+            "every bootstrap kind-0 must carry the selected name"
+        );
+        assert!(
+            !content.contains(&pseudonym),
+            "the generated default must never reach a relay"
+        );
+    }
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn generated_identity_returns_before_bootstrap_publication_unblocks() {
     let directory = tempfile::tempdir().unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());

@@ -28,6 +28,11 @@
 
 ### Added
 
+- `create_identity_with_initial_profile` creates a generated identity whose
+  first public kind-0 is the onboarding-selected profile. Prefer it over
+  `create_identity_with_profile` followed by `publish_user_profile`, which
+  exposes the generated default to contacts first.
+
 - `Marmot::propose_onboarding_relay_repair` previews a lossless relay-list repair
   without signing or publishing. `OnboardingRepairProposalFfi.relay_repair` carries
   the typed before/after tags, exact diff, restored capabilities and ManualReview

@@ -5332,7 +5332,25 @@ impl MarmotAppRuntime {
     ) -> Result<AccountSetupResult, AppError> {
         validate_account_setup_request(&request, AccountSetupOperation::CreateIdentityOnly)?;
         request.identity = None;
-        self.create_generated_account_local_ready(request, true)
+        self.create_generated_account_local_ready(request, true, None)
+            .await
+    }
+
+    /// Create a generated identity whose first public kind-0 is `profile`.
+    ///
+    /// The profile replaces the key-derived default before any bootstrap
+    /// record can reach a relay, so recipients never see a temporary name.
+    /// A resumed setup adopts it only while bootstrap publication has not
+    /// started; once a profile may be public, later changes are ordinary
+    /// profile edits.
+    pub async fn create_identity_local_ready_with_initial_profile(
+        &self,
+        mut request: AccountSetupRequest,
+        profile: UserProfileMetadata,
+    ) -> Result<AccountSetupResult, AppError> {
+        validate_account_setup_request(&request, AccountSetupOperation::CreateIdentityOnly)?;
+        request.identity = None;
+        self.create_generated_account_local_ready(request, true, Some(profile))
             .await
     }
 
@@ -5452,7 +5470,7 @@ impl MarmotAppRuntime {
             }
         };
         if let Err(error) = self
-            .create_generated_account_local_ready(context.request(), true)
+            .create_generated_account_local_ready(context.request(), true, None)
             .await
         {
             self.report_generated_setup_resume_deferred(&account, error.privacy_safe_kind());
@@ -5484,6 +5502,7 @@ impl MarmotAppRuntime {
         &self,
         request: AccountSetupRequest,
         schedule_background: bool,
+        initial_profile: Option<UserProfileMetadata>,
     ) -> Result<AccountSetupResult, AppError> {
         let observation = self.shared.product_analytics.begin(
             crate::ProductFamily::Account,
@@ -5491,7 +5510,11 @@ impl MarmotAppRuntime {
             crate::ProductUnit::Attempt,
         );
         let result = self
-            .create_generated_account_local_ready_unobserved(request, schedule_background)
+            .create_generated_account_local_ready_unobserved(
+                request,
+                schedule_background,
+                initial_profile,
+            )
             .await;
         if let Some(observation) = observation {
             observation.finish(if result.is_ok() { "success" } else { "failure" });
@@ -5503,6 +5526,7 @@ impl MarmotAppRuntime {
         &self,
         request: AccountSetupRequest,
         schedule_background: bool,
+        initial_profile: Option<UserProfileMetadata>,
     ) -> Result<AccountSetupResult, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let _generated_setup_transaction =
@@ -5581,7 +5605,20 @@ impl MarmotAppRuntime {
 
         let profile_started = Instant::now();
         let profile_result = (|| {
-            if let Some(profile) = self
+            // Before bootstrap publication starts, no kind-0 can be public, so
+            // a caller-selected profile still replaces any cached default.
+            if let Some(mut profile) = initial_profile.filter(|_| {
+                matches!(
+                    phase,
+                    AccountSetupPhase::LocalStateCreated | AccountSetupPhase::LocalReady
+                )
+            }) {
+                stamp_published_profile_created_at(&mut profile, unix_now_seconds());
+                self.accounts
+                    .app
+                    .remember_directory_profile(&account.account_id_hex, &profile)?;
+                Ok(profile)
+            } else if let Some(profile) = self
                 .accounts
                 .app
                 .directory_entry_for_account_id(&account.account_id_hex)?
@@ -5705,7 +5742,7 @@ impl MarmotAppRuntime {
         request: AccountSetupRequest,
     ) -> Result<AccountSetupResult, AppError> {
         let local = self
-            .create_generated_account_local_ready(request, false)
+            .create_generated_account_local_ready(request, false, None)
             .await?;
         let context = self
             .accounts
