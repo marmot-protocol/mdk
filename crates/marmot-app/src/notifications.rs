@@ -2053,8 +2053,10 @@ fn message_mentions_account(message: &ReceivedMessage, account_id_hex: &str) -> 
 /// Pure mention predicate over a timeline message's raw fields. A message
 /// mentions `account_id_hex` when it is a kind-9 chat that either carries a
 /// NIP-27 pubkey-reference (`p`) tag resolving to the account, or an inline
-/// nostr pubkey entity referencing it (a bare `@npub1…` handle or an explicit
-/// `nostr:` URI). Shared with the chat-list unread projection so the @-badge
+/// nostr mention token referencing it (for example a bare `@npub1…` handle).
+/// Explicit NIP-21 profile links alone are informational. Existing received
+/// `p` tags remain authoritative, including those authored by older clients.
+/// Shared with the chat-list unread projection so the @-badge
 /// reuses the exact notification classification. The inline Markdown fallback
 /// is intentionally bounded (mdk#654); send-side / wire `p` tags are the
 /// authoritative mention signal for content beyond that cap.

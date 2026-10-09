@@ -867,19 +867,19 @@ fn mention_classification_normalizes_npub_p_tags() {
 }
 
 #[test]
-fn mention_classification_uses_inline_nip27_entities() {
+fn informational_profile_links_do_not_trigger_mention_attention_without_explicit_tags() {
     let receiver = nostr::prelude::Keys::generate().public_key().to_hex();
     let npub = crate::npub_for_account_id(&receiver).unwrap();
     let nprofile = crate::nprofile_for_account_id(&receiver, &[]).unwrap();
 
-    // NIP-27 `nostr:` URIs carry bech32 entities (npub/nprofile), which the
-    // markdown tokenizer renders as mentions.
     for token in [npub.as_str(), nprofile.as_str()] {
         let message = received_chat(&format!("hi nostr:{token}"), Vec::new());
-        assert!(
-            message_mentions_account(&message, &receiver),
-            "mention token form failed: {token}"
+        assert!(!message_mentions_account(&message, &receiver));
+        let legacy = received_chat(
+            &format!("hi nostr:{token}"),
+            vec![vec!["p".into(), receiver.clone()]],
         );
+        assert!(message_mentions_account(&legacy, &receiver));
     }
 
     // `nostr:<raw-hex>` is not a NIP-21 URI, so the tokenizer leaves it as

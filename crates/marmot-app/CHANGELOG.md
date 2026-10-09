@@ -39,6 +39,14 @@
 
 ### Changed
 
+- Explicit NIP-21 `nostr:npub` and `nostr:nprofile` links are informational
+  profile references: they still demand names in conversation presentation,
+  but do not derive `p` tags or implicit mention attention. Real Markdown
+  mention tokens and explicit received `p` tags retain their existing behavior.
+  Older clients' tagged messages remain mention-eligible. Adopt a matching
+  MarmotKit artifact before exposing informational paste on Android; message
+  content, parser grammar and binding signatures are unchanged.
+
 - `relay.damus.io` is no longer on the retired-relay denylist; the relay is
   still operating. `retired_relay_hosts()` now returns only
   `relay.nostr.band`. Members whose kind-10050 inbox list names only

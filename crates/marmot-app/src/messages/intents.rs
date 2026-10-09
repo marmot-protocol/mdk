@@ -59,17 +59,21 @@ pub(crate) fn mention_pubkey_hex(token: &str) -> Option<String> {
     parse_account_id_hex(token).ok()
 }
 
-/// Extract pubkey mentions from inline nostr entities in message content.
-///
-/// Derived from the `marmot-markdown` tokenizer's mention/URI tokens, which
-/// recognize **both** bare `@npub1…` handles (`Inline::NostrMention`) and
-/// explicit `nostr:<hrp>1…` URIs (`Inline::NostrUri`) — the same display
-/// surface a client renders as a mention. Scanning the raw `"nostr:"`
-/// substring missed bare `@npub1…` mentions (the form clients actually emit),
-/// so those never got a `p`-tag on send or classified on receive
-/// (mdk#617). Event/coordinate references (`note`/`nevent`/`naddr`) and
-/// unparseable tokens are ignored.
+/// Extract attention-bearing pubkey mentions from the shared Markdown tree.
+/// Explicit NIP-21 profile links are informational, not implicit recipients.
+/// Legacy `NostrMention` tokens and explicit received `p` tags retain their
+/// existing attention semantics; event references and code are excluded.
 pub(crate) fn inline_mention_pubkey_hexes(content: &str) -> Vec<String> {
+    inline_pubkey_hexes(content, false)
+}
+
+/// Collect both mentions and informational profile links for name presentation.
+/// This read-only identity demand must never derive outgoing tags or attention.
+pub(crate) fn inline_profile_reference_pubkey_hexes(content: &str) -> Vec<String> {
+    inline_pubkey_hexes(content, true)
+}
+
+fn inline_pubkey_hexes(content: &str, include_profile_links: bool) -> Vec<String> {
     let content = markdown_mention_scan_input(content);
     // Both pubkey token forms require these literal HRPs. Keep escaped/entity
     // input on the parser path so Markdown normalization remains authoritative.
@@ -81,7 +85,7 @@ pub(crate) fn inline_mention_pubkey_hexes(content: &str) -> Vec<String> {
     }
     let mut hexes = Vec::new();
     for block in &marmot_markdown::parse(content).blocks {
-        collect_block_mention_hexes(block, &mut hexes);
+        collect_block_mention_hexes(block, &mut hexes, include_profile_links);
     }
     hexes
 }
@@ -97,60 +101,77 @@ fn markdown_mention_scan_input(content: &str) -> &str {
     &content[..end]
 }
 
-fn collect_block_mention_hexes(block: &marmot_markdown::Block, out: &mut Vec<String>) {
+fn collect_block_mention_hexes(
+    block: &marmot_markdown::Block,
+    out: &mut Vec<String>,
+    include_profile_links: bool,
+) {
     use marmot_markdown::Block;
     match block {
         Block::Paragraph { inlines } | Block::Heading { inlines, .. } => {
-            collect_inline_mention_hexes(inlines, out);
+            collect_inline_mention_hexes(inlines, out, include_profile_links);
         }
         Block::BlockQuote { blocks, .. } => {
             for block in blocks {
-                collect_block_mention_hexes(block, out);
+                collect_block_mention_hexes(block, out, include_profile_links);
             }
         }
         Block::List { items, .. } => {
             for item in items {
                 for block in &item.blocks {
-                    collect_block_mention_hexes(block, out);
+                    collect_block_mention_hexes(block, out, include_profile_links);
                 }
             }
         }
         Block::Table { header, rows, .. } => {
             for cell in header {
-                collect_inline_mention_hexes(&cell.inlines, out);
+                collect_inline_mention_hexes(&cell.inlines, out, include_profile_links);
             }
             for row in rows {
                 for cell in row {
-                    collect_inline_mention_hexes(&cell.inlines, out);
+                    collect_inline_mention_hexes(&cell.inlines, out, include_profile_links);
                 }
             }
         }
         // Code blocks, math blocks, and thematic breaks carry no inline
         // mentions.
         Block::Details { summary, body, .. } => {
-            collect_inline_mention_hexes(summary, out);
+            collect_inline_mention_hexes(summary, out, include_profile_links);
             for block in body {
-                collect_block_mention_hexes(block, out);
+                collect_block_mention_hexes(block, out, include_profile_links);
             }
         }
         Block::ThematicBreak | Block::CodeBlock { .. } | Block::MathBlock { .. } => {}
     }
 }
 
-fn collect_inline_mention_hexes(inlines: &[marmot_markdown::Inline], out: &mut Vec<String>) {
+fn collect_inline_mention_hexes(
+    inlines: &[marmot_markdown::Inline],
+    out: &mut Vec<String>,
+    include_profile_links: bool,
+) {
     use marmot_markdown::Inline;
     for inline in inlines {
         match inline {
-            Inline::NostrMention(entity) | Inline::NostrUri(entity) => {
+            Inline::NostrMention(entity) => {
                 if let Some(hex) = mention_pubkey_hex(&entity.bech32) {
+                    out.push(hex);
+                }
+            }
+            Inline::NostrUri(entity) => {
+                if include_profile_links && let Some(hex) = mention_pubkey_hex(&entity.bech32) {
                     out.push(hex);
                 }
             }
             Inline::Emph(children)
             | Inline::Strong(children)
             | Inline::Strikethrough(children)
-            | Inline::Link { children, .. } => collect_inline_mention_hexes(children, out),
-            Inline::Image { alt, .. } => collect_inline_mention_hexes(alt, out),
+            | Inline::Link { children, .. } => {
+                collect_inline_mention_hexes(children, out, include_profile_links)
+            }
+            Inline::Image { alt, .. } => {
+                collect_inline_mention_hexes(alt, out, include_profile_links)
+            }
             Inline::Text(_)
             | Inline::SoftBreak
             | Inline::HardBreak
@@ -163,8 +184,8 @@ fn collect_inline_mention_hexes(inlines: &[marmot_markdown::Inline], out: &mut V
 }
 
 /// Derive NIP-27 `["p", <pubkey-hex>]` tags from inline nostr mentions in
-/// message content (both bare `@npub1…` handles and explicit `nostr:<hrp>1…`
-/// URIs). Each distinct mentioned pubkey gets one tag (in first-seen order);
+/// message content. Explicit `nostr:` profile links never add recipients.
+/// Each distinct mentioned pubkey gets one tag (in first-seen order);
 /// event references and unparseable tokens are ignored. This is how a Marmot
 /// client makes a mention discoverable (a p-tag alongside the inline
 /// reference), per NIP-27.
@@ -933,18 +954,16 @@ mod mention_tests {
     }
 
     #[test]
-    fn mention_p_tags_handles_nostr_uri_npub_and_nprofile() {
+    fn informational_profile_links_do_not_derive_recipient_tags() {
         let hex = valid_pubkey_hex();
         let npub = npub_for_account_id(&hex).unwrap();
         let nprofile = nprofile_for_account_id(&hex, &[]).unwrap();
-        // NIP-27 `nostr:` URIs carry bech32 entities (npub/nprofile), which the
-        // markdown tokenizer renders as mentions.
         for token in [npub.as_str(), nprofile.as_str()] {
             let content = format!("hey nostr:{token} how are you?");
+            assert!(mention_p_tags(&content).is_empty());
             assert_eq!(
-                mention_p_tags(&content),
-                vec![vec!["p".to_owned(), hex.clone()]],
-                "mention token form failed: {token}"
+                inline_profile_reference_pubkey_hexes(&content),
+                vec![hex.clone()]
             );
         }
     }
@@ -998,7 +1017,7 @@ mod mention_tests {
         ] {
             let mut expected = Vec::new();
             for block in &marmot_markdown::parse(markdown_mention_scan_input(&content)).blocks {
-                collect_block_mention_hexes(block, &mut expected);
+                collect_block_mention_hexes(block, &mut expected, false);
             }
             assert_eq!(inline_mention_pubkey_hexes(&content), expected);
         }
@@ -1009,10 +1028,87 @@ mod mention_tests {
         let hex = valid_pubkey_hex();
         let npub = npub_for_account_id(&hex).unwrap();
         let intent = AppMessageIntent::Chat {
-            content: format!("yo nostr:{npub}"),
+            content: format!("yo @{npub}"),
         };
         let event = build_inner_event(&intent, &valid_pubkey_hex(), 0).unwrap();
         assert!(event.tags.contains(&vec!["p".to_owned(), hex]));
+    }
+
+    #[test]
+    fn informational_profile_links_keep_chat_reply_edit_and_caption_content_without_recipients() {
+        let hex = valid_pubkey_hex();
+        let npub = npub_for_account_id(&hex).unwrap();
+        let content = format!("See nostr:{npub}");
+        let target = "aa".repeat(32);
+        let intents = [
+            AppMessageIntent::Chat {
+                content: content.clone(),
+            },
+            AppMessageIntent::TaggedChat {
+                content: content.clone(),
+                tags: vec![],
+            },
+            AppMessageIntent::Reply {
+                target_message_id: target.clone(),
+                text: content.clone(),
+            },
+            AppMessageIntent::Edit {
+                target_message_id: target,
+                content: content.clone(),
+            },
+            AppMessageIntent::Media {
+                message_tags: vec![],
+                caption: Some(content.clone()),
+                attachments: vec![MediaAttachmentReference {
+                    locators: vec![],
+                    ciphertext_sha256: "11".repeat(32),
+                    plaintext_sha256: "22".repeat(32),
+                    nonce_hex: "33".repeat(12),
+                    file_name: "photo.jpg".into(),
+                    media_type: "image/jpeg".into(),
+                    version: "2".into(),
+                    source_epoch: 0,
+                    dim: None,
+                    thumbhash: None,
+                }],
+            },
+        ];
+        for intent in intents {
+            let event = build_inner_event(&intent, &valid_pubkey_hex(), 0).unwrap();
+            assert!(
+                !event
+                    .tags
+                    .iter()
+                    .any(|tag| tag.first().is_some_and(|name| name == "p"))
+            );
+            if !matches!(intent, AppMessageIntent::Media { .. }) {
+                assert_eq!(event.content, content);
+            }
+        }
+    }
+
+    #[test]
+    fn nested_profile_links_demand_names_without_attention_and_preserve_real_mentions() {
+        let mentioned = valid_pubkey_hex();
+        let reference = valid_pubkey_hex();
+        let mention = npub_for_account_id(&mentioned).unwrap();
+        let profile = nprofile_for_account_id(&reference, &[]).unwrap();
+        for content in [
+            format!("**nostr:{profile}** and @{mention}"),
+            format!("> nostr:{profile}\n> @{mention}"),
+            format!("- nostr:{profile}\n- @{mention}"),
+            format!("<details>\n<summary>nostr:{profile}</summary>\n@{mention}\n</details>"),
+        ] {
+            assert_eq!(
+                inline_mention_pubkey_hexes(&content),
+                vec![mentioned.clone()]
+            );
+            assert_eq!(
+                inline_profile_reference_pubkey_hexes(&content),
+                vec![reference.clone(), mentioned.clone()]
+            );
+        }
+        assert!(inline_profile_reference_pubkey_hexes(&format!("`nostr:{profile}`")).is_empty());
     }
 
     #[test]
@@ -1067,7 +1163,7 @@ mod mention_tests {
         let target = "ff".repeat(32);
         let intent = AppMessageIntent::Reply {
             target_message_id: target.clone(),
-            text: format!("re nostr:{npub}"),
+            text: format!("re @{npub}"),
         };
         let event = build_inner_event(&intent, &valid_pubkey_hex(), 0).unwrap();
         assert!(
