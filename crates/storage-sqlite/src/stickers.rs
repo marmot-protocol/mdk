@@ -549,39 +549,80 @@ fn trim_sticker_asset_history_tx(
     if excess <= 0 {
         return Ok(());
     }
-    let cover_shortcode = current_pack
-        .cover
-        .as_ref()
-        .map(|cover| cover.shortcode.as_str());
-    let cover_sha256 = current_pack
-        .cover
-        .as_ref()
-        .map(|cover| cover.sha256.as_str());
-    conn.execute(
-        "DELETE FROM app_sticker_assets
-         WHERE pack_coordinate = ?1
-           AND rowid IN (
-               SELECT assets.rowid
-               FROM app_sticker_assets AS assets
-               WHERE assets.pack_coordinate = ?1
-                 AND NOT EXISTS (
-                     SELECT 1 FROM app_stickers AS current
-                     WHERE current.pack_coordinate = assets.pack_coordinate
-                       AND current.shortcode = assets.shortcode
-                       AND current.sha256 = assets.sha256
-                 )
-                 AND (
-                     ?2 IS NULL
-                     OR assets.shortcode != ?2
-                     OR assets.sha256 != ?3
-                 )
-               ORDER BY assets.rowid ASC
-               LIMIT ?4
-           )",
-        params![coordinate, cover_shortcode, cover_sha256, excess],
-    )
-    .storage()?;
+    let mut protected = retained_sticker_asset_refs_tx(conn, coordinate)?;
+    if let Some(cover) = &current_pack.cover {
+        protected.insert((cover.shortcode.clone(), cover.sha256.clone()));
+    }
+    let mut statement = conn
+        .prepare(
+            "SELECT rowid, shortcode, sha256 FROM app_sticker_assets
+             WHERE pack_coordinate = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM app_stickers AS current
+                   WHERE current.pack_coordinate = app_sticker_assets.pack_coordinate
+                     AND current.shortcode = app_sticker_assets.shortcode
+                     AND current.sha256 = app_sticker_assets.sha256
+               )
+             ORDER BY rowid ASC",
+        )
+        .storage()?;
+    let candidates = statement
+        .query_map(params![coordinate], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()?;
+    drop(statement);
+    let mut removed = 0;
+    for (rowid, shortcode, sha256) in candidates {
+        if removed == excess {
+            break;
+        }
+        if protected.contains(&(shortcode, sha256)) {
+            continue;
+        }
+        conn.execute(
+            "DELETE FROM app_sticker_assets WHERE rowid = ?1",
+            params![rowid],
+        )
+        .storage()?;
+        removed += 1;
+    }
     Ok(())
+}
+
+fn retained_sticker_asset_refs_tx(
+    conn: &Connection,
+    coordinate: &str,
+) -> StorageResult<HashSet<(String, String)>> {
+    let mut referenced = conn
+        .prepare(
+            r#"SELECT tags_json FROM message_timeline
+             WHERE kind = 9 AND deleted = 0 AND tags_json LIKE '%"sticker"%'"#,
+        )
+        .storage()?;
+    let mut refs = HashSet::new();
+    for tags_json in referenced
+        .query_map([], |row| row.get::<_, String>(0))
+        .storage()?
+    {
+        let tags =
+            serde_json::from_str::<Vec<Vec<String>>>(&tags_json.storage()?).unwrap_or_default();
+        for tag in tags {
+            if tag.first().is_some_and(|name| name == "sticker")
+                && tag.get(1).is_some_and(|pack| pack == coordinate)
+                && let (Some(shortcode), Some(sha256)) = (tag.get(2), tag.get(3))
+            {
+                refs.insert((shortcode.clone(), sha256.clone()));
+            }
+        }
+    }
+    Ok(refs)
 }
 
 fn protected_sticker_coordinates_tx(conn: &Connection) -> StorageResult<HashSet<String>> {
@@ -1266,6 +1307,48 @@ mod tests {
         );
         assert_eq!(store.desired_installed_sticker_packs().unwrap(), remote);
         assert!(store.sticker_install_operations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn retained_message_asset_survives_history_trim() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let coordinate = pack(&"11".repeat(32), 1, &"aa".repeat(32)).coordinate;
+        let referenced_hash = format!("{:064x}", 7);
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO message_timeline (
+                group_id_hex, message_id_hex, direction, sender, plaintext, kind,
+                tags_json, timeline_at, received_at, reactions_json, deleted
+             ) VALUES ('group', 'message', 'received', 'alice', '', 9, ?1, 1, 1, '{}', 0)",
+                rusqlite::params![
+                    serde_json::to_string(&vec![vec![
+                        "sticker",
+                        coordinate.as_str(),
+                        "wave",
+                        referenced_hash.as_str(),
+                    ]])
+                    .unwrap()
+                ],
+            )
+            .unwrap();
+        for index in 0..=MAX_STICKER_ASSET_HISTORY_ROWS {
+            let mut winner = pack(
+                &format!("{index:064x}"),
+                u64::try_from(index).unwrap() + 1,
+                &format!("{:064x}", index + 1),
+            );
+            winner.coordinate = coordinate.clone();
+            assert!(store.replace_sticker_pack_if_newer(&winner).unwrap());
+        }
+        assert!(
+            store
+                .sticker_for_ref(&coordinate, "wave", &referenced_hash)
+                .unwrap()
+                .is_some(),
+            "a retained message must keep its exact historical sticker asset"
+        );
     }
 
     #[test]
