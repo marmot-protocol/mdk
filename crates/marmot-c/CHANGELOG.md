@@ -9,6 +9,14 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `marmot_cached_public_event_previews` (synchronous, local), `marmot_cache_public_event_preview` (local admission)
+  and `marmot_resolve_public_event_preview` (bounded relay refresh) return `MarmotPublicEventCacheRead` rows: a
+  canonical `MarmotPublicEventCacheKey`, a `MarmotPublicEventCacheState` (`Present`, `AuthoritativeDeleted`,
+  `Missing`, `Busy`) and the matching optional `MarmotPublicEventPreview` or `MarmotPublicEventDeletion`, both carrying
+  `projection_version`. Release a list with `marmot_public_event_cache_read_list_free` and a single row with
+  `marmot_public_event_cache_read_free`; embedded records have no separate free. These additive exports require the
+  matching generated header and library; existing record layouts are unchanged. A coordinate key's `identifier`
+  is a JSON string literal: decode once while preserving embedded NULs and UTF-8 lengths.
 - Add `marmot_propose_onboarding_relay_repair` and nested typed relay-repair
   preview records. `MarmotOnboardingRepairProposal` gains an optional
   `relay_repair` pointer; regenerate and recompile with the matching header

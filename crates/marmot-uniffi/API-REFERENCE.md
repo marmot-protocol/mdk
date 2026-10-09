@@ -3497,7 +3497,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options. Existing constructors are compatibility wrappers around this entry point.
 
-[Source](src/lib.rs#L245)
+[Source](src/lib.rs#L247)
 
 ### `Marmot::new_with_options`
 
@@ -3509,7 +3509,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L261)
+[Source](src/lib.rs#L263)
 
 ### `Marmot::new`
 
@@ -3521,7 +3521,7 @@ pub fn new(root_path: String, relay_urls: Vec<String>) -> Result<Arc<Self>, Marm
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) via the default keychain-backed account home — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L289)
+[Source](src/lib.rs#L291)
 
 ### `Marmot::new_with_secret_store`
 
@@ -3533,7 +3533,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L307)
+[Source](src/lib.rs#L309)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -3545,7 +3545,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L337)
+[Source](src/lib.rs#L339)
 
 ### `Marmot::new_with_client_name`
 
@@ -3557,7 +3557,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels are omitted. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L356)
+[Source](src/lib.rs#L358)
 
 ### `Marmot::start`
 
@@ -3569,7 +3569,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L393)
+[Source](src/lib.rs#L395)
 
 ### `Marmot::shutdown`
 
@@ -3581,7 +3581,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L405)
+[Source](src/lib.rs#L407)
 
 ### `Marmot::shutdown_and_close`
 
@@ -3593,7 +3593,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L440)
+[Source](src/lib.rs#L442)
 
 ### `Marmot::storage_is_closed`
 
@@ -3605,7 +3605,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L448)
+[Source](src/lib.rs#L450)
 
 ### `Marmot::is_stopping`
 
@@ -3617,7 +3617,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L455)
+[Source](src/lib.rs#L457)
 
 </details>
 
@@ -4322,7 +4322,7 @@ must enforce those separately and bound any untrusted JSON before passing it.
 </details>
 
 <details>
-<summary>New exports — complete and organize before merging</summary>
+<summary>Audit v5 OTLP delivery</summary>
 
 ### `Marmot::post_audit_log_tracker_update_v5`
 
@@ -4343,5 +4343,40 @@ pub fn set_audit_otlp_config_v5( &self, mut config: AuditOtlpConfigV5Ffi, ) -> R
 Install or remove an in-memory v5 OTLP audit destination. With `enabled: true`, provide a stable destination identity, an HTTPS `/v1/logs` endpoint, and a bearer token; local loopback testing additionally requires `allow_loopback_dev: true`. The returned configuration always omits the token. With `enabled: false`, the runtime clears the sender. This does not enable recording, change the v4 Goggles route, or persist credentials. A configuration change fences in-flight acknowledgments.
 
 [Source](src/commands/audit.rs#L54)
+
+</details>
+
+<details>
+<summary>Verified public event previews</summary>
+
+### `Marmot::cache_public_event_preview`
+
+```rust
+pub async fn cache_public_event_preview( &self, account_ref: String, reference: String, candidates: Vec<String>, ) -> Result<PublicEventCacheReadFfi, MarmotKitError>
+```
+
+Validate and persist up to 16 signed event JSON candidates (each at most 256 KiB) for an account and a note/nevent/naddr reference (a 64-character event ID is also accepted), then return the resulting local state. Candidates may include the referenced event, NIP-09 kind-5 deletion requests and the selected author's kind-0 metadata. Native ID/signature verification and exact event ID or complete coordinate matching run before admission; a coordinate selects the newest event, breaking creation-time ties by lowest event ID. A deletion counts only when the locally verified target has the same author (an `e` tag) or the coordinate author made the request (an `a` tag, covering versions created at or before it); unknown targets and deletions of deletions are ignored, and nevent author hints never authenticate anything. Empty, invalid, older or deleted-version refreshes preserve a known-good selection. Oversized batches return an error without changing stored data. This call performs no relay request and is not a network refresh.
+
+[Source](src/commands/public_event_preview.rs#L158)
+
+### `Marmot::cached_public_event_previews`
+
+```rust
+pub fn cached_public_event_previews( &self, account_ref: String, references: Vec<String>, ) -> Result<Vec<PublicEventCacheReadFfi>, MarmotKitError>
+```
+
+Synchronous, network-free cached reads for first-frame state. Returns exactly one `PublicEventCacheReadFfi` per input, in input order and including duplicates; at most 16 references of at most 5,000 bytes each, and the whole request is validated before storage is opened, so one invalid reference fails the call. Each row is `Present` (with a `projection_version` 1 preview and optional cached author profile), `AuthoritativeDeleted` (with the author's signed deletion request), `Missing` (no local knowledge; never durable negative truth) or `Busy` (account lifecycle work is running; retry later, never treat it as a miss). Signatures, reference identity and stored deletion evidence are rechecked on every read; corrupt evidence or an unknown projection version is an error. `refresh_recommended` becomes true for a coordinate after 15 minutes, while immutable event IDs remain reusable. The cache keeps at most 1,024 records and 32 MiB per account. Render a hit before refreshing and keep results with the originating account.
+
+[Source](src/commands/public_event_preview.rs#L143)
+
+### `Marmot::resolve_public_event_preview`
+
+```rust
+pub async fn resolve_public_event_preview( &self, account_ref: String, reference: String, ) -> Result<PublicEventCacheReadFfi, MarmotKitError>
+```
+
+Bounded native refresh for one reference, then the resulting local state. Queries at most four safe relays (up to two ephemeral reference hints, then configured directory relays) for the exact event ID or complete coordinate, then kind-5 deletion requests and kind-0 metadata from the actual target author only, within ten seconds and sixteen received events / 4 MiB overall. It never fetches references inside event content. Concurrent calls for one reference share a single request, and an attempted refresh is not repeated for 30 seconds (in memory only). An empty or failed refresh keeps prior content; a deleted event ID is not queried again. No account guard is held across the network, and results are discarded if the account was removed, wiped, reimported or closed meanwhile.
+
+[Source](src/commands/public_event_preview.rs#L173)
 
 </details>

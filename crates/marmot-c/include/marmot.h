@@ -640,6 +640,42 @@ typedef enum MarmotPresentationResolution {
 } MarmotPresentationResolution;
 
 /**
+ * Which canonical identity a `MarmotPublicEventCacheKey` carries.
+ */
+typedef enum MarmotPublicEventCacheKeyType {
+  /**
+   * `event_id_hex` is non-NULL; the coordinate fields are NULL/unset.
+   */
+  MARMOT_PUBLIC_EVENT_CACHE_KEY_TYPE_EVENT_ID,
+  /**
+   * `author_pubkey_hex`, `kind` and `identifier` are set; `event_id_hex` is NULL.
+   */
+  MARMOT_PUBLIC_EVENT_CACHE_KEY_TYPE_COORDINATE,
+} MarmotPublicEventCacheKeyType;
+
+/**
+ * Local state of one public event reference.
+ */
+typedef enum MarmotPublicEventCacheState {
+  /**
+   * `preview` is non-NULL.
+   */
+  MARMOT_PUBLIC_EVENT_CACHE_STATE_PRESENT,
+  /**
+   * `deletion` is non-NULL: authenticated NIP-09 evidence.
+   */
+  MARMOT_PUBLIC_EVENT_CACHE_STATE_AUTHORITATIVE_DELETED,
+  /**
+   * Nothing is known locally; not durable negative truth.
+   */
+  MARMOT_PUBLIC_EVENT_CACHE_STATE_MISSING,
+  /**
+   * Account lifecycle work is in progress; retry. Never a miss.
+   */
+  MARMOT_PUBLIC_EVENT_CACHE_STATE_BUSY,
+} MarmotPublicEventCacheState;
+
+/**
  * How far an account's setup has progressed.
  */
 typedef enum MarmotAccountSetupReadiness {
@@ -3235,6 +3271,63 @@ typedef struct MarmotMediaRecordList {
   struct MarmotMediaRecord *items;
   uintptr_t len;
 } MarmotMediaRecordList;
+
+/**
+ * Canonical cache identity; relay hints never take part in it.
+ */
+typedef struct MarmotPublicEventCacheKey {
+  enum MarmotPublicEventCacheKeyType key_type;
+  char *event_id_hex;
+  char *author_pubkey_hex;
+  bool has_kind;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint32_t kind;
+  /**
+   *NULL or a JSON string literal; decode once preserving embedded NULs.
+   */
+  char *identifier;
+} MarmotPublicEventCacheKey;
+
+/**
+ * Signed event JSON plus freshness and optional account-scoped cached author metadata.
+ */
+typedef struct MarmotPublicEventPreview {
+  char *event_json;
+  uint64_t received_at;
+  bool refresh_recommended;
+  struct MarmotUserProfileMetadata *author_profile;
+  uint32_t projection_version;
+} MarmotPublicEventPreview;
+
+/**
+ * The author's signed NIP-09 deletion request for the referenced event.
+ */
+typedef struct MarmotPublicEventDeletion {
+  char *deletion_event_json;
+  uint64_t received_at;
+  uint32_t projection_version;
+} MarmotPublicEventDeletion;
+
+/**
+ * One result per requested reference. `preview` is non-NULL exactly for
+ * `Present` and `deletion` exactly for `AuthoritativeDeleted`.
+ */
+typedef struct MarmotPublicEventCacheRead {
+  struct MarmotPublicEventCacheKey key;
+  enum MarmotPublicEventCacheState state;
+  struct MarmotPublicEventPreview *preview;
+  struct MarmotPublicEventDeletion *deletion;
+} MarmotPublicEventCacheRead;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotPublicEventCacheReadList {
+  struct MarmotPublicEventCacheRead *items;
+  uintptr_t len;
+} MarmotPublicEventCacheReadList;
 
 typedef struct MarmotBlockedUser {
   char *public_key;
@@ -7546,6 +7639,58 @@ MarmotStatus marmot_user_profile(const struct MarmotClient *client,
                                  struct MarmotUserProfileMetadata **out);
 
 /**
+ * Network-free ordered cached reads: one row per reference (at most 16,
+ * duplicates kept) without waiting on account lifecycle work, which
+ * yields `Busy` rows instead. Invalid input fails the whole call. Free
+ * with `marmot_public_event_cache_read_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_cached_public_event_previews(const struct MarmotClient *client,
+                                                 const char *account_ref,
+                                                 const char *const *references,
+                                                 uintptr_t references_len,
+                                                 struct MarmotPublicEventCacheReadList **out);
+
+/**
+ * Admit bounded signed candidates (targets, NIP-09 deletions, the selected
+ * author's kind-0) with no relay request; empty or invalid batches never
+ * displace valid state. Free with `marmot_public_event_cache_read_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_cache_public_event_preview(const struct MarmotClient *client,
+                                               const char *account_ref,
+                                               const char *reference,
+                                               const char *const *candidates,
+                                               uintptr_t candidates_len,
+                                               struct MarmotPublicEventCacheRead **out);
+
+/**
+ * Bounded relay refresh (at most four safe relays and ten seconds), then
+ * the resulting local state; failures keep prior content. Free with
+ * `marmot_public_event_cache_read_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_resolve_public_event_preview(const struct MarmotClient *client,
+                                                 const char *account_ref,
+                                                 const char *reference,
+                                                 struct MarmotPublicEventCacheRead **out);
+
+/**
  * Refresh the cached profile for an account id from `relays`.
  *
  * # Safety
@@ -11823,6 +11968,25 @@ void marmot_content_report_page_free(struct MarmotContentReportPage *ptr);
  * this library.
  */
 void marmot_report_dismissal_page_free(struct MarmotReportDismissalPage *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_public_event_cache_read_free(struct MarmotPublicEventCacheRead *ptr);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_public_event_cache_read_list_free(struct MarmotPublicEventCacheReadList *list);
 
 /**
  * Free a value of this type returned by this library. NULL

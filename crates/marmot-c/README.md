@@ -17,7 +17,7 @@ per feature.
 - [Onboarding relay repair](#onboarding-relay-repair)
 - [NIP-46 accounts](#nip-46-accounts)
 - Feature notes: [runtime construction](#runtime-construction), [local sends](#local-sends),
-  [public event verification](#public-event-verification), [host performance stages](#host-performance-stages),
+  [public event verification](#public-event-verification), [verified public event previews](#verified-public-event-previews), [host performance stages](#host-performance-stages),
   [Markdown rendering](#markdown-rendering), [identity references and pseudonyms](#identity-references-and-pseudonyms),
   [KeyPackage inventory](#keypackage-inventory), [selected chat-list presentation](#selected-chat-list-presentation),
   [chat screens and avatars](#chat-screens-and-avatars),
@@ -188,6 +188,25 @@ its row and released by the row's existing deep-free.
 Since 0.11.0, `marmot_edit_local_message_with_client_token` provides
 durable revisions of pending text or replies. Each revision needs a new edit token;
 the C call returns local acceptance and uses the same status and free functions.
+
+## Verified public event previews
+
+The [shared preview contract](../marmot-uniffi/README.md#verified-public-event-previews) defines validation, freshness,
+deletion, account isolation and limits. Input references and candidate strings are borrowed.
+
+`marmot_cached_public_event_previews` is synchronous and never queries relays or waits on account lifecycle work. It
+returns one owned `MarmotPublicEventCacheReadList` with one row per reference, in order and including duplicates;
+release it with `marmot_public_event_cache_read_list_free`. `marmot_cache_public_event_preview` (local admission, no
+relay request) and `marmot_resolve_public_event_preview` (bounded relay refresh) block until completion and return one
+owned `MarmotPublicEventCacheRead`; release it with `marmot_public_event_cache_read_free`.
+
+Each row's `state` is a `MarmotPublicEventCacheState`: `preview` is non-NULL exactly for `Present`, `deletion` exactly
+for `AuthoritativeDeleted`, and both are NULL for `Missing` and `Busy`. `Busy` is retryable contention, not a miss.
+`key.key_type` selects which key fields are set; `has_kind` qualifies `kind`. A coordinate's `key.identifier` is a
+JSON string literal, not raw text. Decode it once and preserve embedded NULs and UTF-8 lengths when comparing keys;
+for example, identifiers `a\0b` and `ab` remain distinct. Non-coordinate keys have a NULL identifier.
+The parent free releases the key, preview,
+author profile and deletion. Keep results with their account.
 
 ## Public event verification
 

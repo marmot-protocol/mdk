@@ -18,6 +18,9 @@
 use crate::attachment_access::MarmotAttachmentLocalBytes;
 use crate::types::avatar::{MarmotAvatarAssetList, MarmotAvatarBytesList};
 use crate::types::presentation::{MarmotPresentedChatListSnapshot, MarmotPresentedChatRow};
+use crate::types::public_event_preview::{
+    MarmotPublicEventCacheRead, MarmotPublicEventCacheReadList,
+};
 use std::ffi::c_char;
 
 use marmot_uniffi::MarmotKitError;
@@ -988,6 +991,22 @@ c_cmd! {
     /// `MARMOT_STATUS_OK` when unknown. Free with
     /// `marmot_user_profile_metadata_free`.
     sync fn marmot_user_profile(account_id_hex: str) -> opt_rec(MarmotUserProfileMetadata) = user_profile;
+
+    /// Network-free ordered cached reads: one row per reference (at most 16,
+    /// duplicates kept) without waiting on account lifecycle work, which
+    /// yields `Busy` rows instead. Invalid input fails the whole call. Free
+    /// with `marmot_public_event_cache_read_list_free`.
+    sync fn marmot_cached_public_event_previews(account_ref: str, references/references_len: str_arr) -> rec(MarmotPublicEventCacheReadList) = cached_public_event_previews;
+
+    /// Admit bounded signed candidates (targets, NIP-09 deletions, the selected
+    /// author's kind-0) with no relay request; empty or invalid batches never
+    /// displace valid state. Free with `marmot_public_event_cache_read_free`.
+    async fn marmot_cache_public_event_preview(account_ref: str, reference: str, candidates/candidates_len: str_arr) -> rec(MarmotPublicEventCacheRead) = cache_public_event_preview;
+
+    /// Bounded relay refresh (at most four safe relays and ten seconds), then
+    /// the resulting local state; failures keep prior content. Free with
+    /// `marmot_public_event_cache_read_free`.
+    async fn marmot_resolve_public_event_preview(account_ref: str, reference: str) -> rec(MarmotPublicEventCacheRead) = resolve_public_event_preview;
 
     /// Refresh the cached profile for an account id from `relays`.
     async fn marmot_refresh_profile(account_id_hex: str, relays/relays_len: str_arr) -> unit = refresh_profile;

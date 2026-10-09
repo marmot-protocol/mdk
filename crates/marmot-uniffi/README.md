@@ -16,7 +16,8 @@ Read the documentation at the tag matching your binaries; `master` can describe 
 - Accounts and identity: [interactive account onboarding](#interactive-account-onboarding),
   [identity references and profiles](#identity-references-and-profiles),
   [KeyPackage inventory](#keypackage-inventory), [KeyPackage client preference](#keypackage-client-preference),
-  [public Nostr event verification](#public-nostr-event-verification)
+  [public Nostr event verification](#public-nostr-event-verification),
+  [verified public event previews](#verified-public-event-previews)
 - Screens: [selected chat-list presentation](#selected-chat-list-presentation),
   [bounded chat screens](#bounded-chat-screens), [prepared conversation windows](#prepared-conversation-windows),
   [live timeline updates](#live-timeline-updates), [durable avatar access](#durable-avatar-access)
@@ -621,6 +622,70 @@ and does not guarantee capability compatibility. Final creation/invitation check
 the actual group's requirements. Device-aware delivery in
 [MDK #1696](https://github.com/marmot-protocol/mdk/issues/1696) is the intended
 replacement for this temporary client ranking.
+
+## Verified public event previews
+
+For first-frame state, call the synchronous `cachedPublicEventPreviews(accountRef, references)` with up to 16
+references. It never touches the network and returns one `PublicEventCacheReadFfi` per input, in input order and
+including duplicates, each with its canonical key and a state:
+
+| State | Payload | Host action |
+| --- | --- | --- |
+| `Present` | `preview`: signed event JSON, admission time, freshness, optional cached author profile | Render immediately, including offline. |
+| `AuthoritativeDeleted` | `deletion`: the author's signed NIP-09 request | Render as deleted. |
+| `Missing` | none | Nothing is known locally; resolve it. Never durable "not found". |
+| `Busy` | none | Account lifecycle work is running, or the account was removed, wiped, reimported or closed during the request; retry shortly. Never treat as a miss. |
+
+Run local reads on the host's I/O dispatcher to keep encrypted storage access and retained-evidence verification off
+the UI thread.
+
+The whole request is validated first, so an invalid reference or more than 16 references is an error. An immutable
+event ID needs no age-based refresh; a coordinate sets `refreshRecommended` after 15 minutes but keeps its content.
+Every payload carries `projectionVersion` (currently 1).
+
+`resolvePublicEventPreview(accountRef, reference)` performs the bounded native refresh and returns the resulting
+local state. It asks at most four safe relays (up to two ephemeral reference hints, then the configured directory
+relays) for the exact event ID or complete coordinate, then NIP-09 deletion requests and kind-0 metadata from the
+actual target author, within ten seconds and sixteen events / 4 MiB overall. Every relay hostname is resolved once,
+each address must be public, and the connection is pinned to a validated address while TLS still verifies the
+original hostname; no proxy is used. The byte budget counts raw received wire bytes, including TLS and HTTP
+handshakes and every WebSocket frame and fragment, before they are parsed; the event budget counts every relay
+event message, including duplicates and invalid events. Every connection is closed at the request deadline, even
+when a relay stops reading or sending mid-message. It never follows references inside
+fetched content. Concurrent calls for one reference share a request, and an attempted refresh is not repeated for
+30 seconds. A failed or empty refresh keeps prior content, so never replace a rendered hit with Loading. Results that
+arrive after the account was removed, wiped, reimported or closed are discarded and reported as `Busy`.
+
+Hosts that already hold signed events can call `cachePublicEventPreview(accountRef, reference, candidates)` with up to
+16 signed JSON events of at most 256 KiB each: the target, kind-5 deletion requests and the author's kind-0. This
+admission performs no relay request. Native verification checks each event ID, Schnorr signature and the reference
+identity. A coordinate selects the newest creation time, then the lowest event ID on a tie. Invalid, empty or older
+batches retain the previous selection; an oversized batch is an error and leaves storage unchanged.
+
+References accept note, nevent, naddr, an optional `nostr:` prefix or an exact 64-character hexadecimal event ID.
+Relay hints do not become cache keys. Optional nevent author/kind metadata remains lookup guidance; the exact signed
+event ID is authoritative. Naddr supports addressable kinds and ordinary replaceable kinds with an empty identifier.
+
+Deletions follow NIP-09. An `e` request counts only when the locally verified target has the same author; an `a`
+request counts only from the coordinate author and covers versions created at or before it. Requests for unknown
+targets, from other authors or against deletion events are ignored. After a deleted event's content is removed, the
+cache keeps the signed request plus a compact `(id, pubkey, signature)` proof of the target, re-verified whenever it
+is used; the target's kind, coordinate and rank are retained from its earlier local verification and bound, with the
+rest of the evidence, by a MAC keyed from the account's private storage key. The set of retained evidence is
+authenticated as a whole too, so moved, renamed or missing evidence is detected. Tampered evidence is an error. An
+addressable event whose identifier exceeds 1,024 bytes is excluded from preview admission, including exact-ID lookups, so deletion semantics are not weakened. Deleting
+a coordinate's selected version blocks that version and older ones, while a genuinely newer version can still win;
+this also holds when the version and its deletion arrive together in one batch before anything was cached.
+
+Author profiles come from the account's existing directory cache without a profile request. A resolved author's
+kind-0 is stored only in that account's directory cache; it does not make the author a followed or synced contact.
+
+The SQLCipher cache is separate for each account and bounded to 1,024 records (selections and deletion evidence
+together) and 32 MiB, counting every retained field. Eviction removes whole related groups, so complete eviction also ends local knowledge of their
+deletions. A coordinate that collects more than 64 deleted versions is evicted as a whole group in the same way. It stores no negative results; corrupt deletion evidence or an unknown format is an error rather than a
+miss. Account removal closes and deletes it; `shutdownAndClose` closes every outstanding handle. Hosts own layout and
+bounded decoded-media caches. These source APIs require generated bindings and a published artifact from a release
+that includes them; the API reference on master is not proof that an older binary provides the methods.
 
 ## Public Nostr event verification
 

@@ -226,6 +226,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `src/runtime/agent_stream_watch.rs`, before any connect; both follow the one dial discipline in
   `docs/marmot-architecture/overview/dial-safety.md` (validate + pin, trust from config, loopback only under an explicit
   dev flag). Do not add an outbound relay/broker path that bypasses them.
+- Public event refresh uses `src/relay_plane/public_event_transport.rs` after the same safety policy. Keep DNS
+  validation and address pinning, configured TLS trust, wire-byte accounting and the absolute request deadline together;
+  do not replace it with an unmetered SDK connection. Cache authority lives in `src/public_event_preview.rs`: verify
+  signatures, coordinate selection and authenticated deletion provenance before returning retained content.
 - Floor every history REQ at an anchor, less `HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE` (`history_floor`, ledger A14): the
   post-join maintenance REQ at the Welcome that installed the copy (`Group::local_copy_welcome_created_at`, never the
   local join time, which an offline member reaches long after the Welcome), and a retained route at the moment
@@ -281,6 +285,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `account_worker/recovery_credits.rs` (process-wide recovery credit pool), `conversation_window.rs`, `chat_list_window.rs`,
   `presentation.rs`, `presented_chat_list.rs`, `account_attention.rs` (presentation windows and account-switcher
   attention), `user_blocks.rs`, `moderation.rs` (reports and admin labels), `local_submissions.rs`,
+  `public_event_preview.rs` (network-free cached batches, bounded refresh and account lifecycle fencing),
   `agent_publisher.rs` (host-driven agent publishing), `attachment_controls.rs`, `attachment_permission.rs`
   (runtime-only network approval; never restore it from disk).
 - `src/client/`: `recovery.rs` (recovery grant authorization), `invite_recovery.rs` (durable invitation recovery),
@@ -288,7 +293,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `audit_v5_app_update.rs` (bounded app-boundary audit rows), `sync/comparison_job.rs` (the one recovery comparison
   job).
 - `src/relay_plane/`: `mod.rs` (shared relay plane), `safety.rs` (relay dial chokepoint), `directory.rs` (directory
-  fetches/subscriptions), `delivery_spill.rs` (durable overflow tail for a full account queue), `telemetry.rs`.
+  fetches/subscriptions), `public_event_query.rs` (bounded public-event target/deletion/profile queries),
+  `public_event_transport.rs` (pinned and metered request sockets), `delivery_spill.rs` (durable overflow tail for a
+  full account queue), `telemetry.rs`.
 - `src/directory/`: also `cached_search.rs` (network-free cross-account search), `search.rs` (streaming web-of-trust
   search), `open_ranking.rs` (bounded Vertex Open Ranking discovery), `member_key_packages.rs` (set-oriented roster
   KeyPackage resolution for create/invite).

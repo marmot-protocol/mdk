@@ -54,3 +54,9 @@ mod attachment_access;
 
 mod attachment_controls;
 pub use attachment_controls::AttachmentTransferSubscription;
+
+pub mod public_event_preview;
+pub use public_event_preview::{
+    PublicEventCacheKeyFfi, PublicEventCacheKeyTypeFfi, PublicEventCacheReadFfi,
+    PublicEventCacheStateFfi, PublicEventDeletionFfi, PublicEventPreviewFfi,
+};
