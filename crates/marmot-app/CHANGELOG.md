@@ -11,6 +11,13 @@
 
 ### Added
 
+- Account-scoped public-event previews provide cached ordered reads, signed-candidate
+  admission and bounded relay refresh through `cached_public_event_previews`,
+  `cache_public_event_preview` and `resolve_public_event_preview`.
+  Each account retains at most 1,024 records and 32 MiB. Cohort eviction removes
+  selections and deletion evidence together, suppressing subsequent deletion
+  and preview writes in the same admission.
+
 - `AccountManager::propose_onboarding_relay_repair` previews exact ordered
   tags, content and minimal relay changes without signing or publishing.
   Approval retains the existing revision and source-event checks; typed
@@ -30,9 +37,6 @@
   `relay.damus.io` can be invited again.
 
 ### Fixed
-
-- Public-event cache cohort eviction suppresses every later deletion and preview write in the same admission,
-  preventing deletion-order-dependent partial evidence after the tombstone cap is exceeded.
 
 - Lossless relay repairs accept case-insensitive NIP-65 read/write markers,
   matching relay-list inspection while preserving their original spelling
