@@ -14,6 +14,7 @@ per feature.
 - [Using the ABI](#using-the-abi)
 - [Integration documentation](#integration-documentation)
 - [Lifecycle and teardown](#lifecycle-and-teardown)
+- [Onboarding relay repair](#onboarding-relay-repair)
 - [NIP-46 accounts](#nip-46-accounts)
 - Feature notes: [runtime construction](#runtime-construction), [local sends](#local-sends),
   [public event verification](#public-event-verification), [verified public event previews](#verified-public-event-previews), [host performance stages](#host-performance-stages),
@@ -140,6 +141,27 @@ Release subscriptions before clients, and never free an object while another cal
 `marmot_client_free` waits for runtime worker cleanup on an ordinary host thread, preventing pending database
 destructors from racing process exit (since 0.10.3). Run final free off the UI thread. Calls from a Tokio runtime
 context retain nonblocking cleanup to avoid deadlock and are not a process-teardown barrier.
+
+## Onboarding relay repair
+
+For a general or inbox onboarding relay failure, call
+`marmot_propose_onboarding_relay_repair` and inspect the optional
+`proposal->relay_repair` in the returned snapshot. Its ordered before/after
+tags and occurrence changes preserve duplicate entries, direction markers,
+unrelated fields, and content. `ManualReview` has no approval action; do not
+publish it or treat it as a full reset. Free the snapshot with
+`marmot_onboarding_snapshot_free` after presenting the exact diff. Approval
+remains a separate revision- and recovery-epoch-bound call.
+
+C relay-repair previews encode `original_content`, `proposed_content`, every
+`fields` element in tags and changes, and each non-NULL `endpoint` as a JSON
+string literal. Decode exactly once with a parser that preserves embedded zero
+bytes and decoded UTF-8 lengths before displaying or prefilling an editor.
+For example, `"a\u0000b"` represents three bytes: `61 00 62`; `""` is an empty
+string, distinct from a NULL optional endpoint. Do not use `strlen` on decoded
+content or discard control bytes. The encoded C strings contain no embedded
+NULs; their snapshot ownership and deep-free rules are unchanged. Swift/Kotlin
+records retain ordinary strings and do not use this C-only encoding.
 
 ## Runtime construction
 

@@ -81,6 +81,7 @@ nostr-relay-builder.workspace = true
 openmls.workspace = true
 openmls_basic_credential.workspace = true
 openmls_rust_crypto.workspace = true
+parking_lot = "0.12"
 tls_codec.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

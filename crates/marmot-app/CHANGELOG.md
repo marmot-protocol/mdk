@@ -11,6 +11,11 @@
 
 ### Added
 
+- `AccountManager::propose_onboarding_relay_repair` previews exact ordered
+  tags, content and minimal relay changes without signing or publishing.
+  Approval retains the existing revision and source-event checks; typed
+  previews require checkpoint version 6.
+
 - `MarmotAppRuntime::message_reactions` returns complete local reaction details for one exact
   account/group/message, with one effective entry per sender/emoji and no
   conversation-preview cap. Missing, hidden, deleted, invalidated and
@@ -25,6 +30,10 @@
   `relay.damus.io` can be invited again.
 
 ### Fixed
+
+- Lossless relay repairs accept case-insensitive NIP-65 read/write markers,
+  matching relay-list inspection while preserving their original spelling
+  and extension fields through approval and publication.
 
 - Commands and maintenance retain committed activity before subscription waits.
   Manual and scheduled convergence keep subscriber updates owned through route,
