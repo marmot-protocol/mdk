@@ -8721,7 +8721,9 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         adapter._inbound_spool._checkpoint_and_verify_bound = original_verify
         await adapter._admit_due_spooled()
-        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+        # This checks recovery/FIFO, not a one-second disk-latency budget.
+        # Include the durable disposition writes in the bounded wait.
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=5)
         self.assertEqual(["first", "second"], [message.text for message in adapter.events])
         self.assertEqual(
             "unresolved", adapter._inbound_spool.get(first["message_id_hex"]).state

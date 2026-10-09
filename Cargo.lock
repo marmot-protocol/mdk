@@ -3759,6 +3759,7 @@ dependencies = [
  "openmls_basic_credential",
  "openmls_rust_crypto",
  "opentelemetry-proto",
+ "parking_lot",
  "prost",
  "psl",
  "rand 0.8.6",
