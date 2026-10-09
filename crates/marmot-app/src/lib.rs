@@ -498,6 +498,8 @@ pub struct MarmotApp {
     member_key_package_prewarm_cache: Arc<Mutex<directory::MemberKeyPackagePrewarmCache>>,
     legacy_directory_cache_checked: Arc<Mutex<bool>>,
     #[cfg(test)]
+    directory_test_clock: Option<Arc<std::sync::atomic::AtomicU64>>,
+    #[cfg(test)]
     directory_cache_open_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     directory_handle_acquire_count: Arc<std::sync::atomic::AtomicUsize>,
@@ -1518,6 +1520,8 @@ impl MarmotApp {
             )),
             legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
             #[cfg(test)]
+            directory_test_clock: None,
+            #[cfg(test)]
             directory_cache_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             directory_handle_acquire_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1606,6 +1610,8 @@ impl MarmotApp {
                 directory::MemberKeyPackagePrewarmCache::default(),
             )),
             legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
+            #[cfg(test)]
+            directory_test_clock: None,
             #[cfg(test)]
             directory_cache_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]

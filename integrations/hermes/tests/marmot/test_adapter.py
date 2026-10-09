@@ -8400,6 +8400,10 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
                     break
                 await asyncio.sleep(0.01)
 
+            # Host event visibility precedes the durable post-handoff write.
+            # Wait for dispatch completion before inspecting the spool state.
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=5)
+
             self.assertEqual(2, release_attempts)
             self.assertEqual([item.text for item in adapter.events], ["first"])
             self.assertEqual("unresolved", adapter._inbound_spool.get("33" * 32).state)
@@ -8499,9 +8503,10 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("pending", recovered.state)
         self.assertEqual("recovered_debounce_buffer", recovered.disposition)
         await adapter._admit_due_spooled()
-        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+        # Bound a stuck dispatch, not SQLite latency on a contended runner.
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=5)
         await adapter._admit_due_spooled()
-        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=5)
         self.assertEqual([item.text for item in adapter.events], ["recover after reopen"])
         await adapter._inbound_spool_call(adapter._inbound_spool.close)
 
@@ -8532,7 +8537,8 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 first_claim.event, spool_message_id=first_claim.message_id
             ),
         )
-        await asyncio.wait_for(handed.wait(), timeout=1)
+        # The handoff follows asynchronous ambient and spool persistence.
+        await asyncio.wait_for(handed.wait(), timeout=5)
 
         await adapter.disconnect()
 
@@ -8579,7 +8585,8 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("pending", record.state)
             adapter._inbound_spool_admission_enabled = True
             await adapter._try_admit_spooled(event["message_id_hex"], ignore_backoff=True)
-            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=1)
+            # Match the existing reopened-spool dispatch guard below.
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=5)
             self.assertEqual(["durable"], [message.text for message in adapter.events])
         finally:
             release.set()

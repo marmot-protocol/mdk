@@ -548,6 +548,19 @@ impl MarmotApp {
         account_id_hex: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<(FetchedKeyPackage, &'static str), AppError> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(50),
+            self.fetch_latest_key_package_for_account_id_bounded(account_id_hex, bootstrap_relays),
+        )
+        .await
+        .map_err(|_| AppError::RelayDirectory("KeyPackage lookup deadline exceeded".into()))?
+    }
+
+    async fn fetch_latest_key_package_for_account_id_bounded(
+        &self,
+        account_id_hex: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<(FetchedKeyPackage, &'static str), AppError> {
         // Normalize the identifier to canonical hex up front. The relay *queries*
         // below re-parse internally, but the KeyPackage record filter compares
         // `event.pubkey` (always hex) against this string verbatim — so an npub
@@ -559,6 +572,7 @@ impl MarmotApp {
             .map_err(|_| AppError::InvalidPublicKey)?
             .to_hex();
         let account_id_hex = canonical.as_str();
+        let discovery_relays = self.directory_source_relays(&bootstrap_relays);
         let has_explicit_bootstrap_relays = !bootstrap_relays.is_empty();
         let mut relay_lists = if has_explicit_bootstrap_relays {
             self.fetch_account_relay_list_status_for_account_id(account_id_hex, bootstrap_relays)
@@ -602,18 +616,62 @@ impl MarmotApp {
                 MissingRelayListKind::Nip65,
             ]));
         }
-        let records = self
-            .fetch_key_package_events_for_account_id(account_id_hex, &source_relays)
-            .await?;
+        let outcome = self
+            .relay_plane
+            .fetch_directory_events_with_completion(
+                source_relays.clone(),
+                vec![DirectoryEventQuery::new(
+                    KIND_MARMOT_KEY_PACKAGE,
+                    vec![account_id_hex.to_owned()],
+                    12,
+                )],
+            )
+            .await
+            .map_err(|error| AppError::RelayDirectory(format!("fetch key packages: {error}")))?;
         let cached_entry = {
             let app = self.clone();
             let account_id = account_id_hex.to_owned();
             blocking_app_task(move || app.directory_entry_for_account_id(&account_id)).await?
         };
+        let cached_entry = cached_entry.map(|mut entry| {
+            if let Some(metadata) = entry.key_package.as_mut() {
+                metadata.key_package_event_id =
+                    metadata.key_package_event_id.trim().to_ascii_lowercase();
+                // A diagnostic cache without a usable public event id cannot
+                // be checked for exact-event revocation and is ineligible.
+                if nostr_sdk::prelude::EventId::from_hex(&metadata.key_package_event_id).is_err() {
+                    entry.key_package = None;
+                }
+            }
+            entry
+        });
+        let cached_target = cached_entry
+            .as_ref()
+            .and_then(|entry| entry.key_package.as_ref())
+            .map(crate::key_package_records::KeyPackageRecoveryTarget::from_cached);
+        let records = self
+            .recover_key_package_records(super::key_package_recovery::KeyPackageRecoveryRequest {
+                account: account_id_hex,
+                searched: &source_relays,
+                observed: outcome.records,
+                primary_complete: outcome.complete,
+                discovery: &discovery_relays,
+                requirements: None,
+                cached_target,
+            })
+            .await?;
+        let cached_entry = cached_entry.filter(|entry| {
+            records.cache_evidence.as_ref().is_none_or(|evidence| {
+                entry
+                    .key_package
+                    .as_ref()
+                    .is_none_or(|cached| evidence.allows_cached(cached))
+            })
+        });
         let selection = latest_fresh_key_package_from_records(
             account_id_hex,
-            records,
-            self.directory_freshness(),
+            records.records,
+            records.freshness,
         )?;
         let from_cache = selection.value.is_none();
         let mut fetched = fresh_or_cached_key_package(account_id_hex, selection, cached_entry)?;
@@ -1205,6 +1263,14 @@ impl MarmotApp {
     }
 
     pub(crate) fn directory_freshness(&self) -> DirectoryFreshness {
+        #[cfg(test)]
+        if let Some(clock) = &self.directory_test_clock {
+            return DirectoryFreshness {
+                max_created_at: clock
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .saturating_add(self.config.directory_max_future_skew.as_secs()),
+            };
+        }
         DirectoryFreshness::from_now(self.config.directory_max_future_skew)
     }
 

@@ -8,8 +8,8 @@ use futures::StreamExt;
 use nostr_sdk::NotificationUpdate;
 use nostr_sdk::prelude::{
     AcquisitionEnd, AcquisitionLimits, Client as NostrSdkClient, Event, Filter, Kind, PublicKey,
-    RelayMessage, RelayNotification, RelayStatus, RelayUrl, ReqTarget, SubscribeAutoCloseOptions,
-    SubscriptionId,
+    RelayMessage, RelayNotification, RelayStatus, RelayUrl, ReqTarget, SingleLetterTag,
+    SubscribeAutoCloseOptions, SubscriptionId, Timestamp,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot};
@@ -44,6 +44,8 @@ pub(crate) struct DirectoryEventQuery {
     pub(crate) kind: u64,
     pub(crate) authors: Vec<String>,
     pub(crate) limit: usize,
+    pub(crate) reference: Option<(char, String)>,
+    pub(crate) since: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,7 +201,70 @@ impl DirectoryEventQuery {
             kind,
             authors,
             limit,
+            reference: None,
+            since: None,
         }
+    }
+
+    pub(crate) fn deletion_reference(
+        account: &str,
+        name: char,
+        value: String,
+        since: Option<u64>,
+    ) -> Self {
+        let mut query = Self::new(5, vec![account.to_owned()], 1);
+        query.reference = Some((name, value));
+        query.since = since;
+        query
+    }
+
+    fn validate_reference(&self) -> Result<(), String> {
+        let Some((name, value)) = &self.reference else {
+            return if self.since.is_none() {
+                Ok(())
+            } else {
+                Err("invalid directory since constraint".into())
+            };
+        };
+        if self.kind != 5 || self.authors.len() != 1 {
+            return Err("invalid deletion query scope".into());
+        }
+        let author = PublicKey::parse(&self.authors[0])
+            .map_err(|_| "invalid query author")?
+            .to_hex();
+        match name {
+            'e' if self.since.is_none()
+                && value.len() == 64
+                && value
+                    .bytes()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) =>
+            {
+                Ok(())
+            }
+            'a' if self.since.is_some() => {
+                let mut parts = value.splitn(3, ':');
+                if parts.next() == Some("30443")
+                    && parts.next() == Some(author.as_str())
+                    && parts.next().is_some_and(|slot| !slot.is_empty())
+                {
+                    Ok(())
+                } else {
+                    Err("invalid deletion coordinate".into())
+                }
+            }
+            _ => Err("invalid deletion reference".into()),
+        }
+    }
+
+    pub(crate) fn matches(&self, event: &NostrTransportEvent) -> bool {
+        self.kind == event.kind
+            && self.authors.contains(&event.pubkey)
+            && self.since.is_none_or(|since| event.created_at >= since)
+            && self.reference.as_ref().is_none_or(|(name, value)| {
+                event
+                    .tag_values(&name.to_string())
+                    .contains(&value.as_str())
+            })
     }
 }
 
@@ -219,6 +284,7 @@ impl DirectoryFetchRequest {
             return Err("directory fetch: no queries".to_owned());
         }
         for query in &queries {
+            query.validate_reference()?;
             if query.authors.is_empty() {
                 return Err("directory fetch: no query authors".to_owned());
             }
@@ -618,16 +684,41 @@ fn validated_directory_event(
     event: &Event,
     query: &DirectoryEventQuery,
 ) -> Option<NostrTransportEvent> {
-    if event.verify().is_err()
-        || u64::from(event.kind.as_u16()) != query.kind
-        || !query
-            .authors
-            .iter()
-            .any(|author| author == &event.pubkey.to_hex())
-    {
+    if event.verify().is_err() {
         return None;
     }
-    NostrTransportEvent::from_nostr_event(event).ok()
+    let event = NostrTransportEvent::from_nostr_event(event).ok()?;
+    query.matches(&event).then_some(event)
+}
+
+/// Shared wire-filter construction, including the inbox inspection probe.
+fn directory_query_filter(query: &DirectoryEventQuery, recipient: bool) -> Result<Filter, String> {
+    query.validate_reference()?;
+    let kind = u16::try_from(query.kind)
+        .map(Kind::from)
+        .map_err(|_| "unsupported Nostr kind")?;
+    let keys = query
+        .authors
+        .iter()
+        .map(|author| PublicKey::parse(author).map_err(|_| "invalid query author"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut filter = if recipient {
+        Filter::new().pubkeys(keys)
+    } else {
+        Filter::new().authors(keys)
+    }
+    .kind(kind)
+    .limit(query.limit);
+    if let Some((name, value)) = &query.reference {
+        filter = filter.custom_tag(
+            SingleLetterTag::from_char(*name).map_err(|_| "invalid reference tag")?,
+            value.clone(),
+        );
+    }
+    if let Some(since) = query.since {
+        filter = filter.since(Timestamp::from_secs(since));
+    }
+    Ok(filter)
 }
 
 impl NostrSdkDirectoryRelayFetcher {
@@ -700,18 +791,7 @@ impl NostrSdkDirectoryRelayFetcher {
 
         let mut records = Vec::new();
         for query in request.queries {
-            let kind = u16::try_from(query.kind)
-                .map(Kind::from)
-                .map_err(|_| format!("unsupported Nostr kind {}", query.kind))?;
-            let public_keys = query
-                .authors
-                .iter()
-                .map(|author| PublicKey::parse(author).map_err(|_| "invalid query author"))
-                .collect::<Result<Vec<_>, _>>()?;
-            let filter = Filter::new()
-                .authors(public_keys)
-                .kind(kind)
-                .limit(query.limit);
+            let filter = directory_query_filter(&query, false)?;
             let events = self
                 .client
                 .fetch_events(ReqTarget::manual(
@@ -782,20 +862,8 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
             .ok_or(Unreachable)?;
         let mut records = Vec::new();
         for query in request.queries {
-            let keys = query
-                .authors
-                .iter()
-                .map(|key| PublicKey::parse(key))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| InvalidRequest)?;
-            let kind = u16::try_from(query.kind).map_err(|_| InvalidRequest)?;
-            let filter = if query.kind == 1059 {
-                Filter::new().pubkeys(keys)
-            } else {
-                Filter::new().authors(keys)
-            }
-            .kind(Kind::from(kind))
-            .limit(query.limit);
+            let filter =
+                directory_query_filter(&query, query.kind == 1059).map_err(|_| InvalidRequest)?;
             // A successful empty fetch can hide a CLOSED terminal. The bounded
             // SDK acquisition retains that typed outcome and its wire reason.
             let report = client
@@ -860,12 +928,10 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         // Discovered targets belong to this bounded read, not the long-lived
         // client pool. Closing the owned client also stops reconnects for
         // failed relays without removing another caller's active relay.
-        let client = anonymous_directory_client();
         let mut tasks = JoinSet::new();
         for relay_url in relay_urls.iter().cloned() {
-            let client = client.clone();
             let queries = request.queries.clone();
-            tasks.spawn(async move { strict_fetch_endpoint(client, relay_url, queries).await });
+            tasks.spawn(async move { strict_fetch_endpoint(relay_url, queries).await });
         }
 
         let mut outcome = DirectoryFetchOutcome {
@@ -884,7 +950,6 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         if relay_urls.is_empty() {
             outcome.complete = false;
         }
-        client.shutdown().await;
         Ok(outcome)
     }
 }
@@ -901,10 +966,18 @@ fn directory_closed_reason(reason: &str) -> DirectoryInspectionError {
 }
 
 async fn strict_fetch_endpoint(
-    client: NostrSdkClient,
     relay_url: RelayUrl,
     queries: Vec<DirectoryEventQuery>,
 ) -> DirectoryFetchOutcome {
+    // Exactly one bounded subscription owns this connection and its wire
+    // counter. Cancellation/early failure closes it through the scoped guard.
+    let wire = super::directory_wire::DirectoryWireTransport::default();
+    let owned = ScopedInspectionClient(
+        NostrSdkClient::builder()
+            .websocket_transport(wire.clone())
+            .build(),
+    );
+    let client = &owned.0;
     let endpoint = TransportEndpoint(relay_url.to_string());
     if !matches!(client.relay(&relay_url).await, Ok(Some(_)))
         && client.add_relay(relay_url.clone()).await.is_err()
@@ -926,23 +999,10 @@ async fn strict_fetch_endpoint(
     };
     let mut filters = Vec::with_capacity(queries.len());
     for query in &queries {
-        let Ok(kind) = u16::try_from(query.kind).map(Kind::from) else {
+        let Ok(filter) = directory_query_filter(query, false) else {
             return DirectoryFetchOutcome::default();
         };
-        let Ok(public_keys) = query
-            .authors
-            .iter()
-            .map(|author| PublicKey::parse(author))
-            .collect::<Result<Vec<_>, _>>()
-        else {
-            return DirectoryFetchOutcome::default();
-        };
-        filters.push(
-            Filter::new()
-                .authors(public_keys)
-                .kind(kind)
-                .limit(query.limit),
-        );
+        filters.push(filter);
     }
 
     let max_records = queries.iter().map(|query| query.limit).sum::<usize>();
@@ -965,6 +1025,7 @@ async fn strict_fetch_endpoint(
     let mut records = Vec::new();
     let mut seen_event_ids = HashSet::new();
     let mut query_counts = vec![0usize; queries.len()];
+    let mut admitted_messages = 0usize;
     let complete = timeout(DIRECTORY_RELAY_FETCH_WAIT, async {
         loop {
             let received = match notifications.next().await {
@@ -977,15 +1038,21 @@ async fn strict_fetch_endpoint(
                         RelayMessage::Event {
                             subscription_id: received_id,
                             event,
-                        } if received_id.as_ref() == &subscription_id => Some(event.into_owned()),
+                        } if received_id.as_ref() == &subscription_id => {
+                            admitted_messages += 1;
+                            Some(event.into_owned())
+                        }
                         RelayMessage::EndOfStoredEvents(received_id)
                             if received_id.as_ref() == &subscription_id =>
                         {
                             // A filter that reaches its limit cannot establish absence.
-                            break queries
-                                .iter()
-                                .zip(&query_counts)
-                                .all(|(query, count)| *count < query.limit);
+                            // A frame discarded before notifications cannot
+                            // establish negative coverage, even after EOSE.
+                            break wire.event_count() == admitted_messages
+                                && queries
+                                    .iter()
+                                    .zip(&query_counts)
+                                    .all(|(query, count)| *count < query.limit);
                         }
                         RelayMessage::Closed {
                             subscription_id: received_id,
@@ -1008,14 +1075,26 @@ async fn strict_fetch_endpoint(
                 Some(NotificationUpdate::Lagged { .. }) | None => break false,
                 _ => None,
             };
-            if let Some(event) = received
-                && let Some(event) = queries
-                    .iter()
-                    .find_map(|query| validated_directory_event(&event, query))
-                && seen_event_ids.insert(event.id.clone())
-            {
+            if let Some(event) = received {
+                if event.verify().is_err() {
+                    continue;
+                }
+                let Ok(event) = NostrTransportEvent::from_nostr_event(&event) else {
+                    continue;
+                };
+                if !queries.iter().any(|query| query.matches(&event)) {
+                    // A filter-ignoring relay cannot establish a complete empty
+                    // scoped deletion result by filling its page with other posts.
+                    if queries.iter().any(|query| query.reference.is_some()) {
+                        break false;
+                    }
+                    continue;
+                }
+                if !seen_event_ids.insert(event.id.clone()) {
+                    continue;
+                }
                 for (query, count) in queries.iter().zip(&mut query_counts) {
-                    if query.kind == event.kind && query.authors.contains(&event.pubkey) {
+                    if query.matches(&event) {
                         *count += 1;
                     }
                 }
@@ -1278,6 +1357,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn strict_directory_sdk_tag_drop_cannot_certify_deletion_absence() {
+        use futures::{SinkExt, StreamExt};
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Tag};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let keys = Keys::generate();
+        let target = "ab".repeat(32);
+        let mut tags = vec![Tag::custom("e", [target.clone()])];
+        tags.extend((0..2000).map(|_| Tag::custom("x", ["padding"])));
+        let deletion = EventBuilder::new(Kind::from(5), "")
+            .tags(tags)
+            .finalize(&keys)
+            .unwrap();
+        assert!(deletion.verify().is_ok());
+        assert_eq!(deletion.tags.len(), 2001);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = socket.next().await {
+                let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if request[0] != "REQ" {
+                    continue;
+                }
+                for response in [
+                    serde_json::json!(["EVENT", request[1], deletion]),
+                    serde_json::json!(["EOSE", request[1]]),
+                ] {
+                    socket
+                        .send(Message::Text(response.to_string().into()))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let request = DirectoryFetchRequest::new(
+            vec![endpoint],
+            vec![DirectoryEventQuery::deletion_reference(
+                &keys.public_key().to_hex(),
+                'e',
+                target,
+                None,
+            )],
+        )
+        .unwrap();
+        let outcome = timeout(
+            Duration::from_secs(8),
+            NostrSdkDirectoryRelayFetcher::standalone()
+                .fetch_directory_events_with_completion(request),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            outcome.records.is_empty(),
+            "SDK tag admission limit stays enabled"
+        );
+        assert!(
+            !outcome.complete,
+            "a discarded signed deletion cannot become complete empty evidence"
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn sdk_fetcher_errors_do_not_echo_invalid_relay_urls() {
         let secret_url = "not-a-relay-with-secret-token";
         let request = DirectoryFetchRequest::new(
@@ -1304,5 +1451,218 @@ mod tests {
         .unwrap();
 
         assert_eq!(relay_urls.len(), 1);
+    }
+
+    #[test]
+    fn scoped_deletion_queries_match_full_predicate_and_keep_distinct_keys() {
+        use nostr_sdk::prelude::{EventBuilder, Keys, Tag, Timestamp};
+        let keys = Keys::generate();
+        let author = keys.public_key().to_hex();
+        let id = "12".repeat(32);
+        let coordinate = format!("30443:{author}:slot:with:colons");
+        let exact = DirectoryEventQuery::deletion_reference(&author, 'e', id.clone(), None);
+        let address =
+            DirectoryEventQuery::deletion_reference(&author, 'a', coordinate.clone(), Some(100));
+        let later =
+            DirectoryEventQuery::deletion_reference(&author, 'a', coordinate.clone(), Some(101));
+        let endpoint = vec![TransportEndpoint("wss://relay.example".into())];
+        assert_ne!(
+            DirectoryFetchRequest::new(endpoint.clone(), vec![address.clone()])
+                .unwrap()
+                .key(),
+            DirectoryFetchRequest::new(endpoint.clone(), vec![later.clone()])
+                .unwrap()
+                .key()
+        );
+        assert_ne!(
+            DirectoryFetchRequest::new(endpoint.clone(), vec![exact.clone()])
+                .unwrap()
+                .key(),
+            DirectoryFetchRequest::new(
+                endpoint.clone(),
+                vec![DirectoryEventQuery::deletion_reference(
+                    &author,
+                    'e',
+                    "13".repeat(32),
+                    None
+                )]
+            )
+            .unwrap()
+            .key()
+        );
+        for timestamp in [99, 100, 101] {
+            let event = EventBuilder::new(Kind::from(5), "")
+                .tags([
+                    Tag::custom("e", [id.clone()]),
+                    Tag::custom("a", [coordinate.clone()]),
+                ])
+                .custom_created_at(Timestamp::from_secs(timestamp))
+                .finalize(&keys)
+                .unwrap();
+            assert!(validated_directory_event(&event, &exact).is_some());
+            assert_eq!(
+                validated_directory_event(&event, &address).is_some(),
+                timestamp >= 100
+            );
+            assert_eq!(
+                validated_directory_event(&event, &later).is_some(),
+                timestamp >= 101
+            );
+        }
+        for invalid in [
+            DirectoryEventQuery::deletion_reference(&author, 'p', id.clone(), None),
+            DirectoryEventQuery::deletion_reference(&author, 'e', id.clone(), Some(1)),
+            DirectoryEventQuery::deletion_reference(&author, 'e', "invalid".into(), None),
+            DirectoryEventQuery::deletion_reference(
+                &author,
+                'a',
+                format!("30443:{}:slot", "55".repeat(32)),
+                Some(1),
+            ),
+        ] {
+            assert!(DirectoryFetchRequest::new(endpoint.clone(), vec![invalid]).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_deletion_filters_reach_all_sdk_fetch_paths() {
+        use futures::{SinkExt, StreamExt};
+        use nostr_sdk::prelude::{EventBuilder, Keys, Tag, Timestamp};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+        // Fresh clients for each single filter avoid satisfying a second read
+        // from the SDK's local copy instead of inspecting its actual wire REQ.
+        for (mode, scope) in [
+            (0, 'e'),
+            (0, 'a'),
+            (1, 'e'),
+            (1, 'a'),
+            (2, 'e'),
+            (2, 'a'),
+            (2, 'b'),
+            (3, 'b'),
+        ] {
+            let keys = Keys::generate();
+            let author = keys.public_key().to_hex();
+            let target = "22".repeat(32);
+            let coordinate = format!("30443:{author}:slot");
+            let deletion = EventBuilder::new(Kind::from(5), "")
+                .tags([
+                    Tag::custom(
+                        "e",
+                        [if mode == 3 {
+                            "33".repeat(32)
+                        } else {
+                            target.clone()
+                        }],
+                    ),
+                    Tag::custom(
+                        "a",
+                        [if mode == 3 {
+                            format!("30443:{author}:other-slot")
+                        } else {
+                            coordinate.clone()
+                        }],
+                    ),
+                ])
+                .custom_created_at(Timestamp::from_secs(100))
+                .finalize(&keys)
+                .unwrap();
+            let expected_id = deletion.id.to_hex();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+            let (sender, mut received) = tokio::sync::mpsc::channel(4);
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(stream).await.unwrap();
+                while let Some(Ok(message)) = socket.next().await {
+                    let Message::Text(text) = message else {
+                        continue;
+                    };
+                    let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if request[0] != "REQ" {
+                        continue;
+                    }
+                    sender.send(request.clone()).await.unwrap();
+                    let mut responses = vec![serde_json::json!(["EVENT", request[1], deletion])];
+                    if mode >= 2 {
+                        responses.push(serde_json::json!(["EVENT", request[1], deletion]));
+                    }
+                    responses.push(serde_json::json!(["EOSE", request[1]]));
+                    for response in responses {
+                        if socket
+                            .send(Message::Text(response.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            });
+            let queries = [
+                DirectoryEventQuery::deletion_reference(&author, 'e', target.clone(), None),
+                DirectoryEventQuery::deletion_reference(
+                    &author,
+                    'a',
+                    coordinate.clone(),
+                    Some(100),
+                ),
+            ]
+            .into_iter()
+            .filter(|query| scope == 'b' || query.reference.as_ref().unwrap().0 == scope)
+            .collect();
+            let request = DirectoryFetchRequest::new(vec![endpoint], queries).unwrap();
+            let fetcher = NostrSdkDirectoryRelayFetcher::standalone();
+            let records = timeout(Duration::from_secs(8), async {
+                match mode {
+                    0 => fetcher.fetch_directory_events(request).await.unwrap(),
+                    1 => fetcher
+                        .inspect_directory_events(request, None)
+                        .await
+                        .unwrap(),
+                    _ => {
+                        let outcome = fetcher
+                            .fetch_directory_events_with_completion(request)
+                            .await
+                            .unwrap();
+                        assert!(
+                            !outcome.complete,
+                            "positive limit or ignored scoped filter cannot prove absence"
+                        );
+                        assert_eq!(
+                            outcome.records.len(),
+                            if mode == 3 { 0 } else { 1 },
+                            "duplicates retained once; unrelated records rejected"
+                        );
+                        outcome.records
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert!(records.iter().all(|record| record.event.id == expected_id));
+            assert_eq!(records.is_empty(), mode == 3);
+            let wire = timeout(Duration::from_secs(1), received.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let filters = &wire.as_array().unwrap()[2..];
+            assert_eq!(filters.len(), if scope == 'b' { 2 } else { 1 });
+            for filter in filters {
+                assert_eq!(filter["limit"], 1);
+                assert_eq!(filter["authors"], serde_json::json!([author]));
+                if let Some(value) = filter.get("#e") {
+                    assert_eq!(*value, serde_json::json!([target]));
+                    assert!(filter.get("#a").is_none() && filter.get("since").is_none());
+                } else {
+                    assert_eq!(filter["#a"], serde_json::json!([coordinate]));
+                    assert_eq!(filter["since"], 100);
+                }
+            }
+            fetcher.client.shutdown().await;
+            server.abort();
+            let _ = server.await;
+        }
     }
 }
