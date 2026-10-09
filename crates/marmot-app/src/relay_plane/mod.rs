@@ -41,6 +41,7 @@ use crate::directory::DirectorySyncPlan;
 
 mod delivery_spill;
 mod directory;
+mod directory_wire;
 #[cfg(test)]
 pub(crate) mod publish_accounting_tests;
 mod safety;
