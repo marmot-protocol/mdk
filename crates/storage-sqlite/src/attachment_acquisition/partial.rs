@@ -88,7 +88,7 @@ impl SqliteAccountStorage {
     }
 
     /// Restore a verified ciphertext prefix into a bounded writer rather than
-    /// returning a whole-file array. Source/attempt fencing matches legacy load.
+    /// returning a whole-file array. Lease and expiry gates include caller I/O.
     pub fn load_attachment_partial_to_writer(
         &self,
         job: &AttachmentAcquisition,
@@ -97,6 +97,8 @@ impl SqliteAccountStorage {
         expected: (&[u8; 32], &[u8; 32]),
         writer: &mut dyn std::io::Write,
     ) -> StorageResult<Option<(AttachmentPartialIdentity, u64)>> {
+        let started = std::time::Instant::now();
+        let current_time = || now.saturating_add(started.elapsed().as_secs());
         let metadata = |conn: &Connection| {
             conn.query_row(
                 "SELECT ciphertext_digest,locator_digest,etag,total,received,expires_at
@@ -118,6 +120,7 @@ impl SqliteAccountStorage {
         };
         let snapshot = self.connection.with_transaction(|| {
             let conn = self.lock()?;
+            let now = current_time();
             if !valid_attempt(&conn, job, now)? {
                 return Ok(None);
             }
@@ -166,8 +169,17 @@ impl SqliteAccountStorage {
         loop {
             let next = self.connection.with_transaction(|| {
                 let conn = self.lock()?;
+                let now = current_time();
                 if !valid_attempt(&conn, job, now)? || metadata(&conn)?.as_ref() != Some(&snapshot)
                 {
+                    return Ok(None);
+                }
+                if snapshot.5 <= now {
+                    conn.execute(
+                        "DELETE FROM attachment_partial WHERE token=?1",
+                        [&job.reference.token],
+                    )
+                    .storage()?;
                     return Ok(None);
                 }
                 let chunk = conn
@@ -204,7 +216,7 @@ impl SqliteAccountStorage {
                 // A cancelled loader must not clear a replacement checkpoint.
                 self.connection.with_transaction(|| {
                     let conn = self.lock()?;
-                    if valid_attempt(&conn, job, now)?
+                    if valid_attempt(&conn, job, current_time())?
                         && metadata(&conn)?.as_ref() == Some(&snapshot)
                     {
                         conn.execute(

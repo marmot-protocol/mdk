@@ -181,9 +181,11 @@ impl SqliteAccountStorage {
         now: u64,
         fallback_budget: u64,
     ) -> StorageResult<usize> {
+        let started = std::time::Instant::now();
         let verified_files = super::file_staging::verify(self, group, message)?;
         self.connection.with_transaction(|| {
             let conn=self.lock()?;
+            let now = now.saturating_add(started.elapsed().as_secs());
             let mut stmt=conn.prepare("SELECT h.message_id_hex,h.attachment_index,h.source_message_id_hex,h.source_epoch,h.sender,h.timeline_at,h.received_at,h.slot_json,u.token,u.plaintext_digest,coalesce((SELECT uf.byte_len FROM outgoing_attachment_upload_files uf WHERE uf.token=u.token),(SELECT ub.byte_len FROM outgoing_attachment_upload_bodies ub WHERE ub.token=u.token),length(u.bytes)),u.quarantined
                 FROM attachment_history h JOIN app_events a USING(group_id_hex,message_id_hex)
                 JOIN account_groups g USING(group_id_hex)
@@ -198,6 +200,14 @@ impl SqliteAccountStorage {
             drop(stmt);drop(conn);
             let mut consumed=std::collections::HashMap::new();let mut slots=std::collections::HashSet::new();let mut promoted=0;
             for (entry,token,digest,size,quarantined) in rows {
+                // Binding can add a file after the verification snapshot. Defer
+                // it before claiming its slot; an absent check is not corruption.
+                let checked_nonce = verified_files.get(&token).map(|(nonce, _)| nonce.as_slice());
+                let checked: bool = self.lock()?.query_row(
+                    "SELECT NOT EXISTS(SELECT 1 FROM outgoing_attachment_upload_files WHERE token=?1 AND (completed=0 OR nonce IS NOT ?2))",
+                    params![token, checked_nonce], |row| row.get(0),
+                ).storage()?;
+                if !checked { continue; }
                 if !slots.insert(entry.attachment_index) {continue;}
                 let digest:[u8;32]=digest.try_into().map_err(|_|invalid("invalid outgoing attachment digest"))?;
                 let AttachmentDemand::Requested(asset)=self.request_attachment_acquisition(group,&entry,digest,now)? else {continue;};
