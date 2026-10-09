@@ -386,8 +386,20 @@ async fn queued_publication_mixed_failure_keeps_progress_before_revival() {
                 .is_err()
         );
     }
-    let updates = client.take_pending_projection_updates();
-    let first_snapshots = updates
+    let summary = tokio::time::timeout(Duration::from_secs(5), client.next_event())
+        .await
+        .expect("committed progress must reach the public consumer")
+        .unwrap();
+    assert!(client.take_pending_projection_updates().is_empty());
+    assert!(
+        client
+            .take_pending_applied_sync_summary()
+            .projection_updates
+            .is_empty(),
+        "the public consumer transfers the retained output exactly once"
+    );
+    let first_snapshots = summary
+        .projection_updates
         .iter()
         .flat_map(|update| &update.timeline_messages)
         .filter(|row| row.message_id_hex == ids[0])
@@ -405,6 +417,176 @@ async fn queued_publication_mixed_failure_keeps_progress_before_revival() {
         first_snapshots.last().unwrap().invalidation_status,
         None,
         "the final delivered snapshot must supersede earlier failed state"
+    );
+}
+
+/// Dropping a later network wait must retain already committed publication
+/// updates for the next public consumer without sending accepted bytes again.
+#[tokio::test]
+async fn queued_publication_cancel_retains_committed_progress_once() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://progress.example")
+        .with_test_relay_client(relay.clone());
+    let (mut client, group, ids) = queued_messages(&app).await;
+    relay.block_next_publish();
+    {
+        let advance = client.advance_convergence_after_runtime_sync(&group);
+        tokio::pin!(advance);
+        tokio::select! {
+            result = &mut advance => panic!("batch returned before first hold: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(5), relay.wait_for_blocked_publish()) => result.unwrap()
+        }
+        relay.block_next_publish();
+        relay.release_publish();
+        tokio::select! {
+            result = &mut advance => panic!("batch returned before second hold: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(5), relay.wait_for_blocked_publish()) => result.unwrap()
+        }
+    }
+    let accepted = relay.published_event_ids().last().unwrap().clone();
+    let summary = tokio::time::timeout(Duration::from_secs(5), client.next_event())
+        .await
+        .expect("committed progress must reach the public consumer")
+        .unwrap();
+    let first = summary
+        .projection_updates
+        .iter()
+        .flat_map(|update| &update.timeline_messages)
+        .filter(|row| row.message_id_hex == ids[0])
+        .collect::<Vec<_>>();
+    assert_eq!(first.len(), 1, "cancellation retains the committed prefix");
+    let source = first[0].source_message_id_hex.clone();
+    assert!(source.is_some());
+    assert!(client.take_pending_projection_updates().is_empty());
+    assert!(
+        client
+            .take_pending_applied_sync_summary()
+            .projection_updates
+            .is_empty()
+    );
+    relay.release_publish();
+    let resumed = client
+        .advance_convergence_after_runtime_sync(&group)
+        .await
+        .unwrap();
+    assert!(
+        resumed
+            .projection_updates
+            .iter()
+            .flat_map(|update| &update.timeline_messages)
+            .all(|row| row.message_id_hex != ids[0]),
+        "delivered progress must not repeat"
+    );
+    assert_eq!(
+        app.timeline_message("alice", &hex::encode(group.as_slice()), &ids[0])
+            .unwrap()
+            .unwrap()
+            .source_message_id_hex,
+        source
+    );
+    assert_eq!(
+        relay
+            .attempted_event_ids()
+            .iter()
+            .filter(|id| **id == accepted)
+            .count(),
+        1
+    );
+}
+
+/// The finalizer can suspend after guarded revival. Cancellation must keep the
+/// older source snapshot before that revival in the shared retained summary.
+#[tokio::test]
+async fn queued_publication_cancel_finalizer_keeps_progress_before_revival() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://progress.example")
+        .with_test_relay_client(relay.clone());
+    let (mut client, group, ids) = queued_messages(&app).await;
+    let group_hex = hex::encode(group.as_slice());
+    let pending_route = client
+        .create_group_with_options_and_telemetry(
+            "pending route",
+            &[],
+            Default::default(),
+            &AppPerformanceTelemetry::default(),
+        )
+        .await
+        .unwrap()
+        .group_id;
+    // Leave a real uninstalled group route for the finalizer's route refresh.
+    client
+        .routing
+        .replace_group_routes(&pending_route, Vec::new());
+    app.invalidate_timeline_app_event(
+        "alice",
+        &group_hex,
+        &ids[0],
+        crate::LOCAL_PUBLISH_FAILED_REASON,
+    )
+    .unwrap();
+    relay.block_next_subscribe();
+    {
+        let advance = client.advance_convergence_after_runtime_sync(&group);
+        tokio::pin!(advance);
+        tokio::select! {
+            result = &mut advance => panic!("finalizer should block: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(5), relay.wait_for_blocked_subscribe()) => result.unwrap()
+        }
+        let row = app
+            .timeline_message("alice", &group_hex, &ids[0])
+            .unwrap()
+            .unwrap();
+        assert!(row.source_message_id_hex.is_some());
+        assert!(
+            row.invalidation_status.is_none(),
+            "the finalizer already revived the row"
+        );
+    }
+    relay.release_subscribe();
+    let attempts = relay.attempted_event_ids();
+    let summary = tokio::time::timeout(Duration::from_secs(5), client.next_event())
+        .await
+        .expect("committed progress must reach the public consumer")
+        .unwrap();
+    let first = summary
+        .projection_updates
+        .iter()
+        .flat_map(|update| &update.timeline_messages)
+        .filter(|row| row.message_id_hex == ids[0])
+        .collect::<Vec<_>>();
+    assert_eq!(first.len(), 2);
+    assert_eq!(
+        first[0].invalidation_status.as_deref(),
+        Some(crate::LOCAL_PUBLISH_FAILED_REASON)
+    );
+    assert!(first[1].invalidation_status.is_none());
+    assert!(client.take_pending_projection_updates().is_empty());
+    assert!(
+        client
+            .take_pending_applied_sync_summary()
+            .projection_updates
+            .is_empty()
+    );
+    assert!(
+        client
+            .advance_convergence_after_runtime_sync(&group)
+            .await
+            .unwrap()
+            .projection_updates
+            .is_empty()
+    );
+    assert_eq!(
+        relay.attempted_event_ids(),
+        attempts,
+        "repair must not republish accepted messages"
     );
 }
 

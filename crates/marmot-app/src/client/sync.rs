@@ -5384,6 +5384,26 @@ impl AppClient {
                 }
             },
         );
+        // Transfer committed early snapshots to the finalizer's retained owner
+        // on success, error, or cancellation of the runtime wait. Appending here
+        // keeps any older retained prefix before progress and later revival.
+        struct RetainPublicationProgress<'a> {
+            retained: &'a mut Vec<crate::AppProjectionUpdate>,
+            buffered: std::sync::Arc<std::sync::Mutex<Vec<crate::AppProjectionUpdate>>>,
+        }
+        impl Drop for RetainPublicationProgress<'_> {
+            fn drop(&mut self) {
+                let mut buffered = self
+                    .buffered
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                self.retained.extend(std::mem::take(&mut *buffered));
+            }
+        }
+        let retain_progress = RetainPublicationProgress {
+            retained: &mut self.pending_applied_sync_summary.projection_updates,
+            buffered,
+        };
         // The worker retries dirty subscription state before this pass. An
         // unchanged group set requires no account-wide refresh per group.
         let effects = self
@@ -5394,31 +5414,11 @@ impl AppClient {
                 yield_requested,
             )
             .await;
-        let progress_updates = std::mem::take(&mut *buffered.lock().unwrap());
-        let effects = match effects {
-            Ok(effects) => effects,
-            Err(error) => {
-                self.pending_projection_updates.extend(progress_updates);
-                return Err(error.into());
-            }
-        };
-        let pending_updates_before_finalization = self.pending_projection_updates.len();
-        let mut summary = match self
+        drop(retain_progress);
+        let effects = effects?;
+        let mut summary = self
             .finish_scheduled_convergence_effects(group_id, &effects)
-            .await
-        {
-            Ok(summary) => summary,
-            Err(error) => {
-                // A mixed failure may already have queued a newer revival or
-                // invalidation. Deliver the earlier source snapshots first.
-                self.pending_projection_updates.splice(
-                    pending_updates_before_finalization..pending_updates_before_finalization,
-                    progress_updates,
-                );
-                return Err(error);
-            }
-        };
-        summary.projection_updates.splice(0..0, progress_updates);
+            .await?;
         // This seam follows an actual engine evaluation. Projection-only
         // replays of an effects batch must not allocate observation identities.
         if let Err(error) = self.observe_qualified_local_stagnation(group_id) {
