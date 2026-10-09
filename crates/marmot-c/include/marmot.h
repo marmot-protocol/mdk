@@ -303,6 +303,35 @@ typedef enum MarmotOnboardingAction {
   MARMOT_ONBOARDING_ACTION_CANCEL_ONBOARDING,
 } MarmotOnboardingAction;
 
+typedef enum MarmotOnboardingRelayRepairMode {
+  MARMOT_ONBOARDING_RELAY_REPAIR_MODE_MANUAL_REVIEW,
+  MARMOT_ONBOARDING_RELAY_REPAIR_MODE_REMOVAL_ONLY,
+  MARMOT_ONBOARDING_RELAY_REPAIR_MODE_ADDITIVE,
+  MARMOT_ONBOARDING_RELAY_REPAIR_MODE_REMOVAL_AND_ADDITIVE,
+} MarmotOnboardingRelayRepairMode;
+
+typedef enum MarmotOnboardingRelayTagRole {
+  MARMOT_ONBOARDING_RELAY_TAG_ROLE_OTHER,
+  MARMOT_ONBOARDING_RELAY_TAG_ROLE_UNMARKED,
+  MARMOT_ONBOARDING_RELAY_TAG_ROLE_READ,
+  MARMOT_ONBOARDING_RELAY_TAG_ROLE_WRITE,
+  MARMOT_ONBOARDING_RELAY_TAG_ROLE_INBOX,
+} MarmotOnboardingRelayTagRole;
+
+typedef enum MarmotOnboardingRelayTagDisposition {
+  MARMOT_ONBOARDING_RELAY_TAG_DISPOSITION_RETAINED,
+  MARMOT_ONBOARDING_RELAY_TAG_DISPOSITION_REMOVED,
+  MARMOT_ONBOARDING_RELAY_TAG_DISPOSITION_ADDED,
+} MarmotOnboardingRelayTagDisposition;
+
+typedef enum MarmotOnboardingRelayCapability {
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_NONE,
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_READ,
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_WRITE,
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_READ_AND_WRITE,
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_INBOX,
+} MarmotOnboardingRelayCapability;
+
 typedef enum MarmotOnboardingDeviceDiscovery {
   MARMOT_ONBOARDING_DEVICE_DISCOVERY_NONE_FOUND,
   MARMOT_ONBOARDING_DEVICE_DISCOVERY_OTHER_INSTALLATION_POSSIBLE,
@@ -525,6 +554,21 @@ typedef enum MarmotMarkdownNostrHrp {
   MARMOT_MARKDOWN_NOSTR_HRP_NADDR,
   MARMOT_MARKDOWN_NOSTR_HRP_NRELAY,
 } MarmotMarkdownNostrHrp;
+
+/**
+ * Timestamp presentation style; hosts format using the device locale and time zone.
+ */
+typedef enum MarmotMarkdownTimestampStyle {
+  MARMOT_MARKDOWN_TIMESTAMP_STYLE_SHORT_TIME,
+  MARMOT_MARKDOWN_TIMESTAMP_STYLE_LONG_TIME,
+  MARMOT_MARKDOWN_TIMESTAMP_STYLE_SHORT_DATE,
+  MARMOT_MARKDOWN_TIMESTAMP_STYLE_LONG_DATE,
+  MARMOT_MARKDOWN_TIMESTAMP_STYLE_SHORT_DATE_TIME,
+  MARMOT_MARKDOWN_TIMESTAMP_STYLE_LONG_DATE_TIME,
+  MARMOT_MARKDOWN_TIMESTAMP_STYLE_COMPACT_DATE_TIME,
+  MARMOT_MARKDOWN_TIMESTAMP_STYLE_COMPACT_DATE_TIME_SECONDS,
+  MARMOT_MARKDOWN_TIMESTAMP_STYLE_RELATIVE,
+} MarmotMarkdownTimestampStyle;
 
 /**
  * How a fenced/indented code block was written.
@@ -1708,6 +1752,63 @@ typedef struct MarmotStringList {
   uintptr_t len;
 } MarmotStringList;
 
+typedef struct MarmotOnboardingRelayTag {
+  /**
+   *Each element is a JSON string literal. Decode once preserving NUL bytes and UTF-8 lengths.
+   */
+  char **fields;
+  uintptr_t fields_len;
+  /**
+   *NULL or a JSON string literal; decode once preserving embedded NULs.
+   */
+  char *endpoint;
+  enum MarmotOnboardingRelayTagRole role;
+} MarmotOnboardingRelayTag;
+
+typedef struct MarmotOnboardingRelayTagChange {
+  enum MarmotOnboardingRelayTagDisposition disposition;
+  bool has_before_index;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t before_index;
+  bool has_after_index;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t after_index;
+  /**
+   *Each element is a JSON string literal. Decode once preserving NUL bytes and UTF-8 lengths.
+   */
+  char **fields;
+  uintptr_t fields_len;
+  /**
+   *NULL or a JSON string literal; decode once preserving embedded NULs.
+   */
+  char *endpoint;
+  enum MarmotOnboardingRelayTagRole role;
+  enum MarmotOnboardingRelayCapability restores;
+} MarmotOnboardingRelayTagChange;
+
+typedef struct MarmotOnboardingRelayRepair {
+  enum MarmotOnboardingRelayRepairMode mode;
+  char *original_event_id;
+  /**
+   *JSON string literal, not raw content. Decode once preserving NUL bytes and UTF-8 lengths.
+   */
+  char *original_content;
+  /**
+   *JSON string literal, not raw content. Decode once preserving NUL bytes and UTF-8 lengths.
+   */
+  char *proposed_content;
+  struct MarmotOnboardingRelayTag *before_tags;
+  uintptr_t before_tags_len;
+  struct MarmotOnboardingRelayTag *after_tags;
+  uintptr_t after_tags_len;
+  struct MarmotOnboardingRelayTagChange *changes;
+  uintptr_t changes_len;
+} MarmotOnboardingRelayRepair;
+
 typedef struct MarmotOnboardingRepairProposal {
   enum MarmotOnboardingStep step;
   uint64_t revision;
@@ -1718,6 +1819,7 @@ typedef struct MarmotOnboardingRepairProposal {
   uintptr_t write_relays_len;
   struct MarmotUserProfileMetadata *profile;
   struct MarmotStringList *follows;
+  struct MarmotOnboardingRelayRepair *relay_repair;
 } MarmotOnboardingRepairProposal;
 
 typedef struct MarmotOnboardingDevicePackage {
@@ -2497,6 +2599,10 @@ typedef enum MarmotMarkdownInline_Tag {
   MARMOT_MARKDOWN_INLINE_MATH,
   MARMOT_MARKDOWN_INLINE_NOSTR_MENTION,
   MARMOT_MARKDOWN_INLINE_NOSTR_URI,
+  /**
+   * Signed Unix seconds and presentation style, without an allocated label.
+   */
+  MARMOT_MARKDOWN_INLINE_TIMESTAMP,
 } MarmotMarkdownInline_Tag;
 
 typedef struct MarmotMarkdownInline_Text_Body {
@@ -2562,6 +2668,11 @@ typedef struct MarmotMarkdownInline_NostrUri_Body {
   struct MarmotMarkdownNostrEntity entity;
 } MarmotMarkdownInline_NostrUri_Body;
 
+typedef struct MarmotMarkdownInline_Timestamp_Body {
+  int64_t unix_seconds;
+  enum MarmotMarkdownTimestampStyle style;
+} MarmotMarkdownInline_Timestamp_Body;
+
 typedef struct MarmotMarkdownInline {
   MarmotMarkdownInline_Tag tag;
   union {
@@ -2576,6 +2687,7 @@ typedef struct MarmotMarkdownInline {
     MarmotMarkdownInline_Math_Body MATH;
     MarmotMarkdownInline_NostrMention_Body NOSTR_MENTION;
     MarmotMarkdownInline_NostrUri_Body NOSTR_URI;
+    MarmotMarkdownInline_Timestamp_Body TIMESTAMP;
   };
 } MarmotMarkdownInline;
 
@@ -4572,6 +4684,9 @@ typedef enum MarmotGroupEventKind_Tag {
   MARMOT_GROUP_EVENT_KIND_GROUP_UNRECOVERABLE,
   MARMOT_GROUP_EVENT_KIND_PENDING_COMMIT_RECOVERED,
   MARMOT_GROUP_EVENT_KIND_GROUP_HYDRATION_RECOVERED,
+  MARMOT_GROUP_EVENT_KIND_LOCAL_GROUP_COPY_TERMINATED,
+  MARMOT_GROUP_EVENT_KIND_LOCAL_GROUP_COPY_RESTORED,
+  MARMOT_GROUP_EVENT_KIND_GROUP_MEMBER_LEAVES_REMOVED,
 } MarmotGroupEventKind_Tag;
 
 typedef struct MarmotGroupEventKind_GroupJoined_Body {
@@ -4647,6 +4762,14 @@ typedef struct MarmotGroupEventKind_GroupHydrationRecovered_Body {
   uint64_t recovered_epoch;
 } MarmotGroupEventKind_GroupHydrationRecovered_Body;
 
+typedef struct MarmotGroupEventKind_LocalGroupCopyTerminated_Body {
+  bool voluntary;
+} MarmotGroupEventKind_LocalGroupCopyTerminated_Body;
+
+typedef struct MarmotGroupEventKind_GroupMemberLeavesRemoved_Body {
+  uint64_t epoch;
+} MarmotGroupEventKind_GroupMemberLeavesRemoved_Body;
+
 typedef struct MarmotGroupEventKind {
   MarmotGroupEventKind_Tag tag;
   union {
@@ -4662,6 +4785,8 @@ typedef struct MarmotGroupEventKind {
     MarmotGroupEventKind_GroupStateRevalidated_Body GROUP_STATE_REVALIDATED;
     MarmotGroupEventKind_PendingCommitRecovered_Body PENDING_COMMIT_RECOVERED;
     MarmotGroupEventKind_GroupHydrationRecovered_Body GROUP_HYDRATION_RECOVERED;
+    MarmotGroupEventKind_LocalGroupCopyTerminated_Body LOCAL_GROUP_COPY_TERMINATED;
+    MarmotGroupEventKind_GroupMemberLeavesRemoved_Body GROUP_MEMBER_LEAVES_REMOVED;
   };
 } MarmotGroupEventKind;
 
@@ -8971,6 +9096,24 @@ MarmotStatus marmot_propose_onboarding_relays(const struct MarmotClient *client,
                                               const char *const *write_relays,
                                               uintptr_t write_relays_len,
                                               struct MarmotOnboardingSnapshot **out);
+
+/**
+ * Preview an exact minimal relay repair without signing or publishing. Manual-review
+ * previews cannot be approved. `step` is a MarmotOnboardingStep discriminant;
+ * out-of-range values return MARMOT_STATUS_INVALID_ARGUMENT.
+ * Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+ *
+ * # Safety
+ * The client must be live, input pointers valid and borrowed, and out writable.
+ * Relay-repair content, tag fields and non-NULL tag/change endpoints are JSON
+ * string literals. Decode once preserving embedded NULs and UTF-8 lengths
+ * before displaying consent or prefilling an editor. Read/write route lists
+ * and event identifiers retain their ordinary-string contract.
+ */
+MarmotStatus marmot_propose_onboarding_relay_repair(const struct MarmotClient *client,
+                                                    const char *account_ref,
+                                                    uint32_t step,
+                                                    struct MarmotOnboardingSnapshot **out);
 
 /**
  * Prepare profile edits without publishing; NULL fields preserve existing values and empty strings clear them. Free the returned snapshot with `marmot_onboarding_snapshot_free`.

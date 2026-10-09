@@ -1,10 +1,132 @@
-use marmot_markdown::Inline;
+use marmot_markdown::{Block, Inline, TimestampStyle, parse};
 
 mod common;
 use common::{code, em, parse_inlines, t};
 
 fn math(s: &str) -> Inline {
     Inline::Math(s.to_string())
+}
+
+#[test]
+fn timestamp_styles() {
+    for (suffix, style) in [
+        ("", TimestampStyle::ShortDateTime),
+        (":t", TimestampStyle::ShortTime),
+        (":T", TimestampStyle::LongTime),
+        (":d", TimestampStyle::ShortDate),
+        (":D", TimestampStyle::LongDate),
+        (":f", TimestampStyle::ShortDateTime),
+        (":F", TimestampStyle::LongDateTime),
+        (":s", TimestampStyle::CompactDateTime),
+        (":S", TimestampStyle::CompactDateTimeSeconds),
+        (":R", TimestampStyle::Relative),
+    ] {
+        assert_eq!(
+            parse_inlines(&format!("<t:1791280800{suffix}>")),
+            vec![Inline::Timestamp {
+                unix_seconds: 1791280800,
+                style
+            }],
+            "style {suffix}"
+        );
+    }
+}
+
+#[test]
+fn timestamp_signed_seconds() {
+    for seconds in [i64::MIN, -1, 0, 1791280800, i64::MAX] {
+        assert_eq!(
+            parse_inlines(&format!("<t:{seconds}:R>")),
+            vec![Inline::Timestamp {
+                unix_seconds: seconds,
+                style: TimestampStyle::Relative,
+            }]
+        );
+    }
+    assert_eq!(
+        parse_inlines("<t:0001:t>"),
+        vec![Inline::Timestamp {
+            unix_seconds: 1,
+            style: TimestampStyle::ShortTime,
+        }]
+    );
+}
+
+#[test]
+fn invalid_timestamp_text() {
+    for source in [
+        "<t:>",
+        "<t::R>",
+        "<t:-:R>",
+        "<t:+1:R>",
+        "<t:1.5:R>",
+        "<t:1:r>",
+        "<t:1:x>",
+        "<t:1:>",
+        "<t:1:RR>",
+        "<t:1:R:>",
+        "<t: 1:R>",
+        "<t:1 :R>",
+        "<t:1: R>",
+        "<t:1:R >",
+        "<t:1:R",
+        "<T:1:R>",
+        "<t:١:R>",
+        "<t:9223372036854775808:R>",
+        "<t:-9223372036854775809:R>",
+    ] {
+        assert_eq!(parse_inlines(source), vec![t(source)], "{source}");
+    }
+}
+
+#[test]
+fn timestamp_source_only() {
+    for source in [r"\<t:1:R>", "&lt;t:1:R&gt;", "<t:&#49;:R>", "<t:1:&#82;>"] {
+        assert!(
+            !parse_inlines(source)
+                .iter()
+                .any(|inline| matches!(inline, Inline::Timestamp { .. })),
+            "{source}"
+        );
+    }
+    assert_eq!(parse_inlines("`<t:1:R>`"), vec![code("<t:1:R>")]);
+    assert_eq!(parse_inlines("$<t:1:R>$"), vec![math("<t:1:R>")]);
+    for source in ["```\n<t:1:R>\n```", "    <t:1:R>"] {
+        assert!(
+            matches!(parse(source).blocks.as_slice(), [Block::CodeBlock { content, .. }] if content == "<t:1:R>\n")
+        );
+    }
+}
+
+#[test]
+fn timestamp_inline_composition() {
+    let timestamp = Inline::Timestamp {
+        unix_seconds: 1,
+        style: TimestampStyle::Relative,
+    };
+    assert_eq!(
+        parse_inlines("é<t:1:R><t:2:F>!"),
+        vec![
+            t("é"),
+            timestamp.clone(),
+            Inline::Timestamp {
+                unix_seconds: 2,
+                style: TimestampStyle::LongDateTime
+            },
+            t("!")
+        ]
+    );
+    assert_eq!(
+        parse_inlines("**<t:1:R>**"),
+        vec![Inline::Strong(vec![timestamp.clone()])]
+    );
+    assert!(
+        matches!(parse_inlines("[<t:1:R>](https://example.com)").as_slice(), [Inline::Link { children, .. }] if children == std::slice::from_ref(&timestamp))
+    );
+    assert!(
+        matches!(parse("<details>\n<summary><t:1:R></summary>\n<t:1:R>\n</details>").blocks.as_slice(), [Block::Details { summary, body, .. }]
+        if summary == std::slice::from_ref(&timestamp) && matches!(body.as_slice(), [Block::Paragraph { inlines }] if inlines == &[timestamp]))
+    );
 }
 
 // ----- Plain text + breaks --------------------------------------------

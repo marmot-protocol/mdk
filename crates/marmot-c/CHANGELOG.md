@@ -11,6 +11,16 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 - Append invitation diagnostic statuses `MARMOT_STATUS_OBSOLETE_KEY_PACKAGE` (96) and `MARMOT_STATUS_MEMBER_DISCOVERY_INCOMPLETE` (97). Existing status values remain unchanged; detail strings omit recipient identity.
 
+
+- Add `marmot_propose_onboarding_relay_repair` and nested typed relay-repair
+  preview records. `MarmotOnboardingRepairProposal` gains an optional
+  `relay_repair` pointer; regenerate and recompile with the matching header
+  and library. The preview is non-publishing, and `ManualReview` has no
+  approvable action.
+- The C event surface appends local-copy termination/restoration and removed-device-leaf
+  events; existing discriminants remain unchanged. Recompile with the matching
+  header and native library and handle the new event kinds. Restoration describes
+  retained-history repair, not automatic scheduler restoration of removed copies.
 - `MarmotPresentedChatRow` gains a nullable row-owned `MarmotChatListDraftVersion` handle and
   `marmot_message_draft_revision_includes_chat_list_version` compares it against
   a borrowed selected revision. Both inputs are opaque read-only borrows; only
@@ -19,6 +29,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   headers/libraries; the row layout and comparison signature change. Identical-text
   saves emit a replacement snapshot because their draft revision changes. See the
   shared chat-list contract.
+- Append `MarmotMarkdownInline::Timestamp` with signed `int64_t` Unix seconds
+  and `MarmotMarkdownTimestampStyle` for local-time timestamp display nodes.
+  Existing inline discriminants are unchanged; the new payload owns no
+  allocations. Recompile consumers against the regenerated `marmot.h` and ship
+  the matching library; older headers cannot handle the new tag. Hosts format
+  labels with the device locale/time zone and refresh visible relative labels.
 - Add `marmot_message_reactions` and the owned
   `MarmotTimelineUserReactionList` root/free for complete exact-message details.
   Existing record layouts are unchanged; the new symbols require matching
@@ -28,6 +44,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   Local-key accounts and separate remote signers can run in the same client.
 
 ### Changed
+
+- Relay-repair C preview content, tag fields and optional endpoints use JSON
+  string literals to preserve embedded NULs and all UTF-8 bytes. Decode once
+  with a length-aware parser before consent or editing. Pointer layouts and
+  snapshot frees are unchanged, but consumers must adopt the new encoding.
 
 - `MarmotAttachmentEntry` adds `role: MarmotAttachmentRole` (`Shared` or
   `InlineEmoji`) for gallery filtering without changing slot or acquisition identity.
@@ -45,6 +66,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   request, without relay URLs or relay-supplied text.
 - Account onboarding can establish inbox-list absence from a completed read of
   freshly discovered outboxes even when a discovery indexer is unavailable.
+
+- Group activity preserves per-commit reaction targets across author and peer
+  replay, including before disband. See `marmot-app`'s Unreleased fixes for
+  projection and push-token behavior.
 
 ## [0.12.0] - 2026-10-02
 

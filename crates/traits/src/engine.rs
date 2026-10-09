@@ -470,11 +470,11 @@ impl PartialOrd for CommitOrderingKey {
 /// (committer) travels alongside on [`GroupEvent::GroupStateChanged`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupStateChange {
-    /// `member` was added to the group (by `actor`).
+    /// The account gained its first group leaf (by `actor`); sibling additions are not invitations.
     MemberAdded { member: MemberId },
-    /// `member` was removed from the group by another member (admin action).
+    /// The account lost its last group leaf to another member (admin action).
     MemberRemoved { member: MemberId },
-    /// `member` removed themselves via a SelfRemove proposal. For this variant
+    /// The account lost its last group leaf through SelfRemove. For this variant
     /// the subject and the originating actor are the same member, regardless of
     /// which member sequenced the auto-commit.
     MemberLeft { member: MemberId },
@@ -556,9 +556,40 @@ impl<'de> Deserialize<'de> for EncryptedMediaSecret {
     }
 }
 
+/// One authenticated MLS leaf. Account identity alone does not identify a sibling device.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupMemberLeaf {
+    pub member: MemberId,
+    pub leaf_index: u32,
+}
+
 /// Ordered, decrypted output the application should render / act on.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupEvent {
+    /// The engine discarded this local copy's retained outbound work. This is a
+    /// device-local effect, not account-level timeline activity. Emit even when
+    /// the engine queue is empty, since app projections can still contain pending rows.
+    LocalGroupCopyTerminated {
+        group_id: GroupId,
+        /// Known voluntary intent at the termination seam. Recovery without
+        /// that evidence preserves the app's existing Left/Removed classification.
+        voluntary: bool,
+    },
+    /// Canonical branch selection restored this device's active MLS leaf.
+    /// Restores participation without an invitation or changing local archive intent.
+    LocalGroupCopyRestored {
+        group_id: GroupId,
+    },
+    /// Device destinations invalidated by an actual canonical state transition.
+    /// Derived from the live pre-apply tree and the final selected tree, rather
+    /// than replaying removals from an already-applied common prefix.
+    GroupMemberLeavesRemoved {
+        group_id: GroupId,
+        epoch: EpochId,
+        leaves: Vec<GroupMemberLeaf>,
+        /// Accounts with no surviving leaf. Only these lose their tombstones.
+        departed_members: Vec<MemberId>,
+    },
     GroupCreated {
         group_id: GroupId,
     },
@@ -617,9 +648,10 @@ pub enum GroupEvent {
     /// SHOULD surface as a group system row (inner kind 1210). Synthesized
     /// locally on each client that applies the change, so the row is derived
     /// from authenticated state rather than a separately delivered message.
-    /// `actor` is the committing member, when attributable (it is `None` for
-    /// changes applied through a convergence reorg, where the committer cannot
-    /// be resolved cheaply).
+    /// `actor` is the authenticated committing member, or the authenticated
+    /// departing member for a SelfRemove proposal. Canonical replay resolves
+    /// actors against each commit's source tree; legacy unattributed changes
+    /// may still carry `None`.
     GroupStateChanged {
         group_id: GroupId,
         /// The epoch the group reached when this change was applied. Used as the
@@ -633,8 +665,8 @@ pub enum GroupEvent {
         /// it onto the synthesized kind-1210 system row so that, if the commit
         /// later loses a fork and is rolled back, the row can be invalidated by
         /// origin commit (one commit → many rows, 1:N). `None` for changes whose
-        /// origin commit is not resolvable cheaply (e.g. a convergence reorg that
-        /// re-derives state without replaying a single attributable commit).
+        /// origin commit is unavailable in legacy unattributed notifications.
+        /// Canonical apply stamps each replayed commit individually.
         origin_commit_id: Option<MessageId>,
     },
     /// A persisted group was skipped during session-open hydration. Hydration

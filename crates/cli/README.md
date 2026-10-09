@@ -229,6 +229,8 @@ receiving account remains eligible for notification; blocked senders stay suppre
 
 ### Groups
 
+Invitation failures in `--json` responses include `account_id` and a typed `code`. `obsolete_key_package` asks the recipient to update and publish a current KeyPackage; `member_discovery_incomplete` is retryable and means the searched relay coverage was incomplete. The `repair.action` field supplies the corresponding next step.
+
 ```sh
 wn --account <npub-or-hex> groups list
 wn --account <npub-or-hex> groups create <name> [member-npub-or-hex ...] [--description <description>]

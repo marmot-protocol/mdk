@@ -2,7 +2,72 @@ use super::*;
 use crate::key_package_records::preferred_member_key_package_from_records;
 
 #[tokio::test]
-async fn legacy_only_member_lookup_reports_obsolete_without_extra_queries() {
+async fn legacy_primary_diagnosis_preserves_current_discovery_recovery() {
+    let (_dir, app, accounts, fetcher) = super::invite_recovery::discovery_fixture(1).await;
+    let account = &accounts[0];
+    let current = fetcher.events_by_endpoint.lock().unwrap()["wss://directory.example"]
+        .iter()
+        .find(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
+        .unwrap()
+        .clone();
+    let mut legacy = member_resolution_key_package_event(
+        account,
+        fresh_key_package_for_account(&app, account, true).await,
+    );
+    // An obsolete replacement in the current package's slot must block that
+    // older current package. Use a distinct slot to test supplementary recovery.
+    legacy.tags.iter_mut().find(|tag| tag[0] == "d").unwrap()[1] = "independent-legacy-slot".into();
+    fetcher
+        .events_by_endpoint
+        .lock()
+        .unwrap()
+        .get_mut("wss://outbox.example")
+        .unwrap()
+        .push(legacy);
+    let resolved = app
+        .resolve_member_key_packages(&[&account.account_id_hex])
+        .await
+        .unwrap();
+    assert_eq!(resolved.len(), 1);
+    let expected = crate::key_package_records::preferred_fresh_key_package_from_records(
+        &account.account_id_hex,
+        &[RelayEventRecord {
+            event: current,
+            endpoints: vec![],
+        }],
+        app.directory_freshness(),
+        None,
+    )
+    .unwrap()
+    .value
+    .unwrap()
+    .fetched
+    .key_package;
+    assert_eq!(resolved[0].bytes, expected.bytes);
+    assert_eq!(
+        resolved[0].protocol_profile,
+        cgka_traits::group::ProtocolProfile::Current
+    );
+    assert!(
+        fetcher
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.queries.iter().any(|query| query.kind == 5))
+    );
+    *fetcher.incomplete_endpoint.lock().unwrap() = Some("wss://directory.example".into());
+    *fetcher.incomplete_query_kind.lock().unwrap() = Some(KIND_MARMOT_KEY_PACKAGE);
+    let error = app
+        .resolve_member_key_packages(&[&account.account_id_hex])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AppError::MemberDiscoveryIncomplete(ref id)
+                    if id == &account.account_id_hex));
+}
+
+#[tokio::test]
+async fn legacy_only_member_lookup_reports_obsolete_after_bounded_recovery() {
     let (_dir, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
     fetcher
         .events
@@ -44,7 +109,7 @@ async fn legacy_only_member_lookup_reports_obsolete_without_extra_queries() {
                 .iter()
                 .filter(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)
                 .count(),
-            1 + targets.len()
+            1 + 2 * targets.len()
         );
     }
 }

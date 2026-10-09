@@ -34,9 +34,9 @@ const MEMBER_RESOLUTION_RELAY_CONCURRENCY: usize = 4;
 /// Existing per-member fallback concurrency, retained for incompatible relays.
 const MEMBER_RESOLUTION_FALLBACK_CONCURRENCY: usize = 8;
 /// One complete set resolution is bounded even when several relay sets stall.
-// Three network stages, each with a bounded single-author retry, can each
-// consume a 5s connection budget plus a 3s fetch budget. Keep enough time for
-// those stages and local validation while retaining one overall deadline.
+// Relay-list discovery, normal reads, supplementary recovery and candidate-
+// scoped deletion proof share one deadline. No per-route or candidate retry
+// renews it; slow/incomplete coverage remains retryable rather than absence.
 const MEMBER_RESOLUTION_DEADLINE: Duration = Duration::from_secs(50);
 const KEY_PACKAGE_EVENTS_PER_AUTHOR: usize = 12;
 const RELAY_LIST_EVENTS_PER_AUTHOR: usize = 4;
@@ -52,6 +52,30 @@ struct MemberKeyPackagePrewarmEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn discovery_recovery_refreshes_routes_for_fresh_commit_resolution() {
+        let (_directory, app, accounts, fetcher) =
+            crate::tests::invite_recovery::discovery_fixture(1).await;
+        app.prewarm_group_member_key_packages(&[&accounts[0].account_id_hex])
+            .await
+            .unwrap();
+        fetcher.requests.lock().unwrap().clear();
+        let result = app
+            .resolve_member_key_packages_for_purpose(
+                vec![accounts[0].account_id_hex.clone()],
+                MemberResolutionPurpose::CommitFresh,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.key_packages.len(), 1);
+        assert!(fetcher.requests.lock().unwrap().iter().any(|r| {
+            r.queries
+                .iter()
+                .any(|q| q.kind == transport_nostr_adapter::KIND_NIP65_RELAY_LIST)
+        }));
+    }
 
     #[test]
     fn composition_prewarm_cache_is_bounded_and_expires_entries() {
@@ -953,52 +977,46 @@ impl MarmotApp {
                             KEY_PACKAGE_EVENTS_PER_AUTHOR,
                         );
                         let result = async {
-                            let (mut records, refetch_error) = match app
+                            let (mut records, complete) = match app
                                 .relay_plane
-                                .fetch_directory_events_with_completion(endpoints, vec![query])
+                                .fetch_directory_events_with_completion(
+                                    endpoints.clone(),
+                                    vec![query],
+                                )
                                 .await
                             {
-                                Ok(outcome) => (
-                                    outcome.records,
-                                    (!outcome.complete).then(|| {
-                                        AppError::MemberDiscoveryIncomplete(
-                                            target.account_id_hex.clone(),
-                                        )
-                                    }),
-                                ),
-                                Err(error) => (
-                                    Vec::new(),
-                                    Some(AppError::RelayDirectory(format!(
-                                        "fetch key packages: {error}"
-                                    ))),
-                                ),
+                                Ok(outcome) => (outcome.records, outcome.complete),
+                                Err(_) => (Vec::new(), false),
                             };
                             // This supplementary lookup must not discard a
                             // valid package observed in this call's batch.
                             // Never load a previously cached package here.
                             records.extend(observed_records);
-                            let selected = preferred_member_key_package_from_records(
+                            let records = app
+                                .recover_key_package_records(
+                                    super::key_package_recovery::KeyPackageRecoveryRequest {
+                                        account: &target.account_id_hex,
+                                        searched: &endpoints,
+                                        observed: records,
+                                        primary_complete: complete,
+                                        discovery: &app.directory_source_relays(&[]),
+                                        requirements,
+                                        cached_target: None,
+                                        member_diagnostics: true,
+                                    },
+                                )
+                                .await?;
+                            let mut fetched = preferred_member_key_package_from_records(
                                 &target.account_id_hex,
-                                &records,
-                                app.directory_freshness(),
+                                &records.records,
+                                records.freshness,
                                 requirements,
-                            )
-                            .and_then(|selection| {
-                                selection.value.ok_or_else(|| {
-                                    AppError::MissingKeyPackage(target.account_id_hex.clone())
-                                })
-                            });
-                            let selected = match (selected, refetch_error) {
-                                (
-                                    Err(
-                                        AppError::ObsoleteKeyPackage(_)
-                                        | AppError::MissingKeyPackage(_),
-                                    ),
-                                    Some(error),
-                                ) => Err(error),
-                                (selected, _) => selected,
-                            };
-                            let mut fetched = selected?.fetched;
+                            )?
+                            .value
+                            .ok_or_else(|| {
+                                AppError::MissingKeyPackage(target.account_id_hex.clone())
+                            })?
+                            .fetched;
                             fetched.relay_lists = target.relay_lists;
                             Ok::<_, AppError>(fetched)
                         }

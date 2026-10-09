@@ -1,6 +1,10 @@
+#[cfg(feature = "test-policy-overrides")]
+mod canonical_membership;
 mod draft_lifecycle;
 mod group_lookup;
 mod invite_diagnostics;
+
+pub(crate) mod invite_recovery;
 mod key_package_inventory;
 mod key_package_selection;
 mod message_journeys;
@@ -11,7 +15,6 @@ use super::*;
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use cgka_traits::Timestamp;
 use cgka_traits::app_event::{
     AGENT_ACTIVITY_STATUS_TAG, AGENT_OPERATION_NAME_TAG, AGENT_OPERATION_STATUS_TAG,
     AGENT_OPERATION_TYPE_TAG, EVENT_REF_TAG, GROUP_SYSTEM_TYPE_TAG,
@@ -23,6 +26,7 @@ use cgka_traits::app_event::{
     STREAM_TAG, STREAM_TYPE_TAG,
 };
 use cgka_traits::storage::{DisbandCandidate, DisbandCandidateStorage};
+use cgka_traits::{GroupStorage as _, Timestamp};
 use marmot_account::AccountHomeError;
 use nostr_sdk::prelude::{
     EventBuilder, FinalizeEvent, Keys, Kind, Tag, Timestamp as NostrTimestamp,
@@ -536,7 +540,7 @@ pub(crate) struct ScriptedPushRelayClient {
 
 #[derive(Default)]
 pub(crate) struct MemberResolutionDirectoryFetcher {
-    requests: std::sync::Mutex<Vec<crate::relay_plane::DirectoryFetchRequest>>,
+    pub(crate) requests: std::sync::Mutex<Vec<crate::relay_plane::DirectoryFetchRequest>>,
     events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     events_by_endpoint:
         std::sync::Mutex<std::collections::HashMap<String, Vec<NostrTransportEvent>>>,
@@ -547,6 +551,10 @@ pub(crate) struct MemberResolutionDirectoryFetcher {
     failing_single_author: std::sync::Mutex<Option<String>>,
     stalled_endpoint: std::sync::Mutex<Option<String>>,
     incomplete_endpoint: std::sync::Mutex<Option<String>>,
+    incomplete_query_kind: std::sync::Mutex<Option<u64>>,
+    failing_endpoint: std::sync::Mutex<Option<String>>,
+    failing_endpoint_kind: std::sync::Mutex<Option<u64>>,
+    fetch_gate_kind: std::sync::Mutex<Option<u64>>,
     fetch_gate: std::sync::Mutex<
         Option<(
             std::sync::Arc<tokio::sync::Notify>,
@@ -563,8 +571,16 @@ impl MemberResolutionDirectoryFetcher {
         std::sync::Arc<tokio::sync::Notify>,
         std::sync::Arc<tokio::sync::Notify>,
     ) {
+        self.hold_fetches_for_kind(KIND_MARMOT_KEY_PACKAGE)
+    }
+
+    fn hold_fetches_for_kind(
+        &self,
+        kind: u64,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
         let entered = std::sync::Arc::new(tokio::sync::Notify::new());
         let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        *self.fetch_gate_kind.lock().unwrap() = Some(kind);
         *self.fetch_gate.lock().unwrap() = Some((entered.clone(), release.clone()));
         (entered, release)
     }
@@ -587,7 +603,7 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
             if request
                 .queries
                 .iter()
-                .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)
+                .any(|query| Some(query.kind) == *self.fetch_gate_kind.lock().unwrap())
             {
                 fetch_gate.take()
             } else {
@@ -615,6 +631,19 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
         {
             return Err(format!("single-author query failed for {failing_author}"));
         }
+        if self
+            .failing_endpoint
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|endpoint| request.endpoints.iter().any(|e| &e.0 == endpoint))
+            && request
+                .queries
+                .iter()
+                .any(|q| Some(q.kind) == *self.failing_endpoint_kind.lock().unwrap())
+        {
+            return Err("endpoint query failed".into());
+        }
         let stalled_endpoint = self.stalled_endpoint.lock().unwrap().clone();
         if stalled_endpoint.is_some_and(|stalled| {
             request
@@ -627,6 +656,9 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
         let single_author_only = self.key_packages_only_in_single_author.lock().unwrap();
         let multi_author_only = self.key_packages_only_in_multi_author.lock().unwrap();
         let matches_query = |event: &NostrTransportEvent| {
+            if event.kind == 5 && event.to_verified_nostr_event().is_err() {
+                return false;
+            }
             if event.kind == KIND_MARMOT_KEY_PACKAGE
                 && multi_author_only.contains(&event.id)
                 && request.queries.iter().all(|query| query.authors.len() == 1)
@@ -639,10 +671,7 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
             {
                 return false;
             }
-            request
-                .queries
-                .iter()
-                .any(|query| query.kind == event.kind && query.authors.contains(&event.pubkey))
+            request.queries.iter().any(|query| query.matches(event))
         };
         let endpoint_events = self.events_by_endpoint.lock().unwrap();
         if endpoint_events.is_empty() {
@@ -687,20 +716,65 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
             self.requests.lock().unwrap().push(request);
             return Ok(crate::relay_plane::DirectoryFetchOutcome::default());
         }
+        let incomplete_kind = *self.incomplete_query_kind.lock().unwrap();
         let complete = !self
             .incomplete_endpoint
             .lock()
             .unwrap()
             .as_ref()
             .is_some_and(|incomplete| {
-                request
-                    .endpoints
-                    .iter()
-                    .any(|endpoint| endpoint.0 == *incomplete)
+                (incomplete_kind.is_none()
+                    || request
+                        .queries
+                        .iter()
+                        .any(|query| Some(query.kind) == incomplete_kind))
+                    && request
+                        .endpoints
+                        .iter()
+                        .any(|endpoint| endpoint.0 == *incomplete)
             });
-        self.fetch_directory_events(request)
-            .await
-            .map(|records| crate::relay_plane::DirectoryFetchOutcome { records, complete })
+        let queries = request.queries.clone();
+        let endpoints = request.endpoints.clone();
+        let mut records = self.fetch_directory_events(request).await?;
+        records.sort_by(|a, b| {
+            b.event
+                .created_at
+                .cmp(&a.event.created_at)
+                .then_with(|| b.event.id.cmp(&a.event.id))
+        });
+        let mut retained = Vec::<crate::relay_plane::DirectoryRelayEventRecord>::new();
+        let mut complete = complete;
+        for endpoint in &endpoints {
+            for query in &queries {
+                // Apply full filters before relay limits, and count unique ids.
+                let mut seen = std::collections::BTreeSet::new();
+                let matching = records
+                    .iter()
+                    .filter(|r| r.endpoints.contains(endpoint) && query.matches(&r.event))
+                    .filter(|r| seen.insert(r.event.id.clone()))
+                    .take(query.limit)
+                    .collect::<Vec<_>>();
+                complete &= matching.len() < query.limit;
+                for record in matching {
+                    if let Some(existing) =
+                        retained.iter_mut().find(|r| r.event.id == record.event.id)
+                    {
+                        if !existing.endpoints.contains(endpoint) {
+                            existing.endpoints.push(endpoint.clone());
+                        }
+                    } else {
+                        retained.push(crate::relay_plane::DirectoryRelayEventRecord {
+                            endpoints: vec![endpoint.clone()],
+                            event: record.event.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(crate::relay_plane::DirectoryFetchOutcome {
+            records: retained,
+            complete,
+        })
     }
 }
 
@@ -709,7 +783,7 @@ impl ScriptedPushRelayClient {
         *self.publish_results.lock().unwrap() = results.into_iter().collect();
     }
 
-    fn published_event_ids(&self) -> Vec<String> {
+    pub(crate) fn published_event_ids(&self) -> Vec<String> {
         self.published_events
             .lock()
             .unwrap()
@@ -820,7 +894,7 @@ impl ScriptedPushRelayClient {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn fail_publishes_as_unavailable(&self) {
+    pub(crate) fn fail_publishes_as_unavailable(&self) {
         self.fail_publish_unavailable
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -933,12 +1007,7 @@ impl crate::relay_plane::DirectoryRelayFetcher for ScriptedPushRelayClient {
             .lock()
             .unwrap()
             .iter()
-            .filter(|event| {
-                request
-                    .queries
-                    .iter()
-                    .any(|query| query.kind == event.kind && query.authors.contains(&event.pubkey))
-            })
+            .filter(|event| request.queries.iter().any(|query| query.matches(event)))
             .cloned()
             .map(|event| crate::relay_plane::DirectoryRelayEventRecord {
                 endpoints: request.endpoints.clone(),
@@ -7720,7 +7789,17 @@ async fn member_key_package_skips_local_legacy_cache() {
     let directory = tempfile::tempdir().unwrap();
     let home = AccountHome::open(directory.path());
     let account = home.create_account("alice").unwrap();
-    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let mut app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    // A records-only mock reports unknown completion. Model an explicitly
+    // completed empty lookup so this test checks missing remote evidence.
+    app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+        None,
+        relay,
+        Arc::new(MemberResolutionDirectoryFetcher::default()),
+        false,
+    );
     let legacy = fresh_key_package_for_account(&app, &account, true).await;
     write_json(
         app.key_package_record_path(&account.label),
@@ -7739,10 +7818,10 @@ async fn member_key_package_skips_local_legacy_cache() {
     let result = app.member_key_package(&account.label).await;
     assert!(
         matches!(
-            result,
+            &result,
             Err(AppError::MissingKeyPackage(_) | AppError::MissingRelayLists(_))
         ),
-        "legacy local cache must not be selected for invites; fallback must fail closed"
+        "legacy local cache must not be selected for invites; got {result:?}"
     );
 }
 
@@ -13007,7 +13086,10 @@ fn ingest_applies_owner_signed_transitive_448_and_drops_spoof() {
     app.ingest_push_gossip_message(
         "alice",
         &message(honest, &relayer),
-        &[owner_id.clone(), relayer.clone()],
+        &[cgka_traits::engine::GroupMemberLeaf {
+            member: cgka_traits::MemberId::new(owner.public_key().to_bytes().to_vec()),
+            leaf_index: 1,
+        }],
         cgka_traits::group::ProtocolProfile::Current,
     )
     .unwrap();
@@ -13023,13 +13105,42 @@ fn ingest_applies_owner_signed_transitive_448_and_drops_spoof() {
     app.ingest_push_gossip_message(
         "alice",
         &message(spoof, &relayer),
-        &[owner_id.clone(), relayer, attacker.public_key().to_hex()],
+        &[cgka_traits::engine::GroupMemberLeaf {
+            member: cgka_traits::MemberId::new(owner.public_key().to_bytes().to_vec()),
+            leaf_index: 1,
+        }],
         cgka_traits::group::ProtocolProfile::Current,
     )
     .unwrap();
     let stored = app.group_push_tokens("alice", &group_id_hex).unwrap();
     assert_eq!(stored.len(), 1, "spoofed record is dropped");
     assert_eq!(stored[0].owner_ts, 1000, "victim's original stamp survives");
+
+    // The same valid owner still has another device, but leaf 1 departed.
+    // Neither a late list in the same pass nor a later delivery may re-add it.
+    app.account_storage("alice")
+        .unwrap()
+        .remove_group_push_tokens_for_leaves(&group_id_hex, &[(owner_id.clone(), 1)], &[])
+        .unwrap();
+    for (owner_ts, kind) in [(3000, 447), (4000, 448)] {
+        let mut late = message(gossip_content(&owner, &owner_id, owner_ts), &relayer);
+        late.kind = kind;
+        app.ingest_push_gossip_message(
+            "alice",
+            &late,
+            &[cgka_traits::engine::GroupMemberLeaf {
+                member: cgka_traits::MemberId::new(owner.public_key().to_bytes().to_vec()),
+                leaf_index: 2,
+            }],
+            cgka_traits::group::ProtocolProfile::Current,
+        )
+        .unwrap();
+        assert!(
+            app.group_push_tokens("alice", &group_id_hex)
+                .unwrap()
+                .is_empty()
+        );
+    }
 }
 
 #[tokio::test]
@@ -15162,14 +15273,14 @@ async fn a_drained_member_departure_removes_that_members_group_push_tokens() {
     .unwrap();
 
     let effects = marmot_account::AccountDeviceEffects {
-        events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
+        events: vec![cgka_traits::engine::GroupEvent::GroupMemberLeavesRemoved {
             group_id: group_id.clone(),
             epoch: cgka_traits::EpochId(1),
-            actor: None,
-            change: cgka_traits::engine::GroupStateChange::MemberRemoved {
+            leaves: vec![cgka_traits::engine::GroupMemberLeaf {
                 member: MemberId::new(hex::decode(&departing).unwrap()),
-            },
-            origin_commit_id: None,
+                leaf_index: 1,
+            }],
+            departed_members: vec![MemberId::new(hex::decode(&departing).unwrap())],
         }],
         ..Default::default()
     };
@@ -15216,15 +15327,21 @@ async fn a_drained_self_departure_and_rejoin_move_stored_self_membership() {
     );
 
     let departure = marmot_account::AccountDeviceEffects {
-        events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
-            group_id: group_id.clone(),
-            epoch: cgka_traits::EpochId(1),
-            actor: None,
-            change: cgka_traits::engine::GroupStateChange::MemberRemoved {
-                member: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+        events: vec![
+            cgka_traits::engine::GroupEvent::GroupStateChanged {
+                group_id: group_id.clone(),
+                epoch: cgka_traits::EpochId(1),
+                actor: None,
+                change: cgka_traits::engine::GroupStateChange::MemberRemoved {
+                    member: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+                },
+                origin_commit_id: None,
             },
-            origin_commit_id: None,
-        }],
+            cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated {
+                group_id: group_id.clone(),
+                voluntary: false,
+            },
+        ],
         ..Default::default()
     };
     client
@@ -15259,123 +15376,6 @@ async fn a_drained_self_departure_and_rejoin_move_stored_self_membership() {
     );
 }
 
-/// Distributed convergence can supersede a removal of this device: the winning
-/// branch keeps us in the group, the engine clears the terminal marker, and the
-/// roster diff reports the local account as `MemberAdded`. That arrival is a
-/// membership transition like any other, so the projection must follow it back
-/// to `Member` — otherwise the healed group keeps its unread suppressed and
-/// renders as departed forever, with no later join event to correct it.
-#[tokio::test]
-async fn a_self_member_added_restores_stored_self_membership_after_a_removal() {
-    let dir = tempfile::tempdir().unwrap();
-    let account = AccountHome::open(dir.path())
-        .create_account("alice")
-        .unwrap();
-    let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = MarmotApp::with_relay(dir.path(), "wss://superseded-removal.example")
-        .with_test_relay_client(relay);
-    let mut client = app.client("alice").await.unwrap();
-    let group_id = client
-        .create_group("superseded removal", &[])
-        .await
-        .unwrap();
-    let group_id_hex = hex::encode(group_id.as_slice());
-    let state_change = |change| marmot_account::AccountDeviceEffects {
-        events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
-            group_id: group_id.clone(),
-            epoch: cgka_traits::EpochId(1),
-            actor: None,
-            change,
-            origin_commit_id: None,
-        }],
-        ..Default::default()
-    };
-    let local = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
-
-    client
-        .observe_drained_session_events(&state_change(
-            cgka_traits::engine::GroupStateChange::MemberRemoved {
-                member: local.clone(),
-            },
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        app.stored_group_self_membership("alice", &group_id_hex)
-            .unwrap(),
-        Some(SelfMembership::Removed),
-    );
-
-    client
-        .observe_drained_session_events(&state_change(
-            cgka_traits::engine::GroupStateChange::MemberAdded { member: local },
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        app.stored_group_self_membership("alice", &group_id_hex)
-            .unwrap(),
-        Some(SelfMembership::Member),
-        "a superseded removal that re-admits this device must un-suppress the group again"
-    );
-}
-
-/// The same restoration must clear a *voluntary* departure. `Left` is preserved
-/// against a realizing eviction (mdk#1746), but that preservation is about how
-/// a departure is classified, not a veto on coming back: once the roster says
-/// this device is a member again, the group is live and its unread must count.
-#[tokio::test]
-async fn a_self_member_added_clears_a_preserved_voluntary_left() {
-    let dir = tempfile::tempdir().unwrap();
-    let account = AccountHome::open(dir.path())
-        .create_account("alice")
-        .unwrap();
-    let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = MarmotApp::with_relay(dir.path(), "wss://superseded-leave.example")
-        .with_test_relay_client(relay);
-    let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("superseded leave", &[]).await.unwrap();
-    let group_id_hex = hex::encode(group_id.as_slice());
-    let state_change = |change| marmot_account::AccountDeviceEffects {
-        events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
-            group_id: group_id.clone(),
-            epoch: cgka_traits::EpochId(1),
-            actor: None,
-            change,
-            origin_commit_id: None,
-        }],
-        ..Default::default()
-    };
-    let local = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
-
-    client
-        .observe_drained_session_events(&state_change(
-            cgka_traits::engine::GroupStateChange::MemberLeft {
-                member: local.clone(),
-            },
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        app.stored_group_self_membership("alice", &group_id_hex)
-            .unwrap(),
-        Some(SelfMembership::Left),
-    );
-
-    client
-        .observe_drained_session_events(&state_change(
-            cgka_traits::engine::GroupStateChange::MemberAdded { member: local },
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        app.stored_group_self_membership("alice", &group_id_hex)
-            .unwrap(),
-        Some(SelfMembership::Member),
-        "re-admission must outrank a preserved voluntary departure"
-    );
-}
-
 /// A peer joining the group says nothing about this device's own membership.
 /// The arrival test is the same self-subject test the departure path uses, so
 /// the two cannot disagree about who arrived.
@@ -15402,12 +15402,17 @@ async fn a_peer_member_added_leaves_stored_self_membership_alone() {
         ..Default::default()
     };
 
+    let mut departure = state_change(cgka_traits::engine::GroupStateChange::MemberRemoved {
+        member: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+    });
+    departure
+        .events
+        .push(cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated {
+            group_id: group_id.clone(),
+            voluntary: false,
+        });
     client
-        .observe_drained_session_events(&state_change(
-            cgka_traits::engine::GroupStateChange::MemberRemoved {
-                member: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
-            },
-        ))
+        .observe_drained_session_events(&departure)
         .await
         .unwrap();
     client
@@ -15439,7 +15444,7 @@ async fn a_peer_member_added_leaves_stored_self_membership_alone() {
 #[tokio::test]
 async fn a_self_departure_marks_transport_routes_dirty() {
     let dir = tempfile::tempdir().unwrap();
-    let account = AccountHome::open(dir.path())
+    AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -15456,28 +15461,20 @@ async fn a_self_departure_marks_transport_routes_dirty() {
     };
     let member = |account_id_hex: &str| MemberId::new(hex::decode(account_id_hex).unwrap());
     let peer = nostr::prelude::Keys::generate().public_key().to_hex();
-    let local = account.account_id_hex.as_str();
     let mut summary = SyncSummary::default();
 
-    for (label, change) in [
-        (
-            "an eviction",
-            cgka_traits::engine::GroupStateChange::MemberRemoved {
-                member: member(local),
-            },
-        ),
-        (
-            "a voluntary leave",
-            cgka_traits::engine::GroupStateChange::MemberLeft {
-                member: member(local),
-            },
-        ),
-    ] {
+    for (label, voluntary) in [("an eviction", false), ("a voluntary leave", true)] {
         assert!(
             client
-                .observe_event_projection_effects(&departure(change), local, &mut summary)
+                .observe_event_projection_effects(
+                    &cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated {
+                        group_id: group_id.clone(),
+                        voluntary
+                    },
+                    &mut summary,
+                )
                 .unwrap(),
-            "{label} that removes this device must mark transport routes dirty"
+            "{label} that terminates this device must mark routes dirty"
         );
     }
     assert!(
@@ -15486,7 +15483,6 @@ async fn a_self_departure_marks_transport_routes_dirty() {
                 &departure(cgka_traits::engine::GroupStateChange::MemberRemoved {
                     member: member(&peer),
                 }),
-                local,
                 &mut summary,
             )
             .unwrap(),
@@ -15503,6 +15499,8 @@ async fn a_self_departure_marks_transport_routes_dirty() {
 /// The arm also sets `routes_dirty`, which this test does not assert: the
 /// teardown it forces belongs to `refresh_group_routes`, which clears a
 /// disbanded group's subscriptions outright. This test pins the push sweep.
+/// The batch starts with a buffered departure after the engine's terminal
+/// guard already prevents live membership queries; projection must still finish.
 #[tokio::test]
 async fn a_drained_disband_performs_the_terminal_push_sweep() {
     let dir = tempfile::tempdir().unwrap();
@@ -15528,14 +15526,49 @@ async fn a_drained_disband_performs_the_terminal_push_sweep() {
     app.upsert_group_push_token("alice", &drained_seam_push_token(&group_id_hex, &peer, 1))
         .unwrap();
 
+    // Model the post-settlement projection seam, rather than re-driving MLS
+    // convergence: live membership is no longer queryable when this batch runs.
+    make_group_terminal(&client, &group_id, true);
+    let storage = app.account_storage("alice").unwrap();
+    let terminal = storage.get_group(&group_id).unwrap();
+    storage.delete_group(&group_id).unwrap();
+    storage.put_group(&terminal).unwrap();
+    drop(client);
+    let mut client = app.client("alice").await.unwrap();
+    assert!(
+        client
+            .runtime
+            .session()
+            .canonical_group_membership(&group_id)
+            .is_err()
+    );
+    let departed = MemberId::new(hex::decode(&peer).unwrap());
     let effects = marmot_account::AccountDeviceEffects {
-        events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
-            group_id: group_id.clone(),
-            epoch: cgka_traits::EpochId(1),
-            actor: None,
-            change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
-            origin_commit_id: None,
-        }],
+        events: vec![
+            cgka_traits::engine::GroupEvent::GroupMemberLeavesRemoved {
+                group_id: group_id.clone(),
+                epoch: cgka_traits::EpochId(1),
+                leaves: vec![cgka_traits::engine::GroupMemberLeaf {
+                    member: departed.clone(),
+                    leaf_index: 1,
+                }],
+                departed_members: vec![departed.clone()],
+            },
+            cgka_traits::engine::GroupEvent::GroupStateChanged {
+                group_id: group_id.clone(),
+                epoch: cgka_traits::EpochId(1),
+                actor: None,
+                change: cgka_traits::engine::GroupStateChange::MemberLeft { member: departed },
+                origin_commit_id: None,
+            },
+            cgka_traits::engine::GroupEvent::GroupStateChanged {
+                group_id: group_id.clone(),
+                epoch: cgka_traits::EpochId(2),
+                actor: None,
+                change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
+                origin_commit_id: None,
+            },
+        ],
         ..Default::default()
     };
     client
@@ -15658,6 +15691,11 @@ async fn replaying_a_drained_batch_the_seam_already_applied_is_a_no_op() {
         .with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
     let group_id = client.create_group("drained replay", &[]).await.unwrap();
+    // The replay fixture represents an already terminal canonical copy.
+    let storage = app.account_storage("alice").unwrap();
+    let mut terminal = storage.get_group(&group_id).unwrap();
+    terminal.removed = true;
+    storage.put_group(&terminal).unwrap();
     let group_id_hex = hex::encode(group_id.as_slice());
 
     app.upsert_push_registration(
@@ -15674,6 +15712,10 @@ async fn replaying_a_drained_batch_the_seam_already_applied_is_a_no_op() {
 
     let effects = marmot_account::AccountDeviceEffects {
         events: vec![
+            cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated {
+                group_id: group_id.clone(),
+                voluntary: false,
+            },
             cgka_traits::engine::GroupEvent::GroupStateChanged {
                 group_id: group_id.clone(),
                 epoch: cgka_traits::EpochId(1),
@@ -17967,6 +18009,7 @@ async fn a_resource_refusal_for_a_terminal_group_arms_no_recovery() {
     );
     client
         .observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+        .await
         .expect("a clean refusal pass must not fail");
 
     assert!(
@@ -18242,14 +18285,19 @@ async fn invite_recovery_failure_preserves_committed_effects_and_results() {
             !storage.automatic_recovery_failed(&group_id).unwrap(),
             "committed health evidence must clear the warning"
         );
-        // Successful scheduled convergence persists the dirty projections;
-        // maintenance and failed convergence leave them queued for the worker.
-        if maintenance || failed_publish {
+        // Both boundaries persist the warning projection. A failed publish
+        // also buffers the committed join before returning the primary error.
+        assert!(
+            client.pending_group_projection_updates.is_empty(),
+            "the cleared warning must be checkpointed"
+        );
+        if failed_publish {
             assert!(
                 client
-                    .pending_group_projection_updates
-                    .contains(&hex::encode(group_id.as_slice())),
-                "the warning projection must remain queued"
+                    .take_pending_applied_sync_summary()
+                    .joined_groups
+                    .contains(&group_id),
+                "the committed join must reach subscribers despite the publish error"
             );
         }
     }
@@ -18359,14 +18407,15 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
     };
 
     let result = match observation {
-        MixedPublishObservation::DirectSend => client
-            .observe_recovery_evidence_then_gate_send_publish(&effects, &group_id, app_event_id)
-            .await
-            .and_then(|()| {
-                let updates = client.finalize_published_app_message_source_retention(&effects)?;
-                client.pending_projection_updates.extend(updates);
-                Ok(SyncSummary::default())
-            }),
+        MixedPublishObservation::DirectSend => {
+            let result = client
+                .observe_recovery_evidence_then_gate_send_publish(&effects, &group_id, app_event_id)
+                .await;
+            if result.is_ok() {
+                client.retry_send_applied_effects_best_effort().await;
+            }
+            result.map(|()| SyncSummary::default())
+        }
         MixedPublishObservation::DirectSendCurrentFailed => client
             .observe_recovery_evidence_then_gate_send_publish(
                 &effects,
@@ -18378,11 +18427,12 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
         MixedPublishObservation::Drained => client.observe_drained_session_events(&effects).await,
         MixedPublishObservation::Scheduled => {
             client
-                .observe_scheduled_convergence_effects(&group_id, &effects)
+                .finish_scheduled_convergence_effects(&group_id, &effects)
                 .await
         }
         MixedPublishObservation::Retry => client
             .observe_convergence_retry_effects(&group_id, &effects)
+            .await
             .map(|_| SyncSummary::default()),
     };
     if matches!(observation, MixedPublishObservation::DirectSend) {
@@ -18396,10 +18446,25 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
             "the unrelated hard failure must still surface to aggregate observers"
         );
     }
+    // Drained batches keep these deltas in the ordered summary so repaired
+    // activity cannot be broadcast after newer finalization or withdrawals.
+    let mut broadcast_updates = client.take_pending_projection_updates();
+    broadcast_updates.extend(
+        client
+            .take_pending_applied_sync_summary()
+            .projection_updates,
+    );
     assert_eq!(
-        client.take_pending_projection_updates().len(),
+        broadcast_updates.len(),
         2,
-        "the delivered and failed sibling updates must remain available for runtime broadcast"
+        "the delivered and failed sibling updates must remain available once for runtime broadcast"
+    );
+    assert!(client.take_pending_projection_updates().is_empty());
+    assert!(
+        client
+            .take_pending_applied_sync_summary()
+            .projection_updates
+            .is_empty()
     );
 
     #[cfg(feature = "product-analytics-export")]
@@ -18710,7 +18775,9 @@ async fn a_publish_failure_during_a_convergence_retry_still_arms_recovery() {
     assert_eq!(audit_rows_of_kind(&app, "epoch_stall_backfill_armed"), 0);
 
     let effects = a_refusal_riding_a_rolled_back_publish(&group_id);
-    let result = client.observe_convergence_retry_effects(&group_id, &effects);
+    let result = client
+        .observe_convergence_retry_effects(&group_id, &effects)
+        .await;
 
     assert!(
         result.is_err(),
@@ -19087,6 +19154,7 @@ async fn the_arming_publish_gate_classifies_exactly_as_the_bare_publish_check() 
         let bare = crate::groups::fail_if_publish_failed(&effects).map_err(|err| err.to_string());
         let armed = client
             .observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await
             .map_err(|err| err.to_string());
         assert_eq!(
             armed, bare,
@@ -19185,6 +19253,7 @@ async fn a_convergence_reorg_ends_the_unrecovered_arm_run() {
     // Convergence then resolves a fork this device was on the wrong side of.
     client
         .observe_recovery_evidence_then_fail_if_publish_failed(&a_convergence_reorg(&group_id, 9))
+        .await
         .expect("a batch carrying only a convergence reorg passes the publish gate");
 
     // Without the reorg this third arm is the run's escalating one
@@ -19237,7 +19306,8 @@ async fn a_maintenance_tick_reports_its_own_epoch_passage_to_the_stall_detector(
 
     // Maintenance then confirms a recovered evolution, 10 -> 11.
     client
-        .observe_recovery_evidence_then_summarize_maintenance(&an_epoch_passage(&group_id, 10, 11))
+        .finish_maintenance_effects(&an_epoch_passage(&group_id, 10, 11))
+        .await
         .expect("a maintenance batch carrying only an epoch passage summarizes cleanly");
 
     // A peer fold carries the device on to 12. Only a detector that heard the
@@ -19308,6 +19378,7 @@ async fn a_confirmed_local_publish_reports_its_epoch_passage_through_the_publish
     // The device then commits and the publish confirms, 10 -> 11.
     client
         .observe_recovery_evidence_then_fail_if_publish_failed(&an_epoch_passage(&group_id, 10, 11))
+        .await
         .expect("a batch carrying only an epoch passage clears the publish gate");
 
     // One epoch per arm is a limp, so that confirm alone does not end the run —
@@ -19396,6 +19467,32 @@ async fn an_escalation_recorded_during_a_received_delivery_rides_that_seam() {
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test]
 async fn a_failed_ingest_leaves_the_delivery_retryable_on_the_reused_client() {
+    assert_failed_delivery_cursor_pin(FailedDeliveryRecovery::Redelivery).await;
+}
+
+/// Projection repair must release its taken delivery without relay redelivery.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn quiet_projection_retry_releases_the_failed_delivery_cursor_pin() {
+    assert_failed_delivery_cursor_pin(FailedDeliveryRecovery::QuietProjectionRetry).await;
+}
+
+/// A failure before engine admission still needs a real ingest before release.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test]
+async fn pre_engine_ingest_failure_keeps_the_delivery_cursor_pin() {
+    assert_failed_delivery_cursor_pin(FailedDeliveryRecovery::BeforeEngine).await;
+}
+
+#[cfg(feature = "test-policy-overrides")]
+enum FailedDeliveryRecovery {
+    Redelivery,
+    QuietProjectionRetry,
+    BeforeEngine,
+}
+
+#[cfg(feature = "test-policy-overrides")]
+async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
@@ -19406,7 +19503,7 @@ async fn a_failed_ingest_leaves_the_delivery_retryable_on_the_reused_client() {
     remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
     // One shared plane for both clients, so a publish fans out locally into
     // the other account's registered routes (`deliver_local_publish`).
-    let plane = MarmotRelayPlane::new(None, relay.clone());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
 
     let mut alice = app
         .client_with_relay_plane("alice", &plane, None)
@@ -19443,6 +19540,8 @@ async fn a_failed_ingest_leaves_the_delivery_retryable_on_the_reused_client() {
             .contains(&group_id),
         "bob must join before the failing application message",
     );
+    bob_client.take_pending_projection_updates();
+    bob_client.take_pending_applied_sync_summary();
 
     let published_before_send = relay.published_events.lock().unwrap().len();
     alice
@@ -19458,10 +19557,6 @@ async fn a_failed_ingest_leaves_the_delivery_retryable_on_the_reused_client() {
         .find(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
         .cloned()
         .expect("published group message backing the send");
-    bob_client
-        .app
-        .config
-        .dev_fail_ingest_after_application_event_ack = true;
     let delivery = tokio::time::timeout(Duration::from_secs(5), bob_client.receive_next_delivery())
         .await
         .expect("locally fanned-out application message")
@@ -19472,50 +19567,120 @@ async fn a_failed_ingest_leaves_the_delivery_retryable_on_the_reused_client() {
     let delivery = *delivery;
     let event_id = hex::encode(delivery.message.id.as_slice());
     assert_eq!(event_id, relay_event.id);
+    let later_cursor = delivery.message.timestamp.0 + 10_000;
+    let probe_cursor = |client: &AppClient| {
+        let sealed = client.adapter.seal_transport_cursor(Some(later_cursor));
+        client
+            .adapter
+            .unseal_transport_cursor(client.state.last_transport_timestamp);
+        sealed
+    };
+    if matches!(recovery, FailedDeliveryRecovery::BeforeEngine) {
+        bob_client.fail_ingest_of = Some(delivery.message.id.clone());
+    } else {
+        bob_client
+            .app
+            .config
+            .dev_fail_ingest_after_application_event_ack = true;
+    }
     bob_client
         .ingest_received_delivery(delivery)
         .await
-        .expect_err("the injected post-ack failure must surface");
+        .expect_err("the injected ingest failure must surface");
     assert!(
         !bob_client.seen_events_index.contains(&event_id),
         "a failed ingest must not mark the delivery seen",
     );
+    assert!(
+        probe_cursor(&bob_client).is_some_and(|cursor| cursor < later_cursor),
+        "a taken delivery must cap the cursor while its ingest remains failed",
+    );
 
-    // The relay redelivers (for example on resubscribe); the reused client
-    // must return the delivery again instead of skipping it as already seen.
+    // Lift the projection fault before quiet repair or relay redelivery.
     bob_client
         .app
         .config
         .dev_fail_ingest_after_application_event_ack = false;
-    assert!(
-        inject(relay_event).await.expect("route the redelivery") >= 1,
-        "the group route must accept the redelivery",
-    );
-    let redelivery =
-        tokio::time::timeout(Duration::from_secs(5), bob_client.receive_next_delivery())
+    let summary = if matches!(recovery, FailedDeliveryRecovery::QuietProjectionRetry) {
+        assert!(bob_client.arm_failed_receive_projection_retry());
+        bob_client
+            .retry_pending_runtime_group_subscription_refresh()
             .await
-            .expect("redelivered application message")
-            .unwrap();
-    let crate::relay_plane::AccountDeliveryReceive::Delivery(redelivery) = redelivery else {
-        panic!("the test did not overflow its account delivery queue");
+            .expect("quiet retry must complete the retained projection");
+        assert!(!bob_client.has_pending_effect_projections());
+        assert_eq!(
+            probe_cursor(&bob_client),
+            Some(later_cursor),
+            "projection retry must release the pin without another delivery",
+        );
+        bob_client.take_pending_applied_sync_summary()
+    } else {
+        if matches!(recovery, FailedDeliveryRecovery::BeforeEngine) {
+            assert!(
+                !bob_client.arm_failed_receive_projection_retry(),
+                "a pre-engine failure has no accepted projection to repair",
+            );
+            assert!(
+                !bob_client
+                    .retry_pending_runtime_group_subscription_refresh()
+                    .await
+                    .unwrap(),
+            );
+            assert!(
+                probe_cursor(&bob_client).is_some_and(|cursor| cursor < later_cursor),
+                "projection retry must not release an unaccepted delivery",
+            );
+        }
+        assert!(
+            inject(relay_event).await.expect("route the redelivery") >= 1,
+            "the group route must accept the redelivery",
+        );
+        let redelivery =
+            tokio::time::timeout(Duration::from_secs(5), bob_client.receive_next_delivery())
+                .await
+                .expect("redelivered application message")
+                .unwrap();
+        let crate::relay_plane::AccountDeliveryReceive::Delivery(redelivery) = redelivery else {
+            panic!("the test did not overflow its account delivery queue");
+        };
+        let redelivery = *redelivery;
+        assert_eq!(hex::encode(redelivery.message.id.as_slice()), event_id);
+        let summary = bob_client
+            .ingest_received_delivery(redelivery)
+            .await
+            .expect("the retry must ingest the redelivered event");
+        assert!(
+            bob_client.seen_events_index.contains(&event_id),
+            "a successful ingest must mark the delivery seen",
+        );
+        assert_eq!(
+            probe_cursor(&bob_client),
+            Some(later_cursor),
+            "successful redelivery must release the original cursor pin",
+        );
+        summary
     };
-    let redelivery = *redelivery;
-    assert_eq!(hex::encode(redelivery.message.id.as_slice()), event_id);
-    let summary = bob_client
-        .ingest_received_delivery(redelivery)
-        .await
-        .expect("the retry must ingest the redelivered event");
-    assert!(
-        bob_client.seen_events_index.contains(&event_id),
-        "a successful ingest must mark the delivery seen",
+    // A post-ack failure already projected the message without returning its
+    // summary; a pre-engine failure projected nothing. Either recovery path
+    // must deliver exactly one notification and leave exactly one durable row.
+    assert_eq!(summary.messages.len(), 1);
+    assert_eq!(
+        summary.messages[0].plaintext,
+        "must survive a failed ingest"
     );
-    // The first attempt durably projected the message before its injected
-    // post-ack failure, so the retried duplicate must not project it again.
-    // (Live-summary replay after a post-ack failure is pinned separately in
-    // `tests/partial_sync_summary.rs`.)
     assert!(
-        summary.messages.is_empty(),
-        "the retried duplicate must not re-project the already-applied message",
+        bob_client
+            .take_pending_applied_sync_summary()
+            .messages
+            .is_empty()
+    );
+    assert!(
+        bob_client
+            .drain_pending_session_events()
+            .await
+            .unwrap()
+            .messages
+            .is_empty()
     );
     assert_eq!(
         app.messages("bob")

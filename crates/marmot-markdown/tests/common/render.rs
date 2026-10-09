@@ -7,7 +7,7 @@
 
 #![allow(dead_code, unused_imports)]
 
-use marmot_markdown::{Alignment, AutolinkKind, Block, Document, Inline, ListKind};
+use marmot_markdown::{Alignment, AutolinkKind, Block, Document, Inline, ListKind, TimestampStyle};
 
 pub fn render(doc: &Document) -> String {
     let mut out = String::new();
@@ -241,6 +241,12 @@ fn render_inline(i: &Inline, out: &mut String) {
                 escape(&e.bech32)
             ));
         }
+        Inline::Timestamp {
+            unix_seconds,
+            style,
+        } => {
+            out.push_str(&escape(&timestamp_text(*unix_seconds, *style)));
+        }
     }
 }
 
@@ -258,8 +264,31 @@ fn collect_text(inlines: &[Inline], out: &mut String) {
             Inline::Autolink { url, .. } => out.push_str(url),
             Inline::Math(s) => out.push_str(s),
             Inline::NostrMention(e) | Inline::NostrUri(e) => out.push_str(&e.bech32),
+            Inline::Timestamp {
+                unix_seconds,
+                style,
+            } => {
+                out.push_str(&timestamp_text(*unix_seconds, *style));
+            }
         }
     }
+}
+
+// The CommonMark oracle is static; preserve a canonical token rather than
+// capturing this test machine's clock, timezone or locale.
+pub fn timestamp_text(seconds: i64, style: TimestampStyle) -> String {
+    let suffix = match style {
+        TimestampStyle::ShortTime => 't',
+        TimestampStyle::LongTime => 'T',
+        TimestampStyle::ShortDate => 'd',
+        TimestampStyle::LongDate => 'D',
+        TimestampStyle::ShortDateTime => 'f',
+        TimestampStyle::LongDateTime => 'F',
+        TimestampStyle::CompactDateTime => 's',
+        TimestampStyle::CompactDateTimeSeconds => 'S',
+        TimestampStyle::Relative => 'R',
+    };
+    format!("<t:{seconds}:{suffix}>")
 }
 
 /// HTML-escape text content (`&`, `<`, `>`, `"`).

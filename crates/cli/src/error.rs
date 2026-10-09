@@ -646,6 +646,24 @@ fn app_error_json(err: &AppError) -> Value {
                 "remote": "wn keys fetch <npub-or-hex> --bootstrap-relays <relay-url>"
             },
         }),
+        AppError::ObsoleteKeyPackage(account) => json!({
+            "code": "obsolete_key_package",
+            "message": err.to_string(),
+            "account_id": account,
+            "retryable": false,
+            "repair": {
+                "action": "ask the recipient to update their app and publish a current KeyPackage",
+            },
+        }),
+        AppError::MemberDiscoveryIncomplete(account) => json!({
+            "code": "member_discovery_incomplete",
+            "message": err.to_string(),
+            "account_id": account,
+            "retryable": true,
+            "repair": {
+                "action": "retry the invitation after checking relay connectivity",
+            },
+        }),
         AppError::MissingMemberInboxRoute(account) => json!({
             "code": "missing_member_inbox_route",
             "message": err.to_string(),
@@ -929,6 +947,56 @@ mod tests {
             error["repair"]["remote"],
             "wn keys fetch <npub-or-hex> --bootstrap-relays <relay-url>"
         );
+    }
+
+    #[test]
+    fn invitation_diagnostic_json_preserves_recipient_and_distinct_repairs() {
+        let account = "23".repeat(32);
+        for (source, code, retryable, action) in [
+            (
+                AppError::ObsoleteKeyPackage(account.clone()),
+                "obsolete_key_package",
+                false,
+                "ask the recipient to update their app and publish a current KeyPackage",
+            ),
+            (
+                AppError::MemberDiscoveryIncomplete(account.clone()),
+                "member_discovery_incomplete",
+                true,
+                "retry the invitation after checking relay connectivity",
+            ),
+        ] {
+            let message = source.to_string();
+            let rendered = wn_error_json(&WnError::App(source));
+            assert_eq!(rendered["code"], code);
+            assert_eq!(rendered["account_id"], account);
+            assert_eq!(rendered["message"], message);
+            assert_eq!(rendered["retryable"], retryable);
+            assert_eq!(rendered["repair"]["action"], action);
+            assert!(!message.contains(&account));
+        }
+    }
+
+    #[test]
+    fn sync_json_retains_invitation_diagnosis_and_partial_progress() {
+        let account = "24".repeat(32);
+        for source in [
+            AppError::ObsoleteKeyPackage(account.clone()),
+            AppError::MemberDiscoveryIncomplete(account.clone()),
+        ] {
+            let expected = app_error_json(&source);
+            let partial = json!({"synced": 1});
+            let rendered = wn_error_json(&WnError::Sync(Box::new(SyncCommandError {
+                source,
+                partial_plain: "one account synced".into(),
+                partial_json: partial.clone(),
+            })));
+            assert_eq!(rendered["code"], expected["code"]);
+            assert_eq!(rendered["account_id"], expected["account_id"]);
+            assert_eq!(rendered["retryable"], expected["retryable"]);
+            assert_eq!(rendered["repair"], expected["repair"]);
+            assert_eq!(rendered["partial"], partial);
+        }
     }
 
     #[test]

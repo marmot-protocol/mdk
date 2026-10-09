@@ -14,6 +14,7 @@ per feature.
 - [Using the ABI](#using-the-abi)
 - [Integration documentation](#integration-documentation)
 - [Lifecycle and teardown](#lifecycle-and-teardown)
+- [Onboarding relay repair](#onboarding-relay-repair)
 - [NIP-46 accounts](#nip-46-accounts)
 - Feature notes: [runtime construction](#runtime-construction), [local sends](#local-sends),
   [public event verification](#public-event-verification), [host performance stages](#host-performance-stages),
@@ -141,6 +142,27 @@ Release subscriptions before clients, and never free an object while another cal
 destructors from racing process exit (since 0.10.3). Run final free off the UI thread. Calls from a Tokio runtime
 context retain nonblocking cleanup to avoid deadlock and are not a process-teardown barrier.
 
+## Onboarding relay repair
+
+For a general or inbox onboarding relay failure, call
+`marmot_propose_onboarding_relay_repair` and inspect the optional
+`proposal->relay_repair` in the returned snapshot. Its ordered before/after
+tags and occurrence changes preserve duplicate entries, direction markers,
+unrelated fields, and content. `ManualReview` has no approval action; do not
+publish it or treat it as a full reset. Free the snapshot with
+`marmot_onboarding_snapshot_free` after presenting the exact diff. Approval
+remains a separate revision- and recovery-epoch-bound call.
+
+C relay-repair previews encode `original_content`, `proposed_content`, every
+`fields` element in tags and changes, and each non-NULL `endpoint` as a JSON
+string literal. Decode exactly once with a parser that preserves embedded zero
+bytes and decoded UTF-8 lengths before displaying or prefilling an editor.
+For example, `"a\u0000b"` represents three bytes: `61 00 62`; `""` is an empty
+string, distinct from a NULL optional endpoint. Do not use `strlen` on decoded
+content or discard control bytes. The encoded C strings contain no embedded
+NULs; their snapshot ownership and deep-free rules are unchanged. Swift/Kotlin
+records retain ordinary strings and do not use this C-only encoding.
+
 ## Runtime construction
 
 `marmot_client_new_with_configuration` takes a `MarmotClientOptions` struct combining relay policy, cursor
@@ -188,6 +210,22 @@ boundaries are defined in the [runtime telemetry catalog](../../docs/marmot-arch
 See the [diagnostics contract](../marmot-uniffi/README.md#localization-privacy-and-diagnostics).
 
 ## Markdown rendering
+
+`MarmotMarkdownInline::Timestamp` carries signed `int64_t` Unix seconds and a
+`MarmotMarkdownTimestampStyle`, with no allocated display string. The tag follows
+`NostrUri`, preserving existing inline tag values. Style values are `ShortTime`
+(`t`), `LongTime` (`T`), `ShortDate` (`d`), `LongDate` (`D`), `ShortDateTime`
+(`f`, the parser default), `LongDateTime` (`F`), `CompactDateTime` (`s`),
+`CompactDateTimeSeconds` (`S`), and `Relative` (`R`).
+
+Format timestamps at render time using the device locale and time zone. Refresh
+labels after locale, time-zone or clock changes and when the app resumes; visible
+`Relative` nodes also need updates as time passes. An absolute-time tooltip or
+accessibility label is optional. Timestamp payloads require no separate free;
+`marmot_markdown_document_free` releases the containing tree. See the
+[shared Markdown contract](../marmot-markdown/README.md) for host
+rendering guidance and [Binary compatibility](#binary-compatibility) for adopting
+the new union tag.
 
 `MarmotMarkdownBlock` includes a `Details` tag (bounded `<details>` / `<summary>` blocks) whose fields live behind
 `MarmotMarkdownDetails`. It was appended without changing existing discriminants or union stride; clients built

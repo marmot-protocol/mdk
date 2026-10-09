@@ -190,6 +190,20 @@ the MLS add.
 - Directory diagnostics (such as `wn keys check` / `keys fetch`) may still describe cached public packages. Their availability
   result is advisory and does not guarantee a fresh relay lookup or acceptance by the create/invite admission policy.
 
+When advertised outboxes have no usable invitation package, lookup makes one supplementary pass over up to eight
+safe configured discovery endpoints that were not already searched. Explicit bootstrap endpoints supply this set for
+direct directory lookups. Successful advertised lookups skip the supplementary pass. Recovery keeps observed
+replacement barriers and requires complete package coverage and completed deletion queries for each usable candidate
+across the searched routes. Separate exact-event and timestamp-scoped coordinate filters ask for one signed deletion;
+unrelated deleted posts cannot fill their limits. Any verified matching deletion rejects the candidate, even when
+another route is incomplete. Accepting a candidate requires complete empty queries on every required route; unknown
+coverage and the twelve-candidate budget remain retryable. Signed deletions cannot revive an older slot version.
+For direct diagnostics, the existing future-record cache fallback also requires this proof for its cached public
+metadata. Incomplete recovery refuses that fallback; a revoked or superseded cache entry is never returned.
+Cached entries without a usable public event identifier are ineligible for this fallback.
+Member resolution and direct lookup each have a 50-second overall deadline. Relay visibility still cannot prove that
+the recipient retains the private package, or that every relay disclosed all replacements and deletions.
+
 **Routing.** New Nostr-routed groups generate `marmot.transport.nostr.routing.v1` at creation, store the component bytes
 in signed MLS app data, and project the decoded `nostr_group_id` plus relay list into group subscriptions and publish
 targets.
@@ -201,6 +215,12 @@ leave, clears the pending flag, and archives the local projection so normal chat
 ### Invitation lookup diagnostics
 
 Invitation resolution reports `ObsoleteKeyPackage` only when the completed bounded lookup finds validated legacy packages in every observed newest addressable slot, with no usable current package. Clients can recommend updating and publishing a current KeyPackage. `MemberDiscoveryIncomplete` means the lookup could not establish missing or obsolete-only packages; retry may help. These diagnoses use the existing query types and bounded lookup paths; an unfinished empty batch can trigger the existing per-member fallback. They preserve strict current-profile admission, slot replacement, fresh validation, and current-client preference. They describe the searched relays, not all publications across Nostr.
+
+**Committed group activity.** Commands and maintenance retain native cleanup and commit activity before subscription
+work can suspend. Manual and scheduled convergence retain subscriber deltas through route refresh, checkpoints,
+notifications and invitation recovery. Quiet observations return repaired deltas once without republishing the accepted
+MLS commit. Cancellation preserves the owning client's pending work; these queues are session-local, not a crash-durable
+event journal.
 
 ## Conversations
 

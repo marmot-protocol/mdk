@@ -21,7 +21,8 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [bounded chat screens](#bounded-chat-screens), [prepared conversation windows](#prepared-conversation-windows),
   [live timeline updates](#live-timeline-updates), [durable avatar access](#durable-avatar-access)
 - Messages and moderation: [deletion provenance and custom events](#deletion-provenance-and-custom-events),
-  [group-system previews](#group-system-previews), [group reporting](#group-reporting),
+  [group-system previews](#group-system-previews),
+  [device-local membership events](#device-local-membership-events), [group reporting](#group-reporting),
   [history may be incomplete notices](#history-may-be-incomplete-notices)
 - Media: [bounded attachment history](#bounded-attachment-history), [local attachment access](#local-attachment-access)
 - Audit logs: [audit v5 recording and delivery](#audit-v5-recording-and-delivery),
@@ -185,6 +186,37 @@ and aggregate snapshots; keep secrets out of diagnostics and host callback error
 
 `MarmotKitError::ObsoleteKeyPackage { account }` identifies a recipient whose completed bounded lookup found only validated legacy packages. Recommend updating the recipient’s app and publishing a current KeyPackage. `MemberDiscoveryIncomplete { account }` means missing or obsolete-only packages could not be established; offer retry without claiming absence. Existing malformed-package and capability errors remain distinct. Error Display strings omit recipient identity; keep the structured account field out of logs. Legacy KeyPackages are rejected for new joins.
 
+### Markdown rendering
+
+Render the typed Markdown tokens on message, timeline and reply-preview records.
+`parseMarkdown` returns the same AST for draft previews and custom renderers.
+`MarkdownInlineFfi.Timestamp` carries signed `unixSeconds` (Swift `Int64`, Kotlin
+`Long`) and a `MarkdownTimestampStyleFfi`, with no formatted text. Timestamp syntax
+is `<t:UNIX_SECONDS>` or `<t:UNIX_SECONDS:STYLE>`; the parser resolves an omitted
+style to `ShortDateTime`. Invalid timestamp syntax remains literal text.
+
+| Style token | Enum variant | Display |
+| --- | --- | --- |
+| `t` | `ShortTime` | Time without seconds |
+| `T` | `LongTime` | Time including seconds |
+| `d` | `ShortDate` | Short date |
+| `D` | `LongDate` | Long date |
+| `f` (default) | `ShortDateTime` | Long date and time without seconds |
+| `F` | `LongDateTime` | Weekday, long date and time without seconds |
+| `s` | `CompactDateTime` | Short date and time without seconds |
+| `S` | `CompactDateTimeSeconds` | Short date and time including seconds |
+| `R` | `Relative` | Time relative to the current clock |
+
+Use native date/time formatters with the device's current locale and timezone at
+render time, including its date order and 12/24-hour preference. The parser and
+bindings do not own a clock, timezone, formatter or refresh task. Refresh displayed
+timestamps when locale, timezone or system clock changes and when the app resumes;
+visible `Relative` nodes also need time-driven refresh even if the message tokens
+are unchanged. A host may provide a localized absolute-time tooltip or accessibility
+description. Keep the timestamp and typed style in display caches rather than
+persisting formatted strings. The native renderer is supplied by the host app,
+not this crate.
+
 ### Compatibility
 
 Generated source, DTOs, enums, errors, headers and native code form one versioned contract.
@@ -300,7 +332,15 @@ Imported identities can use the durable preflight API instead of `login`:
 3. Localize the typed status, findings, and actions. A healthy account advances
    automatically until the single-device acknowledgment. `NeedsInput` offers a repair or, for profile/follows, an
    explicit `continue_onboarding_without`. Empty follow lists are valid.
-4. `propose_onboarding_recommended_relays`, `propose_onboarding_relays`,
+4. `propose_onboarding_relay_repair` previews the smallest safe change to a
+   general or inbox relay declaration, preserving the original ordered tags,
+   duplicate/custom entries, direction markers, and content. NIP-65 read/write
+   markers are interpreted case-insensitively; their spelling and trailing
+   extension fields remain unchanged in the preview and published event. Show its typed
+   before/after diff and repair mode. `ManualReview` cannot be approved; prefill
+   a manual editor from the original tags or offer a separately labeled reset.
+   No proposal signs or publishes until explicit approval. The older
+   `propose_onboarding_recommended_relays`, `propose_onboarding_relays`,
    `propose_onboarding_profile`, and `propose_onboarding_follows` only prepare
    a proposal. Recommended relays append missing defaults to the observed list,
    preserving every original relay tag, including private-network, `ws://` and `wss://` onion,
@@ -365,7 +405,10 @@ version 3 reader cannot validate epoch-scoped approvals. Completed recovery
 leaves a version 4 cancellation tombstone even before a new begin, so older
 readers fail closed. Preparing an additive relay proposal upgrades its checkpoint
 to version 5, with or without a recovery epoch. This prevents older readers from
-resuming an approved, unsigned proposal as a destructive replacement.
+resuming an approved, unsigned proposal as a destructive replacement. Preparing
+an exact lossless relay repair upgrades the checkpoint to version 6, preserving
+that version through approval, signing and completion. Version 3/4/5 readers
+reject it rather than discard the typed preview and publish replacement tags.
 Downgrading once either format is used is unsupported; use a build that supports
 the checkpoint version. Do not relabel versions or delete checkpoints to
 force a downgrade. Restore/upgrade to a supporting build, or explicitly recover
@@ -703,6 +746,17 @@ also carry their ordered `tags`, so clients can render app-defined event types w
 raw events. Deleted rows expose no raw tags in timeline reads, moderation reads, or conversation windows.
 MDK-owned kinds continue to use prepared fields and references there. Custom-event tag changes invalidate
 the conversion cache. Custom events do not change chat-list activity or notification policy.
+
+
+## Device-local membership events
+
+The group-event firehose distinguishes account-level timeline activity from
+`LocalGroupCopyTerminated`, `LocalGroupCopyRestored`, and
+`GroupMemberLeavesRemoved`. MDK applies their membership, pending-send and
+notification effects before host delivery; these events create no system row.
+Use them to refresh presentation, and handle the new variants when regenerating
+Swift/Kotlin bindings. Retained-history engine rollback is separate from automatic
+terminal-copy recovery through the managed scheduler.
 
 ## Group-system previews
 

@@ -11,6 +11,11 @@
 
 ### Added
 
+- `AccountManager::propose_onboarding_relay_repair` previews exact ordered
+  tags, content and minimal relay changes without signing or publishing.
+  Approval retains the existing revision and source-event checks; typed
+  previews require checkpoint version 6.
+
 - `MarmotAppRuntime::message_reactions` returns complete local reaction details for one exact
   account/group/message, with one effective entry per sender/emoji and no
   conversation-preview cap. Missing, hidden, deleted, invalidated and
@@ -26,9 +31,106 @@
 
 ### Fixed
 
+- Lossless relay repairs accept case-insensitive NIP-65 read/write markers,
+  matching relay-list inspection while preserving their original spelling
+  and extension fields through approval and publication.
+
+- Commands and maintenance retain committed activity before subscription waits.
+  Manual and scheduled convergence keep subscriber updates owned through route,
+  checkpoint, notification and invitation waits, including cancellation.
+- Maintenance deadline write failures preserve committed effects. Quiet ticks
+  and reopen repair missing deadlines and partial completion without another
+  MLS commit or reuse of terminal obligation IDs. Deadline collision repair
+  keeps the 24–36-day period; ordinary epoch activity does not postpone an
+  overdue periodic rotation.
+- Test-only conformance progress distinguishes bounded confirmation replay
+  through unchanged opaque rows from a stalled convergence drain.
+
+- Historical canonical replay clears stale removal metadata when the selected
+  local MLS leaf remains active, without emitting a false restoration event.
+  Activity from commits preceding a disband survives a later terminal-cleanup
+  failure. Confirmation replay retries share the normal background row and time
+  budget and resume beyond an unchanged deferred prefix. An admitted slice makes
+  progress even when storage preparation consumes its wall-time allowance.
+- Quiet projection repair releases the accepted delivery's cursor pin. Resumed
+  chat and poll publications wake recipients after source revival and checkpoint;
+  projection or checkpoint failures retain that session's notification obligation.
+  Sent wake ownership lasts through partial fanout acceptance and acknowledgement
+  retry, preventing duplicate wakes from resumed publications or direct-send cleanup.
+
+- Identical same-actor fork activity retains its reaction target when a fresh
+  canonical commit replaces a withdrawn origin; adoption and revival are atomic.
+  Canonical removal and membership cleanup commit together; their native events
+  survive later candidate-cleanup failures. Retained-history restoration resumes
+  enrolled periodic maintenance without reusing failed work IDs.
+- Projection retry retains bookkeeping and failed-message updates as well as
+  native events. Live receive keeps the owning client until projection and its
+  checkpoint finish. Outbound sends reconcile retained route changes and retry
+  failed subscription rebuilds. Comparison admission/checkpoint failures preserve
+  repaired subscriber updates.
+  A second local deletion discards obsolete retained projections. Terminal groups
+  that never reached app projection do not stall later batches. Queues remain
+  session-local; this does not claim crash-durable activity replay.
+
 - The HPKE dependency now uses `libcrux-kem` 0.0.10, fixing malformed hybrid-key
   and short-seed panics (RUSTSEC-2026-0330 and RUSTSEC-2026-0331). A documented
   compatibility patch preserves the existing HPKE and OpenMLS versions.
+
+- Group-activity reaction targets retain each accepted commit's authenticated
+  actor, source-state delta and fork-withdrawal origin. Authors and recipients
+  use the same activity derivation. Account membership rows describe first-leaf
+  arrival and last-leaf departure; sibling-only changes create no misleading
+  account invitation or departure. Display-component decoding no longer blocks
+  otherwise valid legacy MLS evolution. Valid profile repairs retain rename
+  activity with an unknown previous name; unreadable resulting components
+  produce no invented display values.
+  Device-local termination/restoration effects drive participation and pending-send
+  cleanup independently of timeline activity. Push cleanup follows actual leaf
+  transitions, preserves surviving destinations and clears tombstones only for
+  departed accounts. Restoration preserves archive choices and outstanding leave
+  intent; reopen repairs terminal projections from durable removal markers.
+  Manual convergence retries observe the same native effects as scheduled
+  convergence, including reportless membership changes and leaf-token cleanup.
+  Group commands and maintenance also observe native membership decisions
+  produced while settling retained commits. Secondary projection or route-refresh
+  failures preserve the canonical publish result. Failed projection batches
+  retain their source identity/time in a session queue; later delivery, drain and
+  convergence observations cannot overtake them. Successful-prefix subscriber
+  updates survive a later write failure, including an older blocked batch.
+  Retries resume completed native and activity-row phases instead of repeating
+  old termination cleanup over newer sends. Repaired updates precede newer
+  deltas and are returned once by quiet direct-client sync and event reads;
+  cancelled drain checkpoints, receive waits and explicit-sync recovery waits
+  retain progress and pending notifications. Completed pending-send cleanup retains its exact storage update
+  across chat-list conversion failures; message and Welcome notifications wait
+  for acknowledgement completion, and retries re-stage removed acknowledgements.
+  Push gossip never enters partial host-message summaries. Route rebuilds and
+  failed hydration token sweeps use bounded worker retries; one group's failed
+  sweep does not block other groups or route refresh. These retry queues are not durable.
+  Local termination preserves peer push records and tombstones. Late gossip
+  cannot re-add an absent account/leaf pair; hydrated open reconciles missed leaf
+  cleanup without treating unreadable groups as empty rosters.
+  A pass ending in disband retains preceding commits' activity before the terminal
+  row, without emitting the closing commit's incidental member removals.
+  Drained and retried batches retain committed activity even when an unrelated
+  publication fails. Publish confirmation commits retained anchors and native
+  membership cleanup before consuming its retry handle, preserving author
+  activity after transient storage failures. Inbound replay failure after confirmed
+  publication retains a session retry without changing the publish result.
+  Replay-only work remains visible to the convergence scheduler after its
+  one-shot notification is consumed, respecting terminal, unrecoverable and
+  pending-publication gates and the worker's existing error backoff.
+  Eviction realization commits its
+  marker, roster and queued-work cleanup together before emitting events.
+  Forgetting a group removes its queued projection work without blocking other
+  groups. Manual and scheduled retries preserve finalized subscriber updates
+  when later route, retention or checkpoint work fails. Maintenance reconciles
+  the final canonical local leaf when a batch terminates and then restores a copy,
+  without reviving previously failed obligations.
+  Rust consumers must handle the three new non-timeline `GroupEvent` variants.
+  Existing row IDs and correctly attributed stored rows remain unchanged;
+  no account reset or destructive history migration is required.
+
 - When a member lookup does not complete and the member's known inbox relay
   list has no usable relays, the invite now fails with "known member inbox
   relay list has no usable relays and its refresh did not complete" instead

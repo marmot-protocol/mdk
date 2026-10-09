@@ -10,6 +10,14 @@
   identity. No new query types or legacy-package admission. An unfinished empty
   batch can invoke the existing per-member fallback.
 
+
+- `OnboardingRepairProposalFfi.relay_repair` is a new optional field without
+  a binding default. Regenerate matching Swift/Kotlin bindings and pass `nil`
+  (Swift) or `null` (Kotlin) in host record initializers without a typed preview.
+- Native lifecycle events add `LocalGroupCopyTerminated`, `LocalGroupCopyRestored`,
+  and `GroupMemberLeavesRemoved`. Update exhaustive Swift/Kotlin event handling
+  and regenerate bindings with the matching native library. Restoration describes
+  retained-history repair, not automatic scheduler restoration of removed copies.
 - The optional opaque `ChatListDraftVersionFfi` object in
   `PresentedChatRowFfi.draft_version` correlates the presented row's draft
   metadata with a captured composer revision through
@@ -27,6 +35,16 @@
 
 ### Added
 
+- `Marmot::propose_onboarding_relay_repair` previews a lossless relay-list repair
+  without signing or publishing. `OnboardingRepairProposalFfi.relay_repair` carries
+  the typed before/after tags, exact diff, restored capabilities and ManualReview
+  mode. Optional passed-step previews retain readiness when dismissed
+  before approval.
+- Markdown tokens expose local-time timestamps through
+  `MarkdownInlineFfi::Timestamp { unix_seconds, style }` and all nine typed
+  `MarkdownTimestampStyleFfi` variants. Seconds remain signed and unformatted;
+  native renderers own locale/timezone formatting and visible relative-time
+  refresh. Update exhaustive inline switches with matching generated bindings.
 - `Marmot::message_reactions` returns complete local reaction details for one exact
   account/group/message, with one effective entry per sender/emoji and no
   conversation-preview cap. Missing, hidden, deleted, invalidated and
@@ -38,6 +56,15 @@
 
 - `retired_relay_hosts()` no longer includes `relay.damus.io`, and
   `classify_relay_endpoints` now reports it as `Allowed`.
+
+### Fixed
+
+- Android build preflight drains `rustup` output before accepting an installed
+  target, avoiding false missing-target errors from a broken pipe.
+
+- Group activity uses shared per-commit reaction targets for authors and peers,
+  including commits preceding a disband. See `marmot-app`'s Unreleased fixes
+  for projection and push-token behavior.
 
 ## 0.12.0 - 2026-10-02
 
