@@ -102,8 +102,9 @@ credential variables empty for anonymous SOCKS5, or supply both for RFC 1929 use
 credential must contain 1 to 255 UTF-8 bytes without NUL. Partial credentials, credentials without an endpoint,
 hostnames, URL-form endpoints, and zero ports are rejected. Do not change these variables while the runtime is active.
 
-The policy covers relay publishing, account receive/history pools, directory relay clients, C NIP-46 signer sessions,
-and the shared HTTP clients for media, Open Ranking, and collectors (including audit uploads). Relay hostnames are
+The policy covers relay publishing, account receive/history pools, directory relay clients (including completion-aware
+reads), C NIP-46 signer sessions, and the shared HTTP clients for media, Open Ranking, and collectors (including audit
+uploads). Completion-aware reads retain pre-admission wire-event counts under the proxy transport. Relay hostnames are
 resolved by the proxy. HTTP clients still resolve and validate destinations locally, then send the pinned IP through
 SOCKS5 while retaining the original HTTP Host header and TLS identity. The proxy is an explicitly trusted egress.
 
