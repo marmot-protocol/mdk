@@ -4773,7 +4773,7 @@ pub async fn fetch_sticker_asset( &self, account_ref: String, sticker_ref: Stick
 
 Downloads one exact sticker after the account has its `(coordinate, shortcode, hash)` mapping. Hosts pass the typed reference from a timeline row; MDK never asks the host to parse tags. A missing mapping returns `StickerNotFound` rather than fetching an unvalidated URL.
 
-[Source](src/commands/sticker.rs#L100)
+[Source](src/commands/sticker.rs#L104)
 
 ### `Marmot::fetch_sticker_pack`
 
@@ -4793,7 +4793,7 @@ pub async fn import_signal_sticker_pack( &self, account_ref: String, signal_link
 
 Validates a canonical HTTPS Signal pack link, then refuses before any network call. The pinned importer dials Signal's CDN without address pinning, so this command does not download, upload, or publish until that fetch can be injected. The Signal key stays in memory only and is not persisted.
 
-[Source](src/commands/sticker.rs#L87)
+[Source](src/commands/sticker.rs#L91)
 
 ### `Marmot::install_sticker_pack`
 
