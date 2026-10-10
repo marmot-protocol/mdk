@@ -90,7 +90,7 @@ pub struct AccountAttachmentCursor {
     query: AccountAttachmentQuery,
     key: (i64, String, String, i64),
 }
-macro_rules! private_debug {
+macro_rules! private_formatter {
     ($ty:ty,$name:literal) => {
         impl std::fmt::Debug for $ty {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -99,8 +99,8 @@ macro_rules! private_debug {
         }
     };
 }
-private_debug!(AccountAttachmentVersion, "AccountAttachmentVersion");
-private_debug!(AccountAttachmentCursor, "AccountAttachmentCursor");
+private_formatter!(AccountAttachmentVersion, "AccountAttachmentVersion");
+private_formatter!(AccountAttachmentCursor, "AccountAttachmentCursor");
 #[derive(Clone)]
 pub struct AccountAttachmentEntry {
     pub metadata_limited: bool,
