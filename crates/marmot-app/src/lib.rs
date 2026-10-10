@@ -606,6 +606,8 @@ pub(crate) struct GeneratedAccountBootstrapPublication {
     pub relay_and_follow_duration: Duration,
     pub default_profile_duration: Duration,
     pub indexer_copy: Option<PublicIndexerCopy>,
+    /// The published profile, stamped with its signed kind-0 `created_at`.
+    pub profile: UserProfileMetadata,
 }
 
 pub(crate) struct PublicIndexerCopy {
@@ -2321,19 +2323,31 @@ impl MarmotApp {
             .max()
             .unwrap_or_default();
         let default_profile_duration = batch.request_durations[3];
+        // Every record was already sent. Complete the acknowledged ones even
+        // when another record fails, then report the first failure.
         let mut completion = QuorumCancelledDelivery::new(relay_client.clone(), account_id.clone());
+        let mut failure = None;
         for ((record_kind, outcome), request) in
             record_kinds.into_iter().zip(outcomes).zip(&requests)
         {
-            let outcome = outcome?;
-            if outcome.accepted.is_empty() {
-                return Err(AppError::Publish(format!(
-                    "relay acknowledged zero events for bootstrap record {record_kind}"
-                )));
+            match outcome {
+                Ok(outcome) if !outcome.accepted.is_empty() => {
+                    completion.add(&request.event, &request.endpoints, &outcome);
+                }
+                Ok(_) => {
+                    failure.get_or_insert(AppError::Publish(format!(
+                        "relay acknowledged zero events for bootstrap record {record_kind}"
+                    )));
+                }
+                Err(error) => {
+                    failure.get_or_insert(error.into());
+                }
             }
-            completion.add(&request.event, &request.endpoints, &outcome);
         }
         self.spawn_quorum_cancelled_delivery(completion);
+        if let Some(failure) = failure {
+            return Err(failure);
+        }
         let relays = bootstrap
             .default_relays
             .iter()
@@ -2378,7 +2392,16 @@ impl MarmotApp {
                     .collect(),
             },
         )?;
-        self.remember_directory_profile(&account.account_id_hex, profile)?;
+        // Cache the signed kind-0 timestamp: retries can author it ahead of the
+        // clock, and a reopened app recovers its timestamp floor from here.
+        let mut profile = profile.clone();
+        if let Some(request) = requests
+            .iter()
+            .find(|request| request.event.kind == KIND_NOSTR_METADATA)
+        {
+            profile.created_at = request.event.created_at;
+        }
+        self.remember_directory_profile(&account.account_id_hex, &profile)?;
         let indexer_events = requests
             .into_iter()
             .filter(|request| request.event.kind != KIND_NOSTR_CONTACT_LIST)
@@ -2394,6 +2417,7 @@ impl MarmotApp {
                 indexer_events,
                 indexer_endpoints,
             ),
+            profile,
         })
     }
 
@@ -2808,17 +2832,29 @@ impl MarmotApp {
                 "relay-list publication returned incomplete outcomes".into(),
             ));
         }
+        // Every record was already sent. Complete the acknowledged ones even
+        // when another record fails, then report the first failure.
         let mut completion = QuorumCancelledDelivery::new(relay_client.clone(), account_id.clone());
+        let mut failure = None;
         for (outcome, request) in outcomes.into_iter().zip(&requests) {
-            let outcome = outcome?;
-            if outcome.accepted.is_empty() {
-                return Err(AppError::Publish(
-                    "relay acknowledged zero account relay-list events".to_owned(),
-                ));
+            match outcome {
+                Ok(outcome) if !outcome.accepted.is_empty() => {
+                    completion.add(&request.event, &request.endpoints, &outcome);
+                }
+                Ok(_) => {
+                    failure.get_or_insert(AppError::Publish(
+                        "relay acknowledged zero account relay-list events".to_owned(),
+                    ));
+                }
+                Err(error) => {
+                    failure.get_or_insert(error.into());
+                }
             }
-            completion.add(&request.event, &request.endpoints, &outcome);
         }
         self.spawn_quorum_cancelled_delivery(completion);
+        if let Some(failure) = failure {
+            return Err(failure);
+        }
 
         // The signed replaceable events above are the authoritative effect of
         // this operation. Persist their declared state directly after every

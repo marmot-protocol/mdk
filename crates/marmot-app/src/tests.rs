@@ -906,7 +906,7 @@ impl ScriptedPushRelayClient {
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn fail_publishes_of_kind(&self, kind: u64) {
+    pub(crate) fn fail_publishes_of_kind(&self, kind: u64) {
         *self.fail_publish_kind.lock().unwrap() = Some(kind);
     }
 
@@ -6643,6 +6643,15 @@ async fn partial_generated_bootstrap_keeps_the_journaled_identity_for_retry() {
     runtime.shutdown().await;
 }
 
+/// Bootstrap re-stamps the cached profile with its signed kind-0 timestamp,
+/// so a later setup call can return a newer `created_at` for the same profile.
+fn profile_content(profile: &Option<UserProfileMetadata>) -> Option<UserProfileMetadata> {
+    profile.clone().map(|profile| UserProfileMetadata {
+        created_at: 0,
+        ..profile
+    })
+}
+
 #[tokio::test]
 async fn generated_identity_returns_before_bootstrap_publication_unblocks() {
     let directory = tempfile::tempdir().unwrap();
@@ -6699,7 +6708,10 @@ async fn generated_identity_returns_before_bootstrap_publication_unblocks() {
         .await
         .unwrap();
     assert_eq!(repeated.account, result.account);
-    assert_eq!(repeated.profile, result.profile);
+    assert_eq!(
+        profile_content(&repeated.profile),
+        profile_content(&result.profile)
+    );
     assert_eq!(repeated.key_package_bytes, result.key_package_bytes);
     assert_eq!(repeated.readiness, AccountSetupReadiness::Publishing);
     assert_eq!(
@@ -7009,7 +7021,10 @@ async fn concurrent_generated_identity_calls_converge_on_one_local_attempt() {
     let first = first.unwrap();
     let second = second.unwrap();
     assert_eq!(first.account, second.account);
-    assert_eq!(first.profile, second.profile);
+    assert_eq!(
+        profile_content(&first.profile),
+        profile_content(&second.profile)
+    );
     assert_eq!(first.key_package_bytes, second.key_package_bytes);
     assert_eq!(
         AccountHome::open(directory.path()).accounts().unwrap(),

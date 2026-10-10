@@ -8104,7 +8104,7 @@ impl AccountManager {
         if let Some(copy) = publication.indexer_copy {
             self.app.spawn_public_indexer_copy(copy);
         }
-        Ok((publication.status, Some(profile)))
+        Ok((publication.status, Some(publication.profile)))
     }
 
     fn setup_failure_can_roll_back(

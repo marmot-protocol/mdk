@@ -337,3 +337,106 @@ async fn reopened_app_authors_after_previously_published_versions() {
         );
     }
 }
+
+/// Wait until `SLOW` accepted every `kind` record on its own.
+async fn wait_for_slow_acceptance(relay: &ScriptedPushRelayClient, kinds: &[u64]) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let routes = relay.accepted_routes();
+            if kinds
+                .iter()
+                .all(|kind| routes.contains(&(*kind, vec![endpoint(SLOW)])))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "acknowledged kinds {kinds:?} never reached the cut-off relay; routes: {:?}",
+            relay.accepted_routes()
+        )
+    });
+}
+
+#[tokio::test]
+async fn relay_list_batch_completes_acknowledged_records_when_another_fails() {
+    for (failing, acknowledged) in [
+        (KIND_MARMOT_INBOX_RELAY_LIST, KIND_NIP65_RELAY_LIST),
+        (KIND_NIP65_RELAY_LIST, KIND_MARMOT_INBOX_RELAY_LIST),
+    ] {
+        let (_directory, app, relay, label) = quorum_app();
+        relay.fail_publishes_of_kind(failing);
+
+        app.publish_account_relay_lists(&label, two_relay_bootstrap())
+            .await
+            .expect_err("a failed record still fails the save");
+
+        wait_for_slow_acceptance(&relay, &[acknowledged]).await;
+    }
+}
+
+#[tokio::test]
+async fn bootstrap_batch_completes_acknowledged_records_when_another_fails() {
+    let (_directory, app, relay, label) = quorum_app();
+    relay.fail_publishes_of_kind(KIND_NIP65_RELAY_LIST);
+
+    app.publish_generated_account_bootstrap(
+        &label,
+        two_relay_bootstrap(),
+        &UserProfileMetadata {
+            name: Some("Chosen Heron".into()),
+            created_at: 42,
+            ..UserProfileMetadata::default()
+        },
+    )
+    .await
+    .is_err()
+    .then_some(())
+    .expect("a failed record still fails bootstrap");
+
+    wait_for_slow_acceptance(
+        &relay,
+        &[
+            KIND_MARMOT_INBOX_RELAY_LIST,
+            KIND_NOSTR_CONTACT_LIST,
+            KIND_NOSTR_METADATA,
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn repeated_bootstrap_caches_the_authored_profile_timestamp() {
+    let (_directory, app, relay, label) = quorum_app();
+    let profile = UserProfileMetadata {
+        name: Some("Chosen Heron".into()),
+        created_at: 42,
+        ..UserProfileMetadata::default()
+    };
+    for _ in 0..3 {
+        app.publish_generated_account_bootstrap(&label, two_relay_bootstrap(), &profile)
+            .await
+            .unwrap();
+    }
+
+    let authored = relay
+        .attempted_events()
+        .into_iter()
+        .filter(|event| event.kind == KIND_NOSTR_METADATA)
+        .map(|event| event.created_at)
+        .max()
+        .unwrap();
+    let account_id_hex = app.account_home().account(&label).unwrap().account_id_hex;
+    let cached = app
+        .directory_entry_for_account_id(&account_id_hex)
+        .unwrap()
+        .and_then(|entry| entry.profile)
+        .unwrap();
+    assert_eq!(
+        cached.created_at, authored,
+        "bootstrap must cache the signed kind-0 timestamp so a reopen floor stays ahead"
+    );
+}
