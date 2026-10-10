@@ -55,7 +55,6 @@ A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_WINDOW_P
 A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MEMORY_ROUTES
 A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_SET_ASIDE_IDS
 A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_SET_ASIDE_TOTAL
-A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_HELD_PASSES
 A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT
 A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT
 A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES

@@ -110,17 +110,14 @@ const SDK_RECONCILIATION_WINDOW_ROUNDS: usize = 6;
 const SDK_RECONCILIATION_WINDOW_PROBES: usize = 8;
 /// Routes whose advisory acquisition memory one client keeps.
 const SDK_RECONCILIATION_MEMORY_ROUTES: usize = 1024;
-/// IDs one route keeps set aside as fetched, refused or withheld without
-/// admission: as many as one comparison can name, so the list never fills
-/// while those IDs are still missing.
+/// IDs one route keeps set aside per relay it compares with, fetched, refused
+/// or withheld without admission: as many as one relay's comparison can name,
+/// so the list fills only past what every relay's inventory could hold.
 const SDK_RECONCILIATION_SET_ASIDE_IDS: usize = SDK_RECONCILIATION_SET_LIMIT;
-/// Set-aside IDs across all routes; past it the least recently used route's
-/// memory is dropped, and that route sets its IDs aside again.
+/// Set-aside IDs across all routes, and the most one route keeps; past it the
+/// least recently used route's memory is dropped, and that route sets its IDs
+/// aside again.
 const SDK_RECONCILIATION_SET_ASIDE_TOTAL: usize = 65_536;
-/// Passes in a row an oldest-first route may return nothing on purpose, to
-/// wait for a search or a delivery boundary. Recovery parks a route after
-/// three quiet passes; the next pass returns what it fetched.
-const SDK_RECONCILIATION_HELD_PASSES: u8 = 2;
 
 /// Memory-only hints for fetching one group route's gap oldest-first. Losing
 /// them costs at most extra narrowing or one more fetch of an event the
@@ -139,8 +136,6 @@ struct AcquisitionRouteMemory {
     search_high: Option<u64>,
     /// Passes in a row whose search did not finish.
     unfinished_passes: u8,
-    /// Passes in a row that returned nothing.
-    empty_passes: u8,
     /// When this route's memory was last used, for eviction.
     last_used: u64,
     /// The average event size this route returned last, so a window fits the
@@ -165,7 +160,6 @@ struct AcquisitionHints {
     seed: Option<WindowSeed>,
     event_bytes: Option<usize>,
     unfinished_passes: u8,
-    empty_passes: u8,
     set_aside: Vec<EventId>,
 }
 
@@ -219,13 +213,12 @@ enum AcquisitionUpdate {
 }
 
 /// IDs one pass can fetch when events average `event_bytes`.
-/// The oldest timestamp among a pass's returned events.
-fn sdk_events_oldest(events: &[(RelayUrl, NostrTransportEvent)]) -> u64 {
-    events
-        .iter()
-        .map(|(_, event)| event.created_at)
-        .min()
-        .unwrap_or(u64::MAX)
+/// The most IDs a route compared with `relays` relays keeps set aside: the
+/// union of their inventories can name as many as each names alone, summed.
+fn set_aside_cap(relays: usize) -> usize {
+    SDK_RECONCILIATION_SET_ASIDE_IDS
+        .saturating_mul(relays.max(1))
+        .min(SDK_RECONCILIATION_SET_ASIDE_TOTAL)
 }
 
 /// Drop the least recently used route's memory.
@@ -274,6 +267,8 @@ fn window_probes(
         Some(None) => (1..=probes_wanted)
             .map(|power| high - width / (1u64 << (power * 3 / 2).min(62)).max(1))
             .collect(),
+        // A bracket narrower than a round probes every second in it.
+        None if width <= probes_wanted => (low + 1..high).collect(),
         None => {
             let wanted = target.saturating_sub(low_count) as f64;
             let between = high_count.saturating_sub(low_count).max(1) as f64;
@@ -1298,15 +1293,11 @@ impl NostrSdkRelayClient {
             seed: window_seed,
             event_bytes,
             unfinished_passes,
-            empty_passes,
             set_aside,
         } = route_key
             .as_ref()
             .map(|key| self.acquisition_memory_for(key, &remote))
             .unwrap_or_default();
-        // A pass may return nothing on purpose only while the route has not
-        // already done so for long; then it returns what it fetched.
-        let may_hold = empty_passes < SDK_RECONCILIATION_HELD_PASSES;
         let skip = set_aside.iter().copied().collect::<HashSet<_>>();
         let target = window_target(event_bytes);
         let answering = remote_by_endpoint.keys().cloned().collect::<Vec<_>>();
@@ -1314,6 +1305,10 @@ impl NostrSdkRelayClient {
         let mut skip_pass = false;
         // The fresh IDs this pass fetches oldest-first, when it does.
         let window: Option<HashSet<EventId>> = match &route_key {
+            // More never-admitted IDs than every relay's inventory could hold
+            // set aside: ID-order selection still reaches every one of them,
+            // where a window would keep finding the ones it could not record.
+            Some(_) if set_aside.len() >= set_aside_cap(answering.len()) => None,
             // A gap within one pass by count is still one window: its bytes
             // may not fit, and then only a time prefix may be returned.
             Some(_) if remote.len() - remote.intersection(&skip).count() <= target => {
@@ -1338,7 +1333,13 @@ impl NostrSdkRelayClient {
                     )
                     .await
                 {
-                    None => None,
+                    // No relay answered a probe: the gap's order is unknown,
+                    // so this pass fetches nothing rather than an ID-order
+                    // slice. Its IDs stay fetchable for the next.
+                    None => {
+                        skip_pass = true;
+                        None
+                    }
                     Some(WindowSearch::Fits {
                         until,
                         ids,
@@ -1360,8 +1361,7 @@ impl NostrSdkRelayClient {
                         high,
                         over_ids,
                     }) => {
-                        let fetch_anyway =
-                            high.saturating_sub(low) <= 1 || unfinished_passes >= 1 || !may_hold;
+                        let fetch_anyway = high.saturating_sub(low) <= 1 || unfinished_passes >= 1;
                         acquisition_update = AcquisitionUpdate::Unfinished {
                             low,
                             high,
@@ -1417,11 +1417,6 @@ impl NostrSdkRelayClient {
         drop(remote);
         // Requested IDs every claimant answered without.
         let mut withheld = HashSet::new();
-        // IDs this pass tried, and those a budget cut short. The next pass
-        // leads with what a budget cut and continues with what was never
-        // tried; anything else it tried and did not get, it may never get.
-        let mut attempted = HashSet::new();
-        let mut cut_short = HashSet::new();
         // IDs whose events can never fit the single-object ceiling.
         let mut over_ceiling = HashSet::new();
         let mut sdk_events = Vec::new();
@@ -1488,7 +1483,6 @@ impl NostrSdkRelayClient {
                         // This object can never fit the pass allowance. Rotate
                         // past it so smaller missing IDs remain reachable;
                         // durable inventory still keeps it eligible on wrap.
-                        attempted.insert(event_id);
                         over_ceiling.insert(event_id);
                         progress.save_cursor(Some(event_id.to_bytes()))?;
                         continue;
@@ -1497,7 +1491,6 @@ impl NostrSdkRelayClient {
                     // the first candidate on the next pass.
                     break;
                 }
-                attempted.insert(event_id);
                 progress.save_cursor(Some(event_id.to_bytes()))?;
                 spent_items += 1;
                 spent_bytes += event_bytes;
@@ -1700,17 +1693,8 @@ impl NostrSdkRelayClient {
                         .copied(),
                 );
             }
-            attempted.extend(batch.iter().copied());
             if limited && single_object_request && !returned_ids.contains(&event_id.to_hex()) {
                 over_ceiling.insert(event_id);
-            }
-            if limited && !single_object_request {
-                cut_short.extend(
-                    batch
-                        .iter()
-                        .filter(|id| !returned_ids.contains(&id.to_hex()))
-                        .copied(),
-                );
             }
             let first_unreturned = batch
                 .iter()
@@ -1756,14 +1740,16 @@ impl NostrSdkRelayClient {
         let fetched_event_bytes =
             (!sdk_events.is_empty()).then(|| returned_bytes / sdk_events.len().max(1));
         if let Some(window) = &window {
-            // Only what the next pass will fetch holds delivery back: an event
-            // over the single-object ceiling, one every relay withheld, or one
-            // only an unreachable relay claims must not stall the rest.
+            // Everything in the window not returned holds delivery back,
+            // including IDs a request timed out on or a relay failed to serve:
+            // they may still arrive. Only an event every claimant answered
+            // without, or one over the single-object ceiling, does not.
             let left_behind = window
                 .iter()
                 .filter(|id| {
                     !returned_ids.contains(&id.to_hex())
-                        && (!attempted.contains(*id) || cut_short.contains(*id))
+                        && !withheld.contains(*id)
+                        && !over_ceiling.contains(*id)
                 })
                 .copied()
                 .collect::<HashSet<_>>();
@@ -1780,25 +1766,18 @@ impl NostrSdkRelayClient {
                         deadline,
                     )
                     .await;
-                // An unknown boundary is not permission: hold everything, as
-                // when nothing is safe, until the route has waited long enough
-                // that recovery would park it.
-                let keep_up_to = match boundary {
-                    Some(boundary) if may_hold || boundary >= sdk_events_oldest(&sdk_events) => {
-                        Some(boundary)
+                // An unknown boundary is not permission. A route that cannot
+                // prove an order returns nothing; its events stay fetchable,
+                // and recovery parks it with its notice if that persists,
+                // rather than admit newer commits ahead of older messages.
+                let boundary = boundary.unwrap_or(0);
+                sdk_events.retain(|(_, event)| {
+                    let keep = event.created_at <= boundary;
+                    if !keep {
+                        returned_ids.remove(&event.id);
                     }
-                    Some(_) | None if may_hold => Some(0),
-                    _ => None,
-                };
-                if let Some(boundary) = keep_up_to {
-                    sdk_events.retain(|(_, event)| {
-                        let keep = event.created_at <= boundary;
-                        if !keep {
-                            returned_ids.remove(&event.id);
-                        }
-                        keep
-                    });
-                }
+                    keep
+                });
             }
         }
         // An ID an endpoint claimed but this pass did not return is still debt
@@ -1849,13 +1828,7 @@ impl NostrSdkRelayClient {
                 },
                 other => other,
             };
-            self.remember_acquisition(
-                key,
-                update,
-                fetched_event_bytes,
-                !sdk_events.is_empty(),
-                tried,
-            );
+            self.remember_acquisition(key, update, fetched_event_bytes, answering.len(), tried);
         }
         // Negentropy reports a set. MLS input is sequential, so replay the
         // materialized difference in the same authored-time/id order used by
@@ -1919,7 +1892,6 @@ impl NostrSdkRelayClient {
             }),
             event_bytes: route.event_bytes,
             unfinished_passes: route.unfinished_passes,
-            empty_passes: route.empty_passes,
             set_aside: route.set_aside.iter().copied().collect(),
         }
     }
@@ -1929,7 +1901,7 @@ impl NostrSdkRelayClient {
         key: AcquisitionRouteKey,
         update: AcquisitionUpdate,
         event_bytes: Option<usize>,
-        returned_any: bool,
+        relays: usize,
         tried: Vec<EventId>,
     ) {
         let mut memory = self
@@ -1963,18 +1935,12 @@ impl NostrSdkRelayClient {
             }
             AcquisitionUpdate::None => {}
         }
-        route.empty_passes = if returned_any {
-            0
-        } else {
-            route.empty_passes.saturating_add(1)
-        };
         if event_bytes.is_some() {
             route.event_bytes = event_bytes;
         }
+        let cap = set_aside_cap(relays);
         for id in tried {
-            if route.set_aside.len() < SDK_RECONCILIATION_SET_ASIDE_IDS
-                && !route.set_aside.contains(&id)
-            {
+            if route.set_aside.len() < cap && !route.set_aside.contains(&id) {
                 route.set_aside.push_back(id);
             }
         }
@@ -2111,6 +2077,8 @@ impl NostrSdkRelayClient {
             let probes = window_probes(low, high, target, first_round_step.take());
             (search_low, search_high) = (low.0, high.0);
             if probes.is_empty() {
+                // Nothing left to probe is a finished bracket, not a silence.
+                ever_answered = true;
                 break;
             }
             let rounds = futures::future::join_all(probes.iter().map(|probe| {
@@ -6138,6 +6106,35 @@ mod tests {
         assert_eq!(second[0].event.id, published[0].id.to_hex());
         sdk.client.shutdown().await;
         relay.shutdown();
+    }
+
+    #[test]
+    fn set_aside_cap_covers_the_union_of_relay_inventories() {
+        // Each relay's comparison names at most the set limit, but the union
+        // across relays can name that many per relay.
+        assert_eq!(set_aside_cap(0), SDK_RECONCILIATION_SET_ASIDE_IDS);
+        assert_eq!(set_aside_cap(1), SDK_RECONCILIATION_SET_ASIDE_IDS);
+        assert_eq!(set_aside_cap(2), 2 * SDK_RECONCILIATION_SET_ASIDE_IDS);
+        assert_eq!(set_aside_cap(8), SDK_RECONCILIATION_SET_ASIDE_TOTAL);
+        let client = NostrSdkRelayClient::new(Client::builder().build());
+        let key = AcquisitionRouteKey {
+            account_id: MemberId::new(vec![0xa1; 32]),
+            transport_group_id: vec![0xc3; 32],
+        };
+        let ids = (0..SDK_RECONCILIATION_SET_ASIDE_IDS + 1_000)
+            .map(|value| {
+                let mut bytes = [0u8; 32];
+                bytes[24..].copy_from_slice(&(value as u64).to_be_bytes());
+                EventId::from_byte_array(bytes)
+            })
+            .collect::<Vec<_>>();
+        client.remember_acquisition(key.clone(), AcquisitionUpdate::None, None, 2, ids.clone());
+        let remote = ids.iter().copied().collect::<HashSet<_>>();
+        assert_eq!(
+            client.acquisition_memory_for(&key, &remote).set_aside.len(),
+            ids.len(),
+            "two relays' inventories fit"
+        );
     }
 
     #[test]
