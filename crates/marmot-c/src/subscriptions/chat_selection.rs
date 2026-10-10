@@ -1,7 +1,8 @@
 //! Opaque account-local fixed-view intent. Free only when no call is in flight.
 use super::*;
 use crate::types::chat_window::{
-    MarmotChatListView, MarmotChatSelectionPage, MarmotChatSelectionSummary,
+    MarmotChatFolderSelectionRule, MarmotChatListView, MarmotChatSelectionPage,
+    MarmotChatSelectionSummary,
 };
 
 pub struct MarmotChatListSelection {
@@ -12,6 +13,38 @@ impl Drop for MarmotChatListSelection {
     fn drop(&mut self) {
         self.inner.close();
     }
+}
+
+/// Capture the complete version-1 existing-folder rule. Same lifetime, paging
+/// and remove-only revalidation contract as fixed-view selection.
+/// # Safety
+/// client/account_ref/rule and its borrowed inputs must be live; out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_capture_chat_folder_selection(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    rule: *const MarmotChatFolderSelectionRule,
+    out: *mut *mut MarmotChatListSelection,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let rule = try_arg!(unsafe { rule.as_ref() }.ok_or(MarmotStatus::NullPointer));
+        let rule = try_arg!(unsafe { rule.to_ffi() });
+        match client.block_on(client.marmot.capture_chat_folder_selection(account, rule)) {
+            Ok(inner) => unsafe {
+                write_handle(
+                    MarmotChatListSelection {
+                        inner,
+                        runtime: client.runtime.handle().clone(),
+                    },
+                    out,
+                )
+            },
+            Err(error) => status_from_error(&error),
+        }
+    })
 }
 
 /// Capture all eligible IDs in one fixed native view; no display-row hydration.

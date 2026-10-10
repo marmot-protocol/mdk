@@ -143,10 +143,41 @@ free functions; free the handle only without active calls, before its client.
 statuses96,97 and98 without renumbering existing statuses. Ship the generated
 header, Swift/Kotlin source and matching native library together.
 
-This API accepts fixed native views only. It does not evaluate arbitrary saved
-folder expressions, resolve complete member/text inputs, aggregate per-action
-eligibility or provide a filtered live window. Those requirements remain open;
-hosts must not replace them with filtering only the loaded display rows.
+The fixed-view entry point remains unchanged. `capture_chat_folder_selection`
+adds the following existing-folder subset; arbitrary composable expressions,
+per-action eligibility aggregation and filtered live windows remain open.
+
+### Complete existing-folder selection
+
+`ChatFolderSelectionRule.version` must be1. Member IDs (maximum256) are exactly
+32-byte account identities represented as hexadecimal; include/exclude group IDs
+(maximum1024 each) are variable-length nonempty even hexadecimal strings up to512
+characters. Uppercase IDs normalize to lowercase. The keyword is at most1024 UTF-8
+bytes, trimmed once; empty or whitespace-only means absent. Excessive/malformed
+inputs and unsupported versions return `ChatSelectionInvalidFilter` (C status99).
+
+The member-any and keyword criteria combine with OR. Unread-only, groups-only,
+archive-side and effective mute constraints combine with AND. With no member or
+keyword criteria, unread/groups/archive categories can stand alone; an otherwise
+empty automatic rule matches nothing. Manual includes bypass automatic criteria,
+including archive/mute, but cannot resurrect missing, blocked or departed chats.
+Manual exclusions win over both automatic and manual inclusion. Ordering reuses
+native pin/activity keys, and rules are frozen in the handle: recapture after an edit.
+
+Keywords match the MDK-selected literal title and description using Unicode default
+whole-string lowercase and literal substring containment. There is no regex, SQL
+wildcard, accent or compatibility folding. Localized fallback labels are not literal
+metadata. Display strings remain unchanged. Roster matching uses a separate complete
+current-roster index, not the two-person peer-presentation table. Engine writes,
+raw restores/imports and deletes invalidate or atomically replace those inputs;
+upgrade/backfill runs in batches of50 without network or message-history access.
+
+Capture fails with `ChatPresentationNotReady` when required roster/classification/text
+evidence is unknown or stale. Keyword capture and revalidation also fence shared
+profile catch-up before and after the account query. No partially complete selection
+is published. Counts/pages are frozen intent; revalidation only removes ids that
+no longer match, supersedes old pages and does not authorize any mutation. Every
+bulk command must still validate current command-specific permissions.
 
 ## Existing row gestures
 

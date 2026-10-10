@@ -4,6 +4,109 @@ use crate::memory::{CFree, free_c_string, owned_c_string};
 use crate::types::presentation::MarmotPresentedChatRow;
 use marmot_uniffi::conversions::*;
 use std::ffi::c_char;
+
+/// Borrowed input. Keep all strings/arrays live through the capture call; the
+/// library copies them and never frees caller memory. NULL keyword means absent.
+#[repr(C)]
+pub struct MarmotChatFolderSelectionRule {
+    pub version: u32,
+    pub include_member_ids: *const *const c_char,
+    pub include_member_ids_len: usize,
+    pub keyword: *const c_char,
+    pub unread_only: u8,
+    pub groups_only: u8,
+    pub archived_only: u8,
+    pub include_muted: u8,
+    pub manual_include_ids: *const *const c_char,
+    pub manual_include_ids_len: usize,
+    pub manual_exclude_ids: *const *const c_char,
+    pub manual_exclude_ids_len: usize,
+}
+impl MarmotChatFolderSelectionRule {
+    /// # Safety
+    /// Every non-NULL pointer must refer to the stated live borrowed input.
+    pub(crate) unsafe fn to_ffi(&self) -> Result<ChatFolderSelectionRuleFfi, crate::MarmotStatus> {
+        // Reject excessive lengths before pointer traversal or allocation.
+        if self.version != 1
+            || self.include_member_ids_len > 256
+            || self.manual_include_ids_len > 1024
+            || self.manual_exclude_ids_len > 1024
+        {
+            crate::status::set_last_error("invalid folder rule version or excessive input counts");
+            return Err(crate::MarmotStatus::ChatSelectionInvalidFilter);
+        }
+        let value = ChatFolderSelectionRuleFfi {
+            version: self.version,
+            include_member_ids: unsafe {
+                crate::memory::str_array(self.include_member_ids, self.include_member_ids_len)
+            }?,
+            keyword: unsafe { crate::memory::optional_str(self.keyword) }?,
+            unread_only: self.unread_only != 0,
+            groups_only: self.groups_only != 0,
+            archived_only: self.archived_only != 0,
+            include_muted: self.include_muted != 0,
+            manual_include_ids: unsafe {
+                crate::memory::str_array(self.manual_include_ids, self.manual_include_ids_len)
+            }?,
+            manual_exclude_ids: unsafe {
+                crate::memory::str_array(self.manual_exclude_ids, self.manual_exclude_ids_len)
+            }?,
+        };
+        value
+            .validate()
+            .map_err(|error| crate::status::status_from_error(&error))?;
+        Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod folder_input_tests {
+    use super::*;
+    fn rule() -> MarmotChatFolderSelectionRule {
+        MarmotChatFolderSelectionRule {
+            version: 1,
+            include_member_ids: std::ptr::null(),
+            include_member_ids_len: 0,
+            keyword: std::ptr::null(),
+            unread_only: 0,
+            groups_only: 0,
+            archived_only: 0,
+            include_muted: 0,
+            manual_include_ids: std::ptr::null(),
+            manual_include_ids_len: 0,
+            manual_exclude_ids: std::ptr::null(),
+            manual_exclude_ids_len: 0,
+        }
+    }
+    #[test]
+    fn excessive_input_counts_fail_before_pointer_traversal() {
+        let mut input = rule();
+        input.include_member_ids_len = 257;
+        input.include_member_ids = std::ptr::dangling();
+        assert!(matches!(
+            unsafe { input.to_ffi() },
+            Err(crate::MarmotStatus::ChatSelectionInvalidFilter)
+        ));
+        input = rule();
+        input.manual_include_ids_len = 1025;
+        assert!(matches!(
+            unsafe { input.to_ffi() },
+            Err(crate::MarmotStatus::ChatSelectionInvalidFilter)
+        ));
+    }
+    #[test]
+    fn borrowed_arrays_and_byte_booleans_follow_c_input_contract() {
+        let mut input = rule();
+        input.include_muted = 255;
+        let value = unsafe { input.to_ffi() }.unwrap();
+        assert!(value.include_muted);
+        input.manual_include_ids_len = 1;
+        assert!(matches!(
+            unsafe { input.to_ffi() },
+            Err(crate::MarmotStatus::NullPointer)
+        ));
+    }
+}
 c_mirror! { MarmotChatSelectionSummary from ChatSelectionSummaryFfi, free marmot_chat_selection_summary_free {
     copy revision: u64,
     copy count: u64,

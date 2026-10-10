@@ -59,8 +59,9 @@ impl GroupStorage for SqliteAccountStorage {
     }
 
     fn put_group(&self, group: &Group) -> StorageResult<()> {
-        self.lock()?
-            .execute_cached(
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            conn.execute_cached(
                 "INSERT INTO cgka_groups (id, epoch, record)
                  VALUES (?1, ?2, ?3)
                  ON CONFLICT(id) DO UPDATE SET
@@ -73,7 +74,8 @@ impl GroupStorage for SqliteAccountStorage {
                 ],
             )
             .storage()?;
-        Ok(())
+            crate::chat_list::folders::replace_roster(&conn, group)
+        })
     }
 
     fn get_group(&self, id: &GroupId) -> StorageResult<Group> {

@@ -328,6 +328,8 @@ pub enum MarmotKitError {
     ChatSelectionStale,
     #[error("chat selection pages require 1 to 200 IDs and an offset within the selection")]
     ChatSelectionInvalidPage,
+    #[error("invalid or unsupported bounded chat-folder selection rule")]
+    ChatSelectionInvalidFilter,
 }
 
 impl From<marmot_app::ChatSelectionError> for MarmotKitError {
@@ -338,6 +340,7 @@ impl From<marmot_app::ChatSelectionError> for MarmotKitError {
             E::Closed | E::Selection(S::StaleSelection) => Self::ChatSelectionClosed,
             E::StaleRevision => Self::ChatSelectionStale,
             E::Selection(S::InvalidPage) => Self::ChatSelectionInvalidPage,
+            E::Selection(S::InvalidFilter) => Self::ChatSelectionInvalidFilter,
             E::Selection(S::ProjectionNotReady) => Self::ChatPresentationNotReady,
             E::Selection(S::Storage(error)) => AppError::from(error).into(),
             E::App(error) => error.into(),

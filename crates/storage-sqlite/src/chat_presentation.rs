@@ -330,11 +330,29 @@ impl SqliteAccountStorage {
             let changed = old
                 .as_ref()
                 .is_none_or(|old| old.value.presentation != value.presentation);
+            let title_fold = match &value.presentation.title {
+                PresentationText::Literal(text) => crate::chat_list::folders::fold_literal(text),
+                // Localized fallback labels are not literal searchable metadata.
+                _ => String::new(),
+            };
+            let description: String = conn
+                .query_row_cached(
+                    "SELECT profile_description FROM account_groups WHERE group_id_hex=?1",
+                    [&input.group_id_hex],
+                    |row| row.get(0),
+                )
+                .storage()?;
             conn.execute_cached(
                 "UPDATE chat_list_rows SET presentation_json = ?2,
-                    presentation_applied_source_revision = presentation_source_revision
+                    presentation_applied_source_revision = presentation_source_revision,
+                    folder_title_fold=?3, folder_description_fold=?4
                  WHERE group_id_hex = ?1",
-                params![input.group_id_hex, bytes],
+                params![
+                    input.group_id_hex,
+                    bytes,
+                    title_fold,
+                    crate::chat_list::folders::fold_literal(&description)
+                ],
             )
             .storage()?;
             if changed {

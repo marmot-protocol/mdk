@@ -82,12 +82,13 @@ pub use avatar_cache::{
     MAX_AVATAR_DIMENSION,
 };
 pub use chat_list::{
-    AccountAttentionTotal, AccountUnreadTotal, ChatConversationKind, ChatListAttachmentKind,
-    ChatListAvatar, ChatListCursor, ChatListMessageDeliveryState, ChatListMessagePreview,
-    ChatListPage, ChatListPageDirection, ChatListPageError, ChatListPageQuery, ChatListQuery,
-    ChatListRow, ChatListSelectionError, ChatListSelectionSnapshot, ChatListView,
-    ChatListWindowQuery, ChatListWindowRead, ChatPinError, ChatPinState,
-    ExistingDirectConversation, conversation_kind, select_reusable_direct_conversation,
+    AccountAttentionTotal, AccountUnreadTotal, ChatConversationKind, ChatFolderSelectionRule,
+    ChatListAttachmentKind, ChatListAvatar, ChatListCursor, ChatListMessageDeliveryState,
+    ChatListMessagePreview, ChatListPage, ChatListPageDirection, ChatListPageError,
+    ChatListPageQuery, ChatListQuery, ChatListRow, ChatListSelectionError,
+    ChatListSelectionSnapshot, ChatListView, ChatListWindowQuery, ChatListWindowRead, ChatPinError,
+    ChatPinState, ExistingDirectConversation, conversation_kind,
+    select_reusable_direct_conversation,
 };
 pub use chat_presentation::{
     CHAT_LIST_DRAFT_PREVIEW_CHARS, CHAT_PRESENTATION_BATCH_LIMIT, ChatListDraftPreview,

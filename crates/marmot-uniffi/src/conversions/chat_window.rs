@@ -2,6 +2,73 @@
 use super::PresentedChatRowFfi;
 use marmot_app as app;
 
+#[derive(Clone, uniffi::Record)]
+pub struct ChatFolderSelectionRuleFfi {
+    pub version: u32,
+    pub include_member_ids: Vec<String>,
+    pub keyword: Option<String>,
+    pub unread_only: bool,
+    pub groups_only: bool,
+    pub archived_only: bool,
+    pub include_muted: bool,
+    pub manual_include_ids: Vec<String>,
+    pub manual_exclude_ids: Vec<String>,
+}
+impl ChatFolderSelectionRuleFfi {
+    pub fn validate(&self) -> Result<(), crate::MarmotKitError> {
+        let native: app::ChatFolderSelectionRule = self.clone().into();
+        native
+            .validate()
+            .map_err(|_| crate::MarmotKitError::ChatSelectionInvalidFilter)
+    }
+}
+impl From<ChatFolderSelectionRuleFfi> for app::ChatFolderSelectionRule {
+    fn from(v: ChatFolderSelectionRuleFfi) -> Self {
+        Self {
+            version: v.version,
+            include_member_ids: v.include_member_ids,
+            keyword: v.keyword,
+            unread_only: v.unread_only,
+            groups_only: v.groups_only,
+            archived_only: v.archived_only,
+            include_muted: v.include_muted,
+            manual_include_ids: v.manual_include_ids,
+            manual_exclude_ids: v.manual_exclude_ids,
+        }
+    }
+}
+
+#[cfg(test)]
+mod folder_rule_tests {
+    use super::*;
+    #[test]
+    fn folder_conversion_preserves_flags_ids_and_literal_text() {
+        let value = ChatFolderSelectionRuleFfi {
+            version: 1,
+            include_member_ids: vec!["AB".repeat(32)],
+            keyword: Some(" 中文 ".into()),
+            unread_only: true,
+            groups_only: true,
+            archived_only: true,
+            include_muted: true,
+            manual_include_ids: vec!["aa".into()],
+            manual_exclude_ids: vec!["bb".into()],
+        };
+        value.validate().unwrap();
+        let native: app::ChatFolderSelectionRule = value.into();
+        assert!(
+            native.unread_only
+                && native.groups_only
+                && native.archived_only
+                && native.include_muted
+        );
+        assert_eq!(native.keyword.as_deref(), Some(" 中文 "));
+        assert_eq!(native.include_member_ids, ["AB".repeat(32)]);
+        assert_eq!(native.manual_include_ids, ["aa"]);
+        assert_eq!(native.manual_exclude_ids, ["bb"]);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct ChatSelectionSummaryFfi {
     pub revision: u64,

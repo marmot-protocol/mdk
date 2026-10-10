@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add complete existing-folder selection with native roster/text matching, bounded rule validation and remove-only revalidation. This does not yet add composable filtered live windows.
+
 ### Breaking changes
 
 - Attachment history adds `AttachmentRole` and the required `AttachmentEntry.role`
