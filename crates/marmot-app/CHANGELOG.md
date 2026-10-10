@@ -52,6 +52,10 @@
 
 ### Fixed
 
+- Catch-up downloads a large group backlog oldest first. When more history
+  is missing than one comparison pass fetches, the pass narrows to the oldest
+  part that fits, so commits no longer arrive ahead of older messages and move
+  a member's epoch past messages it can then never read (#2086).
 - Catch-up downloads missed group history in far fewer round trips. Each
   comparison pass now fetches up to 256 events (1 MiB), across all relays, in
   batched requests instead of 16 one-at-a-time requests, so a backlog of a few hundred

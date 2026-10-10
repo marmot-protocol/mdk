@@ -463,6 +463,44 @@ async fn large_gap_of_small_events_recovers_in_few_passes() {
     right.shutdown();
 }
 
+/// A route's comparison window as the app passes it: its 30-day inventory
+/// floor up to now, with the gaps below near the recent end.
+const SINCE: u64 = 1_700_000_000 - 30 * 24 * 60 * 60;
+const UNTIL: u64 = 1_700_200_000;
+
+/// Events at consecutive seconds from `start`, each about the size of an
+/// encrypted chat message, stored in a fresh relay database.
+async fn timed_events(
+    keys: &Keys,
+    start: u64,
+    count: usize,
+    label: &str,
+    database: &MemoryDatabase,
+) -> Vec<NostrReconciliationItem> {
+    let mut items = Vec::new();
+    for index in 0..count {
+        let event = EventBuilder::new(
+            Kind::MlsGroupMessage,
+            format!("{label}-{index}-{}", "x".repeat(1_200)),
+        )
+        .tags([Tag::custom("h", [hex::encode(ROUTE)])])
+        .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(
+            start + index as u64,
+        ))
+        .finalize(keys)
+        .unwrap();
+        database
+            .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+            .await
+            .unwrap();
+        items.push(NostrReconciliationItem {
+            event_id: event.id.to_bytes(),
+            created_at: event.created_at.as_secs(),
+        });
+    }
+    items
+}
+
 fn relay_database() -> MemoryDatabase {
     MemoryDatabase::with_opts(MemoryDatabaseOptions {
         events: true,
@@ -645,6 +683,261 @@ async fn large_event_cut_from_a_batch_leads_the_next_pass() {
     );
     sdk.client().shutdown().await;
     relay.shutdown();
+}
+
+/// A gap larger than one pass arrives from its oldest end: no pass returns an
+/// event newer than one still missing, so commits cannot carry a member's
+/// epoch past older messages it has not fetched (#2086).
+#[tokio::test]
+async fn a_gap_larger_than_one_pass_arrives_oldest_first() {
+    let keys = Keys::generate();
+    let database = relay_database();
+    let retained = timed_events(&keys, 1_700_000_000, 50, "retained", &database).await;
+    let missing = timed_events(&keys, 1_700_100_000, 700, "missing", &database).await;
+    let relay = LocalRelay::new(RelayBuilder::default().database(database));
+    relay.run().await.unwrap();
+    let (url, counts) = counted_proxy(relay.url().await.to_string()).await;
+    counts.latency_ms.store(40, Ordering::SeqCst);
+    let sdk = sdk_on(std::slice::from_ref(&url)).await;
+    let route = subscription(&[url]);
+    let cursor = Cursor::default();
+    let mut admitted = retained;
+    let mut pending = missing.clone();
+    let mut passes = 0;
+    let started = std::time::Instant::now();
+    while !pending.is_empty() && passes < 20 {
+        passes += 1;
+        let (_, events) = sdk
+            .reconcile_subscription(route.clone(), &admitted, SINCE, UNTIL, &cursor)
+            .await
+            .unwrap();
+        assert!(!events.is_empty(), "pass {passes} made no progress");
+        let newest_returned = events
+            .iter()
+            .map(|event| event.event.created_at)
+            .max()
+            .unwrap();
+        let returned = events
+            .iter()
+            .map(|event| hex::decode(&event.event.id).unwrap())
+            .collect::<HashSet<_>>();
+        pending.retain(|item| {
+            if returned.contains(item.event_id.as_slice()) {
+                admitted.push(item.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if let Some(oldest_missing) = pending.iter().map(|item| item.created_at).min() {
+            assert!(
+                newest_returned < oldest_missing,
+                "pass {passes} returned an event newer than one still missing"
+            );
+        }
+    }
+    eprintln!(
+        "oldest-first gap: missing={} passes={passes} elapsed_ms={} comparisons={} requests={}",
+        missing.len(),
+        started.elapsed().as_millis(),
+        counts.comparisons.load(Ordering::SeqCst),
+        counts.requests.load(Ordering::SeqCst),
+    );
+    assert!(pending.is_empty(), "every missing event arrives");
+    sdk.client().shutdown().await;
+    relay.shutdown();
+}
+
+/// Older history that appears after a backlog is under way, here from a relay
+/// that joins the route, still arrives before newer history: the window
+/// search looks below where the previous pass left off.
+#[tokio::test]
+async fn older_history_that_appears_later_still_arrives_first() {
+    let keys = Keys::generate();
+    let recent = relay_database();
+    let older = relay_database();
+    let newer_gap = timed_events(&keys, 1_700_100_000, 600, "newer", &recent).await;
+    let older_gap = timed_events(&keys, 1_700_000_000, 400, "older", &older).await;
+    let recent_relay = LocalRelay::new(RelayBuilder::default().database(recent));
+    let older_relay = LocalRelay::new(RelayBuilder::default().database(older));
+    recent_relay.run().await.unwrap();
+    older_relay.run().await.unwrap();
+    let (recent_url, _) = counted_proxy(recent_relay.url().await.to_string()).await;
+    let (older_url, _) = counted_proxy(older_relay.url().await.to_string()).await;
+    let sdk = sdk_on(&[recent_url.clone(), older_url.clone()]).await;
+    let cursor = Cursor::default();
+    let mut admitted = Vec::new();
+    let admit = |admitted: &mut Vec<NostrReconciliationItem>,
+                 events: Vec<transport_nostr_adapter::NostrRelayEvent>| {
+        for event in events {
+            let id: [u8; 32] = hex::decode(&event.event.id).unwrap().try_into().unwrap();
+            if let Some(item) = newer_gap
+                .iter()
+                .chain(&older_gap)
+                .find(|item| item.event_id == id)
+            {
+                admitted.push(item.clone());
+            }
+        }
+    };
+    // One pass against the recent relay alone leaves the route's search
+    // seeded past the older history.
+    let (_, events) = sdk
+        .reconcile_subscription(
+            subscription(std::slice::from_ref(&recent_url)),
+            &admitted,
+            SINCE,
+            UNTIL,
+            &cursor,
+        )
+        .await
+        .unwrap();
+    assert!(!events.is_empty());
+    admit(&mut admitted, events);
+    // The older relay joins: its whole gap is older than anything left.
+    let route = subscription(&[recent_url, older_url]);
+    let (_, events) = sdk
+        .reconcile_subscription(route, &admitted, SINCE, UNTIL, &cursor)
+        .await
+        .unwrap();
+    let older_ids = older_gap
+        .iter()
+        .map(|item| item.event_id)
+        .collect::<HashSet<_>>();
+    assert!(!events.is_empty());
+    assert!(
+        events.iter().all(|event| {
+            let id: [u8; 32] = hex::decode(&event.event.id).unwrap().try_into().unwrap();
+            older_ids.contains(&id)
+        }),
+        "the newly appeared older history comes first"
+    );
+    sdk.client().shutdown().await;
+    recent_relay.shutdown();
+    older_relay.shutdown();
+}
+
+/// Old events the account never admits (malformed, or refused every time)
+/// cannot hold the oldest window: once fetched they yield to history not
+/// tried yet, and the rest of the gap still arrives.
+#[tokio::test]
+async fn history_never_admitted_cannot_hold_the_oldest_window() {
+    let keys = Keys::generate();
+    let database = relay_database();
+    let junk = timed_events(&keys, 1_700_000_000, 400, "junk", &database).await;
+    let wanted = timed_events(&keys, 1_700_100_000, 400, "wanted", &database).await;
+    let relay = LocalRelay::new(RelayBuilder::default().database(database));
+    relay.run().await.unwrap();
+    let (url, _) = counted_proxy(relay.url().await.to_string()).await;
+    let sdk = sdk_on(std::slice::from_ref(&url)).await;
+    let route = subscription(&[url]);
+    let cursor = Cursor::default();
+    let junk_ids = junk
+        .iter()
+        .map(|item| item.event_id)
+        .collect::<HashSet<_>>();
+    let mut admitted = Vec::new();
+    let mut pending = wanted
+        .iter()
+        .map(|item| item.event_id)
+        .collect::<HashSet<_>>();
+    for _ in 0..12 {
+        if pending.is_empty() {
+            break;
+        }
+        let (_, events) = sdk
+            .reconcile_subscription(route.clone(), &admitted, SINCE, UNTIL, &cursor)
+            .await
+            .unwrap();
+        for event in events {
+            let id: [u8; 32] = hex::decode(&event.event.id).unwrap().try_into().unwrap();
+            // The junk is fetched but never admitted.
+            if !junk_ids.contains(&id) && pending.remove(&id) {
+                admitted.push(
+                    wanted
+                        .iter()
+                        .find(|item| item.event_id == id)
+                        .unwrap()
+                        .clone(),
+                );
+            }
+        }
+    }
+    assert!(
+        pending.is_empty(),
+        "{} wanted events never arrived",
+        pending.len()
+    );
+    sdk.client().shutdown().await;
+    relay.shutdown();
+}
+
+/// Old IDs a relay names but never serves cannot hold the oldest window
+/// either: they yield once that relay answers without them, and another
+/// relay still serves the gap.
+#[tokio::test]
+async fn ids_a_relay_never_serves_cannot_hold_the_oldest_window() {
+    let keys = Keys::generate();
+    let honest = relay_database();
+    let lying = relay_database();
+    // Only the lying relay names these, and it serves no events at all.
+    timed_events(&keys, 1_700_000_000, 400, "phantom", &lying).await;
+    let wanted = timed_events(&keys, 1_700_100_000, 400, "wanted", &honest).await;
+    for item in &wanted {
+        let event = honest
+            .event_by_id(&nostr_relay_builder::prelude::EventId::from_byte_array(
+                item.event_id,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        lying.save_event(&event).await.unwrap();
+    }
+    let honest_relay = LocalRelay::new(RelayBuilder::default().database(honest));
+    let lying_relay = LocalRelay::new(RelayBuilder::default().database(lying));
+    honest_relay.run().await.unwrap();
+    lying_relay.run().await.unwrap();
+    let (honest_url, _) = counted_proxy(honest_relay.url().await.to_string()).await;
+    let (lying_url, lying_counts) = counted_proxy(lying_relay.url().await.to_string()).await;
+    lying_counts.suppress_events.store(true, Ordering::SeqCst);
+    let urls = vec![honest_url, lying_url];
+    let sdk = sdk_on(&urls).await;
+    let route = subscription(&urls);
+    let cursor = Cursor::default();
+    let mut admitted = Vec::new();
+    let mut pending = wanted
+        .iter()
+        .map(|item| item.event_id)
+        .collect::<HashSet<_>>();
+    for _ in 0..12 {
+        if pending.is_empty() {
+            break;
+        }
+        let (_, events) = sdk
+            .reconcile_subscription(route.clone(), &admitted, SINCE, UNTIL, &cursor)
+            .await
+            .unwrap();
+        for event in events {
+            let id: [u8; 32] = hex::decode(&event.event.id).unwrap().try_into().unwrap();
+            if pending.remove(&id) {
+                admitted.push(
+                    wanted
+                        .iter()
+                        .find(|item| item.event_id == id)
+                        .unwrap()
+                        .clone(),
+                );
+            }
+        }
+    }
+    assert!(
+        pending.is_empty(),
+        "{} wanted events never arrived",
+        pending.len()
+    );
+    sdk.client().shutdown().await;
+    honest_relay.shutdown();
+    lying_relay.shutdown();
 }
 
 async fn one_missing_event_fixture() -> (

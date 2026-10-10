@@ -138,6 +138,21 @@ certify a subset of a route's relays. `incomplete_endpoints` names the failed on
 answered: they finished the comparison and served their exact-ID requests, but this pass did
 not return every ID they claimed. The rest timed out, errored or truncated.
 
+A group route whose gap is larger than one pass is fetched from its oldest end. MLS applies commits in order, so
+fetching IDs in ID order, which is effectively random in time, could let commits carry a member's epoch more than
+the retained-epoch window past older messages still missing, which can then never be read (mdk#2086). NIP-77 reports
+IDs without timestamps, so the pass finds the oldest window `[since, bound]` that fits it with dry-run comparisons:
+up to six rounds of eight concurrent probes within half of what is left of the deadline. A first search starts at
+the recent end, where a catch-up gap sits, at distances shrinking by powers of two; later rounds spread evenly
+within the bracket. The client remembers, per route and in memory only, the last bound that fit and how far past it
+the next window should reach, so a backlog being worked through usually needs one round. It also sets aside IDs a
+pass fetched but the account has not admitted since, and IDs every claimant answered without: they yield to
+history not tried yet, so events that can never be admitted cannot hold the oldest window, and they are retried
+with whatever room is left. Losing this memory costs at most extra narrowing or a refetch. A window is fetched in
+the cursor's rotation, grouped by claiming relays so requests batch fully, and returned in time order. If no relay
+answers a probe, the pass uses ID-order selection as before. Selection never changes the summary: a relay that
+claimed an ID this pass left unfetched stays incomplete. The account inbox route keeps ID-order selection.
+
 Replay position is advisory, separate from admitted event inventory. A cancelled fetch retains its
 pre-I/O cursor advance. A completed byte-limit rejection of an otherwise eligible network ID
 restores the preceding cursor when earlier results consumed this pass's allowance, so the ID leads
