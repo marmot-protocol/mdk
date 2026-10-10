@@ -1,5 +1,5 @@
 //! Typed individual reports and admin dismissal labels for hosts.
-use crate::conversions::{SendSummaryFfi, TimelineMessageRecordFfi};
+use crate::conversions::{SendAcceptDispositionFfi, SendSummaryFfi, TimelineMessageRecordFfi};
 use crate::{Marmot, MarmotKitError, group_id_from_hex};
 #[derive(Clone, Copy, Debug, uniffi::Enum)]
 pub enum ReportReasonFfi {
@@ -105,8 +105,101 @@ impl From<marmot_app::ReportDismissalPage> for ReportDismissalPageFfi {
         }
     }
 }
+/// Destination for private moderation reports to the deployment's moderation team.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct ModerationReportConfigFfi {
+    /// The moderation team's reports key: 64-character hex or `npub`.
+    pub recipient_pubkey: String,
+    /// Relays to publish to; every entry must pass the relay safety policy.
+    pub relays: Vec<String>,
+}
+impl From<ModerationReportConfigFfi> for marmot_app::ModerationReportConfig {
+    fn from(v: ModerationReportConfigFfi) -> Self {
+        Self {
+            recipient_pubkey: v.recipient_pubkey,
+            relays: v.relays,
+        }
+    }
+}
+/// Which user action produced a moderation report.
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum ModerationReportOriginFfi {
+    Report,
+    /// "Block and Report". Blocking itself is a separate `block_user` call.
+    BlockAndReport,
+}
+impl From<ModerationReportOriginFfi> for marmot_app::ModerationReportOrigin {
+    fn from(v: ModerationReportOriginFfi) -> Self {
+        match v {
+            ModerationReportOriginFfi::Report => Self::Report,
+            ModerationReportOriginFfi::BlockAndReport => Self::BlockAndReport,
+        }
+    }
+}
+/// Result of one moderation report. `AcceptedPending` and `CompletionUnknown` are queued and
+/// retried on catch-up; neither is a failure, and hosts must not resubmit to "fix" them.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct ModerationReportOutcomeFfi {
+    /// Stable local id; a repeat inside the idempotency window returns the same id.
+    pub report_id: String,
+    pub accept_disposition: SendAcceptDispositionFfi,
+}
+impl From<marmot_app::ModerationReportOutcome> for ModerationReportOutcomeFfi {
+    fn from(v: marmot_app::ModerationReportOutcome) -> Self {
+        Self {
+            report_id: v.report_id,
+            accept_disposition: match v.status {
+                marmot_app::ModerationReportStatus::Published => {
+                    SendAcceptDispositionFfi::Published
+                }
+                marmot_app::ModerationReportStatus::AcceptedPending => {
+                    SendAcceptDispositionFfi::AcceptedPending
+                }
+                marmot_app::ModerationReportStatus::CompletionUnknown => {
+                    SendAcceptDispositionFfi::CompletionUnknown
+                }
+            },
+        }
+    }
+}
 #[uniffi::export(async_runtime = "tokio")]
 impl Marmot {
+    /// Privately report a user to the configured moderation team (NIP-56 report,
+    /// NIP-59 gift-wrapped). Additive to `report_message`, which is unchanged.
+    pub async fn submit_moderation_report(
+        &self,
+        account_ref: String,
+        reported_pubkey: String,
+        reason: ReportReasonFfi,
+        explanation: String,
+        origin: ModerationReportOriginFfi,
+    ) -> Result<ModerationReportOutcomeFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .submit_moderation_report(
+                &account_ref,
+                &reported_pubkey,
+                reason.into(),
+                &explanation,
+                origin.into(),
+            )
+            .await?
+            .into())
+    }
+    /// True when a valid moderation-report destination is installed.
+    pub fn moderation_reporting_available(&self) -> bool {
+        self.runtime.moderation_reporting_available()
+    }
+    /// Install (`Some`) or clear (`None`) the moderation-report destination at runtime.
+    /// An invalid config is rejected whole and leaves reporting unconfigured.
+    pub fn configure_moderation_reporting(
+        &self,
+        config: Option<ModerationReportConfigFfi>,
+    ) -> Result<(), MarmotKitError> {
+        Ok(self
+            .app
+            .set_moderation_report_config(config.map(Into::into))?)
+    }
     pub async fn report_message(
         &self,
         account_ref: String,

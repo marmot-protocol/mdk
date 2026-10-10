@@ -16183,6 +16183,126 @@ async fn user_blocks_shared_group_keeps_protocol_and_other_participants_live() {
     runtime.shutdown().await;
 }
 
+/// Private moderation reports are additive: they publish a NIP-59 wrap to the
+/// configured reports relay only, and in-group reports behave exactly as before.
+#[tokio::test]
+async fn moderation_report_wraps_reach_only_the_reports_relay_and_leave_group_reports_unchanged() {
+    use marmot_app::{
+        ModerationReportConfig, ModerationReportOrigin, ModerationReportStatus, ReportReason,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice_id = home.create_account("alice").unwrap().account_id_hex;
+    let bob_id = home.create_account("bob").unwrap().account_id_hex;
+    let (_relay, app, url) = mock_app(&dir).await;
+    let (_reports_relay, reports_url) = mock_relay().await;
+    let moderation = Keys::generate();
+    app.set_moderation_report_config(Some(ModerationReportConfig {
+        recipient_pubkey: moderation.public_key().to_hex(),
+        relays: vec![reports_url.clone()],
+    }))
+    .unwrap();
+
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+    let mut alice = app.client("alice").await.unwrap();
+    let group = alice.create_group("review room", &["bob"]).await.unwrap();
+    bob.sync().await.unwrap();
+    let sent = bob.send(&group, b"content under review").await.unwrap();
+    let target = &sent.message_ids[0];
+    alice.sync().await.unwrap();
+    let group_hex = hex::encode(group.as_slice());
+    let runtime = MarmotAppRuntime::new(app.clone());
+
+    let in_group = alice
+        .report_message(&group, target, ReportReason::Spam, "in-group explanation")
+        .await
+        .unwrap();
+    let outcome = runtime
+        .submit_moderation_report(
+            "alice",
+            &bob_id,
+            ReportReason::Spam,
+            "private explanation",
+            ModerationReportOrigin::BlockAndReport,
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.status, ModerationReportStatus::Published);
+    bob.sync().await.unwrap();
+
+    // In-group moderation is untouched by the private report.
+    for account in ["alice", "bob"] {
+        let page = runtime
+            .content_reports(account, &group, Some(target), None, 10)
+            .unwrap();
+        assert_eq!(page.reports.len(), 1, "{account}");
+        assert_eq!(page.reports[0].report_id_hex, in_group.message_ids[0]);
+        assert_eq!(page.reports[0].explanation, "in-group explanation");
+        assert_eq!(page.reports[0].reporter, alice_id);
+        let messages = app
+            .timeline_messages_with_query(
+                account,
+                TimelineMessageQuery {
+                    group_id_hex: Some(group_hex.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .messages;
+        assert_eq!(messages.len(), 1, "{account}");
+    }
+
+    let wraps_on = |relay_url: String| {
+        let moderation = moderation.public_key();
+        async move {
+            let client = NostrSdkClient::builder().build();
+            client.add_relay(&relay_url).await.unwrap();
+            client.connect().await;
+            let events = client
+                .fetch_events(nostr_sdk::prelude::ReqTarget::manual(vec![(
+                    nostr_sdk::prelude::RelayUrl::parse(&relay_url).unwrap(),
+                    vec![Filter::new().kind(Kind::GiftWrap).pubkey(moderation)],
+                )]))
+                .timeout(Duration::from_secs(3))
+                .await
+                .unwrap();
+            client.shutdown().await;
+            events.into_iter().collect::<Vec<_>>()
+        }
+    };
+    let wraps = wraps_on(reports_url).await;
+    assert_eq!(wraps.len(), 1);
+    assert!(
+        wraps_on(url).await.is_empty(),
+        "never published to the app relay"
+    );
+    let gift = nostr::nips::nip59::UnwrappedGift::from_gift_wrap(&moderation, &wraps[0]).unwrap();
+    assert_eq!(gift.sender.to_hex(), alice_id);
+    assert_eq!(gift.rumor.kind, Kind::from(1984));
+    assert_eq!(gift.rumor.content, "private explanation");
+    assert_eq!(
+        gift.rumor
+            .tags
+            .iter()
+            .map(|tag| tag.as_slice().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec!["p".to_owned(), bob_id.clone(), "spam".to_owned()],
+            vec!["L".to_owned(), "chat.whitenoise.report".to_owned()],
+            vec![
+                "l".to_owned(),
+                "block".to_owned(),
+                "chat.whitenoise.report".to_owned()
+            ],
+        ]
+    );
+    let rumor_json = serde_json::to_string(&gift.rumor).unwrap();
+    assert!(!rumor_json.contains(&group_hex));
+    assert!(!rumor_json.contains(target.as_str()));
+    runtime.shutdown().await;
+}
+
 #[tokio::test]
 async fn encrypted_reports_and_individual_dismissals_do_not_create_chat_rows() {
     use marmot_app::ReportReason;

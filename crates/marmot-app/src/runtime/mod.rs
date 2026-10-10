@@ -1797,7 +1797,9 @@ impl MarmotAppRuntime {
     }
 
     pub async fn catch_up_accounts(&self) -> Result<(), AppError> {
-        self.accounts.catch_up_accounts().await.map(|_| ())
+        let result = self.accounts.catch_up_accounts().await.map(|_| ());
+        self.spawn_moderation_report_retries();
+        result
     }
 
     /// Notify every running account worker that the host has observed usable
@@ -1812,7 +1814,9 @@ impl MarmotAppRuntime {
     /// workers were considered. Used by reconciliation drivers that expose
     /// aggregate per-pass work telemetry (mdk#1380).
     pub async fn catch_up_accounts_reporting(&self) -> Result<CatchUpAccountsSummary, AppError> {
-        self.accounts.catch_up_accounts().await
+        let result = self.accounts.catch_up_accounts().await;
+        self.spawn_moderation_report_retries();
+        result
     }
 
     /// Explicitly repair a potentially incomplete incremental history.
@@ -4181,6 +4185,11 @@ impl MarmotAppRuntime {
             }
         }
 
+        // Queued moderation reports never outlive their account's session:
+        // stop any in-flight publish and delete them before teardown.
+        self.purge_moderation_reports_best_effort(&account.label, "sign_out")
+            .await;
+
         // Step 2 (local teardown): shut the worker down (deactivating its
         // subscriptions) and drop in-memory caches. Crucially this does NOT
         // remove the account directory, so all on-disk state survives for a
@@ -4331,6 +4340,12 @@ impl MarmotAppRuntime {
                 ),
             }),
         }
+
+        // Queued moderation reports belong to this account: stop any in-flight
+        // publish and delete them before the directory goes, so nothing can be
+        // recorded after the wipe.
+        self.purge_moderation_reports_best_effort(&account.label, "sign_out_and_wipe")
+            .await;
 
         // Stages 3-5: local cleanup. `remove_account` shuts the worker down,
         // drops in-memory caches, and removes the account directory (MLS DB,

@@ -3459,7 +3459,8 @@ mod identity_pointer_tests {
 }
 
 use crate::types::moderation::{
-    MarmotContentReportPage, MarmotReportDismissalPage, MarmotReportReason,
+    MarmotContentReportPage, MarmotModerationReportOrigin, MarmotModerationReportOutcome,
+    MarmotReportDismissalPage, MarmotReportReason,
 };
 c_cmd! {
     async fn marmot_dismiss_reports(account_ref: str, group_id_hex: str, report_ids/report_ids_len: str_arr, explanation: str) -> rec(MarmotSendSummary) = dismiss_reports;
@@ -3500,6 +3501,87 @@ pub unsafe extern "C" fn marmot_report_message(
                 out,
             )
         }
+    })
+}
+
+/// Privately report a user to the configured moderation team (NIP-56 report,
+/// NIP-59 gift-wrapped). Additive to marmot_report_message, which is unchanged.
+/// `reason` is a MarmotReportReason and `origin` a MarmotModerationReportOrigin
+/// discriminant. Release `*out` with marmot_moderation_report_outcome_free.
+/// # Safety
+/// Client, strings and output pointer must be valid. Inputs are borrowed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_submit_moderation_report(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    reported_pubkey: *const c_char,
+    reason: u32,
+    explanation: *const c_char,
+    origin: u32,
+    out: *mut *mut MarmotModerationReportOutcome,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let reported = try_arg!(unsafe { required_str(reported_pubkey) });
+        let reason = try_arg!(MarmotReportReason::from_c(reason));
+        let explanation = try_arg!(unsafe { required_str(explanation) });
+        let origin = try_arg!(MarmotModerationReportOrigin::from_c(origin));
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.submit_moderation_report(
+                    account,
+                    reported,
+                    reason.to_ffi(),
+                    explanation,
+                    origin.to_ffi(),
+                )),
+                out,
+            )
+        }
+    })
+}
+
+/// Write whether a valid moderation-report destination is installed.
+/// # Safety
+/// `client` must be a live handle and `out` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_moderation_reporting_available(
+    client: *const MarmotClient,
+    out: *mut bool,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        unsafe { deliver_scalar(Ok(client.marmot.moderation_reporting_available()), out) }
+    })
+}
+
+/// Install the moderation-report destination, or clear it when
+/// `recipient_pubkey` is NULL (`relays` is then ignored). An invalid
+/// destination is rejected whole and leaves reporting unconfigured.
+/// # Safety
+/// `client` must be a live handle; `recipient_pubkey` NULL or a valid string;
+/// `relays` must hold `relays_len` valid strings. Inputs are borrowed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_configure_moderation_reporting(
+    client: *const MarmotClient,
+    recipient_pubkey: *const c_char,
+    relays: *const *const c_char,
+    relays_len: usize,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        let client = try_arg!(unsafe { client_ref(client) });
+        let recipient = try_arg!(unsafe { crate::optional_str(recipient_pubkey) });
+        let config = match recipient {
+            Some(recipient_pubkey) => Some(marmot_uniffi::ModerationReportConfigFfi {
+                recipient_pubkey,
+                relays: try_arg!(unsafe { str_array(relays, relays_len) }),
+            }),
+            None => None,
+        };
+        deliver_unit(client.marmot.configure_moderation_reporting(config))
     })
 }
 

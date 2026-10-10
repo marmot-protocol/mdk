@@ -110,6 +110,13 @@ mod profile_pseudonyms;
 pub use media::MediaDownloadBenchmarkTransport;
 mod audit_export_lifecycle;
 mod messages;
+mod moderation_reports;
+pub use moderation_reports::{
+    MODERATION_REPORT_EXPLANATION_MAX_CHARS, MODERATION_REPORT_IDEMPOTENCY_WINDOW,
+    MODERATION_REPORT_LABEL_NAMESPACE, MODERATION_REPORT_RATE_LIMIT, MODERATION_REPORT_RATE_WINDOW,
+    ModerationReportConfig, ModerationReportOrigin, ModerationReportOutcome,
+    ModerationReportRetrySummary, ModerationReportStatus,
+};
 mod nostr_secret;
 mod nostr_verification;
 mod notifications;
@@ -465,6 +472,7 @@ type LegacyProjectionOpenHook = Arc<dyn Fn() + Send + Sync>;
 #[derive(Clone)]
 pub struct MarmotApp {
     block_list_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    moderation_reports: Arc<moderation_reports::ModerationReportState>,
     pub(crate) block_list_updates: Arc<tokio::sync::watch::Sender<u64>>,
     root: PathBuf,
     /// Present for exclusive-root entry points. Every clone shares this cell,
@@ -1515,6 +1523,7 @@ impl MarmotApp {
             config,
             directory_sync: Arc::new(RwLock::new(None)),
             block_list_locks: Arc::default(),
+            moderation_reports: Arc::default(),
             block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
@@ -1606,6 +1615,7 @@ impl MarmotApp {
             config,
             directory_sync: Arc::new(RwLock::new(None)),
             block_list_locks: Arc::default(),
+            moderation_reports: Arc::default(),
             block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),

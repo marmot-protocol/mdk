@@ -478,6 +478,7 @@ pub unsafe extern "C" fn marmot_client_new_with_configuration(
                             cursor_persistence: Some(cursor.into()),
                             client_name: name,
                             secret_store: store,
+                            moderation_report_config: None,
                         },
                     )
                 }

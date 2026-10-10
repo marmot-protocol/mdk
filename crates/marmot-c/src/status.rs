@@ -136,6 +136,14 @@ pub enum MarmotStatus {
     /// A signed-out account cannot grant automatic network permission.
     AttachmentAccountSignedOut = 94,
     InvalidAppComponent = 95,
+    /// No valid moderation-report destination is installed; nothing was published.
+    ModerationReportingNotConfigured = 96,
+    /// The moderation-report destination was rejected as a whole.
+    InvalidModerationReportConfig = 97,
+    InvalidReportedPublicKey = 98,
+    CannotReportSelf = 99,
+    /// Local per-account moderation-report cap; retry later.
+    ModerationReportRateLimited = 100,
 }
 
 thread_local! {
@@ -183,6 +191,15 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::UserBlocked => MarmotStatus::UserBlocked,
         MarmotKitError::BlockListUnavailable => MarmotStatus::BlockListUnavailable,
         MarmotKitError::BlockPublicationUncertain => MarmotStatus::BlockPublicationUncertain,
+        MarmotKitError::ModerationReportingNotConfigured => {
+            MarmotStatus::ModerationReportingNotConfigured
+        }
+        MarmotKitError::InvalidModerationReportConfig { .. } => {
+            MarmotStatus::InvalidModerationReportConfig
+        }
+        MarmotKitError::InvalidReportedPublicKey => MarmotStatus::InvalidReportedPublicKey,
+        MarmotKitError::CannotReportSelf => MarmotStatus::CannotReportSelf,
+        MarmotKitError::ModerationReportRateLimited => MarmotStatus::ModerationReportRateLimited,
         MarmotKitError::ChatWindowInvalidLimit => MarmotStatus::ChatWindowInvalidLimit,
         MarmotKitError::ChatWindowStale => MarmotStatus::ChatWindowStale,
         MarmotKitError::ChatWindowAnchorOutside => MarmotStatus::ChatWindowAnchorOutside,
@@ -329,6 +346,13 @@ mod tests {
             MarmotKitError::UserBlocked,
             MarmotKitError::BlockListUnavailable,
             MarmotKitError::BlockPublicationUncertain,
+            MarmotKitError::ModerationReportingNotConfigured,
+            MarmotKitError::InvalidModerationReportConfig {
+                details: "relay 0 is unsafe".into(),
+            },
+            MarmotKitError::InvalidReportedPublicKey,
+            MarmotKitError::CannotReportSelf,
+            MarmotKitError::ModerationReportRateLimited,
             MarmotKitError::ChatWindowInvalidLimit,
             MarmotKitError::ChatWindowStale,
             MarmotKitError::ChatWindowAnchorOutside,
@@ -485,10 +509,18 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            86,
+            91,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
+        assert_eq!(
+            status_from_error(&MarmotKitError::ModerationReportingNotConfigured) as i32,
+            96
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::ModerationReportRateLimited) as i32,
+            100
+        );
         assert_eq!(
             status_from_error(&MarmotKitError::BlockListUnavailable) as i32,
             79

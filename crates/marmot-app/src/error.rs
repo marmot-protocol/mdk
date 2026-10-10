@@ -204,6 +204,19 @@ pub enum AppError {
     BlockListUnavailable,
     #[error("block list publication outcome is uncertain; retry to reconcile")]
     BlockPublicationUncertain,
+    /// No valid moderation-report destination is installed; nothing was published.
+    #[error("moderation reporting is not configured")]
+    ModerationReportingNotConfigured,
+    /// The host's moderation-report destination was rejected as a whole.
+    #[error("invalid moderation report configuration: {0}")]
+    InvalidModerationReportConfig(String),
+    #[error("reported user public key is invalid")]
+    InvalidReportedPublicKey,
+    #[error("an account cannot report itself")]
+    CannotReportSelf,
+    /// The local per-account cap; it guards against runaway clients only.
+    #[error("too many moderation reports; try again later")]
+    ModerationReportRateLimited,
     #[error("relay directory fetch failed: {0}")]
     RelayDirectory(String),
     /// An account worker's transport catch-up failed (sync error or timeout).
@@ -453,6 +466,11 @@ impl AppError {
             Self::UserBlocked => "user_blocked",
             Self::BlockListUnavailable => "block_list_unavailable",
             Self::BlockPublicationUncertain => "block_publication_uncertain",
+            Self::ModerationReportingNotConfigured => "moderation_reporting_not_configured",
+            Self::InvalidModerationReportConfig(_) => "invalid_moderation_report_config",
+            Self::InvalidReportedPublicKey => "invalid_reported_public_key",
+            Self::CannotReportSelf => "cannot_report_self",
+            Self::ModerationReportRateLimited => "moderation_report_rate_limited",
             Self::FollowListUnavailable => "follow_list_unavailable",
             Self::RelayDirectory(_) => "relay_directory",
             Self::AccountCatchUp(_) => "account_catch_up",

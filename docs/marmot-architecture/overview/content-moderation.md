@@ -4,6 +4,10 @@ The canonical wire contract lives in Marmot's
 [`features/content-moderation.md`](https://github.com/marmot-protocol/marmot/blob/master/features/content-moderation.md).
 The companion specification was merged in Marmot PR #423.
 
+This in-group path is the primary moderation path. A separate, additive channel
+privately reports an account to the deployment operator; see
+[moderation reports](../moderation-reports.md). It does not change anything here.
+
 Reports are unsigned inner kind 1984 events encrypted through the ordinary group
 transport. `report_message` resolves the target author and sends a NIP-56 category
 and optional explanation. Each report event is independent. MDK does not merge
