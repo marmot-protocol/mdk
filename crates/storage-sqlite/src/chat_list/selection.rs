@@ -1,5 +1,5 @@
 //! Complete, compact selection intent, independent of the live display window.
-use super::{ChatListView, pages};
+use super::{ChatFolderSelectionRule, ChatListView, pages};
 use crate::connection::{CachedSql, ConnectionLifetime};
 use crate::{SqliteAccountStorage, SqliteResultExt};
 use cgka_traits::storage::StorageError;
@@ -12,14 +12,14 @@ use std::collections::HashSet;
 pub struct ChatListSelectionSnapshot {
     lifetime: ConnectionLifetime,
     store_epoch: Vec<u8>,
-    view: ChatListView,
+    scope: SelectionScope,
     group_ids: Vec<String>,
 }
 
 impl std::fmt::Debug for ChatListSelectionSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChatListSelectionSnapshot")
-            .field("view", &self.view)
+            .field("scope", &self.scope)
             .field("count", &self.group_ids.len())
             .finish_non_exhaustive()
     }
@@ -33,8 +33,27 @@ pub enum ChatListSelectionError {
     StaleSelection,
     #[error("chat-list base projection is not ready")]
     ProjectionNotReady,
+    #[error("unsupported or invalid bounded chat-folder rule")]
+    InvalidFilter,
     #[error(transparent)]
     Storage(#[from] StorageError),
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum SelectionScope {
+    View(ChatListView),
+    Folder(ChatFolderSelectionRule),
+}
+impl SelectionScope {
+    fn eligible_ids(&self, conn: &Connection) -> Result<Vec<String>, ChatListSelectionError> {
+        match self {
+            Self::View(view) => eligible_ids(conn, *view),
+            Self::Folder(rule) => {
+                ensure_base_ready(conn)?;
+                rule.eligible_ids(conn)
+            }
+        }
+    }
 }
 
 impl SqliteAccountStorage {
@@ -49,8 +68,27 @@ impl SqliteAccountStorage {
             Ok(ChatListSelectionSnapshot {
                 lifetime: self.connection.lifetime(),
                 store_epoch: store_epoch(conn)?,
-                view,
+                scope: SelectionScope::View(view),
                 group_ids: eligible_ids(conn, view)?,
+            })
+        })
+    }
+
+    /// Freeze all matching IDs in one transaction. Rule edits cannot retarget
+    /// this intent; capture a new selection instead. Required missing projection
+    /// inputs return not-ready, never an empty or partially successful result.
+    pub fn chat_folder_selection_snapshot(
+        &self,
+        rule: ChatFolderSelectionRule,
+    ) -> Result<ChatListSelectionSnapshot, ChatListSelectionError> {
+        rule.validate()?;
+        self.connection.with_deferred_read(|conn| {
+            let scope = SelectionScope::Folder(rule);
+            Ok(ChatListSelectionSnapshot {
+                lifetime: self.connection.lifetime(),
+                store_epoch: store_epoch(conn)?,
+                group_ids: scope.eligible_ids(conn)?,
+                scope,
             })
         })
     }
@@ -96,11 +134,11 @@ impl SqliteAccountStorage {
         self.check_selection_lifetime(selection)?;
         self.connection.with_deferred_read(|conn| {
             check_epoch(conn, selection)?;
-            let eligible: HashSet<_> = eligible_ids(conn, selection.view)?.into_iter().collect();
+            let eligible: HashSet<_> = selection.scope.eligible_ids(conn)?.into_iter().collect();
             Ok(ChatListSelectionSnapshot {
                 lifetime: selection.lifetime.clone(),
                 store_epoch: selection.store_epoch.clone(),
-                view: selection.view,
+                scope: selection.scope.clone(),
                 group_ids: selection
                     .group_ids
                     .iter()
@@ -161,16 +199,7 @@ fn eligible_ids(
     conn: &Connection,
     view: ChatListView,
 ) -> Result<Vec<String>, ChatListSelectionError> {
-    let missing_base: bool = conn
-        .query_row_cached(
-            "SELECT EXISTS(SELECT 1 FROM chat_presentation_row_work)",
-            [],
-            |row| row.get(0),
-        )
-        .storage()?;
-    if missing_base {
-        return Err(ChatListSelectionError::ProjectionNotReady);
-    }
+    ensure_base_ready(conn)?;
     let sql = format!(
         "SELECT group_id_hex FROM chat_list_rows INDEXED BY {} WHERE {} ORDER BY {}",
         view.index(),
@@ -183,6 +212,20 @@ fn eligible_ids(
         .storage()?
         .collect::<Result<_, _>>()
         .storage()?)
+}
+
+fn ensure_base_ready(conn: &Connection) -> Result<(), ChatListSelectionError> {
+    let missing_base: bool = conn
+        .query_row_cached(
+            "SELECT EXISTS(SELECT 1 FROM chat_presentation_row_work)",
+            [],
+            |row| row.get(0),
+        )
+        .storage()?;
+    if missing_base {
+        return Err(ChatListSelectionError::ProjectionNotReady);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

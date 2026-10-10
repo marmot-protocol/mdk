@@ -666,8 +666,11 @@ for paging, sequence handling, cancellation, C ownership, and compatibility.
 
 `captureChatListSelection` provides complete frozen fixed-view intent separately
 from display windows. Its handle supplies revision-fenced count/pages,
-deselection, remove-only revalidation and terminal close. Automatic-folder
-predicates remain a separate contract; see [complete fixed-view selection](CHAT-LIST-ROWS.md#complete-fixed-view-selection).
+deselection, remove-only revalidation and terminal close. `captureChatFolderSelection`
+adds complete version-1 flat and bounded smart-folder intent using native roster,
+literal presentation, draft and outbox inputs, with a typed error for unsupported
+or excessive rules. A smart envelope replaces flat criteria, not manual overrides.
+See [the shared selection contract](CHAT-LIST-ROWS.md#complete-fixed-view-selection).
 
 ## Prepared conversation windows
 

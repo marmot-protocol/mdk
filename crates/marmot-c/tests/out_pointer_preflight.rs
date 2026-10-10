@@ -38,6 +38,26 @@ fn chat_selection_out_preflight_never_runs_capture_or_mutation() {
     use marmot_c::subscriptions::*;
     unsafe {
         assert_eq!(
+            marmot_capture_chat_folder_selection(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut()
+            ),
+            MarmotStatus::NullPointer
+        );
+        let mut folder_out = std::ptr::dangling_mut();
+        assert_eq!(
+            marmot_capture_chat_folder_selection(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                &raw mut folder_out
+            ),
+            MarmotStatus::NullPointer
+        );
+        assert!(folder_out.is_null());
+        assert_eq!(
             marmot_capture_chat_list_selection(
                 std::ptr::null(),
                 std::ptr::null(),

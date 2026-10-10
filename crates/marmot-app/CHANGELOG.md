@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add complete flat and bounded smart-folder selection with native roster/text, draft and outbox matching, strict rule validation and remove-only revalidation. Relative-time predicates and filtered live windows remain separate.
+
 ### Breaking changes
 
 - Attachment history adds `AttachmentRole` and the required `AttachmentEntry.role`

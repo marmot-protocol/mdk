@@ -139,6 +139,7 @@ pub enum MarmotStatus {
     ChatSelectionClosed = 96,
     ChatSelectionStale = 97,
     ChatSelectionInvalidPage = 98,
+    ChatSelectionInvalidFilter = 99,
 }
 
 thread_local! {
@@ -162,6 +163,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::ChatSelectionClosed => MarmotStatus::ChatSelectionClosed,
         MarmotKitError::ChatSelectionStale => MarmotStatus::ChatSelectionStale,
         MarmotKitError::ChatSelectionInvalidPage => MarmotStatus::ChatSelectionInvalidPage,
+        MarmotKitError::ChatSelectionInvalidFilter => MarmotStatus::ChatSelectionInvalidFilter,
         MarmotKitError::ConversationWindowMessageNotRetained => {
             MarmotStatus::ConversationWindowMessageNotRetained
         }

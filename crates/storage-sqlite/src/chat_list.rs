@@ -1,4 +1,5 @@
 mod attention;
+pub(crate) mod folders;
 mod pages;
 mod selection;
 mod window;
@@ -22,6 +23,7 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
 };
 use cgka_traits::storage::StorageResult;
+pub use folders::ChatFolderSelectionRule;
 pub use pages::{
     ChatListCursor, ChatListPage, ChatListPageDirection, ChatListPageError, ChatListPageQuery,
     ChatListView,

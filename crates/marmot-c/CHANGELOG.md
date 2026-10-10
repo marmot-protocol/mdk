@@ -7,6 +7,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- Add borrowed version-1 flat/smart folder-selection input and complete native folder capture, retaining existing selection handle ownership and paging. Use matching generated headers/libraries for the new record layout.
+
 ### Added
 
 - Fixed-view `MarmotChatListSelection` capture/count/page/deselect/revalidate/

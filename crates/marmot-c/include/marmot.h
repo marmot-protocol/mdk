@@ -181,6 +181,7 @@ enum MarmotStatus
   MARMOT_STATUS_CHAT_SELECTION_CLOSED = 96,
   MARMOT_STATUS_CHAT_SELECTION_STALE = 97,
   MARMOT_STATUS_CHAT_SELECTION_INVALID_PAGE = 98,
+  MARMOT_STATUS_CHAT_SELECTION_INVALID_FILTER = 99,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -5365,6 +5366,30 @@ typedef struct MarmotAccountAttentionSnapshot {
   struct MarmotAccountAttentionEntry *accounts;
   uintptr_t accounts_len;
 } MarmotAccountAttentionSnapshot;
+
+/**
+ * Borrowed input. Keep all strings/arrays live through the capture call; the
+ * library copies them and never frees caller memory. NULL keyword means absent.
+ */
+typedef struct MarmotChatFolderSelectionRule {
+  uint32_t version;
+  const char *const *include_member_ids;
+  uintptr_t include_member_ids_len;
+  const char *keyword;
+  uint8_t unread_only;
+  uint8_t unread_mentions_only;
+  uint8_t groups_only;
+  uint8_t direct_chats_only;
+  uint8_t pinned_only;
+  uint8_t include_all;
+  uint8_t archived_only;
+  uint8_t include_muted;
+  const char *smart_filter_json;
+  const char *const *manual_include_ids;
+  uintptr_t manual_include_ids_len;
+  const char *const *manual_exclude_ids;
+  uintptr_t manual_exclude_ids_len;
+} MarmotChatFolderSelectionRule;
 
 typedef struct MarmotChatSelectionSummary {
   uint64_t revision;
@@ -10667,6 +10692,17 @@ MarmotStatus marmot_chat_list_window_subscription_set_visible_anchor(const struc
 MarmotStatus marmot_chat_list_window_subscription_return_to_top(const struct MarmotChatListWindowSubscription *sub,
                                                                 uint64_t sequence,
                                                                 struct MarmotChatListWindowSnapshot **out);
+
+/**
+ * Capture the complete version-1 existing-folder rule. Same lifetime, paging
+ * and remove-only revalidation contract as fixed-view selection.
+ * # Safety
+ * client/account_ref/rule and its borrowed inputs must be live; out writable.
+ */
+MarmotStatus marmot_capture_chat_folder_selection(const struct MarmotClient *client,
+                                                  const char *account_ref,
+                                                  const struct MarmotChatFolderSelectionRule *rule,
+                                                  struct MarmotChatListSelection **out);
 
 /**
  * Capture all eligible IDs in one fixed native view; no display-row hydration.

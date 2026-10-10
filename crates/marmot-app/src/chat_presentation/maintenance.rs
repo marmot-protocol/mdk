@@ -16,7 +16,8 @@ pub(crate) fn prepare_batch(
     local: &str,
 ) -> Result<bool, AppError> {
     let initialized = prepare_base_rows(account, local)?;
-    Ok(maintain(account, shared, local)? || initialized)
+    let roster_pending = account.prepare_chat_folder_rosters()?;
+    Ok(maintain(account, shared, local)? || initialized || roster_pending)
 }
 
 /// Initialize one bounded batch without preparing unrelated selected values.

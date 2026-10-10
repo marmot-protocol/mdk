@@ -488,9 +488,9 @@ pub use subscriptions::PresentedChatListSubscription;
 
 pub use conversions::{
     AccountAttentionEntryFfi, AccountAttentionSnapshotFfi, AccountAttentionStateFfi,
-    AccountAttentionTotalFfi, AccountAttentionUnavailableFfi, ChatListAnchorOutcomeFfi,
-    ChatListPageDirectionFfi, ChatListViewFfi, ChatListWindowSnapshotFfi, ChatSelectionPageFfi,
-    ChatSelectionSummaryFfi,
+    AccountAttentionTotalFfi, AccountAttentionUnavailableFfi, ChatFolderSelectionRuleFfi,
+    ChatListAnchorOutcomeFfi, ChatListPageDirectionFfi, ChatListViewFfi, ChatListWindowSnapshotFfi,
+    ChatSelectionPageFfi, ChatSelectionSummaryFfi,
 };
 pub use subscriptions::ChatListSelection;
 pub use subscriptions::{AccountAttentionSubscription, ChatListWindowSubscription};

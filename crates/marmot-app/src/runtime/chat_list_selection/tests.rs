@@ -67,6 +67,138 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn folder_capture_uses_full_native_scope_and_freezes_the_rule() {
+    let f = Fixture::new(501);
+    let shared = f.app.shared_storage().unwrap();
+    for _ in 0..24 {
+        crate::chat_presentation::maintenance::prepare_batch(&f.store, &shared, &f.account_id)
+            .unwrap();
+    }
+    let rule = ChatFolderSelectionRule {
+        keyword: Some("Chat".into()),
+        ..Default::default()
+    };
+    let handle = f
+        .runtime
+        .capture_chat_folder_selection("alice", rule)
+        .await
+        .unwrap();
+    assert_eq!(handle.count().await.unwrap().count, 501);
+    assert_eq!(handle.page(0, 400, 200).await.unwrap().group_ids.len(), 101);
+    // Exercise the public authoritative source path, not private projection SQL.
+    let mut projection = f.store.load_account_projection_state("alice", 100).unwrap();
+    projection.groups[1].profile_name = "Other".into();
+    f.store
+        .save_account_projection_state(&projection, 100, 120)
+        .unwrap();
+    for _ in 0..24 {
+        crate::chat_presentation::maintenance::prepare_batch(&f.store, &shared, &f.account_id)
+            .unwrap();
+    }
+    assert_eq!(handle.count().await.unwrap().count, 501);
+    let checked = handle.revalidate(0).await.unwrap();
+    assert_eq!(checked.count, 500);
+    assert_eq!(checked.revision, 1);
+    assert!(matches!(
+        handle.page(0, 0, 1).await,
+        Err(ChatSelectionError::StaleRevision)
+    ));
+    handle.close();
+}
+
+#[tokio::test]
+async fn invalid_folder_is_rejected_before_capture_and_manual_scope_needs_no_roster() {
+    let f = Fixture::new(3);
+    assert!(matches!(
+        f.runtime
+            .capture_chat_folder_selection(
+                "alice",
+                ChatFolderSelectionRule {
+                    version: 2,
+                    ..Default::default()
+                }
+            )
+            .await,
+        Err(ChatSelectionError::Selection(
+            ChatListSelectionError::InvalidFilter
+        ))
+    ));
+    let handle = f
+        .runtime
+        .capture_chat_folder_selection(
+            "alice",
+            ChatFolderSelectionRule {
+                manual_include_ids: vec!["0000".into(), "0001".into(), "ffff".into()],
+                manual_exclude_ids: vec!["0001".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(handle.page(0, 0, 200).await.unwrap().group_ids, ["0000"]);
+    handle.close();
+}
+
+#[tokio::test]
+async fn keyword_revalidation_waits_for_shared_profile_catch_up_without_mutating_intent() {
+    let f = Fixture::new(3);
+    let shared = f.app.shared_storage().unwrap();
+    for _ in 0..6 {
+        crate::chat_presentation::maintenance::prepare_batch(&f.store, &shared, &f.account_id)
+            .unwrap();
+    }
+    let handle = f
+        .runtime
+        .capture_chat_folder_selection(
+            "alice",
+            ChatFolderSelectionRule {
+                keyword: Some("chat".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    shared
+        .put_public_directory_user(&storage_sqlite::PublicDirectoryUserRecord {
+            account_id_hex: "bb".repeat(32),
+            npub: "fixture".into(),
+            profile_json: Some("{\"name\":\"Changed\"}".into()),
+            relay_lists_json: "{}".into(),
+            key_package_json: None,
+            event_id_hex: None,
+            event_kind: None,
+            event_created_at: None,
+            follows: vec![],
+        })
+        .unwrap();
+    assert!(matches!(
+        handle.revalidate(0).await,
+        Err(ChatSelectionError::Selection(
+            ChatListSelectionError::ProjectionNotReady
+        ))
+    ));
+    assert_eq!(
+        handle.count().await.unwrap(),
+        ChatSelectionSummary {
+            revision: 0,
+            count: 3
+        }
+    );
+    for _ in 0..6 {
+        crate::chat_presentation::maintenance::prepare_batch(&f.store, &shared, &f.account_id)
+            .unwrap();
+    }
+    assert_eq!(
+        handle.revalidate(0).await.unwrap(),
+        ChatSelectionSummary {
+            revision: 1,
+            count: 3
+        }
+    );
+    handle.close();
+}
+
+#[tokio::test]
 async fn complete_selection_pages_all_ids_without_hydrating_presentation() {
     let f = Fixture::new(501);
     let handle = f

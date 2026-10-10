@@ -219,6 +219,8 @@ mod migration_0104_file_attachment_retention;
 mod migration_0105_file_attachment_partials;
 #[path = "migrations/0106_retained_attachment_chunks.rs"]
 mod migration_0106_retained_attachment_chunks;
+#[path = "migrations/0107_chat_folder_inputs.rs"]
+mod migration_0107_chat_folder_inputs;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -764,6 +766,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 106,
         name: "0106_retained_attachment_chunks",
         apply: migration_0106_retained_attachment_chunks::apply,
+    },
+    Migration {
+        version: 107,
+        name: "0107_chat_folder_inputs",
+        apply: migration_0107_chat_folder_inputs::apply,
     },
 ];
 
@@ -1751,6 +1758,8 @@ mod tests {
 
     #[test]
     fn avatar_acquisition_upgrade_bootstraps_once_and_preserves_cached_bytes() {
+        use sha2::{Digest, Sha256};
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("avatar-acquisition-upgrade.db");
         let mut conn = keyed_connection(&path);
@@ -1773,14 +1782,39 @@ mod tests {
         conn.execute_batch("INSERT INTO account_groups(group_id_hex, endpoint, profile_name, updated_at, member_count) VALUES('aabb', 'fixture', 'Chat', 7, 3);
             INSERT INTO chat_list_rows(group_id_hex, activity_sort_at, updated_at) VALUES('aabb', 19, 7);").unwrap();
         conn.execute("UPDATE chat_list_rows SET presentation_json = ?1, presentation_applied_source_revision = presentation_source_revision WHERE group_id_hex = 'aabb'", [bytes]).unwrap();
+        let image =
+            crate::AvatarImage::new(vec![1; 8], crate::AvatarImageFormat::Png, 1, 1).unwrap();
+        // Cached bytes already exist in the pre-acquisition schema. Later
+        // folder-input rebuilding must retain both them and their source.
+        conn.execute(
+            "INSERT INTO avatar_assets(owner_key,source_key,token,bytes,digest,media_type,width,height)
+             SELECT 'chat:' || lower(hex(presentation_row_epoch)), 'source', randomblob(16),
+                    ?1, ?2, 'image/png', 1, 1 FROM chat_list_rows WHERE group_id_hex='aabb'",
+            rusqlite::params![image.bytes(), Sha256::digest(image.bytes()).as_slice()],
+        )
+        .unwrap();
         run_all(&mut conn).unwrap();
         drop(conn);
         let key = SqlCipherKey::new(TEST_DATABASE_KEY).unwrap();
         let storage = crate::SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let crate::ChatPresentationRead::Ready(retained) =
+            storage.chat_presentation("aabb").unwrap()
+        else {
+            panic!("metadata-only upgrades must retain the previous avatar selection");
+        };
+        assert_eq!(
+            retained.presentation.resolution,
+            crate::PresentationResolution::LastKnown
+        );
+        assert!(retained.presentation.avatar == value.presentation.avatar);
         assert!(!storage.bootstrap_avatar_acquisition().unwrap());
+        let reference = storage.chat_avatar_reference("aabb").unwrap().unwrap();
+        assert_eq!(
+            storage.read_avatar(&reference, 0).unwrap().image,
+            Some(image.clone())
+        );
         let job = storage.claim_avatar_acquisition(0).unwrap().unwrap();
-        let image =
-            crate::AvatarImage::new(vec![1; 8], crate::AvatarImageFormat::Png, 1, 1).unwrap();
+        assert_eq!(job.reference, reference);
         storage
             .complete_avatar_acquisition(&job, &image, None)
             .unwrap();
@@ -1793,6 +1827,12 @@ mod tests {
         reopened.remove_avatar_source(&job.reference).unwrap();
         reopened.close().unwrap();
         let reopened = crate::SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let input = reopened.chat_presentation_input("aabb").unwrap().unwrap();
+        assert_eq!(
+            reopened.store_chat_presentation(&input, &value).unwrap(),
+            crate::ChatPresentationWrite::Applied
+        );
+        assert!(reopened.claim_avatar_acquisition(0).unwrap().is_none());
         assert!(!reopened.bootstrap_avatar_acquisition().unwrap());
         assert!(reopened.claim_avatar_acquisition(0).unwrap().is_none());
     }

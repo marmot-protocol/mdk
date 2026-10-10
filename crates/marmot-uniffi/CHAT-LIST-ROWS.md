@@ -143,10 +143,71 @@ free functions; free the handle only without active calls, before its client.
 statuses96,97 and98 without renumbering existing statuses. Ship the generated
 header, Swift/Kotlin source and matching native library together.
 
-This API accepts fixed native views only. It does not evaluate arbitrary saved
-folder expressions, resolve complete member/text inputs, aggregate per-action
-eligibility or provide a filtered live window. Those requirements remain open;
-hosts must not replace them with filtering only the loaded display rows.
+The fixed-view entry point remains unchanged. `capture_chat_folder_selection`
+adds existing flat and bounded smart-folder expressions. Relative-time predicates,
+per-action eligibility aggregation and filtered live windows remain open.
+
+### Complete existing-folder selection
+
+`ChatFolderSelectionRule.version` must be1. Member IDs (maximum256) are exactly
+32-byte account identities represented as hexadecimal; include/exclude group IDs
+(maximum1024 each) are variable-length nonempty even hexadecimal strings up to512
+characters. Uppercase IDs normalize to lowercase. The keyword is at most1024 UTF-8
+bytes, trimmed once; empty or whitespace-only means absent. Excessive/malformed
+inputs and unsupported versions return `ChatSelectionInvalidFilter` (C status99).
+
+The member-any and keyword criteria combine with OR. Unread-only, unread-mentions,
+groups-only, direct-chats-only, pinned-only, archive-side and effective mute
+constraints combine with AND. Explicit `include_all` enables all eligible chats
+on the selected archive side. With no member or keyword criteria, categories can
+stand alone; contradictory group/direct categories match nothing. An otherwise
+empty automatic rule matches nothing. Manual includes bypass automatic criteria,
+including archive/mute, but cannot resurrect missing, blocked or departed chats.
+Manual exclusions win over both automatic and manual inclusion. Ordering reuses
+native pin/activity keys, and rules are frozen in the handle: recapture after an edit.
+
+Keywords match the MDK-selected literal title and description using Unicode default
+whole-string lowercase and literal substring containment. There is no regex, SQL
+wildcard, accent or compatibility folding. Localized fallback labels are not literal
+metadata. Display strings remain unchanged. Roster matching uses a separate complete
+current-roster index, not the two-person peer-presentation table. Engine writes,
+raw restores/imports and deletes invalidate or atomically replace those inputs;
+upgrade/backfill runs in batches of50 without network or message-history access.
+Migration107 also creates partial pending-send indexes, which requires a one-time
+scan of existing timeline/submission rows during the transactional upgrade. Later
+pending-send matching uses those indexes, not a message-history traversal.
+
+If present, `smart_filter_json` replaces flat automatic criteria, preserving
+manual inclusion/exclusion. This private JSON envelope has `version:1` and a
+`root` group with `kind:"group"`, `all` (AND when true, OR otherwise), `not`,
+and `children`. Conditions have `kind:"condition"`, uppercase `field` and `mode`,
+`values` and `not`. Nested groups and conditions support negation. An empty root
+is manual-only, including a negated root; nested empty groups are invalid.
+
+Supported fields are `UNREAD`, `MENTIONS`, `DRAFT`, `PENDING_SEND`, `MUTED`,
+`ARCHIVED`, `ACCEPTED` and `PINNED` (`PRESENT`/`NONE`, no values);
+`PARTICIPANTS` (`ANY_OF`/`ALL_OF`/`EXCLUDES`, nonempty lowercase64-hex identities);
+`TYPE` (`DIRECT`/`GROUP`, no values); and `TITLE` (`CONTAINS`, one nonblank literal).
+Smart expressions may cross archive sides; use an `ARCHIVED` condition when needed.
+The complete current native outbox, including older pending timeline sends, drives
+`PENDING_SEND`; a received latest-message preview does not imply no pending sends.
+Drafts include nonblank text or attachments. Deleted, invalidated or confirmed
+timeline sends do not count as pending.
+
+Limits are65536 UTF-8 envelope bytes, depth4 (root depth0),64 total nodes,64
+unique values per condition, and256 UTF-16 units per title literal. Unknown fields,
+unsupported combinations, malformed versions or any invalid subtree reject the
+whole rule. A required source remains unknown under negation: incomplete roster,
+type or selected-title evidence returns not-ready, never a partially authorized set.
+User text is bound as SQL parameters. Smart title literals are not trimmed before
+matching; flat keywords retain their legacy trim behavior.
+
+Capture fails with `ChatPresentationNotReady` when required roster/classification/text
+evidence is unknown or stale. Keyword capture and revalidation also fence shared
+profile catch-up before and after the account query. No partially complete selection
+is published. Counts/pages are frozen intent; revalidation only removes ids that
+no longer match, supersedes old pages and does not authorize any mutation. Every
+bulk command must still validate current command-specific permissions.
 
 ## Existing row gestures
 

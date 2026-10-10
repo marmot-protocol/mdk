@@ -2,7 +2,9 @@
 use super::{ChatListView, MarmotAppRuntime, RuntimeLifecycle, wait_for_runtime_shutdown};
 use crate::AppError;
 use std::sync::{Arc, Mutex};
-use storage_sqlite::{ChatListSelectionSnapshot, SqliteAccountStorage};
+use storage_sqlite::{
+    ChatFolderSelectionRule, ChatListSelectionSnapshot, SqliteAccountStorage, SqliteSharedStorage,
+};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 #[derive(Debug, thiserror::Error)]
@@ -52,6 +54,7 @@ enum Action {
 struct State {
     snapshot: ChatListSelectionSnapshot,
     revision: u64,
+    text_source: Option<SqliteSharedStorage>,
 }
 
 /// Drop or close releases intent. All commands serialize; late results after
@@ -146,6 +149,27 @@ impl MarmotAppRuntime {
         account_ref: &str,
         view: ChatListView,
     ) -> Result<ChatListSelectionHandle, ChatSelectionError> {
+        self.capture_selection(account_ref, view, None).await
+    }
+
+    /// Complete existing-folder selection. Matching runs against native compact
+    /// inputs, not the host's retained rows. Unknown inputs return retryable not-ready.
+    pub async fn capture_chat_folder_selection(
+        &self,
+        account_ref: &str,
+        rule: ChatFolderSelectionRule,
+    ) -> Result<ChatListSelectionHandle, ChatSelectionError> {
+        rule.validate()?;
+        self.capture_selection(account_ref, ChatListView::Chats, Some(rule))
+            .await
+    }
+
+    async fn capture_selection(
+        &self,
+        account_ref: &str,
+        view: ChatListView,
+        rule: Option<ChatFolderSelectionRule>,
+    ) -> Result<ChatListSelectionHandle, ChatSelectionError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.accounts.resolve(account_ref)?;
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
@@ -166,16 +190,52 @@ impl MarmotAppRuntime {
                 return Err(ChatSelectionError::Closed);
             }
             let store = app.account_storage(&label)?;
-            crate::chat_presentation::maintenance::prepare_base_rows(
-                &store,
-                &account.account_id_hex,
-            )?;
-            let snapshot = store.chat_list_selection_snapshot(view).inspect_err(|_| {
+            let text_source = if rule
+                .as_ref()
+                .map(ChatFolderSelectionRule::requires_text)
+                .transpose()?
+                .unwrap_or(false)
+            {
+                Some(app.shared_storage()?)
+            } else {
+                None
+            };
+            if rule.is_some() {
+                crate::chat_presentation::maintenance::prepare_batch(
+                    &store,
+                    &app.shared_storage()?,
+                    &account.account_id_hex,
+                )?;
+            } else {
+                crate::chat_presentation::maintenance::prepare_base_rows(
+                    &store,
+                    &account.account_id_hex,
+                )?;
+            }
+            let text_head = text_source
+                .as_ref()
+                .map(|shared| folder_text_head(&store, shared))
+                .transpose()
+                .inspect_err(|_| app.presentation_signals.wake())?;
+            let snapshot = match rule {
+                Some(rule) => store.chat_folder_selection_snapshot(rule),
+                None => store.chat_list_selection_snapshot(view),
+            }
+            .inspect_err(|_| {
                 app.presentation_signals.wake();
             })?;
-            Ok::<_, ChatSelectionError>((store, snapshot))
+            if let (Some(shared), Some(head)) = (&text_source, &text_head)
+                && shared
+                    .directory_presentation_version()
+                    .map_err(AppError::from)?
+                    != *head
+            {
+                app.presentation_signals.wake();
+                return Err(storage_sqlite::ChatListSelectionError::ProjectionNotReady.into());
+            }
+            Ok::<_, ChatSelectionError>((store, snapshot, text_source))
         });
-        let (store, snapshot) = tokio::select! {
+        let (store, snapshot, text_source) = tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut stopping) => return Err(ChatSelectionError::Closed),
             _ = wait_for_reset(&mut resets, &account.label) => return Err(ChatSelectionError::Closed),
@@ -193,6 +253,7 @@ impl MarmotAppRuntime {
             State {
                 snapshot,
                 revision: 0,
+                text_source,
             },
             receiver,
             stopping,
@@ -279,7 +340,20 @@ fn apply(
             }
         }
         Action::Revalidate => {
+            let text_head = state
+                .text_source
+                .as_ref()
+                .map(|shared| folder_text_head(store, shared))
+                .transpose()?;
             let next = store.revalidate_chat_list_selection(&state.snapshot)?;
+            if let (Some(shared), Some(head)) = (&state.text_source, &text_head)
+                && shared
+                    .directory_presentation_version()
+                    .map_err(AppError::from)?
+                    != *head
+            {
+                return Err(storage_sqlite::ChatListSelectionError::ProjectionNotReady.into());
+            }
             // Every action-validation result supersedes previously paged action intent,
             // even when the count stayed the same. No old page can be spliced into it.
             state.revision = state
@@ -296,6 +370,27 @@ fn apply(
         },
         group_ids: ids,
     })
+}
+
+fn folder_text_head(
+    store: &SqliteAccountStorage,
+    shared: &SqliteSharedStorage,
+) -> Result<storage_sqlite::ChatPresentationVersion, ChatSelectionError> {
+    let head = shared
+        .directory_presentation_version()
+        .map_err(AppError::from)?;
+    let checkpoint = store
+        .chat_presentation_checkpoint()
+        .map_err(AppError::from)?
+        .state;
+    if checkpoint.shared_epoch != head.store_epoch
+        || checkpoint.revision != head.revision
+        || checkpoint.reconciling
+        || checkpoint.active.is_some()
+    {
+        return Err(storage_sqlite::ChatListSelectionError::ProjectionNotReady.into());
+    }
+    Ok(head)
 }
 
 fn reset_observed(resets: &mut broadcast::Receiver<String>, label: &str) -> bool {

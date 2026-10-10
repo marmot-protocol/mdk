@@ -88,9 +88,13 @@ still enforce their own mutation preconditions: this read is not an atomic autho
 
 Capture and revalidation use O(eligible IDs) work and memory, independently of profile/history size; each page
 copies at most 200 IDs. The app runtime's `capture_chat_list_selection` exposes a lifecycle-bound fixed-view
-handle with count, bounded pages, deselection, remove-only revalidation and close. Automatic-folder expressions
-and host selection UI remain separate contracts. Callers must retain account/view generations and resolve
-complete intent instead of deriving it from visible rows.
+handle with count, bounded pages, deselection, remove-only revalidation and close.
+`chat_folder_selection_snapshot(rule)` captures complete flat or bounded smart
+folder matches from native current roster, presentation, draft and outbox inputs;
+unknown required evidence fails closed. See the
+[folder contract](../marmot-uniffi/CHAT-LIST-ROWS.md#complete-existing-folder-selection).
+Filtered live windows and host selection UI remain separate. Callers must retain
+account/view generations and resolve complete intent instead of visible rows.
 
 ## Migrations
 

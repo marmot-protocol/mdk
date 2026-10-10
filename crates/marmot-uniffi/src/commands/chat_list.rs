@@ -56,6 +56,20 @@ impl Marmot {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl Marmot {
+    /// Complete version-1 existing-folder intent. Exclusions override manual and
+    /// automatic inclusion; unknown required native inputs return not-ready.
+    pub async fn capture_chat_folder_selection(
+        &self,
+        account_ref: String,
+        rule: crate::conversions::ChatFolderSelectionRuleFfi,
+    ) -> Result<std::sync::Arc<crate::ChatListSelection>, MarmotKitError> {
+        Ok(crate::ChatListSelection::new(
+            self.runtime
+                .capture_chat_folder_selection(&account_ref, rule.into())
+                .await?,
+        ))
+    }
+
     /// Capture the complete fixed native view, independent of displayed rows.
     /// Automatic folders require a separate native predicate contract.
     pub async fn capture_chat_list_selection(
