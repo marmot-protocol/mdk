@@ -101,8 +101,10 @@ reports and weigh them against abuse. A report is a claim by its reporter, not p
   `CompletionUnknown` means a relay may have received it without acknowledging, and it stays `CompletionUnknown` until
   a relay accepts the wrap. Neither retained state is a failure.
 - **Durability.** The signed wrap is staged in the account's SQLCipher database before any relay sees it. Each
-  `catch_up_accounts` call starts a background retry for accounts with queued reports. Runtime shutdown cancels an
-  in-flight publish and leaves the report queued. The queued row holds only the ciphertext wrap, the recipient key, an
+  `catch_up_accounts` call starts a background retry for accounts with queued reports. Each pass tries never-attempted
+  reports first and then the least recently attempted, so reports that keep failing cannot starve newer ones. Every
+  attempt is marked in flight before any relay I/O. If shutdown, cancellation or process death interrupts it, the
+  report stays queued as `CompletionUnknown`, because it may already have reached a relay. The queued row holds only the ciphertext wrap, the recipient key, an
   opaque local id and a one-way dedupe key. The wrap is deleted once a relay accepts it. A queued report addressed to a
   different recipient than the current configuration is dropped, never redirected. An unpublished report is abandoned
   after seven days.

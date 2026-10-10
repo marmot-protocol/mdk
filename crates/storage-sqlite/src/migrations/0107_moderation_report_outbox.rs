@@ -22,6 +22,9 @@ CREATE TABLE moderation_report_outbox (
     created_at_ms INTEGER NOT NULL,
     last_attempt_at_ms INTEGER,
     attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+    -- Set before relay I/O and cleared when the attempt is recorded. A row left
+    -- set was interrupted after the wrap may have left the device.
+    in_flight INTEGER NOT NULL DEFAULT 0 CHECK(in_flight IN (0, 1)),
     CHECK((outcome = 'published') = (event_json IS NULL))
 );
 CREATE INDEX moderation_report_outbox_dedupe_idx

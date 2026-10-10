@@ -337,7 +337,7 @@ impl MarmotApp {
     /// Submit one private report about `reported_pubkey` to the configured moderation team.
     ///
     /// `stopping` resolves when the runtime shuts down; an interrupted publish leaves the
-    /// staged report queued and returns [`ModerationReportStatus::AcceptedPending`].
+    /// staged report queued and returns [`ModerationReportStatus::CompletionUnknown`].
     pub(crate) async fn submit_moderation_report(
         &self,
         label: &str,
@@ -463,6 +463,9 @@ impl MarmotApp {
             created_at_ms: now_ms,
             attempts: 0,
         })?;
+        // Durably mark the attempt before relay I/O: if it is interrupted,
+        // shutdown, cancellation or process death leave it `CompletionUnknown`.
+        storage.begin_moderation_report_attempt(&report_id)?;
         // Publish without the account lock so a slow relay never blocks another
         // report, a retry selection or a purge. A purge that lands meanwhile
         // deletes the row, and the attempt record below then updates nothing.
@@ -475,11 +478,12 @@ impl MarmotApp {
                 return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
             }
             _ = runtime_stopping(&mut stopping) => {
-                // Left queued; the next catch-up after restart retries it.
+                // Left queued and marked in flight; the wrap may already have
+                // reached a relay. The next catch-up after restart retries it.
                 return Ok((
                     ModerationReportOutcome {
                         report_id,
-                        status: ModerationReportStatus::AcceptedPending,
+                        status: ModerationReportStatus::CompletionUnknown,
                     },
                     false,
                 ));
@@ -550,6 +554,10 @@ impl MarmotApp {
                 summary.abandoned += 1;
                 continue;
             };
+            if !storage.begin_moderation_report_attempt(&entry.report_id)? {
+                // Purged or published since selection.
+                continue;
+            }
             let outcome = tokio::select! {
                 outcome = self.publish_moderation_wrap(&config, &event) => outcome,
                 _ = generation_changed(&mut generation) => break,

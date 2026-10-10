@@ -28,6 +28,8 @@ struct RecordingPublisher {
     hung: AtomicUsize,
     /// When set, the next publish hangs regardless of `mode`.
     hang_next: std::sync::atomic::AtomicBool,
+    /// Wrap ids refused regardless of `mode`.
+    refused_ids: Mutex<std::collections::HashSet<String>>,
 }
 
 impl RecordingPublisher {
@@ -38,6 +40,7 @@ impl RecordingPublisher {
             started: tokio::sync::Notify::new(),
             hung: AtomicUsize::new(0),
             hang_next: std::sync::atomic::AtomicBool::new(false),
+            refused_ids: Mutex::default(),
         })
     }
 
@@ -99,6 +102,8 @@ impl NostrRelayClient for RecordingPublisher {
         self.started.notify_one();
         let mode = if self.hang_next.swap(false, Ordering::SeqCst) {
             Mode::Hang
+        } else if self.refused_ids.lock().unwrap().contains(&event.id) {
+            Mode::Refuse
         } else {
             *self.mode.lock().unwrap()
         };
@@ -1045,6 +1050,59 @@ async fn an_unacknowledged_report_stays_unknown_after_an_offline_retry() {
 }
 
 #[tokio::test]
+async fn reports_that_keep_failing_do_not_starve_newer_ones() {
+    let fixture = Fixture::configured(Mode::Refuse);
+    let now = unix_now_ms();
+    // A full batch of older reports, outside the current rate window...
+    for _ in 0..RETRY_BATCH_LIMIT {
+        fixture
+            .submit_at(
+                &Keys::generate().public_key().to_hex(),
+                now - 2 * 60 * 60 * 1000,
+            )
+            .await
+            .unwrap();
+    }
+    // ...and newer ones queued after them.
+    for _ in 0..3 {
+        fixture
+            .submit_at(
+                &Keys::generate().public_key().to_hex(),
+                now - 30 * 60 * 1000,
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(fixture.pending().len(), RETRY_BATCH_LIMIT + 3);
+    // The relay keeps refusing the older wraps but accepts the newer ones.
+    {
+        let events = fixture.publisher.events();
+        let mut refused = fixture.publisher.refused_ids.lock().unwrap();
+        for event in &events[..RETRY_BATCH_LIMIT] {
+            refused.insert(event.id.clone());
+        }
+    }
+    fixture.publisher.set_mode(Mode::Accept);
+
+    let first = fixture
+        .app
+        .retry_pending_moderation_reports("alice", None)
+        .await
+        .unwrap();
+    let second = fixture
+        .app
+        .retry_pending_moderation_reports("alice", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        first.published + second.published,
+        3,
+        "{first:?} {second:?}"
+    );
+    assert_eq!(fixture.pending().len(), RETRY_BATCH_LIMIT);
+}
+
+#[tokio::test]
 async fn runtime_stop_leaves_the_report_queued_for_retry() {
     let fixture = Fixture::configured(Mode::Hang);
     let (stop, stopping) = watch::channel(false);
@@ -1063,10 +1121,38 @@ async fn runtime_stop_leaves_the_report_queued_for_retry() {
     };
     let (outcome, ()) = tokio::join!(submit, stopper);
     let outcome = outcome.unwrap();
-    assert_eq!(outcome.status, ModerationReportStatus::AcceptedPending);
+    // The wrap may already have reached a relay that never acknowledged it.
+    assert_eq!(outcome.status, ModerationReportStatus::CompletionUnknown);
     let pending = fixture.pending();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].report_id, outcome.report_id);
+    assert_eq!(
+        pending[0].outcome,
+        ModerationReportOutboxOutcome::CompletionUnknown
+    );
+
+    // An offline retry cannot downgrade the interrupted attempt to pending.
+    fixture.publisher.set_mode(Mode::Refuse);
+    fixture
+        .app
+        .retry_pending_moderation_reports("alice", None)
+        .await
+        .unwrap();
+    let (repeat, repeated) = fixture
+        .app
+        .submit_moderation_report_at(
+            "alice",
+            &reported,
+            ReportReason::Spam,
+            "",
+            ModerationReportOrigin::Report,
+            None,
+            unix_now_ms(),
+        )
+        .await
+        .unwrap();
+    assert!(repeated);
+    assert_eq!(repeat.status, ModerationReportStatus::CompletionUnknown);
 
     fixture.publisher.set_mode(Mode::Accept);
     let summary = fixture

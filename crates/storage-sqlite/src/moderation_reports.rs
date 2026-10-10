@@ -57,8 +57,11 @@ pub struct ModerationReportOutboxEntry {
     pub attempts: u32,
 }
 
-const COLUMNS: &str =
-    "report_id, dedupe_key, recipient_pubkey_hex, outcome, event_json, created_at_ms, attempts";
+/// `outcome` reads as `completion_unknown` while an attempt is in flight or was
+/// interrupted: the wrap may already have reached a relay.
+const COLUMNS: &str = "report_id, dedupe_key, recipient_pubkey_hex,
+    CASE WHEN in_flight = 1 THEN 'completion_unknown' ELSE outcome END,
+    event_json, created_at_ms, attempts";
 
 fn entry_from_row(row: &Row<'_>) -> rusqlite::Result<(ModerationReportOutboxEntryRaw, String)> {
     Ok((
@@ -164,6 +167,23 @@ impl SqliteAccountStorage {
         Ok(())
     }
 
+    /// Mark `report_id` as being sent, before any relay I/O. If the previous
+    /// attempt never recorded its result, it may have reached a relay, so the
+    /// report becomes `CompletionUnknown`. Returns whether the row still exists.
+    pub fn begin_moderation_report_attempt(&self, report_id: &str) -> StorageResult<bool> {
+        let changed = self
+            .lock()?
+            .execute(
+                "UPDATE moderation_report_outbox
+                 SET outcome = CASE WHEN in_flight = 1 THEN 'completion_unknown' ELSE outcome END,
+                     in_flight = 1
+                 WHERE report_id = ?1 AND event_json IS NOT NULL",
+                params![report_id],
+            )
+            .storage()?;
+        Ok(changed > 0)
+    }
+
     /// Record one publish attempt. A published report drops its wrap.
     /// `CompletionUnknown` is sticky: once a wrap may have reached a relay, a
     /// later refused attempt cannot downgrade it to `AcceptedPending`. Returns
@@ -185,7 +205,8 @@ impl SqliteAccountStorage {
                      END,
                      event_json = CASE WHEN ?2 = 'published' THEN NULL ELSE event_json END,
                      last_attempt_at_ms = ?3,
-                     attempts = attempts + 1
+                     attempts = attempts + 1,
+                     in_flight = 0
                  WHERE report_id = ?1 AND event_json IS NOT NULL",
                 params![
                     report_id,
@@ -197,7 +218,8 @@ impl SqliteAccountStorage {
         Ok(changed > 0)
     }
 
-    /// Reports still awaiting acceptance, oldest first.
+    /// Reports still awaiting acceptance: never-attempted first, then least
+    /// recently attempted, so reports that keep failing cannot starve newer ones.
     pub fn pending_moderation_reports(
         &self,
         limit: usize,
@@ -207,7 +229,9 @@ impl SqliteAccountStorage {
             .prepare(&format!(
                 "SELECT {COLUMNS} FROM moderation_report_outbox
                  WHERE event_json IS NOT NULL
-                 ORDER BY created_at_ms, report_id LIMIT ?1"
+                 ORDER BY last_attempt_at_ms IS NOT NULL, last_attempt_at_ms,
+                          created_at_ms, report_id
+                 LIMIT ?1"
             ))
             .storage()?;
         let rows = stmt
@@ -382,6 +406,100 @@ mod tests {
             .record_moderation_report_attempt(&id, ModerationReportOutboxOutcome::Published, 4_000)
             .unwrap();
         assert_eq!(outcome(&store), ModerationReportOutboxOutcome::Published);
+    }
+
+    #[test]
+    fn an_interrupted_attempt_reads_and_stays_completion_unknown() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .stage_moderation_report(&entry('a', 'd', 1_000))
+            .unwrap();
+        let id = "a".repeat(32);
+        let outcome = |store: &SqliteAccountStorage| {
+            store
+                .moderation_report_by_dedupe_key(&"d".repeat(64), 0)
+                .unwrap()
+                .unwrap()
+                .outcome
+        };
+        assert_eq!(
+            outcome(&store),
+            ModerationReportOutboxOutcome::AcceptedPending
+        );
+        // In flight: the wrap may be leaving the device.
+        assert!(store.begin_moderation_report_attempt(&id).unwrap());
+        assert_eq!(
+            outcome(&store),
+            ModerationReportOutboxOutcome::CompletionUnknown
+        );
+        // Interrupted (never recorded), then a later attempt is refused before sending.
+        assert!(store.begin_moderation_report_attempt(&id).unwrap());
+        store
+            .record_moderation_report_attempt(
+                &id,
+                ModerationReportOutboxOutcome::AcceptedPending,
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome(&store),
+            ModerationReportOutboxOutcome::CompletionUnknown
+        );
+    }
+
+    #[test]
+    fn a_completed_attempt_without_prior_uncertainty_stays_pending() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .stage_moderation_report(&entry('a', 'd', 1_000))
+            .unwrap();
+        let id = "a".repeat(32);
+        assert!(store.begin_moderation_report_attempt(&id).unwrap());
+        store
+            .record_moderation_report_attempt(
+                &id,
+                ModerationReportOutboxOutcome::AcceptedPending,
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(
+            store.pending_moderation_reports(1).unwrap()[0].outcome,
+            ModerationReportOutboxOutcome::AcceptedPending
+        );
+    }
+
+    #[test]
+    fn retry_selection_rotates_past_reports_that_keep_failing() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .stage_moderation_report(&entry('a', 'd', 1_000))
+            .unwrap();
+        store
+            .stage_moderation_report(&entry('b', 'e', 2_000))
+            .unwrap();
+        store
+            .stage_moderation_report(&entry('f', 'f', 3_000))
+            .unwrap();
+        let ids = |store: &SqliteAccountStorage| {
+            store
+                .pending_moderation_reports(2)
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.report_id.chars().next().unwrap())
+                .collect::<String>()
+        };
+        assert_eq!(ids(&store), "ab");
+        for (id, at) in [('a', 5_000), ('b', 6_000)] {
+            store
+                .record_moderation_report_attempt(
+                    &id.to_string().repeat(32),
+                    ModerationReportOutboxOutcome::AcceptedPending,
+                    at,
+                )
+                .unwrap();
+        }
+        // The never-attempted report comes first, then the least recently tried.
+        assert_eq!(ids(&store), "fa");
     }
 
     #[test]
