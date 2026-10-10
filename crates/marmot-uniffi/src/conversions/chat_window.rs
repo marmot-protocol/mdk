@@ -2,6 +2,33 @@
 use super::PresentedChatRowFfi;
 use marmot_app as app;
 
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ChatSelectionSummaryFfi {
+    pub revision: u64,
+    pub count: u64,
+}
+impl From<app::ChatSelectionSummary> for ChatSelectionSummaryFfi {
+    fn from(v: app::ChatSelectionSummary) -> Self {
+        Self {
+            revision: v.revision,
+            count: v.count,
+        }
+    }
+}
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ChatSelectionPageFfi {
+    pub summary: ChatSelectionSummaryFfi,
+    pub group_ids: Vec<String>,
+}
+impl From<app::ChatSelectionPage> for ChatSelectionPageFfi {
+    fn from(v: app::ChatSelectionPage) -> Self {
+        Self {
+            summary: v.summary.into(),
+            group_ids: v.group_ids,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum ChatListViewFfi {
     Chats,

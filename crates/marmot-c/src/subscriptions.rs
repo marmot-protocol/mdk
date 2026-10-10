@@ -1310,6 +1310,8 @@ pub unsafe extern "C" fn marmot_presented_chat_list_subscription_free(
 
 mod chat_window;
 pub use chat_window::*;
+mod chat_selection;
+pub use chat_selection::*;
 
 mod conversation_window;
 use crate::types::user_blocks::MarmotBlockListSnapshot;

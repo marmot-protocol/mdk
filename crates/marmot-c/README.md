@@ -304,6 +304,13 @@ for version ordering, localization, readiness, and account-switch behavior.
 
 ## Chat screens and avatars
 
+`marmot_capture_chat_list_selection` returns an opaque fixed-view selection
+handle independent of display windows. Count/page/deselect/revalidate return
+owned summaries/pages; close is idempotent and free requires no active call.
+Null output pointers are rejected before capture or local intent mutation.
+See the [shared selection contract](../marmot-uniffi/CHAT-LIST-ROWS.md#complete-fixed-view-selection)
+for revisions, cancellation, account lifecycle and excluded folder behavior.
+
 Live Chats/Unread/Archived/Left windows and independent account attention follow the
 [native handoff contract](../../docs/marmot-architecture/further-context/chat-projections-native.md)
 for paging, sequence handling, cancellation, C ownership, and compatibility. Prepared conversation windows (history,

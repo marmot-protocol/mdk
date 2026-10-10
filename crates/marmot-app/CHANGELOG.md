@@ -11,6 +11,12 @@
 
 ### Added
 
+- `MarmotAppRuntime::capture_chat_list_selection` exposes complete frozen
+  fixed-view selection independently of display pagination. Handles serialize
+  revision-fenced count/page/deselect/revalidate commands and close on reset,
+  shutdown or explicit cancellation. Revalidation only removes IDs and does
+  not grant mutation authority. Automatic-folder predicates remain separate.
+
 - `MarmotAppRuntime::create_identity_local_ready_with_initial_profile` makes a
   caller-selected profile the first public kind-0 of a generated account, so
   contacts never see the key-derived default name. A setup resumed past

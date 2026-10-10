@@ -28,6 +28,12 @@
 
 ### Added
 
+- `capture_chat_list_selection` and the `ChatListSelection` object expose complete
+  fixed-view count, revision-fenced ID pages, deselection, remove-only action
+  revalidation and terminal close. Three typed selection errors distinguish
+  closed intent, stale revision and invalid pages. Folder predicates remain
+  separate; use matching generated bindings and native libraries.
+
 - `create_identity_with_initial_profile` creates a generated identity whose
   first public kind-0 is the onboarding-selected profile. Prefer it over
   `create_identity_with_profile` followed by `publish_user_profile`, which

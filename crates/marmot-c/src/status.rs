@@ -136,6 +136,9 @@ pub enum MarmotStatus {
     /// A signed-out account cannot grant automatic network permission.
     AttachmentAccountSignedOut = 94,
     InvalidAppComponent = 95,
+    ChatSelectionClosed = 96,
+    ChatSelectionStale = 97,
+    ChatSelectionInvalidPage = 98,
 }
 
 thread_local! {
@@ -156,6 +159,9 @@ pub(crate) fn take_last_error() -> Option<String> {
 pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
     set_last_error(err.to_string());
     match err {
+        MarmotKitError::ChatSelectionClosed => MarmotStatus::ChatSelectionClosed,
+        MarmotKitError::ChatSelectionStale => MarmotStatus::ChatSelectionStale,
+        MarmotKitError::ChatSelectionInvalidPage => MarmotStatus::ChatSelectionInvalidPage,
         MarmotKitError::ConversationWindowMessageNotRetained => {
             MarmotStatus::ConversationWindowMessageNotRetained
         }
@@ -278,6 +284,30 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn chat_selection_status_codes_append_without_changing_existing_values() {
+        assert_eq!(MarmotStatus::InvalidAppComponent as u32, 95);
+        for (error, status, number) in [
+            (
+                MarmotKitError::ChatSelectionClosed,
+                MarmotStatus::ChatSelectionClosed,
+                96,
+            ),
+            (
+                MarmotKitError::ChatSelectionStale,
+                MarmotStatus::ChatSelectionStale,
+                97,
+            ),
+            (
+                MarmotKitError::ChatSelectionInvalidPage,
+                MarmotStatus::ChatSelectionInvalidPage,
+                98,
+            ),
+        ] {
+            assert_eq!(status_from_error(&error), status);
+            assert_eq!(status as u32, number);
+        }
+    }
 
     #[test]
     fn attachment_configuration_errors_have_distinct_status_codes() {

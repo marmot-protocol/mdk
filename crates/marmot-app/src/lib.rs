@@ -167,13 +167,16 @@ pub use runtime::{
     ConversationPageDirection, ConversationWindowError, ConversationWindowHandle,
     ConversationWindowRevision, ConversationWindowSnapshot, RuntimeConversationWindowSubscription,
 };
+pub use runtime::{
+    ChatListSelectionHandle, ChatSelectionError, ChatSelectionPage, ChatSelectionSummary,
+};
 pub(crate) use sqlcipher::{SqlcipherDatabaseKind, remove_sqlite_file_set};
 pub use storage_sqlite::{
-    CHAT_LIST_DRAFT_PREVIEW_CHARS, ChatListDraftPreview, ChatListRowActions, ChatPinState,
-    ChatPresentationVersion, ConversationOpenError, ConversationPresentation,
-    PresentationResolution, PresentationSource, PresentationText, PresentedChatListSnapshot,
-    PresentedChatRow, SelectedAvatar, SelectedChatPreview, TimelineMessageChange,
-    TimelineRemoveReason, TimelineUpdateTrigger,
+    CHAT_LIST_DRAFT_PREVIEW_CHARS, ChatListDraftPreview, ChatListRowActions,
+    ChatListSelectionError, ChatPinState, ChatPresentationVersion, ConversationOpenError,
+    ConversationPresentation, PresentationResolution, PresentationSource, PresentationText,
+    PresentedChatListSnapshot, PresentedChatRow, SelectedAvatar, SelectedChatPreview,
+    TimelineMessageChange, TimelineRemoveReason, TimelineUpdateTrigger,
 };
 
 pub use agent_streams::{

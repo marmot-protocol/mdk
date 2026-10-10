@@ -9,6 +9,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Fixed-view `MarmotChatListSelection` capture/count/page/deselect/revalidate/
+  close/free calls and owned summary/page deep frees. Append selection closed,
+  stale and invalid-page statuses96–98 without changing existing values.
+  Capture and local mutations preflight output pointers; close is terminal.
+  Rebuild with matching headers/libraries. Automatic-folder predicates remain separate.
+
 - `marmot_create_identity_with_initial_profile` creates a generated identity
   whose first public kind-0 is the borrowed onboarding profile. New symbol;
   use the matching header and library.

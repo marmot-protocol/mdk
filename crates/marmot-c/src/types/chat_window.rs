@@ -4,6 +4,14 @@ use crate::memory::{CFree, free_c_string, owned_c_string};
 use crate::types::presentation::MarmotPresentedChatRow;
 use marmot_uniffi::conversions::*;
 use std::ffi::c_char;
+c_mirror! { MarmotChatSelectionSummary from ChatSelectionSummaryFfi, free marmot_chat_selection_summary_free {
+    copy revision: u64,
+    copy count: u64,
+} }
+c_mirror! { MarmotChatSelectionPage from ChatSelectionPageFfi, free marmot_chat_selection_page_free {
+    rec summary: MarmotChatSelectionSummary,
+    str_vec group_ids/group_ids_len,
+} }
 c_enum! { MarmotChatListView from ChatListViewFfi { Chats, Unread, Archived, Left, } }
 c_enum! { MarmotChatListPageDirection from ChatListPageDirectionFfi { Forward, Backward, } }
 c_enum! { MarmotAccountAttentionUnavailable from AccountAttentionUnavailableFfi { Preparing, ReadFailed, Resetting, } }
@@ -125,6 +133,41 @@ impl MarmotChatListPageDirection {
 mod tests {
     use super::*;
     use crate::memory::{audit, boxed};
+    #[test]
+    fn chat_selection_pages_preserve_count_revision_and_deep_free_ids() {
+        let _guard = audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let before = audit::live_allocations();
+        for count in [0, 1, 200] {
+            let page = ChatSelectionPageFfi {
+                summary: ChatSelectionSummaryFfi {
+                    revision: 42,
+                    count: 501,
+                },
+                group_ids: (0..count).map(|i| format!("{i:04x}")).collect(),
+            };
+            let mirror: MarmotChatSelectionPage = page.into();
+            assert_eq!(mirror.summary.revision, 42);
+            assert_eq!(mirror.summary.count, 501);
+            assert_eq!(mirror.group_ids_len, count);
+            unsafe {
+                marmot_chat_selection_page_free(boxed(mirror));
+            }
+        }
+        let summary: MarmotChatSelectionSummary = ChatSelectionSummaryFfi {
+            revision: u64::MAX,
+            count: u64::MAX,
+        }
+        .into();
+        assert_eq!(summary.count, u64::MAX);
+        unsafe {
+            marmot_chat_selection_summary_free(boxed(summary));
+            marmot_chat_selection_page_free(std::ptr::null_mut());
+            marmot_chat_selection_summary_free(std::ptr::null_mut());
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(audit::live_allocations(), before);
+    }
     #[test]
     fn screen_snapshots_deep_free_all_anchor_and_availability_variants() {
         let _guard = audit::test_lock();

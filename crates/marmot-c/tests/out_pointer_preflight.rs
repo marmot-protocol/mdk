@@ -34,6 +34,50 @@ fn client(root: &tempfile::TempDir) -> Option<*mut MarmotClient> {
 }
 
 #[test]
+fn chat_selection_out_preflight_never_runs_capture_or_mutation() {
+    use marmot_c::subscriptions::*;
+    unsafe {
+        assert_eq!(
+            marmot_capture_chat_list_selection(
+                std::ptr::null(),
+                std::ptr::null(),
+                u32::MAX,
+                std::ptr::null_mut()
+            ),
+            MarmotStatus::NullPointer
+        );
+        assert_eq!(
+            marmot_chat_list_selection_count(std::ptr::null(), std::ptr::null_mut()),
+            MarmotStatus::NullPointer
+        );
+        assert_eq!(
+            marmot_chat_list_selection_page(std::ptr::null(), 0, 0, 200, std::ptr::null_mut()),
+            MarmotStatus::NullPointer
+        );
+        assert_eq!(
+            marmot_chat_list_selection_deselect(
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut()
+            ),
+            MarmotStatus::NullPointer
+        );
+        assert_eq!(
+            marmot_chat_list_selection_revalidate(std::ptr::null(), 0, std::ptr::null_mut()),
+            MarmotStatus::NullPointer
+        );
+        let mut out = std::ptr::dangling_mut();
+        assert_eq!(
+            marmot_chat_list_selection_count(std::ptr::null(), &raw mut out),
+            MarmotStatus::NullPointer
+        );
+        assert!(out.is_null());
+        marmot_chat_list_selection_free(std::ptr::null_mut());
+    }
+}
+
+#[test]
 fn null_out_is_rejected_before_the_command_runs() {
     let root = tempfile::tempdir().expect("temp dir");
     let Some(client) = client(&root) else {

@@ -79,6 +79,10 @@ pub use account_attention::{
     AccountAttentionEntry, AccountAttentionSnapshot, AccountAttentionState, AccountAttentionTotal,
     AccountAttentionUnavailable, RuntimeAccountAttentionSubscription,
 };
+mod chat_list_selection;
+pub use chat_list_selection::{
+    ChatListSelectionHandle, ChatSelectionError, ChatSelectionPage, ChatSelectionSummary,
+};
 mod chat_list_window;
 mod conversation_window;
 mod worker_startup;

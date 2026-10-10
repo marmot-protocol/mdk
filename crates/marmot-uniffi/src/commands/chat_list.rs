@@ -56,6 +56,20 @@ impl Marmot {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl Marmot {
+    /// Capture the complete fixed native view, independent of displayed rows.
+    /// Automatic folders require a separate native predicate contract.
+    pub async fn capture_chat_list_selection(
+        &self,
+        account_ref: String,
+        view: crate::conversions::ChatListViewFfi,
+    ) -> Result<std::sync::Arc<crate::ChatListSelection>, MarmotKitError> {
+        Ok(crate::ChatListSelection::new(
+            self.runtime
+                .capture_chat_list_selection(&account_ref, view.into())
+                .await?,
+        ))
+    }
+
     /// Look up the reusable existing direct conversation with `peer_account_id`.
     ///
     /// `peer_account_id` accepts hex or `npub`. The read is keyed by this

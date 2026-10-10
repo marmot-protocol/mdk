@@ -110,6 +110,44 @@ not select an older surviving message automatically; an expired selected message
 can be rendered as an empty preview until an authoritative replacement arrives.
 Keep the row itself, ordering and unread state authoritative to MDK.
 
+## Complete fixed-view selection
+
+`captureChatListSelection(accountRef, view)` captures every eligible ID in one
+Chats, Unread, Archived or Left view, independently of the screen's 50/200-row
+window. The frozen order/count holds only IDs; capture and action revalidation
+are O(eligible IDs), without profile, roster or message-body hydration. Pending
+base preparation returns `ChatPresentationNotReady`, never a complete partial count.
+
+Call `count()` for the complete count/current revision, then `page(revision,
+offset, limit)` for at most 200 IDs. New messages, order changes and late chats
+do not expand the captured intent. `deselect(revision, groupIdHex)` removes one
+ID; unknown IDs leave intent unchanged. A changed selection supersedes old pages
+with `ChatSelectionStale`. `revalidate(revision)` removes no-longer-eligible IDs
+and always advances the revision; use only new-revision pages for the action.
+Each mutation still checks current authorization and preconditions. Revalidation
+is not an atomic permission grant, and the handle executes no bulk mutations.
+
+Commands serialize on the handle. Cancellation before queued admission prevents
+its local intent change; an admitted change can complete after caller cancellation.
+Read the current count/revision before retrying a cancelled operation. `close()`
+is idempotent and terminal; explicit close, account reset, shutdown or dropping
+the final object releases the selection and discards pending read results. A
+closed/reopened/foreign account store cannot reuse old intent. Hosts must close
+when switching selection context and never log or persist returned IDs.
+
+C has `MarmotChatListSelection` and matching capture/count/page/deselect/
+revalidate/close/free calls. Every output pointer is validated before work;
+results own their allocations. Deep-free summaries/pages with their matching
+free functions; free the handle only without active calls, before its client.
+`ChatSelectionClosed`, `ChatSelectionStale` and `ChatSelectionInvalidPage` append
+statuses96,97 and98 without renumbering existing statuses. Ship the generated
+header, Swift/Kotlin source and matching native library together.
+
+This API accepts fixed native views only. It does not evaluate arbitrary saved
+folder expressions, resolve complete member/text inputs, aggregate per-action
+eligibility or provide a filtered live window. Those requirements remain open;
+hosts must not replace them with filtering only the loaded display rows.
+
 ## Existing row gestures
 
 `actions` is local display availability for existing client gestures. It is not
