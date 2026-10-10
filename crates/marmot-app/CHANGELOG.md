@@ -11,6 +11,15 @@
 
 ### Added
 
+- Opt-in relay telemetry exports `relay_reconciliation_attempts` and
+  `relay_reconciliation_order_unproven_passes`: device-wide, unlabeled counts
+  of NIP-77 history-repair passes, and of group passes that returned nothing
+  because no time order covered the missing history (#2086). Repeated, those
+  passes end in a "history may be incomplete" notice.
+  `NostrAdapterMetrics` gains `reconciliation_order_unproven_passes` and
+  `NostrReconciliationSummary` gains `order_unproven`; struct literals need
+  the field or `..Default::default()`.
+
 - `MarmotAppRuntime::create_identity_local_ready_with_initial_profile` makes a
   caller-selected profile the first public kind-0 of a generated account, so
   contacts never see the key-derived default name. A setup resumed past

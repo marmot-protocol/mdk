@@ -162,7 +162,8 @@ past older messages still missing, which can then never be read (mdk#2086).
 - **No order, no delivery.** A route that cannot prove an order (a relay that answers comparisons but never the
   probes, or one second holding more than a pass) returns nothing and stays quiet. Its events stay fetchable, and
   recovery parks it with its "history may be incomplete" notice if that persists, rather than admit newer commits
-  ahead of older messages.
+  ahead of older messages. Such a pass sets `NostrReconciliationSummary::order_unproven`; the relay plane counts it,
+  and opt-in telemetry exports the device-wide total as `relay_reconciliation_order_unproven_passes`.
 - **Memory.** The client remembers, per route and in memory only, the last bound that fit, how far past it to look
   next, an unfinished bracket, and the route's average event size, so a backlog being worked through usually needs
   one round. It also sets aside IDs a pass returned that the account has not admitted since, and IDs every claimant
@@ -173,7 +174,7 @@ past older messages still missing, which can then never be read (mdk#2086).
   memory is dropped, and it sets its IDs aside again. Losing this memory costs at most extra narrowing or a refetch.
 
 A window is fetched in the cursor's rotation, grouped by claiming relays so requests batch fully, and returned in time
-order. Selection never changes the summary: a relay that claimed an ID this pass left unfetched stays incomplete. The
+order. Selection never changes the summary's endpoint results: a relay that claimed an ID this pass left unfetched stays incomplete. The
 account inbox route keeps ID-order selection. The extra dry-run comparisons are control traffic: about 200 KiB to
 fetch an eight-event, 2.6-MB gap against 1,100 retained events in the adapter fixture.
 

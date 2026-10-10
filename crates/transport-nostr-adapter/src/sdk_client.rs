@@ -375,6 +375,12 @@ pub struct NostrReconciliationSummary {
     pub incomplete_endpoints: Vec<TransportEndpoint>,
     pub remote_items: usize,
     pub received_items: usize,
+    /// This group pass returned nothing because no time order covered what it
+    /// was missing: no relay answered its window probes, its delivery boundary
+    /// was unknown or excluded everything it fetched, or more history was set
+    /// aside than its relays' comparisons name. A pass that waits one round
+    /// for an unfinished search does not count. Diagnostic only.
+    pub order_unproven: bool,
 }
 
 /// Planned SDK subscription derived from a transport-adapter subscription.
@@ -1303,6 +1309,8 @@ impl NostrSdkRelayClient {
         let answering = remote_by_endpoint.keys().cloned().collect::<Vec<_>>();
         let mut acquisition_update = AcquisitionUpdate::None;
         let mut skip_pass = false;
+        // Why this pass returns nothing for want of a proven order, if it does.
+        let mut order_unproven: Option<&'static str> = None;
         // The fresh IDs this pass fetches oldest-first, when it does.
         let window: Option<HashSet<EventId>> = match &route_key {
             // More never-admitted IDs than every relay's inventory could hold
@@ -1311,6 +1319,7 @@ impl NostrSdkRelayClient {
             // stays quiet, and recovery parks it with its notice.
             Some(_) if set_aside.len() >= set_aside_cap(answering.len()) => {
                 skip_pass = true;
+                order_unproven = Some("set_aside_full");
                 None
             }
             // A gap within one pass by count is still one window: its bytes
@@ -1342,6 +1351,7 @@ impl NostrSdkRelayClient {
                     // slice. Its IDs stay fetchable for the next.
                     None => {
                         skip_pass = true;
+                        order_unproven = Some("search_unanswered");
                         None
                     }
                     Some(WindowSearch::Fits {
@@ -1776,6 +1786,7 @@ impl NostrSdkRelayClient {
                 // prove an order returns nothing; its events stay fetchable,
                 // and recovery parks it with its notice if that persists,
                 // rather than admit newer commits ahead of older messages.
+                let boundary_known = boundary.is_some();
                 let boundary = boundary.unwrap_or(0);
                 sdk_events.retain(|(_, event)| {
                     let keep = event.created_at <= boundary;
@@ -1784,6 +1795,13 @@ impl NostrSdkRelayClient {
                     }
                     keep
                 });
+                if sdk_events.is_empty() {
+                    order_unproven = Some(if boundary_known {
+                        "boundary_excludes_fetched"
+                    } else {
+                        "boundary_unknown"
+                    });
+                }
             }
         }
         // An ID an endpoint claimed but this pass did not return is still debt
@@ -1859,6 +1877,15 @@ impl NostrSdkRelayClient {
             sorted.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
             sorted
         };
+        if let Some(reason) = order_unproven {
+            tracing::debug!(
+                target: "transport_nostr_adapter::sdk_client",
+                method = "reconcile_subscription",
+                reason,
+                remote_item_count,
+                "group reconciliation pass held back without a proven order"
+            );
+        }
         let summary = NostrReconciliationSummary {
             relays_succeeded: endpoints.len().saturating_sub(failed_endpoints.len()),
             relays_failed: failed_endpoints.len(),
@@ -1866,6 +1893,7 @@ impl NostrSdkRelayClient {
             incomplete_endpoints: sorted(&incomplete_endpoints),
             remote_items: remote_item_count,
             received_items: remote_events.len(),
+            order_unproven: order_unproven.is_some(),
         };
         Ok((summary, remote_events))
     }

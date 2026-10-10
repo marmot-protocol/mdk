@@ -375,6 +375,10 @@ pub struct NostrAdapterMetrics {
     /// Missing events successfully downloaded by reconciliation.
     #[serde(default)]
     pub reconciliation_received_items: usize,
+    /// Group passes that returned nothing because no time order covered the
+    /// history they were missing (`NostrReconciliationSummary::order_unproven`).
+    #[serde(default)]
+    pub reconciliation_order_unproven_passes: usize,
 }
 
 /// Successful/failed endpoint-level result from a relay client publish.
@@ -913,6 +917,7 @@ impl NostrTransportAdapter {
         state.metrics.reconciliation_relays_failed += summary.relays_failed;
         state.metrics.reconciliation_remote_items += summary.remote_items;
         state.metrics.reconciliation_received_items += summary.received_items;
+        state.metrics.reconciliation_order_unproven_passes += usize::from(summary.order_unproven);
     }
 
     async fn subscribe_all(

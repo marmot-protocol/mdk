@@ -62,6 +62,10 @@ runtime. It complements the policy docs:
 | `publish_successes` | Calls whose accepted-endpoint count is at least `max(required_acks, 1)`, the same rule as `TransportPublishReport::met_required_acks`. Partial acceptance at or above that threshold succeeds. | Aggregate count. |
 | `publish_failures` | Client errors and `Ok` outcomes below that threshold, including empty acceptance when `required_acks == 0`. | Aggregate count. |
 | `publish_cancellations` | Started calls whose caller dropped them before the relay client returned. Not a relay failure; the event may still have reached a relay. | Aggregate count. |
+| `reconciliation_attempts` | NIP-77 reconciliation passes recorded by the relay plane, inbox and group routes alike, including passes that errored. | Aggregate count. |
+| `reconciliation_relays_succeeded` / `reconciliation_relays_failed` | Endpoint results summed over those passes. | Aggregate count. |
+| `reconciliation_remote_items` / `reconciliation_received_items` | Event ids relays reported missing locally, and missing events downloaded. | Aggregate count. |
+| `reconciliation_order_unproven_passes` | Group passes that returned nothing because no time order covered the history they were missing: no relay answered the window probes, the delivery boundary was unknown or excluded everything fetched, or more history was set aside than the relays' comparisons name. A pass waiting one round for an unfinished window search does not count. Repeated, these are the passes that end in a "history may be incomplete" notice. | Aggregate count. |
 
 Account-scoped publishes and the shared adapter's own `publish` share these counters. They are device-wide and unlabeled. Once every started call has resolved or been dropped, attempts equal successes + failures + cancellations; while calls are in flight, attempts is larger. A future that is never polled, or a request rejected before the client call (wrong account, unsafe endpoint, envelope mismatch, malformed payload), changes nothing. Local fanout runs only after the terminal count and cannot reclassify it.
 
@@ -503,6 +507,8 @@ Unresolved relay indices are skipped rather than exported as opaque ids.
 | `relay_publish_successes` | none | Counter | Adapter `publish_successes` (acceptance threshold met) |
 | `relay_publish_failures` | none | Counter | Adapter `publish_failures` (error or below threshold) |
 | `relay_publish_cancellations` | none | Counter | Adapter `publish_cancellations` (caller dropped the call in flight) |
+| `relay_reconciliation_attempts` | none | Counter | Adapter `reconciliation_attempts` (inbox and group NIP-77 passes) |
+| `relay_reconciliation_order_unproven_passes` | none | Counter | Adapter `reconciliation_order_unproven_passes` (group passes held back without a proven order) |
 | `message_observed` | none | Counter | `RelayDeliverySpread.observed` |
 | `message_corroborated` | none | Counter | `RelayDeliverySpread.corroborated` |
 | `message_single_source` | none | Counter | `RelayDeliverySpread.single_source` |

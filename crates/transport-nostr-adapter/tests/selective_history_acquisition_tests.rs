@@ -765,11 +765,12 @@ async fn a_gap_larger_than_one_pass_arrives_oldest_first() {
     let started = std::time::Instant::now();
     while !pending.is_empty() && passes < 20 {
         passes += 1;
-        let (_, events) = sdk
+        let (summary, events) = sdk
             .reconcile_subscription(route.clone(), &admitted, SINCE, UNTIL, &cursor)
             .await
             .unwrap();
         assert!(!events.is_empty(), "pass {passes} made no progress");
+        assert!(!summary.order_unproven, "pass {passes} proved its order");
         let newest_returned = events
             .iter()
             .map(|event| event.event.created_at)
@@ -1092,19 +1093,21 @@ async fn an_unproven_delivery_boundary_holds_a_cut_short_pass() {
     let sdk = sdk_on(std::slice::from_ref(&url)).await;
     let route = subscription(&[url]);
     let cursor = Cursor::default();
-    let (_, first) = sdk
+    let (summary, first) = sdk
         .reconcile_subscription(route.clone(), &[], SINCE, UNTIL, &cursor)
         .await
         .unwrap();
     assert!(first.is_empty(), "no proven prefix, so nothing is returned");
+    assert!(summary.order_unproven, "the held pass is counted");
     // Nor on later passes: the route stays quiet rather than return the
     // window unordered, and the events stay fetchable.
     for pass in 2..=4 {
-        let (_, events) = sdk
+        let (summary, events) = sdk
             .reconcile_subscription(route.clone(), &[], SINCE, UNTIL, &cursor)
             .await
             .unwrap();
         assert!(events.is_empty(), "pass {pass} returned an unproven prefix");
+        assert!(summary.order_unproven, "pass {pass} is counted");
     }
     assert_eq!(missing.len(), 60);
     sdk.client().shutdown().await;
@@ -1331,7 +1334,7 @@ async fn a_search_no_relay_answers_fetches_nothing() {
     *counts.answer_only_until.lock().unwrap() = Some(UNTIL);
     let sdk = sdk_on(std::slice::from_ref(&url)).await;
     let route = subscription(&[url]);
-    let (_, events) = sdk
+    let (summary, events) = sdk
         .reconcile_subscription(route, &[], SINCE, UNTIL, &Cursor::default())
         .await
         .unwrap();
@@ -1340,6 +1343,7 @@ async fn a_search_no_relay_answers_fetches_nothing() {
         "{} events of an unordered gap",
         events.len()
     );
+    assert!(summary.order_unproven, "the unanswered search is counted");
     assert_eq!(gap.len(), 600);
     sdk.client().shutdown().await;
     relay.shutdown();

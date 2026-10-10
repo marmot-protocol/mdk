@@ -66,6 +66,13 @@ pub struct RelayTelemetryRollup {
     /// client returned (for example, endpoints abandoned after quorum).
     #[serde(default)]
     pub publish_cancellations: u64,
+    /// Device-wide NIP-77 reconciliation passes, inbox and group routes alike.
+    #[serde(default)]
+    pub reconciliation_attempts: u64,
+    /// Device-wide group passes that returned nothing because no time order
+    /// covered the history they were missing.
+    #[serde(default)]
+    pub reconciliation_order_unproven_passes: u64,
     /// Optional engine-side reorg metrics, folded in once the parallel
     /// `observed_reorg_rate` workstream lands. `None` until then.
     pub engine: Option<EngineReorgMetrics>,
@@ -191,6 +198,8 @@ pub(crate) fn rollup_from_snapshots(
         publish_successes: metrics.publish_successes as u64,
         publish_failures: metrics.publish_failures as u64,
         publish_cancellations: metrics.publish_cancellations as u64,
+        reconciliation_attempts: metrics.reconciliation_attempts as u64,
+        reconciliation_order_unproven_passes: metrics.reconciliation_order_unproven_passes as u64,
         engine,
     }
 }
