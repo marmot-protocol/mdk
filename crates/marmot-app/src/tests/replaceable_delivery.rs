@@ -516,3 +516,51 @@ async fn reopened_app_authors_after_versions_from_failed_batches() {
         "a profile edit after reopening must be newer than failed-batch version {floor}"
     );
 }
+
+#[tokio::test]
+async fn resumed_indexer_copy_authors_after_the_persisted_floor() {
+    let (_directory, app, relay, label) = quorum_app();
+    app.publish_account_relay_lists(&label, two_relay_bootstrap())
+        .await
+        .unwrap();
+    app.publish_user_profile(
+        &label,
+        UserProfileMetadata {
+            name: Some("Saved".into()),
+            ..UserProfileMetadata::default()
+        },
+        two_relay_bootstrap(),
+    )
+    .await
+    .unwrap();
+    let floors = [
+        KIND_NOSTR_METADATA,
+        KIND_NIP65_RELAY_LIST,
+        KIND_MARMOT_INBOX_RELAY_LIST,
+    ]
+    .map(|kind| (kind, newest_authored(&relay, kind)));
+    let status = app.account_relay_list_status(&label).unwrap();
+
+    let copy = app
+        .prepare_generated_account_indexer_copy(
+            &label,
+            &status,
+            &UserProfileMetadata {
+                name: Some("Saved".into()),
+                ..UserProfileMetadata::default()
+            },
+            &[endpoint("wss://index.example")],
+        )
+        .await
+        .unwrap()
+        .expect("indexers configured");
+    copy.run().await;
+
+    // A same-second tie would let an indexer keep this copy over a later edit.
+    for (kind, floor) in floors {
+        assert!(
+            newest_authored(&relay, kind) > floor,
+            "resumed indexer copy of kind {kind} must be authored after {floor}"
+        );
+    }
+}

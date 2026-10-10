@@ -2467,7 +2467,10 @@ impl MarmotApp {
             publish_endpoints: operational.clone(),
         }
         .to_event()?;
-        events.push(sign_account_publication_event(nostr_signer.clone(), &nip65_event).await?);
+        events.push(
+            self.sign_replaceable_identity_event(label, nostr_signer.clone(), &nip65_event)
+                .await?,
+        );
         let inbox_event = NostrAccountRelayListPublication {
             account_id: account_id.clone(),
             list_kind: NostrAccountRelayListKind::Inbox,
@@ -2481,14 +2484,20 @@ impl MarmotApp {
             publish_endpoints: operational,
         }
         .to_event()?;
-        events.push(sign_account_publication_event(nostr_signer.clone(), &inbox_event).await?);
+        events.push(
+            self.sign_replaceable_identity_event(label, nostr_signer.clone(), &inbox_event)
+                .await?,
+        );
         let profile_event = NostrTransportEvent::new_unsigned(
             account.account_id_hex.clone(),
             KIND_NOSTR_METADATA,
             Vec::new(),
             serde_json::to_string(&directory::records::profile_content_json(profile))?,
         );
-        events.push(sign_account_publication_event(nostr_signer.clone(), &profile_event).await?);
+        events.push(
+            self.sign_replaceable_identity_event(label, nostr_signer.clone(), &profile_event)
+                .await?,
+        );
         let relay_client = self.relay_client_for_account_id(&account.account_id_hex, nostr_signer);
         Ok(PublicIndexerCopy::new(
             relay_client,
