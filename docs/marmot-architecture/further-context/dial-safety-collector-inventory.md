@@ -1,7 +1,7 @@
 ---
 title: "Dial Safety Collector Inventory"
 created: 2026-09-15
-updated: 2026-09-15
+updated: 2026-10-09
 tags: [marmot, security, network, ssrf, collector, audit]
 status: current-implementation
 ---
@@ -37,6 +37,9 @@ OTLP export, product analytics, and forensic audit-log POST uploads.
 - Disable automatic redirects and system proxies. Proxy-side DNS would bypass the
   pin. A `3xx` is a non-success status; no request, body, or bearer token is sent to
   the `Location` target, regardless of original or target scheme.
+- The explicit [SOCKS5 policy](../../../crates/marmot-app/README.md#socks5-routing)
+  sends the validated IP through the configured proxy, preserving the pin and
+  Host/SNI. Proxy failure never falls back to a direct connection.
 - Keep TLS verification enabled, including for local HTTPS collectors.
 - DNS and connect are bounded at 10 seconds. The helper's request timeout is 30
   seconds. It does not wrap resolve-plus-send in an enclosing attempt deadline.

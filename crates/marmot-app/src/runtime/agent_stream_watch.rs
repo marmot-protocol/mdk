@@ -62,6 +62,7 @@ impl MarmotAppRuntime {
         options: AgentStreamWatchOptions,
     ) -> Result<RuntimeAgentStreamWatch, AppError> {
         self.shared.lifecycle().ensure_running()?;
+        crate::network_proxy::require_direct_transport()?;
         let group_id_hex = hex::encode(group_id.as_slice());
         let app = self.accounts.app.clone();
         let account_ref_for_query = account_ref.to_owned();

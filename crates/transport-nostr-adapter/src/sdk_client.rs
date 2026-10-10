@@ -30,6 +30,7 @@ use transport_nostr_peeler::{
     KIND_MARMOT_GROUP_MESSAGE, MarmotNostrSigner, NostrTransportEvent, SdkSigner,
 };
 
+use crate::network_proxy as process_proxy;
 use crate::{
     NostrAcquisitionCancellation, NostrAcquisitionEnd, NostrAcquisitionEndpoint,
     NostrAcquisitionError, NostrAcquisitionLimits, NostrAcquisitionRequest, NostrAcquisitionResult,
@@ -678,7 +679,8 @@ impl NostrSdkRelayClient {
     /// a registered immutable client; the root's anonymous client never
     /// inherits credentials or handles account traffic.
     pub fn multi_account() -> Self {
-        let mut this = Self::new(Client::builder().build());
+        let mut this =
+            Self::new(process_proxy::nostr_builder(process_proxy::socks5_proxy()).build());
         this.require_account_context = true;
         this
     }
@@ -733,6 +735,11 @@ impl NostrSdkRelayClient {
         let builder = Client::builder().authenticator(
             nostr_sdk::authenticator::SignerAuthenticator::new(SdkSigner(signer.clone())),
         );
+        // Account receive/history pools are independent SDK clients, so they
+        // must carry the explicit process routing policy as well.
+        let proxy = process_proxy::socks5_proxy()
+            .map_err(|detail| TransportAdapterError::Subscription(detail.to_owned()))?;
+        let builder = process_proxy::apply_proxy(builder, proxy);
         let mut context = Self::from_builder(builder);
         context.signer = Some(SdkSigner(signer));
         context.account_id = Some(account_id.clone());

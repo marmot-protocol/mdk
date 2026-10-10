@@ -56,8 +56,7 @@ use marmot_account::{
     TransportRoutingPolicy,
 };
 use nostr_sdk::prelude::{
-    Client as NostrSdkClient, EventBuilder, FinalizeUnsignedEvent, Kind, PublicKey, Tag,
-    Timestamp as NostrTimestamp,
+    EventBuilder, FinalizeUnsignedEvent, Kind, PublicKey, Tag, Timestamp as NostrTimestamp,
 };
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -81,6 +80,7 @@ pub use user_blocks::{BlockListSnapshot, BlockedUser};
 mod agent_streams;
 mod app_telemetry;
 mod collector_host_safety;
+mod network_proxy;
 pub mod product_analytics;
 pub use product_analytics::*;
 mod audit_log;
@@ -1656,6 +1656,7 @@ impl MarmotApp {
         account_home: AccountHome,
         config: MarmotAppConfig,
     ) -> Result<Self, AppError> {
+        network_proxy::socks5_proxy().map_err(network_proxy::config_error)?;
         let root = root.as_ref().to_path_buf();
         let lease = MarmotRootRuntimeLease::try_acquire(&root)?;
         audit_log::cleanup_legacy_audit_logs(&root);
@@ -6828,7 +6829,7 @@ impl MarmotApp {
         clients
             .entry(account_id_hex.to_owned())
             .or_insert_with(|| {
-                let client = NostrSdkClient::builder()
+                let client = network_proxy::nostr_builder()
                     .authenticator(nostr_sdk::authenticator::SignerAuthenticator::new(
                         transport_nostr_peeler::SdkSigner(signer.clone()),
                     ))

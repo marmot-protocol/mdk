@@ -8,10 +8,11 @@ description = "Nostr transport adapter for Marmot CGKA transport messages."
 
 [features]
 default = []
-sdk = ["dep:nostr-gossip", "dep:nostr-sdk"]
+sdk = ["dep:nostr-gossip", "dep:nostr-sdk", "dep:async-wsocket", "dep:tokio-socks", "dep:tokio-tungstenite", "dep:zeroize"]
 
 [dependencies]
 async-trait.workspace = true
+async-wsocket = { workspace = true, optional = true }
 base64.workspace = true
 cgka-traits.workspace = true
 futures.workspace = true
@@ -23,12 +24,14 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
+tokio-socks = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
 tokio-util.workspace = true
 tracing.workspace = true
 transport-nostr-peeler.workspace = true
+zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
 nostr-memory = { git = "https://github.com/erskingardner/rust-nostr", rev = "a9c7a6423d104c603de6ea8244265ea17f0f9d89" }
 nostr-relay-builder.workspace = true
 tokio = { workspace = true, features = ["net", "test-util"] }
-tokio-tungstenite = "0.26"

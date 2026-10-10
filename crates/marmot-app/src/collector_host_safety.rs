@@ -46,10 +46,8 @@ impl PinnedCollector {
         &self,
         builder: reqwest::ClientBuilder,
     ) -> Result<reqwest::Client, CollectorRequestError> {
-        builder
-            // Proxies can resolve the original hostname themselves, bypassing
-            // the validated addresses. This exporter always dials directly.
-            .no_proxy()
+        crate::network_proxy::http_builder(builder)
+            .map_err(|_| CollectorRequestError)?
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
@@ -113,3 +111,6 @@ where
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod proxy_tests;

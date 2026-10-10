@@ -667,7 +667,7 @@ impl DirectoryRelayPlane {
 // challenge must not trigger a failed authentication attempt that
 // closes the SDK's active fetch before its events arrive.
 pub(super) fn anonymous_directory_client() -> NostrSdkClient {
-    NostrSdkClient::builder().build()
+    crate::network_proxy::nostr_builder().build()
 }
 
 impl NostrSdkDirectoryRelayFetcher {
@@ -829,7 +829,7 @@ impl DirectoryRelayFetcher for NostrSdkDirectoryRelayFetcher {
         use DirectoryInspectionError::*;
         // The signer belongs to this request only, never to a shared mutable
         // directory client that could authenticate as another account.
-        let builder = NostrSdkClient::builder();
+        let builder = crate::network_proxy::nostr_builder();
         let client = ScopedInspectionClient(match signer {
             Some(signer) => builder
                 .authenticator(nostr_sdk::authenticator::SignerAuthenticator::new(
@@ -969,14 +969,12 @@ async fn strict_fetch_endpoint(
     relay_url: RelayUrl,
     queries: Vec<DirectoryEventQuery>,
 ) -> DirectoryFetchOutcome {
-    // Exactly one bounded subscription owns this connection and its wire
+    // One bounded subscription owns this connection and its pre-admission wire
     // counter. Cancellation/early failure closes it through the scoped guard.
-    let wire = super::directory_wire::DirectoryWireTransport::default();
-    let owned = ScopedInspectionClient(
-        NostrSdkClient::builder()
-            .websocket_transport(wire.clone())
-            .build(),
-    );
+    let builder = crate::network_proxy::nostr_builder();
+    let wire =
+        super::directory_wire::DirectoryWireTransport::new(builder.websocket_transport.clone());
+    let owned = ScopedInspectionClient(builder.websocket_transport(wire.clone()).build());
     let client = &owned.0;
     let endpoint = TransportEndpoint(relay_url.to_string());
     if !matches!(client.relay(&relay_url).await, Ok(Some(_)))

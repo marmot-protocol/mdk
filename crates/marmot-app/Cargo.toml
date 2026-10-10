@@ -56,7 +56,7 @@ sha2.workspace = true
 storage-sqlite.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["fs", "net"] }
+tokio = { workspace = true, features = ["fs", "net", "io-util"] }
 tokio-util.workspace = true
 tracing.workspace = true
 transport-nostr-adapter = { workspace = true, features = ["sdk"] }
@@ -69,6 +69,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+tokio-tungstenite.workspace = true
 keyring-core.workspace = true
 marmot-forensics.workspace = true
 nostr-relay-builder.workspace = true
@@ -79,7 +80,6 @@ parking_lot = "0.12"
 tls_codec.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
-tokio-tungstenite = "0.26"
 
 [[bench]]
 name = "media_download_backlog"

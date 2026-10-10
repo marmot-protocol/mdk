@@ -22,6 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, watch};
+use transport_nostr_adapter::network_proxy as process_proxy;
 use zeroize::{Zeroize, Zeroizing};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
@@ -43,6 +44,7 @@ struct SignRequest<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Error {
     Invalid,
+    ProxyConfig,
     Unavailable,
     RelayPublish(String),
     Rejected,
@@ -56,6 +58,7 @@ impl Error {
     fn detail(&self) -> std::borrow::Cow<'static, str> {
         match self {
             Self::Invalid => "invalid NIP-46 configuration or protocol response".into(),
+            Self::ProxyConfig => process_proxy::CONFIG_ERROR.into(),
             Self::Unavailable => "remote signer unavailable".into(),
             Self::RelayPublish(detail) => std::borrow::Cow::Owned(detail.clone()),
             Self::Rejected => "remote signer rejected the request".into(),
@@ -69,7 +72,7 @@ impl Error {
     fn status(self) -> MarmotStatus {
         set_last_error(self.detail().as_ref());
         match self {
-            Self::Invalid => MarmotStatus::InvalidArgument,
+            Self::Invalid | Self::ProxyConfig => MarmotStatus::InvalidArgument,
             Self::Timeout => MarmotStatus::Timeout,
             Self::Rejected | Self::Cancelled => MarmotStatus::ExternalSignerRejected,
             Self::Mismatch => MarmotStatus::ExternalSignerMismatch,
@@ -179,6 +182,7 @@ fn checked_relays(owner: &Marmot, relays: Vec<String>) -> Result<Vec<RelayUrl>> 
 
 impl Session {
     fn spawn(owner: Arc<Marmot>, mut config: Config) -> Result<MarmotNip46Session> {
+        let proxy = process_proxy::socks5_proxy().map_err(|_| Error::ProxyConfig)?;
         let keys = match config.client_secret.as_deref() {
             Some(secret) => Keys::new(SecretKey::from_hex(secret).map_err(|_| Error::Invalid)?),
             None => Keys::generate(),
@@ -281,7 +285,7 @@ impl Session {
                     .build()
                 {
                     Ok(runtime) => {
-                        runtime.block_on(run_transport(transport, receiver, cancellation))
+                        runtime.block_on(run_transport(transport, receiver, cancellation, proxy))
                     }
                     Err(_) => transport.set_state(
                         "unavailable",
@@ -478,8 +482,8 @@ struct Transport {
     configured: Vec<RelayUrl>,
 }
 impl Transport {
-    fn new() -> Self {
-        let client = Client::default();
+    fn new(proxy: Option<Arc<process_proxy::ProxyConfig>>) -> Self {
+        let client = process_proxy::nostr_builder(Ok(proxy)).build();
         let notifications = client.notifications();
         Self {
             client,
@@ -765,8 +769,9 @@ async fn run_transport(
     session: Arc<Session>,
     mut commands: mpsc::Receiver<Command>,
     mut cancel: watch::Receiver<bool>,
+    proxy: Option<Arc<process_proxy::ProxyConfig>>,
 ) {
-    let mut transport = Transport::new();
+    let mut transport = Transport::new(proxy);
     loop {
         let command = tokio::select! {
             biased;

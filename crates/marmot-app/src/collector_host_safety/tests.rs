@@ -235,6 +235,7 @@ async fn every_attempt_resolves_fresh_and_checks_host_and_port() {
 }
 
 struct ForbiddenDns(Arc<AtomicUsize>);
+
 impl reqwest::dns::Resolve for ForbiddenDns {
     fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
         self.0.fetch_add(1, Ordering::SeqCst);
