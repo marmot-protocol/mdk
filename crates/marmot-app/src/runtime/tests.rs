@@ -4406,3 +4406,55 @@ async fn chat_preview_retention_only_change_wakes_subscribers() {
     );
     assert!(rx.try_recv().is_err());
 }
+
+#[test]
+fn generated_setup_profile_adopts_a_selected_profile_only_before_local_readiness() {
+    let account_id_hex = "11".repeat(32);
+    let pseudonym = default_profile_pseudonym(&account_id_hex);
+    let selected = || {
+        Some(UserProfileMetadata {
+            name: Some("Chosen Heron".into()),
+            ..UserProfileMetadata::default()
+        })
+    };
+    let cached = || {
+        Some(UserProfileMetadata {
+            name: Some("Cached".into()),
+            created_at: 7,
+            ..UserProfileMetadata::default()
+        })
+    };
+
+    let (profile, store) = generated_setup_profile(
+        &account_id_hex,
+        AccountSetupPhase::LocalStateCreated,
+        cached(),
+        selected(),
+        42,
+    );
+    assert_eq!(profile.name.as_deref(), Some("Chosen Heron"));
+    assert_eq!(profile.created_at, 42);
+    assert!(store);
+
+    for phase in [
+        AccountSetupPhase::LocalReady,
+        AccountSetupPhase::BootstrapPublicationStarted,
+        AccountSetupPhase::BootstrapPublicationConfirmed,
+    ] {
+        let (profile, store) =
+            generated_setup_profile(&account_id_hex, phase, cached(), selected(), 42);
+        assert_eq!(profile.name.as_deref(), Some("Cached"), "{phase:?}");
+        assert!(!store, "{phase:?}");
+
+        // A running bootstrap that found no cached profile captured the same
+        // key-derived fallback, so a retry must report that, not its input.
+        let (profile, store) =
+            generated_setup_profile(&account_id_hex, phase, None, selected(), 42);
+        assert_eq!(
+            profile.name.as_deref(),
+            Some(pseudonym.as_str()),
+            "{phase:?}"
+        );
+        assert!(store, "{phase:?}");
+    }
+}

@@ -1528,6 +1528,52 @@ pub unsafe extern "C" fn marmot_publish_user_profile(
     })
 }
 
+/// Create a fresh identity whose first public kind-0 is `profile`, returning
+/// at durable local readiness. Use this instead of
+/// `marmot_create_identity_with_profile` followed by
+/// `marmot_publish_user_profile` when onboarding collects a name, so
+/// contacts never see the generated default. Free with
+/// `marmot_identity_creation_result_free`.
+///
+/// # Safety
+/// `client` must be a live handle; `profile` a valid borrowed struct (never
+/// freed by the library); relay arrays must hold `len` valid strings (or be
+/// NULL with len 0); `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_create_identity_with_initial_profile(
+    client: *const MarmotClient,
+    profile: *const MarmotUserProfileMetadata,
+    default_relays: *const *const c_char,
+    default_relays_len: usize,
+    bootstrap_relays: *const *const c_char,
+    bootstrap_relays_len: usize,
+    inbox_relays: *const *const c_char,
+    inbox_relays_len: usize,
+    out: *mut *mut MarmotIdentityCreationResult,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let profile = try_arg!(unsafe { borrowed(profile) });
+        let profile = try_arg!(unsafe { profile.to_ffi() });
+        let default_relays = try_arg!(unsafe { str_array(default_relays, default_relays_len) });
+        let bootstrap_relays =
+            try_arg!(unsafe { str_array(bootstrap_relays, bootstrap_relays_len) });
+        let inbox_relays = try_arg!(unsafe { str_array(inbox_relays, inbox_relays_len) });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.create_identity_with_initial_profile(
+                    profile,
+                    default_relays,
+                    bootstrap_relays,
+                    inbox_relays,
+                )),
+                out,
+            )
+        }
+    })
+}
+
 /// Replace the group's encrypted-media default blob endpoints as a full
 /// component update. Requires admin. Free with
 /// `marmot_send_summary_free`.
