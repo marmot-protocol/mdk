@@ -52,6 +52,11 @@
 
 ### Fixed
 
+- Profile, follow-list and relay-list saves still return on the first relay
+  acknowledgement, but relays the quorum cancelled now receive the identical
+  signed record in a bounded background send. Previously those relays kept
+  serving the older version, such as a generated signup name (#2216).
+
 - Explicit onboarding relay edits now preview and publish the selected endpoint
   changes without rebuilding untouched tags: mixed NIP-65 roles, duplicate
   occurrences, tag extensions, unrelated tags and event content survive, including

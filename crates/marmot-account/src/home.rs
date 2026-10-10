@@ -1,5 +1,6 @@
 //! Persistent account home: local Nostr account records and signing credentials.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -681,6 +682,43 @@ impl AccountHome {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err.into()),
         }
+    }
+
+    /// Newest timestamp this device authored per replaceable record kind.
+    /// Kinds are opaque to this layer; callers record a floor before signing
+    /// so a later version is never authored behind one already published,
+    /// even after a restart.
+    pub fn replaceable_record_floors(
+        &self,
+        account_ref: &str,
+    ) -> AccountHomeResult<BTreeMap<u64, u64>> {
+        let account = self.account(account_ref)?;
+        match read_json(self.replaceable_record_floors_path(&account.label)) {
+            Ok(floors) => Ok(floors),
+            Err(AccountHomeError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                Ok(BTreeMap::new())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Raise one kind's floor to `created_at`; a lower value leaves it unchanged.
+    /// The owner-only file is atomically replaced.
+    pub fn advance_replaceable_record_floor(
+        &self,
+        account_ref: &str,
+        kind: u64,
+        created_at: u64,
+    ) -> AccountHomeResult<()> {
+        let _guard = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let account = self.account(account_ref)?;
+        let mut floors = self.replaceable_record_floors(&account.label)?;
+        let floor = floors.entry(kind).or_insert(0);
+        if *floor >= created_at {
+            return Ok(());
+        }
+        *floor = created_at;
+        write_private_json(self.replaceable_record_floors_path(&account.label), &floors)
     }
 
     /// Retain the last cancelled checkpoint while removing its active gate.
@@ -1429,6 +1467,10 @@ impl AccountHome {
 
     fn account_record_path(&self, label: &str) -> PathBuf {
         self.account_dir(label).join(ACCOUNT_RECORD_FILE)
+    }
+
+    fn replaceable_record_floors_path(&self, label: &str) -> PathBuf {
+        self.account_dir(label).join("replaceable-floors.json")
     }
 
     fn account_setup_state_path(&self, label: &str) -> PathBuf {

@@ -4468,18 +4468,15 @@ impl MarmotAppRuntime {
         {
             profile = merge_user_profile_update(current, profile);
         }
-        // Stamp the just-published profile with the current time before caching
-        // it. The published kind-0 event is authored with `now`, so the cached
-        // own-account entry must carry a matching `created_at`. Callers that
-        // arrive via FFI hardcode `created_at == 0` (see
-        // `UserProfileMetadataFfi -> UserProfileMetadata`), and a zero stamp
-        // loses to *any* fetched kind-0 in `remember_directory_profile_if_newer`
-        // (it only retains the cache when `cached.created_at > fetched`). That
-        // let a stale pre-edit copy served by a lagging relay revert the local
-        // edit on the next directory refresh. Stamping `now` protects the edit
-        // against relay copies published before this moment.
+        // Cache the published event's own `created_at`. FFI callers pass
+        // `created_at == 0` (see `UserProfileMetadataFfi -> UserProfileMetadata`),
+        // which loses to any fetched kind-0 in `remember_directory_profile_if_newer`,
+        // and rapid saves author timestamps that run ahead of the clock. Either
+        // way, a stale or intermediate relay copy could otherwise revert the
+        // local edit on the next directory refresh.
         stamp_published_profile_created_at(&mut profile, unix_now_seconds());
-        self.accounts
+        profile.created_at = self
+            .accounts
             .app
             .publish_user_profile_to_endpoints_and_indexers(
                 &account.label,
@@ -8129,7 +8126,7 @@ impl AccountManager {
         if let Some(copy) = publication.indexer_copy {
             self.app.spawn_public_indexer_copy(copy);
         }
-        Ok((publication.status, Some(profile)))
+        Ok((publication.status, Some(publication.profile)))
     }
 
     fn setup_failure_can_roll_back(
