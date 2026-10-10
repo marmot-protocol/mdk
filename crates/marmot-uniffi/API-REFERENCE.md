@@ -2456,7 +2456,7 @@ pub async fn report_message( &self, account_ref: String, group_id_hex: String, m
 
 Publish a report with a typed reason and explanation for a target message.
 
-[Source](src/commands/moderation.rs#L110)
+[Source](src/commands/moderation.rs#L203)
 
 ### `Marmot::dismiss_reports`
 
@@ -2468,7 +2468,7 @@ pub async fn dismiss_reports( &self, account_ref: String, group_id_hex: String, 
 
 Publish an admin dismissal label for selected reports.
 
-[Source](src/commands/moderation.rs#L130)
+[Source](src/commands/moderation.rs#L223)
 
 ### `Marmot::content_reports`
 
@@ -2480,7 +2480,7 @@ pub fn content_reports( &self, account_ref: String, group_id_hex: String, messag
 
 Read a bounded page of reports with per-report dismissal state.
 
-[Source](src/commands/moderation.rs#L148)
+[Source](src/commands/moderation.rs#L241)
 
 ### `Marmot::reported_message`
 
@@ -2492,7 +2492,7 @@ pub fn reported_message( &self, account_ref: String, group_id_hex: String, messa
 
 Read the report target through deletion-masked timeline presentation.
 
-[Source](src/commands/moderation.rs#L167)
+[Source](src/commands/moderation.rs#L260)
 
 ### `Marmot::report_dismissals`
 
@@ -2504,7 +2504,43 @@ pub fn report_dismissals( &self, account_ref: String, group_id_hex: String, repo
 
 Read a bounded page of dismissal labels.
 
-[Source](src/commands/moderation.rs#L182)
+[Source](src/commands/moderation.rs#L275)
+
+### `Marmot::submit_moderation_report`
+
+**Current.**
+
+```rust
+pub async fn submit_moderation_report( &self, account_ref: String, reported_pubkey: String, reason: ReportReasonFfi, explanation: String, origin: ModerationReportOriginFfi, ) -> Result<ModerationReportOutcomeFfi, MarmotKitError>
+```
+
+Privately report a user to the deployment's moderation team: a NIP-56 kind-1984 report about `reported_pubkey` (hex or `npub`), sealed by the account key and gift-wrapped per NIP-59 to the configured reports key, published only to the configured relays. It carries the reported key, the NIP-56 type mapped from `reason`, an origin label and the trimmed explanation (at most 1,000 characters; empty is omitted), and never message content, message ids, group ids or relay metadata. Additive to `report_message`, which stays the in-group path and is unchanged; "Block and Report" still calls `block_user` separately. `Published`, `AcceptedPending` and `CompletionUnknown` follow send summaries: the two retained states are queued, retried on catch-up and must not be resubmitted. A repeat of the same reported key, reason and origin within 10 minutes returns the existing outcome. Typed errors: `ModerationReportingNotConfigured`, `InvalidReportedPublicKey`, `CannotReportSelf`, `ModerationReportRateLimited` (20 per account per hour). Sign-out and wipe delete the account's queued reports. See [moderation reports](../../docs/marmot-architecture/moderation-reports.md).
+
+[Source](src/commands/moderation.rs#L169)
+
+### `Marmot::moderation_reporting_available`
+
+**Current.**
+
+```rust
+pub fn moderation_reporting_available(&self) -> bool
+```
+
+True when a valid moderation-report destination is installed (from `MarmotOptions.moderation_report_config` or `configure_moderation_reporting`). Gate the report-to-operator affordance on it.
+
+[Source](src/commands/moderation.rs#L190)
+
+### `Marmot::configure_moderation_reporting`
+
+**Current.**
+
+```rust
+pub fn configure_moderation_reporting( &self, config: Option<ModerationReportConfigFfi>, ) -> Result<(), MarmotKitError>
+```
+
+Install (`Some`) or clear (`None`) the moderation-report destination at runtime and learn why one was rejected. The recipient is 64-character hex or `npub`; every relay must pass the relay safety policy. One bad entry rejects the whole destination with `InvalidModerationReportConfig` and leaves reporting unconfigured; nothing is partially applied. Prefer `MarmotOptions.moderation_report_config` set per build flavor so production and staging never mix.
+
+[Source](src/commands/moderation.rs#L195)
 
 </details>
 
@@ -3588,7 +3624,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options. Existing constructors are compatibility wrappers around this entry point.
 
-[Source](src/lib.rs#L246)
+[Source](src/lib.rs#L252)
 
 ### `Marmot::new_with_options`
 
@@ -3600,7 +3636,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L262)
+[Source](src/lib.rs#L268)
 
 ### `Marmot::new`
 
@@ -3612,7 +3648,7 @@ pub fn new(root_path: String, relay_urls: Vec<String>) -> Result<Arc<Self>, Marm
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) via the default keychain-backed account home — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L290)
+[Source](src/lib.rs#L296)
 
 ### `Marmot::new_with_secret_store`
 
@@ -3624,7 +3660,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L308)
+[Source](src/lib.rs#L314)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -3636,7 +3672,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L338)
+[Source](src/lib.rs#L344)
 
 ### `Marmot::new_with_client_name`
 
@@ -3648,7 +3684,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels are omitted. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L357)
+[Source](src/lib.rs#L363)
 
 ### `Marmot::start`
 
@@ -3660,7 +3696,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L394)
+[Source](src/lib.rs#L400)
 
 ### `Marmot::shutdown`
 
@@ -3672,7 +3708,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L406)
+[Source](src/lib.rs#L412)
 
 ### `Marmot::shutdown_and_close`
 
@@ -3684,7 +3720,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L441)
+[Source](src/lib.rs#L447)
 
 ### `Marmot::storage_is_closed`
 
@@ -3696,7 +3732,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L449)
+[Source](src/lib.rs#L455)
 
 ### `Marmot::is_stopping`
 
@@ -3708,7 +3744,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L456)
+[Source](src/lib.rs#L462)
 
 </details>
 
@@ -4448,3 +4484,4 @@ Install or remove an in-memory v5 OTLP audit destination. With `enabled: true`, 
 [Source](src/commands/audit.rs#L54)
 
 </details>
+

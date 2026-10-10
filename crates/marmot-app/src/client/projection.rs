@@ -1483,6 +1483,17 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::UserBlocked => "read_marker_failed:user_blocked",
         AppError::BlockListUnavailable => "read_marker_failed:block_list_unavailable",
         AppError::BlockPublicationUncertain => "read_marker_failed:block_publication_uncertain",
+        AppError::ModerationReportingNotConfigured => {
+            "read_marker_failed:moderation_reporting_not_configured"
+        }
+        AppError::InvalidModerationReportConfig(_) => {
+            "read_marker_failed:invalid_moderation_report_config"
+        }
+        AppError::InvalidReportedPublicKey => "read_marker_failed:invalid_reported_public_key",
+        AppError::CannotReportSelf => "read_marker_failed:cannot_report_self",
+        AppError::ModerationReportRateLimited => {
+            "read_marker_failed:moderation_report_rate_limited"
+        }
     }
 }
 

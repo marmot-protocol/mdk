@@ -4,12 +4,31 @@
 
 ### Breaking changes
 
+- `AppError` adds `ModerationReportingNotConfigured`, `InvalidModerationReportConfig`,
+  `InvalidReportedPublicKey`, `CannotReportSelf` and `ModerationReportRateLimited`;
+  update exhaustive matches. `MarmotAppConfig` adds `moderation_report_config`;
+  struct literals that do not use `..Default::default()` must set it.
+
 - Attachment history adds `AttachmentRole` and the required `AttachmentEntry.role`
   field. Update Rust struct literals; gallery consumers can exclude `InlineEmoji`
   without changing original slots, parser verdicts or acquisition references.
   See [the attachment-history handoff](../marmot-uniffi/ATTACHMENT-HISTORY.md).
 
 ### Added
+
+- `MarmotAppRuntime::submit_moderation_report` privately reports an account to
+  the deployment's moderation team. It sends a NIP-56 kind-1984 rumor, sealed by
+  the account key and gift-wrapped per NIP-59 (through the shared Welcome wrap
+  path) to the configured reports key, and publishes only to the configured
+  relays without account AUTH. This is additive: `report_message`,
+  `content_reports` and `dismiss_reports` are unchanged. Reports never carry
+  message, group or relay identifiers. Signed wraps are staged before publishing,
+  retried after `catch_up_accounts` and purged on sign-out and wipe. Repeats
+  within 10 minutes return the existing outcome, and each account may send 20
+  reports per hour. The new
+  `moderation_reporting_available`, `retry_pending_moderation_reports` and
+  `MarmotApp::set_moderation_report_config` complete the surface. See
+  `docs/marmot-architecture/moderation-reports.md`.
 
 - `MarmotAppRuntime::create_identity_local_ready_with_initial_profile` makes a
   caller-selected profile the first public kind-0 of a generated account, so

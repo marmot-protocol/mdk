@@ -1,10 +1,32 @@
 //! C mirrors for individual reports and admin dismissal labels.
 use crate::macros::{c_enum, c_mirror};
+use crate::types::account::MarmotSendAcceptDisposition;
 use marmot_uniffi::{
-    ContentReportFfi, ContentReportPageFfi, ReportDismissalFfi, ReportDismissalPageFfi,
-    ReportReasonFfi,
+    ContentReportFfi, ContentReportPageFfi, ModerationReportOriginFfi, ModerationReportOutcomeFfi,
+    ReportDismissalFfi, ReportDismissalPageFfi, ReportReasonFfi,
 };
 c_enum! { MarmotReportReason from ReportReasonFfi { Nudity, Malware, Profanity, Illegal, Spam, Impersonation, Other } }
+c_enum! {
+    /// Which user action produced a private moderation report.
+    MarmotModerationReportOrigin from ModerationReportOriginFfi { Report, BlockAndReport }
+}
+c_mirror! {
+    /// Outcome of marmot_submit_moderation_report. AcceptedPending and
+    /// CompletionUnknown are queued and retried on catch-up; never resubmit them.
+    MarmotModerationReportOutcome from ModerationReportOutcomeFfi,
+    free marmot_moderation_report_outcome_free {
+        str report_id,
+        copy accept_disposition: MarmotSendAcceptDisposition,
+    }
+}
+impl MarmotModerationReportOrigin {
+    pub(crate) fn to_ffi(self) -> ModerationReportOriginFfi {
+        match self {
+            Self::Report => ModerationReportOriginFfi::Report,
+            Self::BlockAndReport => ModerationReportOriginFfi::BlockAndReport,
+        }
+    }
+}
 c_mirror! { MarmotContentReport from ContentReportFfi {
     str report_id_hex,
     str message_id_hex,
@@ -74,7 +96,17 @@ mod tests {
                 created_at: 2,
             }],
         }));
+        assert!(MarmotModerationReportOrigin::from_c(2).is_err());
+        let outcome = boxed(MarmotModerationReportOutcome::from(
+            ModerationReportOutcomeFfi {
+                report_id: "0".repeat(32),
+                accept_disposition:
+                    marmot_uniffi::conversions::SendAcceptDispositionFfi::AcceptedPending,
+            },
+        ));
         unsafe {
+            marmot_moderation_report_outcome_free(outcome);
+            marmot_moderation_report_outcome_free(std::ptr::null_mut());
             marmot_content_report_page_free(reports);
             marmot_report_dismissal_page_free(labels);
             marmot_content_report_page_free(std::ptr::null_mut());

@@ -158,6 +158,11 @@ These are longer working documents. Go here when you need depth, not orientation
   - **What it covers:** Current implementation inventory for opt-in forensic JSONL logs, file identity, every event
     kind and metadata field, upload/tracker behavior, and downstream tooling guidance.
 
+- **Doc:** [`moderation-reports.md`](./moderation-reports.md)
+  - **What it covers:** Private NIP-56 reports to the deployment's moderation team, gift-wrapped per NIP-59: event
+    layers, labels, reader steps, and client durability, idempotency and privacy behavior. Additive to in-group
+    moderation.
+
 - **Doc:** [`runtime-state-bounds.md`](./runtime-state-bounds.md)
   - **What it covers:** Inventory of long-lived daemon/broker runtime structures (maps, counters, handle sets, temp
     artifacts) with their bounds and eviction/reclamation rules, plus the tracked-resource discipline for adding new

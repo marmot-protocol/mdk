@@ -271,7 +271,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `conversation_presentation/` (C5 header, capability, and window selectors; they never subscribe, acknowledge
   reads, or fetch media), `local_submissions.rs` + `local_submissions/` (durable device-local send admission and host
   correlation; no relay I/O),
-  `user_blocks.rs` (block policy and NIP-51 sync), `history_notices.rs` (public notice DTOs and opaque id codec),
+  `user_blocks.rs` (block policy and NIP-51 sync), `moderation_reports.rs` (private NIP-59-wrapped NIP-56 reports
+  to the deployment operator: config validation, staged outbox, retry, purge; tests in
+  `moderation_reports/tests.rs`), `history_notices.rs` (public notice DTOs and opaque id codec),
   `notifications.rs` (push platform, triggers, settings), `external_signer.rs` (`ExternalAccountSigner` and the
   internal `AccountSigner`), `nostr_secret.rs` (secret-key shape classification shared with CLI/UniFFI),
   `nostr_verification.rs` (stateless public-event verification), `profile_pseudonyms.rs` (cosmetic display names; not a
@@ -284,7 +286,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - `src/runtime/`: `worker_startup.rs` (per-account startup admission and retry backoff),
   `account_worker/recovery_credits.rs` (process-wide recovery credit pool), `conversation_window.rs`, `chat_list_window.rs`,
   `presentation.rs`, `presented_chat_list.rs`, `account_attention.rs` (presentation windows and account-switcher
-  attention), `user_blocks.rs`, `moderation.rs` (reports and admin labels), `local_submissions.rs`,
+  attention), `user_blocks.rs`, `moderation.rs` (reports, admin labels and operator moderation reports),
+  `local_submissions.rs`,
   `agent_publisher.rs` (host-driven agent publishing), `attachment_controls.rs`, `attachment_permission.rs`
   (runtime-only network approval; never restore it from disk).
 - `src/client/`: `recovery.rs` (recovery grant authorization), `invite_recovery.rs` (durable invitation recovery),
