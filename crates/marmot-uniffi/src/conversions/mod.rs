@@ -826,3 +826,6 @@ pub use attachment_access::*;
 
 mod attachment_controls;
 pub use attachment_controls::*;
+
+mod account_attachment_history;
+pub use account_attachment_history::*;

@@ -1147,6 +1147,10 @@ typedef enum MarmotHostPerformanceOutcome {
   MARMOT_HOST_PERFORMANCE_OUTCOME_UNAVAILABLE,
 } MarmotHostPerformanceOutcome;
 
+typedef struct MarmotAccountAttachmentCursor MarmotAccountAttachmentCursor;
+
+typedef struct MarmotAccountAttachmentVersion MarmotAccountAttachmentVersion;
+
 /**
  * Free before its client. Concurrent next and commands are supported; never free during a call.
  */
@@ -1383,43 +1387,6 @@ typedef struct MarmotClientOptions {
 } MarmotClientOptions;
 
 /**
- * NULL reference means unavailable, with byte_count zero. A non-NULL reference
- * with byte_count zero is a verified empty file. References are opaque.
- */
-typedef struct MarmotAttachmentLocalAsset {
-  char *reference;
-  uint64_t byte_count;
-} MarmotAttachmentLocalAsset;
-
-/**
- *Owned list; free the root with its `_free` function only.
- */
-typedef struct MarmotAttachmentLocalAssetList {
-  struct MarmotAttachmentLocalAsset *items;
-  uintptr_t len;
-} MarmotAttachmentLocalAssetList;
-
-/**
- * available=false means discard any assembled host result. Available with
- * zero bytes is EOF. Hosts own decoding and plaintext buffer lifetime.
- */
-typedef struct MarmotAttachmentLocalBytes {
-  bool available;
-  uint8_t *bytes;
-  uintptr_t bytes_len;
-} MarmotAttachmentLocalBytes;
-
-/**
- * Borrowed original source slot from a timeline/history entry. Strings must be
- * NUL-terminated; caller retains ownership throughout the call.
- */
-typedef struct MarmotAttachmentLocalTarget {
-  const char *message_id_hex;
-  const char *source_message_id_hex;
-  uint32_t attachment_index;
-} MarmotAttachmentLocalTarget;
-
-/**
  * One storage locator for an encrypted attachment.
  */
 typedef struct MarmotMediaLocator {
@@ -1506,6 +1473,95 @@ typedef struct MarmotAttachmentEntry {
   enum MarmotAttachmentRole role;
   struct MarmotMediaAttachmentOutcome attachment;
 } MarmotAttachmentEntry;
+
+typedef struct MarmotAccountAttachmentEntry {
+  char *group_id_hex;
+  struct MarmotAttachmentEntry entry;
+} MarmotAccountAttachmentEntry;
+
+/**
+ * Owned result fields; borrow handles only while the result is live, or clone the version baseline.
+ */
+typedef struct MarmotAccountAttachmentPage {
+  struct MarmotAccountAttachmentEntry *entries;
+  uintptr_t entries_len;
+  struct MarmotAccountAttachmentVersion *version;
+  struct MarmotAccountAttachmentCursor *next_cursor;
+  bool has_more;
+  bool has_next_expiry;
+  uint64_t next_expiry;
+} MarmotAccountAttachmentPage;
+
+typedef enum MarmotAccountAttachmentPageRead_Tag {
+  MARMOT_ACCOUNT_ATTACHMENT_PAGE_READ_PAGE,
+  MARMOT_ACCOUNT_ATTACHMENT_PAGE_READ_RESTART_REQUIRED,
+  MARMOT_ACCOUNT_ATTACHMENT_PAGE_READ_CURSOR_MISMATCH,
+  MARMOT_ACCOUNT_ATTACHMENT_PAGE_READ_INVALID_QUERY,
+  MARMOT_ACCOUNT_ATTACHMENT_PAGE_READ_INVALID_LIMIT,
+  MARMOT_ACCOUNT_ATTACHMENT_PAGE_READ_RESPONSE_TOO_LARGE,
+} MarmotAccountAttachmentPageRead_Tag;
+
+typedef struct MarmotAccountAttachmentPageRead_Page_Body {
+  struct MarmotAccountAttachmentPage page;
+} MarmotAccountAttachmentPageRead_Page_Body;
+
+typedef struct MarmotAccountAttachmentPageRead {
+  MarmotAccountAttachmentPageRead_Tag tag;
+  union {
+    MarmotAccountAttachmentPageRead_Page_Body PAGE;
+  };
+} MarmotAccountAttachmentPageRead;
+
+/**
+ * Borrowed arrays, at most100 entries each. Empty means all; has_after/has_before are uint8_t flags.
+ */
+typedef struct MarmotAccountAttachmentQuery {
+  const char *const *groups;
+  uintptr_t groups_len;
+  const char *const *senders;
+  uintptr_t senders_len;
+  uint8_t has_after;
+  uint64_t after;
+  uint8_t has_before;
+  uint64_t before;
+} MarmotAccountAttachmentQuery;
+
+/**
+ * NULL reference means unavailable, with byte_count zero. A non-NULL reference
+ * with byte_count zero is a verified empty file. References are opaque.
+ */
+typedef struct MarmotAttachmentLocalAsset {
+  char *reference;
+  uint64_t byte_count;
+} MarmotAttachmentLocalAsset;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotAttachmentLocalAssetList {
+  struct MarmotAttachmentLocalAsset *items;
+  uintptr_t len;
+} MarmotAttachmentLocalAssetList;
+
+/**
+ * available=false means discard any assembled host result. Available with
+ * zero bytes is EOF. Hosts own decoding and plaintext buffer lifetime.
+ */
+typedef struct MarmotAttachmentLocalBytes {
+  bool available;
+  uint8_t *bytes;
+  uintptr_t bytes_len;
+} MarmotAttachmentLocalBytes;
+
+/**
+ * Borrowed original source slot from a timeline/history entry. Strings must be
+ * NUL-terminated; caller retains ownership throughout the call.
+ */
+typedef struct MarmotAttachmentLocalTarget {
+  const char *message_id_hex;
+  const char *source_message_id_hex;
+  uint32_t attachment_index;
+} MarmotAttachmentLocalTarget;
 
 /**
  * All fields, including opaque handles, are owned by this page's result.
@@ -5740,6 +5796,58 @@ void marmot_string_free(char *s);
  * been freed already.
  */
 void marmot_bytes_free(uint8_t *data, uintptr_t len);
+
+/**
+ * Deep-free the page result, including its borrowed cursor/version fields. NULL is a no-op.
+ * # Safety
+ * Value must be NULL or an owned, unfreed result with no outstanding borrows.
+ */
+void marmot_account_attachment_page_read_free(struct MarmotAccountAttachmentPageRead *value);
+
+/**
+ * Free a standalone version, never a field of a page result. NULL is a no-op.
+ * # Safety
+ * Value must be NULL or an owned standalone version with no outstanding borrows.
+ */
+void marmot_account_attachment_version_free(struct MarmotAccountAttachmentVersion *value);
+
+/**
+ * Clone a borrowed version into an independently owned baseline.
+ * # Safety
+ * Value must be live and out writable.
+ */
+MarmotStatus marmot_account_attachment_version_clone(const struct MarmotAccountAttachmentVersion *value,
+                                                     struct MarmotAccountAttachmentVersion **out);
+
+/**
+ * Blocking local read; call off the UI thread. Limit is1..=100 candidates, not a filtered row target.
+ * # Safety
+ * Client, strings and query arrays must be valid, cursor NULL or live, and out writable.
+ */
+MarmotStatus marmot_account_attachment_history_page(const struct MarmotClient *client,
+                                                    const char *account_ref,
+                                                    const struct MarmotAccountAttachmentQuery *query,
+                                                    uint32_t limit,
+                                                    const struct MarmotAccountAttachmentCursor *cursor,
+                                                    struct MarmotAccountAttachmentPageRead **out);
+
+/**
+ * Read a constant-work account change token, owned independently from any page.
+ * # Safety
+ * Client and string must be live and out writable.
+ */
+MarmotStatus marmot_account_attachment_history_version(const struct MarmotClient *client,
+                                                       const char *account_ref,
+                                                       struct MarmotAccountAttachmentVersion **out);
+
+/**
+ * Compare against the retained baseline; outputs a MarmotAttachmentHistoryChange discriminant, not a count.
+ * # Safety
+ * Both versions must be live and out writable.
+ */
+MarmotStatus marmot_account_attachment_version_change_since(const struct MarmotAccountAttachmentVersion *current,
+                                                            const struct MarmotAccountAttachmentVersion *previous,
+                                                            uint32_t *out);
 
 /**
  * Free a list returned by this library. NULL is a no-op.
