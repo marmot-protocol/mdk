@@ -156,32 +156,33 @@ impl Marmot {
         bootstrap_relays: Vec<String>,
         inbox_relays: Vec<String>,
     ) -> Result<IdentityCreationResultFfi, MarmotKitError> {
-        let request = AccountSetupRequest {
-            identity: None,
-            import_nsec: None,
-            default_relays: endpoints(&default_relays),
-            bootstrap_relays: endpoints(&bootstrap_relays),
-            inbox_relays: endpoints(&inbox_relays),
-            discovery_relays: ffi_discovery_relays(),
-            publish_missing_relay_lists: true,
-            publish_initial_key_package: true,
-        };
-        let result = self.runtime.create_identity_local_ready(request).await?;
-        let profile = result.profile.ok_or_else(|| MarmotKitError::Runtime {
-            details: "generated profile is unavailable".into(),
-        })?;
-        Ok(IdentityCreationResultFfi {
-            account: AccountSummaryFfi {
-                label: result.account.label,
-                account_id_hex: result.account.account_id_hex,
-                local_signing: result.account.local_signing,
-                external_signing: result.account.external_signing,
-                signed_out: result.account.signed_out,
-                running: true,
-            },
-            profile: profile.into(),
-            readiness: result.readiness.into(),
-        })
+        self.create_local_ready_identity(default_relays, bootstrap_relays, inbox_relays, None)
+            .await
+    }
+
+    /// Create a generated identity whose first public kind-0 is `profile`,
+    /// returning at durable local readiness like `create_identity_with_profile`.
+    /// Use this when onboarding collects a name: publishing it afterwards with
+    /// `publish_user_profile` would first expose the key-derived default to
+    /// contacts. The returned profile is the stamped one that setup publishes.
+    ///
+    /// `inbox_relays` (default empty) sets the kind-10050 inbox list
+    /// separately; empty declares `default_relays` in both lists.
+    #[uniffi::method(default(inbox_relays = []))]
+    pub async fn create_identity_with_initial_profile(
+        &self,
+        profile: UserProfileMetadataFfi,
+        default_relays: Vec<String>,
+        bootstrap_relays: Vec<String>,
+        inbox_relays: Vec<String>,
+    ) -> Result<IdentityCreationResultFfi, MarmotKitError> {
+        self.create_local_ready_identity(
+            default_relays,
+            bootstrap_relays,
+            inbox_relays,
+            Some(UserProfileMetadata::from(profile)),
+        )
+        .await
     }
 
     /// Read setup readiness without performing network I/O.
@@ -731,6 +732,50 @@ impl Marmot {
     }
 }
 
+impl Marmot {
+    async fn create_local_ready_identity(
+        &self,
+        default_relays: Vec<String>,
+        bootstrap_relays: Vec<String>,
+        inbox_relays: Vec<String>,
+        initial_profile: Option<UserProfileMetadata>,
+    ) -> Result<IdentityCreationResultFfi, MarmotKitError> {
+        let request = AccountSetupRequest {
+            identity: None,
+            import_nsec: None,
+            default_relays: endpoints(&default_relays),
+            bootstrap_relays: endpoints(&bootstrap_relays),
+            inbox_relays: endpoints(&inbox_relays),
+            discovery_relays: ffi_discovery_relays(),
+            publish_missing_relay_lists: true,
+            publish_initial_key_package: true,
+        };
+        let result = match initial_profile {
+            Some(profile) => {
+                self.runtime
+                    .create_identity_local_ready_with_initial_profile(request, profile)
+                    .await?
+            }
+            None => self.runtime.create_identity_local_ready(request).await?,
+        };
+        let profile = result.profile.ok_or_else(|| MarmotKitError::Runtime {
+            details: "generated profile is unavailable".into(),
+        })?;
+        Ok(IdentityCreationResultFfi {
+            account: AccountSummaryFfi {
+                label: result.account.label,
+                account_id_hex: result.account.account_id_hex,
+                local_signing: result.account.local_signing,
+                external_signing: result.account.external_signing,
+                signed_out: result.account.signed_out,
+                running: true,
+            },
+            profile: profile.into(),
+            readiness: result.readiness.into(),
+        })
+    }
+}
+
 fn ffi_discovery_relays() -> Vec<TransportEndpoint> {
     // Directory reads remain available for imported and external-signer
     // accounts even when local development relays suppress public writes.
@@ -775,6 +820,51 @@ mod tests {
         assert_eq!(created.profile.banner, cached.banner);
         assert_eq!(created.profile.nip05, cached.nip05);
         assert_eq!(created.profile.lud16, cached.lud16);
+        kit.runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn generated_identity_with_initial_profile_caches_the_selected_profile() {
+        let relay = MockRelay::run().await.expect("start mock relay");
+        let relay_url = relay.url().await.to_string();
+        let root = tempfile::tempdir().expect("tempdir");
+        let app = MarmotApp::with_relay(root.path(), relay_url.clone());
+        let runtime = app.runtime();
+        let kit = Marmot { app, runtime };
+
+        let created = kit
+            .create_identity_with_initial_profile(
+                UserProfileMetadataFfi {
+                    name: Some("Chosen Heron".into()),
+                    display_name: Some("Chosen Heron".into()),
+                    about: Some("first profile".into()),
+                    picture: None,
+                    banner: None,
+                    nip05: None,
+                    lud16: None,
+                },
+                vec![relay_url.clone()],
+                vec![relay_url],
+                Vec::new(),
+            )
+            .await
+            .expect("create identity with a selected profile");
+
+        assert_eq!(created.readiness, AccountSetupReadinessFfi::LocalReady);
+        assert_eq!(created.profile.name.as_deref(), Some("Chosen Heron"));
+        assert_eq!(
+            created.profile.display_name.as_deref(),
+            Some("Chosen Heron")
+        );
+        assert_eq!(created.profile.about.as_deref(), Some("first profile"));
+        let cached = kit
+            .app
+            .directory_entry_for_account_id(&created.account.account_id_hex)
+            .expect("read cached profile")
+            .and_then(|entry| entry.profile)
+            .expect("selected profile is locally durable");
+        assert_eq!(cached.name.as_deref(), Some("Chosen Heron"));
+        assert_ne!(cached.created_at, 0);
         kit.runtime.shutdown().await;
     }
 
