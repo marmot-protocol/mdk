@@ -216,3 +216,124 @@ async fn successive_saves_of_one_kind_author_strictly_increasing_timestamps() {
         );
     }
 }
+
+#[tokio::test]
+async fn rapid_profile_saves_cache_the_authored_timestamp() {
+    let (_directory, app, relay, label) = quorum_app();
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    let save = |name: &'static str| {
+        runtime.publish_user_profile(
+            &label,
+            UserProfileMetadata {
+                name: Some(name.into()),
+                ..UserProfileMetadata::default()
+            },
+            two_relay_bootstrap(),
+        )
+    };
+    save("First").await.unwrap();
+    save("Second").await.unwrap();
+    let returned = save("Third").await.unwrap();
+
+    let authored = relay
+        .attempted_events()
+        .into_iter()
+        .filter(|event| event.kind == KIND_NOSTR_METADATA)
+        .map(|event| event.created_at)
+        .max()
+        .unwrap();
+    assert_eq!(
+        returned.created_at, authored,
+        "the returned profile must carry the published event's timestamp"
+    );
+    // A late copy of the second save must not replace the third.
+    let account_id_hex = app.account_home().account(&label).unwrap().account_id_hex;
+    app.remember_directory_profile_if_newer(
+        &account_id_hex,
+        &UserProfileMetadata {
+            name: Some("Second".into()),
+            created_at: authored - 1,
+            ..UserProfileMetadata::default()
+        },
+    )
+    .unwrap();
+    let cached = app
+        .directory_entry_for_account_id(&account_id_hex)
+        .unwrap()
+        .and_then(|entry| entry.profile)
+        .unwrap();
+    assert_eq!(cached.name.as_deref(), Some("Third"));
+    assert_eq!(cached.created_at, authored);
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn reopened_app_authors_after_previously_published_versions() {
+    let (directory, app, relay, label) = quorum_app();
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    for name in ["First", "Second", "Third"] {
+        runtime
+            .publish_user_profile(
+                &label,
+                UserProfileMetadata {
+                    name: Some(name.into()),
+                    ..UserProfileMetadata::default()
+                },
+                two_relay_bootstrap(),
+            )
+            .await
+            .unwrap();
+        app.publish_account_relay_lists(&label, two_relay_bootstrap())
+            .await
+            .unwrap();
+    }
+    runtime.shutdown().await;
+    drop(runtime);
+    drop(app);
+
+    let reopened =
+        MarmotApp::with_relay(directory.path(), FAST).with_test_relay_client(relay.clone());
+    let newest_before = |kind: u64| {
+        relay
+            .attempted_events()
+            .into_iter()
+            .filter(|event| event.kind == kind)
+            .map(|event| event.created_at)
+            .max()
+            .unwrap()
+    };
+    let profile_floor = newest_before(KIND_NOSTR_METADATA);
+    let relay_list_floor = newest_before(KIND_NIP65_RELAY_LIST);
+    let attempted_before = relay.attempted_events().len();
+    reopened
+        .publish_user_profile(
+            &label,
+            UserProfileMetadata {
+                name: Some("Fourth".into()),
+                ..UserProfileMetadata::default()
+            },
+            two_relay_bootstrap(),
+        )
+        .await
+        .unwrap();
+    reopened
+        .publish_account_relay_lists(&label, two_relay_bootstrap())
+        .await
+        .unwrap();
+
+    let after = relay.attempted_events().split_off(attempted_before);
+    for (kind, floor) in [
+        (KIND_NOSTR_METADATA, profile_floor),
+        (KIND_NIP65_RELAY_LIST, relay_list_floor),
+    ] {
+        let created_at = after
+            .iter()
+            .find(|event| event.kind == kind)
+            .map(|event| event.created_at)
+            .unwrap();
+        assert!(
+            created_at > floor,
+            "kind {kind} after reopen authored {created_at}, not after {floor}"
+        );
+    }
+}

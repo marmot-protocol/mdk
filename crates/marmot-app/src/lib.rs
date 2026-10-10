@@ -3020,23 +3020,33 @@ impl MarmotApp {
     }
 
     /// Sign a replaceable identity record (kind 0, kind 3, relay lists) with a
-    /// `created_at` strictly after the previous version this process authored
-    /// for the same account and kind. Relays keep the lower event id on a
-    /// timestamp tie, so a same-second older version delivered late by quorum
-    /// completion could otherwise replace a newer save.
+    /// `created_at` strictly after the previous version authored for the same
+    /// account and kind. Relays keep the lower event id on a timestamp tie, so
+    /// a same-second older version delivered late by quorum completion could
+    /// otherwise replace a newer save. After a reopen the floor is recovered
+    /// from the cached profile and relay lists; kind 3 has no cached timestamp.
     pub(crate) async fn sign_replaceable_identity_event(
         &self,
         signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
         event: &NostrTransportEvent,
     ) -> Result<NostrTransportEvent, AppError> {
+        let key = (event.pubkey.clone(), event.kind);
+        let known = self
+            .replaceable_identity_created_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&key);
+        let cached_floor = if known {
+            0
+        } else {
+            self.cached_replaceable_identity_created_at(&event.pubkey, event.kind)?
+        };
         let created_at = {
             let mut latest = self
                 .replaceable_identity_created_at
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let newest = latest
-                .entry((event.pubkey.clone(), event.kind))
-                .or_insert(0);
+            let newest = latest.entry(key).or_insert(cached_floor);
             *newest = event.created_at.max(newest.saturating_add(1));
             *newest
         };
@@ -3048,6 +3058,22 @@ impl MarmotApp {
             created_at,
         );
         sign_account_publication_event(signer, &event).await
+    }
+
+    fn cached_replaceable_identity_created_at(
+        &self,
+        account_id_hex: &str,
+        kind: u64,
+    ) -> Result<u64, AppError> {
+        let Some(entry) = self.directory_entry_for_account_id(account_id_hex)? else {
+            return Ok(0);
+        };
+        Ok(match kind {
+            KIND_NOSTR_METADATA => entry.profile.map_or(0, |profile| profile.created_at),
+            KIND_NIP65_RELAY_LIST => entry.relay_lists.nip65.created_at,
+            KIND_MARMOT_INBOX_RELAY_LIST => entry.relay_lists.inbox.created_at,
+            _ => 0,
+        })
     }
 
     pub(crate) fn spawn_quorum_cancelled_delivery(&self, delivery: QuorumCancelledDelivery) {

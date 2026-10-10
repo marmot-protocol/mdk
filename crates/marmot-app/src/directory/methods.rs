@@ -844,9 +844,11 @@ impl MarmotApp {
                 .collect(),
         )
         .await
+        .map(|_| ())
     }
 
-    /// Publish kind-0 metadata to an already-selected, account-scoped route.
+    /// Publish kind-0 metadata to an already-selected, account-scoped route,
+    /// returning the authored event's `created_at` for the local cache.
     ///
     /// This is the action boundary used when the runtime has captured one
     /// coherent relay-list snapshot and must not re-read it before publishing.
@@ -857,7 +859,7 @@ impl MarmotApp {
         endpoints: Vec<TransportEndpoint>,
         indexer_relays: Vec<TransportEndpoint>,
         declared_relays: Vec<TransportEndpoint>,
-    ) -> Result<(), AppError> {
+    ) -> Result<u64, AppError> {
         let observation = self.product_analytics.begin(
             crate::ProductFamily::Directory,
             "publish",
@@ -885,7 +887,7 @@ impl MarmotApp {
         endpoints: Vec<TransportEndpoint>,
         indexer_relays: Vec<TransportEndpoint>,
         declared_relays: Vec<TransportEndpoint>,
-    ) -> Result<(), AppError> {
+    ) -> Result<u64, AppError> {
         let account = self.account_home().account(label)?;
         let signer = self.account_signer_for_summary(&account)?;
         let content = serde_json::to_string(&profile_content_json(&profile))?;
@@ -921,12 +923,13 @@ impl MarmotApp {
             crate::QuorumCancelledDelivery::new(relay_client.clone(), account_id.clone());
         completion.add(&event, &endpoints, &outcome);
         self.spawn_quorum_cancelled_delivery(completion);
+        let created_at = event.created_at;
         if let Some(copy) =
             crate::PublicIndexerCopy::new(relay_client, account_id, vec![event], indexers)
         {
             self.spawn_public_indexer_copy(copy);
         }
-        Ok(())
+        Ok(created_at)
     }
 
     /// Select profile publication endpoints from one account relay-list
