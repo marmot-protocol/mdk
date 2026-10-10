@@ -35,6 +35,10 @@ _Static_assert(MARMOT_REPORT_REASON_ILLEGAL == 3, "report reason ABI value");
 _Static_assert(MARMOT_REPORT_REASON_SPAM == 4, "report reason ABI value");
 _Static_assert(MARMOT_REPORT_REASON_IMPERSONATION == 5, "report reason ABI value");
 _Static_assert(MARMOT_REPORT_REASON_OTHER == 6, "report reason ABI value");
+_Static_assert(MARMOT_MODERATION_REPORT_ORIGIN_REPORT == 0, "moderation origin ABI value");
+_Static_assert(MARMOT_MODERATION_REPORT_ORIGIN_BLOCK_AND_REPORT == 1, "moderation origin ABI value");
+_Static_assert(MARMOT_STATUS_MODERATION_REPORTING_NOT_CONFIGURED == 96, "moderation status ABI value");
+_Static_assert(MARMOT_STATUS_MODERATION_REPORT_RATE_LIMITED == 100, "moderation status ABI value");
 
 static int failures = 0;
 

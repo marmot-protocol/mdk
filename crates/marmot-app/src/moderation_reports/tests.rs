@@ -928,6 +928,123 @@ async fn a_stalled_retry_pass_blocks_neither_new_reports_nor_purge() {
 }
 
 #[tokio::test]
+async fn a_teardown_fence_closes_admission_until_the_sign_out_commits() {
+    let fixture = Fixture::configured(Mode::Accept);
+    let (fence, purged) = fixture.app.fence_moderation_reports("alice").await;
+    assert_eq!(purged.unwrap(), 0);
+
+    // The account is still signed in, but a report arriving mid-teardown is refused.
+    let error = fixture
+        .submit(
+            &Keys::generate().public_key().to_hex(),
+            ReportReason::Spam,
+            "",
+            ModerationReportOrigin::Report,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AppError::AccountHome(AccountHomeError::SecretNotFound(_))
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        fixture
+            .storage()
+            .moderation_reports_created_since(0)
+            .unwrap(),
+        0
+    );
+
+    // A retry pass during teardown publishes nothing, even a row staged meanwhile.
+    fixture
+        .storage()
+        .stage_moderation_report(&ModerationReportOutboxEntry {
+            report_id: "a".repeat(32),
+            dedupe_key: "d".repeat(64),
+            recipient_pubkey_hex: fixture.moderation.public_key().to_hex(),
+            outcome: ModerationReportOutboxOutcome::AcceptedPending,
+            event_json: Some("{}".into()),
+            created_at_ms: unix_now_ms(),
+            attempts: 0,
+        })
+        .unwrap();
+    let summary = fixture
+        .app
+        .retry_pending_moderation_reports("alice", None)
+        .await
+        .unwrap();
+    assert_eq!(summary, ModerationReportRetrySummary::default());
+    assert!(fixture.publisher.publishes().is_empty());
+
+    // Once the sign-out commits, dropping the fence does not reopen admission.
+    fixture
+        .app
+        .account_home()
+        .set_account_signed_out("alice", true)
+        .unwrap();
+    drop(fence);
+    let error = fixture
+        .submit(
+            &Keys::generate().public_key().to_hex(),
+            ReportReason::Spam,
+            "",
+            ModerationReportOrigin::Report,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AppError::AccountHome(AccountHomeError::SecretNotFound(_))
+        ),
+        "{error:?}"
+    );
+    assert!(fixture.publisher.publishes().is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_teardown_reopens_admission_when_its_fence_drops() {
+    let fixture = Fixture::configured(Mode::Accept);
+    let (fence, _) = fixture.app.fence_moderation_reports("alice").await;
+    drop(fence);
+    let outcome = fixture
+        .submit(
+            &Keys::generate().public_key().to_hex(),
+            ReportReason::Spam,
+            "",
+            ModerationReportOrigin::Report,
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.status, ModerationReportStatus::Published);
+}
+
+#[tokio::test]
+async fn an_unacknowledged_report_stays_unknown_after_an_offline_retry() {
+    let fixture = Fixture::configured(Mode::Unacknowledged);
+    let reported = Keys::generate().public_key().to_hex();
+    let now = unix_now_ms();
+    let (first, _) = fixture.submit_at(&reported, now).await.unwrap();
+    assert_eq!(first.status, ModerationReportStatus::CompletionUnknown);
+
+    fixture.publisher.set_mode(Mode::Refuse);
+    let summary = fixture
+        .app
+        .retry_pending_moderation_reports("alice", None)
+        .await
+        .unwrap();
+    assert_eq!(summary.pending, 1);
+
+    // The original wrap may already have reached the operator.
+    let (repeat, repeated) = fixture.submit_at(&reported, now + 60_000).await.unwrap();
+    assert!(repeated);
+    assert_eq!(repeat.status, ModerationReportStatus::CompletionUnknown);
+}
+
+#[tokio::test]
 async fn runtime_stop_leaves_the_report_queued_for_retry() {
     let fixture = Fixture::configured(Mode::Hang);
     let (stop, stopping) = watch::channel(false);

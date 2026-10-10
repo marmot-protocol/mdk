@@ -4186,8 +4186,10 @@ impl MarmotAppRuntime {
         }
 
         // Queued moderation reports never outlive their account's session:
-        // stop any in-flight publish and delete them before teardown.
-        self.purge_moderation_reports_best_effort(&account.label, "sign_out")
+        // stop any in-flight publish, delete them, and keep report admission
+        // closed until the teardown below has committed the sign-out.
+        let (_report_fence, report_purge) = self
+            .fence_moderation_reports_for_teardown(&account.label, "sign_out")
             .await;
 
         // Step 2 (local teardown): shut the worker down (deactivating its
@@ -4208,6 +4210,19 @@ impl MarmotAppRuntime {
                     reason: Some(wipe_failure_reason(&err)),
                 };
             }
+        }
+        // Queued reports left on disk would be retried at the next sign-in, so
+        // a failed purge means local cleanup is incomplete.
+        if let Err(err) = report_purge
+            && outcome.local_cleanup.completed
+        {
+            outcome.local_cleanup = LocalCleanupReport {
+                completed: false,
+                reason: Some(format!(
+                    "moderation report purge failed: {}",
+                    wipe_failure_reason(&err)
+                )),
+            };
         }
 
         Ok(outcome)
@@ -4342,9 +4357,11 @@ impl MarmotAppRuntime {
         }
 
         // Queued moderation reports belong to this account: stop any in-flight
-        // publish and delete them before the directory goes, so nothing can be
-        // recorded after the wipe.
-        self.purge_moderation_reports_best_effort(&account.label, "sign_out_and_wipe")
+        // publish, delete them, and keep report admission closed until the
+        // directory is gone, so nothing is staged or published during the wipe.
+        // Removing the directory deletes the rows even when this purge fails.
+        let (_report_fence, _) = self
+            .fence_moderation_reports_for_teardown(&account.label, "sign_out_and_wipe")
             .await;
 
         // Stages 3-5: local cleanup. `remove_account` shuts the worker down,

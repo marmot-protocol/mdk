@@ -73,8 +73,11 @@ relays. It never uses the reporter's general relay list or outbox.
 Each deployment configures a reports key and a relay set per build flavor, so production and staging never mix.
 A reader:
 
-1. subscribes on those relays to `{"kinds": [1059], "#p": ["<reports pubkey hex>"]}`. Use a `since` of at least
-   two days before the reader's last checkpoint, because wrap timestamps are randomized into the past;
+1. subscribes on those relays to `{"kinds": [1059], "#p": ["<reports pubkey hex>"]}`. Use a `since` at least nine
+   days before the reader's last checkpoint: a wrap's `created_at` is randomized up to two days into the past, and a
+   client may keep retrying the same signed wrap for up to seven days before a relay accepts it. Relay receipt time is
+   not in the event, so a shorter lookback can miss a late first publication; deduplication (step 6) makes the overlap
+   harmless;
 2. verifies the wrap signature, NIP-44-decrypts the content with the reports key, and parses the seal;
 3. verifies the seal signature. The seal's `pubkey` is the authenticated reporter;
 4. NIP-44-decrypts the seal content using the seal's `pubkey`, parses the rumor, and rejects it unless
@@ -95,7 +98,8 @@ reports and weigh them against abuse. A report is a claim by its reporter, not p
   configuration, `submit_moderation_report` returns `ModerationReportingNotConfigured` and publishes nothing.
 - **Outcomes.** These follow send summaries. `Published` means a configured relay accepted the wrap.
   `AcceptedPending` means no relay accepted it yet, and every failure provably never left the device.
-  `CompletionUnknown` means a relay may have received it without acknowledging. Neither retained state is a failure.
+  `CompletionUnknown` means a relay may have received it without acknowledging, and it stays `CompletionUnknown` until
+  a relay accepts the wrap. Neither retained state is a failure.
 - **Durability.** The signed wrap is staged in the account's SQLCipher database before any relay sees it. Each
   `catch_up_accounts` call starts a background retry for accounts with queued reports. Runtime shutdown cancels an
   in-flight publish and leaves the report queued. The queued row holds only the ciphertext wrap, the recipient key, an
@@ -109,8 +113,9 @@ reports and weigh them against abuse. A report is a claim by its reporter, not p
 - **Validation.** Reporting your own key returns `CannotReportSelf`. A key that is not 64-character hex or `npub`
   returns `InvalidReportedPublicKey`.
 - **Account isolation.** Queued reports live in the reporting account's database. `sign_out` and `sign_out_and_wipe`
-  cancel in-flight report work and delete the account's queued and published report rows. Signed-out accounts cannot
-  report.
+  cancel in-flight report work, delete the account's queued and published report rows, and refuse new reports and
+  retries until the sign-out or wipe has committed. If that purge fails, sign-out reports its local cleanup as
+  incomplete. Signed-out accounts cannot report.
 - **Telemetry.** Logs and traces carry only aggregate fields, such as the `moderation_report_submitted` event with
   `origin` and `outcome`, and retry-pass counts. They never carry the reported key, the explanation, the one-time key
   or event ids.

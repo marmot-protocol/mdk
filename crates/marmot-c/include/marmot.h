@@ -1162,6 +1162,14 @@ typedef enum MarmotHostPerformanceOutcome {
 } MarmotHostPerformanceOutcome;
 
 /**
+ * Which user action produced a private moderation report.
+ */
+typedef enum MarmotModerationReportOrigin {
+  MARMOT_MODERATION_REPORT_ORIGIN_REPORT,
+  MARMOT_MODERATION_REPORT_ORIGIN_BLOCK_AND_REPORT,
+} MarmotModerationReportOrigin;
+
+/**
  * Free before its client. Concurrent next and commands are supported; never free during a call.
  */
 typedef struct MarmotAccountAttentionSubscription MarmotAccountAttentionSubscription;

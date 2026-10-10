@@ -178,8 +178,18 @@ impl MarmotAppRuntime {
         }
     }
 
-    pub(crate) async fn purge_moderation_reports_best_effort(&self, label: &str, method: &str) {
-        if let Err(error) = self.accounts.app.purge_moderation_reports(label).await {
+    /// Close `label`'s report admission and purge its reports for a teardown.
+    /// Hold the fence until the teardown commits.
+    pub(crate) async fn fence_moderation_reports_for_teardown(
+        &self,
+        label: &str,
+        method: &str,
+    ) -> (
+        crate::moderation_reports::ModerationReportFence,
+        Result<u64, AppError>,
+    ) {
+        let (fence, purged) = self.accounts.app.fence_moderation_reports(label).await;
+        if let Err(error) = &purged {
             tracing::warn!(
                 target: "marmot_app::runtime",
                 method,
@@ -187,5 +197,6 @@ impl MarmotAppRuntime {
                 "failed to purge queued moderation reports"
             );
         }
+        (fence, purged)
     }
 }

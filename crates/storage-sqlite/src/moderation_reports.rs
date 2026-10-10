@@ -164,7 +164,9 @@ impl SqliteAccountStorage {
         Ok(())
     }
 
-    /// Record one publish attempt. A published report drops its wrap. Returns
+    /// Record one publish attempt. A published report drops its wrap.
+    /// `CompletionUnknown` is sticky: once a wrap may have reached a relay, a
+    /// later refused attempt cannot downgrade it to `AcceptedPending`. Returns
     /// whether the row still existed (a purge may have removed it meanwhile).
     pub fn record_moderation_report_attempt(
         &self,
@@ -176,7 +178,11 @@ impl SqliteAccountStorage {
             .lock()?
             .execute(
                 "UPDATE moderation_report_outbox
-                 SET outcome = ?2,
+                 SET outcome = CASE
+                         WHEN ?2 = 'published' THEN 'published'
+                         WHEN outcome = 'completion_unknown' THEN 'completion_unknown'
+                         ELSE ?2
+                     END,
                      event_json = CASE WHEN ?2 = 'published' THEN NULL ELSE event_json END,
                      last_attempt_at_ms = ?3,
                      attempts = attempts + 1
@@ -338,6 +344,44 @@ mod tests {
                 )
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn completion_unknown_survives_a_later_refused_attempt() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .stage_moderation_report(&entry('a', 'd', 1_000))
+            .unwrap();
+        let id = "a".repeat(32);
+        let outcome = |store: &SqliteAccountStorage| {
+            store
+                .moderation_report_by_dedupe_key(&"d".repeat(64), 0)
+                .unwrap()
+                .unwrap()
+                .outcome
+        };
+        store
+            .record_moderation_report_attempt(
+                &id,
+                ModerationReportOutboxOutcome::CompletionUnknown,
+                2_000,
+            )
+            .unwrap();
+        store
+            .record_moderation_report_attempt(
+                &id,
+                ModerationReportOutboxOutcome::AcceptedPending,
+                3_000,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome(&store),
+            ModerationReportOutboxOutcome::CompletionUnknown
+        );
+        store
+            .record_moderation_report_attempt(&id, ModerationReportOutboxOutcome::Published, 4_000)
+            .unwrap();
+        assert_eq!(outcome(&store), ModerationReportOutboxOutcome::Published);
     }
 
     #[test]

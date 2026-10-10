@@ -145,6 +145,33 @@ struct AccountSlot {
     generation: watch::Sender<u64>,
     /// Set while a retry pass runs, so overlapping catch-ups do not double-publish.
     retrying: std::sync::atomic::AtomicBool,
+    /// Open [`ModerationReportFence`]s. While nonzero, no report is admitted
+    /// or retried. Sign-out and wipe hold one from purge through teardown,
+    /// because the account stays signed in until teardown commits.
+    fences: std::sync::atomic::AtomicUsize,
+}
+
+impl AccountSlot {
+    /// Whether work admitted now may stage or publish. Call with `work` held,
+    /// after subscribing to `generation`: a fence raised before the
+    /// subscription is seen here, and one raised after it bumps the generation
+    /// the publish waits on.
+    fn admits(&self, generation: &watch::Receiver<u64>) -> bool {
+        self.fences.load(std::sync::atomic::Ordering::Acquire) == 0
+            && !generation.has_changed().unwrap_or(true)
+    }
+}
+
+/// Keeps one account's report admission closed until dropped.
+#[must_use = "admission reopens as soon as the fence is dropped"]
+pub(crate) struct ModerationReportFence(Arc<AccountSlot>);
+
+impl Drop for ModerationReportFence {
+    fn drop(&mut self) {
+        self.0
+            .fences
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 impl ModerationReportState {
@@ -158,6 +185,7 @@ impl ModerationReportState {
                     work: tokio::sync::Mutex::new(()),
                     generation: watch::channel(0).0,
                     retrying: std::sync::atomic::AtomicBool::new(false),
+                    fences: std::sync::atomic::AtomicUsize::new(0),
                 })
             })
             .clone()
@@ -382,8 +410,9 @@ impl MarmotApp {
         let slot = self.moderation_reports.slot(label);
         let mut generation = slot.generation.subscribe();
         let work = slot.work.lock().await;
-        if generation.has_changed().unwrap_or(true) {
-            // Signed out while this submission waited.
+        // Re-read the account under the lock: a sign-out may have closed
+        // admission or committed while this submission waited.
+        if !slot.admits(&generation) || self.account_home.account(label)?.signed_out {
             return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
         }
         let storage = self.account_storage(label)?;
@@ -491,6 +520,9 @@ impl MarmotApp {
         };
         let mut generation = slot.generation.subscribe();
         let work = slot.work.lock().await;
+        if !slot.admits(&generation) || self.account_home.account(label)?.signed_out {
+            return Ok(ModerationReportRetrySummary::default());
+        }
         let storage = self.account_storage(label)?;
         let now_ms = unix_now_ms();
         let mut summary = ModerationReportRetrySummary {
@@ -549,12 +581,33 @@ impl MarmotApp {
     }
 
     /// Stop in-flight report work for `label` and delete every report it queued.
+    #[cfg(test)]
     pub(crate) async fn purge_moderation_reports(&self, label: &str) -> Result<u64, AppError> {
+        let (_fence, purged) = self.fence_moderation_reports(label).await;
+        purged
+    }
+
+    /// Close `label`'s report admission, stop its in-flight report work and
+    /// delete every report it queued. Admission stays closed until the fence
+    /// drops, so a teardown holds it until the account is signed out or gone.
+    /// The fence is returned even when the purge fails.
+    pub(crate) async fn fence_moderation_reports(
+        &self,
+        label: &str,
+    ) -> (ModerationReportFence, Result<u64, AppError>) {
         let slot = self.moderation_reports.slot(label);
+        // Raise the fence before bumping: work that subscribes after the bump
+        // sees the fence under the lock instead.
+        slot.fences
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let fence = ModerationReportFence(slot.clone());
         slot.generation
             .send_modify(|generation| *generation = generation.wrapping_add(1));
         let _work = slot.work.lock().await;
-        Ok(self.account_storage(label)?.purge_moderation_reports()?)
+        let purged = self
+            .account_storage(label)
+            .and_then(|storage| Ok(storage.purge_moderation_reports()?));
+        (fence, purged)
     }
 
     async fn publish_moderation_wrap(
