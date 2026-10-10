@@ -400,7 +400,7 @@ fn mentions(
     let mut found = Vec::new();
     // Inline parsing reuses the same bounded Markdown/NIP-27 parser as sends
     // and unread classification. Never interpret a raw hex substring as a mention.
-    for id in crate::messages::inline_mention_pubkey_hexes(plaintext)
+    for id in crate::messages::inline_profile_reference_pubkey_hexes(plaintext)
         .into_iter()
         .chain(
             tags.iter()

@@ -250,6 +250,16 @@ event journal.
 
 ## Conversations
 
+- **Profile links and mentions.** Explicit `nostr:npub` and `nostr:nprofile`
+  links are informational references: name presentation resolves them, but
+  sending, replying, editing or using them in a media caption does not derive
+  recipient `p` tags. Markdown mention tokens such as `@npub` still do.
+  Notification and unread-mention fallback follow the same distinction;
+  explicit received `p` tags remain authoritative for older clients. Hosts
+  implementing informational paste must adopt a matching artifact and preserve
+  the canonical NIP-21 text, rather than sending the visible profile name.
+  Older readers may still infer attention from an untagged profile URI;
+  updating one sender does not establish every peer's notification behavior.
 - **Drafts.** Rust app/runtime draft commands expose selected metadata, conditional save/clear, keyed attachment bytes,
   and revision-bound sends. Post-commit invalidations let conversation owners reload the selected composer; durable
   outbox acceptance clears only the submitted revision. See the
