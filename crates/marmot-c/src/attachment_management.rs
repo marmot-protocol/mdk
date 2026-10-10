@@ -25,8 +25,17 @@ impl MarmotAttachmentJobQuery {
     pub(crate) unsafe fn to_ffi(&self) -> Result<AttachmentJobQueryFfi, MarmotStatus> {
         Ok(AttachmentJobQueryFfi {
             group_id_hex: unsafe { optional_str(self.group_id_hex) }?,
-            view: MarmotAttachmentJobView::from_c(self.view)?.into(),
-            origin: MarmotAttachmentJobOrigin::from_c(self.origin)?.into(),
+            view: match MarmotAttachmentJobView::from_c(self.view)? {
+                MarmotAttachmentJobView::All => AttachmentJobViewFfi::All,
+                MarmotAttachmentJobView::Active => AttachmentJobViewFfi::Active,
+                MarmotAttachmentJobView::NeedsAttention => AttachmentJobViewFfi::NeedsAttention,
+                MarmotAttachmentJobView::Ready => AttachmentJobViewFfi::Ready,
+            },
+            origin: match MarmotAttachmentJobOrigin::from_c(self.origin)? {
+                MarmotAttachmentJobOrigin::Any => AttachmentJobOriginFfi::Any,
+                MarmotAttachmentJobOrigin::Automatic => AttachmentJobOriginFfi::Automatic,
+                MarmotAttachmentJobOrigin::Explicit => AttachmentJobOriginFfi::Explicit,
+            },
         })
     }
 }
@@ -70,6 +79,7 @@ pub struct MarmotManagedAttachmentEntry {
     pub group_id_hex: *mut c_char,
     pub entry: MarmotAttachmentEntry,
     pub explicit: bool,
+    pub origin_known: bool,
     pub status: MarmotAttachmentTransferStatus,
     pub failure: MarmotAttachmentFailureCategory,
     pub action: *mut MarmotAttachmentJobActionToken,
@@ -80,6 +90,7 @@ impl From<ManagedAttachmentEntryFfi> for MarmotManagedAttachmentEntry {
             group_id_hex: owned_c_string(e.group_id_hex),
             entry: e.entry.into(),
             explicit: e.explicit,
+            origin_known: e.origin_known,
             status: e.status.into(),
             failure: e.failure.into(),
             action: boxed(e.action.into()),
@@ -333,7 +344,7 @@ pub unsafe extern "C" fn marmot_control_managed_attachment(
                 unsafe { *out = v };
                 MarmotStatus::Ok
             }
-            Err(e) => crate::status_from_error(&e),
+            Err(e) => crate::status::status_from_error(&e),
         }
     })
 }

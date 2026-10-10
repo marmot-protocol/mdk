@@ -97,6 +97,25 @@ fn recheck(
     }
     Ok(())
 }
+fn effective_permission(
+    s: &storage_sqlite::SqliteAccountStorage,
+    config: &crate::MarmotAppConfig,
+    permissions: &super::attachment_permission::Permissions,
+) -> Result<storage_sqlite::AttachmentManagementPermission, AppError> {
+    Ok(storage_sqlite::AttachmentManagementPermission {
+        automatic: s
+            .attachment_download_policy(&super::attachment_controls::default_policy(config))?
+            .automatic
+            && config.cursor_persistence != crate::CursorPersistence::Frozen,
+        categories: if config.attachment_acquisition_mode
+            == crate::AttachmentAcquisitionMode::HostManaged
+        {
+            permissions.categories(&s.attachment_store_identity()?)
+        } else {
+            [true; 4]
+        },
+    })
+}
 impl MarmotAppRuntime {
     pub async fn managed_attachment_page(
         &self,
@@ -105,9 +124,10 @@ impl MarmotAppRuntime {
         limit: usize,
         cursor: Option<AttachmentJobCursor>,
     ) -> Result<ManagedAttachmentPage, AppError> {
-        let fallback = super::attachment_controls::default_policy(&self.accounts.app.config);
+        let config = self.accounts.app.config.clone();
+        let permissions = self.shared.attachment_permissions.clone();
         self.attachment_read(account, move |s, loopback| {
-            let automatic = s.attachment_download_policy(&fallback)?.automatic;
+            let automatic = effective_permission(&s, &config, &permissions)?;
             let p = s.attachment_jobs_page(
                 &query,
                 limit,
@@ -127,9 +147,10 @@ impl MarmotAppRuntime {
         account: &str,
         query: AttachmentJobQuery,
     ) -> Result<AttachmentManagementSnapshot, AppError> {
-        let fallback = super::attachment_controls::default_policy(&self.accounts.app.config);
+        let config = self.accounts.app.config.clone();
+        let permissions = self.shared.attachment_permissions.clone();
         self.attachment_read(account, move |s, loopback| {
-            let automatic = s.attachment_download_policy(&fallback)?.automatic;
+            let automatic = effective_permission(&s, &config, &permissions)?;
             let f = s.attachment_management_frame(&query, crate::unix_now_seconds(), automatic)?;
             let h = f.page.history_version.clone();
             let result = AttachmentManagementSnapshot {

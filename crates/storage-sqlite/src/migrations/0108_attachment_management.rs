@@ -14,7 +14,7 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             UPDATE attachment_management_sequence SET value=value+1,revision=revision+1 WHERE id=1;
             UPDATE attachment_acquisition SET management_sequence=(SELECT value FROM attachment_management_sequence WHERE id=1) WHERE token=NEW.token;
         END;
-        CREATE TRIGGER attachment_management_promoted AFTER UPDATE OF explicit_request ON attachment_acquisition WHEN OLD.explicit_request=0 AND NEW.explicit_request=1 BEGIN
+        CREATE TRIGGER attachment_management_promoted AFTER UPDATE OF explicit_request,cancelled ON attachment_acquisition WHEN (OLD.explicit_request=0 AND NEW.explicit_request=1) OR (OLD.cancelled=0 AND NEW.cancelled=1) BEGIN
             UPDATE attachment_management_sequence SET value=value+1 WHERE id=1;
             UPDATE attachment_acquisition SET management_sequence=(SELECT value FROM attachment_management_sequence WHERE id=1) WHERE token=NEW.token;
         END;

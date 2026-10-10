@@ -226,6 +226,29 @@ fn management_health_is_independent_of_transfer_phases_and_missing_observations(
     assert_eq!(f.counts.policy_blocked, 1);
     assert_eq!(f.counts.cancelled, 1);
     assert!(f.page.entries.iter().all(|e| e.status.total.is_none()));
+    let denied = crate::AttachmentManagementPermission {
+        automatic: true,
+        categories: [false; 4],
+    };
+    let paused = s.attachment_management_frame(&q, 12, denied).unwrap();
+    assert_eq!(paused.counts.active, 0);
+    assert_eq!(paused.counts.paused, 6);
+    assert_eq!(paused.counts.needs_attention, 2);
+    assert!(!paused.version.same_as(&f.version));
+    let active = s
+        .attachment_jobs_page(
+            &AttachmentJobQuery {
+                view: AttachmentJobView::Active,
+                ..q.clone()
+            },
+            50,
+            None,
+            12,
+            denied,
+        )
+        .unwrap();
+    assert!(active.entries.is_empty());
+
     let cancelled = f
         .page
         .entries
@@ -292,4 +315,53 @@ fn management_health_is_independent_of_transfer_phases_and_missing_observations(
     );
     s.close().unwrap();
     assert!(s.attachment_management_frame(&q, 12, true).is_err());
+}
+
+#[test]
+fn cancelling_intent_invalidates_old_actions_without_deleting_ready_bytes() {
+    let s = SqliteAccountStorage::in_memory().unwrap();
+    seed(&s, "one");
+    request(&s, "one");
+    let old = s
+        .attachment_jobs_page(&AttachmentJobQuery::default(), 1, None, 12, true)
+        .unwrap()
+        .entries[0]
+        .action
+        .clone();
+    let cursor = s.begin_attachment_cancellation(None, false).unwrap();
+    assert_eq!(s.cancel_attachment_batch(&cursor, 12).unwrap().requested, 1);
+    assert!(!s.control_managed_attachment(&old, true, 13).unwrap());
+    let page = s
+        .attachment_jobs_page(&AttachmentJobQuery::default(), 1, None, 13, true)
+        .unwrap();
+    assert!(!page.entries[0].origin_known);
+    assert!(
+        s.control_managed_attachment(&page.entries[0].action, true, 13)
+            .unwrap()
+    );
+    assert_eq!(s.cancel_attachment_batch(&cursor, 13).unwrap().requested, 0);
+}
+
+#[test]
+fn action_tokens_require_refresh_after_visibility_is_reallowed() {
+    let s = SqliteAccountStorage::in_memory().unwrap();
+    seed(&s, "one");
+    request(&s, "one");
+    let old = s
+        .attachment_jobs_page(&AttachmentJobQuery::default(), 1, None, 12, true)
+        .unwrap()
+        .entries[0]
+        .action
+        .clone();
+    sql(&s, "INSERT INTO user_blocks VALUES('author',0,0);");
+    assert!(!s.control_managed_attachment(&old, false, 12).unwrap());
+    sql(&s, "DELETE FROM user_blocks WHERE public_key='author';");
+    assert!(!s.control_managed_attachment(&old, false, 12).unwrap());
+    let current = s
+        .attachment_jobs_page(&AttachmentJobQuery::default(), 1, None, 12, true)
+        .unwrap();
+    assert!(
+        s.control_managed_attachment(&current.entries[0].action, false, 12)
+            .unwrap()
+    );
 }

@@ -171,3 +171,5 @@ pub use attachment_acquisition::{
     AttachmentJobOrigin, AttachmentJobPage, AttachmentJobQuery, AttachmentJobView,
     AttachmentManagementFrame, AttachmentManagementVersion,
 };
+
+pub use attachment_acquisition::AttachmentManagementPermission;

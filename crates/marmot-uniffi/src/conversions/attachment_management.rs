@@ -96,6 +96,7 @@ pub struct ManagedAttachmentEntryFfi {
     pub group_id_hex: String,
     pub entry: AttachmentEntryFfi,
     pub explicit: bool,
+    pub origin_known: bool,
     pub status: AttachmentTransferStatusFfi,
     pub failure: AttachmentFailureCategoryFfi,
     pub action: Arc<AttachmentJobActionToken>,
@@ -117,6 +118,7 @@ impl From<app::ManagedAttachmentPage> for ManagedAttachmentPageFfi {
                     group_id_hex: e.group_id_hex,
                     entry: e.entry.into(),
                     explicit: e.explicit,
+                    origin_known: e.origin_known,
                     status: {
                         let mut status: AttachmentTransferStatusFfi = Some(e.status).into();
                         status.reference = None;

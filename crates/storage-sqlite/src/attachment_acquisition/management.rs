@@ -2,6 +2,34 @@
 use super::*;
 use crate::{AccountAttachmentVersion, AttachmentHistoryEntry};
 
+/// Runtime-effective policy for presentation; never persisted as new job authority.
+#[derive(Clone, Copy, Debug)]
+pub struct AttachmentManagementPermission {
+    pub automatic: bool,
+    pub categories: [bool; 4],
+}
+impl From<bool> for AttachmentManagementPermission {
+    fn from(automatic: bool) -> Self {
+        Self {
+            automatic,
+            categories: [true; 4],
+        }
+    }
+}
+fn apply_permission(
+    status: &mut AttachmentTransferStatus,
+    permission: AttachmentManagementPermission,
+) {
+    if active(status.state)
+        && status.automatic_media_type.as_ref().is_some_and(|mime| {
+            !permission.categories[AttachmentPermissionCategory::from_media_type(mime) as usize]
+        })
+    {
+        status.state = AttachmentTransferState::Paused;
+        status.retry_at = None;
+    }
+}
+
 pub const ATTACHMENT_MANAGEMENT_PAGE_LIMIT: usize = 50;
 pub const ATTACHMENT_MANAGEMENT_COUNT_LIMIT: usize = 1024;
 
@@ -107,6 +135,7 @@ pub struct AttachmentJobCursor {
 }
 #[derive(Clone)]
 pub struct AttachmentJobActionToken {
+    history: AccountAttachmentVersion,
     reference: AttachmentAssetRef,
     sequence: i64,
 }
@@ -239,8 +268,9 @@ impl SqliteAccountStorage {
         limit: usize,
         cursor: Option<&AttachmentJobCursor>,
         now: u64,
-        automatic: bool,
+        automatic: impl Into<AttachmentManagementPermission>,
     ) -> StorageResult<AttachmentJobPage> {
+        let permission = automatic.into();
         if !(1..=ATTACHMENT_MANAGEMENT_PAGE_LIMIT).contains(&limit) {
             return Err(invalid("invalid attachment management limit"));
         }
@@ -281,19 +311,20 @@ impl SqliteAccountStorage {
                     continue;
                 };
                 let conn = self.lock()?;
-                let Some(status) = super::controls::transfer_status(
+                let Some(mut status) = super::controls::transfer_status(
                     &conn,
                     &identity,
                     &g,
                     (&m, &source, index),
                     now,
-                    automatic,
+                    permission.automatic,
                     &mut next_expiry,
                 )?
                 else {
                     continue;
                 };
                 drop(conn);
+                apply_permission(&mut status, permission);
                 if status.reference.as_ref().is_none_or(|r| r.token != token)
                     || !query.accepts(explicit, status.state)
                 {
@@ -306,6 +337,7 @@ impl SqliteAccountStorage {
                     origin_known: status.state != AttachmentTransferState::Cancelled,
                     status,
                     action: AttachmentJobActionToken {
+                        history: h.clone(),
                         reference: AttachmentAssetRef {
                             store_epoch: identity.clone(),
                             token,
@@ -334,8 +366,9 @@ impl SqliteAccountStorage {
         &self,
         group: Option<&str>,
         now: u64,
-        automatic: bool,
+        automatic: impl Into<AttachmentManagementPermission>,
     ) -> StorageResult<AttachmentJobCounts> {
+        let permission = automatic.into();
         let q = AttachmentJobQuery {
             group_id_hex: group.map(str::to_owned),
             ..Default::default()
@@ -350,8 +383,9 @@ impl SqliteAccountStorage {
                 let eligible:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM attachment_acquisition q WHERE token=?1 AND {ACCEPTED})"),[&token],|r|r.get(0)).storage()?;
                 if !eligible {continue;}
                 // Reuse the canonical state mapping; source/expiry privacy is checked before classification.
-                if let Some(status)=super::controls::transfer_status(&conn,&identity,&g,(&m,&s,i),now,automatic,&mut None)? {
+                if let Some(mut status)=super::controls::transfer_status(&conn,&identity,&g,(&m,&s,i),now,permission.automatic,&mut None)? {
                     if status.reference.as_ref().is_none_or(|r|r.token!=token){continue;}
+                    apply_permission(&mut status,permission);
                     if active(status.state){counts.active+=1;}else if attention(status.state){counts.needs_attention+=1;}else{match status.state {AttachmentTransferState::Ready=>counts.ready+=1,AttachmentTransferState::Paused=>counts.paused+=1,AttachmentTransferState::Cancelled=>counts.cancelled+=1,AttachmentTransferState::PolicyBlocked=>counts.policy_blocked+=1,_=>counts.other+=1}}
                 }
             }
@@ -405,6 +439,7 @@ impl SqliteAccountStorage {
         now: u64,
     ) -> StorageResult<bool> {
         self.connection.with_transaction(|| {
+            if history(self)?.requires_restart_since(&token.history){return Ok(false);}
             let conn=self.lock()?;
             if !matches_store(&conn,&token.reference)?{return Ok(false);}
             let current:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM attachment_acquisition q WHERE token=?1 AND management_sequence=?2 AND {SOURCE_MATCH} AND {ACCEPTED} AND (expires_at IS NULL OR expires_at>?3))"),params![token.reference.token,token.sequence,u64_to_i64(now)?],|r|r.get(0)).storage()?;drop(conn);
@@ -449,8 +484,9 @@ impl SqliteAccountStorage {
         &self,
         query: &AttachmentJobQuery,
         now: u64,
-        automatic: bool,
+        automatic: impl Into<AttachmentManagementPermission>,
     ) -> StorageResult<AttachmentManagementFrame> {
+        let permission = automatic.into();
         let q = query.canonical()?;
         self.connection.with_read_snapshot(|| {
             let conn=self.lock()?;
@@ -462,14 +498,15 @@ impl SqliteAccountStorage {
             let failure=if available{group.as_ref().map(|g|self.automatic_recovery_failed(&cgka_traits::GroupId::new(g.clone()))).transpose()?}else{None};
             let (notices,notices_complete)=if available{self.bounded_parked_recovery_notices(group.as_deref(),50)?}else{(Vec::new(),true)};
             let mut hash=Sha256::new();hash.update([u8::from(available),u8::from(failure.unwrap_or(false)),u8::from(notices_complete)]);
+            hash.update(permission.categories.map(u8::from));hash.update([u8::from(permission.automatic)]);
             hash.update([u8::from(failure.is_some()),q.view as u8,q.origin as u8]);
             match q.group_id_hex.as_deref(){
                 Some(g)=>{hash.update([1]);hash.update((g.len() as u64).to_be_bytes());hash.update(g.as_bytes());},
                 None=>hash.update([0]),
             }
             for n in &notices {hash.update(n.ticket.id);hash.update(n.ticket.revision.to_be_bytes());}
-            let counts=if available{self.attachment_job_counts(q.group_id_hex.as_deref(),now,automatic)?}else{AttachmentJobCounts::default()};
-            let page=self.attachment_jobs_page(&q,50,None,now,automatic)?;
+            let counts=if available{self.attachment_job_counts(q.group_id_hex.as_deref(),now,permission)?}else{AttachmentJobCounts::default()};
+            let page=self.attachment_jobs_page(&q,50,None,now,permission)?;
             let version=AttachmentManagementVersion{identity,revision,history:page.history_version.clone(),health_fence:hash.finalize().into()};
             Ok(AttachmentManagementFrame{available,automatic_recovery_failed:failure,notices,notices_complete,counts,page,version})
         })
