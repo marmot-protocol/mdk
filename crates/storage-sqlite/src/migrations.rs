@@ -1806,7 +1806,7 @@ mod tests {
             retained.presentation.resolution,
             crate::PresentationResolution::LastKnown
         );
-        assert_eq!(retained.presentation.avatar, value.presentation.avatar);
+        assert!(retained.presentation.avatar == value.presentation.avatar);
         assert!(!storage.bootstrap_avatar_acquisition().unwrap());
         let reference = storage.chat_avatar_reference("aabb").unwrap().unwrap();
         assert_eq!(
