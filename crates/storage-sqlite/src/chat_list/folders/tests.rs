@@ -154,7 +154,7 @@ fn unicode_literal_matching_has_no_sql_like_wildcards_or_locale_dependency() {
                     ..Default::default()
                 }
             ),
-            [a.clone()]
+            std::slice::from_ref(&a)
         );
     }
     assert!(
@@ -397,4 +397,370 @@ fn required_input_checks_and_member_match_use_compact_indexes() {
         details.contains("INDEX") && !details.contains("SCAN member"),
         "{details}"
     );
+}
+
+#[test]
+fn explicit_all_mentions_direct_and_pinned_legacy_flags_have_native_parity() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let a = seed(&store, 1, false, true, "", 1);
+    let b = seed(&store, 2, false, true, "Group", 2);
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE account_groups SET member_count=2 WHERE group_id_hex=?1",
+            [&a],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE chat_list_rows SET unread_mention_count=1 WHERE group_id_hex=?1",
+            [&a],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chat_pin_positions(group_id_hex,ordinal) VALUES(?1,0)",
+            [&a],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        ids(
+            &store,
+            ChatFolderSelectionRule {
+                include_all: true,
+                ..Default::default()
+            }
+        ),
+        [a.clone(), b]
+    );
+    assert_eq!(
+        ids(
+            &store,
+            ChatFolderSelectionRule {
+                unread_mentions_only: true,
+                direct_chats_only: true,
+                pinned_only: true,
+                ..Default::default()
+            }
+        ),
+        [a]
+    );
+    assert!(
+        ids(
+            &store,
+            ChatFolderSelectionRule {
+                groups_only: true,
+                direct_chats_only: true,
+                ..Default::default()
+            }
+        )
+        .is_empty()
+    );
+}
+
+fn condition(field: &str, mode: &str, values: Vec<String>, not: bool) -> serde_json::Value {
+    serde_json::json!({"kind":"condition","field":field,"mode":mode,"values":values,"not":not})
+}
+fn smart_rule(children: Vec<serde_json::Value>, all: bool, not: bool) -> ChatFolderSelectionRule {
+    ChatFolderSelectionRule{smart_filter_json:Some(serde_json::json!({"version":1,"root":{"kind":"group","all":all,"not":not,"children":children}}).to_string()),..Default::default()}
+}
+
+#[test]
+fn smart_all_any_not_manual_overrides_and_archive_cross_scope_are_complete() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let a = seed(&store, 1, false, true, "Project", 1);
+    let b = seed(&store, 2, true, false, "Other", 2);
+    let c = seed(&store, 3, false, false, "Third", 3);
+    let keyword = condition("TITLE", "CONTAINS", vec!["project".into()], false);
+    let archive = condition("ARCHIVED", "PRESENT", vec![], false);
+    assert_eq!(
+        ids(
+            &store,
+            smart_rule(vec![keyword.clone(), archive.clone()], false, false)
+        ),
+        [a.clone(), b.clone()]
+    );
+    assert!(
+        ids(
+            &store,
+            smart_rule(vec![keyword.clone(), archive.clone()], true, false)
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        ids(&store, smart_rule(vec![keyword, archive], false, true)),
+        std::slice::from_ref(&c)
+    );
+    assert!(ids(&store, smart_rule(vec![], true, true)).is_empty());
+    assert_eq!(
+        ids(
+            &store,
+            ChatFolderSelectionRule {
+                manual_include_ids: vec![b.clone()],
+                manual_exclude_ids: vec![a],
+                ..smart_rule(
+                    vec![condition("UNREAD", "PRESENT", vec![], false)],
+                    true,
+                    false
+                )
+            }
+        ),
+        [b]
+    );
+    assert_eq!(
+        ids(
+            &store,
+            smart_rule(
+                vec![condition("UNREAD", "NONE", vec![], false)],
+                true,
+                false
+            )
+        )
+        .len(),
+        2
+    );
+}
+
+#[test]
+fn smart_participant_truth_and_title_parameterization_do_not_expand_input() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let a = seed(&store, 1, false, false, "literal ' OR 1=1 --", 1);
+    let b = seed(&store, 2, false, false, "Other", 2);
+    assert_eq!(
+        ids(
+            &store,
+            smart_rule(
+                vec![condition(
+                    "PARTICIPANTS",
+                    "ANY_OF",
+                    vec!["01".repeat(32)],
+                    false
+                )],
+                true,
+                false
+            )
+        ),
+        std::slice::from_ref(&a)
+    );
+    assert!(
+        ids(
+            &store,
+            smart_rule(
+                vec![condition(
+                    "PARTICIPANTS",
+                    "ALL_OF",
+                    vec!["01".repeat(32), "02".repeat(32)],
+                    false
+                )],
+                true,
+                false
+            )
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        ids(
+            &store,
+            smart_rule(
+                vec![condition(
+                    "PARTICIPANTS",
+                    "EXCLUDES",
+                    vec!["01".repeat(32)],
+                    false
+                )],
+                true,
+                false
+            )
+        ),
+        [b]
+    );
+    assert_eq!(
+        ids(
+            &store,
+            smart_rule(
+                vec![condition(
+                    "TITLE",
+                    "CONTAINS",
+                    vec!["' OR 1=1 --".into()],
+                    false
+                )],
+                true,
+                false
+            )
+        ),
+        std::slice::from_ref(&a)
+    );
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "DELETE FROM chat_folder_rosters WHERE group_id_hex=?1",
+            [&a],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.chat_folder_selection_snapshot(smart_rule(
+            vec![condition(
+                "PARTICIPANTS",
+                "EXCLUDES",
+                vec!["01".repeat(32)],
+                false
+            )],
+            true,
+            false
+        )),
+        Err(ChatListSelectionError::ProjectionNotReady)
+    ));
+}
+
+#[test]
+fn smart_draft_and_complete_pending_send_use_current_sources_not_latest_preview() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let a = seed(&store, 1, false, false, "A", 1);
+    let b = seed(&store, 2, false, false, "B", 2);
+    store
+        .save_message_draft(&a, "\u{00a0} \n", None, &[])
+        .unwrap();
+    assert!(
+        ids(
+            &store,
+            smart_rule(
+                vec![condition("DRAFT", "PRESENT", vec![], false)],
+                true,
+                false
+            )
+        )
+        .is_empty()
+    );
+    store.save_message_draft(&a, "draft", None, &[]).unwrap();
+    assert_eq!(
+        ids(
+            &store,
+            smart_rule(
+                vec![condition("DRAFT", "PRESENT", vec![], false)],
+                true,
+                false
+            )
+        ),
+        [a]
+    );
+    store
+        .insert_local_submission(&crate::LocalSubmission {
+            group_id_hex: b.clone(),
+            client_token: "fixture".into(),
+            message_id_hex: "aa".repeat(32),
+            request_hash: vec![0; 32],
+            payload_hash: vec![0; 32],
+            payload: None,
+            request_json: None,
+            state: 0,
+            outcome_json: None,
+        })
+        .unwrap();
+    let pending = smart_rule(
+        vec![condition("PENDING_SEND", "PRESENT", vec![], false)],
+        true,
+        false,
+    );
+    assert_eq!(ids(&store, pending.clone()), std::slice::from_ref(&b));
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE local_message_submissions SET state=1 WHERE group_id_hex=?1",
+            [&b],
+        )
+        .unwrap();
+    assert!(ids(&store, pending.clone()).is_empty());
+    // An older local send still counts even when the latest preview is received.
+    store.lock().unwrap().execute(
+        "INSERT INTO message_timeline(group_id_hex,message_id_hex,direction,sender,plaintext,kind,tags_json,timeline_at,received_at,reactions_json)
+            VALUES(?1,?2,'sent','self','older',9,'[]',1,1,'[]')",
+        params![b, "ab".repeat(32)],
+    ).unwrap();
+    assert_eq!(ids(&store, pending.clone()), std::slice::from_ref(&b));
+    let plan: Vec<String> = store.lock().unwrap().prepare(
+        "EXPLAIN QUERY PLAN SELECT 1 FROM message_timeline pending INDEXED BY idx_chat_folder_pending_send WHERE group_id_hex=?1 AND direction='sent' AND source_message_id_hex IS NULL AND invalidation_status IS NULL AND deleted=0",
+    ).unwrap().query_map([&b], |row| row.get(3)).unwrap().collect::<Result<_,_>>().unwrap();
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("SEARCH pending USING INDEX idx_chat_folder_pending_send")),
+        "{plan:?}"
+    );
+    for change in [
+        "deleted=1",
+        "deleted=0,invalidation_status='failed'",
+        "invalidation_status=NULL,source_message_id_hex='confirmed'",
+    ] {
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                &format!("UPDATE message_timeline SET {change} WHERE group_id_hex=?1"),
+                [&b],
+            )
+            .unwrap();
+        assert!(ids(&store, pending.clone()).is_empty());
+    }
+}
+
+#[test]
+fn smart_invalid_subtrees_versions_depth_nodes_and_values_fail_whole_rule() {
+    for rule in [
+        smart_rule(
+            vec![condition("TITLE", "CONTAINS", vec!["x".repeat(257)], false)],
+            true,
+            false,
+        ),
+        smart_rule(
+            vec![condition(
+                "PARTICIPANTS",
+                "ANY_OF",
+                vec!["AB".repeat(32)],
+                false,
+            )],
+            true,
+            false,
+        ),
+        smart_rule(
+            vec![condition(
+                "UNREAD",
+                "PRESENT",
+                vec!["unexpected".into()],
+                false,
+            )],
+            true,
+            false,
+        ),
+        smart_rule(
+            vec![condition("UNREAD", "PRESENT", vec![], false); 64],
+            true,
+            false,
+        ),
+        smart_rule(
+            vec![serde_json::json!({"kind":"group","all":true,"not":true,"children":[]})],
+            true,
+            false,
+        ),
+        ChatFolderSelectionRule {
+            smart_filter_json: Some("{\"version\":2,\"root\":{}}".into()),
+            ..Default::default()
+        },
+        ChatFolderSelectionRule {
+            smart_filter_json: Some(" ".repeat(65537)),
+            ..Default::default()
+        },
+    ] {
+        assert!(matches!(
+            rule.validate(),
+            Err(ChatListSelectionError::InvalidFilter)
+        ));
+    }
+    let mut root = condition("UNREAD", "PRESENT", vec![], false);
+    for _ in 0..6 {
+        root = serde_json::json!({"kind":"group","all":true,"not":false,"children":[root]});
+    }
+    assert!(matches!(
+        smart_rule(vec![root], true, false).validate(),
+        Err(ChatListSelectionError::InvalidFilter)
+    ));
 }

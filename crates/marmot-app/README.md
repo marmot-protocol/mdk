@@ -36,8 +36,9 @@ so CLI, TUI, and native surfaces never open the databases directly.
 from display windows. Its account-local handle provides revision-fenced counts,
 bounded ID pages, deselection, remove-only revalidation and terminal close.
 Reset/shutdown invalidates pending results. `capture_chat_folder_selection`
-adds complete version-1 existing-folder matching over native roster/title inputs;
-unprepared required sources return not-ready. Composable live folder windows and
+adds complete version-1 flat and bounded smart-folder matching over native
+roster/title, draft and current outbox inputs; unprepared required sources return
+not-ready. Time-dependent predicates, filtered live folder windows and
 bulk-command authorization remain separate; see the
 [shared selection contract](../marmot-uniffi/CHAT-LIST-ROWS.md#complete-fixed-view-selection).
 

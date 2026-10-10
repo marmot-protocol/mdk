@@ -85,14 +85,16 @@ async fn folder_capture_uses_full_native_scope_and_freezes_the_rule() {
         .unwrap();
     assert_eq!(handle.count().await.unwrap().count, 501);
     assert_eq!(handle.page(0, 400, 200).await.unwrap().group_ids.len(), 101);
+    // Exercise the public authoritative source path, not private projection SQL.
+    let mut projection = f.store.load_account_projection_state("alice", 100).unwrap();
+    projection.groups[1].profile_name = "Other".into();
     f.store
-        .lock()
-        .unwrap()
-        .execute(
-            "UPDATE chat_list_rows SET folder_title_fold='other' WHERE group_id_hex='0001'",
-            [],
-        )
+        .save_account_projection_state(&projection, 100, 120)
         .unwrap();
+    for _ in 0..24 {
+        crate::chat_presentation::maintenance::prepare_batch(&f.store, &shared, &f.account_id)
+            .unwrap();
+    }
     assert_eq!(handle.count().await.unwrap().count, 501);
     let checked = handle.revalidate(0).await.unwrap();
     assert_eq!(checked.count, 500);

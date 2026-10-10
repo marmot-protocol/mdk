@@ -8,9 +8,14 @@ pub struct ChatFolderSelectionRuleFfi {
     pub include_member_ids: Vec<String>,
     pub keyword: Option<String>,
     pub unread_only: bool,
+    pub unread_mentions_only: bool,
     pub groups_only: bool,
+    pub direct_chats_only: bool,
+    pub pinned_only: bool,
+    pub include_all: bool,
     pub archived_only: bool,
     pub include_muted: bool,
+    pub smart_filter_json: Option<String>,
     pub manual_include_ids: Vec<String>,
     pub manual_exclude_ids: Vec<String>,
 }
@@ -29,9 +34,14 @@ impl From<ChatFolderSelectionRuleFfi> for app::ChatFolderSelectionRule {
             include_member_ids: v.include_member_ids,
             keyword: v.keyword,
             unread_only: v.unread_only,
+            unread_mentions_only: v.unread_mentions_only,
             groups_only: v.groups_only,
+            direct_chats_only: v.direct_chats_only,
+            pinned_only: v.pinned_only,
+            include_all: v.include_all,
             archived_only: v.archived_only,
             include_muted: v.include_muted,
+            smart_filter_json: v.smart_filter_json,
             manual_include_ids: v.manual_include_ids,
             manual_exclude_ids: v.manual_exclude_ids,
         }
@@ -48,9 +58,17 @@ mod folder_rule_tests {
             include_member_ids: vec!["AB".repeat(32)],
             keyword: Some(" 中文 ".into()),
             unread_only: true,
+            unread_mentions_only: true,
             groups_only: true,
+            direct_chats_only: true,
+            pinned_only: true,
+            include_all: true,
             archived_only: true,
             include_muted: true,
+            smart_filter_json: Some(
+                r#"{"version":1,"root":{"kind":"group","all":true,"not":false,"children":[]}}"#
+                    .into(),
+            ),
             manual_include_ids: vec!["aa".into()],
             manual_exclude_ids: vec!["bb".into()],
         };
@@ -61,11 +79,19 @@ mod folder_rule_tests {
                 && native.groups_only
                 && native.archived_only
                 && native.include_muted
+                && native.unread_mentions_only
+                && native.direct_chats_only
+                && native.pinned_only
+                && native.include_all
         );
         assert_eq!(native.keyword.as_deref(), Some(" 中文 "));
         assert_eq!(native.include_member_ids, ["AB".repeat(32)]);
         assert_eq!(native.manual_include_ids, ["aa"]);
         assert_eq!(native.manual_exclude_ids, ["bb"]);
+        assert_eq!(
+            native.smart_filter_json.as_deref(),
+            Some(r#"{"version":1,"root":{"kind":"group","all":true,"not":false,"children":[]}}"#)
+        );
     }
 }
 

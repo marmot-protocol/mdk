@@ -18,16 +18,21 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             PRIMARY KEY(group_id,member_id_hex)
         ) WITHOUT ROWID;
         CREATE INDEX chat_folder_member_groups ON chat_folder_members(member_id_hex,group_id);
+        CREATE INDEX idx_chat_folder_pending_submission ON local_message_submissions(group_id_hex) WHERE state=0;
+        CREATE INDEX idx_chat_folder_pending_send ON message_timeline(group_id_hex)
+            WHERE direction='sent' AND source_message_id_hex IS NULL AND invalidation_status IS NULL AND deleted=0;
         CREATE TABLE chat_folder_roster_work (
             group_id BLOB PRIMARY KEY REFERENCES cgka_groups(id) ON DELETE CASCADE
         ) WITHOUT ROWID;
         INSERT INTO chat_folder_roster_work SELECT id FROM cgka_groups;
         CREATE TRIGGER chat_folder_group_inserted AFTER INSERT ON cgka_groups BEGIN
-            INSERT OR IGNORE INTO chat_folder_roster_work VALUES(NEW.id);
+            INSERT INTO chat_folder_roster_work SELECT NEW.id
+                WHERE NOT EXISTS(SELECT 1 FROM chat_folder_roster_work WHERE group_id=NEW.id);
         END;
         CREATE TRIGGER chat_folder_group_updated AFTER UPDATE OF id,record ON cgka_groups
         WHEN OLD.id IS NOT NEW.id OR OLD.record IS NOT NEW.record BEGIN
-            INSERT OR IGNORE INTO chat_folder_roster_work VALUES(NEW.id);
+            INSERT INTO chat_folder_roster_work SELECT NEW.id
+                WHERE NOT EXISTS(SELECT 1 FROM chat_folder_roster_work WHERE group_id=NEW.id);
         END;
         ALTER TABLE chat_list_rows ADD COLUMN folder_title_fold TEXT;
         ALTER TABLE chat_list_rows ADD COLUMN folder_description_fold TEXT;
@@ -52,6 +57,8 @@ mod tests {
         conn.execute_batch("PRAGMA foreign_keys=ON;
             CREATE TABLE cgka_groups(id BLOB PRIMARY KEY,record BLOB);
             CREATE TABLE account_groups(group_id_hex TEXT PRIMARY KEY,profile_description TEXT);
+            CREATE TABLE local_message_submissions(group_id_hex TEXT,state INTEGER);
+            CREATE TABLE message_timeline(group_id_hex TEXT,direction TEXT,source_message_id_hex TEXT,invalidation_status TEXT,deleted INTEGER);
             CREATE TABLE chat_list_rows(group_id_hex TEXT PRIMARY KEY,presentation_json BLOB,presentation_source_revision INTEGER);
             INSERT INTO cgka_groups VALUES(x'01',x'00');
             INSERT INTO account_groups VALUES('01','old');
@@ -84,6 +91,9 @@ mod tests {
             "INSERT INTO chat_folder_rosters VALUES(x'01','01',1,0,zeroblob(32));
             DELETE FROM chat_folder_roster_work;
             UPDATE cgka_groups SET record=x'01';
+            -- The outer statement's conflict policy can override trigger OR IGNORE.
+            INSERT INTO cgka_groups VALUES(x'01',x'02') ON CONFLICT(id) DO UPDATE SET record=excluded.record;
+            INSERT OR REPLACE INTO cgka_groups VALUES(x'01',x'03');
             UPDATE account_groups SET profile_description='new';",
         )
         .unwrap();

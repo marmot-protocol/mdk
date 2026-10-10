@@ -5377,9 +5377,14 @@ typedef struct MarmotChatFolderSelectionRule {
   uintptr_t include_member_ids_len;
   const char *keyword;
   uint8_t unread_only;
+  uint8_t unread_mentions_only;
   uint8_t groups_only;
+  uint8_t direct_chats_only;
+  uint8_t pinned_only;
+  uint8_t include_all;
   uint8_t archived_only;
   uint8_t include_muted;
+  const char *smart_filter_json;
   const char *const *manual_include_ids;
   uintptr_t manual_include_ids_len;
   const char *const *manual_exclude_ids;

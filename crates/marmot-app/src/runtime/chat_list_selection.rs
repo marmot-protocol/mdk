@@ -190,11 +190,12 @@ impl MarmotAppRuntime {
                 return Err(ChatSelectionError::Closed);
             }
             let store = app.account_storage(&label)?;
-            let text_source = if rule.as_ref().is_some_and(|rule| {
-                rule.keyword
-                    .as_deref()
-                    .is_some_and(|text| !text.trim().is_empty())
-            }) {
+            let text_source = if rule
+                .as_ref()
+                .map(ChatFolderSelectionRule::requires_text)
+                .transpose()?
+                .unwrap_or(false)
+            {
                 Some(app.shared_storage()?)
             } else {
                 None
@@ -223,15 +224,14 @@ impl MarmotAppRuntime {
             .inspect_err(|_| {
                 app.presentation_signals.wake();
             })?;
-            if let (Some(shared), Some(head)) = (&text_source, &text_head) {
-                if shared
+            if let (Some(shared), Some(head)) = (&text_source, &text_head)
+                && shared
                     .directory_presentation_version()
                     .map_err(AppError::from)?
                     != *head
-                {
-                    app.presentation_signals.wake();
-                    return Err(storage_sqlite::ChatListSelectionError::ProjectionNotReady.into());
-                }
+            {
+                app.presentation_signals.wake();
+                return Err(storage_sqlite::ChatListSelectionError::ProjectionNotReady.into());
             }
             Ok::<_, ChatSelectionError>((store, snapshot, text_source))
         });
@@ -346,14 +346,13 @@ fn apply(
                 .map(|shared| folder_text_head(store, shared))
                 .transpose()?;
             let next = store.revalidate_chat_list_selection(&state.snapshot)?;
-            if let (Some(shared), Some(head)) = (&state.text_source, &text_head) {
-                if shared
+            if let (Some(shared), Some(head)) = (&state.text_source, &text_head)
+                && shared
                     .directory_presentation_version()
                     .map_err(AppError::from)?
                     != *head
-                {
-                    return Err(storage_sqlite::ChatListSelectionError::ProjectionNotReady.into());
-                }
+            {
+                return Err(storage_sqlite::ChatListSelectionError::ProjectionNotReady.into());
             }
             // Every action-validation result supersedes previously paged action intent,
             // even when the count stayed the same. No old page can be spliced into it.

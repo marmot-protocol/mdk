@@ -311,6 +311,9 @@ Null output pointers are rejected before capture or local intent mutation.
 See the [shared selection contract](../marmot-uniffi/CHAT-LIST-ROWS.md#complete-fixed-view-selection)
 for revisions, cancellation and account lifecycle. `marmot_capture_chat_folder_selection`
 accepts a borrowed version-1 rule, copying strings and arrays before returning.
+Its nullable `smart_filter_json` accepts the bounded private smart-rule envelope;
+NULL uses flat criteria. Rebuild this new record with matching generated headers
+and native libraries; never mix its previous draft layout with the updated ABI.
 Byte-valued input booleans accept nonzero as true. Array lengths and version are
 checked before pointer traversal; invalid rules return status99. Free the returned
 handle using the existing selection free function, never free borrowed inputs.

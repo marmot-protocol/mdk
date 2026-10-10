@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Export `capture_chat_folder_selection` and the version-1 bounded folder rule to Kotlin/Swift. Invalid filters return a typed selection error.
+- Export `capture_chat_folder_selection` and the version-1 flat/smart folder rule to Kotlin/Swift. Invalid filters return a typed selection error. Regenerate bindings with the matching native library.
 
 ### Breaking changes
 

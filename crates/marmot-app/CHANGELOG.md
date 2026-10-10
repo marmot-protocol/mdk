@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Add complete existing-folder selection with native roster/text matching, bounded rule validation and remove-only revalidation. This does not yet add composable filtered live windows.
+- Add complete flat and bounded smart-folder selection with native roster/text, draft and outbox matching, strict rule validation and remove-only revalidation. Relative-time predicates and filtered live windows remain separate.
 
 ### Breaking changes
 

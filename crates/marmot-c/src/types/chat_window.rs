@@ -14,9 +14,14 @@ pub struct MarmotChatFolderSelectionRule {
     pub include_member_ids_len: usize,
     pub keyword: *const c_char,
     pub unread_only: u8,
+    pub unread_mentions_only: u8,
     pub groups_only: u8,
+    pub direct_chats_only: u8,
+    pub pinned_only: u8,
+    pub include_all: u8,
     pub archived_only: u8,
     pub include_muted: u8,
+    pub smart_filter_json: *const c_char,
     pub manual_include_ids: *const *const c_char,
     pub manual_include_ids_len: usize,
     pub manual_exclude_ids: *const *const c_char,
@@ -42,9 +47,14 @@ impl MarmotChatFolderSelectionRule {
             }?,
             keyword: unsafe { crate::memory::optional_str(self.keyword) }?,
             unread_only: self.unread_only != 0,
+            unread_mentions_only: self.unread_mentions_only != 0,
             groups_only: self.groups_only != 0,
+            direct_chats_only: self.direct_chats_only != 0,
+            pinned_only: self.pinned_only != 0,
+            include_all: self.include_all != 0,
             archived_only: self.archived_only != 0,
             include_muted: self.include_muted != 0,
+            smart_filter_json: unsafe { crate::memory::optional_str(self.smart_filter_json) }?,
             manual_include_ids: unsafe {
                 crate::memory::str_array(self.manual_include_ids, self.manual_include_ids_len)
             }?,
@@ -69,9 +79,14 @@ mod folder_input_tests {
             include_member_ids_len: 0,
             keyword: std::ptr::null(),
             unread_only: 0,
+            unread_mentions_only: 0,
             groups_only: 0,
+            direct_chats_only: 0,
+            pinned_only: 0,
+            include_all: 0,
             archived_only: 0,
             include_muted: 0,
+            smart_filter_json: std::ptr::null(),
             manual_include_ids: std::ptr::null(),
             manual_include_ids_len: 0,
             manual_exclude_ids: std::ptr::null(),
@@ -98,8 +113,34 @@ mod folder_input_tests {
     fn borrowed_arrays_and_byte_booleans_follow_c_input_contract() {
         let mut input = rule();
         input.include_muted = 255;
+        input.unread_mentions_only = 255;
+        input.direct_chats_only = 255;
+        input.pinned_only = 255;
+        input.include_all = 255;
+        let smart = std::ffi::CString::new(
+            r#"{"version":1,"root":{"kind":"group","all":true,"not":false,"children":[]}}"#,
+        )
+        .unwrap();
+        input.smart_filter_json = smart.as_ptr();
         let value = unsafe { input.to_ffi() }.unwrap();
-        assert!(value.include_muted);
+        assert!(
+            value.include_muted
+                && value.unread_mentions_only
+                && value.direct_chats_only
+                && value.pinned_only
+                && value.include_all
+        );
+        assert_eq!(value.smart_filter_json.as_deref(), smart.to_str().ok());
+        let invalid = std::ffi::CString::new(
+            r#"{"version":2,"root":{"kind":"group","all":true,"not":false,"children":[]}}"#,
+        )
+        .unwrap();
+        input.smart_filter_json = invalid.as_ptr();
+        assert!(matches!(
+            unsafe { input.to_ffi() },
+            Err(crate::MarmotStatus::ChatSelectionInvalidFilter)
+        ));
+        input.smart_filter_json = std::ptr::null();
         input.manual_include_ids_len = 1;
         assert!(matches!(
             unsafe { input.to_ffi() },
