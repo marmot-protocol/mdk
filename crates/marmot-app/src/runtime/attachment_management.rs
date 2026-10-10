@@ -224,12 +224,17 @@ impl MarmotAppRuntime {
             .presentation_signals
             .account_resets
             .subscribe();
+        let app = self.accounts.app.clone();
+        let reference = account.to_owned();
+        let account =
+            super::blocking_app_task(move || Ok(app.account_home().account(&reference)?.label))
+                .await?;
         let snapshot = self
-            .attachment_management_snapshot(account, query.clone())
+            .attachment_management_snapshot(&account, query.clone())
             .await?;
         Ok(Arc::new(RuntimeAttachmentManagementSubscription {
             runtime: self.clone(),
-            account: account.into(),
+            account,
             query,
             closed: watch::channel(false).0,
             state: Mutex::new(ManagementSubscriptionState {
@@ -240,6 +245,7 @@ impl MarmotAppRuntime {
                 version: snapshot.version,
                 expiry: snapshot.page.next_expiry,
                 initial: true,
+                dirty: true,
                 last: tokio::time::Instant::now(),
             }),
         }))
@@ -253,6 +259,7 @@ struct ManagementSubscriptionState {
     version: AttachmentManagementVersion,
     expiry: Option<u64>,
     initial: bool,
+    dirty: bool,
     last: tokio::time::Instant,
 }
 pub struct RuntimeAttachmentManagementSubscription {
@@ -274,7 +281,7 @@ impl RuntimeAttachmentManagementSubscription {
             if *closed.borrow() || self.runtime.shared.lifecycle().ensure_running().is_err() {
                 return Ok(None);
             }
-            if !st.initial {
+            if !st.initial && !st.dirty {
                 let deadline = st.expiry;
                 let expiry = async move {
                     if let Some(t) = deadline {
@@ -293,7 +300,33 @@ impl RuntimeAttachmentManagementSubscription {
                     resets,
                     ..
                 } = &mut *st;
-                tokio::select! {biased;_=closed.changed()=>return Ok(None),_=wait_for_runtime_shutdown(&mut stop)=>return Ok(None),_=resets.recv()=>{self.close();return Ok(None)},_=updates.changed()=>{},_=events.recv()=>{},_=presentation.recv()=>{},_=expiry=>{}}
+                tokio::select! {
+                    biased;
+                    _=closed.changed()=>return Ok(None),
+                    _=wait_for_runtime_shutdown(&mut stop)=>return Ok(None),
+                    reset=resets.recv()=>match reset {
+                        Ok(label) if label==self.account=>{self.close();return Ok(None)},
+                        Ok(_)=>continue,
+                        Err(broadcast::error::RecvError::Lagged(_))=>{},
+                        Err(broadcast::error::RecvError::Closed)=>{self.close();return Ok(None)},
+                    },
+                    _=updates.changed()=>{},
+                    event=events.recv()=>match event {
+                        Ok(event) if event_account_label(&event)!=self.account=>continue,
+                        Ok(_)|Err(broadcast::error::RecvError::Lagged(_))=>{},
+                        Err(broadcast::error::RecvError::Closed)=>{self.close();return Ok(None)},
+                    },
+                    event=presentation.recv()=>match event {
+                        Ok(event) if event.account_label!=self.account=>continue,
+                        Ok(_)|Err(broadcast::error::RecvError::Lagged(_))=>{},
+                        Err(broadcast::error::RecvError::Closed)=>{self.close();return Ok(None)},
+                    },
+                    _=expiry=>{},
+                }
+                // This state survives a dropped future during coalescing or the asynchronous read.
+                st.dirty = true;
+            }
+            if !st.initial {
                 tokio::select! {biased;_=closed.changed()=>return Ok(None),_=wait_for_runtime_shutdown(&mut stop)=>return Ok(None),_=tokio::time::sleep_until(st.last+Duration::from_millis(250))=>{}}
             }
             let result = self
@@ -316,6 +349,7 @@ impl RuntimeAttachmentManagementSubscription {
             }
             let changed = st.initial || !snap.version.same_as(&st.version);
             st.initial = false;
+            st.dirty = false;
             st.last = tokio::time::Instant::now();
             st.expiry = snap.page.next_expiry;
             st.version = snap.version.clone();
@@ -325,5 +359,22 @@ impl RuntimeAttachmentManagementSubscription {
         }
     }
 }
+fn event_account_label(event: &super::MarmotAppEvent) -> &str {
+    use super::MarmotAppEvent as E;
+    match event {
+        E::GroupJoined { account_label, .. }
+        | E::GroupStateUpdated { account_label, .. }
+        | E::WelcomeDeliveryPending { account_label, .. }
+        | E::EpochStallEscalated { account_label, .. }
+        | E::GroupChangeSuperseded { account_label, .. }
+        | E::HistoryNoticesChanged { account_label, .. } => account_label,
+        E::MessageReceived(v) => &v.account_label,
+        E::AgentStreamStarted(v) => &v.account_label,
+        E::ProjectionUpdated(v) => &v.account_label,
+        E::GroupEvent(v) => &v.account_label,
+        E::AccountError(v) => &v.account_label,
+    }
+}
+
 #[cfg(test)]
 mod tests;

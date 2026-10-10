@@ -1711,6 +1711,8 @@ async fn attachment_controls_interrupt_http_and_release_capacity_without_publish
         let dir = tempfile::tempdir().unwrap();
         let (mut client, store) = client_at(dir.path(), &reference, true).await;
         let shared = RuntimeSharedServices::default();
+        let mut runtime = client.app.runtime();
+        runtime.shared = shared.clone();
         let (http, mut completions) = context();
         let mut admission = Admission::default();
         schedule(&client, &shared, &http, &mut admission).unwrap();
@@ -1743,18 +1745,22 @@ async fn attachment_controls_interrupt_http_and_release_capacity_without_publish
                 .set_attachment_download_policy(&policy, crate::unix_now_seconds())
                 .unwrap();
         } else if mode == 2 {
-            let cursor = store
-                .begin_attachment_cancellation(Some(GROUP), false)
+            let cursor = runtime
+                .begin_attachment_cancellation("alice", Some(GROUP.into()), false)
+                .await
                 .unwrap();
-            let batch = store
-                .cancel_attachment_batch(&cursor, crate::unix_now_seconds())
+            let batch = runtime
+                .cancel_attachment_batch("alice", cursor)
+                .await
                 .unwrap();
             assert_eq!(batch.requested, 1);
             assert!(batch.next_cursor.is_none());
         } else {
             store.cancel_attachment_acquisition(&asset).unwrap();
         }
-        shared.attachment_cancellations.send_modify(|_| {});
+        if mode != 2 {
+            shared.attachment_cancellations.send_modify(|_| {});
+        }
         let done = tokio::time::timeout(Duration::from_secs(3), completions.recv())
             .await
             .unwrap()
@@ -1786,6 +1792,7 @@ async fn attachment_controls_interrupt_http_and_release_capacity_without_publish
                 storage_sqlite::AttachmentTransferState::Cancelled
             }
         );
+        runtime.shutdown_and_close().await.unwrap();
         server.abort();
         let _ = server.await;
     }

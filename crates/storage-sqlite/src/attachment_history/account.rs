@@ -188,7 +188,13 @@ impl SqliteAccountStorage {
     pub fn account_attachment_history_version(
         &self,
     ) -> Result<AccountAttachmentVersion, AccountAttachmentHistoryError> {
-        let now = clock()?;
+        self.account_attachment_history_version_at(clock()?)
+    }
+    /// Same-clock snapshot composition for bounded acquisition projections and retention tests.
+    pub(crate) fn account_attachment_history_version_at(
+        &self,
+        now: u64,
+    ) -> Result<AccountAttachmentVersion, AccountAttachmentHistoryError> {
         self.connection
             .with_deferred_read(|conn| version(conn, now))
     }

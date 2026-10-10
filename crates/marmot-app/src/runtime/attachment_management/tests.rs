@@ -132,6 +132,21 @@ async fn group_health_projection_keeps_accounts_actions_feed_and_diagnostics_sco
         .await
         .unwrap();
     assert!(sub.next().await.unwrap().is_some());
+    rt.accounts
+        .app
+        .presentation_signals
+        .account_resets
+        .send("bob".into())
+        .unwrap();
+    rt.events
+        .send(super::super::MarmotAppEvent::HistoryNoticesChanged {
+            account_id_hex: "00".repeat(32),
+            account_label: "bob".into(),
+        })
+        .unwrap();
+    // Force a cancellable coalescing window without changing production timing.
+    sub.state.lock().await.last = tokio::time::Instant::now() + Duration::from_secs(1);
+
     assert!(
         rt.control_managed_attachment("alice", action.clone(), true)
             .await
@@ -142,6 +157,16 @@ async fn group_health_projection_keeps_accounts_actions_feed_and_diagnostics_sco
             .await
             .unwrap()
     );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), sub.next())
+            .await
+            .is_err()
+    );
+    assert!(
+        sub.state.lock().await.dirty,
+        "a dropped next call must retain its invalidation"
+    );
+    sub.state.lock().await.last = tokio::time::Instant::now() - Duration::from_secs(1);
     let next = tokio::time::timeout(Duration::from_secs(3), sub.next())
         .await
         .unwrap()

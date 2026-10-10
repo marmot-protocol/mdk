@@ -195,11 +195,12 @@ private_formatter!(
     AttachmentCancellationCursor
 );
 
-fn history(s: &SqliteAccountStorage) -> StorageResult<AccountAttachmentVersion> {
-    s.account_attachment_history_version().map_err(|e| match e {
-        crate::AccountAttachmentHistoryError::Storage(e) => e,
-        _ => invalid("attachment management history unavailable"),
-    })
+fn history(s: &SqliteAccountStorage, now: u64) -> StorageResult<AccountAttachmentVersion> {
+    s.account_attachment_history_version_at(now)
+        .map_err(|e| match e {
+            crate::AccountAttachmentHistoryError::Storage(e) => e,
+            _ => invalid("attachment management history unavailable"),
+        })
 }
 fn current_sequence(conn: &Connection) -> StorageResult<i64> {
     conn.query_row(
@@ -276,7 +277,7 @@ impl SqliteAccountStorage {
         }
         let query = query.canonical()?;
         self.connection.with_read_snapshot(|| {
-            let h = history(self)?;
+            let h = history(self, now)?;
             let conn = self.lock()?;
             let identity = epoch(&conn)?;
             let (cutoff, before) = if let Some(c) = cursor {
@@ -439,7 +440,7 @@ impl SqliteAccountStorage {
         now: u64,
     ) -> StorageResult<bool> {
         self.connection.with_transaction(|| {
-            if history(self)?.requires_restart_since(&token.history){return Ok(false);}
+            if history(self,now)?.requires_restart_since(&token.history){return Ok(false);}
             let conn=self.lock()?;
             if !matches_store(&conn,&token.reference)?{return Ok(false);}
             let current:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM attachment_acquisition q WHERE token=?1 AND management_sequence=?2 AND {SOURCE_MATCH} AND {ACCEPTED} AND (expires_at IS NULL OR expires_at>?3))"),params![token.reference.token,token.sequence,u64_to_i64(now)?],|r|r.get(0)).storage()?;drop(conn);

@@ -365,3 +365,25 @@ fn action_tokens_require_refresh_after_visibility_is_reallowed() {
             .unwrap()
     );
 }
+
+#[test]
+fn management_expiry_replaces_the_frame_once_without_database_writes() {
+    let s = SqliteAccountStorage::in_memory().unwrap();
+    seed(&s, "one");
+    request(&s, "one");
+    sql(
+        &s,
+        "UPDATE app_events SET retention_expires_at=13 WHERE message_id_hex='one';",
+    );
+    let q = AttachmentJobQuery::default();
+    let before = s.attachment_management_frame(&q, 12, true).unwrap();
+    assert_eq!(before.page.next_expiry, Some(13));
+    assert_eq!(before.page.entries.len(), 1);
+    let after = s.attachment_management_frame(&q, 13, true).unwrap();
+    assert!(after.page.entries.is_empty());
+    assert_eq!(after.page.next_expiry, None);
+    assert!(!after.version.same_as(&before.version));
+    let later = s.attachment_management_frame(&q, 14, true).unwrap();
+    assert!(later.version.same_as(&after.version));
+    assert_eq!(later.page.next_expiry, None);
+}

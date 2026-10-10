@@ -37,6 +37,8 @@ prefix = ""
 include = [
     "MarmotAttachmentAcquisitionMode",
     "MarmotAttachmentControl",
+    "MarmotAttachmentJobView",
+    "MarmotAttachmentJobOrigin",
     "MarmotAttachmentHistoryChange",
     "MarmotChatListPageDirection",
     "MarmotConversationOpenMode",
