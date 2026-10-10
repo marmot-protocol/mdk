@@ -87,6 +87,15 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
         echoed_idempotency_key: req.idempotency_key ?? null,
       });
       break;
+    case "edit_message":
+      if (req.text === "__wrong_type") {
+        send(socket, id, { type: "app_event_sent", message_ids_hex: [HEX32("ed")] });
+      } else if (req.text === "__rejected") {
+        send(socket, id, { type: "error", code: "invalid_edit_target", retryable: false, message: "invalid target" });
+      } else {
+        send(socket, id, { type: "final_sent", message_ids_hex: [HEX32("ed")], echoed_target: req.target_message_id_hex, echoed_text: req.text });
+      }
+      break;
     case "delete_message":
       send(socket, id, {
         type: "final_sent",
@@ -301,6 +310,15 @@ describe("MarmotAgentControlClient", () => {
   it("returns durable message ids from send_final", async () => {
     const res = await client.sendFinal(HEX32("aa"), HEX32("cc"), "done");
     expect(res.message_ids_hex).toEqual([HEX32("ab")]);
+  });
+
+  it("edits an exact target and rejects wrong response types and typed target errors", async () => {
+    const result = await client.editMessage(HEX32("aa"), HEX32("cc"), HEX32("dd"), "updated") as unknown as {
+      type: string; message_ids_hex: string[]; echoed_target: string; echoed_text: string;
+    };
+    expect(result).toMatchObject({ type: "final_sent", message_ids_hex: [HEX32("ed")], echoed_target: HEX32("dd"), echoed_text: "updated" });
+    await expect(client.editMessage(HEX32("aa"), HEX32("cc"), HEX32("dd"), "__wrong_type")).rejects.toThrow("unexpected response");
+    await expect(client.editMessage(HEX32("aa"), HEX32("cc"), HEX32("dd"), "__rejected")).rejects.toMatchObject({ code: "invalid_edit_target", retryable: false });
   });
 
   it("forwards an idempotency_key on send_final when supplied, and omits it otherwise", async () => {

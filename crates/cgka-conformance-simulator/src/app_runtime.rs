@@ -2797,7 +2797,8 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::OnboardingRequired
         | AppError::AccountSetupResetNotApplicable
         | AppError::AccountSetupKeyPackageRecoveryAvailable
-        | AppError::ReactionNotFound => SubjectFailureCategory::ExpectedRefusal,
+        | AppError::ReactionNotFound
+        | AppError::InvalidEditTarget => SubjectFailureCategory::ExpectedRefusal,
         AppError::Account(_)
         | AppError::AccountHome(_)
         | AppError::Session(_)

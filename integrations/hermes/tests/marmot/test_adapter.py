@@ -328,6 +328,29 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         # Optional on the wire: the key is omitted when not supplied.
         self.assertNotIn("idempotency_key", requests[0])
 
+    async def test_edit_message_writes_exact_fields_and_checks_response_type(self):
+        requests = []
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            await write_json_line(writer, {
+                "marmot_agent_control": "marmot.agent-control.v2", "id": request["id"],
+                "type": "final_sent" if request["text"] == "updated" else "app_event_sent",
+                "message_ids_hex": ["aa" * 32],
+            })
+            writer.close()
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+        response = await client.edit_message("11" * 32, "22" * 16, "33" * 32, "updated")
+        self.assertEqual(response["type"], "final_sent")
+        self.assertEqual({key: requests[0][key] for key in (
+            "type", "account_id_hex", "group_id_hex", "target_message_id_hex", "text")}, {
+            "type": "edit_message", "account_id_hex": "11" * 32, "group_id_hex": "22" * 16,
+            "target_message_id_hex": "33" * 32, "text": "updated",
+        })
+        with self.assertRaises(self.adapter.AgentControlError):
+            await client.edit_message("11" * 32, "22" * 16, "33" * 32, "wrong-response")
+
     async def test_send_final_includes_idempotency_key_only_when_supplied(self):
         requests = []
 

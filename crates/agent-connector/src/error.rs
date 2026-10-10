@@ -65,6 +65,7 @@ impl ConnectorError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::AccountHome(_) => "account_home_error",
+            Self::App(AppError::InvalidEditTarget) => "invalid_edit_target",
             Self::App(AppError::ReactionNotFound) => "reaction_not_found",
             Self::App(AppError::MediaUploadTimedOut) => "media_upload_timeout",
             Self::App(AppError::AgentStreamPublisher(_)) => "stream_error",
@@ -114,6 +115,9 @@ impl ConnectorError {
                 "control socket path exceeds platform byte limit; shorten --home or --socket"
             }
             Self::Unauthorized => "agent control request is unauthorized",
+            Self::App(AppError::InvalidEditTarget) => {
+                "target must be an available self-authored chat message"
+            }
             Self::UnsafeControlPlaneConfig(_) => "unsafe agent control plane configuration",
             Self::Hex(_) => "invalid hex value",
             Self::Json(_) | Self::Control(_) => "invalid control request",

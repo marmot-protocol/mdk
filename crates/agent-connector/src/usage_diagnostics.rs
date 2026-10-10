@@ -223,10 +223,15 @@ mod tests {
 
     #[tokio::test]
     async fn owner_socket_updates_the_active_consent_without_starting_collectors() {
-        // Leave room for the private staging address and long process IDs.
+        // Private socket binding adds a staging directory to the path. Use a
+        // private directory under a short Unix base, independent of both HOME
+        // and TMPDIR (which is especially long on macOS). Resolve the /tmp
+        // alias first: private-directory preparation rejects its writable
+        // /private/tmp target when reached through a symlink.
+        let short_temp_base = std::fs::canonicalize("/tmp").unwrap();
         let home = tempfile::Builder::new()
             .prefix(".mu-")
-            .tempdir_in(std::env::var_os("HOME").expect("test home"))
+            .tempdir_in(short_temp_base)
             .unwrap();
         let app = MarmotApp::try_with_relays_and_account_home_and_config(
             home.path(),

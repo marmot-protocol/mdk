@@ -4334,6 +4334,8 @@ impl AppClient {
             .account_home()
             .account(&self.state.label)?
             .account_id_hex;
+        let now = unix_now_seconds();
+        let mut event_created_at = now;
         // NIP-25 has no native un-react: kind-7 reactions are retracted with a
         // kind-5 delete. Resolve every matching active own reaction from the
         // projection and place all ids in one tombstone so remove-all is atomic.
@@ -4371,6 +4373,33 @@ impl AppClient {
                             "report is unavailable in this group".into(),
                         ));
                     }
+                }
+                intent
+            }
+            AppMessageIntent::Edit {
+                ref target_message_id,
+                ..
+            } => {
+                let target = self
+                    .app
+                    .account_storage(&self.state.label)?
+                    .timeline_message(&hex::encode(group_id.as_slice()), target_message_id)?;
+                let target = target
+                    .filter(|target| {
+                        target.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT
+                            && target.sender == sender
+                            && !target.deleted
+                            && target.invalidation_status.is_none()
+                    })
+                    .ok_or(AppError::InvalidEditTarget)?;
+                if prepared.is_none() {
+                    event_created_at = crate::local_submissions::next_edit_created_at(
+                        now,
+                        target.edit.map(|previous| previous.edited_at),
+                    )
+                    .ok_or_else(|| {
+                        AppError::InvalidAppMessagePayload("edit rate limit: retry shortly".into())
+                    })?;
                 }
                 intent
             }
@@ -4443,10 +4472,10 @@ impl AppClient {
                 Some(reply) => build_inner_event_with_media_reply(
                     &intent,
                     &sender,
-                    unix_now_seconds(),
+                    event_created_at,
                     Some(reply),
                 )?,
-                None => build_inner_event(&intent, &sender, unix_now_seconds())?,
+                None => build_inner_event(&intent, &sender, event_created_at)?,
             };
             let payload = encode_inner_event(&event)?;
             (event, payload)

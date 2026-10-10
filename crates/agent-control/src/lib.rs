@@ -240,6 +240,14 @@ pub enum AgentControlRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         idempotency_key: Option<String>,
     },
+    /// Edit a message authored by the selected local account. Shared runtime
+    /// preflight requires a locally available, non-invalidated chat target.
+    EditMessage {
+        account_id_hex: String,
+        group_id_hex: String,
+        target_message_id_hex: String,
+        text: String,
+    },
     DeleteMessage {
         account_id_hex: String,
         group_id_hex: String,
@@ -1925,6 +1933,15 @@ mod tests {
                     idempotency_key: None,
                 },
                 "send_final",
+            ),
+            (
+                AgentControlRequest::EditMessage {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    target_message_id_hex: message(),
+                    text: "updated dashboard".to_owned(),
+                },
+                "edit_message",
             ),
             (
                 AgentControlRequest::DeleteMessage {

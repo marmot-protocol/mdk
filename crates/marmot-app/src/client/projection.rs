@@ -1479,6 +1479,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::AttachmentAccountSignedOut => "read_marker_failed:attachment_account_signed_out",
         AppError::RuntimeStopping => "read_marker_failed:runtime_stopping",
         AppError::ReactionNotFound => "read_marker_failed:reaction_not_found",
+        AppError::InvalidEditTarget => "read_marker_failed:invalid_edit_target",
         AppError::TransportClosed => "read_marker_failed:transport_closed",
         AppError::UserBlocked => "read_marker_failed:user_blocked",
         AppError::BlockListUnavailable => "read_marker_failed:block_list_unavailable",

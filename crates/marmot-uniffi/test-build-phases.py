@@ -48,7 +48,7 @@ def put(path, data="fixture"):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(data)
 if name == "rustup" and args[:2] == ["target", "list"]:
-    print("\n".join(os.environ["BUILD_TEST_TARGETS"].split()))
+    os.write(1, ("\n".join(os.environ["BUILD_TEST_TARGETS"].split()) + "\n").encode())
 elif name in ["rustc", "cargo"] and args == ["--version"]:
     print(name + " 1.97.1 fixture")
 elif name == "cargo":

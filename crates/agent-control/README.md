@@ -65,6 +65,28 @@ existing reaction id instead of publishing a duplicate.
 `emoji` retracts all of the calling account's active reactions with that exact content. Omitting `emoji` retracts all
 of the account's active reactions on the target in one durable delete event.
 
+## Editing a durable message
+
+`edit_message` lets a control client update a message authored by the selected
+local account. Supply `account_id_hex`, `group_id_hex`, `target_message_id_hex`,
+and replacement `text`. The shared app-client send preflight checks the locally
+projected target for chat kind, authorship, deletion and invalidation. A target
+that fails this check produces the non-retryable `invalid_edit_target` error;
+`unauthorized` remains reserved for peer authorization failures. This check also
+covers the CLI, mobile runtime and retained local submissions. It is a preflight,
+not an atomic guarantee against deletion/invalidation arriving during a send;
+recipient projection still decides whether an edit applies.
+
+A successful request returns `final_sent` with the edit event id. The Hermes
+`MarmotAgentControlClient.edit_message` and OpenClaw `MarmotAgentControlClient.editMessage`
+methods expose this operation to control-client integrations, for example a
+client that updates its own pinned status row. The existing message tools do not
+automatically edit status updates.
+
+An edit has no idempotency key. If the response is lost after publication, read
+the materialized target with `timeline_message_get` before deciding whether to
+retry; do not blindly replay an uncertain edit.
+
 ## Materialized timeline reads
 
 `timeline_message_get` resolves one durable message id and `timeline_list` pages a group's current materialized

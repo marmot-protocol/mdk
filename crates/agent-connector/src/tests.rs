@@ -5631,6 +5631,189 @@ fn delivered_inbound_cursor_dedups_and_evicts_oldest() {
     assert!(cursor.contains("d"));
 }
 
+#[test]
+fn invalid_edit_target_has_a_distinct_non_retryable_contract() {
+    let error = crate::ConnectorError::App(marmot_app::AppError::InvalidEditTarget);
+    assert_eq!(error.code(), "invalid_edit_target");
+    assert_eq!(
+        error.client_message(),
+        "target must be an available self-authored chat message"
+    );
+    assert!(!error.retryable());
+}
+
+#[tokio::test]
+async fn connector_edit_dispatch_preserves_typed_eligibility_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let setup_runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let human = setup_runtime.create_identity(setup).await.unwrap();
+    let group = setup_runtime
+        .create_group(
+            &agent.account.account_id_hex,
+            "edit wire errors",
+            std::slice::from_ref(&human.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    setup_runtime.shutdown().await;
+    let group_hex = hex::encode(group.as_slice());
+    let socket = dir.path().join("dev/wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+    connector.runtime.catch_up_accounts().await.unwrap();
+    let sent = connector
+        .send_final_response(
+            &agent.account.account_id_hex,
+            &group_hex,
+            "original".into(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let AgentControlResponse::FinalSent {
+        message_ids_hex, ..
+    } = sent
+    else {
+        panic!("expected original send, got {sent:?}");
+    };
+    let target = message_ids_hex[0].clone();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            connector.runtime.catch_up_accounts().await.unwrap();
+            if connector
+                .runtime
+                .timeline_message(&human.account.account_id_hex, &group_hex, &target)
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("peer must observe the foreign target before authorization test");
+    let listener = bind_connector_socket(&socket).unwrap();
+    for (account, group, target_id, expected) in [
+        (
+            human.account.account_id_hex.clone(),
+            group_hex.clone(),
+            target.clone(),
+            "invalid_edit_target",
+        ),
+        (
+            agent.account.account_id_hex.clone(),
+            group_hex.clone(),
+            "ff".repeat(32),
+            "invalid_edit_target",
+        ),
+        (
+            agent.account.account_id_hex.clone(),
+            "not-hex".into(),
+            target.clone(),
+            "invalid_hex",
+        ),
+    ] {
+        let response = serve_control_request_once(
+            &connector,
+            &listener,
+            &socket,
+            "edit-invalid",
+            AgentControlRequest::EditMessage {
+                account_id_hex: account,
+                group_id_hex: group,
+                target_message_id_hex: target_id,
+                text: "must not publish".into(),
+            },
+        )
+        .await;
+        let AgentControlResponse::Error {
+            code, retryable, ..
+        } = response.payload
+        else {
+            panic!("expected edit error, got {:?}", response.payload);
+        };
+        assert_eq!(code, expected);
+        assert!(!retryable);
+    }
+    let response = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "edit-valid",
+        AgentControlRequest::EditMessage {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex: group_hex.clone(),
+            target_message_id_hex: target.clone(),
+            text: "updated".into(),
+        },
+    )
+    .await;
+    let AgentControlResponse::FinalSent {
+        message_ids_hex, ..
+    } = response.payload
+    else {
+        panic!("expected successful edit, got {:?}", response.payload);
+    };
+    assert!(!message_ids_hex.is_empty());
+    let AgentControlResponse::TimelineMessage {
+        message: Some(message),
+        ..
+    } = connector
+        .timeline_message_response(&agent.account.account_id_hex, &group_hex, &target)
+        .unwrap()
+    else {
+        panic!("expected materialized target");
+    };
+    assert_eq!(message.text.as_deref(), Some("updated"));
+    let first_edit_time = connector
+        .runtime
+        .timeline_message(&agent.account.account_id_hex, &group_hex, &target)
+        .unwrap()
+        .unwrap()
+        .edit
+        .unwrap()
+        .edited_at;
+    connector
+        .edit_message_response(
+            &agent.account.account_id_hex,
+            &group_hex,
+            &target,
+            "latest revision",
+        )
+        .await
+        .unwrap();
+    let latest = connector
+        .runtime
+        .timeline_message(&agent.account.account_id_hex, &group_hex, &target)
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.plaintext, "latest revision");
+    assert!(latest.edit.unwrap().edited_at > first_edit_time);
+    connector.runtime.shutdown().await;
+}
+
 #[tokio::test]
 async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
     // End-to-end regression for mdk#210: when the inbound broadcast lags, the
@@ -5742,16 +5925,37 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
 
     // Exercise every durable mutation through the same production projection
     // used by live delivery and replay.
-    connector
-        .runtime
-        .edit_message(
+    let edited = connector
+        .edit_message_response(
             &human.account.account_id_hex,
-            &group_id,
+            &group_id_hex,
             &target_message_id_hex,
             "edited while lagging",
         )
         .await
         .unwrap();
+    let AgentControlResponse::FinalSent {
+        message_ids_hex, ..
+    } = edited
+    else {
+        panic!("expected edit send, got {edited:?}");
+    };
+    assert!(!message_ids_hex.is_empty());
+    let materialized = connector
+        .timeline_message_response(
+            &human.account.account_id_hex,
+            &group_id_hex,
+            &target_message_id_hex,
+        )
+        .unwrap();
+    let AgentControlResponse::TimelineMessage {
+        message: Some(message),
+        ..
+    } = materialized
+    else {
+        panic!("expected materialized edit, got {materialized:?}");
+    };
+    assert_eq!(message.text.as_deref(), Some("edited while lagging"));
     let reaction = connector
         .runtime
         .react_to_message(
