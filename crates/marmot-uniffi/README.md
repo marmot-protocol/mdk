@@ -25,7 +25,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [device-local membership events](#device-local-membership-events), [group reporting](#group-reporting),
   [history may be incomplete notices](#history-may-be-incomplete-notices)
 - Media: [file-backed media upload](#file-backed-media-upload),
-  [account attachment history](#account-attachment-history),
+  [account attachment history](#account-attachment-history), [download management and chat health](#download-management-and-chat-health),
   [bounded attachment history](#bounded-attachment-history), [local attachment access](#local-attachment-access)
 - Audit logs: [audit v5 recording and delivery](#audit-v5-recording-and-delivery),
   [legacy audit v4 upload](#legacy-audit-v4-upload)
@@ -41,6 +41,7 @@ This is the current integration entry point for Swift/iOS, Swift/macOS and Kotli
 | --- | --- |
 | [Complete method reference](API-REFERENCE.md) | Every exported constructor, runtime method, object method, free function and host callback, with signatures, purpose, source and API-selection guidance. |
 | [Release integration index](../../docs/integration/README.md) | Per-release upgrade guides: required changes, changed defaults, optional adoption, examples and acceptance checks. Read every intervening guide when skipping versions. |
+| [Download management and chat health](ATTACHMENT-MANAGEMENT.md) | Global/chat transfer pages, partial totals, intent-fenced cancellation, recovery evidence and event-driven observation. |
 | [Changelog](CHANGELOG.md) | Binding-level changes per release, including unreleased work on `master`. |
 | [Distribution](DISTRIBUTION.md) | Exact artifact layout, platform setup, checksums, Apple resources and source/binary pairing. |
 | [Chat lists](../../docs/marmot-architecture/further-context/chat-projections-native.md) | Bounded list windows, account attention, navigation and sequence handling. |
@@ -86,6 +87,7 @@ screen API exists. The method reference marks explicit alternatives individually
 | Reaction details | `messageReactions` for complete effective participants | Window references contain bounded previews only. See [complete reaction details](CONVERSATION-WINDOW.md#complete-reaction-details). |
 | Composer | `selectedMessageDraft`, revision-conditional save/clear/attachment reads, `sendMessageDraft` | Unconditional `messageDraft` / `saveMessageDraft` / `deleteMessageDraft` for older single-owner flows; new concurrent composers should use revisions. `sendText` and other direct send methods remain supported. |
 | Visible avatars | `requestAvatarAssets` then `readAvatarAssets` using screen metadata | `downloadProfileImage` / `downloadGroupBlossomImage` for explicit low-level downloads; new screens should use MDK's durable cache. |
+| Download management and chat health | `attachmentManagementSnapshot`, `managedAttachmentPage` and `subscribeAttachmentManagement` | Explicit-target transfer snapshots remain supported; new global/chat managers use intent-fenced controls and clearly labelled partial totals. |
 | Media library | `attachmentHistoryPage` / `attachmentHistoryVersion` | `listMedia` is the older accepted-only listing; it omits rejected source slots and lacks the new cursor/version contract. |
 | Display received media | `attachmentLocalAssets` then `readAttachmentAsset`, plus transfer observation/controls | `downloadMedia` is a supported one-shot network download returning full transient bytes. It is not a retained-cache read. |
 | KeyPackage settings | `localAccountKeyPackages`, then `refreshAccountKeyPackages` | `accountKeyPackages` for the existing network-oriented inventory; `accountKeyPackageRelayEvents` remains useful for observed publication history. |
@@ -1106,6 +1108,10 @@ python3 crates/marmot-uniffi/measure-release-profile.py \
 Apple exporters use raw static-library slices and publish a matching privacy manifest for the consuming Swift target.
 See the [privacy audit and adoption guide](apple-privacy/README.md) for declarations, archive validation, host
 integration changes, and unresolved release questions.
+
+## Download management and chat health
+
+Use the [download management contract](../marmot-uniffi/ATTACHMENT-MANAGEMENT.md) for global/chat transfer visibility, explicit partial totals, intent-fenced cancellation and independently observed recovery health. Replacement feeds use existing native invalidations with no idle polling. Swift/Kotlin records carry opaque managed cursor/action/version objects; C consumers use borrowed inputs, deep-free roots and independent handle clones.
 
 ## Account attachment history
 

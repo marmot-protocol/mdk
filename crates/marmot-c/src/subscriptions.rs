@@ -1379,3 +1379,5 @@ pub unsafe extern "C" fn marmot_block_list_subscription_snapshot(
         }
     })
 }
+
+mod attachment_management;

@@ -1,0 +1,45 @@
+# Download management and chat health
+
+`attachment_management_snapshot` combines a bounded transfer head with independently observed recovery evidence. Omit `group_id_hex` for account scope, or pass an opaque MLS group ID for one chat. Account scope includes account-wide parked history notices; chat scope includes only that group's notices. A failed file does not establish failed synchronization, membership removal, missing epochs or corrupt state. `automatic_recovery_failed` comes from the existing durable qualified-recovery flag. `None` means account scope or unavailable group, never healthy. Read errors remain errors and close observations; `available=false` supplies no recovery assertion or actions.
+
+All reads run locally without relay fetch, demand registration, decryption, retry, read acknowledgment or notice dismissal. The native shared parser supplies file metadata and preserves rejected outcomes. No client-side protocol index or download scheduler is required.
+
+## Paging and truthful totals
+
+`managed_attachment_page` seeks an indexed monotonic intent sequence across an account or one group, visiting at most `limit + 1` job candidates, with `limit` in `1..=50`. Source, permission, expiry, origin and state filters are applied inside that candidate bound. Empty filtered pages can continue: exhaust only when `next_cursor` is absent. Cursors bind the account incarnation, canonical query, initial intent cutoff and existing attachment privacy version. New jobs, promotions and retries require a head refresh; they are outside an older continuation. State and byte progress are live observations, not a frozen historical view. Discard the cursor after an error, privacy/source change, account reconstruction or shutdown.
+
+Snapshot counts independently visit at most 1024 job candidates. `counts.complete=false` means every count is a lower bound; clients must label it as partial or “at least”, rather than display it as an exact total. Hidden, stale, unaccepted and expired sources do not count. The fixed cap includes filtered candidates, so a sparse visible selection can also be partial. This bounds read work without scanning chat history or decoding message bodies. Count work is O(min(current jobs,1024)) bounded source/status lookups; page work is O(limit) lookups after an indexed seek. No historical-attempt log is counted. Source metadata is bounded by the existing 16KiB acquisition descriptor; at most50 details and50 notices leave a frame below1MiB plus fixed record overhead. Scalar identifiers come from validated native source identities.
+
+`attempt`, `received`, optional `total` and `retry_at` retain existing transfer semantics. Unknown total stays absent. `origin_known=false` means the old intent is unknown, notably after cancellation clears the explicit-request flag. Automatic/explicit filters exclude these unknown-origin rows; the all-origin view retains them. Failure categories describe observed state: retry exhaustion, unavailable retained bytes, completed without retention, policy blocked or unclassified failure. An opaque transport error is never guessed to be a connectivity, integrity or server diagnosis. Queued work and policy pauses do not create persistent recovery warnings.
+
+## Cancelling old work
+
+1. Call `begin_attachment_cancellation` with explicit account/chat scope and `automatic_only`.
+2. Call `cancel_attachment_batch` using its opaque cursor. Each transaction visits at most64 old intent candidates and records cancellation before waking the existing worker cancellation channel.
+3. Continue with the returned cursor until absent. Report the cumulative `requested` count as cancellation requests, never as a count of closed network connections.
+
+`visited`, `requested` and `preserved` count candidate visits in that batch. Preserved candidates can be ready, hidden, expired, previously cancelled or explicitly promoted. Verified ready bytes survive cancellation. New inserts, manual promotions and every explicit retry advance a monotonic intent sequence, even within the same second. They are outside every older cancellation cutoff. Replaying an old cursor can revisit already-cancelled work but cannot cancel a new retry. Cursors are process-local opaque objects; a foreign account rejects them. A vanished or changed source is never recreated by cancellation.
+
+Per-file `control_managed_attachment` uses an opaque observed intent token. False means stale, unavailable, already retained or no applicable change; refresh before offering another action. A later retry invalidates its older action token. Retry retains the existing budget/admission behavior. Cancellation is separate from file deletion and cache cleanup. Existing `set_attachment_download_policy` pauses automatic work persistently; it does not cancel explicit downloads. A chat cancellation never changes account-wide automatic policy.
+
+## Observation and privacy
+
+`subscribe_attachment_management` emits a revalidated initial head and coalesced complete replacement heads, at most4Hz. Existing acquisition, runtime and presentation broadcasts invalidate it; retention uses a one-shot expiry deadline. It adds no idle timer or diagnostic polling loop. Continued pages stay explicit pull reads. Closing/dropping the feed stops observation without cancelling transfers or accepting incomplete-history notices. Runtime shutdown, account incarnation change and account reset fence publication. External writers must use existing update signals or explicitly request another snapshot; this feed does not watch database files.
+
+Authorized snapshots carry source identities so clients can navigate to the original message. Their Debug output and opaque tokens are redacted. The separately supplied `redacted_diagnostics` is a fixed low-cardinality JSON summary below4096bytes, excluding identifiers, names, captions, URLs, timestamps, tokens and keys. Sharing is an explicit client action; no automatic upload is added. Notice dismissal remains the existing revision-fenced `dismiss_history_notice`, a separate outcome from recovered history.
+
+## C ownership
+
+Use the matching generated header and native library. Query strings are borrowed and nullable group means account scope. Input enum discriminants are checked `uint32_t`; input flags are `uint8_t`. Required output pointers are validated before reads or mutations. Every returned page, snapshot and cancellation batch is one independently owned deep-free root. Handles embedded in it are borrowed until that root is freed. Clone a cursor, action or version to retain it independently, then free only the clone with its corresponding handle free. Never free an embedded handle directly. Blocking calls belong off the UI thread. Subscription next supports bounded timeouts; close/free observation before its client and never free during an active call.
+
+## Delivery scope
+
+These additive Rust, Swift/Kotlin and C surfaces prepare shared native behavior. Android screens, background/platform diagnostics and future SDK artifact/client adoption are separate. The account attachment library is a dependency; broader text search remains separate. No workspace version is changed.
+
+## Comparison informing the contract
+
+The comparison uses official documentation, rather than assuming undocumented capabilities or claiming device testing of other apps. [Telegram's download manager](https://telegram.org/blog/downloads-attachments-streaming) separates global active downloads, individual/bulk pause and source-chat navigation; its [bounded native search](https://core.telegram.org/tdlib/docs/classtd_1_1td__api_1_1search_file_downloads.html) reinforces explicit cursor scope. MDK supplies global/chat candidate pages and scoped old-intent cancellation; it preserves existing native scheduling instead of adding another queue or priority policy.
+
+[Signal storage management](https://support.signal.org/hc/en-us/articles/360049673331-Storage-Management) groups media/files/audio and supports selected save/delete, while [network-specific automatic download policy](https://support.signal.org/hc/en-us/articles/360056044831-Data-Usage-Options-Wi-Fi-Cellular) is independent. [WhatsApp automatic download policy](https://faq.whatsapp.com/366146522333492) likewise separates media/network choices from storage review. The MDK contract keeps policy pause, network cancellation, retained bytes and explicit deletion distinct, preserving ready data even when cancellation races publication.
+
+[Element's documented search](https://element.io/en/help) distinguishes room/global scope and encrypted-search client capabilities. MDK returns explicit unavailable/error/partial evidence and owns the account index instead of requiring a client timeline fan-out. [Threema's explicit Save](https://threema.com/en/faq/android-save-picture) separates internal downloads from exported media and auto-save preferences. Native download management does not imply saving private files outside the encrypted store. Client storage/export UI remains a deliberate platform action.

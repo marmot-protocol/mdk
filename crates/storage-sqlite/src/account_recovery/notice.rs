@@ -777,3 +777,18 @@ mod tests {
         assert_eq!(row(&store, explicit.id), (0, None, next.revision as i64));
     }
 }
+
+impl SqliteAccountStorage {
+    /// Bounded, group-specific or account-wide parked occurrences, never combined.
+    pub(crate) fn bounded_parked_recovery_notices(
+        &self,
+        group: Option<&[u8]>,
+        limit: usize,
+    ) -> StorageResult<(Vec<ParkedRecoveryObligation>, bool)> {
+        let conn = self.lock()?;
+        let mut rows=conn.prepare("SELECT id,revision,cause,group_id,parked_at_ms FROM account_recovery_obligations INDEXED BY attachment_management_group_notices WHERE state=0 AND eligibility=4 AND group_id IS ?1 ORDER BY parked_at_ms,id LIMIT ?2").storage()?.query_map(rusqlite::params![group,(limit+1) as i64],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).storage()?.collect::<Result<Vec<ParkedRow>,_>>().storage()?;
+        let complete = rows.len() <= limit;
+        rows.truncate(limit);
+        Ok((parked(rows)?, complete))
+    }
+}

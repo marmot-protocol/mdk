@@ -2868,3 +2868,5 @@ fn attachment_idle_permission_resume_is_read_only() {
 mod outgoing;
 mod outgoing_files;
 mod promotion;
+
+mod management;

@@ -604,3 +604,4 @@ mod tests {
         );
     }
 }
+pub use commands::AttachmentManagementSubscription;

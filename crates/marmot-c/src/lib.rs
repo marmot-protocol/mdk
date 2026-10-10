@@ -805,3 +805,5 @@ mod tests {
         );
     }
 }
+
+pub mod attachment_management;

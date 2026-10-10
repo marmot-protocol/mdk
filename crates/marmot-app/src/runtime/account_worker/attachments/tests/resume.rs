@@ -1689,7 +1689,7 @@ async fn attachment_resume_hash_miss_retries_from_zero_after_reopen() {
 
 #[tokio::test]
 async fn attachment_controls_interrupt_http_and_release_capacity_without_publishing() {
-    for disable in [false, true] {
+    for mode in 0..3 {
         let (listener, reference, cipher) =
             listener_fixture(&vec![42; 2 * ATTACHMENT_CHECKPOINT_BYTES]).await;
         let (sent, started) = oneshot::channel();
@@ -1735,13 +1735,22 @@ async fn attachment_controls_interrupt_http_and_release_capacity_without_publish
             .unwrap()
             .reference
             .unwrap();
-        if disable {
+        if mode == 1 {
             let mut policy =
                 super::super::super::super::attachment_controls::default_policy(&client.app.config);
             policy.automatic = false;
             store
                 .set_attachment_download_policy(&policy, crate::unix_now_seconds())
                 .unwrap();
+        } else if mode == 2 {
+            let cursor = store
+                .begin_attachment_cancellation(Some(GROUP), false)
+                .unwrap();
+            let batch = store
+                .cancel_attachment_batch(&cursor, crate::unix_now_seconds())
+                .unwrap();
+            assert_eq!(batch.requested, 1);
+            assert!(batch.next_cursor.is_none());
         } else {
             store.cancel_attachment_acquisition(&asset).unwrap();
         }
@@ -1766,12 +1775,12 @@ async fn attachment_controls_interrupt_http_and_release_capacity_without_publish
                     &entry.source_message_id_hex,
                     0,
                     crate::unix_now_seconds(),
-                    !disable
+                    mode != 1
                 )
                 .unwrap()
                 .unwrap()
                 .state,
-            if disable {
+            if mode == 1 {
                 storage_sqlite::AttachmentTransferState::Paused
             } else {
                 storage_sqlite::AttachmentTransferState::Cancelled
