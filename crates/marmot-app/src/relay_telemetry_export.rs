@@ -78,6 +78,12 @@ pub mod metric_names {
     pub const PUBLISH_FAILURES: &str = "relay_publish_failures";
     /// Device-wide publishes dropped by their caller in flight (monotonic).
     pub const PUBLISH_CANCELLATIONS: &str = "relay_publish_cancellations";
+    /// Device-wide NIP-77 reconciliation passes, inbox and group (monotonic).
+    pub const RECONCILIATION_ATTEMPTS: &str = "relay_reconciliation_attempts";
+    /// Device-wide group reconciliation passes that returned nothing because
+    /// no time order covered the missing history (monotonic).
+    pub const RECONCILIATION_ORDER_UNPROVEN_PASSES: &str =
+        "relay_reconciliation_order_unproven_passes";
     /// Engine settle episodes (monotonic).
     pub const SETTLES: &str = "relay_settles";
     /// Engine post-settle reorgs (monotonic).
@@ -979,6 +985,14 @@ pub fn build_export_batch(
         (
             metric_names::PUBLISH_CANCELLATIONS,
             rollup.publish_cancellations,
+        ),
+        (
+            metric_names::RECONCILIATION_ATTEMPTS,
+            rollup.reconciliation_attempts,
+        ),
+        (
+            metric_names::RECONCILIATION_ORDER_UNPROVEN_PASSES,
+            rollup.reconciliation_order_unproven_passes,
         ),
         (metric_names::MESSAGE_OBSERVED, rollup.messages_observed),
         (

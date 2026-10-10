@@ -213,6 +213,28 @@ fn build_export_batch_includes_unlabeled_message_counters() {
 }
 
 #[test]
+fn build_export_batch_includes_unlabeled_reconciliation_counters() {
+    let rollup = RelayTelemetryRollup {
+        reconciliation_attempts: 9,
+        reconciliation_order_unproven_passes: 2,
+        ..Default::default()
+    };
+    let batch = build_export_batch(&rollup, &RelayLabelResolution::default());
+
+    for (name, value) in [
+        (metric_names::RECONCILIATION_ATTEMPTS, 9),
+        (metric_names::RECONCILIATION_ORDER_UNPROVEN_PASSES, 2),
+    ] {
+        assert!(batch.points.iter().any(|point| {
+            point.name == name
+                && point.relay.is_none()
+                && point.failure.is_none()
+                && point.value == ExportMetricValue::Counter(value)
+        }));
+    }
+}
+
+#[test]
 fn build_export_batch_appends_unlabeled_app_performance_metrics() {
     let app_performance = AppPerformanceSnapshot {
         app_start: AppPerformanceOperationSnapshot {

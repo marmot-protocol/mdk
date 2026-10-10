@@ -138,6 +138,46 @@ certify a subset of a route's relays. `incomplete_endpoints` names the failed on
 answered: they finished the comparison and served their exact-ID requests, but this pass did
 not return every ID they claimed. The rest timed out, errored or truncated.
 
+A group route's gap is fetched from its oldest end. MLS applies commits in order, so fetching IDs in ID order,
+which is effectively random in time, could let commits carry a member's epoch more than the retained-epoch window
+past older messages still missing, which can then never be read (mdk#2086).
+
+- **Window.** When the gap holds more than one pass (256 IDs, or fewer when the route's events are large enough that
+  256 would exceed 1 MiB), the pass finds the oldest window `[since, bound]` that fits with dry-run comparisons: up to
+  six rounds of eight concurrent probes within half of what is left of the deadline. A first search starts at the
+  recent end, where a catch-up gap sits, at distances shrinking by powers of two; later rounds spread evenly within
+  the bracket. A probe counts as fitting only when every relay asked answered it: a relay that missed it may hold
+  older history the others lack.
+- **Unfinished searches.** A pass whose search did not find such a window fetches nothing and the next pass resumes
+  its bracket, because fetching a window larger than a pass would return part of it in ID order. It fetches anyway
+  when the bracket can no longer shrink or the previous pass already waited: the narrowest window a complete probe
+  measured, or else the whole gap, with delivery still held to a time prefix. A pass whose probes no relay answered
+  fetches nothing.
+- **Time prefix.** A window the byte budget or deadline cuts short returns only events older than every one it left
+  for the next pass, found with one more probe round up to the returned events' timestamps; timestamps are whole
+  seconds, so a second split by the budget is held together. When no probe gets a complete answer the boundary is
+  unknown and the pass holds everything. Events held back are fetched again. Every ID of the window not returned
+  holds delivery back, including ones a request timed out on, except an event every claimant answered without or one
+  over the single-object ceiling. Ordered passes reserve part of the deadline for that probe round.
+- **No order, no delivery.** A route that cannot prove an order (a relay that answers comparisons but never the
+  probes, or one second holding more than a pass) returns nothing and stays quiet. Its events stay fetchable, and
+  recovery parks it with its "history may be incomplete" notice if that persists, rather than admit newer commits
+  ahead of older messages. Such a pass sets `NostrReconciliationSummary::order_unproven`; the relay plane counts it,
+  and opt-in telemetry exports the device-wide total as `relay_reconciliation_order_unproven_passes`.
+- **Memory.** The client remembers, per route and in memory only, the last bound that fit, how far past it to look
+  next, an unfinished bracket, and the route's average event size, so a backlog being worked through usually needs
+  one round. It also sets aside IDs a pass returned that the account has not admitted since, and IDs every claimant
+  answered without (not ones this pass's own allowance dropped), or that can never fit the single-object ceiling:
+  they yield to history not tried yet and are
+  retried with leftover room. A route keeps as many as its relays' comparisons can name together, up to 65,536;
+  beyond that it cannot keep an order and stays quiet. Past 65,536 across routes the least recently used route's
+  memory is dropped, and it sets its IDs aside again. Losing this memory costs at most extra narrowing or a refetch.
+
+A window is fetched in the cursor's rotation, grouped by claiming relays so requests batch fully, and returned in time
+order. Selection never changes the summary's endpoint results: a relay that claimed an ID this pass left unfetched stays incomplete. The
+account inbox route keeps ID-order selection. The extra dry-run comparisons are control traffic: about 200 KiB to
+fetch an eight-event, 2.6-MB gap against 1,100 retained events in the adapter fixture.
+
 Replay position is advisory, separate from admitted event inventory. A cancelled fetch retains its
 pre-I/O cursor advance. A completed byte-limit rejection of an otherwise eligible network ID
 restores the preceding cursor when earlier results consumed this pass's allowance, so the ID leads
