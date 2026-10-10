@@ -154,6 +154,11 @@ publish it or treat it as a full reset. Free the snapshot with
 `marmot_onboarding_snapshot_free` after presenting the exact diff. Approval
 remains a separate revision- and recovery-epoch-bound call.
 
+Explicit `marmot_propose_onboarding_relays` selections also return the typed
+preview. See the shared [manual-edit preservation and checkpoint compatibility
+contract](../marmot-uniffi/README.md#explicit-recovery-and-checkpoint-compatibility).
+The C signatures and snapshot ownership rules are unchanged.
+
 C relay-repair previews encode `original_content`, `proposed_content`, every
 `fields` element in tags and changes, and each non-NULL `endpoint` as a JSON
 string literal. Decode exactly once with a parser that preserves embedded zero

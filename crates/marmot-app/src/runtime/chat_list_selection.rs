@@ -1,7 +1,7 @@
 //! Frozen complete fixed-view intent, never a second display/presentation cache.
-use super::{ChatListView, MarmotAppRuntime, wait_for_runtime_shutdown};
+use super::{ChatListView, MarmotAppRuntime, RuntimeLifecycle, wait_for_runtime_shutdown};
 use crate::AppError;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use storage_sqlite::{ChatListSelectionSnapshot, SqliteAccountStorage};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
@@ -60,6 +60,9 @@ struct State {
 pub struct ChatListSelectionHandle {
     commands: mpsc::Sender<Command>,
     closing: Arc<watch::Sender<bool>>,
+    lifecycle: RuntimeLifecycle,
+    resets: Arc<Mutex<broadcast::Receiver<String>>>,
+    account_label: Arc<str>,
 }
 impl ChatListSelectionHandle {
     pub async fn count(&self) -> Result<ChatSelectionSummary, ChatSelectionError> {
@@ -101,9 +104,7 @@ impl ChatListSelectionHandle {
         revision: Option<u64>,
         action: Action,
     ) -> Result<ChatSelectionPage, ChatSelectionError> {
-        if *self.closing.borrow() {
-            return Err(ChatSelectionError::Closed);
-        }
+        self.ensure_open()?;
         let (reply, result) = oneshot::channel();
         self.commands
             .send(Command {
@@ -114,10 +115,26 @@ impl ChatListSelectionHandle {
             .await
             .map_err(|_| ChatSelectionError::Closed)?;
         let result = result.await.map_err(|_| ChatSelectionError::Closed)?;
-        if *self.closing.borrow() {
+        // Delivery linearizes here, not when the actor sends the reply: a
+        // terminal transition can happen while this caller is not scheduled.
+        self.ensure_open()?;
+        result
+    }
+
+    fn ensure_open(&self) -> Result<(), ChatSelectionError> {
+        if *self.closing.borrow() || self.lifecycle.is_stopping() {
+            self.close();
             return Err(ChatSelectionError::Closed);
         }
-        result
+        let mut resets = self.resets.lock().map_err(|_| {
+            self.close();
+            ChatSelectionError::Closed
+        })?;
+        if reset_observed(&mut resets, &self.account_label) {
+            self.close();
+            return Err(ChatSelectionError::Closed);
+        }
+        Ok(())
     }
 }
 
@@ -138,6 +155,9 @@ impl MarmotAppRuntime {
             .presentation_signals
             .account_resets
             .subscribe();
+        // Keep a separate cursor for delivery checks. Resubscribing after
+        // capture or per call would silently skip already queued resets.
+        let delivery_resets = resets.resubscribe();
         let app = self.accounts.app.clone();
         let label = account.label.clone();
         let capture = tokio::task::spawn_blocking(move || {
@@ -177,13 +197,18 @@ impl MarmotAppRuntime {
             receiver,
             stopping,
             resets,
-            account.label,
+            account.label.clone(),
             close_rx,
         ));
-        Ok(ChatListSelectionHandle {
+        let handle = ChatListSelectionHandle {
             commands,
             closing: Arc::new(closing),
-        })
+            lifecycle: self.shared.lifecycle().clone(),
+            resets: Arc::new(Mutex::new(delivery_resets)),
+            account_label: account.label.into(),
+        };
+        handle.ensure_open()?;
+        Ok(handle)
     }
 }
 

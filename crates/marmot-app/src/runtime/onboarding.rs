@@ -9,6 +9,7 @@ use transport_nostr_peeler::NostrTransportEvent;
 
 mod cancellation;
 mod recovery;
+mod relay_edits;
 mod relay_repair;
 mod single_device;
 
@@ -86,6 +87,8 @@ const ONBOARDING_VERSION: u32 = 3;
 const RECOVERED_ONBOARDING_VERSION: u32 = 4;
 const APPEND_ONBOARDING_VERSION: u32 = 5;
 const LOSSLESS_RELAY_REPAIR_ONBOARDING_VERSION: u32 = 6;
+// Earlier readers recompute all typed previews as automatic repairs.
+const MANUAL_RELAY_EDIT_ONBOARDING_VERSION: u32 = 7;
 const ONBOARDING_V2: u32 = 2;
 const STEP_COUNT: usize = 6;
 const MAX_RELAYS: usize = 16;
@@ -332,6 +335,8 @@ struct OnboardingCheckpoint {
     #[serde(default)]
     append_relays: bool,
     #[serde(default)]
+    manual_relay_edit: bool,
+    #[serde(default)]
     single_device_acknowledged: bool,
     #[serde(default)]
     setup_cleanup_pending: bool,
@@ -427,6 +432,7 @@ impl OnboardingCheckpoint {
             approved: false,
             signed_repair: None,
             append_relays: false,
+            manual_relay_edit: false,
             single_device_acknowledged: false,
             setup_cleanup_pending: false,
             attempt_start_revision: 0,
@@ -630,6 +636,7 @@ fn decode_onboarding_checkpoint(
             | (RECOVERED_ONBOARDING_VERSION, Some(_))
             | (APPEND_ONBOARDING_VERSION, _)
             | (LOSSLESS_RELAY_REPAIR_ONBOARDING_VERSION, _)
+            | (MANUAL_RELAY_EDIT_ONBOARDING_VERSION, _)
     ) || checkpoint
         .snapshot
         .recovery_epoch
@@ -638,6 +645,8 @@ fn decode_onboarding_checkpoint(
         || checkpoint.snapshot.account_id_hex != account_id_hex
         || checkpoint.snapshot.steps.len() != STEP_COUNT
         || checkpoint.records.len() != STEP_COUNT
+        || (checkpoint.manual_relay_edit
+            && checkpoint.version != MANUAL_RELAY_EDIT_ONBOARDING_VERSION)
     {
         return Err(onboarding_error());
     }
@@ -1075,7 +1084,11 @@ impl AccountManager {
                 };
             }
         }
-        if checkpoint
+        if checkpoint.manual_relay_edit
+            || checkpoint.version == MANUAL_RELAY_EDIT_ONBOARDING_VERSION
+        {
+            checkpoint.version = MANUAL_RELAY_EDIT_ONBOARDING_VERSION;
+        } else if checkpoint
             .snapshot
             .proposal
             .as_ref()
@@ -1245,6 +1258,7 @@ impl AccountManager {
                 }
                 existing.snapshot.proposal = None;
                 existing.append_relays = false;
+                existing.manual_relay_edit = false;
                 existing.single_device_acknowledged = false;
                 existing.snapshot.single_device_notice = None;
                 for index in 0..STEP_COUNT {
@@ -2068,6 +2082,10 @@ impl AccountManager {
     /// Prepare a relay replacement without signing or publishing it. Passing
     /// None appends the recommended defaults to the observed list, preserving
     /// existing tags and read/write roles, independently of local dial policy.
+    /// An explicit selection edits known endpoint roles while preserving retained
+    /// tags verbatim (including duplicates, order and extension fields), unrelated
+    /// tags and event content. The typed preview is inert until approved; an
+    /// unchanged selection produces a manual-review preview without approval.
     /// For inbox lists use read_relays; write_relays must be empty.
     pub async fn propose_onboarding_relays(
         &self,
@@ -2089,6 +2107,7 @@ impl AccountManager {
             return Err(onboarding_error());
         }
         c.append_relays = selection.is_none();
+        c.manual_relay_edit = selection.is_some();
         let (read_relays, write_relays) = if let Some(selection) = selection {
             selection
         } else {
@@ -2132,12 +2151,64 @@ impl AccountManager {
             }
             (reads, writes)
         };
+        self.validate_onboarding_relay_selection(
+            step,
+            &read_relays,
+            &write_relays,
+            c.append_relays,
+        )?;
+        let relay_repair = c.manual_relay_edit.then(|| {
+            relay_edits::manual_relay_edit(
+                step,
+                c.records[step.index()].as_ref(),
+                &read_relays,
+                &write_relays,
+            )
+        });
+        let manual_review = relay_repair
+            .as_ref()
+            .is_some_and(|repair| repair.mode == OnboardingRelayRepairMode::ManualReview);
+        c.snapshot.proposal = Some(OnboardingRepairProposal {
+            step,
+            revision: c
+                .snapshot
+                .revision
+                .checked_add(1)
+                .ok_or_else(onboarding_error)?,
+            previous_event_id: c.records[step.index()].as_ref().map(|e| e.id.clone()),
+            read_relays,
+            write_relays,
+            profile: None,
+            follows: None,
+            relay_repair,
+        });
+        c.snapshot.steps[step.index()].actions = if manual_review {
+            vec![OnboardingAction::EditRelays, OnboardingAction::CancelRepair]
+        } else {
+            vec![
+                OnboardingAction::ApproveRepair,
+                OnboardingAction::CancelRepair,
+            ]
+        };
+        self.save_onboarding(&mut c)?;
+        Ok(c.snapshot)
+    }
+    fn validate_onboarding_relay_selection(
+        &self,
+        step: OnboardingStep,
+        read_relays: &[String],
+        write_relays: &[String],
+        append_relays: bool,
+    ) -> Result<(), AppError> {
+        if !step.relay() {
+            return Err(onboarding_error());
+        }
         let all = read_relays
             .iter()
-            .chain(&write_relays)
+            .chain(write_relays)
             .cloned()
             .collect::<Vec<_>>();
-        let invalid_selection = !c.append_relays
+        let invalid_selection = !append_relays
             && (all.iter().collect::<HashSet<_>>().len() > MAX_RELAYS
                 || all
                     .iter()
@@ -2151,39 +2222,20 @@ impl AccountManager {
         let invalid_roles = (step == OnboardingStep::Relays && write_relays.is_empty())
             || (step == OnboardingStep::InboxRelays && !write_relays.is_empty());
         let routes = if step == OnboardingStep::Relays {
-            &write_relays
+            write_relays
         } else {
-            &read_relays
+            read_relays
         };
         let has_route = self
             .app
             .relay_plane
-            .classify_relay_endpoints(routes.clone())
+            .classify_relay_endpoints(routes.to_vec())
             .iter()
             .any(|v| v.policy == RelayEndpointPolicy::Allowed);
         if all.is_empty() || invalid_selection || invalid_roles || !has_route {
             return Err(onboarding_error());
         }
-        c.snapshot.proposal = Some(OnboardingRepairProposal {
-            step,
-            revision: c
-                .snapshot
-                .revision
-                .checked_add(1)
-                .ok_or_else(onboarding_error)?,
-            previous_event_id: c.records[step.index()].as_ref().map(|e| e.id.clone()),
-            read_relays,
-            write_relays,
-            profile: None,
-            follows: None,
-            relay_repair: None,
-        });
-        c.snapshot.steps[step.index()].actions = vec![
-            OnboardingAction::ApproveRepair,
-            OnboardingAction::CancelRepair,
-        ];
-        self.save_onboarding(&mut c)?;
-        Ok(c.snapshot)
+        Ok(())
     }
     pub async fn propose_onboarding_profile(
         &self,
@@ -2229,6 +2281,7 @@ impl AccountManager {
         if c.approved || c.snapshot.steps[step.index()].status != OnboardingStatus::NeedsInput {
             return Err(onboarding_error());
         }
+        c.manual_relay_edit = false;
         c.snapshot.proposal = Some(OnboardingRepairProposal {
             step,
             revision: c
@@ -2386,7 +2439,31 @@ impl AccountManager {
         c: &OnboardingCheckpoint,
         proposal: &OnboardingRepairProposal,
     ) -> Result<(), AppError> {
+        if c.manual_relay_edit && (c.append_relays || proposal.relay_repair.is_none()) {
+            return Err(onboarding_error());
+        }
         if let Some(repair) = &proposal.relay_repair {
+            if c.manual_relay_edit {
+                self.validate_onboarding_relay_selection(
+                    proposal.step,
+                    &proposal.read_relays,
+                    &proposal.write_relays,
+                    false,
+                )?;
+                let expected = relay_edits::manual_relay_edit(
+                    proposal.step,
+                    c.records[proposal.step.index()].as_ref(),
+                    &proposal.read_relays,
+                    &proposal.write_relays,
+                );
+                if expected.mode == OnboardingRelayRepairMode::ManualReview
+                    || *repair != expected
+                    || repair.original_event_id != proposal.previous_event_id
+                {
+                    return Err(onboarding_error());
+                }
+                return Ok(());
+            }
             let (expected, read_relays, write_relays) = self.minimal_relay_repair(
                 proposal.step,
                 c.records[proposal.step.index()].as_ref(),
@@ -2439,6 +2516,7 @@ impl AccountManager {
                 c.approved = false;
                 c.snapshot.proposal = None;
                 c.append_relays = false;
+                c.manual_relay_edit = false;
                 c.set(
                     proposal.step,
                     OnboardingStatus::RetryableFailure,

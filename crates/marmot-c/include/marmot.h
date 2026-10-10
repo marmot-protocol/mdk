@@ -8505,6 +8505,29 @@ MarmotStatus marmot_publish_user_profile(const struct MarmotClient *client,
                                          struct MarmotUserProfileMetadata **out);
 
 /**
+ * Create a fresh identity whose first public kind-0 is `profile`, returning
+ * at durable local readiness. Use this instead of
+ * `marmot_create_identity_with_profile` followed by
+ * `marmot_publish_user_profile` when onboarding collects a name, so
+ * contacts never see the generated default. Free with
+ * `marmot_identity_creation_result_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; `profile` a valid borrowed struct (never
+ * freed by the library); relay arrays must hold `len` valid strings (or be
+ * NULL with len 0); `out` valid.
+ */
+MarmotStatus marmot_create_identity_with_initial_profile(const struct MarmotClient *client,
+                                                         const struct MarmotUserProfileMetadata *profile,
+                                                         const char *const *default_relays,
+                                                         uintptr_t default_relays_len,
+                                                         const char *const *bootstrap_relays,
+                                                         uintptr_t bootstrap_relays_len,
+                                                         const char *const *inbox_relays,
+                                                         uintptr_t inbox_relays_len,
+                                                         struct MarmotIdentityCreationResult **out);
+
+/**
  * Replace the group's encrypted-media default blob endpoints as a full
  * component update. Requires admin. Free with
  * `marmot_send_summary_free`.

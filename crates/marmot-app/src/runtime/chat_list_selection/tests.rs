@@ -245,7 +245,7 @@ async fn dropping_last_handle_releases_the_actor_and_reset_receiver() {
         .unwrap();
     assert_eq!(
         f.app.presentation_signals.account_resets.receiver_count(),
-        before + 1
+        before + 2
     );
     drop(handle);
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -284,4 +284,82 @@ async fn cancelled_queued_deselection_does_not_change_intent() {
         }
     );
     handle.close();
+}
+
+#[tokio::test]
+async fn queued_success_is_discarded_at_delivery_after_terminal_transition() {
+    // A controlled responder makes the dangerous interval deterministic:
+    // success has been published, but the awaiting host has not consumed it.
+    for shutdown in [false, true] {
+        let (commands, mut received) = mpsc::channel(1);
+        let (closing, _) = watch::channel(false);
+        let (reset_tx, reset_rx) = broadcast::channel(4);
+        let lifecycle = RuntimeLifecycle::new();
+        let handle = ChatListSelectionHandle {
+            commands,
+            closing: Arc::new(closing),
+            lifecycle: lifecycle.clone(),
+            resets: Arc::new(Mutex::new(reset_rx)),
+            account_label: "alice".into(),
+        };
+        let call = handle.page(0, 0, 200);
+        tokio::pin!(call);
+        let command = tokio::select! {
+            command = received.recv() => command.unwrap(),
+            result = &mut call => panic!("returned before response: {result:?}"),
+        };
+        command
+            .reply
+            .send(Ok(ChatSelectionPage {
+                summary: ChatSelectionSummary {
+                    revision: 0,
+                    count: 1,
+                },
+                group_ids: vec!["0000".into()],
+            }))
+            .unwrap();
+        if shutdown {
+            lifecycle.begin_shutdown();
+        } else {
+            reset_tx.send("alice".into()).unwrap();
+        }
+        assert!(matches!(call.await, Err(ChatSelectionError::Closed)));
+        assert!(matches!(
+            handle.clone().count().await,
+            Err(ChatSelectionError::Closed)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn delivery_observer_ignores_other_accounts_but_fails_closed_on_lag() {
+    let f = Fixture::new(1);
+    let handle = f
+        .runtime
+        .capture_chat_list_selection("alice", ChatListView::Chats)
+        .await
+        .unwrap();
+    f.app
+        .presentation_signals
+        .account_resets
+        .send("bob".into())
+        .unwrap();
+    assert_eq!(handle.count().await.unwrap().count, 1);
+    // Even if the actor consumes these, the delivery cursor must independently
+    // retain evidence; a lost reset cannot authorize returning stale account IDs.
+    for _ in 0..65 {
+        f.app
+            .presentation_signals
+            .account_resets
+            .send("bob".into())
+            .unwrap();
+    }
+    assert!(matches!(
+        handle.ensure_open(),
+        Err(ChatSelectionError::Closed)
+    ));
+    assert!(matches!(
+        handle.clone().count().await,
+        Err(ChatSelectionError::Closed)
+    ));
 }

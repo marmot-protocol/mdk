@@ -17,6 +17,12 @@
   shutdown or explicit cancellation. Revalidation only removes IDs and does
   not grant mutation authority. Automatic-folder predicates remain separate.
 
+- `MarmotAppRuntime::create_identity_local_ready_with_initial_profile` makes a
+  caller-selected profile the first public kind-0 of a generated account, so
+  contacts never see the key-derived default name. A setup resumed past
+  its first local step ignores the profile and returns what its bootstrap
+  publishes.
+
 - `AccountManager::propose_onboarding_relay_repair` previews exact ordered
   tags, content and minimal relay changes without signing or publishing.
   Approval retains the existing revision and source-event checks; typed
@@ -51,6 +57,15 @@
   `relay.damus.io` can be invited again.
 
 ### Fixed
+
+- Explicit onboarding relay edits now preview and publish the selected endpoint
+  changes without rebuilding untouched tags: mixed NIP-65 roles, duplicate
+  occurrences, tag extensions, unrelated tags and event content survive, including
+  when a host supplies an equivalent URL spelling. No-op selections cannot publish. Approval revalidates the exact preview and current
+  endpoint policy; restart retries the same persisted signed event. Manual edit
+  checkpoints use version 7, which older readers reject; no database migration
+  or binding signature change is required. Follow-up to #1979.
+
 
 - File acquisition enforces disk reserve with or without resumable validators,
   saves interrupted ciphertext tails, retries a rejected resumed representation

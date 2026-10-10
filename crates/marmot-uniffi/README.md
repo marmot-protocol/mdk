@@ -348,8 +348,9 @@ Imported identities can use the durable preflight API instead of `login`:
    offers explicit editing instead of recommending an append that cannot add a write route.
    Relay findings are advisory once a usable outbox/inbox route is
    confirmed. Proposals require a policy-allowed write route (or inbox route);
-   reachability is checked after publication. Explicit relay selections replace
-   the list and require every selected endpoint to pass dial policy. Approval
+   reachability is checked after publication. Explicit relay selections edit known
+   endpoint roles, preserving retained tag occurrences and unrelated fields in a
+   typed preview, and require every selected endpoint to pass dial policy. Approval
    requires every configured discovery source to complete; failures from additional
    user-declared sources are tolerated only when the previous record is found.
    This bounded check cannot rule out newer records on unreachable or unqueried sources.
@@ -406,7 +407,13 @@ resuming an approved, unsigned proposal as a destructive replacement. Preparing
 an exact lossless relay repair upgrades the checkpoint to version 6, preserving
 that version through approval, signing and completion. Version 3/4/5 readers
 reject it rather than discard the typed preview and publish replacement tags.
-Downgrading once either format is used is unsupported; use a build that supports
+Explicit relay edits return the same typed before/after preview. Retained
+endpoint roles keep their original tag occurrences, order and extension fields,
+even when selected with equivalent URL spelling; unrelated tags and content remain unchanged. An unchanged selection returns
+`ManualReview` without an approval action. These manual previews use checkpoint
+version 7 because version 6 readers can only revalidate automatic minimal repairs.
+No binding signature changes are required. Downgrading once any of these formats
+is used is unsupported; use a build that supports
 the checkpoint version. Do not relabel versions or delete checkpoints to
 force a downgrade. Restore/upgrade to a supporting build, or explicitly recover
 unsupported evidence with this API.
