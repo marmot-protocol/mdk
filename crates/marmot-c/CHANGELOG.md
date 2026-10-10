@@ -9,6 +9,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Account attachment pages, bounded borrowed query inputs and opaque cursor/version handles with deep-free and version-clone functions. New records/symbols require matching headers and libraries; existing group history remains supported.
+
 - `marmot_create_identity_with_initial_profile` creates a generated identity
   whose first public kind-0 is the borrowed onboarding profile. New symbol;
   use the matching header and library.

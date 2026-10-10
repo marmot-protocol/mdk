@@ -25,6 +25,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [device-local membership events](#device-local-membership-events), [group reporting](#group-reporting),
   [history may be incomplete notices](#history-may-be-incomplete-notices)
 - Media: [file-backed media upload](#file-backed-media-upload),
+  [account attachment history](#account-attachment-history),
   [bounded attachment history](#bounded-attachment-history), [local attachment access](#local-attachment-access)
 - Audit logs: [audit v5 recording and delivery](#audit-v5-recording-and-delivery),
   [legacy audit v4 upload](#legacy-audit-v4-upload)
@@ -1105,3 +1106,7 @@ python3 crates/marmot-uniffi/measure-release-profile.py \
 Apple exporters use raw static-library slices and publish a matching privacy manifest for the consuming Swift target.
 See the [privacy audit and adoption guide](apple-privacy/README.md) for declarations, archive validation, host
 integration changes, and unresolved release questions.
+
+## Account attachment history
+
+`account_attachment_history_page` reads bounded indexed attachment candidates across one local account. Original album slots retain source identity and shared-parser metadata; group/sender selections and inclusive dates bind the cursor. Empty filtered pages may still continue, and destructive source changes require replacing loaded rows; additions offer a separate head refresh. Reads perform no acquisition or decryption. See [Account attachment history](ACCOUNT-ATTACHMENT-HISTORY.md) for integration and bounds.

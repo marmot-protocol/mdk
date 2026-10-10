@@ -71,6 +71,8 @@ pub use attachment_acquisition::{
     MAX_RETAINED_FILE_ATTACHMENT_BYTES, RetainedAttachmentAsset,
 };
 pub use attachment_history::{
+    AccountAttachmentCursor, AccountAttachmentEntry, AccountAttachmentHistoryError,
+    AccountAttachmentPage, AccountAttachmentQuery, AccountAttachmentVersion,
     AttachmentHistoryCursor, AttachmentHistoryEntry, AttachmentHistoryError, AttachmentHistoryPage,
     AttachmentHistoryVersion, MAX_ATTACHMENT_HISTORY_PAGE,
 };

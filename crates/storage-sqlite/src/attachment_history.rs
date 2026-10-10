@@ -242,40 +242,7 @@ impl SqliteAccountStorage {
                         message: r.get(4)?,
                         attachment_order: r.get(5)?,
                     };
-                    let json: String = r.get(12)?;
-                    let entry = AttachmentHistoryEntry {
-                        message_id_hex: key.message.clone(),
-                        attachment_index: usize::try_from(nonnegative(r, 6)?)
-                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, i64::MAX))?,
-                        source_message_id_hex: r.get(7)?,
-                        source_epoch: r
-                            .get::<_, Option<i64>>(8)?
-                            .map(|v| {
-                                u64::try_from(v)
-                                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(8, v))
-                            })
-                            .transpose()?,
-                        sender: r.get(9)?,
-                        timeline_at: nonnegative(r, 10)?,
-                        received_at: nonnegative(r, 11)?,
-                        emoji_tags: serde_json::from_str::<Vec<serde_json::Value>>(
-                            &r.get::<_, String>(13)?,
-                        )
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter_map(|tag| serde_json::from_value(tag).ok())
-                        .collect(),
-                        slot: serde_json::from_str(&json).map_err(|_| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                12,
-                                rusqlite::types::Type::Text,
-                                Box::new(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    "attachment index contains invalid JSON",
-                                )),
-                            )
-                        })?,
-                    };
+                    let entry = entry_from_row(r)?;
                     Ok((key, entry))
                 })
                 .storage()?
@@ -302,6 +269,51 @@ impl SqliteAccountStorage {
         })
     }
 }
+
+fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentHistoryEntry> {
+    let json: String = r.get(12)?;
+    let slot = serde_json::from_str(&json).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            12,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "attachment index contains invalid JSON",
+            )),
+        )
+    })?;
+    let emoji_tags = serde_json::from_str::<Vec<serde_json::Value>>(&r.get::<_, String>(13)?)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|tag| serde_json::from_value(tag).ok())
+        .collect();
+    entry_with_metadata(r, slot, emoji_tags)
+}
+
+fn entry_with_metadata(
+    r: &rusqlite::Row<'_>,
+    slot: serde_json::Value,
+    emoji_tags: Vec<Vec<String>>,
+) -> rusqlite::Result<AttachmentHistoryEntry> {
+    Ok(AttachmentHistoryEntry {
+        message_id_hex: r.get(4)?,
+        attachment_index: usize::try_from(nonnegative(r, 6)?)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, i64::MAX))?,
+        source_message_id_hex: r.get(7)?,
+        source_epoch: r
+            .get::<_, Option<i64>>(8)?
+            .map(|v| u64::try_from(v).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(8, v)))
+            .transpose()?,
+        sender: r.get(9)?,
+        timeline_at: nonnegative(r, 10)?,
+        received_at: nonnegative(r, 11)?,
+        emoji_tags,
+        slot,
+    })
+}
+
+mod account;
+pub use account::*;
 
 #[cfg(test)]
 mod tests;

@@ -4425,7 +4425,7 @@ must enforce those separately and bound any untrusted JSON before passing it.
 </details>
 
 <details>
-<summary>New exports — complete and organize before merging</summary>
+<summary>Audit v5 tracker and configuration</summary>
 
 ### `Marmot::post_audit_log_tracker_update_v5`
 
@@ -4446,5 +4446,40 @@ pub fn set_audit_otlp_config_v5( &self, mut config: AuditOtlpConfigV5Ffi, ) -> R
 Install or remove an in-memory v5 OTLP audit destination. With `enabled: true`, provide a stable destination identity, an HTTPS `/v1/logs` endpoint, and a bearer token; local loopback testing additionally requires `allow_loopback_dev: true`. The returned configuration always omits the token. With `enabled: false`, the runtime clears the sender. This does not enable recording, change the v4 Goggles route, or persist credentials. A configuration change fences in-flight acknowledgments.
 
 [Source](src/commands/audit.rs#L54)
+
+</details>
+
+<details>
+<summary>Account attachment history</summary>
+
+### `AccountAttachmentVersion::change_since`
+
+```rust
+pub fn change_since( &self, previous: Arc<AccountAttachmentVersion>, ) -> AttachmentHistoryChangeFfi
+```
+
+Compare a freshly read account version with the original loaded-page baseline. RestartRequired discards loaded rows; Additions offers a head refresh while old-page cursors remain valid. The opaque value is not a row count; retain it in memory only.
+
+[Source](src/conversions/account_attachment_history.rs#L33)
+
+### `Marmot::account_attachment_history_page`
+
+```rust
+pub async fn account_attachment_history_page( &self, account_ref: String, query: AccountAttachmentQueryFfi, limit: u32, cursor: Option<Arc<AccountAttachmentCursor>>, ) -> Result<AccountAttachmentPageReadFfi, MarmotKitError>
+```
+
+Read at most 100 indexed attachment candidates across one local account with group, sender and inclusive date constraints. Empty filtered pages can have a continuation. Keep handles in memory, replace pages on RestartRequired, and use the typed metadata with the existing on-demand open/download APIs. See [Account attachment history](ACCOUNT-ATTACHMENT-HISTORY.md) for bounds and ownership.
+
+[Source](src/commands/account_attachment_history.rs#L7)
+
+### `Marmot::account_attachment_history_version`
+
+```rust
+pub async fn account_attachment_history_version( &self, account_ref: String, ) -> Result<Arc<AccountAttachmentVersion>, MarmotKitError>
+```
+
+Read the constant-work local account attachment change token, including after exhaustion. No network, acquisition or decryption starts. Keep the original loaded-page baseline and compare it using change_since; replace rows on RestartRequired and offer refresh on Additions.
+
+[Source](src/commands/account_attachment_history.rs#L26)
 
 </details>

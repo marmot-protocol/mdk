@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Account-wide attachment candidate pages, group/sender/date queries and opaque account/query-bound cursor/version handles. Filtered empty pages can continue; source changes require restart. Existing group history and acquisition primitives are unchanged.
+
 ### Breaking changes
 
 - `OnboardingRepairProposalFfi.relay_repair` is a new optional field without
