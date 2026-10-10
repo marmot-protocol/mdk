@@ -55,6 +55,8 @@ struct WireCounts {
     comparisons: AtomicUsize,
     drop_requests: AtomicBool,
     suppress_events: AtomicBool,
+    /// Event IDs (hex) this relay claims but never sends.
+    suppress_ids: Mutex<HashSet<String>>,
     extra_event_copies: AtomicUsize,
     /// Simulated round trip: each client frame reaches the relay this long
     /// after it was sent, in order, without delaying the frames behind it.
@@ -136,7 +138,11 @@ async fn counted_proxy(backend: String) -> (String, Arc<WireCounts>) {
                                 counts
                                     .sent_event_json
                                     .fetch_add(payload_bytes, Ordering::SeqCst);
-                                if counts.suppress_events.load(Ordering::SeqCst) {
+                                if counts.suppress_events.load(Ordering::SeqCst)
+                                    || event.get("id").and_then(Value::as_str).is_some_and(|id| {
+                                        counts.suppress_ids.lock().unwrap().contains(id)
+                                    })
+                                {
                                     continue;
                                 }
                                 for _ in 0..counts.extra_event_copies.load(Ordering::SeqCst) {
@@ -448,9 +454,197 @@ async fn large_gap_of_small_events_recovers_in_few_passes() {
         elapsed.as_millis()
     );
     assert_eq!(seen, wanted, "every missing event is recovered");
+    assert!(
+        requests < MISSING,
+        "batched recovery used {requests} requests for {MISSING} events"
+    );
     sdk.client().shutdown().await;
     left.shutdown();
     right.shutdown();
+}
+
+fn relay_database() -> MemoryDatabase {
+    MemoryDatabase::with_opts(MemoryDatabaseOptions {
+        events: true,
+        max_events: Some(8_192),
+    })
+}
+
+async fn sdk_on(urls: &[String]) -> NostrSdkRelayClient {
+    let sdk = NostrSdkRelayClient::new(Client::builder().build());
+    for url in urls {
+        sdk.client().add_relay(url.as_str()).await.unwrap();
+    }
+    sdk.client().connect().await;
+    sdk
+}
+
+/// Events signed by a fresh key until `accept` holds for the ID order, so a
+/// test can rely on which ID a pass requests first.
+fn events_with_id_order(
+    specs: &[(usize, u64)],
+    accept: impl Fn(&[nostr_sdk::prelude::Event]) -> bool,
+) -> Vec<nostr_sdk::prelude::Event> {
+    loop {
+        let keys = Keys::generate();
+        let events = specs
+            .iter()
+            .enumerate()
+            .map(|(index, (size, created_at))| {
+                EventBuilder::new(
+                    Kind::MlsGroupMessage,
+                    format!("{index}-{}", "x".repeat(*size)),
+                )
+                .tags([Tag::custom("h", [hex::encode(ROUTE)])])
+                .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(*created_at))
+                .finalize(&keys)
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        if accept(&events) {
+            return events;
+        }
+    }
+}
+
+/// Two relays that claim the same batch can each return a different event
+/// within their own limits. What the pass returns is the union, and it must
+/// still fit the pass allowance; the event that does not fit leads the next
+/// pass.
+#[tokio::test]
+async fn complementary_relay_results_share_one_pass_allowance() {
+    // A small event first in ID order, then two 600-KiB events in one batch.
+    let events = events_with_id_order(
+        &[
+            (1_024, 1_700_000_000),
+            (600 * 1024, 1_700_000_001),
+            (600 * 1024, 1_700_000_002),
+        ],
+        |events| events[0].id < events[1].id && events[0].id < events[2].id,
+    );
+    let database = relay_database();
+    for event in &events {
+        database
+            .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+            .await
+            .unwrap();
+    }
+    let left = LocalRelay::new(RelayBuilder::default().database(database.clone()));
+    let right = LocalRelay::new(RelayBuilder::default().database(database));
+    left.run().await.unwrap();
+    right.run().await.unwrap();
+    let (left_url, left_counts) = counted_proxy(left.url().await.to_string()).await;
+    let (right_url, right_counts) = counted_proxy(right.url().await.to_string()).await;
+    // Both relays claim all three; each serves only one of the large ones.
+    left_counts
+        .suppress_ids
+        .lock()
+        .unwrap()
+        .insert(events[2].id.to_hex());
+    right_counts
+        .suppress_ids
+        .lock()
+        .unwrap()
+        .insert(events[1].id.to_hex());
+    let urls = vec![left_url, right_url];
+    let sdk = sdk_on(&urls).await;
+    let route = subscription(&urls);
+    let cursor = Cursor::default();
+    let (_, first) = sdk
+        .reconcile_subscription(route.clone(), &[], 0, u64::MAX, &cursor)
+        .await
+        .unwrap();
+    assert!(
+        returned_json_bytes(&first) <= PASS_BYTE_BUDGET,
+        "one pass returned {} bytes",
+        returned_json_bytes(&first)
+    );
+    assert_eq!(first.len(), 2, "the small event and one large event fit");
+    let admitted = first
+        .iter()
+        .map(|event| NostrReconciliationItem {
+            event_id: hex::decode(&event.event.id).unwrap().try_into().unwrap(),
+            created_at: event.event.created_at,
+        })
+        .collect::<Vec<_>>();
+    let (_, second) = sdk
+        .reconcile_subscription(route, &admitted, 0, u64::MAX, &cursor)
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 1, "the deferred large event arrives next");
+    assert!(
+        first
+            .iter()
+            .all(|event| event.event.id != second[0].event.id)
+    );
+    sdk.client().shutdown().await;
+    left.shutdown();
+    right.shutdown();
+}
+
+/// A large event a batch's byte limit cuts off, behind smaller batch-mates the
+/// relay sends first, leads the next pass, where it fits as a one-ID request
+/// under the single-object ceiling.
+#[tokio::test]
+async fn large_event_cut_from_a_batch_leads_the_next_pass() {
+    // Thirty 80-KiB events, which the relay sends before the older large
+    // one, and a 4.5-MiB event that falls in the first batch after the
+    // pass's one-ID first request (about eleven IDs at this size) without
+    // being that first request. Smaller events remain after the batch, so a
+    // cursor left past the batch would not come back to the large one soon.
+    let mut specs = (0..30)
+        .map(|index| (80 * 1024, 1_700_000_100 + index))
+        .collect::<Vec<_>>();
+    specs.push((4 * 1024 * 1024 + 512 * 1024, 1_700_000_000));
+    let events = events_with_id_order(&specs, |events| {
+        let rank = events[..30]
+            .iter()
+            .filter(|small| small.id < events[30].id)
+            .count();
+        (1..=10).contains(&rank)
+    });
+    let large_id = events[30].id;
+    let database = relay_database();
+    for event in &events {
+        database
+            .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+            .await
+            .unwrap();
+    }
+    let relay = LocalRelay::new(RelayBuilder::default().database(database));
+    relay.run().await.unwrap();
+    let (url, _) = counted_proxy(relay.url().await.to_string()).await;
+    let sdk = sdk_on(std::slice::from_ref(&url)).await;
+    let route = subscription(&[url]);
+    let cursor = Cursor::default();
+    let (_, first) = sdk
+        .reconcile_subscription(route.clone(), &[], 0, u64::MAX, &cursor)
+        .await
+        .unwrap();
+    assert!(
+        first
+            .iter()
+            .all(|event| event.event.id != large_id.to_hex())
+    );
+    let admitted = first
+        .iter()
+        .map(|event| NostrReconciliationItem {
+            event_id: hex::decode(&event.event.id).unwrap().try_into().unwrap(),
+            created_at: event.event.created_at,
+        })
+        .collect::<Vec<_>>();
+    let (_, second) = sdk
+        .reconcile_subscription(route, &admitted, 0, u64::MAX, &cursor)
+        .await
+        .unwrap();
+    assert!(
+        second
+            .iter()
+            .any(|event| event.event.id == large_id.to_hex()),
+        "the cut-off large event arrives on the next pass"
+    );
+    sdk.client().shutdown().await;
+    relay.shutdown();
 }
 
 async fn one_missing_event_fixture() -> (

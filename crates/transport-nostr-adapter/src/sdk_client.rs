@@ -1055,6 +1055,11 @@ impl NostrSdkRelayClient {
         let mut sdk_events = Vec::new();
         let mut spent_items = 0usize;
         let mut spent_bytes = 0usize;
+        // The distinct events this pass returns. With several IDs per request,
+        // different relays can each return a different event within their own
+        // limits, so the union is bounded by the same pass allowance.
+        let mut returned_items = 0usize;
+        let mut returned_bytes = 0usize;
         let mut returned_ids = HashSet::new();
         let mut requests = 0usize;
         // The largest event JSON this pass has returned. A relay streams every
@@ -1121,6 +1126,8 @@ impl NostrSdkRelayClient {
                 progress.save_cursor(Some(event_id.to_bytes()))?;
                 spent_items += 1;
                 spent_bytes += event_bytes;
+                returned_items += 1;
+                returned_bytes += event_bytes;
                 largest_event_bytes = largest_event_bytes.max(event_bytes);
                 returned_ids.insert(event_id.to_hex());
                 sdk_events.push((
@@ -1203,7 +1210,9 @@ impl NostrSdkRelayClient {
                     remote_ids.next();
                 }
             }
-            progress.save_cursor(batch.last().map(|id| id.to_bytes()))?;
+            // Save only the first ID before I/O, as a one-ID request did; the
+            // response decides how far past it the cursor moves.
+            progress.save_cursor(Some(event_id.to_bytes()))?;
             requests += 1;
             let result = self
                 .acquire_history(
@@ -1239,6 +1248,7 @@ impl NostrSdkRelayClient {
             let mut request_items = 0usize;
             let mut request_bytes = 0usize;
             let mut limited = false;
+            let mut answered_by_any = false;
             let wanted_ids = batch.iter().map(|id| id.to_hex()).collect::<HashSet<_>>();
             for (endpoint, outcome) in claimants.iter().zip(result.endpoints) {
                 request_items = request_items.max(outcome.stats.received_items);
@@ -1260,6 +1270,7 @@ impl NostrSdkRelayClient {
                         | NostrAcquisitionEnd::ItemLimitReached
                         | NostrAcquisitionEnd::ByteLimitReached
                 );
+                answered_by_any |= answered;
                 if !answered {
                     failed_endpoints.insert(endpoint.clone());
                 } else if claimed_id_missing
@@ -1275,39 +1286,62 @@ impl NostrSdkRelayClient {
                     if returned_ids.contains(&event.id) {
                         continue;
                     }
-                    // SDK stats charge every received EVENT before accepting
-                    // it, using the same event JSON length. The maximum
-                    // endpoint cost therefore dominates this deduped batch.
-                    largest_event_bytes = largest_event_bytes.max(event_json_bytes(&event));
+                    // Each endpoint stayed within its own limits, but relays
+                    // can return different events; the union must fit the
+                    // pass allowance too. An event it cannot fit stays
+                    // unreturned and leads the next pass.
+                    let event_bytes = event_json_bytes(&event);
+                    if returned_items >= SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT
+                        || returned_bytes.saturating_add(event_bytes) > byte_allowance
+                    {
+                        limited = true;
+                        continue;
+                    }
+                    returned_items += 1;
+                    returned_bytes += event_bytes;
+                    largest_event_bytes = largest_event_bytes.max(event_bytes);
                     returned_ids.insert(event.id.clone());
                     sdk_events.push((endpoint.clone(), event));
                 }
             }
-            spent_items = spent_items.saturating_add(request_items);
-            spent_bytes = spent_bytes.saturating_add(request_bytes);
+            spent_items = spent_items
+                .saturating_add(request_items)
+                .max(returned_items);
+            spent_bytes = spent_bytes
+                .saturating_add(request_bytes)
+                .max(returned_bytes);
             if largest_event_bytes == 0 {
                 unsized_batch = (unsized_batch * 2).min(SDK_RECONCILIATION_MAX_IDS_PER_REQUEST);
             }
             let first_unreturned = batch
                 .iter()
                 .position(|id| !returned_ids.contains(&id.to_hex()));
-            if let Some(position) = first_unreturned
-                && !single_object_request
-                && limited
-                && request_bytes <= SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES
-            {
-                // This request ran into the room left after earlier results.
-                // Keep the pre-I/O save for cancellation, but after a
-                // completed bounded rejection let the first ID it left
-                // unreturned lead the next pass, even if an earlier result
-                // stays unadmitted. An object beyond the single-event ceiling
-                // still rotates.
-                let cursor = match position {
-                    0 => prior_cursor,
-                    _ => Some(batch[position - 1].to_bytes()),
-                };
-                progress.save_cursor(cursor)?;
-                break;
+            match first_unreturned {
+                None => progress.save_cursor(batch.last().map(|id| id.to_bytes()))?,
+                // A budget cut this request short: the first ID it left
+                // unreturned leads the next pass, where it is the one-ID first
+                // request with the single-object allowance, even if an earlier
+                // result stays unadmitted. A one-ID first request that is cut
+                // short is over that ceiling and rotates.
+                Some(position) if limited && !single_object_request => {
+                    progress.save_cursor(match position {
+                        0 => prior_cursor,
+                        _ => Some(batch[position - 1].to_bytes()),
+                    })?;
+                    break;
+                }
+                // No relay answered: advance through what returned, at least
+                // the first ID, and leave the rest of the batch to the next
+                // pass, as one-ID requests did after a timeout.
+                Some(position) if !answered_by_any => {
+                    if position > 0 {
+                        progress.save_cursor(Some(batch[position - 1].to_bytes()))?;
+                    }
+                    break;
+                }
+                // Relays answered without some IDs: those rotate, as a withheld
+                // one-ID request did.
+                Some(_) => progress.save_cursor(batch.last().map(|id| id.to_bytes()))?,
             }
             if spent_bytes > SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT {
                 // A first oversized result, or expensive duplicate/boundary

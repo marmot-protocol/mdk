@@ -98,8 +98,9 @@ and legacy installation/removal APIs retain their shape and ids.
 
 `NostrSdkRelayClient::reconcile_subscription` requires a `NostrReconciliationProgress` store for
 that account and route. Hosts serialize reconciliation per route and preserve its cursor across
-subscription rebuilds. Each selected ID is checkpointed before its exact-ID request, including
-when the caller later cancels. An ID left unattempted by the pass budget does not move the cursor.
+subscription rebuilds. The first ID of each exact-ID request is checkpointed before the request,
+including when the caller later cancels; after the response the cursor moves through the IDs that
+returned. An ID left unattempted by the pass budget does not move the cursor.
 A failed progress read or write stops replay; it must not silently restart at a refused prefix.
 Empty remote sets preserve the cursor: failed relay comparisons can also produce an empty set, and
 the next nonempty set wraps around the saved position.
@@ -117,12 +118,13 @@ Pass budgets:
   consecutive IDs the same endpoints claimed, sized to the byte room left at the largest event the pass has seen,
   because a relay streams every event a request names before the byte limit can stop it. Until an event has
   returned, batches start at one ID and double. When a budget cuts a request short, its first unreturned ID leads
-  the next pass.
+  the next pass; when no relay answers, the pass stops after advancing through what returned, at least one ID.
 - One event up to 5 MiB can occupy an otherwise empty pass, matching the pinned SDK's default normalized-message
   ceiling; larger events remain incomplete. Full-event SDK cache hits share this rule with fetched events.
 - The first exact-ID request may temporarily retain up to 5 MiB per endpoint before deduplication, and the SDK can
   observe one rejected boundary event beyond its byte limit. The largest endpoint's received count/bytes
-  conservatively charges each network request.
+  conservatively charges each network request. Relays can return different events from one batch, so the
+  distinct events a pass returns are held to the same allowance; one that does not fit leads the next pass.
 - These are returned-result and SDK-received budgets, not complete wire or memory ceilings.
 
 Each exact-ID request goes only to the endpoints whose comparison claimed that ID, and
