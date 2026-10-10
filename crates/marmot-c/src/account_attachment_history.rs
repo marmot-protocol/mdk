@@ -5,7 +5,7 @@ use crate::macros::c_mirror;
 use crate::memory::{
     CFree, boxed, boxed_opt, free_boxed, free_guard, free_vec, owned_vec, required_str, str_array,
 };
-use crate::{MarmotClient, MarmotStatus, check_out, client_ref, ffi_guard, preflight_out_ptr};
+use crate::{MarmotClient, MarmotStatus, client_ref, ffi_guard, preflight_out, preflight_out_ptr};
 use marmot_uniffi::conversions::*;
 use std::{ffi::c_char, sync::Arc};
 pub struct MarmotAccountAttachmentCursor {
@@ -217,7 +217,7 @@ pub unsafe extern "C" fn marmot_account_attachment_version_change_since(
     out: *mut u32,
 ) -> MarmotStatus {
     ffi_guard(|| {
-        try_arg!(unsafe { check_out(out) });
+        try_arg!(unsafe { preflight_out(out) });
         let Some(current) = (unsafe { current.as_ref() }) else {
             return MarmotStatus::NullPointer;
         };
@@ -235,6 +235,21 @@ pub unsafe extern "C" fn marmot_account_attachment_version_change_since(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn version_comparison_clears_stale_output_on_invalid_handles() {
+        let mut output = u32::MAX;
+        assert_eq!(
+            unsafe {
+                marmot_account_attachment_version_change_since(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &mut output,
+                )
+            },
+            MarmotStatus::NullPointer
+        );
+        assert_eq!(output, 0);
+    }
     #[test]
     fn rejects_null_output_before_touching_inputs_and_bounds_borrowed_arrays() {
         assert_eq!(
