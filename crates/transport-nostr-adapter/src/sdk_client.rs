@@ -125,10 +125,19 @@ struct AcquisitionRouteMemory {
     /// density of the events the last window returned, or the distance to
     /// the nearest bound found too large.
     window_step: Option<u64>,
+    /// The upper bound of a search that did not finish: the next pass probes
+    /// between `window_until` and it first.
+    search_high: Option<u64>,
+    /// Passes in a row whose search did not finish.
+    unfinished_passes: u8,
+    /// The average event size this route returned last, so a window fits the
+    /// byte allowance as well as the item count.
+    event_bytes: Option<usize>,
     /// IDs a pass fetched, or asked for and was answered without, that the
     /// account has not admitted since, in the order they were set aside. They
     /// yield to history not tried yet, so events that can never be admitted
-    /// cannot hold the oldest window.
+    /// cannot hold the oldest window. Once it is full the route uses ID-order
+    /// selection, which cannot stall behind them.
     set_aside: VecDeque<EventId>,
 }
 
@@ -138,22 +147,54 @@ struct AcquisitionRouteKey {
     transport_group_id: Vec<u8>,
 }
 
-/// The oldest part of a route's gap that one pass fetches, or, when the search
-/// ran out of rounds, the narrowest window found that still holds more.
-struct OldestWindow {
-    ids: HashSet<EventId>,
-    /// The largest probed bound whose window fit a pass, and the smallest
-    /// whose window did not.
-    fits_until: Option<u64>,
-    over_until: Option<u64>,
+/// What a window search found.
+enum WindowSearch {
+    /// A non-empty window of at most one pass: `[since, until]` holds `ids`.
+    Fits {
+        until: u64,
+        ids: HashSet<EventId>,
+        over_until: Option<u64>,
+    },
+    /// No such window in the rounds and time allowed. The window up to `low`
+    /// fits, the one up to `high` holds `over_ids`, more than a pass.
+    Unfinished {
+        low: u64,
+        high: u64,
+        over_ids: HashSet<EventId>,
+    },
 }
 
 /// Where an earlier pass left the window search: a bound whose window still
-/// fits one pass, and how far past it to probe first.
+/// fits one pass, how far past it to probe first, and the upper bound of a
+/// search it did not finish.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WindowSeed {
     low: u64,
     step: Option<u64>,
+    high: Option<u64>,
+}
+
+/// How a pass leaves a route's window search.
+enum AcquisitionUpdate {
+    Fits {
+        until: u64,
+        step: Option<u64>,
+    },
+    /// `skipped`: the pass fetched nothing to let the next one resume.
+    Unfinished {
+        low: u64,
+        high: u64,
+        skipped: bool,
+    },
+    None,
+}
+
+/// IDs one pass can fetch when events average `event_bytes`.
+fn window_target(event_bytes: Option<usize>) -> usize {
+    event_bytes.map_or(SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT, |bytes| {
+        (SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT * 4 / 5 / bytes.max(1))
+            .clamp(1, SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT)
+    })
 }
 
 /// Candidate upper bounds for one round of the window search, within
@@ -172,6 +213,8 @@ fn window_probes(
     target: usize,
     first_round_step: Option<Option<u64>>,
 ) -> Vec<u64> {
+    // `Some(Some(step))`: seeded first round; `Some(None)`: unseeded first
+    // round; `None`: a later round, or a first round resuming a bracket.
     let width = high.saturating_sub(low);
     let probes_wanted = SDK_RECONCILIATION_WINDOW_PROBES as u64;
     let mut probes = match first_round_step {
@@ -575,6 +618,9 @@ pub struct NostrSdkRelayClient {
     /// Advisory per-route hints for oldest-first acquisition. A std lock,
     /// never held across an await.
     acquisition_memory: Arc<StdMutex<HashMap<AcquisitionRouteKey, AcquisitionRouteMemory>>>,
+    /// Test-only: select every route in ID order, to exercise the cursor alone.
+    #[cfg(test)]
+    id_order_only: bool,
 }
 
 /// An aborted public forwarder must not detach a blocked delivery child. It
@@ -807,6 +853,8 @@ impl NostrSdkRelayClient {
             publish_relay_pin_failure_stage: Arc::new(AtomicU8::new(0)),
             registration_log: Arc::new(Mutex::new(HashMap::new())),
             acquisition_memory: Arc::default(),
+            #[cfg(test)]
+            id_order_only: false,
         }
     }
 
@@ -1181,7 +1229,12 @@ impl NostrSdkRelayClient {
         // end. MLS applies commits in order, and IDs picked in ID order could
         // let commits carry the epoch more than the retained-epoch window past
         // older messages still missing, which can then never be read (#2086).
+        #[cfg(test)]
+        let id_order_only = self.id_order_only;
+        #[cfg(not(test))]
+        let id_order_only = false;
         let route_key = match &subscription {
+            _ if id_order_only => None,
             NostrSubscription::Group {
                 account_id,
                 transport_group_id,
@@ -1192,34 +1245,83 @@ impl NostrSdkRelayClient {
             }),
             _ => None,
         };
-        let (window_seed, set_aside) = route_key
+        let (window_seed, event_bytes, unfinished_passes, set_aside) = route_key
             .as_ref()
             .map(|key| self.acquisition_memory_for(key, &remote))
             .unwrap_or_default();
-        let window = match &route_key {
-            Some(_) if remote.len() > SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT => {
+        let skip = set_aside.iter().copied().collect::<HashSet<_>>();
+        let target = window_target(event_bytes);
+        let answering = remote_by_endpoint.keys().cloned().collect::<Vec<_>>();
+        let mut acquisition_update = AcquisitionUpdate::None;
+        let mut skip_pass = false;
+        // The fresh IDs this pass fetches oldest-first, when it does.
+        let window: Option<HashSet<EventId>> = match &route_key {
+            // More IDs set aside than the route keeps out of the way: ID-order
+            // selection reaches every one of them in turn and cannot stall.
+            Some(_) if set_aside.len() >= SDK_RECONCILIATION_SET_ASIDE_IDS => None,
+            // A gap within one pass by count is still one window: its bytes
+            // may not fit, and then only a time prefix may be returned.
+            Some(_) if remote.len() - remote.intersection(&skip).count() <= target => {
+                Some(remote.difference(&skip).copied().collect())
+            }
+            Some(_) => {
                 // Narrowing may spend half of what is left; fetching keeps the rest.
                 let now = tokio::time::Instant::now();
                 let narrowing_deadline = now + deadline.saturating_duration_since(now) / 2;
-                let answering = remote_by_endpoint.keys().cloned().collect::<Vec<_>>();
-                self.oldest_window(
-                    &plan.filter,
-                    &answering,
-                    &items,
-                    &options,
-                    (reconcile_since, reconcile_until),
-                    &remote,
-                    &set_aside,
-                    window_seed,
-                    narrowing_deadline,
-                )
-                .await
+                match self
+                    .oldest_window(
+                        &plan.filter,
+                        &answering,
+                        &items,
+                        &options,
+                        (reconcile_since, reconcile_until),
+                        &remote,
+                        &set_aside,
+                        target,
+                        window_seed,
+                        narrowing_deadline,
+                    )
+                    .await
+                {
+                    None => None,
+                    Some(WindowSearch::Fits {
+                        until,
+                        ids,
+                        over_until,
+                    }) => {
+                        acquisition_update = AcquisitionUpdate::Fits {
+                            until,
+                            step: over_until.map(|over| over.saturating_sub(until)),
+                        };
+                        Some(ids)
+                    }
+                    // Fetching a window that holds more than a pass would
+                    // return part of it in ID order, the race of #2086. Wait
+                    // one pass for the search to finish from where it
+                    // stopped, unless its bracket can no longer shrink, or the
+                    // previous pass already waited.
+                    Some(WindowSearch::Unfinished {
+                        low,
+                        high,
+                        over_ids,
+                    }) => {
+                        let fetch_anyway = high.saturating_sub(low) <= 1 || unfinished_passes >= 1;
+                        acquisition_update = AcquisitionUpdate::Unfinished {
+                            low,
+                            high,
+                            skipped: !fetch_anyway,
+                        };
+                        skip_pass = !fetch_anyway;
+                        (fetch_anyway && !over_ids.is_empty()).then_some(over_ids)
+                    }
+                }
             }
-            _ => None,
+            None => None,
         };
         let remote_ids = match &window {
+            _ if skip_pass => Vec::new(),
             Some(window) => oldest_first_remote_ids(
-                &window.ids,
+                window,
                 &set_aside,
                 |id| {
                     endpoints
@@ -1237,9 +1339,26 @@ impl NostrSdkRelayClient {
             )?,
             None => select_reconciliation_remote_ids(&remote, progress)?,
         };
+        // An oldest-first pass keeps a little time to work out which part of
+        // a window cut short it may return.
+        let fetch_deadline = match &window {
+            Some(_) => {
+                let reserve = deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .div_f32(5.0)
+                    .min(Duration::from_millis(400));
+                deadline.checked_sub(reserve).unwrap_or(deadline)
+            }
+            None => deadline,
+        };
         drop(remote);
         // Requested IDs every claimant answered without.
         let mut withheld = HashSet::new();
+        // IDs this pass tried, and those a budget cut short. The next pass
+        // leads with what a budget cut and continues with what was never
+        // tried; anything else it tried and did not get, it may never get.
+        let mut attempted = HashSet::new();
+        let mut cut_short = HashSet::new();
         let mut sdk_events = Vec::new();
         let mut spent_items = 0usize;
         let mut spent_bytes = 0usize;
@@ -1275,7 +1394,7 @@ impl NostrSdkRelayClient {
         };
         let mut remote_ids = remote_ids.into_iter().peekable();
         while let Some(event_id) = remote_ids.next() {
-            if tokio::time::Instant::now() >= deadline {
+            if tokio::time::Instant::now() >= fetch_deadline {
                 out_of_time = true;
                 break;
             }
@@ -1304,6 +1423,7 @@ impl NostrSdkRelayClient {
                         // This object can never fit the pass allowance. Rotate
                         // past it so smaller missing IDs remain reachable;
                         // durable inventory still keeps it eligible on wrap.
+                        attempted.insert(event_id);
                         progress.save_cursor(Some(event_id.to_bytes()))?;
                         continue;
                     }
@@ -1311,6 +1431,7 @@ impl NostrSdkRelayClient {
                     // the first candidate on the next pass.
                     break;
                 }
+                attempted.insert(event_id);
                 progress.save_cursor(Some(event_id.to_bytes()))?;
                 spent_items += 1;
                 spent_bytes += event_bytes;
@@ -1348,7 +1469,8 @@ impl NostrSdkRelayClient {
                 SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT
             };
             let remaining_bytes = byte_allowance.saturating_sub(spent_bytes);
-            let remaining_time = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining_time =
+                fetch_deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining_items == 0 || remaining_bytes == 0 || remaining_time.is_zero() {
                 out_of_time |= remaining_time.is_zero();
                 break;
@@ -1512,6 +1634,15 @@ impl NostrSdkRelayClient {
                         .copied(),
                 );
             }
+            attempted.extend(batch.iter().copied());
+            if limited && !single_object_request {
+                cut_short.extend(
+                    batch
+                        .iter()
+                        .filter(|id| !returned_ids.contains(&id.to_hex()))
+                        .copied(),
+                );
+            }
             let first_unreturned = batch
                 .iter()
                 .position(|id| !returned_ids.contains(&id.to_hex()));
@@ -1547,6 +1678,48 @@ impl NostrSdkRelayClient {
                 // traffic, consumes this pass. Failed endpoints remain marked
                 // while the unattempted suffix stays retryable.
                 break;
+            }
+        }
+        // A window the budget or deadline cut short returns only a time
+        // prefix: no event newer than one it left behind, or the older one
+        // could arrive after commits that carry the epoch past it. Events held
+        // back are fetched again; the cursor already leads with what was left.
+        let fetched_event_bytes =
+            (!sdk_events.is_empty()).then(|| returned_bytes / sdk_events.len().max(1));
+        if let Some(window) = &window {
+            // Only what the next pass will fetch holds delivery back: an event
+            // over the single-object ceiling, one every relay withheld, or one
+            // only an unreachable relay claims must not stall the rest.
+            let left_behind = window
+                .iter()
+                .filter(|id| {
+                    !returned_ids.contains(&id.to_hex())
+                        && (!attempted.contains(*id) || cut_short.contains(*id))
+                })
+                .copied()
+                .collect::<HashSet<_>>();
+            if !left_behind.is_empty()
+                && !sdk_events.is_empty()
+                && let Some(boundary) = self
+                    .delivery_boundary(
+                        &plan.filter,
+                        &answering,
+                        &items,
+                        &options,
+                        reconcile_since,
+                        sdk_events.iter().map(|(_, event)| event.created_at),
+                        &left_behind,
+                        deadline,
+                    )
+                    .await
+            {
+                sdk_events.retain(|(_, event)| {
+                    let keep = event.created_at <= boundary;
+                    if !keep {
+                        returned_ids.remove(&event.id);
+                    }
+                    keep
+                });
             }
         }
         // An ID an endpoint claimed but this pass did not return is still debt
@@ -1586,21 +1759,17 @@ impl NostrSdkRelayClient {
                 .min()
                 .zip(sdk_events.iter().map(|(_, event)| event.created_at).max())
                 .map(|(oldest, newest)| {
-                    ((newest - oldest).max(1) as f64
-                        * SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT as f64
-                        / sdk_events.len() as f64) as u64
+                    ((newest - oldest).max(1) as f64 * target as f64 / sdk_events.len() as f64)
+                        as u64
                 });
-            self.remember_acquisition(
-                key,
-                window.map(|window| {
-                    let bracket_step = window
-                        .fits_until
-                        .zip(window.over_until)
-                        .map(|(fits, over)| over.saturating_sub(fits));
-                    (window.fits_until, density_step.or(bracket_step))
-                }),
-                tried,
-            );
+            let update = match acquisition_update {
+                AcquisitionUpdate::Fits { until, step } => AcquisitionUpdate::Fits {
+                    until,
+                    step: density_step.or(step),
+                },
+                other => other,
+            };
+            self.remember_acquisition(key, update, fetched_event_bytes, tried);
         }
         // Negentropy reports a set. MLS input is sequential, so replay the
         // materialized difference in the same authored-time/id order used by
@@ -1636,32 +1805,40 @@ impl NostrSdkRelayClient {
         Ok((summary, remote_events))
     }
 
-    /// The route's last window bound and the IDs still in `remote` that
-    /// earlier passes set aside, pruning the ones since admitted.
+    /// Where the route's window search left off, its typical event size, the
+    /// passes in a row its search did not finish, and the IDs still in
+    /// `remote` that earlier passes set aside, pruning the ones since admitted.
     fn acquisition_memory_for(
         &self,
         key: &AcquisitionRouteKey,
         remote: &HashSet<EventId>,
-    ) -> (Option<WindowSeed>, Vec<EventId>) {
+    ) -> (Option<WindowSeed>, Option<usize>, u8, Vec<EventId>) {
         let mut memory = self
             .acquisition_memory
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let Some(route) = memory.get_mut(key) else {
-            return (None, Vec::new());
+            return (None, None, 0, Vec::new());
         };
         route.set_aside.retain(|id| remote.contains(id));
         let seed = route.window_until.map(|low| WindowSeed {
             low,
             step: route.window_step,
+            high: route.search_high,
         });
-        (seed, route.set_aside.iter().copied().collect())
+        (
+            seed,
+            route.event_bytes,
+            route.unfinished_passes,
+            route.set_aside.iter().copied().collect(),
+        )
     }
 
     fn remember_acquisition(
         &self,
         key: AcquisitionRouteKey,
-        window: Option<(Option<u64>, Option<u64>)>,
+        update: AcquisitionUpdate,
+        event_bytes: Option<usize>,
         tried: Vec<EventId>,
     ) {
         let mut memory = self
@@ -1675,24 +1852,95 @@ impl NostrSdkRelayClient {
             memory.remove(&evicted);
         }
         let route = memory.entry(key).or_default();
-        if let Some((fits_until, step)) = window {
-            route.window_until = fits_until.or(route.window_until);
-            route.window_step = step.or(route.window_step);
+        match update {
+            AcquisitionUpdate::Fits { until, step } => {
+                route.window_until = Some(until);
+                route.window_step = step.or(route.window_step);
+                route.search_high = None;
+                route.unfinished_passes = 0;
+            }
+            AcquisitionUpdate::Unfinished { low, high, skipped } => {
+                route.window_until = Some(low);
+                route.search_high = Some(high);
+                route.unfinished_passes = if skipped {
+                    route.unfinished_passes.saturating_add(1)
+                } else {
+                    0
+                };
+            }
+            AcquisitionUpdate::None => {}
         }
+        if event_bytes.is_some() {
+            route.event_bytes = event_bytes;
+        }
+        // Once full, the route falls back to ID-order selection rather than
+        // forgetting IDs that would then hold the oldest window again.
         for id in tried {
-            if !route.set_aside.contains(&id) {
+            if route.set_aside.len() < SDK_RECONCILIATION_SET_ASIDE_IDS
+                && !route.set_aside.contains(&id)
+            {
                 route.set_aside.push_back(id);
             }
         }
-        while route.set_aside.len() > SDK_RECONCILIATION_SET_ASIDE_IDS {
-            route.set_aside.pop_front();
+    }
+
+    /// The newest second a pass may return up to when `left_behind` IDs of
+    /// its window were not fetched: the largest of the returned events'
+    /// timestamps with none of those IDs older than it. Events sharing that
+    /// second may be returned; finer order is not known. Returns `None` when
+    /// no probe gets a complete answer, and the pass returns what it fetched.
+    #[allow(clippy::too_many_arguments)]
+    async fn delivery_boundary(
+        &self,
+        filter: &Filter,
+        endpoints: &[RelayUrl],
+        items: &[(EventId, NostrTimestamp)],
+        options: &SyncOptions,
+        since: u64,
+        returned_at: impl Iterator<Item = u64>,
+        left_behind: &HashSet<EventId>,
+        deadline: tokio::time::Instant,
+    ) -> Option<u64> {
+        let mut times = returned_at.collect::<Vec<_>>();
+        times.sort_unstable();
+        times.dedup();
+        let oldest = *times.first()?;
+        let probes = SDK_RECONCILIATION_WINDOW_PROBES;
+        let mut candidates = (0..probes)
+            .map(|index| times[index * (times.len() - 1) / (probes - 1).max(1)])
+            .collect::<Vec<_>>();
+        candidates.dedup();
+        let answers = futures::future::join_all(candidates.iter().map(|at| async move {
+            // Nothing in scope is older than the window's floor.
+            if *at <= since {
+                return Some((HashSet::new(), true));
+            }
+            self.window_remote_ids(filter, endpoints, items, options, (since, at - 1), deadline)
+                .await
+        }))
+        .await;
+        let mut answered = false;
+        let mut boundary = None;
+        for (at, answer) in candidates.into_iter().zip(answers) {
+            let Some((ids, complete)) = answer else {
+                continue;
+            };
+            answered |= complete;
+            if complete && ids.is_disjoint(left_behind) {
+                boundary = Some(at);
+            }
         }
+        // Every complete probe saw something left behind older than the
+        // oldest returned event: return nothing this pass.
+        answered.then(|| boundary.unwrap_or(oldest.saturating_sub(1)))
     }
 
     /// Find the oldest window `[since, bound]` of a group route's gap that one
-    /// pass can fetch, with dry-run comparisons over candidate bounds. IDs set
-    /// aside by earlier passes do not count toward it. Returns `None` when no
-    /// relay answers a round, and the pass falls back to ID-order selection.
+    /// pass can fetch, `target` IDs at most, with dry-run comparisons over
+    /// candidate bounds. IDs set aside by earlier passes do not count toward
+    /// it. A probe counts as fitting only when every relay asked answered it:
+    /// a relay that missed a probe may hold older history the others lack.
+    /// Returns `None` when no relay answers at all.
     #[allow(clippy::too_many_arguments)]
     async fn oldest_window(
         &self,
@@ -1703,10 +1951,10 @@ impl NostrSdkRelayClient {
         (since, until): (u64, u64),
         remote: &HashSet<EventId>,
         set_aside: &[EventId],
+        target: usize,
         seed: Option<WindowSeed>,
         deadline: tokio::time::Instant,
-    ) -> Option<OldestWindow> {
-        let target = SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT;
+    ) -> Option<WindowSearch> {
         let skip = set_aside.iter().copied().collect::<HashSet<_>>();
         // The largest probed bound whose window fits a pass, and the smallest
         // that does not. The whole comparison window is already known not to.
@@ -1718,8 +1966,20 @@ impl NostrSdkRelayClient {
         let gap = remote.iter().filter(|id| !skip.contains(id)).count();
         let mut ever_answered = false;
         let seed = seed.filter(|seed| since <= seed.low && seed.low < until);
-        let mut first_round_step = Some(seed.and_then(|seed| seed.step));
-        let (mut search_low, mut search_high) = (seed.map_or(since, |seed| seed.low), until);
+        let resume_high = seed
+            .and_then(|seed| seed.high)
+            .filter(|high| seed.is_some_and(|seed| seed.low < *high) && *high <= until);
+        // A resumed bracket spreads its first round within it; a seed without
+        // one steps past the previous window; no seed starts at the recent end.
+        let mut first_round_step = match (seed, resume_high) {
+            (_, Some(_)) => None,
+            (Some(seed), None) => Some(seed.step),
+            (None, None) => Some(None),
+        };
+        let (mut search_low, mut search_high) = (
+            seed.map_or(since, |seed| seed.low),
+            resume_high.unwrap_or(until),
+        );
         for _ in 0..SDK_RECONCILIATION_WINDOW_ROUNDS {
             let low = fits
                 .as_ref()
@@ -1737,8 +1997,8 @@ impl NostrSdkRelayClient {
             }))
             .await;
             let mut answered = false;
-            for (probe, ids) in probes.into_iter().zip(rounds) {
-                let Some(ids) = ids else {
+            for (probe, result) in probes.into_iter().zip(rounds) {
+                let Some((ids, complete)) = result else {
                     continue;
                 };
                 answered = true;
@@ -1746,12 +2006,14 @@ impl NostrSdkRelayClient {
                     .into_iter()
                     .filter(|id| remote.contains(id) && !skip.contains(id))
                     .collect::<HashSet<_>>();
-                if ids.len() <= target {
-                    if fits.as_ref().is_none_or(|(bound, _)| probe > *bound) {
-                        fits = Some((probe, ids));
+                // A partial answer can show a window is too large, never
+                // that it fits.
+                if ids.len() > target {
+                    if over.as_ref().is_none_or(|(bound, _)| probe < *bound) {
+                        over = Some((probe, ids));
                     }
-                } else if over.as_ref().is_none_or(|(bound, _)| probe < *bound) {
-                    over = Some((probe, ids));
+                } else if complete && fits.as_ref().is_none_or(|(bound, _)| probe > *bound) {
+                    fits = Some((probe, ids));
                 }
             }
             if !answered {
@@ -1761,30 +2023,43 @@ impl NostrSdkRelayClient {
             ever_answered = true;
             // Older history can appear below the seed, for example from a relay
             // that was down. If every probe above the seed already holds more
-            // than a pass, look below it too.
+            // than a pass, look below it too. Likewise, a resumed bracket's top
+            // may no longer hold too much once its history was admitted.
             if fits.is_none() && search_low > since {
                 search_low = since;
             }
+            if over.is_none() && search_high < until {
+                search_high = until;
+            }
             // At least half a pass is enough.
-            if fits.as_ref().is_some_and(|(_, ids)| ids.len() * 2 > target) {
+            if fits
+                .as_ref()
+                .is_some_and(|(_, ids)| ids.len() * 2 >= target)
+            {
                 break;
             }
         }
         if !ever_answered {
             return None;
         }
-        let fits_until = fits.as_ref().map(|(bound, _)| *bound);
         let over_until = over.as_ref().map(|(bound, _)| *bound);
-        let (_, ids) = fits.filter(|(_, ids)| !ids.is_empty()).or(over)?;
-        Some(OldestWindow {
-            ids,
-            fits_until,
-            over_until,
+        Some(match fits {
+            Some((until, ids)) if !ids.is_empty() => WindowSearch::Fits {
+                until,
+                ids,
+                over_until,
+            },
+            fits => WindowSearch::Unfinished {
+                low: fits.map_or(search_low, |(bound, _)| bound),
+                high: over_until.unwrap_or(until),
+                over_ids: over.map(|(_, ids)| ids).unwrap_or_default(),
+            },
         })
     }
 
     /// Remote-only IDs within `[since, until]` across the endpoints that
-    /// answer a dry-run comparison by `deadline`, or `None` if none does.
+    /// answer a dry-run comparison by `deadline`, and whether every endpoint
+    /// answered, or `None` if none does.
     async fn window_remote_ids(
         &self,
         filter: &Filter,
@@ -1793,7 +2068,7 @@ impl NostrSdkRelayClient {
         options: &SyncOptions,
         (since, until): (u64, u64),
         deadline: tokio::time::Instant,
-    ) -> Option<HashSet<EventId>> {
+    ) -> Option<(HashSet<EventId>, bool)> {
         if tokio::time::Instant::now() >= deadline {
             return None;
         }
@@ -1823,13 +2098,13 @@ impl NostrSdkRelayClient {
                 .flatten()
             }
         });
-        let mut answered = false;
+        let mut answered = 0usize;
         let mut ids = HashSet::new();
         for summary in futures::future::join_all(syncs).await.into_iter().flatten() {
-            answered = true;
+            answered += 1;
             ids.extend(summary.remote);
         }
-        answered.then_some(ids)
+        (answered > 0).then_some((ids, answered == endpoints.len()))
     }
 
     /// Summarize SDK-owned relay health without exposing relay URLs.
@@ -5589,8 +5864,7 @@ mod tests {
             },
         );
         let mut published = Vec::new();
-        // One shared timestamp: no time window can split this set, so the
-        // durable cursor alone decides each pass's selection.
+        // One shared timestamp: no time window can split this set.
         for index in 0..SDK_RECONCILIATION_REPLAY_BATCH + 9 {
             let event = EventBuilder::new(Kind::MlsGroupMessage, format!("synthetic-{index}"))
                 .tags([Tag::custom("h", ["c3".repeat(32)])])
@@ -5619,7 +5893,11 @@ mod tests {
             LocalRelay::new(nostr_relay_builder::RelayBuilder::default().database(database));
         relay.run().await.unwrap();
         let endpoint = RelayUrl::parse(&relay.url().await.to_string()).unwrap();
-        let sdk = NostrSdkRelayClient::new(Client::builder().build());
+        // This exercises the durable cursor's ID-order rotation, which
+        // oldest-first acquisition falls back to; the integration tests cover
+        // the ordering itself.
+        let mut sdk = NostrSdkRelayClient::new(Client::builder().build());
+        sdk.id_order_only = true;
         let progress = TestReconciliationProgress::default();
         sdk.client.add_relay(endpoint.clone()).await.unwrap();
         sdk.client.connect().await;
