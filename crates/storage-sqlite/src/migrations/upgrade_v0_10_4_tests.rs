@@ -20,7 +20,8 @@ const ROTATED_GROUP: &str = "5cd77cb71f1a861ace44d13e4dfdae3d";
 const RETAINED_ROUTE: &str = "17f6648f67003fec1ac26f7b1e027e5185beb61b22c131605ea80ec8aaf4810e";
 const PERSISTED_CURSOR: i64 = 1_790_635_089;
 
-/// Tables whose rows migrations 0090-0098 must carry over unchanged.
+/// Tables whose original values forward migrations must carry over, except
+/// the explicit presentation-refresh revision in migration 0107 below.
 const PRESERVED_TABLES: &[&str] = &[
     "cgka_groups",
     "cgka_messages",
@@ -116,7 +117,7 @@ fn v0_10_4_account_upgrades_without_losing_state_or_raising_notices() {
     write_fixture(&database);
 
     // What v0.10.4 left behind.
-    let (before_tables, before_cursor, before_routes) = {
+    let (before_tables, before_cursor, before_routes, chat_revision_column) = {
         let conn = raw(&database);
         assert_eq!(
             count(&conn, "cgka_schema_migrations"),
@@ -128,7 +129,19 @@ fn v0_10_4_account_upgrades_without_losing_state_or_raising_notices() {
             .collect();
         assert_eq!(count(&conn, "cgka_groups"), 3);
         assert!(count(&conn, "message_timeline") >= 18);
-        (tables, cursor(&conn), retained_routes(&conn))
+        let chat_revision_column: usize = conn
+            .prepare("SELECT * FROM chat_list_rows")
+            .unwrap()
+            .column_names()
+            .iter()
+            .position(|name| *name == "presentation_source_revision")
+            .unwrap();
+        (
+            tables,
+            cursor(&conn),
+            retained_routes(&conn),
+            chat_revision_column,
+        )
     };
     assert_eq!(before_cursor, Some(PERSISTED_CURSOR));
     assert_eq!(before_routes.len(), 1);
@@ -181,8 +194,27 @@ fn v0_10_4_account_upgrades_without_losing_state_or_raising_notices() {
         }
 
         for (table, before) in PRESERVED_TABLES.iter().zip(&before_tables) {
-            assert_eq!(&table_rows(&conn, table), before, "{table} changed");
+            let mut expected = before.clone();
+            if *table == "chat_list_rows" {
+                // Migration 0107 dirties metadata for bounded re-preparation,
+                // retaining every original value (especially selected display
+                // and avatar bytes). The two appended filter inputs start NULL.
+                for row in &mut expected {
+                    let Value::Integer(revision) = &mut row[chat_revision_column] else {
+                        panic!("fixture presentation revision must be an integer");
+                    };
+                    *revision += 1;
+                    row.extend([Value::Null, Value::Null]);
+                }
+            }
+            assert_eq!(table_rows(&conn, table), expected, "{table} changed");
         }
+        assert_eq!(
+            count(&conn, "chat_folder_roster_work"),
+            count(&conn, "cgka_groups")
+        );
+        assert_eq!(count(&conn, "chat_folder_rosters"), 0);
+        assert_eq!(count(&conn, "chat_folder_members"), 0);
         assert_eq!(cursor(&conn), Some(PERSISTED_CURSOR));
         assert_eq!(retained_routes(&conn), before_routes);
     }
