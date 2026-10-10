@@ -440,3 +440,79 @@ async fn repeated_bootstrap_caches_the_authored_profile_timestamp() {
         "bootstrap must cache the signed kind-0 timestamp so a reopen floor stays ahead"
     );
 }
+
+fn newest_authored(relay: &ScriptedPushRelayClient, kind: u64) -> u64 {
+    relay
+        .attempted_events()
+        .into_iter()
+        .filter(|event| event.kind == kind)
+        .map(|event| event.created_at)
+        .max()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn reopened_app_authors_follow_lists_after_previous_versions() {
+    let (directory, app, relay, label) = quorum_app();
+    let followed = "22".repeat(32);
+    app.publish_account_follow_list(&label, &[], two_relay_bootstrap())
+        .await
+        .unwrap();
+    app.publish_account_follow_list(&label, &[followed.as_str()], two_relay_bootstrap())
+        .await
+        .unwrap();
+    let floor = newest_authored(&relay, KIND_NOSTR_CONTACT_LIST);
+    drop(app);
+
+    let reopened =
+        MarmotApp::with_relay(directory.path(), FAST).with_test_relay_client(relay.clone());
+    reopened
+        .publish_account_follow_list(&label, &[], two_relay_bootstrap())
+        .await
+        .unwrap();
+
+    assert!(
+        newest_authored(&relay, KIND_NOSTR_CONTACT_LIST) > floor,
+        "a follow list saved after reopening must be newer than {floor}"
+    );
+}
+
+#[tokio::test]
+async fn reopened_app_authors_after_versions_from_failed_batches() {
+    let (directory, app, relay, label) = quorum_app();
+    relay.fail_publishes_of_kind(KIND_NIP65_RELAY_LIST);
+    let profile = UserProfileMetadata {
+        name: Some("Bootstrap".into()),
+        created_at: 42,
+        ..UserProfileMetadata::default()
+    };
+    for _ in 0..3 {
+        assert!(
+            app.publish_generated_account_bootstrap(&label, two_relay_bootstrap(), &profile)
+                .await
+                .is_err()
+        );
+    }
+    let floor = newest_authored(&relay, KIND_NOSTR_METADATA);
+    drop(app);
+    relay.allow_all_publish_kinds();
+
+    let reopened =
+        MarmotApp::with_relay(directory.path(), FAST).with_test_relay_client(relay.clone());
+    reopened
+        .publish_user_profile(
+            &label,
+            UserProfileMetadata {
+                name: Some("Edited".into()),
+                ..UserProfileMetadata::default()
+            },
+            two_relay_bootstrap(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        newest_authored(&relay, KIND_NOSTR_METADATA) > floor,
+        "a profile edit after reopening must be newer than failed-batch version {floor}"
+    );
+}

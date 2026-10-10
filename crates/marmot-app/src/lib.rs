@@ -530,8 +530,8 @@ pub struct MarmotApp {
     /// pool instead of constructing another TCP/TLS/WebSocket stack.
     account_publish_clients: Arc<Mutex<HashMap<String, Arc<dyn NostrRelayClient>>>>,
     public_indexer_copy_tasks: Arc<Mutex<PublicIndexerCopyTasks>>,
-    /// Newest `created_at` this process authored per (account, replaceable
-    /// kind); see `sign_replaceable_identity_event`.
+    /// In-memory view of the persisted per-kind authoring floors; see
+    /// `sign_replaceable_identity_event`.
     replaceable_identity_created_at: Arc<Mutex<HashMap<(String, u64), u64>>>,
 }
 
@@ -2289,7 +2289,7 @@ impl MarmotApp {
         let nostr_signer = signer.as_nostr_signer();
         for request in &mut requests {
             request.event = self
-                .sign_replaceable_identity_event(nostr_signer.clone(), &request.event)
+                .sign_replaceable_identity_event(label, nostr_signer.clone(), &request.event)
                 .await?;
         }
         let relay_client = self.relay_client_for_account_id(&account.account_id_hex, nostr_signer);
@@ -2821,7 +2821,7 @@ impl MarmotApp {
         // the exact events the operational relays acknowledged.
         for request in &mut requests {
             request.event = self
-                .sign_replaceable_identity_event(nostr_signer.clone(), &request.event)
+                .sign_replaceable_identity_event(label, nostr_signer.clone(), &request.event)
                 .await?;
         }
         let outcomes = relay_client
@@ -3059,33 +3059,15 @@ impl MarmotApp {
     /// `created_at` strictly after the previous version authored for the same
     /// account and kind. Relays keep the lower event id on a timestamp tie, so
     /// a same-second older version delivered late by quorum completion could
-    /// otherwise replace a newer save. After a reopen the floor is recovered
-    /// from the cached profile and relay lists; kind 3 has no cached timestamp.
+    /// otherwise replace a newer save. The floor is persisted before signing,
+    /// so it survives a restart even when the publication then fails.
     pub(crate) async fn sign_replaceable_identity_event(
         &self,
+        account_ref: &str,
         signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
         event: &NostrTransportEvent,
     ) -> Result<NostrTransportEvent, AppError> {
-        let key = (event.pubkey.clone(), event.kind);
-        let known = self
-            .replaceable_identity_created_at
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key(&key);
-        let cached_floor = if known {
-            0
-        } else {
-            self.cached_replaceable_identity_created_at(&event.pubkey, event.kind)?
-        };
-        let created_at = {
-            let mut latest = self
-                .replaceable_identity_created_at
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let newest = latest.entry(key).or_insert(cached_floor);
-            *newest = event.created_at.max(newest.saturating_add(1));
-            *newest
-        };
+        let created_at = self.reserve_replaceable_identity_created_at(account_ref, event)?;
         let event = NostrTransportEvent::new_unsigned_at(
             event.pubkey.clone(),
             event.kind,
@@ -3096,20 +3078,31 @@ impl MarmotApp {
         sign_account_publication_event(signer, &event).await
     }
 
-    fn cached_replaceable_identity_created_at(
+    fn reserve_replaceable_identity_created_at(
         &self,
-        account_id_hex: &str,
-        kind: u64,
+        account_ref: &str,
+        event: &NostrTransportEvent,
     ) -> Result<u64, AppError> {
-        let Some(entry) = self.directory_entry_for_account_id(account_id_hex)? else {
-            return Ok(0);
+        let kind = event.kind;
+        let mut latest = self
+            .replaceable_identity_created_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (event.pubkey.clone(), kind);
+        let floor = match latest.get(&key) {
+            Some(floor) => *floor,
+            None => self
+                .account_home()
+                .replaceable_record_floors(account_ref)?
+                .get(&kind)
+                .copied()
+                .unwrap_or(0),
         };
-        Ok(match kind {
-            KIND_NOSTR_METADATA => entry.profile.map_or(0, |profile| profile.created_at),
-            KIND_NIP65_RELAY_LIST => entry.relay_lists.nip65.created_at,
-            KIND_MARMOT_INBOX_RELAY_LIST => entry.relay_lists.inbox.created_at,
-            _ => 0,
-        })
+        let created_at = event.created_at.max(floor.saturating_add(1));
+        self.account_home()
+            .advance_replaceable_record_floor(account_ref, kind, created_at)?;
+        latest.insert(key, created_at);
+        Ok(created_at)
     }
 
     pub(crate) fn spawn_quorum_cancelled_delivery(&self, delivery: QuorumCancelledDelivery) {

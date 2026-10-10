@@ -910,7 +910,7 @@ impl ScriptedPushRelayClient {
         *self.fail_publish_kind.lock().unwrap() = Some(kind);
     }
 
-    fn allow_all_publish_kinds(&self) {
+    pub(crate) fn allow_all_publish_kinds(&self) {
         self.fail_publish_kind.lock().unwrap().take();
     }
 
