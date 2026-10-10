@@ -496,6 +496,7 @@ pub use subscriptions::{AccountAttentionSubscription, ChatListWindowSubscription
 pub use commands::moderation::*;
 
 pub use commands::AttachmentTransferSubscription;
+pub use commands::AttachmentManagementSubscription;
 
 #[cfg(test)]
 mod tests {
@@ -604,4 +605,3 @@ mod tests {
         );
     }
 }
-pub use commands::AttachmentManagementSubscription;
