@@ -36,9 +36,12 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
         END;
         ALTER TABLE chat_list_rows ADD COLUMN folder_title_fold TEXT;
         ALTER TABLE chat_list_rows ADD COLUMN folder_description_fold TEXT;
-        -- Existing selected values reprepare through the bounded presentation worker.
-        UPDATE chat_list_rows SET presentation_json=NULL,
-            presentation_source_revision=presentation_source_revision+1;
+        -- Reprepare new search inputs through the bounded presentation worker.
+        -- This is not a membership/subject change: retain LastKnown display and
+        -- the selected avatar so upgrade bootstrap and same-source eviction
+        -- suppression still have their authoritative previous selection.
+        -- Folder capture fences on the applied revision and nullable new inputs.
+        UPDATE chat_list_rows SET presentation_source_revision=presentation_source_revision+1;
         CREATE TRIGGER chat_folder_description_changed AFTER UPDATE OF profile_description ON account_groups
         WHEN OLD.profile_description IS NOT NEW.profile_description BEGIN
             UPDATE chat_list_rows SET folder_description_fold=NULL,
@@ -80,7 +83,7 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(source, (None, 11));
+        assert_eq!(source, (Some(b"{}".to_vec()), 11));
         assert_eq!(
             conn.query_row("SELECT count(*) FROM chat_folder_roster_work", [], |r| r
                 .get::<_, i64>(0))
