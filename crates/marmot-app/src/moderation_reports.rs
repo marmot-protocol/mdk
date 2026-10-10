@@ -135,6 +135,8 @@ pub(crate) struct ModerationReportState {
     accounts: Mutex<HashMap<String, Arc<AccountSlot>>>,
     /// Anonymous publisher: never shares a socket with an account's authenticated pool.
     publisher: OnceLock<Arc<dyn NostrRelayClient>>,
+    #[cfg(test)]
+    fail_next_purge: std::sync::atomic::AtomicBool,
 }
 
 struct AccountSlot {
@@ -306,8 +308,8 @@ impl MarmotApp {
                 "recipient_pubkey must be a 64-character hex or npub public key",
             ));
         }
-        let recipient = PublicKey::parse(recipient)
-            .map_err(|_| invalid("recipient_pubkey is not a valid x-only public key"))?;
+        let recipient = parse_curve_point(recipient)
+            .ok_or_else(|| invalid("recipient_pubkey is not a valid x-only public key"))?;
         if config.relays.is_empty() {
             return Err(invalid("at least one relay is required"));
         }
@@ -341,6 +343,13 @@ impl MarmotApp {
             }
         }
         Ok(ValidatedModerationReportConfig { recipient, relays })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_moderation_report_purge_for_test(&self) {
+        self.moderation_reports
+            .fail_next_purge
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(test)]
@@ -655,6 +664,19 @@ impl MarmotApp {
         let _work = slot.work.lock().await;
         // An account that cannot sign, or whose database was never created,
         // has no reports. Do not create and migrate a database to learn that.
+        #[cfg(test)]
+        if self
+            .moderation_reports
+            .fail_next_purge
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return (
+                fence,
+                Err(AppError::Storage(cgka_traits::storage::StorageError::Busy(
+                    "injected".into(),
+                ))),
+            );
+        }
         let purged = match self.account_home.account(label) {
             Ok(account) if !account.can_sign() => Ok(0),
             Ok(_) if !self.account_storage_path(label).exists() => Ok(0),
@@ -723,7 +745,15 @@ fn parse_reported_pubkey(value: &str) -> Result<PublicKey, AppError> {
     if !well_formed {
         return Err(AppError::InvalidReportedPublicKey);
     }
-    PublicKey::parse(value).map_err(|_| AppError::InvalidReportedPublicKey)
+    parse_curve_point(value).ok_or(AppError::InvalidReportedPublicKey)
+}
+
+/// Parse a hex or `npub` key that is a real secp256k1 x-only point.
+/// `PublicKey::parse` only decodes 32 bytes; `xonly` checks curve membership.
+fn parse_curve_point(value: &str) -> Option<PublicKey> {
+    PublicKey::parse(value)
+        .ok()
+        .filter(|key| key.xonly().is_ok())
 }
 
 /// Trim, bound to [`MODERATION_REPORT_EXPLANATION_MAX_CHARS`], and trim again so a cut

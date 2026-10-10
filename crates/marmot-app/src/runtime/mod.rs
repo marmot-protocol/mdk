@@ -4185,15 +4185,6 @@ impl MarmotAppRuntime {
             }
         }
 
-        // Queued moderation reports never outlive their account's session:
-        // stop any in-flight publish, delete them, and keep report admission
-        // closed until the teardown below has committed the sign-out.
-        let (_report_fence, report_purge) = self
-            .accounts
-            .app
-            .fence_moderation_reports(&account.label)
-            .await;
-
         // Step 2 (local teardown): shut the worker down (deactivating its
         // subscriptions) and drop in-memory caches. Crucially this does NOT
         // remove the account directory, so all on-disk state survives for a
@@ -4212,19 +4203,6 @@ impl MarmotAppRuntime {
                     reason: Some(wipe_failure_reason(&err)),
                 };
             }
-        }
-        // Queued reports left on disk would be retried at the next sign-in, so
-        // a failed purge means local cleanup is incomplete.
-        if let Err(err) = report_purge
-            && outcome.local_cleanup.completed
-        {
-            outcome.local_cleanup = LocalCleanupReport {
-                completed: false,
-                reason: Some(format!(
-                    "moderation report purge failed: {}",
-                    wipe_failure_reason(&err)
-                )),
-            };
         }
 
         Ok(outcome)
@@ -6479,7 +6457,8 @@ impl AccountManager {
         // Stop and delete the account's moderation reports, and admit none
         // until the removal below has committed (every removal entry point).
         // Fenced before the global lock: the purge may open account storage.
-        let _report_fence = self.fence_moderation_reports(account_ref).await;
+        // Removing the directory deletes the rows even if this purge fails.
+        let (_report_fence, _) = self.fence_moderation_reports(account_ref).await;
         let lock_wait = self
             .shared
             .app_performance_telemetry()
@@ -6681,16 +6660,24 @@ impl AccountManager {
     async fn fence_moderation_reports(
         &self,
         account_ref: &str,
-    ) -> Option<crate::moderation_reports::ModerationReportFence> {
-        let label = self.app.account_home().account(account_ref).ok()?.label;
-        Some(self.app.fence_moderation_reports(&label).await.0)
+    ) -> (
+        Option<crate::moderation_reports::ModerationReportFence>,
+        Result<(), AppError>,
+    ) {
+        let Ok(account) = self.app.account_home().account(account_ref) else {
+            return (None, Ok(()));
+        };
+        let (fence, purged) = self.app.fence_moderation_reports(&account.label).await;
+        (Some(fence), purged.map(|_| ()))
     }
 
     pub async fn deactivate_account(&self, account_ref: &str) -> Result<(), AppError> {
         // Queued moderation reports never outlive a sign-out: stop and delete
         // them, and admit none until the sign-out below has committed. Fenced
-        // before the global lock: the purge may open account storage.
-        let _report_fence = self.fence_moderation_reports(account_ref).await;
+        // before the global lock: the purge may open account storage. A failed
+        // purge does not stop the sign-out, but it is reported: reports left on
+        // disk would be retried at the next sign-in.
+        let (_report_fence, report_purge) = self.fence_moderation_reports(account_ref).await;
         let lock_wait = self
             .shared
             .app_performance_telemetry()
@@ -6716,9 +6703,10 @@ impl AccountManager {
                 .forget_account(&account.account_id_hex);
             self.shared.attachment_cancellations.send_modify(|_| {});
             self.app.drop_account_caches(&account.label);
-            Ok(())
+            Ok::<(), AppError>(())
         }
-        .await
+        .await?;
+        report_purge
     }
 
     async fn restore_signed_out_after_key_package_failure(&self, account_ref: &str) {

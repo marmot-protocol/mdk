@@ -228,6 +228,11 @@ fn unwrap_with(moderation: &Keys, event: &NostrTransportEvent) -> Unwrapped {
     Unwrapped { wrap, seal, rumor }
 }
 
+/// An `npub` encoding 32 bytes that are not a secp256k1 x coordinate.
+fn off_curve_npub() -> String {
+    PublicKey::from_byte_array([0xff; 32]).to_bech32().unwrap()
+}
+
 fn now_secs() -> u64 {
     unix_now_ms() / 1000
 }
@@ -435,6 +440,9 @@ async fn config_validation_rejects_the_whole_config() {
     let rejected = [
         config("not a key".into(), &[REPORT_RELAY]),
         config("ab".repeat(31), &[REPORT_RELAY]),
+        // 32 bytes, but not an x coordinate on secp256k1.
+        config("ff".repeat(32), &[REPORT_RELAY]),
+        config(off_curve_npub(), &[REPORT_RELAY]),
         config(
             fixture.reporter.secret_key().to_bech32().unwrap(),
             &[REPORT_RELAY],
@@ -773,6 +781,8 @@ async fn reporting_yourself_or_an_invalid_key_is_rejected() {
         "nope".to_owned(),
         "ab".repeat(31),
         "zz".repeat(32),
+        "ff".repeat(32),
+        off_curve_npub(),
         nprofile,
         fixture.reporter.secret_key().to_bech32().unwrap(),
     ] {
@@ -1495,6 +1505,45 @@ mod runtime {
             .await
             .unwrap();
         assert_eq!(fixture.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_purge_is_reported_by_deactivation_and_sign_out() {
+        let fixture = runtime_fixture(Mode::Refuse).await;
+        fixture.queue_one().await;
+        fixture.app.fail_next_moderation_report_purge_for_test();
+        let error = fixture
+            .runtime
+            .accounts()
+            .deactivate_account(&fixture.account_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::Storage(_)), "{error:?}");
+        // The sign-out itself still committed.
+        assert!(
+            fixture
+                .app
+                .account_home()
+                .account(&fixture.account_id)
+                .unwrap()
+                .signed_out
+        );
+
+        let fixture = runtime_fixture(Mode::Refuse).await;
+        fixture.queue_one().await;
+        fixture.app.fail_next_moderation_report_purge_for_test();
+        let outcome = fixture
+            .runtime
+            .sign_out(
+                &fixture.account_id,
+                SignOutOptions {
+                    delete_key_packages: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!outcome.local_cleanup.completed);
+        assert!(outcome.local_cleanup.reason.is_some());
     }
 
     #[tokio::test]

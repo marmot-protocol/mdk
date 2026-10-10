@@ -108,8 +108,8 @@ reports and weigh them against abuse. A report is a claim by its reporter, not p
   opaque local id and a one-way dedupe key. The wrap is deleted once a relay accepts it. A queued report addressed to a
   different recipient than the current configuration is dropped, never redirected. An unpublished report is abandoned
   after seven days.
-- **Idempotency.** The same account, reported key, report type and origin within 10 minutes return the existing
-  outcome and do not mint a new wrap.
+- **Idempotency.** The same account, reports key, reported key, report type and origin within 10 minutes return the
+  existing outcome and do not mint a new wrap. After a reports-key change, a repeat is a new report to the new key.
 - **Rate limit.** Each account may submit 20 reports per rolling hour. Beyond that the call returns
   `ModerationReportRateLimited`. This only guards against runaway clients; it is not abuse protection.
 - **Validation.** Reporting your own key returns `CannotReportSelf`. A key that is not 64-character hex or `npub`
@@ -117,7 +117,7 @@ reports and weigh them against abuse. A report is a claim by its reporter, not p
 - **Account isolation.** Queued reports live in the reporting account's database. `sign_out` and `sign_out_and_wipe`
   cancel in-flight report work, delete the account's queued and published report rows, and refuse new reports and
   retries until the sign-out or wipe has committed. If that purge fails, sign-out reports its local cleanup as
-  incomplete. Signed-out accounts cannot report.
+  incomplete and `deactivate_account` returns the error after signing out. Signed-out accounts cannot report.
 - **Telemetry.** Logs and traces carry only aggregate fields, such as the `moderation_report_submitted` event with
   `origin` and `outcome`, and retry-pass counts. They never carry the reported key, the explanation, the one-time key
   or event ids.
