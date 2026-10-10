@@ -898,3 +898,303 @@ async fn completion_write_failure_does_not_stall_later_submissions() {
     }
     runtime.shutdown_and_close().await.unwrap();
 }
+
+fn prepared_media_snapshot_fixture(
+    h: &History,
+) -> (crate::MessageDraftRevision, LocalMessageRequest) {
+    use sha2::{Digest, Sha256};
+    let attachments: Vec<_> = (0_u8..2)
+        .map(|index| crate::MessageDraftAttachment {
+            id: format!("native-photo-{index}"),
+            file_name: format!("photo-{index}.jpg"),
+            media_type: "image/jpeg".into(),
+            plaintext: vec![index + 1, index + 2],
+            dim: None,
+            thumbhash: None,
+            duration_seconds: None,
+            waveform_samples: vec![],
+        })
+        .collect();
+    let references = attachments
+        .iter()
+        .enumerate()
+        .map(|(index, attachment)| crate::MediaAttachmentReference {
+            locators: vec![crate::MediaLocator {
+                kind: "blossom-v1".into(),
+                value: format!(
+                    "https://media.example/{}.bin",
+                    hex::encode([index as u8 + 10; 32])
+                ),
+            }],
+            ciphertext_sha256: hex::encode([index as u8 + 10; 32]),
+            plaintext_sha256: hex::encode(Sha256::digest(&attachment.plaintext)),
+            nonce_hex: hex::encode([index as u8 + 20; 12]),
+            file_name: attachment.file_name.clone(),
+            media_type: attachment.media_type.clone(),
+            version: "encrypted-media-v2".into(),
+            source_epoch: 0,
+            dim: None,
+            thumbhash: None,
+        })
+        .collect();
+    let group = hex::encode(h.group.as_slice());
+    let selected = h.app.selected_message_draft("alice", &group).unwrap();
+    let saved = h
+        .app
+        .save_message_draft_if_revision("alice", &selected.revision, "caption", None, attachments)
+        .unwrap();
+    (
+        saved.revision,
+        LocalMessageRequest {
+            content: "caption".into(),
+            reply_to: None,
+            attachments: references,
+        },
+    )
+}
+
+#[tokio::test]
+async fn prepared_media_snapshot_consumption_survives_restart_before_host_cleanup() {
+    use crate::local_submissions::LocalDraftAdmission;
+    let h = History::new(0).await;
+    let group = hex::encode(h.group.as_slice());
+    let (revision, request) = prepared_media_snapshot_fixture(&h);
+    let expected_tags: Vec<_> = request.attachments.iter().map(|a| a.imeta_tag()).collect();
+    let (accepted, _) = h
+        .app
+        .admit_local_message_with_draft_policy_at(
+            "alice",
+            &h.group,
+            "snapshot-token".into(),
+            request.clone(),
+            Some(LocalDraftAdmission::ConsumeIfCurrent(revision.clone())),
+            None,
+            42,
+        )
+        .unwrap();
+    // Reopen immediately, without any host draft-cleanup call.
+    h.app.close_storage().unwrap();
+    let reopened = MarmotApp::with_relay(h._dir.path(), "wss://relay.example")
+        .with_test_relay_client(h.relay.clone());
+    assert!(
+        reopened
+            .selected_message_draft("alice", &group)
+            .unwrap()
+            .draft
+            .is_none()
+    );
+    let store = reopened.account_storage("alice").unwrap();
+    let retained = store
+        .local_submission(&group, "snapshot-token")
+        .unwrap()
+        .unwrap();
+    let event =
+        cgka_traits::app_event::MarmotAppEvent::decode(retained.payload.as_ref().unwrap()).unwrap();
+    assert_eq!(event.content, "caption");
+    assert_eq!(event.tags, expected_tags);
+    drop(store);
+    // A new draft must survive replay of the already consumed send.
+    let empty = reopened.selected_message_draft("alice", &group).unwrap();
+    let newer = reopened
+        .save_message_draft_if_revision("alice", &empty.revision, "next message", None, vec![])
+        .unwrap();
+    let (replayed, update) = reopened
+        .admit_local_message_with_draft_policy_at(
+            "alice",
+            &h.group,
+            "snapshot-token".into(),
+            request,
+            Some(LocalDraftAdmission::ConsumeIfCurrent(revision)),
+            None,
+            42,
+        )
+        .unwrap();
+    assert_eq!(replayed, accepted);
+    assert!(update.is_none());
+    assert_eq!(
+        reopened
+            .selected_message_draft("alice", &group)
+            .unwrap()
+            .revision,
+        newer.revision
+    );
+    reopened.close_storage().unwrap();
+}
+
+#[tokio::test]
+async fn prepared_media_snapshot_preserves_changed_cleared_and_identical_newer_drafts() {
+    use crate::local_submissions::LocalDraftAdmission;
+    for change in 0..4 {
+        let h = History::new(0).await;
+        let group = hex::encode(h.group.as_slice());
+        let (revision, request) = prepared_media_snapshot_fixture(&h);
+        let original = h.app.message_draft("alice", &group).unwrap().unwrap();
+        if change == 0 {
+            h.app
+                .clear_message_draft_if_revision("alice", &revision)
+                .unwrap();
+        } else {
+            let mut attachments = original.media_attachments.clone();
+            if change == 2 {
+                attachments[0].id = "new-picker-occurrence".into();
+                attachments[0].plaintext = vec![9, 8];
+            }
+            let newer = h
+                .app
+                .save_message_draft_if_revision(
+                    "alice",
+                    &revision,
+                    "next message",
+                    None,
+                    attachments.clone(),
+                )
+                .unwrap();
+            if change == 3 {
+                h.app
+                    .save_message_draft_if_revision(
+                        "alice",
+                        &newer.revision,
+                        "caption",
+                        None,
+                        attachments,
+                    )
+                    .unwrap();
+            }
+        }
+        let expected = h.app.message_draft("alice", &group).unwrap();
+        let expected_revision = h
+            .app
+            .selected_message_draft("alice", &group)
+            .unwrap()
+            .revision;
+        assert_ne!(expected_revision, revision);
+        let (accepted, _) = h
+            .app
+            .admit_local_message_with_draft_policy_at(
+                "alice",
+                &h.group,
+                "snapshot-token".into(),
+                request.clone(),
+                Some(LocalDraftAdmission::ConsumeIfCurrent(revision)),
+                None,
+                42,
+            )
+            .unwrap();
+        assert_eq!(h.app.message_draft("alice", &group).unwrap(), expected);
+        assert_eq!(
+            h.app
+                .selected_message_draft("alice", &group)
+                .unwrap()
+                .revision,
+            expected_revision
+        );
+        let row = h
+            .app
+            .account_storage("alice")
+            .unwrap()
+            .timeline_message(&group, &accepted.message_id_hex)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.plaintext, "caption");
+        assert_eq!(
+            row.tags,
+            request
+                .attachments
+                .iter()
+                .map(|a| a.imeta_tag())
+                .collect::<Vec<_>>()
+        );
+        h.app.close_storage().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn prepared_media_snapshot_rejects_unrelated_payload_without_consuming_the_draft() {
+    use crate::local_submissions::LocalDraftAdmission;
+    let h = History::new(0).await;
+    let group = hex::encode(h.group.as_slice());
+    let (revision, request) = prepared_media_snapshot_fixture(&h);
+    for mismatch in 0..4 {
+        let mut changed = request.clone();
+        match mismatch {
+            0 => changed.content = "unrelated".into(),
+            1 => changed.attachments.reverse(),
+            2 => changed.reply_to = Some("aa".repeat(32)),
+            _ => changed.attachments[0].plaintext_sha256 = "aa".repeat(32),
+        }
+        let result = h.app.admit_local_message_with_draft_policy_at(
+            "alice",
+            &h.group,
+            format!("mismatched-{mismatch}"),
+            changed,
+            Some(LocalDraftAdmission::ConsumeIfCurrent(revision.clone())),
+            None,
+            42,
+        );
+        assert!(matches!(result, Err(AppError::InvalidMessageDraft(_))));
+        assert_eq!(
+            h.app
+                .selected_message_draft("alice", &group)
+                .unwrap()
+                .revision,
+            revision
+        );
+        assert!(
+            h.app
+                .account_storage("alice")
+                .unwrap()
+                .local_submission(&group, &format!("mismatched-{mismatch}"))
+                .unwrap()
+                .is_none()
+        );
+    }
+    h.app.close_storage().unwrap();
+}
+
+#[tokio::test]
+async fn prepared_media_snapshot_rollback_preserves_both_draft_and_admission() {
+    use crate::local_submissions::LocalDraftAdmission;
+    use cgka_traits::storage::StorageProvider;
+    let h = History::new(0).await;
+    let group = hex::encode(h.group.as_slice());
+    let (revision, request) = prepared_media_snapshot_fixture(&h);
+    let store = h.app.account_storage("alice").unwrap();
+    let mut message_id = None;
+    let result: Result<(), AppError> = StorageProvider::with_transaction(&store, |_| {
+        let (accepted, _) = h.app.admit_local_message_with_draft_policy_at(
+            "alice",
+            &h.group,
+            "rollback-token".into(),
+            request,
+            Some(LocalDraftAdmission::ConsumeIfCurrent(revision.clone())),
+            None,
+            42,
+        )?;
+        message_id = Some(accepted.message_id_hex);
+        Err(AppError::InvalidAppMessagePayload(
+            "injected transaction rollback".into(),
+        ))
+    });
+    assert!(result.is_err());
+    assert!(
+        store
+            .local_submission(&group, "rollback-token")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .timeline_message(&group, &message_id.unwrap())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        h.app
+            .selected_message_draft("alice", &group)
+            .unwrap()
+            .revision,
+        revision
+    );
+    drop(store);
+    h.app.close_storage().unwrap();
+}

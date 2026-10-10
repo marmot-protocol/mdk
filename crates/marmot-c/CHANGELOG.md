@@ -9,6 +9,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Add `marmot_send_prepared_media_with_client_token` for captured ordinary-media admission and conditional draft consumption. Inputs are borrowed; the nullable captured revision remains owned by its selected-draft root. The owned result uses the existing `marmot_local_send_acceptance_free`; layouts and status values are unchanged. Use matching regenerated headers and libraries.
+
+
 - File-backed media upload inputs, token-aware upload calls and operation
   cancellation/progress handles. New symbols and borrowed input records require
   matching headers/libraries; existing byte-array APIs retain their bounds.

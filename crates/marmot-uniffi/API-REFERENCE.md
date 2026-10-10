@@ -4313,7 +4313,7 @@ Read a retained submission's local state without relay I/O. `None` means no reta
 association. `Completed` describes the worker attempt; inspect its summary disposition
 and follow timeline updates for later delivery. See [local sends](LOCAL-SENDS.md).
 
-[Source](src/commands/local_submissions.rs#L178)
+[Source](src/commands/local_submissions.rs#L203)
 
 ### `Marmot::edit_local_message_with_client_token`
 
@@ -4354,6 +4354,18 @@ acceptance, not delivery; never clear a newer composer on completion. See [local
 
 [Source](src/commands/local_submissions.rs#L103)
 
+### `Marmot::send_prepared_media_with_client_token`
+
+```rust
+pub async fn send_prepared_media_with_client_token( &self, account_ref: String, group_id_hex: String, attachments: Vec<MediaAttachmentReferenceFfi>, caption: Option<String>, client_token: String, consuming_draft: Option<Arc<MessageDraftRevisionFfi>>, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>
+```
+
+Admit the immutable caption and ordered references from an ordinary-media upload with its stable client token. If the original captured draft revision remains current, matching caption/reply and media descriptors are validated and that draft is consumed in the admission transaction. A newer, cleared or absent draft is preserved and never supplies send content. This method has no reply target; retain revisioned draft admission for replied media.
+
+Capture cleanup authority before upload and keep it with the logical attempt; never reselect a newer draft during Retry. Use `local_send_status` to recover owned work after an interrupted return or restart before uploading or admitting again. A nullable consumption revision is for composer-free sends or revoked consumption eligibility, not a fallback for a failed draft read. Acceptance is local ownership, not peer receipt. See [captured-media integration](LOCAL-SENDS.md#captured-ordinary-media-drafts) and use matching generated Swift/Kotlin bindings and native binaries.
+
+[Source](src/commands/local_submissions.rs#L125)
+
 ### `Marmot::send_text_with_client_token`
 
 ```rust
@@ -4377,7 +4389,7 @@ The result includes uploaded references and optional local acceptance. Uploads t
 are not idempotent or restart-resumable; query token status after unknown outcomes.
 See [local sends](LOCAL-SENDS.md) for cancellation and epoch-bound media handling.
 
-[Source](src/commands/local_submissions.rs#L125)
+[Source](src/commands/local_submissions.rs#L150)
 
 ### `Marmot::upload_media_files_with_client_token`
 
@@ -4389,7 +4401,7 @@ pub async fn upload_media_files_with_client_token( &self, account_ref: String, g
 
 File-backed `upload_media_with_client_token`: every attachment is prepared and uploaded before durable token admission. Cancellation observed before admission starts returns an error and admits nothing. Once admission starts it is not interruptible, even before durable acceptance returns; follow `local_send_status` and timeline delivery, including uncertain-delivery handling. Admission rejects references from a source epoch that is no longer current. There is no fixed worker-response timeout; per-endpoint network deadlines still apply.
 
-[Source](src/commands/local_submissions.rs#L152)
+[Source](src/commands/local_submissions.rs#L177)
 
 </details>
 

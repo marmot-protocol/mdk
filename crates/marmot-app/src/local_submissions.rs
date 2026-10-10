@@ -16,6 +16,41 @@ use crate::{
     MessageDraftRevision, unix_now_seconds,
 };
 
+/// Select draft content, or consume an unchanged draft without replacing a captured payload.
+#[derive(Clone)]
+pub(crate) enum LocalDraftAdmission {
+    Source(MessageDraftRevision),
+    ConsumeIfCurrent(MessageDraftRevision),
+}
+
+impl LocalDraftAdmission {
+    pub(crate) fn into_revision(self) -> MessageDraftRevision {
+        match self {
+            Self::Source(revision) | Self::ConsumeIfCurrent(revision) => revision,
+        }
+    }
+
+    fn revision(&self) -> &MessageDraftRevision {
+        match self {
+            Self::Source(revision) | Self::ConsumeIfCurrent(revision) => revision,
+        }
+    }
+}
+
+fn draft_media_describes_refs(
+    draft: &storage_sqlite::SelectedMessageDraftContent,
+    references: &[MediaAttachmentReference],
+) -> bool {
+    draft.media_attachments.len() == references.len()
+        && draft
+            .media_attachments
+            .iter()
+            .zip(references)
+            .all(|(draft, reference)| {
+                draft.file_name == reference.file_name && draft.media_type == reference.media_type
+            })
+}
+
 /// Durable local ownership, not a relay acknowledgment or successful MLS send.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalSendAcceptance {
@@ -195,8 +230,30 @@ impl MarmotApp {
         account_ref: &str,
         group: &cgka_traits::GroupId,
         token: String,
-        mut request: LocalMessageRequest,
+        request: LocalMessageRequest,
         draft: Option<MessageDraftRevision>,
+        edit_of_client_token: Option<String>,
+        created_at: u64,
+    ) -> Result<(LocalSendAcceptance, Option<AppProjectionUpdate>), AppError> {
+        self.admit_local_message_with_draft_policy_at(
+            account_ref,
+            group,
+            token,
+            request,
+            draft.map(LocalDraftAdmission::Source),
+            edit_of_client_token,
+            created_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn admit_local_message_with_draft_policy_at(
+        &self,
+        account_ref: &str,
+        group: &cgka_traits::GroupId,
+        token: String,
+        mut request: LocalMessageRequest,
+        draft: Option<LocalDraftAdmission>,
         edit_of_client_token: Option<String>,
         created_at: u64,
     ) -> Result<(LocalSendAcceptance, Option<AppProjectionUpdate>), AppError> {
@@ -224,9 +281,13 @@ impl MarmotApp {
             request_hash.update((original.len() as u64).to_le_bytes());
             request_hash.update(original.as_bytes());
         }
-        if let Some(revision) = &draft {
+        if let Some(policy) = &draft {
+            let revision = policy.revision();
             if revision.group_id_hex() != group_hex {
                 return Err(AppError::MessageDraftRevisionConflict);
+            }
+            if matches!(policy, LocalDraftAdmission::ConsumeIfCurrent(_)) {
+                request_hash.update(b"consume-unchanged-draft-v1");
             }
             request_hash.update(revision.local_submission_binding());
         }
@@ -254,6 +315,7 @@ impl MarmotApp {
                         message_id_hex: existing.message_id_hex,
                     },
                     None,
+                    false,
                 ));
             }
             let stored_group = storage.get_group(group)?;
@@ -267,28 +329,57 @@ impl MarmotApp {
             if storage.direct_conversation_has_blocked_user(&group_hex)? {
                 return Err(AppError::UserBlocked);
             }
-            if let Some(revision) = &draft {
-                let selected = storage.selected_message_draft(&group_hex)?;
-                if selected.revision != *revision {
-                    return Err(AppError::MessageDraftRevisionConflict);
+            let consuming_revision = match &draft {
+                Some(LocalDraftAdmission::Source(revision)) => {
+                    let selected = storage.selected_message_draft(&group_hex)?;
+                    if selected.revision != *revision {
+                        return Err(AppError::MessageDraftRevisionConflict);
+                    }
+                    let selected = selected
+                        .draft
+                        .ok_or_else(|| AppError::InvalidMessageDraft("draft is empty".into()))?;
+                    if !draft_media_describes_refs(&selected, &request.attachments) {
+                        return Err(AppError::InvalidMessageDraft(
+                            "prepared media must match the selected draft".into(),
+                        ));
+                    }
+                    request.content = selected.content;
+                    request.reply_to = selected.reply_to_message_id_hex;
+                    Some(revision)
                 }
-                let selected = selected
-                    .draft
-                    .ok_or_else(|| AppError::InvalidMessageDraft("draft is empty".into()))?;
-                if selected.media_attachments.len() != request.attachments.len()
-                    || selected
-                        .media_attachments
-                        .iter()
-                        .zip(&request.attachments)
-                        .any(|(a, b)| a.file_name != b.file_name || a.media_type != b.media_type)
-                {
-                    return Err(AppError::InvalidMessageDraft(
-                        "prepared media must match the selected draft".into(),
-                    ));
+                Some(LocalDraftAdmission::ConsumeIfCurrent(revision)) => {
+                    let selected = storage.selected_message_draft(&group_hex)?;
+                    if selected.revision == *revision {
+                        if let Some(selected) = selected.draft {
+                            let plaintext_hashes =
+                                storage.message_draft_plaintext_hashes(revision).map_err(
+                                    |error| crate::drafts::revision_error(error, &group_hex),
+                                )?;
+                            if selected.content.trim() != request.content.trim()
+                                || selected.reply_to_message_id_hex != request.reply_to
+                                || !draft_media_describes_refs(&selected, &request.attachments)
+                                || plaintext_hashes.len() != request.attachments.len()
+                                || !plaintext_hashes.iter().zip(&request.attachments).all(
+                                    |(hash, reference)| {
+                                        hex::decode(&reference.plaintext_sha256)
+                                            .is_ok_and(|submitted| submitted.as_slice() == hash)
+                                    },
+                                )
+                            {
+                                return Err(AppError::InvalidMessageDraft(
+                                    "captured media must describe the draft selected for consumption".into(),
+                                ));
+                            }
+                            Some(revision)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
                 }
-                request.content = selected.content;
-                request.reply_to = selected.reply_to_message_id_hex;
-            }
+                None => None,
+            };
             let mut event_created_at = created_at;
             let intent = if let Some(original_token) = &edit_of_client_token {
                 let original = storage
@@ -389,7 +480,7 @@ impl MarmotApp {
                 moderation_grant: false,
             };
             let update = self.record_account_app_event(&account.label, &projection)?;
-            if let Some(revision) = &draft {
+            if let Some(revision) = consuming_revision {
                 storage
                     .clear_message_draft_if_revision(revision)
                     .map_err(|error| crate::drafts::revision_error(error, &group_hex))?;
@@ -400,11 +491,12 @@ impl MarmotApp {
                     message_id_hex: event.id,
                 },
                 Some(update),
+                consuming_revision.is_some(),
             ))
         })?;
-        if draft.is_some() && result.1.is_some() {
+        if result.2 {
             self.notify_draft_changed(&account.label, &group_hex);
         }
-        Ok(result)
+        Ok((result.0, result.1))
     }
 }

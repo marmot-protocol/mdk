@@ -28,6 +28,9 @@
 
 ### Added
 
+- `Marmot::send_prepared_media_with_client_token` exposes captured ordinary-media admission with transactional conditional draft consumption. Use the original token and revision for live retries, recover ownership by token after interruption, and pair regenerated Swift/Kotlin bindings with the matching library. See [local sends](LOCAL-SENDS.md).
+
+
 - `Marmot::propose_onboarding_relay_repair` previews a lossless relay-list repair
   without signing or publishing. `OnboardingRepairProposalFfi.relay_repair` carries
   the typed before/after tags, exact diff, restored capabilities and ManualReview
