@@ -4,6 +4,8 @@ Multi-account app runtime bridge (`MarmotApp`, `MarmotAppRuntime`) beneath `wn`,
 the human overview and host-facing API contracts (storage tiers, KeyPackage inventory, directory search, app-owned
 components, full-history repair, notices, blocking, moderation) see [`README.md`](README.md); do not restate them here.
 
+Implement shared behavior here, following [MDK's host boundary](../../docs/marmot-architecture/overview/app-core-boundary.md#host-app-boundary).
+
 ## Scope and module rules
 
 - Own the app-facing runtime that ties `AccountHome`, SQLCipher session storage, Nostr peeling, and Nostr transport
@@ -56,6 +58,10 @@ components, full-history repair, notices, blocking, moderation) see [`README.md`
   (`blossom.rs`, `crypto.rs`, `group_image.rs`, `host_safety.rs`, `avatar.rs` for downloaded avatar admission).
   `media/attachment_resume.rs` adapts attempt-fenced storage checkpoints to the shared safe HTTP path;
   keep Range validation, protected partials and complete-body authentication separate from native progress/access.
+  `media/file_transfer.rs` owns file-backed upload preparation: private owner-only snapshots under the account's
+  `media-staging/`, streaming EVP ChaCha20-Poly1305 that reproduces the in-memory wire bytes, and the
+  `MediaFileTransferControl` cancellation/progress handle. Prepare every snapshot before the first PUT, keep chunks
+  at 64 KiB, and stage retention through `stage_attachment_upload_files` (never a whole-file `Vec`).
 - Never discard the shared `imeta` parser's verdict in a projection (mdk#1787). `parse_media_attachment` returns a
   typed `MediaAttachmentRejection` whose `kind` is judged version-first so it does not depend on field order, and
   `media_attachment_outcomes_from_tags` / `media_attachment_outcomes_from_media_json` yield ordered per-attachment

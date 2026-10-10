@@ -1,0 +1,36 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "GroupEvent::GroupMemberLeavesRemoved\n{\n    group_id: gid(), epoch: EpochId(7), leaves:\n    vec![cgka_traits::engine::GroupMemberLeaf\n    { member: mem_id(), leaf_index: 3 }], departed_members: vec![mem_id()],\n}"
+---
+{
+  "GroupMemberLeavesRemoved": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ],
+    "epoch": 7,
+    "leaves": [
+      {
+        "member": [
+          97,
+          108,
+          105,
+          99,
+          101
+        ],
+        "leaf_index": 3
+      }
+    ],
+    "departed_members": [
+      [
+        97,
+        108,
+        105,
+        99,
+        101
+      ]
+    ]
+  }
+}

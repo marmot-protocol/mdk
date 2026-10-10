@@ -246,6 +246,16 @@ pub(crate) fn member_id_at_leaf(group: &MlsGroup, leaf_idx: LeafNodeIndex) -> Op
     validated_member_id(&member.credential).ok()
 }
 
+/// The same MLS-local identity predicate serves removal healing and terminal-gated readers.
+/// Durable group-record gates belong to the caller, since healing must ignore its old marker.
+pub(crate) fn local_leaf_is_active(group: &MlsGroup, identity: &MemberId) -> bool {
+    group.is_active()
+        && group.own_leaf_node().is_some_and(|leaf| {
+            BasicCredential::try_from(leaf.credential().clone())
+                .is_ok_and(|credential| credential.identity() == identity.as_slice())
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::validate_credential_identity;

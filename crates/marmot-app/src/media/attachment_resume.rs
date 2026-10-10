@@ -127,6 +127,19 @@ impl AttachmentResume {
         }
         Ok(())
     }
+    /// Final progress keeps ciphertext units; only the receipt uses plaintext length.
+    pub(crate) async fn completed_file_body(
+        &self,
+        plaintext_len: usize,
+    ) -> Result<(), AttachmentDownloadFailure> {
+        let ciphertext_len = (plaintext_len as u64)
+            .checked_add(super::file_transfer::MEDIA_AEAD_TAG_BYTES)
+            .ok_or_else(|| stop("attachment length overflow"))?;
+        self.progress(ciphertext_len, Some(ciphertext_len), false)
+            .await?;
+        self.completed_body(plaintext_len).await
+    }
+
     pub(crate) async fn completed_body(
         &self,
         plaintext_len: usize,
@@ -158,6 +171,29 @@ impl AttachmentResume {
             return Err(stop("attachment receipt superseded"));
         }
         Ok(())
+    }
+
+    fn check_file_capacity(&self, bytes: u64) -> Result<(), AttachmentDownloadFailure> {
+        let policy = self
+            .storage
+            .attachment_download_policy(&self.policy)
+            .map_err(|_| retry("attachment publication policy unavailable"))?;
+        let free = fs4::available_space(&self.directory).unwrap_or(0);
+        if free < policy.disk_reserve.saturating_add(bytes.saturating_mul(4)) {
+            return Err(retry("insufficient disk space for attachment publication"));
+        }
+        Ok(())
+    }
+
+    /// Check staging headroom without recording a completed-body receipt.
+    pub(super) async fn file_capacity(
+        self: &Arc<Self>,
+        bytes: u64,
+    ) -> Result<(), AttachmentDownloadFailure> {
+        let this = Arc::clone(self);
+        tokio::task::spawn_blocking(move || this.check_file_capacity(bytes))
+            .await
+            .map_err(|_| retry("attachment capacity task failed"))?
     }
 
     pub(crate) async fn progress(
@@ -206,6 +242,24 @@ impl AttachmentResume {
         Ok(())
     }
 
+    pub(super) async fn checkpoint_total(
+        &self,
+        url: &url::Url,
+    ) -> Result<Option<u64>, AttachmentDownloadFailure> {
+        let this = self.clone();
+        let locator_digest = Sha256::digest(url.as_str().as_bytes()).into();
+        tokio::task::spawn_blocking(move || {
+            this.storage.attachment_partial_total(
+                &this.job,
+                crate::unix_now_seconds(),
+                (&this.ciphertext_digest, &locator_digest),
+            )
+        })
+        .await
+        .map_err(|_| retry("partial checkpoint task failed"))?
+        .map_err(|_| retry("partial checkpoint metadata unavailable"))
+    }
+
     pub(super) async fn load(
         &self,
         url: &url::Url,
@@ -248,7 +302,7 @@ impl AttachmentResume {
         .map_err(|_| retry("partial checkpoint cleanup failed"))?;
         Ok(())
     }
-    async fn save(
+    pub(super) async fn save(
         &self,
         identity: AttachmentPartialIdentity,
         offset: usize,
@@ -281,6 +335,53 @@ impl AttachmentResume {
             return Err(retry("partial checkpoint no longer admitted"));
         }
         Ok(())
+    }
+
+    pub(crate) async fn load_file(
+        &self,
+        url: &url::Url,
+        max: u64,
+        directory: std::path::PathBuf,
+    ) -> Result<
+        Option<(
+            super::file_transfer::PrivateMediaFile,
+            AttachmentPartialIdentity,
+        )>,
+        AttachmentDownloadFailure,
+    > {
+        let this = self.clone();
+        let locator_digest: [u8; 32] = Sha256::digest(url.as_str().as_bytes()).into();
+        tokio::task::spawn_blocking(move || {
+            let total = this
+                .storage
+                .attachment_partial_total(
+                    &this.job,
+                    crate::unix_now_seconds(),
+                    (&this.ciphertext_digest, &locator_digest),
+                )
+                .map_err(|_| retry("partial checkpoint metadata unavailable"))?;
+            this.check_file_capacity(total.unwrap_or(0))?;
+            let mut file = super::file_transfer::PrivateMediaFile::create(&directory)?;
+            let mut writer = file.writer()?;
+            let part = this
+                .storage
+                .load_attachment_partial_to_writer(
+                    &this.job,
+                    crate::unix_now_seconds(),
+                    max,
+                    (&this.ciphertext_digest, &locator_digest),
+                    &mut writer,
+                )
+                .map_err(|_| retry("partial file checkpoint unavailable"))?;
+            if let Some((identity, received)) = part {
+                file.len = received;
+                Ok(Some((file, identity)))
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+        .map_err(|_| retry("partial file checkpoint task failed"))?
     }
 }
 

@@ -23,6 +23,14 @@ function send(socket: Socket, id: unknown, payload: Record<string, unknown>): vo
 function handleRequest(socket: Socket, req: Record<string, unknown>): void {
   const id = req.id;
   switch (req.type) {
+    case "group_profile_update":
+      if (req.name === "__denied") {
+        send(socket, id, { type: "error", code: "not_group_admin", message: "private detail", retryable: false });
+      } else {
+        send(socket, id, { type: "group_profile_updated", group_id_hex: req.group_id_hex,
+          message_ids_hex: req.name === "__empty_ids" ? [] : [HEX32("ab")], echoed_request: req });
+      }
+      break;
     case "account_list":
       send(socket, id, {
         type: "account_list",
@@ -223,6 +231,15 @@ function startServer(socketPath: string, responseDelayMs = 0, handle = handleReq
 }
 
 describe("MarmotAgentControlClient", () => {
+  it("sends a partial profile clear and requires a nonempty commit response", async () => {
+    const response = await client.groupProfileUpdate(HEX32("aa"), "cc".repeat(16), { description: "" });
+    const request = (response as unknown as { echoed_request: Record<string, unknown> }).echoed_request;
+    expect(request).toMatchObject({ type: "group_profile_update", description: "", group_id_hex: "cc".repeat(16) });
+    expect(request).not.toHaveProperty("name");
+    await expect(client.groupProfileUpdate(HEX32("aa"), "cc".repeat(16), { name: "__denied" })).rejects.toMatchObject({ code: "not_group_admin" });
+    await expect(client.groupProfileUpdate(HEX32("aa"), "cc".repeat(16), { name: "__empty_ids" })).rejects.toMatchObject({ code: "invalid_group_profile_response" });
+    await expect(client.groupProfileUpdate(HEX32("aa"), "cc".repeat(16), {})).rejects.toMatchObject({ code: "invalid_group_profile_input" });
+  });
   let dir: string;
   let socketPath: string;
   let server: Server;

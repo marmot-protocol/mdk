@@ -562,7 +562,7 @@ impl SqliteAccountStorage {
             due=CASE WHEN explicit_request=1 AND ?3<?5 THEN ?4 ELSE NULL END,
             attempt=NULL,size_blocked_max=CASE WHEN explicit_request=1 AND ?3<?5 THEN NULL ELSE ?3 END
             WHERE token=?1 AND state=1 AND attempt=?2",
-            params![job.reference.token, job.attempt, u64_to_i64(max)?,u64_to_i64(now)?, MAX_RETAINED_ATTACHMENT_BYTES as i64],
+            params![job.reference.token, job.attempt, u64_to_i64(max)?,u64_to_i64(now)?, MAX_RETAINED_FILE_ATTACHMENT_BYTES as i64],
         )
         .storage()?;
         Ok(())
@@ -580,8 +580,8 @@ impl SqliteAccountStorage {
         restart: bool,
     ) -> StorageResult<bool> {
         if phase > 4
-            || received > MAX_RETAINED_ATTACHMENT_BYTES as u64
-            || total.is_some_and(|t| t < received || t > MAX_RETAINED_ATTACHMENT_BYTES as u64)
+            || received > MAX_RETAINED_FILE_ATTACHMENT_BYTES
+            || total.is_some_and(|t| t < received || t > MAX_RETAINED_FILE_ATTACHMENT_BYTES)
         {
             return Err(invalid("invalid attachment progress"));
         }

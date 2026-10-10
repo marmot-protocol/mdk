@@ -31,8 +31,9 @@
 //! Unlike CommonMark proper, this parser **does not** recognize general HTML
 //! blocks or raw HTML inlines. Tag-like sequences (`<div>`, `<!-- ... -->`,
 //! etc.) are passed through as literal text and HTML-escaped at render
-//! time. Only autolinks — `<scheme:body>` and `<email@host>` — get
-//! structured treatment, plus a bounded [`Block::Details`] extension for
+//! time. Autolinks (`<scheme:body>` and `<email@host>`) and local-time
+//! timestamps (`<t:seconds[:style]>`) get structured treatment, plus
+//! a bounded [`Block::Details`] extension for
 //! structural `<details>` / `<summary>` lines (see the crate README).
 //!
 //! ## Untrusted destinations
@@ -75,7 +76,7 @@ pub const MAX_SOURCE_BLANK_LINES: u8 = block::MAX_SOURCE_BLANK_LINES;
 
 pub use ast::{
     Alignment, AutolinkKind, Block, CodeBlockKind, Document, Inline, LinkDestinationKind, ListItem,
-    ListKind, NostrEntity, NostrHrp, TableCell,
+    ListKind, NostrEntity, NostrHrp, TableCell, TimestampStyle,
 };
 pub use destination::classify_link_destination;
 
@@ -87,6 +88,10 @@ pub use destination::classify_link_destination;
 /// - GFM tables (`| h | k |\n| - | - |\n| 1 | 2 |`).
 /// - GFM strikethrough (`~~foo~~`).
 /// - GFM task-list items (`- [ ]`, `- [x]`).
+/// - Local-time timestamps (`<t:1791280800:F>`), emitted as [`Inline::Timestamp`]
+///   with signed Unix seconds and a [`TimestampStyle`]. Styles are `t`, `T`,
+///   `d`, `D`, `f`, `F`, `s`, `S`, `R`; omitted style defaults to `f`.
+///   Device-local formatting and live relative updates belong to renderers.
 /// - Bare URLs (GFM-style extended autolinks) for the schemes `http://`,
 ///   `https://`, `mailto:`, `tel:`, `marmot://`, `whitenoise://`, and
 ///   `whitenoise-staging://`, plus bare `www.` host/path forms. `www.`

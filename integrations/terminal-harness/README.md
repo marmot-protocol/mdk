@@ -2,7 +2,8 @@
 
 `marmot-terminal-harness` is the shared Rust runtime behind
 [`wn-claude`](../claude/marmot), [`wn-codex`](../codex/marmot),
-[`wn-opencode`](../opencode/marmot), and [`wn-pi`](../pi/marmot). It keeps the
+[`wn-opencode`](../opencode/marmot), [`wn-pi`](../pi/marmot), and
+[`wn-goose`](../goose/marmot). It keeps the
 Marmot-facing behavior of pure terminal connectors consistent while leaving
 backend command construction and event parsing in each connector crate.
 
@@ -14,11 +15,133 @@ storage, QUIC previews, or backend-specific CLI semantics.
 
 ## Contents
 
+- [First installation and verification](#first-installation-and-verification)
 - [Backend Boundary](#backend-boundary)
 - [Execution Profiles](#execution-profiles)
 - [Shared Behavior](#shared-behavior)
 - [Chat Commands](#chat-commands)
+- [Organize Your Task Groups](#organize-your-task-groups)
 - [Development](#development)
+
+## First installation and verification
+
+For admin promotion, task titles and progress reactions, see the
+[recommended chat setup](../README.md#recommended-chat-setup). Claude Code,
+Codex, OpenCode and Pi provide the shared `wn-agent group-profile` route on each
+ordinary turn for admin name/description updates. Verify the installed command, backend PATH and authorized socket access;
+see [Admin group profile updates](#admin-group-profile-updates). Progress reactions
+need a separately configured tool. The suggested instruction block is not
+installed automatically.
+
+Use the [checksum-verified quickstart](../README.md#get-started-white-noise--agents)
+for the selected runtime. Claude Code, Codex, OpenCode, Pi and Goose share this setup
+contract; their READMEs below describe backend-specific permissions and files.
+The installer supplies `wn-agent` and the harness, not the model CLI, its login,
+provider credentials or model configuration. Before installation, verify an
+ordinary local model turn works as the same OS user that will run the service.
+Do not change `HOME` to the connector directory: backend authentication and
+project configuration remain owned by the native CLI.
+
+### Record the two-process configuration
+
+Every terminal connection needs a running `wn-agent` **and** one running
+harness. Record its backend executable, connector home, socket, selected agent
+account, allowed phone sender, relay set, service names and private session-map
+path. Use the installer's `--help` and `--dry-run` to check that plan before
+installing a matching release cohort. `wn-agent --version` and `wn-<runtime> --version` alone do not prove the backend is authenticated or receiving prompts.
+
+The installer accepts public npub or hex values for `--allow-welcomer` /
+`--allow-sender`. A fresh installation uses the normalized list for both invite
+admission and prompt authorization. An existing `<PREFIX>_ALLOWED_SENDERS_HEX`
+can retain a separate prompt-sender list, so verify the final service/env values
+rather than assuming a newly allowed inviter can invoke the backend. The harness mirrors its sender list
+**additively** into the account's invite allowlist. Removing invite permission
+alone is not prompt revocation: update the harness sender list and restart it,
+and remove the invite entry too when that should be revoked.
+
+The default homes/services differ by runtime. For a second instance of the
+**same** harness, make its home, socket, bootstrap label, agent service,
+harness service and launchd labels distinct. Changing only `--home` does not
+change a service name or the default session-map path. Set a separate
+`WN_CLAUDE_STATE_PATH`, `WN_CODEX_STATE_PATH`, `WN_OPENCODE_STATE_PATH`,
+`WN_PI_STATE_PATH` or `WN_GOOSE_STATE_PATH` for same-kind instances; Pi's backend session directory also
+needs its own `WN_PI_SESSION_DIR` when explicitly overridden. Persist these
+settings in the actual service/launcher, not just the install shell.
+
+For intentional sharing, one daemon/service owns the shared socket, each harness
+selects its account explicitly, and only trusted consumers share the control
+boundary. A prompt allowlist is not an account-scoped control-token boundary.
+Several eligible subscribers to the same account/group can all respond.
+
+### Manual startup and service environments
+
+A foreground `wn-agent` occupies its terminal. Bootstrap and the harness belong
+in a **second terminal** with the same home/socket/relay/auth settings. Never
+start a second daemon beside an already-installed service to complete bootstrap.
+Without a service manager, supervise both processes explicitly. `--no-service`
+means services are not installed, not that bootstrap cannot start a temporary
+daemon; the installer cleans that temporary process up when it exits.
+`--no-start-wn-agent` also leaves the harness stopped; `--no-start-wn-<runtime>`
+leaves that harness stopped. Follow the printed manual-start instructions.
+
+The release installer writes `$MARMOT_HOME/dev/wn-<runtime>.env`. For a manual
+harness start, load the **trusted, installer-generated** file in Bash and export
+its assignments to the child:
+
+```bash
+# Replace the home and filename with this installation's recorded values.
+export MARMOT_HOME="$HOME/.marmot-agents/codex"
+set -a
+. "$MARMOT_HOME/dev/wn-codex.env"
+set +a
+wn-codex
+```
+
+Do not run this beside an active `wn-codex` service. The file is a Bash-sourceable
+manual-start aid, not a provider-credential export. Generated systemd/launchd
+services embed their own environment; editing this file or exporting a variable
+in a terminal does **not** update a running service. Apply approved overrides
+through the service manager and restart only the corresponding service. Keep
+provider login and tokens private; do not paste them into White Noise.
+
+### Prove the first model reply
+
+1. Check that the two intended services are running, the socket is reachable,
+   and the configured account matches the bootstrap agent npub. Verify the
+   backend executable and native authentication under the service user.
+2. Invite that agent from the authorized phone account over the configured
+   public relays. The phone's public npub identifies the sender to allow; it is
+   not a secret identity to import as the agent.
+3. Send `/help`, then select a trusted directory under the service user's `HOME`
+   with `/<path>` or `/cd <path>` and confirm `/pwd` / `/status`. These are local
+   harness commands, not proof that a model ran. Codex needs a Git repository
+   by default; the other backends retain their own project rules.
+4. Send an ordinary text prompt and verify an actual model reply in the same
+   White Noise conversation. Only then report the round trip verified. If phone
+   testing is unavailable, keep local installation checks and phone verification
+   separate. Do not loosen permissions or sender policy to hide a failure.
+
+### Know the file capability before testing it
+
+| Harness | Inbound files | Generated-file return |
+| --- | --- | --- |
+| Claude Code | Non-empty file batches are rejected before invocation | Not implemented |
+| Codex | Recognized images and the documented staged-file classes | Opt-in completion manifest with an exact group/export-root grant |
+| OpenCode | Its documented text/image/PDF classifications | Not implemented |
+| Pi | Its documented image or nonempty NUL-free UTF-8 classifications | Not implemented |
+| Goose | Non-empty file batches are rejected before invocation | Not implemented |
+
+See the exact [Codex](../codex/marmot/README.md#inbound-attachments),
+[OpenCode](../opencode/marmot/README.md#inbound-attachments) and
+[Pi](../pi/marmot/README.md#attachments) file matrices and Claude Code's
+[security notes](../claude/marmot/README.md#security-notes). A local path is not
+proof the model received or understood a file. Unsupported mixed batches fail
+as a unit; the harness does not silently drop an attachment and run the text.
+`MEDIA:` is Hermes syntax, not an export command for these terminal harnesses.
+For Codex exports, the selected backend must be able to write both the authorized
+export files and its completion manifest under its existing execution policy.
+The harness's source grant and `wn-agent --media-allowed-root` staging permission
+are separate and both must be configured; do not widen either to the whole home.
 
 ## Backend Boundary
 
@@ -46,7 +169,7 @@ process group at once and fails the turn without keeping the session id
 observed in that run. The backend may already have acted on the prompt before
 the decoder reports the failure.
 
-Claude Code, Codex, OpenCode, and Pi write prompt text to stdin. Backend-specific behavior
+Claude Code, Codex, OpenCode, Pi, and Goose write prompt text to stdin. Backend-specific behavior
 belongs in those connector crates, not in this shared runtime.
 
 ## Execution Profiles
@@ -65,6 +188,7 @@ the backends have equivalent permission or sandbox systems:
 | Claude Code | Existing permission config | `--permission-mode acceptEdits`; explicit denies remain and other unanswered asks are denied | `--dangerously-skip-permissions` | None |
 | Pi | Existing tool/config behavior | Same native approval-free invocation | Same native approval-free invocation | None |
 | OpenCode | Existing permission config | `--auto`; explicit denies remain | `--auto` plus process-local `OPENCODE_CONFIG_CONTENT={"permission":"allow"}` | None |
+| Goose | Existing `GOOSE_MODE` and config; headless approve modes fail the turn on the first ask | Rejected at startup and by the installer; no Goose mode keeps denies without asking | Process-local `GOOSE_MODE=auto`; `never_allow` is not consulted | None |
 | Codex | Existing approval, sandbox, and network config | `approval_policy="never"`; sandbox/network remain configured | `--dangerously-bypass-approvals-and-sandbox` | Configured for `inherit`/`autonomous`; bypassed for `unrestricted` |
 
 The OpenCode overlay is set only on the spawned process and never rewrites the
@@ -81,7 +205,8 @@ Installers accept `--execution-profile inherit|autonomous|unrestricted` and
 write the shared environment variable into the private env file and same-user
 service configuration. Writing `unrestricted` requires the separate
 `--acknowledge-unrestricted` flag, including in non-interactive and dry-run
-installs.
+installs. The Goose installer refuses `autonomous` because `wn-goose` would
+reject it at startup.
 
 ### Security Boundary
 
@@ -133,6 +258,50 @@ its [README](../codex/marmot/README.md).
 Download timeouts, connector rejections, and local file-validation failures have
 distinct privacy-safe pre-backend replies. The connector never forwards a
 server-provided error string or attachment metadata into those replies.
+
+## Admin group profile updates
+
+Codex, Claude Code, OpenCode and Pi receive the same connector-provided control
+instructions on each ordinary turn, including resumed turns. Literal `//`
+forwarding omits this suffix, including after durable recovery and `/retry-last`.
+Old recovery records without a forwarding discriminator retain ordinary-turn
+behavior. When the user asks the
+agent to change this conversation's name or description, it can invoke the
+`wn-agent` binary from the same release bundle with a JSON object on stdin:
+
+```sh
+printf '%s' '{"name":"New name","description":"New description"}' | wn-agent group-profile
+```
+
+Omit a field to preserve it; an empty string explicitly clears it. Names are
+limited to 256 UTF-8 bytes and descriptions to 4096 bytes. The shared runtime
+supplies `MARMOT_AGENT_SOCKET`, `MARMOT_ACCOUNT_ID_HEX`, `MARMOT_GROUP_ID_HEX`,
+authentication and the request timeout only in that turn's child process.
+Parallel conversations never change global environment state. The agent should
+use this route as supplied, rather than guess an account or group.
+
+The command uses the existing authenticated `group_profile_update` operation.
+MDK checks current admin authority when committing; `not_group_admin` is a
+rejection. A successful response contains `ok: true` and the commit message ids.
+A timeout, EOF or invalid acknowledgement is reported as an unknown outcome:
+the update may have committed, so inspect current group details before retrying.
+The command does not retry a mutation automatically.
+
+Use a matching `wn-agent` and harness release containing this command and keep
+`wn-agent` on the backend's PATH. Backend shell permissions and sandbox policy
+remain authoritative; the harness does not override a policy denying socket
+access. The local token still grants the existing full control API; the turn
+route is convenience context, not a new per-group security capability. Use an
+isolated connector home for a separate trust boundary.
+
+A configured token, including one loaded from a token file, is passed as the raw
+`MARMOT_AGENT_AUTH_TOKEN` value to each backend child. Tool shells, MCP servers
+and other descendants that inherit its environment can use the full control
+API for every account in that connector home. Only run trusted descendants in
+that boundary. Backend environment filtering must explicitly preserve the
+turn's `MARMOT_*` route and token for `wn-agent group-profile`; permission to
+launch a shell alone does not ensure that these values reach it. Without a turn
+token, the CLI retains its normal connector-home `control.token` fallback.
 
 ## Chat Commands
 
@@ -204,6 +373,64 @@ and backend contracts:
 - [`integrations/codex/marmot/README.md`](../codex/marmot/README.md)
 - [`integrations/opencode/marmot/README.md`](../opencode/marmot/README.md)
 - [`integrations/pi/marmot/README.md`](../pi/marmot/README.md)
+- [`integrations/goose/marmot/README.md`](../goose/marmot/README.md)
+
+## Organize Your Task Groups
+
+Start with one verified normal group containing you and your connector. Add
+more groups with that same connector account as you need parallel conversations.
+Each group has its own stored workdir, backend session, and standing goal. You
+do not need another connector installation or a public agent profile for each
+group. Keep different connector installations distinguishable with local
+nicknames, where your app supports them, after verifying their full public keys.
+
+Use `/status` to inspect a group's stored workspace and session; it is not a
+guarantee that work is idle or that backend authentication succeeds. Allow a
+running task to finish before reusing a group. `/new` starts a new logical
+session in the preserved workspace when the command is handled; it does not
+cancel an in-flight backend or erase backend transcript files. Ordinary prompts
+resume the stored session, so the backend's supported compaction can happen
+without replacing the group. `/goal` instructions survive `/new` and compaction.
+
+### Optional Completion Mentions
+
+To request the advisory mention-based workaround in one group, send a standing
+goal with your **own full npub**, for example:
+
+```text
+/goal On the final answer that completes my request, mention @npub1<your-full-public-key> once. Keep progress updates and questions free of this completion mention. If I send a follow-up while work remains, continue that work before sending the final answer.
+```
+
+Replace the placeholder with the public key of the account whose notifications
+you want. If the group already has a goal, include this preference in that goal:
+`/goal <text>` replaces the existing value. `/goal clear` removes the whole goal.
+Keep keys and policy out of the group title. This is an advisory instruction to
+the backend, not a connector-enforced completion event. It can fail or be
+overridden; notification settings and delivery still determine whether you are
+alerted. Completed assistant text blocks can arrive before a backend turn ends,
+so adding mentions to every delivered block would create false completion alerts.
+
+The shared [Markdown tokenizer](../../crates/marmot-markdown/src/inline.rs)
+recognizes `@npub` mentions. Android exposes a Mentions notification channel
+separately from ordinary group messages. Configure it in the app or Android
+notification settings and check a test mention on your phone before relying on
+it; this candidate does not include device notification verification. Do not
+assume that iOS has the same Android OS channel controls.
+
+### Task Titles
+
+For manual titles today, or once automatic title support is available, a short
+title can help you find the right group. Agent-driven edits need a callable
+current-group profile update operation and admin permission.
+Use a stable connector cue first (`🧑‍💻`, `🦀`, `🥧`, or `🛠️`), then a consistent
+project emoji when the project is known, and a short task label. Omit an unknown
+project cue instead of guessing. Keep the last task title when work finishes;
+activity status should not replace the task label.
+
+Automatic title instructions need a matching release with callable harness
+support; availability of the underlying group-profile protocol alone is not
+sufficient. The [onboarding design](onboarding-design.md) distinguishes this
+proposed default from the currently available manual workflow.
 
 ## Development
 
@@ -215,18 +442,21 @@ cargo test -p wn-claude
 cargo test -p wn-codex
 cargo test -p wn-opencode
 cargo test -p wn-pi
+cargo test -p wn-goose
 
 just claude-dev-e2e-connector
 just codex-dev-e2e-connector
 just opencode-dev-e2e-connector
 just pi-dev-e2e-connector
+just goose-dev-e2e-connector
 
 just claude-installer-test
 just codex-installer-test
 just opencode-installer-test
 just pi-installer-test
+just goose-installer-test
 ```
 
 The process-level connector tests are ignored by default and use real
 `wn-agent` and connector binaries with fake backend executables. They do not
-install or authenticate the real Claude Code, Codex, OpenCode, or Pi CLIs.
+install or authenticate the real Claude Code, Codex, OpenCode, Pi, or Goose CLIs.

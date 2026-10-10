@@ -285,7 +285,8 @@ impl ConformancePendingWorkSnapshot {
 /// Sanitized scheduling state used by black-box convergence simulators.
 ///
 /// This is a read-only conformance surface. It exposes only aggregate work,
-/// lifecycle phase, durable generation/epoch counters, and virtual-clock
+/// lifecycle phase, durable generation/epoch counters, process-local replay
+/// completion counts, and virtual-clock
 /// deadlines. Message, member, account, and group identifiers are excluded.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConformanceStructuralProgressSnapshot {
@@ -297,6 +298,13 @@ pub struct ConformanceStructuralProgressSnapshot {
     /// sweep can make durable progress without changing the retained row count.
     #[serde(default)]
     pub deferred_peel_completed_context_attempts: u64,
+    /// Retained eligible rows already examined in the pending confirmation
+    /// replay sweep. Bounded slices can advance this process-local witness
+    /// without changing durable row state or deferred-peel retry counters.
+    /// Excludes retired rows; zero when no confirmation replay is pending.
+    /// Restart discards the sweep cursor and therefore resets this count.
+    #[serde(default)]
+    pub confirmation_replay_completed_rows: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pass_generation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -598,6 +606,7 @@ fn capture_pending_work_snapshot_from<S: StorageProvider>(
         } else {
             engine.has_pending_convergence_inputs(group_id)?
                 || engine.has_pending_canonical_applications(group_id)?
+                || engine.pending_confirmation_replays.contains(group_id)
         }),
         queued_outbound_intents: engine.storage.list_queued_outbound_intents(group_id)?.len(),
         stored_created_messages,
@@ -623,13 +632,8 @@ fn capture_pending_work_snapshot_from<S: StorageProvider>(
         valid_proposal_schedule_signals: usize::from(
             engine.valid_proposal_groups.contains(group_id),
         ),
-        pending_state_changes: engine
-            .pending_state_changes
-            .keys()
-            .filter(|pending| {
-                engine.epoch_manager.group_for_pending(**pending).as_ref() == Some(group_id)
-            })
-            .count(),
+        // Retained in the diagnostic schema; activity is derived on confirm now.
+        pending_state_changes: 0,
         pending_leave_requests: usize::from(engine.leave_requests.contains_key(group_id)),
         scheduled_self_remove_auto_commits: engine
             .scheduled_self_remove_auto_commits
@@ -773,7 +777,17 @@ pub(crate) fn capture_structural_progress_snapshot<S: StorageProvider>(
     {
         runnable_work = runnable_work.saturating_add(1);
     }
-    if pass.is_none() && pending_work.unresolved_convergence_inputs > 0 {
+    let confirmation_replay_ready = engine.pending_confirmation_replays.contains(group_id)
+        && matches!(epoch_state, EpochState::Stable { .. })
+        && engine
+            .stored_group_record(group_id)?
+            .is_some_and(|group| !group.is_terminal() && !group.unrecoverable)
+        && pass.as_ref().is_none_or(|pass| !pass.is_active());
+    // Diagnostic unresolved work includes replay markers even while blocked.
+    // Only the gated readiness above can make those markers runnable.
+    let canonical_inputs = engine.has_pending_convergence_inputs(group_id)?
+        || engine.has_pending_canonical_applications(group_id)?;
+    if (pass.is_none() && canonical_inputs) || confirmation_replay_ready {
         runnable_work = runnable_work.saturating_add(1);
     }
     runnable_work = runnable_work
@@ -794,6 +808,26 @@ pub(crate) fn capture_structural_progress_snapshot<S: StorageProvider>(
             .filter_map(|record| record.deferred_peel.as_ref())
             .map(|lifecycle| u64::from(lifecycle.distinct_context_attempts))
             .sum(),
+        confirmation_replay_completed_rows: if engine
+            .pending_confirmation_replays
+            .contains(group_id)
+        {
+            engine.deferred_peel.get(group_id).map_or(0, |state| {
+                messages
+                    .iter()
+                    .filter(|record| {
+                        matches!(
+                            record.state,
+                            MessageState::Created
+                                | MessageState::Retryable
+                                | MessageState::PeelDeferred
+                        ) && state.confirmation_replay_visited.contains(&record.id)
+                    })
+                    .count()
+            })
+        } else {
+            0
+        },
         pass_generation: pass.as_ref().map(|pass| pass.generation),
         pass_phase: pass.as_ref().map(|pass| pass.phase),
         earliest_next_wake_monotonic_ms: next_wake,
@@ -826,7 +860,10 @@ fn event_group_id(event: &cgka_traits::engine::GroupEvent) -> &GroupId {
     use cgka_traits::engine::GroupEvent;
 
     match event {
-        GroupEvent::GroupCreated { group_id }
+        GroupEvent::LocalGroupCopyTerminated { group_id, .. }
+        | GroupEvent::LocalGroupCopyRestored { group_id }
+        | GroupEvent::GroupMemberLeavesRemoved { group_id, .. }
+        | GroupEvent::GroupCreated { group_id }
         | GroupEvent::GroupJoined { group_id, .. }
         | GroupEvent::TransportObjectResourceRefused { group_id, .. }
         | GroupEvent::MessageReceived { group_id, .. }

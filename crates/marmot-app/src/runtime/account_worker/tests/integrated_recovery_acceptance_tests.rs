@@ -5,8 +5,8 @@
 use super::*;
 use nostr_relay_builder::prelude::{
     Backend, BoxedFuture, DatabaseError, DatabaseEventStatus, Event, EventId, Events,
-    Filter as RelayFilter, MemoryDatabase, MemoryDatabaseOptions, NostrDatabase, PolicyResult,
-    QueryPolicy, SaveEventStatus, SingleLetterTag, Timestamp as RelayTimestamp,
+    Filter as RelayFilter, Kind as RelayKind, MemoryDatabase, MemoryDatabaseOptions, NostrDatabase,
+    PolicyResult, QueryPolicy, SaveEventStatus, SingleLetterTag, Timestamp as RelayTimestamp,
 };
 use nostr_relay_builder::{LocalRelay, RelayBuilder};
 use nostr_sdk::prelude::{
@@ -249,7 +249,11 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     );
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
-    let healthy_relay = LocalRelay::new(RelayBuilder::default());
+    let healthy_database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
+        events: true,
+        max_events: Some(256),
+    });
+    let healthy_relay = LocalRelay::new(RelayBuilder::default().database(healthy_database.clone()));
     healthy_relay.run().await.unwrap();
     let healthy_url = healthy_relay.url().await.to_string();
     let dir = tempfile::tempdir().unwrap();
@@ -536,6 +540,104 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     .await
     .expect("healthy-group send finishes before the held recovery request")
     .expect("healthy-group send succeeds");
+    let local_token = "startup-healthy-durable-send";
+    let queue_before_healthy = reopened
+        .app_performance_snapshot()
+        .outbound_message_queue_wait;
+    assert!(
+        reopened
+            .submit_text(
+                &alice.label,
+                &groups[1],
+                "invalid token".into(),
+                String::new()
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        reopened
+            .app_performance_snapshot()
+            .outbound_message_queue_wait
+            .attempts,
+        queue_before_healthy.attempts,
+        "failed admission adds no queue observation and releases its local guard"
+    );
+    let accepted = timeout(
+        Duration::from_secs(2),
+        reopened.submit_text(
+            &alice.label,
+            &groups[1],
+            "durable send while recovering".into(),
+            local_token.into(),
+        ),
+    )
+    .await
+    .expect("durable acceptance remains available during startup recovery")
+    .expect("healthy-group durable submission is accepted");
+    let published = timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(crate::LocalSendStatus::Completed(summary)) = reopened
+                .local_send_status(&alice.label, &groups[1], local_token)
+                .unwrap()
+            {
+                break summary;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("healthy-group durable send completes before the held recovery request");
+    assert_eq!(
+        published.accept_disposition,
+        cgka_traits::SendAcceptDisposition::Published
+    );
+    assert_eq!(published.published, 1);
+    assert_eq!(published.message_ids, vec![accepted.message_id_hex.clone()]);
+    let source_id = reopened_app
+        .account_storage(&alice.label)
+        .unwrap()
+        .timeline_message(&hex::encode(groups[1].as_slice()), &accepted.message_id_hex)
+        .unwrap()
+        .unwrap()
+        .source_message_id_hex
+        .expect("published durable send has a transport source");
+    assert!(
+        healthy_database
+            .event_by_id(&EventId::from_hex(&source_id).unwrap())
+            .await
+            .unwrap()
+            .is_some(),
+        "the healthy relay stores this exact send before recovery is released"
+    );
+    let repeated = reopened
+        .submit_text(
+            &alice.label,
+            &groups[1],
+            "durable send while recovering".into(),
+            local_token.into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted.message_id_hex, repeated.message_id_hex);
+    assert_eq!(
+        reopened
+            .app_performance_snapshot()
+            .outbound_message_queue_wait
+            .attempts,
+        queue_before_healthy.attempts + 1,
+        "first durable execution is measured once; repeated admission cannot reset it"
+    );
+    assert_eq!(
+        reopened_app
+            .messages(&alice.label)
+            .unwrap()
+            .iter()
+            .filter(|message| message.plaintext == "durable send while recovering")
+            .count(),
+        1,
+        "repeated durable admission keeps one canonical message"
+    );
     assert_eq!(gate.active.load(Ordering::SeqCst), 1);
     assert_eq!(activity.active_jobs.load(Ordering::SeqCst), 1);
     assert_eq!(activity.active_requests.load(Ordering::SeqCst), 1);
@@ -563,17 +665,86 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
             respond: ordered_respond,
         })
         .unwrap();
+    // This snapshot read is answered behind the two earlier commands, proving
+    // that the worker processed them into the deferred FIFO before admission.
+    timeout(
+        Duration::from_secs(2),
+        reopened.group_mls_state(&alice.label, &groups[1]),
+    )
+    .await
+    .expect("startup snapshot read crosses the established deferred barrier")
+    .unwrap();
     assert!(
-        timeout(Duration::from_millis(100), &mut ordered_answer)
-            .await
-            .is_err(),
+        matches!(
+            ordered_answer.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ),
         "a status behind a startup CatchUp barrier stays in FIFO"
     );
     assert!(
-        timeout(Duration::from_millis(100), &mut catch_up_answer)
-            .await
-            .is_err(),
+        matches!(
+            catch_up_answer.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ),
         "coalesced CatchUp waits for the initial comparison"
+    );
+    let relay_before_deferred = healthy_database
+        .query(RelayFilter::new().kind(RelayKind::MlsGroupMessage))
+        .await
+        .unwrap()
+        .iter()
+        .map(|event| event.id)
+        .collect::<HashSet<_>>();
+    let deferred_token = "startup-fifo-durable-send";
+    let queue_before_deferred = reopened
+        .app_performance_snapshot()
+        .outbound_message_queue_wait;
+    reopened
+        .submit_text(
+            &alice.label,
+            &groups[1],
+            "durable send behind startup barrier".into(),
+            deferred_token.into(),
+        )
+        .await
+        .unwrap();
+    sleep(Duration::from_millis(100)).await;
+    // A send stuck inside publication could still appear Queued. Require the
+    // serialized worker to answer again while the recovery request stays held.
+    timeout(
+        Duration::from_secs(2),
+        reopened.group_mls_state(&alice.label, &groups[1]),
+    )
+    .await
+    .expect("a deferred durable send does not occupy the worker")
+    .unwrap();
+    assert!(
+        matches!(
+            reopened
+                .local_send_status(&alice.label, &groups[1], deferred_token)
+                .unwrap(),
+            Some(crate::LocalSendStatus::Queued)
+        ),
+        "durable sends cannot bypass the deferred startup FIFO"
+    );
+    let relay_after_deferred = healthy_database
+        .query(RelayFilter::new().kind(RelayKind::MlsGroupMessage))
+        .await
+        .unwrap()
+        .iter()
+        .map(|event| event.id)
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        relay_after_deferred, relay_before_deferred,
+        "no deferred send reaches the relay while the startup barrier is held"
+    );
+    assert_eq!(
+        reopened
+            .app_performance_snapshot()
+            .outbound_message_queue_wait
+            .attempts,
+        queue_before_deferred.attempts,
+        "a required FIFO wait has no completed queue-duration sample yet"
     );
     let mut bob_client = reopened_app.client(&bob.label).await.unwrap();
     bob_client
@@ -705,6 +876,35 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
         .await
         .expect("startup joins after release")
         .unwrap();
+    let published = timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(crate::LocalSendStatus::Completed(summary)) = reopened
+                .local_send_status(&alice.label, &groups[1], deferred_token)
+                .unwrap()
+            {
+                break summary;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("deferred durable send completes after startup FIFO replay");
+    assert_eq!(
+        published.accept_disposition,
+        cgka_traits::SendAcceptDisposition::Published
+    );
+    assert_eq!(published.published, 1);
+    let queue_after_deferred = reopened
+        .app_performance_snapshot()
+        .outbound_message_queue_wait;
+    assert_eq!(
+        queue_after_deferred.attempts,
+        queue_before_deferred.attempts + 1
+    );
+    assert!(
+        queue_after_deferred.duration_ms.sum_ms >= queue_before_deferred.duration_ms.sum_ms + 100,
+        "durable queue measurement includes the intentionally required FIFO wait"
+    );
     // The gap may start its own comparison straight away; the held job
     // itself is gone.
     timeout(Duration::from_secs(45), async {
@@ -970,6 +1170,12 @@ async fn startup_comparison_shutdown_reaps_owned_request_and_keeps_debt() {
         .nostr_routing
         .nostr_group_id_hex;
     *database.route.lock().unwrap() = Some(route.clone());
+    let retry_not_before_ms = initial_app
+        .account_storage(&account.label)
+        .unwrap()
+        .recovery_retry_state()
+        .unwrap()
+        .not_before_ms;
     initial.shutdown_and_close().await.unwrap();
     drop(initial);
     drop(initial_app);
@@ -988,6 +1194,17 @@ async fn startup_comparison_shutdown_reaps_owned_request_and_keeps_debt() {
     *gate.target.lock().unwrap() = Some(signed.id.to_hex());
     gate.hold.store(true, Ordering::SeqCst);
 
+    // Preserve the persisted retry deadline and let it expire while the runtime
+    // is offline. Otherwise this immediate reopen can first finish startup and
+    // only acquire the held comparison from the later steady recovery loop.
+    let wall_now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    sleep(Duration::from_millis(
+        retry_not_before_ms.saturating_sub(wall_now_ms),
+    ))
+    .await;
     let app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone());
     let runtime = crate::MarmotAppRuntime::new(app.clone());
     let pool = runtime
@@ -1038,10 +1255,110 @@ async fn startup_comparison_shutdown_reaps_owned_request_and_keeps_debt() {
         .unwrap()
         .attempt_serial;
     assert!(retry > 0);
+    let commands = runtime
+        .accounts()
+        .worker_commands(&account.label)
+        .await
+        .unwrap();
+    let startup_sync_attempts = runtime.app_performance_snapshot().account_sync.attempts;
+    eprintln!(
+        "shutdown startup witness: account_sync_attempts={startup_sync_attempts} active_jobs={} active_requests={} retry_serial={retry}",
+        activity.active_jobs.load(Ordering::SeqCst),
+        activity.active_requests.load(Ordering::SeqCst),
+    );
+    assert_eq!(
+        startup_sync_attempts, 0,
+        "the held request belongs to initial sync"
+    );
+    let (respond, mut catch_up_answer) = oneshot::channel();
+    commands
+        .try_send(AccountWorkerCommand::CatchUp { respond })
+        .unwrap();
+    let (respond, mut ordered_answer) = oneshot::channel();
+    commands
+        .try_send(AccountWorkerCommand::GroupRecoveryStatus {
+            group_id: group.clone(),
+            respond,
+        })
+        .unwrap();
+    timeout(
+        Duration::from_secs(2),
+        runtime.group_mls_state(&account.label, &group),
+    )
+    .await
+    .expect("snapshot read acknowledges the earlier required startup FIFO barrier")
+    .unwrap();
+    assert!(
+        matches!(
+            catch_up_answer.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ),
+        "CatchUp is deferred until the held initial comparison finishes"
+    );
+    assert!(
+        matches!(
+            ordered_answer.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ),
+        "the later status remains behind the established startup FIFO barrier"
+    );
+    let token = "shutdown-retained-startup-send";
+    let content = "durable send retained through startup close";
+    let accepted = runtime
+        .submit_text(&account.label, &group, content.into(), token.into())
+        .await
+        .unwrap();
+    sleep(Duration::from_millis(100)).await;
+    assert!(matches!(
+        runtime
+            .local_send_status(&account.label, &group, token)
+            .unwrap(),
+        Some(crate::LocalSendStatus::Queued)
+    ));
+    assert_eq!(runtime.app_performance_snapshot().account_sync.attempts, 0);
+    assert_eq!(activity.active_jobs.load(Ordering::SeqCst), 1);
+    assert_eq!(activity.active_requests.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        catch_up_answer.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        ordered_answer.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    let retained = app
+        .account_storage(&account.label)
+        .unwrap()
+        .local_submission(&hex::encode(&group), token)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        retained.state, 0,
+        "the required FIFO keeps ownership in the app queue"
+    );
+    assert_eq!(retained.message_id_hex, accepted.message_id_hex);
+    assert_eq!(
+        runtime
+            .app_performance_snapshot()
+            .outbound_message_queue_wait
+            .attempts,
+        0
+    );
     timeout(Duration::from_secs(15), runtime.shutdown_and_close())
         .await
         .expect("shutdown reaps the startup comparison without relay release")
         .unwrap();
+    let queue = runtime
+        .app_performance_snapshot()
+        .runtime_operations
+        .into_iter()
+        .find(|snapshot| snapshot.operation == RuntimeOp::SendQueue)
+        .unwrap();
+    assert_eq!(queue.in_flight, 0);
+    assert_eq!(
+        queue.cancelled, 1,
+        "terminal close cancels timing, not the durable row"
+    );
     assert_eq!(activity.active_jobs.load(Ordering::SeqCst), 0);
     assert_eq!(activity.active_requests.load(Ordering::SeqCst), 0);
     assert_eq!(
@@ -1058,5 +1375,233 @@ async fn startup_comparison_shutdown_reaps_owned_request_and_keeps_debt() {
         retry
     );
     assert!(storage.recovery_comparison().unwrap().pending());
+    let restored = storage
+        .local_submission(&hex::encode(&group), token)
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.state, 0);
+    assert_eq!(restored.message_id_hex, accepted.message_id_hex);
+    drop(storage);
+    let restarted = crate::MarmotAppRuntime::new(reopened.clone());
+    restarted.reconcile_accounts().await.unwrap();
+    let repeated = restarted
+        .submit_text(&account.label, &group, content.into(), token.into())
+        .await
+        .unwrap();
+    assert_eq!(repeated.message_id_hex, accepted.message_id_hex);
+    let published = timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(crate::LocalSendStatus::Completed(summary)) = restarted
+                .local_send_status(&account.label, &group, token)
+                .unwrap()
+            {
+                break summary;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("restored app-owned send completes after the dependency is released");
+    assert_eq!(
+        published.accept_disposition,
+        cgka_traits::SendAcceptDisposition::Published
+    );
+    assert_eq!(published.published, 1);
+    assert_eq!(published.message_ids, vec![accepted.message_id_hex.clone()]);
+    let source = reopened
+        .account_storage(&account.label)
+        .unwrap()
+        .timeline_message(&hex::encode(&group), &accepted.message_id_hex)
+        .unwrap()
+        .unwrap()
+        .source_message_id_hex
+        .unwrap();
+    assert!(
+        database
+            .inner
+            .event_by_id(&EventId::from_hex(&source).unwrap())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        reopened
+            .messages(&account.label)
+            .unwrap()
+            .iter()
+            .filter(|message| message.plaintext == content)
+            .count(),
+        1
+    );
+    assert_eq!(
+        restarted
+            .app_performance_snapshot()
+            .outbound_message_queue_wait
+            .attempts,
+        0,
+        "restored admissions have no fabricated monotonic timing sample"
+    );
+    restarted.shutdown_and_close().await.unwrap();
+    relay.shutdown();
+}
+
+#[tokio::test]
+async fn unhydrated_durable_send_waits_for_safety_and_survives_terminal_close() {
+    let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+    let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
+        events: true,
+        max_events: Some(64),
+    });
+    let relay = LocalRelay::new(RelayBuilder::default().database(database.clone()));
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("unhydrated")
+        .unwrap();
+    let normal = crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let group = {
+        let fixture = MarmotApp::with_relay_and_config(dir.path(), url.clone(), normal.clone());
+        let mut client = fixture.client(&account.label).await.unwrap();
+        client
+            .create_group("only unhydrated group", &[])
+            .await
+            .unwrap()
+    };
+    let held = normal
+        .clone()
+        .with_dev_startup_hydration_batch_delay_ms(30_000);
+    let app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), held);
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if runtime
+                .app_performance_snapshot()
+                .runtime_operations
+                .iter()
+                .any(|snapshot| {
+                    snapshot.operation == RuntimeOp::WorkerHydration && snapshot.in_flight == 1
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the sole stored group enters the held unhydrated pipeline");
+    let before = database
+        .query(RelayFilter::new().kind(RelayKind::MlsGroupMessage))
+        .await
+        .unwrap()
+        .iter()
+        .map(|event| event.id)
+        .collect::<HashSet<_>>();
+    let token = "unhydrated-durable-token";
+    let content = "send after hydration is safe";
+    let accepted = runtime
+        .submit_text(&account.label, &group, content.into(), token.into())
+        .await
+        .unwrap();
+    sleep(Duration::from_millis(100)).await;
+    assert!(matches!(
+        runtime
+            .local_send_status(&account.label, &group, token)
+            .unwrap(),
+        Some(crate::LocalSendStatus::Queued)
+    ));
+    assert_eq!(
+        app.account_storage(&account.label)
+            .unwrap()
+            .local_submission(&hex::encode(&group), token)
+            .unwrap()
+            .unwrap()
+            .state,
+        0
+    );
+    let after = database
+        .query(RelayFilter::new().kind(RelayKind::MlsGroupMessage))
+        .await
+        .unwrap()
+        .iter()
+        .map(|event| event.id)
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        after, before,
+        "unhydrated sends cannot reach transport before required safety work"
+    );
+    assert_eq!(
+        runtime
+            .app_performance_snapshot()
+            .outbound_message_queue_wait
+            .attempts,
+        0
+    );
+    timeout(Duration::from_secs(2), runtime.shutdown_and_close())
+        .await
+        .expect("terminal close interrupts the thirty-second hydration hold")
+        .unwrap();
+    drop(runtime);
+    drop(app);
+    let restored = MarmotApp::with_relay_and_config(dir.path(), url, normal);
+    let restarted = crate::MarmotAppRuntime::new(restored.clone());
+    restarted.reconcile_accounts().await.unwrap();
+    let repeated = restarted
+        .submit_text(&account.label, &group, content.into(), token.into())
+        .await
+        .unwrap();
+    assert_eq!(repeated.message_id_hex, accepted.message_id_hex);
+    let published = timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(crate::LocalSendStatus::Completed(summary)) = restarted
+                .local_send_status(&account.label, &group, token)
+                .unwrap()
+            {
+                break summary;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("one restored send publishes after real group hydration");
+    assert_eq!(
+        published.accept_disposition,
+        cgka_traits::SendAcceptDisposition::Published
+    );
+    assert_eq!(published.published, 1);
+    assert_eq!(published.message_ids, vec![accepted.message_id_hex.clone()]);
+    let source = restored
+        .account_storage(&account.label)
+        .unwrap()
+        .timeline_message(&hex::encode(&group), &accepted.message_id_hex)
+        .unwrap()
+        .unwrap()
+        .source_message_id_hex
+        .unwrap();
+    assert!(
+        database
+            .event_by_id(&EventId::from_hex(&source).unwrap())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        restored
+            .messages(&account.label)
+            .unwrap()
+            .iter()
+            .filter(|message| message.plaintext == content)
+            .count(),
+        1
+    );
+    assert_eq!(
+        restarted
+            .app_performance_snapshot()
+            .outbound_message_queue_wait
+            .attempts,
+        0
+    );
+    restarted.shutdown_and_close().await.unwrap();
     relay.shutdown();
 }

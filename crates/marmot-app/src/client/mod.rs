@@ -145,7 +145,7 @@ impl PendingWelcomeDeliveryRecovery {
 }
 
 pub(crate) struct EncryptedMediaUploadHttp {
-    request: MediaUploadRequest,
+    request: crate::media::file_transfer::MediaUploadPayload,
     source_epoch: u64,
     media_secret: SecretBytes,
     nostr_signer: Arc<dyn MarmotNostrSigner>,
@@ -161,8 +161,29 @@ pub(crate) struct EncryptedMediaUploadHttp {
 
 impl EncryptedMediaUploadHttp {
     pub(crate) async fn run(self) -> Result<(MediaUploadResult, Vec<Vec<u8>>), AppError> {
+        let request = match self.request {
+            crate::media::file_transfer::MediaUploadPayload::Files(request, control) => {
+                return run_file_upload(
+                    request,
+                    control,
+                    self.source_epoch,
+                    self.media_secret,
+                    self.nostr_signer,
+                    self.version,
+                    self.default_endpoints,
+                    self.allowed_locator_kinds,
+                    self.allow_loopback_http,
+                    self.transport,
+                    self.retention_app,
+                    self.retention_account,
+                    self.retention_group,
+                )
+                .await;
+            }
+            crate::media::file_transfer::MediaUploadPayload::Bytes(request) => request,
+        };
         let (result, plaintext) = upload_encrypted_media_retaining(
-            self.request,
+            request,
             self.source_epoch,
             self.media_secret.as_ref(),
             self.nostr_signer.as_ref(),
@@ -205,6 +226,9 @@ pub(crate) struct EncryptedMediaUploadFinish {
     should_send: bool,
     caption: Option<String>,
     message_tags: Vec<Vec<String>>,
+    /// File-backed uploads only: a cancellation observed before message
+    /// admission prevents publication. Admission itself is not interruptible.
+    control: Option<Arc<crate::MediaFileTransferControl>>,
 }
 
 /// Preserve the primary upload/admission failure when orphan cleanup also fails.
@@ -285,6 +309,206 @@ fn stage_uploaded_media(
     })
 }
 
+/// Network-only file-backed upload job. It owns everything it needs so the
+/// account worker keeps polling; publication stays in the finish phase. Every
+/// snapshot is prepared before the first PUT. A cancellation observed after
+/// HTTP completes skips optional retention, abandons anything staged and
+/// prevents publication; nothing has been admitted at that point.
+#[allow(clippy::too_many_arguments)]
+async fn run_file_upload(
+    request: crate::MediaFileUploadRequest,
+    control: Arc<crate::MediaFileTransferControl>,
+    source_epoch: u64,
+    media_secret: SecretBytes,
+    nostr_signer: Arc<dyn MarmotNostrSigner>,
+    version: EncryptedMediaVersion,
+    default_endpoints: Vec<AppBlobEndpoint>,
+    allowed_locator_kinds: Vec<String>,
+    allow_loopback_http: bool,
+    transport: BlossomHttpTransport,
+    app: MarmotApp,
+    account: String,
+    group: GroupId,
+) -> Result<(MediaUploadResult, Vec<Vec<u8>>), AppError> {
+    let directory = crate::media::file_transfer::media_staging_directory(&app, &account);
+    let (result, plaintext) = crate::media::file_transfer::upload_files_retaining(
+        request,
+        source_epoch,
+        media_secret.as_ref(),
+        nostr_signer.as_ref(),
+        MediaOperationPolicy {
+            version,
+            default_endpoints: &default_endpoints,
+            allowed_locator_kinds: &allowed_locator_kinds,
+            allow_loopback_http,
+        },
+        &transport,
+        directory,
+        control.clone(),
+    )
+    .await?;
+    control.check()?;
+    let descriptors = result.clone();
+    let staging_app = app.clone();
+    let staging_account = account.clone();
+    let staging_control = control.clone();
+    let staged = tokio::task::spawn_blocking(move || {
+        let staged = stage_uploaded_media_files(
+            &staging_app,
+            &staging_account,
+            &group,
+            source_epoch,
+            &descriptors,
+            &plaintext,
+            &staging_control,
+        );
+        // Private snapshots are removed on this blocking thread, not the runtime.
+        drop(plaintext);
+        staged
+    })
+    .await;
+    let tokens = match staged {
+        Ok(Ok(tokens)) => tokens,
+        _ => {
+            tracing::warn!(target: "marmot_app::media", method = "outgoing_retention_stage",
+                "optional outgoing file retention unavailable");
+            Vec::new()
+        }
+    };
+    if let Err(error) = control.check() {
+        let cleanup = app.account_storage(&account).and_then(|storage| {
+            storage
+                .abandon_attachment_uploads(&tokens)
+                .map_err(AppError::from)
+        });
+        return Err(preserve_encrypted_media_upload_error(error, cleanup));
+    }
+    Ok((result, tokens))
+}
+
+/// File-backed twin of [`stage_uploaded_media`]: the same prune, quota, disk
+/// reserve and atomic binding, but each body streams from its
+/// private snapshot in bounded chunks. The exact uploaded `imeta` descriptors
+/// are bound; a descriptor whose plaintext digest differs from its snapshot is
+/// refused before any write. Refusal affects optional retention only.
+fn stage_uploaded_media_files(
+    app: &MarmotApp,
+    account: &str,
+    group: &GroupId,
+    source_epoch: u64,
+    result: &MediaUploadResult,
+    plaintext: &[crate::media::file_transfer::PrivateMediaFile],
+    control: &crate::MediaFileTransferControl,
+) -> Result<Vec<Vec<u8>>, AppError> {
+    control.check()?;
+    let storage = app.account_storage(account)?;
+    let now = crate::unix_now_seconds();
+    if storage.prune_attachment_uploads(now, 64).is_err() {
+        tracing::warn!(target: "marmot_app::media", method = "outgoing_retention_prune",
+                "optional outgoing retention cleanup deferred");
+    }
+    if plaintext.len() != result.attachments.len() {
+        return Err(AppError::InvalidEncryptedMedia(
+            "outgoing retention buffer unavailable".into(),
+        ));
+    }
+    if plaintext
+        .iter()
+        .any(|file| file.len > storage_sqlite::MAX_RETAINED_FILE_ATTACHMENT_BYTES)
+    {
+        return Err(AppError::InvalidEncryptedMedia(
+            "outgoing retention exceeds storage bound".into(),
+        ));
+    }
+    let policy = storage.attachment_download_policy(
+        &crate::runtime::attachment_controls::default_policy(&app.config),
+    )?;
+    let total = plaintext
+        .iter()
+        .fold(0u64, |total, file| total.saturating_add(file.len));
+    if fs4::available_space(app.account_dir(account)).unwrap_or(0)
+        < policy.disk_reserve.saturating_add(total.saturating_mul(4))
+    {
+        return Err(AppError::InvalidEncryptedMedia(
+            "outgoing retention disk reserve unavailable".into(),
+        ));
+    }
+    let slots = result
+        .attachments
+        .iter()
+        .zip(plaintext)
+        .map(|(attachment, file)| {
+            let digest = crate::media::media_hash_from_reference(&attachment.reference)?;
+            if digest != file.digest {
+                return Err(AppError::InvalidEncryptedMedia(
+                    "outgoing retention descriptor mismatch".into(),
+                ));
+            }
+            Ok((
+                serde_json::to_value(attachment.reference.imeta_tag()).map_err(|_| {
+                    AppError::InvalidEncryptedMedia("invalid upload descriptor".into())
+                })?,
+                digest,
+            ))
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    let mut readers = plaintext
+        .iter()
+        .map(|file| file.reader())
+        .collect::<Result<Vec<_>, AppError>>()?;
+    let mut sources = readers
+        .iter_mut()
+        .zip(plaintext)
+        .map(|(reader, file)| storage_sqlite::AttachmentUploadSource {
+            reader: reader as &mut dyn std::io::Read,
+            len: file.len,
+            digest: file.digest,
+        })
+        .collect::<Vec<_>>();
+    stage_and_bind_media_files(
+        &storage,
+        &hex::encode(group.as_slice()),
+        source_epoch,
+        &mut sources,
+        now,
+        policy.retained_bytes,
+        control,
+        &slots,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_and_bind_media_files(
+    storage: &storage_sqlite::SqliteAccountStorage,
+    group: &str,
+    source_epoch: u64,
+    sources: &mut [storage_sqlite::AttachmentUploadSource<'_>],
+    now: u64,
+    byte_budget: u64,
+    control: &crate::MediaFileTransferControl,
+    slots: &[(serde_json::Value, [u8; 32])],
+) -> Result<Vec<Vec<u8>>, AppError> {
+    // Staging owns its short chunk transactions. An outer transaction here
+    // would retain the account connection throughout every file read/hash.
+    let tokens = storage.stage_attachment_upload_files(
+        group,
+        source_epoch,
+        sources,
+        now,
+        byte_budget,
+        &|| control.is_cancelled(),
+    )?;
+    // Binding is already an atomic, short transaction. On refusal, compensate
+    // the unowned reservation without replacing the primary binding error.
+    if let Err(error) = storage.bind_attachment_uploads(&tokens, slots) {
+        let cleanup = storage
+            .abandon_attachment_uploads(&tokens)
+            .map_err(AppError::from);
+        return Err(preserve_encrypted_media_upload_error(error.into(), cleanup));
+    }
+    Ok(tokens)
+}
+
 pub(crate) struct EncryptedMediaDownloadHttp {
     reference: MediaAttachmentReference,
     media_secret: SecretBytes,
@@ -293,7 +517,53 @@ pub(crate) struct EncryptedMediaDownloadHttp {
     transport: BlossomHttpTransport,
 }
 
+pub(crate) enum AcquiredMediaBody {
+    Memory(MediaDownloadResult),
+    File(crate::media::file_transfer::PrivateMediaFile),
+}
+
 impl EncryptedMediaDownloadHttp {
+    pub(crate) async fn run_acquisition(
+        self,
+        resume: crate::media::attachment_resume::AttachmentResume,
+    ) -> Result<AcquiredMediaBody, crate::media::AttachmentDownloadFailure> {
+        let reference = self.reference.clone();
+        let secret = self.media_secret.clone();
+        let endpoints = self.default_blob_endpoints.clone();
+        let kinds = self.allowed_locator_kinds.clone();
+        let transport = self.transport.clone();
+        let directory = resume.directory.join("media-staging");
+        let result = self.run_classified(resume.clone()).await;
+        match result {
+            Ok(result) => Ok(AcquiredMediaBody::Memory(result)),
+            Err(crate::media::AttachmentDownloadFailure::FileRequired) => {
+                let control = Arc::new(crate::MediaFileTransferControl::default());
+                struct CancelOnDrop(Arc<crate::MediaFileTransferControl>);
+                impl Drop for CancelOnDrop {
+                    fn drop(&mut self) {
+                        self.0.cancel();
+                    }
+                }
+                let _cancel = CancelOnDrop(control.clone());
+                resume.phase(0).await?;
+                let file = crate::media::file_transfer::download_file(
+                    reference,
+                    secret.as_ref(),
+                    &endpoints,
+                    &kinds,
+                    &transport,
+                    directory,
+                    crate::MAX_FILE_MEDIA_CIPHERTEXT_BYTES,
+                    control,
+                    Arc::new(resume.clone()),
+                )
+                .await?;
+                resume.completed_file_body(file.len as usize).await?;
+                Ok(AcquiredMediaBody::File(file))
+            }
+            Err(error) => Err(error),
+        }
+    }
     pub(crate) async fn run_classified(
         self,
         resume: crate::media::attachment_resume::AttachmentResume,
@@ -535,6 +805,13 @@ pub struct AppClient {
     /// sync summary so live chat-list/group-state subscriptions observe the
     /// applied commits.
     pub(crate) pending_applied_sync_summary: crate::SyncSummary,
+    /// Committed batches retained until every app projection write succeeds.
+    pub(super) pending_applied_effects: std::collections::VecDeque<sync::PendingAppliedEffects>,
+    /// Publication wake ownership through source finalization and durable fanout cleanup.
+    pub(super) pending_resumed_message_notifications:
+        HashMap<(GroupId, String), sync::PendingMessageNotification>,
+    /// Hydrated groups whose canonical push cleanup needs a bounded retry.
+    pub(super) pending_push_leaf_reconciliations: std::collections::HashSet<GroupId>,
     /// App-visible outputs ingested during a sync whose account-projection
     /// checkpoint failed. A retained client keeps the matching projected state
     /// and outbox acknowledgements, then returns this summary after its next
@@ -1197,40 +1474,19 @@ impl AppClient {
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<crate::MaintenanceRunSummary, AppError> {
-        let result = self.observe_recovery_evidence_then_summarize_maintenance(effects);
+        // Retention observes recovery evidence once, before any fallible reads.
+        // Keep committed activity even if native projection or summary reads fail.
+        let observed = self.observe_native_membership_effects(effects).await;
+        let result = observed.and_then(|()| self.summarize_maintenance(effects));
         self.recover_superseded_invites_best_effort().await;
         result
     }
 
-    /// Observe one maintenance tick's recovery evidence, then summarize the
-    /// tick — split from the tick itself so the pair is exercisable against a
-    /// given batch of effects.
-    ///
-    /// A maintenance tick publishes: it drains a recovered staged evolution and
-    /// confirms it, so this batch can carry an `EpochChanged` for a group the
-    /// stall detector is tracking. That passage is one-shot in these effects and
-    /// reaches the detector nowhere else — a tick's own recovery is invisible to
-    /// every delivery-driven seam.
-    ///
-    /// Hence the order the name states, and the reason this is one function
-    /// rather than two calls at the seam: the summary build reads storage and so
-    /// can return early, and an `Err` reached before the observation would drop
-    /// that passage for good. It is the same hazard
-    /// [`Self::observe_recovery_evidence_then_fail_if_publish_failed`] exists
-    /// for, and it gets the same answer — a name that fixes the order.
-    ///
-    /// A tick can also *arm*, from a `TransportObjectResourceRefused` riding the
-    /// same batch. Nothing executes that arm here: the worker does not run the
-    /// pending backfill after a tick, so the intent waits for the next
-    /// delivery-driven seam to drain it. The arm and its audit row are durable
-    /// meanwhile, so the wait costs latency, not the recovery.
-    pub(crate) fn observe_recovery_evidence_then_summarize_maintenance(
+    /// Build maintenance counters after retaining the tick's committed effects.
+    fn summarize_maintenance(
         &mut self,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<crate::MaintenanceRunSummary, AppError> {
-        self.observe_recovery_evidence(effects);
-        self.observe_recovery_health(effects)?;
-        self.queue_own_group_system_projection_updates(effects);
         let summary = self.runtime.maintenance_run_summary(effects)?;
         // The summary includes this pass's failed executions. Backlog counts only
         // durable failed obligations; reuse this read instead of rescanning state.
@@ -2645,6 +2901,7 @@ impl AppClient {
             // `&mut self`.
             Ok(effects) => self
                 .observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+                .await
                 .map(|()| effects),
             Err(error) => Err(error),
         };
@@ -2681,7 +2938,6 @@ impl AppClient {
             self.refresh_group(group_id);
             self.prune_plaintext_retention_for_group(group_id)?;
             self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-            self.queue_own_group_system_projection_updates(&effects);
             Ok::<_, AppError>(())
         })();
         record_app_performance(
@@ -2764,13 +3020,13 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.cleanup_stale_push_tokens_best_effort(group_id);
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
         self.publish_targeted_group_state_wake_best_effort(
             group_id,
             wake_snapshot,
@@ -2836,7 +3092,8 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
@@ -2954,24 +3211,8 @@ impl AppClient {
         self.pending_recovery_capacity_writes.remove(group_id);
         self.encrypted_media_not_required_epochs.remove(&group_hex);
         self.pending_convergence_groups.remove(group_id);
-        for summary in [
-            &mut self.pending_applied_sync_summary,
-            &mut self.pending_failed_sync_summary,
-        ] {
-            summary.joined_groups.retain(|group| group != group_id);
-            summary
-                .messages
-                .retain(|message| &message.group_id != group_id);
-            summary
-                .events
-                .retain(|event| crate::groups::event_group_id(event) != Some(group_id));
-            summary
-                .projection_updates
-                .retain(|update| update.group_id_hex != group_hex);
-            summary
-                .epoch_stall_escalations
-                .retain(|event| &event.group_id != group_id);
-        }
+        self.forget_pending_effect_projections(group_id);
+        self.pending_push_leaf_reconciliations.remove(group_id);
         self.app.presentation_signals.wake();
         // Deletion already committed. A failed transport refresh must not make
         // the caller believe the group still exists; ordinary maintenance retries.
@@ -3092,6 +3333,14 @@ impl AppClient {
                 return Err(error);
             }
         };
+        // A committed deletion supersedes every previously admitted projection
+        // for this group, including a cached decision to cross an older frontier.
+        self.forget_pending_effect_projections(group_id);
+        self.pending_group_projection_updates.remove(&group_id_hex);
+        self.pending_local_group_deletion_frontier_clears
+            .remove(&group_id_hex);
+        self.pending_projection_updates
+            .retain(|update| update.group_id_hex != group_id_hex);
         if was_live {
             // The wipe has committed. Route restoration is a best-effort
             // post-success step: a transient adapter failure must not report
@@ -3163,7 +3412,8 @@ impl AppClient {
                     audit_context.clone(),
                 )
                 .await?;
-            self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+            self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+                .await?;
             Ok::<_, AppError>(effects)
         }
         .await
@@ -3183,7 +3433,6 @@ impl AppClient {
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
         // A local leave / decline is a voluntary departure, recorded as `Left`
         // so the chat list can distinguish it from an involuntary removal. The
         // inbound `observe_account_device_effects` path records this for an
@@ -3590,12 +3839,12 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
         self.publish_targeted_group_state_wake_best_effort(
             group_id,
             wake_snapshot,
@@ -3659,12 +3908,12 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -3717,13 +3966,13 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.prune_plaintext_retention_for_group(group_id)?;
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -3788,12 +4037,12 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -3832,12 +4081,12 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         self.refresh_group(group_id);
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -4079,7 +4328,7 @@ impl AppClient {
         // Capture the human-action descriptor before `Unreact` is rewritten to
         // `DeleteReactions` below, so the audit log records the user's actual
         // intent.
-        let audit_context = Self::message_human_action_context(&intent);
+        let mut audit_context = Self::message_human_action_context(&intent);
         let sender = self
             .app
             .account_home()
@@ -4233,6 +4482,12 @@ impl AppClient {
 
         let group_id_hex = hex::encode(group_id.as_slice());
         let app_event_id = event.id.clone();
+        audit_context
+            .get_or_insert_with(Default::default)
+            .operation_id = Some(marmot_forensics::application_send_operation_id(
+            group_id.as_slice(),
+            &app_event_id,
+        ));
 
         let should_project_locally = !notifications::is_push_gossip_kind(event.kind);
         if should_project_locally {
@@ -4369,19 +4624,7 @@ impl AppClient {
         // Finalization skips an already-completed local projection, repairs
         // failed source writes, and forwards sibling updates before retiring
         // the accepted fanouts.
-        let finalize_updates = self.finalize_published_app_message_source_retention(&effects)?;
-        self.pending_projection_updates.extend(finalize_updates);
-        // A send that lands while inbound convergence input is retained folds
-        // those commits before publishing, so `effects.events` can carry peer
-        // state changes (e.g. a mid-window group rename). Observe them through
-        // the same pipeline as inbound deliveries — state group refresh plus
-        // kind-1210 system-row synthesis (replacing the narrower
-        // `queue_own_group_system_projection_updates`) — and buffer the summary
-        // for the account worker to broadcast; dropping the events here leaves
-        // storage renamed while chat-list/group-state subscribers never wake.
-        // Best-effort: a projection failure must not fail a completed publish.
-        self.observe_send_applied_effects_best_effort(&effects)
-            .await;
+        self.retry_send_applied_effects_best_effort().await;
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         if published.is_some() && notification_trigger_for_intent(&intent).is_some() {
             // A checkpoint is needed only when another transport wait follows;
@@ -4394,6 +4637,7 @@ impl AppClient {
                 notifications::NotificationTrigger::NewMessage,
             )
             .await;
+            self.remember_message_notification_sent(group_id, &app_event_id);
         }
         Ok((
             event,
@@ -4435,23 +4679,11 @@ impl AppClient {
         group_id: &GroupId,
         app_event_id: &str,
     ) -> Result<(), AppError> {
-        self.observe_recovery_evidence(effects);
-        self.remember_pending_convergence_groups(effects);
-        match self
-            .invalidate_failed_app_message_projections(effects, Some((group_id, app_event_id)))
-        {
-            Ok(failed_updates) => self.pending_projection_updates.extend(failed_updates),
-            Err(error) => {
-                // A sibling projection failure must not retract the current
-                // send when its own fanout was accepted or retained.
-                tracing::warn!(
-                    target: "marmot_app::messages",
-                    method = "send_app_event_with_local_projection",
-                    error_kind = error.privacy_safe_kind(),
-                    "failed to invalidate a terminally failed sibling from a send batch"
-                );
-            }
-        }
+        let mut retained = effects.clone();
+        retained
+            .failed_app_messages
+            .retain(|failed| failed.group_id != *group_id || failed.app_event_id != app_event_id);
+        self.retain_applied_effects(&retained);
         // Every attempted application fanout lands in exactly one of the
         // published, unresolved, or failed lists. A send in none of them was
         // never fanned out: unsettled convergence or an in-flight publication
@@ -4485,23 +4717,7 @@ impl AppClient {
         // remains visibly pending until an unrelated recovery pass. Keep this
         // best-effort so projection trouble cannot mask the primary publish
         // failure.
-        self.remember_published_reports(effects);
-        match self.finalize_published_app_message_source_retention(effects) {
-            Ok(updates) => self.pending_projection_updates.extend(updates),
-            Err(error) => {
-                tracing::warn!(
-                    target: "marmot_app::messages",
-                    method = "send_app_event_with_local_projection",
-                    error_kind = error.privacy_safe_kind(),
-                    "failed to finalize a successful sibling from a failed send batch"
-                );
-            }
-        }
-        // The send itself failed to reach anyone, but any peer commits it
-        // folded are durably applied — broadcast them before surfacing the
-        // publish failure, best-effort so a projection error cannot mask
-        // the primary error.
-        self.observe_send_applied_effects_best_effort(effects).await;
+        self.retry_send_applied_effects_best_effort().await;
         if let Err(_save_err) = self.save_state_with_pending_local_group_deletion_frontier_clears()
         {
             tracing::warn!(
@@ -4977,6 +5193,18 @@ impl AppClient {
         group_id: &GroupId,
         request: MediaUploadRequest,
     ) -> Result<(EncryptedMediaUploadHttp, EncryptedMediaUploadFinish), AppError> {
+        self.prepare_encrypted_media_upload_payload(
+            group_id,
+            crate::media::file_transfer::MediaUploadPayload::Bytes(request),
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_encrypted_media_upload_payload(
+        &mut self,
+        group_id: &GroupId,
+        request: crate::media::file_transfer::MediaUploadPayload,
+    ) -> Result<(EncryptedMediaUploadHttp, EncryptedMediaUploadFinish), AppError> {
         self.ensure_group_application_messages_allowed(group_id)?;
         self.sync_runtime_groups().await?;
         let policy = self.encrypted_media_policy_for_group(group_id)?;
@@ -5001,7 +5229,7 @@ impl AppClient {
                 "group policy has no usable Blossom endpoint for upload".into(),
             ));
         }
-        let has_explicit_server = request.blossom_server.is_some();
+        let has_explicit_server = request.server().is_some();
         let default_endpoints = if has_explicit_server {
             Vec::new()
         } else {
@@ -5024,11 +5252,17 @@ impl AppClient {
         let (source_epoch, media_secret) = self.encrypted_media_secret(group_id)?;
         let account = self.app.account_home().account(&self.state.label)?;
         let signer = self.app.account_signer_for_summary(&account)?;
-        crate::messages::validate_message_tags(&request.message_tags)?;
-        let message_tags = request.message_tags.clone();
-        let should_send = request.send;
-        let caption = request.caption.clone();
-        crate::media::validate_media_upload_batch(&request.attachments)?;
+        crate::messages::validate_message_tags(request.tags())?;
+        let message_tags = request.tags().to_vec();
+        let should_send = request.send();
+        let caption = request.caption().clone();
+        request.validate()?;
+        let control = match &request {
+            crate::media::file_transfer::MediaUploadPayload::Files(_, control) => {
+                Some(control.clone())
+            }
+            crate::media::file_transfer::MediaUploadPayload::Bytes(_) => None,
+        };
         Ok((
             EncryptedMediaUploadHttp {
                 request,
@@ -5051,6 +5285,7 @@ impl AppClient {
                 should_send,
                 caption,
                 message_tags,
+                control,
             },
         ))
     }
@@ -5062,6 +5297,20 @@ impl AppClient {
         mut result: MediaUploadResult,
         upload_tokens: Vec<Vec<u8>>,
     ) -> Result<MediaUploadResult, AppError> {
+        if let Some(control) = &finish.control
+            && let Err(error) = control.check()
+        {
+            return Err(preserve_encrypted_media_upload_error(
+                error,
+                self.app
+                    .account_storage(&self.state.label)
+                    .and_then(|storage| {
+                        storage
+                            .abandon_attachment_uploads(&upload_tokens)
+                            .map_err(AppError::from)
+                    }),
+            ));
+        }
         if !finish.should_send {
             return Ok(result);
         }
@@ -5284,13 +5533,13 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         let summary = send_summary_from_effects(&effects);
         self.refresh_group(group_id);
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
         Ok(summary)
     }
 
@@ -5540,36 +5789,26 @@ impl AppClient {
         self.sync_runtime_groups().await?;
         let effects = self.runtime.advance_convergence(group_id).await?;
         self.observe_convergence_retry_effects(group_id, &effects)
+            .await
     }
 
     /// Project one convergence retry's effects, split from the advance itself so
     /// the projection is exercisable against a given batch of effects.
-    pub(crate) fn observe_convergence_retry_effects(
+    pub(crate) async fn observe_convergence_retry_effects(
         &mut self,
         group_id: &GroupId,
         effects: &marmot_account::AccountDeviceEffects,
     ) -> Result<SendSummary, AppError> {
-        // Observe before the publish gate, for the reason spelled out in
-        // `observe_drained_session_events`.
-        self.observe_recovery_evidence(effects);
-        self.remember_published_reports(effects);
-        // This is the path that releases sends the engine had retained, so its
-        // finalize updates carry the pending -> delivered flip for each of them.
-        // Buffer these updates for the account worker, as the direct send path
-        // does for sibling completions and deferred source repairs. Dropping
-        // them leaves subscribers pending even though storage is delivered.
-        let finalize_updates = self.finalize_published_app_message_source_retention(effects)?;
-        self.pending_projection_updates.extend(finalize_updates);
-        let failed_updates = self.invalidate_failed_app_message_projections(effects, None)?;
-        self.pending_projection_updates.extend(failed_updates);
-        // A manual retry can complete one frozen fanout while another publish
-        // in the same convergence batch fails. Finalize that success before
-        // surfacing the unrelated failure because its fanout is already gone.
-        fail_if_publish_failed(effects)?;
-        self.refresh_group(group_id);
-        self.prune_plaintext_retention_for_group(group_id)?;
-        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(effects);
+        // Manual and scheduled retries consume the same one-shot native events.
+        // Reuse their complete observer, including reportless membership effects,
+        // source finalization, route refresh, and persistence before broadcasting.
+        self.observe_scheduled_convergence_effects(group_id, effects)
+            .await?;
+        let mut summary = self.take_pending_applied_sync_summary();
+        self.drain_epoch_stall_escalations(&mut summary);
+        self.pending_projection_updates
+            .extend(std::mem::take(&mut summary.projection_updates));
+        self.pending_applied_sync_summary.merge(summary);
         Ok(send_summary_from_effects(effects))
     }
 
@@ -5635,7 +5874,8 @@ impl AppClient {
                 audit_context.clone(),
             )
             .await?;
-        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
         self.record_human_action_succeeded(group_id, &audit_context, &effects);
         self.remember_published_reports(&effects);
         let group_metadata = self.runtime.group_record(group_id).ok();
@@ -5648,7 +5888,6 @@ impl AppClient {
         );
         self.mark_group_projection_dirty(group_id);
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
-        self.queue_own_group_system_projection_updates(&effects);
         Ok(send_summary_from_effects(&effects))
     }
 
@@ -6608,7 +6847,8 @@ impl AppClient {
                 // same gate, so no publishing seam reaches the bare check.
                 recover_post_canonical_result(
                     "classify_founding_welcome_publish",
-                    self.observe_recovery_evidence_then_fail_if_publish_failed(&effects),
+                    self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+                        .await,
                 );
                 recover_post_canonical_result(
                     "record_founding_welcome_delivery_failures",
@@ -6619,7 +6859,6 @@ impl AppClient {
                 );
                 self.record_human_action_succeeded(&work.group_id, &work.audit_context, &effects);
                 self.remember_published_reports(&effects);
-                self.queue_own_group_system_projection_updates(&effects);
             }
             UnpublishedWelcomeKind::Invite {
                 welcomes,

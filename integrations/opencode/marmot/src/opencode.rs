@@ -310,6 +310,48 @@ mod tests {
         "/tests/fixtures/mock-opencode.sh"
     );
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runner_receives_current_group_profile_route() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("control-route-opencode");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+test "$MARMOT_ACCOUNT_ID_HEX" = "test-account" || exit 1
+test "$MARMOT_GROUP_ID_HEX" = "test-group" || exit 2
+test "$MARMOT_AGENT_AUTH_TOKEN" = "test-token" || exit 3
+cat >/dev/null
+printf '%s\n' '{"type":"text","sessionID":"ses_control","part":{"type":"text","text":"ok"}}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let context = marmot_terminal_harness::GroupProfileContext {
+            socket: root.path().join("test.sock"),
+            auth_token: Some("test-token".into()),
+            account_id_hex: "test-account".into(),
+            group_id_hex: "test-group".into(),
+            request_timeout: Duration::from_secs(30),
+        };
+        let (tx, mut rx) = mpsc::channel(4);
+        let outcome = marmot_terminal_harness::with_group_profile_context(
+            context,
+            run_with_bin(
+                script.to_str().unwrap(),
+                ExecutionProfile::Inherit,
+                mock_invocation(&root, "normal"),
+                &[],
+                tx,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(rx.recv().await, Some(RunnerEvent::Text("ok".into())));
+    }
+
     async fn run(
         invocation: Invocation,
         tx: mpsc::Sender<RunnerEvent>,

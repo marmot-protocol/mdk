@@ -92,6 +92,595 @@ fn resume_context(
         },
     }
 }
+
+/// Exercise the file sink on small fixtures: the same implementation handles
+/// large explicit transfers without allocating a whole-file array.
+#[tokio::test]
+async fn file_attachment_resume_survives_irregular_chunks_and_publishes_authenticated_bytes() {
+    let plain = vec![42; 2 * ATTACHMENT_CHECKPOINT_BYTES + 71];
+    let (listener, reference, cipher) = listener_fixture(&plain).await;
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        assert!(!headers(&mut socket).await.contains("range:"));
+        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n",cipher.len()).as_bytes()).await.unwrap();
+        let interrupted = ATTACHMENT_CHECKPOINT_BYTES + 123;
+        for part in cipher[..interrupted].chunks(17003) {
+            socket.write_all(part).await.unwrap();
+        }
+        drop(socket);
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = headers(&mut socket).await;
+        let prefix = ATTACHMENT_CHECKPOINT_BYTES + 123;
+        assert!(
+            request.contains(&format!("range: bytes={prefix}-\r\n")),
+            "{request}"
+        );
+        assert!(request.contains("if-range: \"v1\""));
+        respond(
+            &mut socket,
+            "206 Partial Content",
+            &format!(
+                "ETag: \"v1\"\r\nContent-Range: bytes {prefix}-{}/{}\r\n",
+                cipher.len() - 1,
+                cipher.len()
+            ),
+            &cipher[prefix..],
+            cipher.len() - prefix,
+        )
+        .await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (client, store) = client_at(dir.path(), &reference, true).await;
+    let job = claim(&store);
+    let mut context = resume_context(&store, &job, dir.path(), &reference);
+    context.automatic = false;
+    let context = Arc::new(context);
+    let url = &reference.locators[0].value;
+    let transport = crate::media::BlossomHttpTransport::new(true);
+    let staging = dir.path().join("media-staging");
+    let fetch = || {
+        crate::media::fetch_blossom_file_with_transport(
+            url,
+            &transport,
+            &staging,
+            context.ciphertext_digest,
+            crate::MAX_FILE_MEDIA_CIPHERTEXT_BYTES,
+            Arc::new(crate::MediaFileTransferControl::default()),
+            context.clone(),
+        )
+    };
+    assert!(fetch().await.is_err());
+    let prefix = context
+        .load_file(
+            &url::Url::parse(url).unwrap(),
+            crate::MAX_FILE_MEDIA_CIPHERTEXT_BYTES,
+            staging.clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(prefix.0.len, (ATTACHMENT_CHECKPOINT_BYTES + 123) as u64);
+    assert!(
+        store
+            .read_retained_attachment(&job.reference, crate::unix_now_seconds(), 0, 10)
+            .unwrap()
+            .is_none()
+    );
+    drop(prefix);
+    let downloaded = fetch().await.unwrap();
+    assert_eq!(downloaded.len, plain.len() as u64 + 16);
+    let plain_hash = Sha256::digest(&plain).into();
+    let version = crate::EncryptedMediaVersion::V2;
+    let key = crate::media::derive_media_file_key(
+        &[7; 32],
+        version,
+        &plain_hash,
+        &reference.media_type,
+        &reference.file_name,
+    )
+    .unwrap();
+    let aad = crate::media::media_aad(
+        version,
+        &plain_hash,
+        &reference.media_type,
+        &reference.file_name,
+    );
+    let file = crate::media::file_transfer::decrypt_file(
+        &downloaded,
+        &staging,
+        &key,
+        &[3; 12],
+        &aad,
+        plain_hash,
+        &crate::MediaFileTransferControl::default(),
+    )
+    .unwrap();
+    // A final ciphertext update precedes decryption on a slow transfer. The
+    // production completion seam must not move that progress backwards.
+    context
+        .progress(downloaded.len, Some(downloaded.len), false)
+        .await
+        .unwrap();
+    context
+        .completed_file_body(file.len as usize)
+        .await
+        .unwrap();
+    complete_acquired(
+        &client,
+        &job,
+        Ok(crate::client::AcquiredMediaBody::File(file)),
+        128 * 1024 * 1024,
+    )
+    .unwrap();
+    assert_eq!(
+        store.retained_attachment_byte_count().unwrap(),
+        plain.len() as u64
+    );
+    assert_eq!(
+        store
+            .read_retained_attachment(&job.reference, crate::unix_now_seconds(), 0, 100)
+            .unwrap()
+            .unwrap()
+            .as_slice(),
+        &plain[..100]
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn file_attachment_complete_checkpoint_is_verified_without_network() {
+    let (listener, reference, cipher) = listener_fixture(b"completed ciphertext").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_, store) = client_at(dir.path(), &reference, true).await;
+    let job = claim(&store);
+    let context = Arc::new(resume_context(&store, &job, dir.path(), &reference));
+    let url = url::Url::parse(&reference.locators[0].value).unwrap();
+    let identity = AttachmentPartialIdentity {
+        ciphertext_digest: context.ciphertext_digest,
+        locator_digest: Sha256::digest(url.as_str().as_bytes()).into(),
+        etag: "\"v1\"".into(),
+        total: cipher.len() as u64,
+    };
+    assert!(
+        store
+            .checkpoint_attachment_partial(
+                &job,
+                &identity,
+                0,
+                &cipher,
+                crate::unix_now_seconds(),
+                context.budget
+            )
+            .unwrap()
+    );
+    let result = crate::media::fetch_blossom_file_with_transport(
+        url.as_str(),
+        &crate::media::BlossomHttpTransport::new(true),
+        &dir.path().join("media-staging"),
+        context.ciphertext_digest,
+        crate::MAX_FILE_MEDIA_CIPHERTEXT_BYTES,
+        Arc::new(crate::MediaFileTransferControl::default()),
+        context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.len, cipher.len() as u64);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn file_attachment_invalid_range_restarts_without_mixing_representations() {
+    const REDIRECT_COUNT: usize = 5;
+    for scenario in ["duplicate", "etag", "416"] {
+        let (listener, reference, cipher) =
+            listener_fixture(b"restart validated representation").await;
+        let len = cipher.len();
+        let url = url::Url::parse(&reference.locators[0].value).unwrap();
+        let final_path = format!("/hop{REDIRECT_COUNT}");
+        let checkpoint_url = url.join(&final_path).unwrap();
+        let server = tokio::spawn(async move {
+            for hop in 1..=REDIRECT_COUNT {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                assert!(!headers(&mut socket).await.contains("\r\nrange:"));
+                respond(
+                    &mut socket,
+                    "302 Found",
+                    &format!("Location: /hop{hop}\r\n"),
+                    b"",
+                    0,
+                )
+                .await;
+            }
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = headers(&mut socket).await;
+            assert!(request.starts_with(&format!("get {final_path} ")));
+            assert!(request.contains("range: bytes=8-"));
+            let range = format!("Content-Range: bytes 8-{}/{}\r\n", len - 1, len);
+            match scenario {
+                "duplicate" => {
+                    respond(
+                        &mut socket,
+                        "206 Partial Content",
+                        &format!("ETag: \"v1\"\r\n{range}{range}"),
+                        &cipher[8..],
+                        len - 8,
+                    )
+                    .await
+                }
+                "etag" => {
+                    respond(
+                        &mut socket,
+                        "206 Partial Content",
+                        &format!("ETag: \"changed\"\r\n{range}"),
+                        &cipher[8..],
+                        len - 8,
+                    )
+                    .await
+                }
+                _ => respond(&mut socket, "416 Range Not Satisfiable", "", b"", 0).await,
+            }
+            drop(socket);
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = headers(&mut socket).await;
+            assert!(request.starts_with(&format!("get {final_path} ")));
+            assert!(!request.contains("\r\nrange:"));
+            respond(&mut socket, "200 OK", "ETag: \"v2\"\r\n", &cipher, len).await;
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (_, store) = client_at(dir.path(), &reference, true).await;
+        let job = claim(&store);
+        let context = Arc::new(resume_context(&store, &job, dir.path(), &reference));
+        let (_, valid_cipher) =
+            crate::media::tests::attachment_worker_fixture(b"restart validated representation");
+        let identity = AttachmentPartialIdentity {
+            ciphertext_digest: context.ciphertext_digest,
+            locator_digest: Sha256::digest(checkpoint_url.as_str().as_bytes()).into(),
+            etag: "\"v1\"".into(),
+            total: len as u64,
+        };
+        assert!(
+            store
+                .checkpoint_attachment_partial(
+                    &job,
+                    &identity,
+                    0,
+                    &valid_cipher[..8],
+                    crate::unix_now_seconds(),
+                    context.budget
+                )
+                .unwrap()
+        );
+        let file = crate::media::fetch_blossom_file_with_transport(
+            url.as_str(),
+            &crate::media::BlossomHttpTransport::new(true),
+            &dir.path().join("media-staging"),
+            context.ciphertext_digest,
+            crate::MAX_FILE_MEDIA_CIPHERTEXT_BYTES,
+            Arc::new(crate::MediaFileTransferControl::default()),
+            context,
+        )
+        .await
+        .unwrap();
+        assert_eq!(file.len, len as u64);
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn resumed_hash_retries_fresh() {
+    check_resume_failure(ResumeFailure::HashMismatch).await;
+}
+
+#[tokio::test]
+async fn resumed_overflow_clears_prefix() {
+    check_resume_failure(ResumeFailure::Overflow).await;
+}
+
+enum ResumeFailure {
+    HashMismatch,
+    Overflow,
+}
+
+async fn check_resume_failure(failure: ResumeFailure) {
+    let overflow = matches!(failure, ResumeFailure::Overflow);
+    let (listener, reference, cipher) = listener_fixture(b"validated file checkpoint").await;
+    let prefix = cipher[..8].to_vec();
+    let len = cipher.len();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        assert!(headers(&mut socket).await.contains("range: bytes=8-"));
+        let mut suffix = cipher[8..].to_vec();
+        if overflow {
+            suffix.push(0);
+            socket.write_all(format!("HTTP/1.1 206 Partial Content\r\nETag: \"v1\"\r\nContent-Range: bytes 8-{}/{}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n", len - 1, len, suffix.len()).as_bytes()).await.unwrap();
+            socket.write_all(&suffix).await.unwrap();
+            socket.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+            return;
+        }
+        suffix[0] ^= 1;
+        respond(
+            &mut socket,
+            "206 Partial Content",
+            &format!(
+                "ETag: \"v1\"\r\nContent-Range: bytes 8-{}/{}\r\n",
+                len - 1,
+                len
+            ),
+            &suffix,
+            suffix.len(),
+        )
+        .await;
+        drop(socket);
+        let (mut socket, _) = listener.accept().await.unwrap();
+        assert!(!headers(&mut socket).await.contains("\r\nrange:"));
+        respond(&mut socket, "200 OK", "ETag: \"v1\"\r\n", &cipher, len).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (_, store) = client_at(dir.path(), &reference, true).await;
+    let job = claim(&store);
+    let context = Arc::new(resume_context(&store, &job, dir.path(), &reference));
+    let url = url::Url::parse(&reference.locators[0].value).unwrap();
+    let identity = AttachmentPartialIdentity {
+        ciphertext_digest: context.ciphertext_digest,
+        locator_digest: Sha256::digest(url.as_str().as_bytes()).into(),
+        etag: "\"v1\"".into(),
+        total: len as u64,
+    };
+    assert!(
+        store
+            .checkpoint_attachment_partial(
+                &job,
+                &identity,
+                0,
+                &prefix,
+                crate::unix_now_seconds(),
+                context.budget
+            )
+            .unwrap()
+    );
+    let staging = dir.path().join("media-staging");
+    let transport = crate::media::BlossomHttpTransport::new(true);
+    let fetch = || {
+        crate::media::fetch_blossom_file_with_transport(
+            url.as_str(),
+            &transport,
+            &staging,
+            context.ciphertext_digest,
+            crate::MAX_FILE_MEDIA_CIPHERTEXT_BYTES,
+            Arc::default(),
+            context.clone(),
+        )
+    };
+    let error = fetch().await.err().unwrap();
+    if overflow {
+        assert!(
+            matches!(error, AttachmentDownloadFailure::Stop(_)),
+            "an oversized Range body is terminal"
+        );
+    } else {
+        assert!(
+            matches!(error, AttachmentDownloadFailure::Retry(_)),
+            "a failed resumed representation must retry without its prefix"
+        );
+    }
+    assert!(
+        context
+            .load_file(
+                &url,
+                crate::MAX_FILE_MEDIA_CIPHERTEXT_BYTES,
+                staging.clone()
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .read_retained_attachment(&job.reference, crate::unix_now_seconds(), 0, 10)
+            .unwrap()
+            .is_none()
+    );
+    if !overflow {
+        assert_eq!(fetch().await.unwrap().len, len as u64);
+    }
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn disk_reserve_without_etag() {
+    check_disk_reserve(ResponseLength::Known).await;
+}
+
+#[tokio::test]
+async fn disk_reserve_unknown_length() {
+    check_disk_reserve(ResponseLength::Unknown).await;
+}
+
+enum ResponseLength {
+    Known,
+    Unknown,
+}
+
+async fn check_disk_reserve(length: ResponseLength) {
+    let known_length = matches!(length, ResponseLength::Known);
+    let plain = vec![42; 2 * ATTACHMENT_CHECKPOINT_BYTES + 71];
+    let (listener, reference, cipher) = listener_fixture(&plain).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_, store) = client_at(dir.path(), &reference, true).await;
+    let job = claim(&store);
+    assert!(
+        store
+            .promote_attachment_demand(&job.reference, crate::unix_now_seconds())
+            .unwrap()
+    );
+    let mut context = resume_context(&store, &job, dir.path(), &reference);
+    context.automatic = false;
+    let (updates, mut progress) = tokio::sync::watch::channel(());
+    context.updates = Some(updates);
+    let server_store = store.clone();
+    let mut policy = context.policy.clone();
+    let unavailable_reserve = fs4::total_space(dir.path()).unwrap().saturating_add(1);
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        headers(&mut socket).await;
+        if known_length {
+            policy.disk_reserve = unavailable_reserve;
+            server_store
+                .set_attachment_download_policy(&policy, crate::unix_now_seconds())
+                .unwrap();
+        }
+        let framing = if known_length {
+            format!("Content-Length: {}\r\n", cipher.len())
+        } else {
+            "Transfer-Encoding: chunked\r\n".into()
+        };
+        socket
+            .write_all(format!("HTTP/1.1 200 OK\r\nConnection: close\r\n{framing}\r\n").as_bytes())
+            .await
+            .unwrap();
+        if !known_length {
+            // Initial file admission has passed; pressure arrives while the
+            // body grows without a validator or trustworthy complete size.
+            progress.changed().await.unwrap();
+            policy.disk_reserve = unavailable_reserve;
+            server_store
+                .set_attachment_download_policy(&policy, crate::unix_now_seconds())
+                .unwrap();
+            let _ = socket
+                .write_all(format!("{:x}\r\n", cipher.len()).as_bytes())
+                .await;
+        }
+        // Refusal may close the socket before the scripted body finishes.
+        let _ = socket.write_all(&cipher).await;
+        if !known_length {
+            let _ = socket.write_all(b"\r\n0\r\n\r\n").await;
+        }
+    });
+    let context = Arc::new(context);
+    let staging = dir.path().join("media-staging");
+    let transport = crate::media::BlossomHttpTransport::new(true);
+    let result = crate::media::fetch_blossom_file_with_transport(
+        &reference.locators[0].value,
+        &transport,
+        &staging,
+        context.ciphertext_digest,
+        crate::MAX_FILE_MEDIA_CIPHERTEXT_BYTES,
+        Arc::default(),
+        context,
+    );
+    assert!(
+        matches!(
+            result.await,
+            Err(AttachmentDownloadFailure::Retry(AppError::BlobStore(_)))
+        ),
+        "disk pressure must defer before private staging consumes the reserve"
+    );
+    assert!(
+        store
+            .read_retained_attachment(&job.reference, crate::unix_now_seconds(), 0, 10)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn file_attachment_corrupt_ciphertext_is_terminal_and_never_readable() {
+    let (listener, reference, mut cipher) =
+        listener_fixture(&vec![42; ATTACHMENT_CHECKPOINT_BYTES + 71]).await;
+    cipher[0] ^= 1;
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        headers(&mut socket).await;
+        respond(
+            &mut socket,
+            "200 OK",
+            "ETag: \"bad\"\r\n",
+            &cipher,
+            cipher.len(),
+        )
+        .await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (_, store) = client_at(dir.path(), &reference, true).await;
+    let job = claim(&store);
+    let context = Arc::new(resume_context(&store, &job, dir.path(), &reference));
+    let result = crate::media::fetch_blossom_file_with_transport(
+        &reference.locators[0].value,
+        &crate::media::BlossomHttpTransport::new(true),
+        &dir.path().join("media-staging"),
+        context.ciphertext_digest,
+        crate::MAX_FILE_MEDIA_CIPHERTEXT_BYTES,
+        Arc::new(crate::MediaFileTransferControl::default()),
+        context.clone(),
+    )
+    .await;
+    assert!(matches!(result, Err(AttachmentDownloadFailure::Stop(_))));
+    assert!(
+        context
+            .load_file(
+                &url::Url::parse(&reference.locators[0].value).unwrap(),
+                crate::MAX_FILE_MEDIA_CIPHERTEXT_BYTES,
+                dir.path().join("media-staging")
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .read_retained_attachment(&job.reference, crate::unix_now_seconds(), 0, 10)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("media-staging"))
+            .unwrap()
+            .count(),
+        0
+    );
+    server.await.unwrap();
+}
+#[tokio::test]
+async fn file_redirect_limit_stops() {
+    let (listener, reference, _) = listener_fixture(b"redirect boundary").await;
+    let server = tokio::spawn(async move {
+        for hop in 1..=6 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            assert!(!headers(&mut socket).await.contains("\r\nrange:"));
+            respond(
+                &mut socket,
+                "302 Found",
+                &format!("Location: /hop{hop}\r\n"),
+                b"",
+                0,
+            )
+            .await;
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (_, store) = client_at(dir.path(), &reference, true).await;
+    let job = claim(&store);
+    let context = Arc::new(resume_context(&store, &job, dir.path(), &reference));
+    let result = crate::media::fetch_blossom_file_with_transport(
+        &reference.locators[0].value,
+        &crate::media::BlossomHttpTransport::new(true),
+        &dir.path().join("media-staging"),
+        context.ciphertext_digest,
+        crate::MAX_FILE_MEDIA_CIPHERTEXT_BYTES,
+        Arc::new(crate::MediaFileTransferControl::default()),
+        context,
+    )
+    .await;
+    assert!(matches!(result, Err(AttachmentDownloadFailure::Stop(_))));
+    server.await.unwrap();
+}
+
 async fn headers(socket: &mut tokio::net::TcpStream) -> String {
     let mut bytes = Vec::new();
     loop {

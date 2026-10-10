@@ -25,7 +25,7 @@ holds the implementation, its architecture notes, conformance tests, formal mode
 
 | I want to… | Start here |
 | --- | --- |
-| Talk to Hermes, OpenClaw, Claude Code, Codex, OpenCode, or Pi from White Noise | [White Noise + Agents quickstart](integrations/README.md) |
+| Talk to Hermes, OpenClaw, Claude Code, Codex, OpenCode, Pi, or Goose from White Noise | [White Noise + Agents quickstart](integrations/README.md) |
 | Use White Noise from a terminal (CLI, daemon, TUI) | [`wn` guide](crates/cli/README.md) |
 | Integrate MDK into an iOS, macOS, or Android app | [MarmotKit integration guide](crates/marmot-uniffi/README.md) |
 | Integrate from C or another raw-FFI host | [C ABI guide](crates/marmot-c/README.md) |
@@ -50,6 +50,7 @@ you allowlist can invite or message it.
 | Codex | Terminal harness | [integrations/codex](integrations/codex/marmot/README.md) |
 | OpenCode | Terminal harness | [integrations/opencode](integrations/opencode/marmot/README.md) |
 | Pi | Terminal harness | [integrations/pi](integrations/pi/marmot/README.md) |
+| Goose | Terminal harness | [integrations/goose](integrations/goose/marmot/README.md) |
 
 The [quickstart](integrations/README.md) installs a checksum-verified release on macOS or Linux and gets you to a first
 encrypted chat. For how connectors share one machine, identities, and allowlists, see
@@ -157,6 +158,10 @@ still land on the same epoch and group state. The engine — not relay order or 
 ## Development
 
 The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml); most tasks run through [`just`](Justfile).
+
+`Cargo.toml` patches HPKE 0.7 with the local [`vendor/hpke-rs-libcrux`](vendor/hpke-rs-libcrux/BACKPORT.md)
+provider to use `libcrux-kem 0.0.10`, fixing RUSTSEC-2026-0330 and RUSTSEC-2026-0331.
+Its backport notes record provenance, regression commands and the removal condition.
 
 ```sh
 just fast-ci                 # formatting, doc/naming gates, compile checks, clippy; skips the `just test` matrix

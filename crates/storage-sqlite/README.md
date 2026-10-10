@@ -14,6 +14,7 @@ group snapshots and rollback must be atomic across Marmot records and group-scop
 - [Migrations](#migrations)
 - [Recovery semantics](#recovery-semantics)
 - [Conversation reads](#conversation-reads)
+- [Chat-list selection](#chat-list-selection)
 - [Account recovery ledger](#account-recovery-ledger)
 - [Tests and benchmarks](#tests-and-benchmarks)
 
@@ -64,6 +65,29 @@ surviving clones return `StorageError::Closed`.
 The shared store is unencrypted and owner-only, with WAL, `synchronous=NORMAL`, a 5-second busy timeout, foreign keys
 ON, `trusted_schema=OFF`, `temp_store=MEMORY`, and terminal close. See the
 [app storage boundaries](../../docs/marmot-architecture/further-context/app-sqlite-storage-boundaries.md).
+
+## Chat-list selection
+
+`chat_list_selection_snapshot(view)` captures all eligible IDs for one of the four native `ChatListView`s in one
+read transaction, before display pagination. It uses the view's indexed predicate and ordering and reads no
+presentation, profile, roster or history blobs. Pending base-projection work returns `ProjectionNotReady` rather
+than a falsely complete result. The runtime must finish its existing bounded base-row preparation before retrying.
+
+The transient snapshot belongs to one connection lifetime and database epoch. Clones of that account store may
+use it; a foreign store or reopened connection returns `StaleSelection`, and terminal close preserves
+`StorageError::Closed`. Debug output contains only the view and count. The snapshot itself holds no connection
+lease and is never persisted.
+
+`chat_list_selection_count` returns the full frozen count; `chat_list_selection_page` returns at most 200 IDs from
+an offset in the captured order. New arrivals, activity reordering and window eviction do not expand that intent.
+`revalidate_chat_list_selection` returns its still-eligible subset in the original order, never adding new IDs.
+Use the returned snapshot for subsequent validation to retain removals. Batch actions must revalidate first and
+still enforce their own mutation preconditions: this read is not an atomic authorization for a later write.
+
+Capture and revalidation use O(eligible IDs) work and memory, independently of profile/history size; each page
+copies at most 200 IDs. This storage primitive does not implement automatic-folder expressions, binding handles
+or host selection UI. Those callers must retain account/view generations, explicit cancellation and progress
+while resolving complete intent instead of deriving it from visible rows.
 
 ## Migrations
 
@@ -175,6 +199,10 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   retired watermark separately from import: clearing one token restores other joined generations and returns `false`
   while loss remains, preserving the runtime's pending flag across reopen. Late duplicate writers cannot resurrect a
   retired generation; increased counts can.
+- **Comparison plans.** Format-1 plans still accept the retired optional `live_since_seconds` field from older
+  databases, but recovery ignores it and new writes omit it. A normal settlement rewrites a legacy plan without
+  changing its fence, route scopes, retry cost, or uncovered demand. Other unknown fields and malformed legacy values
+  remain errors; no schema migration or plan-format change is required.
 - **Inventory revision.** Inventory expiration, compaction, message release, and route/group deletion bump the account
   inventory revision in the same transaction; reservations and plan installation check it. Installed proof is
   invalidated only for overlapping route/window scopes (and the exact event for known-event predicates), so unrelated or

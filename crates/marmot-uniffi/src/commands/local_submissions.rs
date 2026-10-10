@@ -169,6 +169,35 @@ impl Marmot {
         })
     }
 
+    /// File-backed `upload_media_with_client_token`. Every attachment is
+    /// prepared and uploaded before durable admission. Cancellation observed
+    /// before admission starts returns an error and admits nothing. Once
+    /// admission starts it is not interruptible; follow `local_send_status`
+    /// and timeline delivery updates for the outcome.
+    pub async fn upload_media_files_with_client_token(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        request: MediaFileUploadRequestFfi,
+        control: Arc<MediaFileTransferControlFfi>,
+        client_token: String,
+    ) -> Result<MediaUploadSubmissionFfi, MarmotKitError> {
+        let (upload, acceptance) = self
+            .runtime
+            .upload_media_files_with_client_token(
+                &account_ref,
+                &group_id_from_hex(&group_id_hex)?,
+                request.into(),
+                control.inner.clone(),
+                client_token,
+            )
+            .await?;
+        Ok(MediaUploadSubmissionFfi {
+            upload: upload.try_into()?,
+            acceptance: acceptance.map(Into::into),
+        })
+    }
+
     /// Local-only status lookup, including after restart. Timeline subscriptions
     /// remain the source of subsequent transport delivery and failure updates.
     pub fn local_send_status(

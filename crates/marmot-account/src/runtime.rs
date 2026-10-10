@@ -391,6 +391,28 @@ impl MaintenanceActivity {
             .saturating_add(previous.failed_transitions);
     }
 }
+type PublicationProgressObserver =
+    Arc<dyn Fn(&AccountDeviceSession, &PublishedApplicationMessage) + Send + Sync>;
+type SecondaryRetryYield = futures::future::Shared<futures::future::BoxFuture<'static, ()>>;
+#[derive(Clone)]
+struct PublicationProgress {
+    observe: PublicationProgressObserver,
+    secondary_retry_yield: SecondaryRetryYield,
+}
+type PublicationProgressSlot = Arc<std::sync::Mutex<Option<PublicationProgress>>>;
+
+/// Restore the previous observer even when the owning convergence future is dropped.
+struct PublicationProgressGuard {
+    slot: PublicationProgressSlot,
+    previous: Option<PublicationProgress>,
+}
+
+impl Drop for PublicationProgressGuard {
+    fn drop(&mut self) {
+        *self.slot.lock().unwrap_or_else(|error| error.into_inner()) = self.previous.take();
+    }
+}
+
 pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackagePublisher> {
     session: AccountDeviceSession,
     adapter: A,
@@ -403,6 +425,9 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     maintenance_paused: bool,
     maintenance_activity: std::sync::Mutex<MaintenanceActivity>,
     maintenance_quiet_monotonic: HashMap<cgka_traits::MessageId, Duration>,
+    /// Secondary maintenance writes must not discard committed session effects.
+    /// Keep their group-scoped reconciliation owned until a quiet retry succeeds.
+    pending_leaf_reconciliations: HashMap<GroupId, Option<Timestamp>>,
     /// Exact Welcome events whose relay-only publish phase currently runs
     /// outside the serialized account owner. Other maintenance/manual retry
     /// paths skip these ids until their results are reconciled, preventing two
@@ -412,6 +437,7 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// legacy publish for this message id fails with a transient storage
     /// error. Never set by production code.
     finish_stage_failure: Option<cgka_traits::MessageId>,
+    publication_progress: PublicationProgressSlot,
 }
 
 impl<A, R, K> AccountDeviceRuntime<A, R, K>
@@ -433,8 +459,10 @@ where
             maintenance_paused: false,
             maintenance_activity: std::sync::Mutex::new(MaintenanceActivity::default()),
             maintenance_quiet_monotonic: HashMap::new(),
+            pending_leaf_reconciliations: HashMap::new(),
             detached_welcome_publishes: HashSet::new(),
             finish_stage_failure: None,
+            publication_progress: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -479,7 +507,9 @@ where
 
     /// Abandon a group locally without sending a leave or disband.
     pub fn forget_group_local(&mut self, group_id: &GroupId) -> AccountResult<bool> {
-        Ok(self.session.forget_group_local(group_id)?)
+        let forgotten = self.session.forget_group_local(group_id)?;
+        self.pending_leaf_reconciliations.remove(group_id);
+        Ok(forgotten)
     }
 
     pub fn group_record(&self, group_id: &GroupId) -> AccountResult<Group> {
@@ -1504,6 +1534,7 @@ where
         use sha2::{Digest, Sha256};
 
         self.sweep_expired_key_package_private_material()?;
+        self.reconcile_confirmed_own_leaf_rotations(&[]);
         let mut output = AccountDeviceEffects::default();
         // Hydration recreates the publication edge for a surviving staged
         // evolution. Consume that edge before consulting the semantic
@@ -1587,6 +1618,9 @@ where
         } else {
             self.session.live_group_ids()?
         } {
+            if self.pending_leaf_reconciliations.contains_key(&group_id) {
+                continue;
+            }
             let Some(Some(mut state)) =
                 skips_group_this_tick(self.session.group_maintenance(&group_id))?
             else {
@@ -1605,15 +1639,10 @@ where
             if has_active {
                 continue;
             }
-            if state.next_periodic_rotation_at.is_none()
-                && let Some(last_rotation) = state.last_own_leaf_rotation_at
-            {
-                state.next_periodic_rotation_at = Some(Timestamp(
-                    last_rotation.0.saturating_add(
-                        self.maintenance_random
-                            .sample_inclusive(PERIODIC_MIN_SECS, PERIODIC_MAX_SECS),
-                    ),
-                ));
+            if state.next_periodic_rotation_at.is_none() {
+                let baseline = Self::periodic_baseline(&state, &active_obligations, None, now);
+                state.next_periodic_rotation_at =
+                    Some(self.fresh_periodic_deadline(&group_id, baseline)?);
                 self.session.put_group_maintenance(&state)?;
             }
             if state
@@ -1659,6 +1688,12 @@ where
         let mut obligations = self.session.maintenance_obligations()?;
         obligations.sort_by_key(|obligation| obligation.created_at);
         for mut obligation in obligations {
+            if self
+                .pending_leaf_reconciliations
+                .contains_key(&obligation.group_id)
+            {
+                continue;
+            }
             if matches!(
                 obligation.phase,
                 MaintenancePhase::Complete | MaintenancePhase::Failed
@@ -1691,6 +1726,18 @@ where
             if self.session.leave_in_progress(&obligation.group_id)?
                 || self.session.disbanding_in_progress(&obligation.group_id)?
             {
+                continue;
+            }
+            if let Some(baseline) = &obligation.own_leaf_baseline_hash
+                && baseline.as_slice()
+                    != self.session.own_leaf_hash(&obligation.group_id)?.as_slice()
+            {
+                // A reopen can lose the event, but not the live obligation's
+                // evidence that the selected local leaf already rotated.
+                self.pending_leaf_reconciliations
+                    .entry(obligation.group_id.clone())
+                    .or_insert(None);
+                self.reconcile_confirmed_own_leaf_rotations(&[]);
                 continue;
             }
             let original_obligation = obligation.clone();
@@ -1878,9 +1925,7 @@ where
                                     activity.failed_attempts.saturating_add(1);
                             }
                             output.absorb_account_effects(retried);
-                            if confirmed {
-                                self.complete_maintenance_obligation(&mut obligation, now)?;
-                            } else {
+                            if !confirmed {
                                 obligation.phase = MaintenancePhase::PendingPublication;
                                 obligation.attempt_count =
                                     obligation.attempt_count.saturating_add(1);
@@ -1954,9 +1999,7 @@ where
                         activity.failed_attempts = activity.failed_attempts.saturating_add(1);
                     }
                     output.absorb_account_effects(effects);
-                    if confirmed {
-                        self.complete_maintenance_obligation(&mut obligation, now)?;
-                    } else {
+                    if !confirmed {
                         obligation.phase = MaintenancePhase::PendingPublication;
                         obligation.attempt_count = obligation.attempt_count.saturating_add(1);
                         self.put_maintenance_obligation_if_changed(
@@ -2115,22 +2158,20 @@ where
         obligation: &mut MaintenanceObligation,
         completed_at: Timestamp,
     ) -> AccountResult<()> {
+        if let Some(mut state) = self.session.group_maintenance(&obligation.group_id)? {
+            state.last_own_leaf_rotation_at = Some(completed_at);
+            state.next_periodic_rotation_at = if state.periodic_enrolled {
+                Some(self.fresh_periodic_deadline(&obligation.group_id, completed_at)?)
+            } else {
+                None
+            };
+            self.session.put_group_maintenance(&state)?;
+        }
+        // Keep a live retry owner until the deadline write has succeeded.
         obligation.phase = MaintenancePhase::Complete;
         obligation.last_failure_code = None;
         self.persist_maintenance_obligation(obligation)?;
         self.maintenance_quiet_monotonic.remove(&obligation.id);
-        if let Some(mut state) = self.session.group_maintenance(&obligation.group_id)? {
-            state.last_own_leaf_rotation_at = Some(completed_at);
-            state.next_periodic_rotation_at = state.periodic_enrolled.then(|| {
-                Timestamp(
-                    completed_at.0.saturating_add(
-                        self.maintenance_random
-                            .sample_inclusive(PERIODIC_MIN_SECS, PERIODIC_MAX_SECS),
-                    ),
-                )
-            });
-            self.session.put_group_maintenance(&state)?;
-        }
         Ok(())
     }
 
@@ -2309,7 +2350,7 @@ where
             .push(PendingResolution::RolledBack { pending });
         output.absorb_session_effects(rollback_effects, &mut queue);
         self.publish_queue(&mut output, &mut queue, None).await?;
-        self.reconcile_confirmed_own_leaf_rotations(&output.events)?;
+        self.reconcile_confirmed_own_leaf_rotations(&output.events);
         let superseded = self.reconcile_superseded_maintenance(&output.events)?;
         output.superseded_intents.extend(superseded);
         Ok(output)
@@ -2472,6 +2513,51 @@ where
             }))
     }
 
+    /// Advance convergence while observing each durable accepted application
+    /// publication before waiting for later publications in the same batch.
+    ///
+    /// The synchronous observer receives the live session at the completed
+    /// engine boundary. It must not panic or perform network work. Its
+    /// notification uses the same acceptance rule as `published_app_messages`;
+    /// it does not change quorum, MLS confirmation, or acknowledge projection
+    /// persistence. Observers should handle local failures without interrupting
+    /// the remaining batch. Dropping this future removes its observer; durable
+    /// fanouts remain available to the ordinary recovery path.
+    pub async fn advance_convergence_with_publication_progress(
+        &mut self,
+        group_id: &GroupId,
+        observe: PublicationProgressObserver,
+    ) -> AccountResult<AccountDeviceEffects> {
+        self.advance_convergence_with_publication_progress_and_yield(
+            group_id,
+            observe,
+            std::future::pending(),
+        )
+        .await
+    }
+
+    /// Yield only dispensable secondary relay waits when the owner has foreground work.
+    /// The signal is latched for this pass. Below-quorum publications and pending MLS
+    /// confirmation remain mandatory; cancelled secondary attempts retain exact bytes
+    /// and conservative exposure evidence through the ordinary durable retry path.
+    pub async fn advance_convergence_with_publication_progress_and_yield(
+        &mut self,
+        group_id: &GroupId,
+        observe: PublicationProgressObserver,
+        yield_requested: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> AccountResult<AccountDeviceEffects> {
+        let slot = self.publication_progress.clone();
+        let previous = slot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .replace(PublicationProgress {
+                observe,
+                secondary_retry_yield: yield_requested.boxed().shared(),
+            });
+        let _guard = PublicationProgressGuard { slot, previous };
+        self.advance_convergence(group_id).await
+    }
+
     pub async fn advance_convergence(
         &mut self,
         group_id: &GroupId,
@@ -2487,13 +2573,16 @@ where
         let (mut output, blocked_groups) = self
             .resume_outbound_fanouts_for_group(Some(group_id))
             .await?;
-        // An older deferred transport fanout blocks only newly queued
-        // outbound intents. Convergence inputs must still settle: otherwise a
-        // permanently unavailable relay can wedge epoch progression and fork
-        // healing forever. Any protocol effects produced by settlement remain
-        // observable while the queued-intent drain stays ordered behind the
-        // frozen fanout.
-        let effects = if blocked_groups.contains(group_id) {
+        // Keep exact-event retries in their original order, but do not make
+        // engine-queued sends wait for secondary replication after quorum and
+        // MLS confirmation. Foreground sends already use that same boundary.
+        // Inspect the remaining durable state, including newer fanouts skipped
+        // behind the oldest retry, so an unresolved publication stays a barrier.
+        let queued_intents_blocked = blocked_groups.contains(group_id)
+            && self.queued_outbound_intents_blocked_by_fanouts(group_id)?;
+        // Required publication barriers must not prevent inbound convergence
+        // from settling, even while the corresponding relay is unavailable.
+        let effects = if queued_intents_blocked {
             self.session.advance_convergence_inputs(group_id).await?
         } else {
             self.session.advance_convergence(group_id).await?
@@ -2508,6 +2597,30 @@ where
 
     pub fn has_queued_outbound_intents(&self, group_id: &GroupId) -> AccountResult<bool> {
         Ok(self.session.has_queued_outbound_intents(group_id)?)
+    }
+
+    /// Whether retained publications still prevent staging queued sends.
+    ///
+    /// Pending MLS confirmation and outstanding targets below required quorum
+    /// are barriers; secondary replication after quorum is not. This inspects
+    /// every retained fanout, including newer work behind an older retry. It
+    /// does not establish that convergence inputs or other engine gates cleared.
+    /// Unhydrated or unavailable group state is an error, never an empty outbox.
+    pub fn queued_outbound_intents_blocked_by_fanouts(
+        &self,
+        group_id: &GroupId,
+    ) -> AccountResult<bool> {
+        self.session.group_record(group_id)?;
+        Ok(self
+            .session
+            .outbound_fanouts_for_group(group_id)?
+            .iter()
+            .any(|fanout| {
+                let outcome = fanout.outcome();
+                matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+                    || (outcome.outstanding_targets > 0
+                        && outcome.accepted_targets < fanout.request().required_acks.max(1))
+            }))
     }
 
     pub fn has_pending_outbound_fanouts(&self, group_id: &GroupId) -> AccountResult<bool> {
@@ -2691,7 +2804,7 @@ where
         let mut queue = VecDeque::new();
         output.absorb_session_effects(effects, &mut queue);
         self.publish_queue(&mut output, &mut queue, context).await?;
-        self.reconcile_confirmed_own_leaf_rotations(&output.events)?;
+        self.reconcile_confirmed_own_leaf_rotations(&output.events);
         let superseded = self.reconcile_superseded_maintenance(&output.events)?;
         output.superseded_intents.extend(superseded);
         Ok(output)
@@ -2782,6 +2895,33 @@ where
             .map(|(effects, _blocked_groups)| effects)
     }
 
+    /// Notify only after the ordinary durable-fanout path records acceptance.
+    fn record_published_application_fanout(
+        &self,
+        fanout: &OutboundFanout,
+        output: &mut AccountDeviceEffects,
+    ) {
+        let previous_count = output.published_app_messages.len();
+        record_published_application_fanout(fanout, output);
+        if output.published_app_messages.len() == previous_count {
+            return;
+        }
+        let observer = self
+            .publication_progress
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(observer) = observer {
+            (observer.observe)(
+                &self.session,
+                output
+                    .published_app_messages
+                    .last()
+                    .expect("recorded publication"),
+            );
+        }
+    }
+
     /// Retire terminal accepted application fanouts only after the app has
     /// durably finalized their optimistic projections.
     ///
@@ -2851,7 +2991,7 @@ where
                     blocked_groups.insert(fanout_group);
                 }
             } else if outcome.accepted_targets > 0 && fanout.application_message().is_some() {
-                record_published_application_fanout(&fanout, &mut output);
+                self.record_published_application_fanout(&fanout, &mut output);
                 output.fanout.push(outcome);
             } else {
                 let reason = "insufficient publish acknowledgements".to_owned();
@@ -2868,74 +3008,167 @@ where
             }
         }
         self.publish_queue(&mut output, &mut queue, None).await?;
-        self.reconcile_confirmed_own_leaf_rotations(&output.events)?;
+        self.reconcile_confirmed_own_leaf_rotations(&output.events);
         let superseded = self.reconcile_superseded_maintenance(&output.events)?;
         output.superseded_intents.extend(superseded);
         Ok((output, blocked_groups))
     }
 
-    fn reconcile_confirmed_own_leaf_rotations(
+    /// Reconcile against the final canonical local leaf after all batch effects,
+    /// since branch selection can restore a copy terminated earlier in the batch.
+    fn reconcile_confirmed_own_leaf_rotations(&mut self, events: &[GroupEvent]) {
+        for event in events {
+            let (group_id, restored_at) = match event {
+                GroupEvent::EpochChanged { group_id, .. }
+                | GroupEvent::LocalGroupCopyTerminated { group_id, .. } => (group_id, None),
+                GroupEvent::LocalGroupCopyRestored { group_id } => {
+                    (group_id, Some(self.wall_clock.now()))
+                }
+                _ => continue,
+            };
+            if let Some(owned) = self.pending_leaf_reconciliations.get_mut(group_id) {
+                if restored_at.is_some() {
+                    *owned = restored_at;
+                }
+            } else {
+                self.pending_leaf_reconciliations
+                    .insert(group_id.clone(), restored_at);
+            }
+        }
+        let mut pending = std::mem::take(&mut self.pending_leaf_reconciliations);
+        pending.retain(|group_id, restored_at| {
+            if self
+                .reconcile_own_leaf_group(group_id, *restored_at)
+                .is_err()
+            {
+                tracing::warn!(target: TRACE_TARGET,
+                    method = "reconcile_confirmed_own_leaf_rotations",
+                    error_kind = "maintenance_reconciliation_retry",
+                    "committed group maintenance reconciliation remains owned for retry");
+                return true;
+            }
+            false
+        });
+        self.pending_leaf_reconciliations = pending;
+    }
+
+    fn reconcile_own_leaf_group(
         &mut self,
-        events: &[GroupEvent],
+        group_id: &GroupId,
+        restored_at: Option<Timestamp>,
     ) -> AccountResult<()> {
-        let changed_groups = events
-            .iter()
-            .filter_map(|event| match event {
-                GroupEvent::EpochChanged { group_id, .. } => Some(group_id.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let mut unique_changed_groups = Vec::new();
         let now = self.wall_clock.now();
-        for group_id in changed_groups {
-            if unique_changed_groups.contains(&group_id) {
-                continue;
-            }
-            unique_changed_groups.push(group_id.clone());
-            let self_id = self.session.self_id();
-            let local_member_present = self
+        // A surviving sibling keeps the account in the roster, but it
+        // cannot supply this copy's removed local leaf for rotation.
+        let local_member_present = !self.session.group_record(group_id)?.is_terminal()
+            && self
                 .session
-                .members(&group_id)?
-                .iter()
-                .any(|member| member.id == self_id);
-            if !local_member_present {
-                for mut obligation in self.session.maintenance_obligations_for_group(&group_id)? {
-                    if matches!(
-                        obligation.phase,
-                        MaintenancePhase::Complete | MaintenancePhase::Failed
-                    ) {
-                        continue;
-                    }
-                    obligation.phase = MaintenancePhase::Failed;
-                    obligation.last_failure_code = Some("local_member_removed".into());
-                    self.persist_maintenance_obligation(&obligation)?;
-                    self.maintenance_quiet_monotonic.remove(&obligation.id);
-                }
-                if let Some(mut state) = self.session.group_maintenance(&group_id)? {
-                    state.periodic_enrolled = false;
-                    state.next_periodic_rotation_at = None;
-                    self.session.put_group_maintenance(&state)?;
-                }
-                continue;
-            }
-            let current = self.session.own_leaf_hash(&group_id)?;
-            for mut obligation in self.session.maintenance_obligations_for_group(&group_id)? {
+                .canonical_group_membership(group_id)?
+                .local_leaf_active;
+        if !local_member_present {
+            for mut obligation in self.session.maintenance_obligations_for_group(group_id)? {
                 if matches!(
                     obligation.phase,
                     MaintenancePhase::Complete | MaintenancePhase::Failed
                 ) {
                     continue;
                 }
-                if obligation
-                    .own_leaf_baseline_hash
-                    .as_ref()
-                    .is_some_and(|baseline| baseline.as_slice() != current.as_slice())
-                {
-                    self.complete_maintenance_obligation(&mut obligation, now)?;
-                }
+                obligation.phase = MaintenancePhase::Failed;
+                obligation.last_failure_code = Some("local_member_removed".into());
+                self.persist_maintenance_obligation(&obligation)?;
+                self.maintenance_quiet_monotonic.remove(&obligation.id);
+            }
+            if let Some(mut state) = self.session.group_maintenance(group_id)? {
+                // Enrollment is policy, not current membership. Preserve it
+                // for a later canonical restoration; terminal groups are
+                // excluded from the maintenance tick's live group set.
+                state.next_periodic_rotation_at = None;
+                self.session.put_group_maintenance(&state)?;
+            }
+            return Ok(());
+        }
+        let obligations = self.session.maintenance_obligations_for_group(group_id)?;
+        if let Some(mut state) = self.session.group_maintenance(group_id)?
+            && state.periodic_enrolled
+            && state.next_periodic_rotation_at.is_none()
+        {
+            let baseline = Self::periodic_baseline(&state, &obligations, restored_at, now);
+            state.next_periodic_rotation_at =
+                Some(self.fresh_periodic_deadline(group_id, baseline)?);
+            self.session.put_group_maintenance(&state)?;
+        }
+        let current = self.session.own_leaf_hash(group_id)?;
+        for mut obligation in obligations {
+            if matches!(
+                obligation.phase,
+                MaintenancePhase::Complete | MaintenancePhase::Failed
+            ) {
+                continue;
+            }
+            if obligation
+                .own_leaf_baseline_hash
+                .as_ref()
+                .is_some_and(|baseline| baseline.as_slice() != current.as_slice())
+            {
+                self.complete_maintenance_obligation(&mut obligation, now)?;
             }
         }
         Ok(())
+    }
+
+    fn periodic_baseline(
+        state: &cgka_traits::maintenance::GroupMaintenanceState,
+        obligations: &[MaintenanceObligation],
+        restored_at: Option<Timestamp>,
+        now: Timestamp,
+    ) -> Timestamp {
+        if let Some(restored_at) = restored_at {
+            return restored_at;
+        }
+        if obligations.iter().any(|obligation| {
+            obligation.group_id == state.group_id
+                && obligation.phase == MaintenancePhase::Failed
+                && obligation.last_failure_code.as_deref() == Some("local_member_removed")
+        }) {
+            return now;
+        }
+        state.last_own_leaf_rotation_at.unwrap_or(now)
+    }
+
+    fn fresh_periodic_deadline(
+        &mut self,
+        group_id: &GroupId,
+        baseline: Timestamp,
+    ) -> AccountResult<Timestamp> {
+        let earliest = baseline.0.saturating_add(PERIODIC_MIN_SECS);
+        let latest = baseline.0.saturating_add(PERIODIC_MAX_SECS);
+        let first = baseline.0.saturating_add(
+            self.maintenance_random
+                .sample_inclusive(PERIODIC_MIN_SECS, PERIODIC_MAX_SECS),
+        );
+        let mut deadline = first;
+        loop {
+            let mut hasher = Sha256::new();
+            hasher.update(b"marmot-periodic-self-update-v1");
+            hasher.update((group_id.as_slice().len() as u64).to_be_bytes());
+            hasher.update(group_id.as_slice());
+            hasher.update(deadline.to_be_bytes());
+            let id = cgka_traits::MessageId::new(hasher.finalize().to_vec());
+            if self.session.maintenance_obligation(&id)?.is_none() {
+                return Ok(Timestamp(deadline));
+            }
+            deadline = if deadline < latest {
+                deadline + 1
+            } else {
+                earliest
+            };
+            if deadline == first {
+                return Err(cgka_traits::EngineError::Backend(
+                    "periodic deadline exhausted".into(),
+                )
+                .into());
+            }
+        }
     }
 
     /// Retire the evolutions behind commits this batch announced as
@@ -3906,8 +4139,17 @@ where
         mut fanout: OutboundFanout,
         output: &mut AccountDeviceEffects,
         queue: &mut VecDeque<PublishWork>,
-        context: Option<AuditEventContext>,
+        mut context: Option<AuditEventContext>,
     ) -> AccountResult<PublishStatus> {
+        // Durable application identity connects first publication and exact
+        // retries to the same logical send, including after process restart.
+        if let Some(application) = fanout.application_message() {
+            context.get_or_insert_with(Default::default).operation_id =
+                Some(marmot_forensics::application_send_operation_id(
+                    application.group_id.as_slice(),
+                    &application.app_event_id,
+                ));
+        }
         let outcome = fanout.outcome();
         // A receipt persisted before cancellation can still be below quorum.
         // Finish that pass before releasing its Welcome continuation. Once a
@@ -3922,10 +4164,26 @@ where
         }
         let endpoints = fanout.request().target.endpoints().to_vec();
         let now_ms = self.wall_clock.now().0.saturating_mul(1_000);
+        let secondary_retry_yield = (fanout.outcome().accepted_targets
+            >= fanout.request().required_acks.max(1)
+            && !matches!(fanout.mls_state(), FanoutMlsState::Pending(_)))
+        .then(|| {
+            self.publication_progress
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .map(|progress| progress.secondary_retry_yield.clone())
+        })
+        .flatten();
+        let yield_before_attempt = secondary_retry_yield
+            .as_ref()
+            .is_some_and(|signal| signal.clone().now_or_never().is_some());
         let due = fanout
             .outstanding_target_indexes()
             .into_iter()
-            .filter(|&index| frozen_fanout_target_retry_due(&fanout, index, now_ms))
+            .filter(|&index| {
+                !yield_before_attempt && frozen_fanout_target_retry_due(&fanout, index, now_ms)
+            })
             .collect::<Vec<_>>();
         let attempted_any = !due.is_empty();
         if !due.is_empty() {
@@ -3948,8 +4206,8 @@ where
             let account_id = fanout.request().account_id.clone();
             let mut accepted = fanout.outcome().accepted_targets;
             let ack_goal = fanout.request().required_acks.max(1);
-            // A retry after confirmation must finish its outstanding attempts;
-            // otherwise an already-met quorum would cancel every retry.
+            // An already-met quorum alone must not cancel every retry. Only
+            // explicit foreground pressure may interrupt this secondary tail.
             let finish_retries = accepted >= ack_goal;
             let mut attempts = due
                 .iter()
@@ -3973,6 +4231,16 @@ where
                 // exact-event retry, including after cancellation or restart.
                 let next = if accepted >= ack_goal && !finish_retries {
                     attempts.next().now_or_never().flatten()
+                } else if let Some(signal) = &secondary_retry_yield {
+                    // Only relay futures are cancelled. No engine transaction or
+                    // confirmation future is dropped, and ready receipts win ties.
+                    let next = attempts.next().fuse();
+                    let requested = signal.clone().fuse();
+                    futures::pin_mut!(next, requested);
+                    futures::select_biased! {
+                        result = next => result,
+                        () = requested => None,
+                    }
                 } else {
                     attempts.next().await
                 };
@@ -4113,7 +4381,7 @@ where
             }
         }
         if status.accepted_by_any_endpoint {
-            record_published_application_fanout(&fanout, output);
+            self.record_published_application_fanout(&fanout, output);
         } else if let Some(reason) = publish_failure_reason {
             record_failed_application_fanout(&fanout, reason, output);
         } else if let Some(application) = fanout.application_message()

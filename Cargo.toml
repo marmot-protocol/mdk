@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["vendor/hpke-rs-libcrux"]
 members = [
     "crates/fs-private",
     "crates/traits",
@@ -28,6 +29,7 @@ members = [
     "integrations/codex/marmot",
     "integrations/opencode/marmot",
     "integrations/pi/marmot",
+    "integrations/goose/marmot",
 ]
 
 [workspace.package]
@@ -52,7 +54,7 @@ tls_codec = "~0.5"
 
 # async
 tokio = { version = "1", features = ["sync", "macros", "rt", "time"] }
-tokio-util = { version = "0.7", features = ["io"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
 async-trait = "0.1"
 futures = "0.3"
 
@@ -94,6 +96,7 @@ sha2 = "0.10"
 url = "2"
 psl = "2"
 chacha20poly1305 = "0.10"
+openssl = { version = "0.10", features = ["vendored"] }
 bytes = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 zeroize = "1"
@@ -148,6 +151,10 @@ marmot-terminal-harness = { path = "integrations/terminal-harness" }
 # dependency under cfg(hax). Pin the upstream removal until the next hax
 # release contains it, then remove this patch and update the libcrux path.
 [patch.crates-io]
+# HPKE 0.7 pins vulnerable libcrux-kem 0.0.9. This unchanged 0.7 provider
+# selects fixed KEM 0.0.10; remove once a compatible published HPKE provider
+# carries the fix. Provenance and regression commands: vendor/hpke-rs-libcrux/BACKPORT.md.
+hpke-rs-libcrux = { path = "vendor/hpke-rs-libcrux" }
 hax-lib-macros = { git = "https://github.com/cryspen/hax.git", rev = "8f9cb576e58f6cc7e9ed249a7d4439b0f7ed0da7" }
 # libsqlite3-sys 0.38.2 still bundles SQLCipher 4.14.0, whose enhanced
 # memory-security allocator emits one WARN for every mlock failure. Pin the

@@ -5,9 +5,11 @@ set -euo pipefail
 # do not inherit an operator-selected profile from the test runner.
 unset MARMOT_HARNESS_EXECUTION_PROFILE
 
-kind="${1:?usage: test_installer.sh claude|codex|pi|opencode}"
+kind="${1:?usage: test_installer.sh claude|codex|pi|opencode|goose}"
+writable_profiles="autonomous unrestricted"
 case "$kind" in
     claude)
+        connector_emoji="🦀"
         env_prefix="WN_CLAUDE"
         display_name="Claude Code"
         default_home="$HOME/.marmot-agents/claude"
@@ -16,6 +18,7 @@ case "$kind" in
         agent_label="claude-harness-agent"
         ;;
     codex)
+        connector_emoji="🧑‍💻"
         env_prefix="WN_CODEX"
         display_name="Codex"
         default_home="$HOME/.marmot-agents/codex"
@@ -24,6 +27,7 @@ case "$kind" in
         agent_label="codex-harness-agent"
         ;;
     pi)
+        connector_emoji="🥧"
         env_prefix="WN_PI"
         display_name="Pi"
         default_home="$HOME/.marmot-agents/pi"
@@ -32,12 +36,23 @@ case "$kind" in
         agent_label="pi-harness-agent"
         ;;
     opencode)
+        connector_emoji="🛠️"
         env_prefix="WN_OPENCODE"
         display_name="OpenCode"
         default_home="$HOME/.marmot-agents/harnesses"
         agent_service="wn-agent-harnesses.service"
         agent_launchd="org.marmot.wn-agent.harnesses"
         agent_label="terminal-harness-agent"
+        ;;
+    goose)
+        connector_emoji="🪿"
+        env_prefix="WN_GOOSE"
+        display_name="Goose"
+        default_home="$HOME/.marmot-agents/goose"
+        agent_service="wn-agent-goose.service"
+        agent_launchd="org.marmot.wn-agent.goose"
+        agent_label="goose-harness-agent"
+        writable_profiles="unrestricted"
         ;;
     *) echo "unsupported harness: $kind" >&2; exit 64 ;;
 esac
@@ -102,10 +117,18 @@ run_linux_service_case() {
     local output_file="$fixture_root/installer-output.log"
     shift 3
 
+    local mock_command
+    for mock_command in curl shasum tar systemctl sleep uname python3; do
+        if [ ! -x "$mock_bin/$mock_command" ]; then
+            echo "missing installer fixture command: $mock_command" >&2
+            return 1
+        fi
+    done
     : >"$log_file"
     SYSTEMCTL_ACTIVE="$active" \
     SYSTEMCTL_LOG="$log_file" \
     TEST_LEGACY_BOOTSTRAP="${TEST_LEGACY_BOOTSTRAP:-0}" \
+    TEST_NO_NPROFILE="${TEST_NO_NPROFILE:-0}" \
     TEST_HARNESS_BINARY="$harness_binary" \
     HOME="$fixture_root/home" \
     MARMOT_HOME="$fixture_root/marmot-home" \
@@ -222,7 +245,9 @@ case "$code" in
         [ "${TEST_LEGACY_BOOTSTRAP:-0}" = 1 ] || printf '%s\n' npub-test
         ;;
     *'json.load(sys.stdin).get("nprofile", "")'*)
-        [ "${TEST_LEGACY_BOOTSTRAP:-0}" = 1 ] || printf '%s\n' nprofile-test
+        if [ "${TEST_LEGACY_BOOTSTRAP:-0}" != 1 ] && [ "${TEST_NO_NPROFILE:-0}" != 1 ]; then
+            printf '%s\n' nprofile-test
+        fi
         ;;
     *) exit 1 ;;
 esac
@@ -230,11 +255,33 @@ EOF
 chmod +x "$mock_bin"/*
 
 fresh_log="$fixture_root/systemctl-fresh.log"
+missing_mock_root="$fixture_root/missing-mock"
+mkdir -p "$missing_mock_root"
+if run_linux_service_case "$missing_mock_root" 0 "$missing_mock_root/systemctl.log" >"$missing_mock_root/error.log" 2>&1; then
+    echo "$kind installer fixture ran without mocked network/service commands" >&2
+    exit 1
+fi
+grep -F "missing installer fixture command: curl" "$missing_mock_root/error.log" >/dev/null
+[ ! -f "$missing_mock_root/systemctl.log" ]
 run_linux_service_case "$fixture_root" 0 "$fresh_log"
 installer_output="$fixture_root/installer-output.log"
 grep -F "npub: npub-test" "$installer_output" >/dev/null
 grep -F "nprofile: nprofile-test" "$installer_output" >/dev/null
 grep -F "Services were installed and started for the current user." "$installer_output" >/dev/null
+grep -F "Phone conversation verification is still required." "$installer_output" >/dev/null
+grep -F "Compare this full npub on your trusted computer" "$installer_output" >/dev/null
+grep -F "\"$connector_emoji $display_name\"" "$installer_output" >/dev/null
+grep -F "This installer does not publish a public agent profile." "$installer_output" >/dev/null
+grep -F "Admin permission is not required for ordinary messaging." "$installer_output" >/dev/null
+grep -F "Once that capability is" "$installer_output" >/dev/null
+grep -F "That grant also allows group and member changes." "$installer_output" >/dev/null
+grep -F "phone-to-backend connection is not verified." "$installer_output" >/dev/null
+grep -F "fresh word in this group" "$installer_output" >/dev/null
+grep -F "/new does not erase" "$installer_output" >/dev/null
+if grep -Fq "Install complete." "$installer_output"; then
+    echo "$kind installer confused software installation with verified conversation setup" >&2
+    exit 1
+fi
 if grep -Fq "To run it manually:" "$installer_output"; then
     echo "$kind installer printed manual-start steps after starting services" >&2
     exit 1
@@ -245,6 +292,24 @@ TEST_LEGACY_BOOTSTRAP=1 run_linux_service_case "$fixture_root" 1 "$legacy_log" -
 legacy_output="$fixture_root/installer-output.log"
 grep -F "White Noise agent identity was not returned by this wn-agent release." "$legacy_output" >/dev/null
 grep -F "Inspect the bootstrap response at: $fixture_root/marmot-home/bootstrap.json" "$legacy_output" >/dev/null
+grep -F "Pairing is paused: retrieve the full agent npub" "$legacy_output" >/dev/null
+if grep -Fq "Add the verified agent account" "$legacy_output"; then
+    echo "$kind installer offered pairing steps without an agent identity" >&2
+    exit 1
+fi
+grep -F "then rerun guided setup." "$legacy_output" >/dev/null
+
+no_nprofile_root="$fixture_root/no-nprofile"
+mkdir -p "$no_nprofile_root"
+cp -R "$mock_bin" "$no_nprofile_root/mock-bin"
+TEST_NO_NPROFILE=1 run_linux_service_case "$no_nprofile_root" 1 "$no_nprofile_root/systemctl.log" --no-service
+partial_output="$no_nprofile_root/installer-output.log"
+grep -F "npub: npub-test" "$partial_output" >/dev/null
+grep -F "Add the verified agent account" "$partial_output" >/dev/null
+if grep -Fq "Pairing is paused" "$partial_output"; then
+    echo "$kind installer blocked full-npub pairing because optional nprofile was missing" >&2
+    exit 1
+fi
 assert_log_contains "$fresh_log" "--user enable --now $agent_service"
 assert_log_contains "$fresh_log" "--user enable --now $harness_service"
 assert_log_excludes "$fresh_log" "--user restart $agent_service"
@@ -261,7 +326,7 @@ grep -F "Environment=\"$profile_env=inherit\"" "$unit_dir/$harness_service" >/de
 grep -F "$profile_env=inherit" \
     "$fixture_root/marmot-home/dev/$harness_binary.env" >/dev/null
 
-for profile in autonomous unrestricted; do
+for profile in $writable_profiles; do
     profile_log="$fixture_root/systemctl-profile-$profile.log"
     profile_args=(--execution-profile "$profile")
     if [ "$profile" = unrestricted ]; then
@@ -357,7 +422,7 @@ installer_stdin_dry_run="$(
     bash -s -- --dry-run --yes --no-service --allow-welcomer "$allow_hex" < "$shared_installer"
 )"
 
-for profile in inherit autonomous unrestricted; do
+for profile in inherit $writable_profiles; do
     profile_args=(--execution-profile "$profile")
     if [ "$profile" = unrestricted ]; then
         profile_args+=(--acknowledge-unrestricted)
@@ -385,6 +450,24 @@ env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
     || unacknowledged_status=$?
 [ "$unacknowledged_status" -ne 0 ]
 grep -F -- "--acknowledge-unrestricted is required" "$unacknowledged_stderr" >/dev/null
+
+if [ "$kind" = goose ]; then
+    autonomous_status=0
+    autonomous_stderr="$fixture_root/unsupported-autonomous.err"
+    env -u MARMOT_HOME -u MARMOT_AGENT_SOCKET \
+        WN_AGENT_SHA="$fixture_version" \
+        MARMOT_RELEASE_TAG="wn-agent-v$fixture_version-test" \
+        "$installer" --dry-run --yes --no-service --allow-welcomer "$allow_hex" \
+            --execution-profile autonomous >/dev/null 2>"$autonomous_stderr" \
+        || autonomous_status=$?
+    [ "$autonomous_status" -ne 0 ]
+    grep -F "does not support the autonomous execution profile" "$autonomous_stderr" >/dev/null
+    goose_help="$("$installer" --help)"
+    case "$goose_help" in
+        *"--execution-profile PROFILE  inherit or unrestricted"*) ;;
+        *) echo "goose installer help advertises an unsupported execution profile" >&2; exit 1 ;;
+    esac
+fi
 
 custom_root="$fixture_parent/custom"
 installer_custom_socket_dry_run="$(
@@ -465,6 +548,16 @@ esac
 case "$installer_dry_run" in
     *"Dry run complete. No services were installed or started."* ) ;;
     *) echo "$kind installer dry-run claimed that services were started" >&2; exit 1;;
+esac
+case "$installer_dry_run" in
+    *"Dry run: no agent identity was created or verified."*"Installation preview."* ) ;;
+    *) echo "$kind installer dry-run did not distinguish preview from real pairing" >&2; exit 1;;
+esac
+case "$installer_dry_run" in
+    *"Compare this full npub"* | *"Connector files installed."* | *"Add the verified agent account"* | *"Pairing is paused"* )
+        echo "$kind installer dry-run offered a placeholder as a verified identity" >&2
+        exit 1
+        ;;
 esac
 case "$installer_dry_run" in
     *"--socket $default_home/dev/wn-agent.sock"* ) ;;

@@ -471,6 +471,7 @@ enum SdkPublication {
     /// the SDK pool's read lock across a relay acknowledgement.
     OwnedRelay {
         gossip: Option<Arc<dyn NostrGossip>>,
+        authenticator_available: bool,
     },
 }
 
@@ -797,8 +798,12 @@ impl NostrSdkRelayClient {
     /// policy and gossip callback. Use [`Self::new`] for an already-built custom client.
     pub fn from_builder(builder: ClientBuilder) -> Self {
         let gossip = builder.gossip.clone();
+        let authenticator_available = builder.authenticator.is_some();
         let mut client = Self::new(builder.build());
-        client.publication = SdkPublication::OwnedRelay { gossip };
+        client.publication = SdkPublication::OwnedRelay {
+            gossip,
+            authenticator_available,
+        };
         client
     }
 
@@ -1802,7 +1807,7 @@ impl NostrSdkRelayClient {
                     Err(local_failure("relay did not acknowledge event"))
                 }
             }
-            SdkPublication::OwnedRelay { gossip } => {
+            SdkPublication::OwnedRelay { gossip, .. } => {
                 // Match the fork's Client::send_event storage-before-callback
                 // order. The attempt timeout covers this entire sequence.
                 self.client
@@ -1872,7 +1877,26 @@ impl NostrSdkRelayClient {
                         ack_kind,
                     });
                 }
-                Ok(Err(failure)) => last_failure = failure,
+                Ok(Err(failure)) => {
+                    // An anonymous connection cannot satisfy NIP-42 by waiting
+                    // and resending. Return its explicit rejection so the
+                    // account owner can perform its authenticated fallback.
+                    // Opaque clients and all configured authenticators retain
+                    // retries because their authentication may be in flight.
+                    if failure.rejection_category
+                        == Some(TransportEndpointRejectionCategory::AuthRequired)
+                        && matches!(
+                            self.publication,
+                            SdkPublication::OwnedRelay {
+                                authenticator_available: false,
+                                ..
+                            }
+                        )
+                    {
+                        return Err(failure);
+                    }
+                    last_failure = failure;
+                }
                 Err(_) => {
                     last_failure.reason = "send event timed out".to_owned();
                     last_failure.kind = TransportEndpointFailureKind::PossiblyExposed;
@@ -3083,7 +3107,11 @@ async fn event_for_publish_with_signer(
         .custom_created_at(NostrTimestamp::from_secs(event.created_at))
         .finalize_async(signer)
         .await
-        .map_err(|_| TransportAdapterError::Publish("sign event failed".to_owned()))
+        // Signer text can carry relay URLs or remote detail, and this Display
+        // reaches upper-layer logs.
+        .map_err(|_| {
+            TransportAdapterError::Publish(format!("sign event failed for kind {}", event.kind))
+        })
 }
 
 fn parse_endpoints(
@@ -7278,9 +7306,142 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_publish_batch_cleans_write_only_relay() {
+        assert_cancelled_publish_cleans_write_only_relay(signed_sdk(Keys::generate())).await;
+    }
+
+    /// Account fallbacks use builder-owned authenticated clients. Cancel only
+    /// after NIP-42 succeeds and the exact signed EVENT is waiting for its ACK.
+    #[tokio::test]
+    async fn cancelled_owned_authenticated_publish_cleans_write_only_relay() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+        let relay_url = RelayUrl::parse(endpoint.as_str()).unwrap();
+        let keys = Keys::generate();
+        let expected_auth_pubkey = keys.public_key();
+        let sdk = NostrSdkRelayClient::from_builder(Client::builder().authenticator(
+            nostr_sdk::authenticator::SignerAuthenticator::new(SdkSigner(Arc::new(keys))),
+        ));
+        let event = signed_group_event_dto();
+        let expected_event = serde_json::to_value(&event).unwrap();
+        let expected_relay_url = relay_url.to_string();
+        let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let challenge = "held-authenticated-publication";
+            socket
+                .send(serde_json::json!(["AUTH", challenge]).to_string().into())
+                .await
+                .unwrap();
+            let mut authenticated = false;
+            let mut received_tx = Some(received_tx);
+            while let Some(Ok(message)) = socket.next().await {
+                if message.is_close() {
+                    break;
+                }
+                let Ok(text) = message.into_text() else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                match value[0].as_str() {
+                    Some("AUTH") => {
+                        let auth: Event = serde_json::from_value(value[1].clone()).unwrap();
+                        auth.verify().unwrap();
+                        assert_eq!(auth.pubkey, expected_auth_pubkey);
+                        assert_eq!(value[1]["kind"], 22242);
+                        let tags = value[1]["tags"].as_array().unwrap();
+                        assert!(tags.contains(&serde_json::json!(["challenge", challenge])));
+                        assert!(tags.contains(&serde_json::json!(["relay", expected_relay_url])));
+                        socket
+                            .send(
+                                serde_json::json!(["OK", auth.id.to_hex(), true, ""])
+                                    .to_string()
+                                    .into(),
+                            )
+                            .await
+                            .unwrap();
+                        authenticated = true;
+                    }
+                    Some("EVENT") if !authenticated => {
+                        socket
+                            .send(
+                                serde_json::json!([
+                                    "OK",
+                                    value[1]["id"],
+                                    false,
+                                    "auth-required: authenticate"
+                                ])
+                                .to_string()
+                                .into(),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    Some("EVENT") => {
+                        assert_eq!(value[1], expected_event);
+                        received_tx
+                            .take()
+                            .expect("only one authenticated EVENT")
+                            .send(())
+                            .unwrap();
+                        // Deliberately withhold this EVENT's OK. The test may
+                        // now cancel an authenticated wire send, not setup.
+                    }
+                    _ => {}
+                }
+            }
+            assert!(authenticated);
+            assert!(received_tx.is_none());
+        });
+        let publish_sdk = sdk.clone();
+        let publish = tokio::spawn(async move {
+            publish_sdk
+                .publish_events(&[NostrEventPublishRequest {
+                    endpoints: vec![endpoint],
+                    event,
+                    required_acks: 1,
+                }])
+                .await
+        });
+        timeout(Duration::from_secs(3), received_rx)
+            .await
+            .expect("relay must receive the authenticated EVENT")
+            .unwrap();
+        let relay = sdk
+            .client()
+            .relay(relay_url.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(relay.capabilities().has_write());
+        assert!(!relay.capabilities().has_read());
+        assert!(!publish.is_finished(), "no ACK must not become success");
+        publish.abort();
+        assert!(publish.await.unwrap_err().is_cancelled());
+        timeout(Duration::from_secs(2), async {
+            while sdk.relay_health().await.total_relays != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation must release the authenticated WRITE relay");
+        assert_eq!(
+            sdk.publish_release_attempts.lock().await.get(&relay_url),
+            Some(&1)
+        );
+        assert_eq!(sdk.relay_health().await.total_relays, 0);
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("cancelled publication must close its socket")
+            .unwrap();
+        sdk.client().shutdown().await;
+    }
+
+    async fn assert_cancelled_publish_cleans_write_only_relay(sdk: NostrSdkRelayClient) {
         let endpoint = TransportEndpoint(silent_relay_url().await);
         let relay_url = RelayUrl::parse(endpoint.as_str()).unwrap();
-        let sdk = signed_sdk(Keys::generate());
         let publish_sdk = sdk.clone();
         let publish = tokio::spawn(async move {
             publish_sdk
@@ -7292,17 +7453,18 @@ mod tests {
                 .await
         });
 
-        for _ in 0..100 {
-            if sdk
+        timeout(Duration::from_secs(2), async {
+            while !sdk
                 .publish_connect_attempts
                 .lock()
                 .await
                 .contains_key(&relay_url)
             {
-                break;
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .expect("wire publication must start before cancellation");
         let relay = sdk
             .client()
             .relays()
@@ -7318,12 +7480,13 @@ mod tests {
 
         publish.abort();
         let _ = publish.await;
-        for _ in 0..100 {
-            if sdk.relay_health().await.total_relays == 0 {
-                break;
+        timeout(Duration::from_secs(2), async {
+            while sdk.relay_health().await.total_relays != 0 {
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .expect("cancelled publication must release its transient relay");
 
         assert_eq!(
             sdk.publish_release_attempts.lock().await.get(&relay_url),
@@ -7573,6 +7736,152 @@ mod tests {
 
         assert_eq!(outcome.accepted.len(), 1);
         assert!(outcome.failed.is_empty());
+    }
+
+    /// A known anonymous publisher must hand authentication-required evidence
+    /// back to its owner after one wire attempt, including on a reused socket.
+    #[tokio::test]
+    async fn anonymous_auth_required_does_not_retry_before_account_fallback() {
+        let (endpoint, attempts, server) = auth_required_publish_relay().await;
+        let sdk = NostrSdkRelayClient::from_builder(Client::builder());
+        let keys = Keys::generate();
+        let mut expected = Vec::new();
+        for content in [
+            "first anonymous publication",
+            "second anonymous publication",
+        ] {
+            let signed = EventBuilder::new(Kind::TextNote, content)
+                .finalize(&keys)
+                .unwrap();
+            expected.push(signed.id.to_hex());
+            let event = NostrTransportEvent::from_nostr_event(&signed).unwrap();
+            let error = timeout(
+                Duration::from_secs(5),
+                sdk.publish_event(std::slice::from_ref(&endpoint), &event, 1),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert_eq!(
+                error.publish_message_id(),
+                Some(&cgka_traits::MessageId::new(signed.id.to_bytes().to_vec()))
+            );
+            let failures = error.publish_endpoint_failures();
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].endpoint, endpoint);
+            assert_eq!(
+                failures[0].rejection_category,
+                Some(TransportEndpointRejectionCategory::AuthRequired)
+            );
+            assert_eq!(
+                failures[0].kind,
+                TransportEndpointFailureKind::RetryableUnavailable
+            );
+        }
+        sdk.client().shutdown().await;
+        server.abort();
+        let _ = server.await;
+        assert_eq!(
+            *attempts.lock().await,
+            expected,
+            "anonymous retries cannot authenticate; return the first rejection for account fallback"
+        );
+    }
+
+    /// An opaque client's authenticator is unknown, so it keeps its existing
+    /// retry opportunity even when this test client happens to be anonymous.
+    #[tokio::test]
+    async fn opaque_auth_required_preserves_existing_retry_attempts() {
+        let (endpoint, attempts, server) = auth_required_publish_relay().await;
+        let sdk = NostrSdkRelayClient::new(Client::builder().build());
+        let signed = EventBuilder::new(Kind::TextNote, "opaque authentication")
+            .finalize(&Keys::generate())
+            .unwrap();
+        let event = NostrTransportEvent::from_nostr_event(&signed).unwrap();
+        let error = timeout(
+            Duration::from_secs(5),
+            sdk.publish_event(&[endpoint], &event, 1),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        sdk.client().shutdown().await;
+        server.abort();
+        let _ = server.await;
+        assert_eq!(
+            error.publish_endpoint_failures()[0].rejection_category,
+            Some(TransportEndpointRejectionCategory::AuthRequired)
+        );
+        assert_eq!(
+            *attempts.lock().await,
+            vec![signed.id.to_hex(); SDK_RELAY_PUBLISH_ATTEMPTS]
+        );
+    }
+
+    /// A builder authenticator works even without an adapter account signer;
+    /// signer absence must never classify this client as anonymous.
+    #[tokio::test]
+    async fn owned_authenticator_publishes_without_adapter_signer() {
+        use nostr_relay_builder::builder::{RelayBuilderNip42, RelayBuilderNip42Mode};
+        use nostr_relay_builder::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default().nip42(RelayBuilderNip42 {
+            mode: RelayBuilderNip42Mode::Write,
+        }));
+        relay.run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let keys = Keys::generate();
+        let sdk = NostrSdkRelayClient::from_builder(Client::builder().authenticator(
+            nostr_sdk::authenticator::SignerAuthenticator::new(SdkSigner(Arc::new(keys.clone()))),
+        ));
+        let signed = EventBuilder::new(Kind::TextNote, "builder authentication")
+            .finalize(&keys)
+            .unwrap();
+        let event = NostrTransportEvent::from_nostr_event(&signed).unwrap();
+        let outcome = sdk
+            .publish_event(std::slice::from_ref(&endpoint), &event, 1)
+            .await
+            .unwrap();
+        sdk.client().shutdown().await;
+        relay.shutdown();
+        assert_eq!(outcome.accepted.len(), 1);
+        assert_eq!(outcome.accepted[0].endpoint, endpoint);
+        assert!(outcome.failed.is_empty());
+    }
+
+    /// Real SDK EVENT/OK traffic, without an authenticator or an accepting path.
+    async fn auth_required_publish_relay() -> (
+        TransportEndpoint,
+        Arc<Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let observed = attempts.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                let Ok(text) = message.into_text() else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                if value[0] != "EVENT" {
+                    continue;
+                }
+                let event_id = value[1]["id"].as_str().unwrap().to_owned();
+                observed.lock().await.push(event_id.clone());
+                let response =
+                    serde_json::json!(["OK", event_id, false, "auth-required: authenticate"]);
+                if socket.send(response.to_string().into()).await.is_err() {
+                    return;
+                }
+            }
+        });
+        (endpoint, attempts, server)
     }
 
     #[tokio::test]

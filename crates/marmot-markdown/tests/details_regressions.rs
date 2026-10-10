@@ -50,6 +50,12 @@ fn texts(doc: &marmot_markdown::Document) -> String {
                 Inline::NostrMention(entity) | Inline::NostrUri(entity) => {
                     out.push_str(&entity.bech32);
                 }
+                Inline::Timestamp {
+                    unix_seconds,
+                    style,
+                } => {
+                    out.push_str(&common::render::timestamp_text(*unix_seconds, *style));
+                }
             }
         }
     }

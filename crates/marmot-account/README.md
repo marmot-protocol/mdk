@@ -58,6 +58,16 @@ A production Nostr implementation should derive those answers from Nostr state r
 transport adapter family, so the account runtime can ask the active transport to publish a KeyPackage without knowing
 whether that means Marmot Nostr kind `30443`, another relay-plane format, or a future non-Nostr transport.
 
+## Own-leaf maintenance
+
+Secondary maintenance write failures do not discard committed session effects. `run_due_maintenance` retries the
+owning group's reconciliation and reconstructs missing deadlines for enrolled live copies after restoration or reopen.
+Ordinary epoch activity uses the durable rotation baseline; an observed restoration starts a fresh period.
+
+An obligation stays live until its next deadline is durable. After reopen, the canonical leaf hash identifies rotations
+that already committed, so completing their bookkeeping does not publish another MLS commit. Repaired deadlines stay
+within the 24–36-day policy window and do not reuse failed or completed periodic obligation IDs.
+
 ## KeyPackage generator upgrades
 
 The lifecycle records the KeyPackage generator revision independently of app versions. Records written before revision
@@ -73,6 +83,21 @@ Embedders that use `AccountDeviceRuntime` directly must drive maintenance themse
 - Ordinary releases do not bump the generator revision.
 - Paused maintenance can finish a prepared current-revision publication, but waits for resume before replacing an
   older pending revision, because that requires generating new private material.
+
+## Queued sends and relay retries
+
+Frozen relay events retain their original bytes, targets and retry order until each outstanding obligation resolves.
+Once a group's required acknowledgements and MLS confirmation are complete, a secondary relay's replication retry no
+longer blocks new engine-queued application sends. This uses the same publication boundary as foreground sends.
+An unmet quorum or pending MLS confirmation still blocks the queued drain, including obligations behind an older
+completed-quorum event. Incoming convergence can settle while that publication barrier remains.
+
+Ordinary lower-level convergence calls still await due relay attempts. Owners using
+`advance_convergence_with_publication_progress_and_yield` can supply a signal that ends optional secondary waits
+after required acknowledgements and MLS confirmation. The signal remains latched for that pass; a later quiet pass
+can resume replication. A cancelled attempt keeps its exact bytes and targets, conservative exposure state, and
+ordinary retry backoff. An attempt skipped before starting keeps its existing deadline. This does not cancel engine
+steps, bypass required publication barriers, or guarantee zero network delay or universal per-relay FIFO delivery.
 
 ## What it does not do
 

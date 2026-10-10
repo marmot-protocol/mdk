@@ -211,6 +211,14 @@ mod migration_0100_attachment_explicit_priority;
 mod migration_0101_outgoing_attachment_uploads;
 #[path = "migrations/0102_attachment_emoji_role.rs"]
 mod migration_0102_attachment_emoji_role;
+#[path = "migrations/0103_outgoing_attachment_upload_bodies.rs"]
+mod migration_0103_outgoing_attachment_upload_bodies;
+#[path = "migrations/0104_file_attachment_retention.rs"]
+mod migration_0104_file_attachment_retention;
+#[path = "migrations/0105_file_attachment_partials.rs"]
+mod migration_0105_file_attachment_partials;
+#[path = "migrations/0106_retained_attachment_chunks.rs"]
+mod migration_0106_retained_attachment_chunks;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -736,6 +744,26 @@ const MIGRATIONS: &[Migration] = &[
         version: 102,
         name: "0102_attachment_emoji_role",
         apply: migration_0102_attachment_emoji_role::apply,
+    },
+    Migration {
+        version: 103,
+        name: "0103_outgoing_attachment_upload_bodies",
+        apply: migration_0103_outgoing_attachment_upload_bodies::apply,
+    },
+    Migration {
+        version: 104,
+        name: "0104_file_attachment_retention",
+        apply: migration_0104_file_attachment_retention::apply,
+    },
+    Migration {
+        version: 105,
+        name: "0105_file_attachment_partials",
+        apply: migration_0105_file_attachment_partials::apply,
+    },
+    Migration {
+        version: 106,
+        name: "0106_retained_attachment_chunks",
+        apply: migration_0106_retained_attachment_chunks::apply,
     },
 ];
 

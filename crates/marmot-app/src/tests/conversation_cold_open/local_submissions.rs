@@ -1114,12 +1114,13 @@ async fn prepared_media_snapshot_rejects_unrelated_payload_without_consuming_the
     let h = History::new(0).await;
     let group = hex::encode(h.group.as_slice());
     let (revision, request) = prepared_media_snapshot_fixture(&h);
-    for mismatch in 0..3 {
+    for mismatch in 0..4 {
         let mut changed = request.clone();
         match mismatch {
             0 => changed.content = "unrelated".into(),
             1 => changed.attachments.reverse(),
-            _ => changed.reply_to = Some("aa".repeat(32)),
+            2 => changed.reply_to = Some("aa".repeat(32)),
+            _ => changed.attachments[0].plaintext_sha256 = "aa".repeat(32),
         }
         let result = h.app.admit_local_message_with_draft_policy_at(
             "alice",

@@ -147,6 +147,17 @@ transient shelf and preserve fresh picker occurrences. Do not separately delete
 an accepted draft on delivery. Pair the additive Swift/Kotlin method and C
 function with their matching generated bindings, header and native library.
 
+`upload_media_files_with_client_token` has the same admission contract for
+file-backed attachments (`source_path` instead of a plaintext byte array). Every
+attachment is snapshotted, encrypted and uploaded before admission. Its
+`MediaFileTransferControlFfi` is the only cancellation input. Cancellation
+observed before admission starts returns an error and admits nothing; an upload
+that already completed is left unreferenced on the server. Dropping the host's
+wait is not cancellation. Once admission starts it is not interruptible, even
+before durable acceptance returns; use `local_send_status` and timeline delivery
+as for any token-bound send. File-backed uploads have no fixed worker-response
+timeout; per-endpoint network deadlines still apply.
+
 ## Conversation windows and draft cost
 
 Return-to-latest can consume a coherent pre-publication checkpoint, including an

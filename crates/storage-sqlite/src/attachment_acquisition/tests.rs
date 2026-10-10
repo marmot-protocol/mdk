@@ -896,6 +896,138 @@ fn partial_identity(total: u64) -> AttachmentPartialIdentity {
         total,
     }
 }
+
+#[test]
+fn file_partial_writer_preserves_large_reservations_and_discards_corrupt_prefixes() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "file-prefix");
+    let asset = request(&store, "file-prefix");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    let identity = partial_identity(758_000_016);
+    let first = vec![0x37; ATTACHMENT_CHECKPOINT_BYTES];
+    assert!(
+        store
+            .checkpoint_attachment_partial(&job, &identity, 0, &first, 12, 2 * 1024 * 1024 * 1024)
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .attachment_partial_total(
+                &job,
+                12,
+                (&identity.ciphertext_digest, &identity.locator_digest)
+            )
+            .unwrap(),
+        Some(identity.total)
+    );
+    assert_eq!(
+        store
+            .attachment_partial_total(&job, 12, (&identity.ciphertext_digest, &[0; 32]))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .attachment_partial_total(
+                &job,
+                100,
+                (&identity.ciphertext_digest, &identity.locator_digest)
+            )
+            .unwrap(),
+        None
+    );
+    // Legacy callers must not erase a checkpoint they cannot load into memory.
+    assert!(
+        store
+            .load_attachment_partial(&job, 12, MAX_RETAINED_FILE_ATTACHMENT_BYTES, None)
+            .unwrap()
+            .is_none()
+    );
+    struct BoundedWriter {
+        count: usize,
+        largest: usize,
+    }
+    impl std::io::Write for BoundedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            assert!(bytes.iter().all(|byte| *byte == 0x37));
+            self.count += bytes.len();
+            self.largest = self.largest.max(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut output = BoundedWriter {
+        count: 0,
+        largest: 0,
+    };
+    let restored = store
+        .load_attachment_partial_to_writer(
+            &job,
+            12,
+            MAX_RETAINED_FILE_ATTACHMENT_BYTES,
+            (&identity.ciphertext_digest, &identity.locator_digest),
+            &mut output,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.0.total, 758_000_016);
+    assert_eq!(restored.1, ATTACHMENT_CHECKPOINT_BYTES as u64);
+    assert_eq!(output.count, ATTACHMENT_CHECKPOINT_BYTES);
+    assert!(output.largest <= ATTACHMENT_CHECKPOINT_BYTES);
+    sql(
+        &store,
+        "UPDATE attachment_partial_chunk SET digest=zeroblob(32);",
+    );
+    assert!(
+        store
+            .load_attachment_partial_to_writer(
+                &job,
+                12,
+                MAX_RETAINED_FILE_ATTACHMENT_BYTES,
+                (&identity.ciphertext_digest, &identity.locator_digest),
+                &mut std::io::sink()
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(partial_usage(&store), 0);
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT reserved_bytes FROM attachment_partial_usage",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    // Corruption recovery leaves a fresh attempt able to checkpoint again.
+    assert!(
+        store
+            .checkpoint_attachment_partial(&job, &identity, 0, &first, 12, 2 * 1024 * 1024 * 1024)
+            .unwrap()
+    );
+    store.cancel_attachment_acquisition(&asset).unwrap();
+    assert!(
+        store
+            .load_attachment_partial_to_writer(
+                &job,
+                13,
+                MAX_RETAINED_FILE_ATTACHMENT_BYTES,
+                (&identity.ciphertext_digest, &identity.locator_digest),
+                &mut std::io::sink()
+            )
+            .unwrap()
+            .is_none()
+    );
+}
 fn partial_usage(store: &SqliteAccountStorage) -> u64 {
     store
         .lock()
@@ -2734,4 +2866,5 @@ fn attachment_idle_permission_resume_is_read_only() {
 }
 
 mod outgoing;
+mod outgoing_files;
 mod promotion;

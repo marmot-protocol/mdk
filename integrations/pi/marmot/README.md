@@ -10,13 +10,45 @@ For the current guided install, runtime chooser, and steps to finish in White No
 
 ## Contents
 
+- [What you can do](#what-you-can-do)
 - [Attachments](#attachments)
+- [First-install checklist](#first-install-checklist)
 - [Install (Pi Already Installed)](#install-pi-already-installed)
 - [Manual setup](#manual-setup)
 - [Chat Commands](#chat-commands)
 - [Configuration](#configuration)
 - [Security Notes](#security-notes)
 - [Development](#development)
+
+## What you can do
+
+For task titles and progress reactions, use the shared
+[recommended chat setup](../../README.md#recommended-chat-setup), including
+admin promotion and the phone acceptance test. Agent policy is in
+[the integration instructions](../../AGENTS.md#suggested-agent-chat-instructions).
+Each ordinary turn exposes the shared `wn-agent group-profile` route for
+admin name/description updates. Verify that the installed release includes it,
+`wn-agent` is on the backend's PATH, and the backend's shell/sandbox policy permits
+access to the connector socket. See [Admin group profile updates](#admin-group-profile-updates).
+Progress reactions require a separately configured tool; the harness has none built in.
+
+- **Work through Pi from your phone.** Send a prompt from an authorized
+  White Noise account and use the backend's configured model and tools.
+  Every allowed message activates the harness; mentioning the agent is not required.
+
+- **Continue or reset the conversation.** Pi uses JSON mode and a private session directory, retaining a separate session per chat. Completed assistant text reaches the phone; thinking and tool output do not.
+  `/new` resets the backend session while retaining the project.
+
+- **Know the file contract.** Supported images and non-empty NUL-free UTF-8 text reach Pi in one ordered batch. PDFs, audio, archives and other unsupported bytes reject the whole prompt. Generated-file return is not implemented. See [Attachments](#attachments).
+
+Project selection (`/cd`), standing instructions (`/goal`), and recovery
+commands share the [terminal-harness command guide](../../terminal-harness/README.md#chat-commands).
+
+Tool access, credentials and model choices come from the backend's native
+configuration and the [execution profile](../../terminal-harness/README.md#execution-profiles).
+The harness does not implement mention activation, reaction tools
+or live previews. An interactive backend's slash commands are not automatically
+available through this chat; shared harness commands are handled locally.
 
 ## Attachments
 
@@ -71,6 +103,27 @@ from an earlier turn.
 adapter mirrors (checked against Pi source at
 [`36b60d2e`](https://github.com/earendil-works/pi/tree/36b60d2e8985899743c4cf5bd5f8929832a3f05d/packages/coding-agent/src/cli)).
 
+## First-install checklist
+
+Follow the [shared terminal-harness first-install guide](../../terminal-harness/README.md#first-installation-and-verification)
+before the release command below. It covers the two services, matching home and
+socket, sender authorization, manual environment loading, independent instance
+state, execution policy and the required phone/model round trip.
+
+Verify the configured Pi executable, native provider/model login and a local
+JSON-mode turn as the service user. Use `WN_PI_BIN` / `--pi-bin` when Pi is not
+on the service's PATH. Its connector sessions live in the private Pi session
+directory; do not attach another client to a connector-owned session. Pi's
+normal tool invocation is approval-free and provides no OS sandbox, so choose
+an OS/user boundary appropriate for the allowed phone sender.
+
+Start with a text-only phone round trip. Supported attachments are classified
+from bytes and passed as ordered `@file` operands, with all items validated
+before spawn. Unsupported mixed batches are refused rather than forwarding
+just their caption. Generated-file export and Hermes `MEDIA:` delivery are not
+implemented for `wn-pi`; only the documented Codex export path provides that
+terminal-harness feature today.
+
 ## Install (Pi Already Installed)
 
 Versioned `wn-agent-v*` releases publish `wn-agent`, `wn-pi`, checksums, and a
@@ -83,39 +136,26 @@ Prerequisites:
 - White Noise phone app pointed at the same public relay set
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
-```sh
-install_verified() (
-  set -eu
-  installer_url="$1"
-  checksum_url="$2"
-  shift 2
-  installer_script="${installer_url##*/}"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
-  curl -fsSL "$installer_url" -o "$tmpdir/$installer_script"
-  curl -fsSL "$checksum_url" -o "$tmpdir/$installer_script.sha256"
-  if command -v shasum >/dev/null 2>&1; then
-    (cd "$tmpdir" && shasum -a 256 -c "$installer_script.sha256")
-  elif command -v sha256sum >/dev/null 2>&1; then
-    (cd "$tmpdir" && sha256sum -c "$installer_script.sha256")
-  else
-    echo "error: need shasum or sha256sum to verify the installer" >&2
-    exit 1
-  fi
-  bash "$tmpdir/$installer_script" "$@"
-)
+First copy the [verified installer helper](../../README.md#verified-installer-helper)
+into this shell. Then select the release documented here:
 
+```sh
 base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
+```
+
+Run this example in the same shell where `install_verified` was defined.
+
+```sh
 install_verified "$base_url/install-pi-marmot.sh" \
   "$base_url/install-pi-marmot.sh.sha256"
 ```
 
 For noninteractive setup, provide the allowed inviter and prompt sender:
 
-Run this example in the same shell where `install_verified` above was defined.
+Run this example in the same shell where `install_verified` was defined.
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
+# Reuse the selected base_url from the same shell above.
 install_verified "$base_url/install-pi-marmot.sh" \
   "$base_url/install-pi-marmot.sh.sha256" \
   --yes --allow-welcomer npub1...
@@ -141,20 +181,28 @@ pi --version
 Install Pi first and authenticate it normally, then run an isolated `wn-agent`
 identity and the harness:
 
+In terminal 1, run the daemon only if its service is not already running:
+
 ```sh
 export MARMOT_HOME="$HOME/.marmot-agents/pi"
 export MARMOT_AGENT_SOCKET="$MARMOT_HOME/dev/wn-agent.sock"
-export WN_PI_ALLOWED_SENDERS_HEX="..."
-
-# Shell 1: wn-agent runs in the foreground.
+export WN_PI_ALLOWED_SENDERS_HEX="<phone-public-key-as-64-hex-characters>"
 wn-agent --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" \
   --relay wss://relay.eu.whitenoise.chat \
   --relay wss://relay.us.whitenoise.chat
+```
 
-# Shell 2: bootstrap the identity, then start the harness.
+In terminal 2, export the same settings again, bootstrap the single sender in
+this example, then start the harness only if its service is not already running:
+
+```sh
+export MARMOT_HOME="$HOME/.marmot-agents/pi"
+export MARMOT_AGENT_SOCKET="$MARMOT_HOME/dev/wn-agent.sock"
+export WN_PI_ALLOWED_SENDERS_HEX="<phone-public-key-as-64-hex-characters>"
 wn-agent bootstrap --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" \
-  --label pi-harness-agent --allow-welcomer "$WN_PI_ALLOWED_SENDERS_HEX" --qr
-
+  --label pi-harness-agent --allow-welcomer "$WN_PI_ALLOWED_SENDERS_HEX" \
+  --relay wss://relay.eu.whitenoise.chat \
+  --relay wss://relay.us.whitenoise.chat --qr
 wn-pi
 ```
 
@@ -170,6 +218,14 @@ shared harness answers its own reserved commands, including `/help`, `/status`,
 `/help` in a chat to list them; the full table and the `//` literal escape are
 documented in the
 [shared chat-command reference](../../terminal-harness/README.md#chat-commands).
+
+## Admin group profile updates
+
+This harness exposes the shared `wn-agent group-profile` command to the agent
+for the active conversation. It supports name and description changes for
+current admins, partial updates and explicit clearing. See the
+[shared control-command contract](../../terminal-harness/README.md#admin-group-profile-updates)
+for routing, release compatibility, permissions and uncertain outcomes.
 
 ## Configuration
 
@@ -204,6 +260,12 @@ than adding a containment mechanism. See the shared
 [execution-profile capability matrix](../../terminal-harness/README.md#execution-profiles).
 
 ## Security Notes
+
+- Group-profile routing passes a configured bearer token as a raw child
+  environment value, including tokens loaded from files. Trusted tool shells,
+  MCP servers and other descendants may inherit its full connector authority.
+  Backend environment filtering must preserve the turn's route and token;
+  see the [shared control-command contract](../../terminal-harness/README.md#admin-group-profile-updates).
 
 - The same configured sender list controls prompt execution and is mirrored
   additively into the `wn-agent` welcomer allowlist. To revoke access, remove the

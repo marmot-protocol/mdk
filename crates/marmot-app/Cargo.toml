@@ -42,6 +42,7 @@ marmot-forensics.workspace = true
 marmot-markdown.workspace = true
 nostr = { workspace = true, features = ["nip04"] }
 nostr-sdk.workspace = true
+openssl.workspace = true
 opentelemetry-proto = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 psl.workspace = true
@@ -54,6 +55,7 @@ serde_json.workspace = true
 sha2.workspace = true
 storage-sqlite.workspace = true
 thiserror.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["fs", "net"] }
 tokio-util.workspace = true
 tracing.workspace = true
@@ -70,6 +72,11 @@ criterion.workspace = true
 keyring-core.workspace = true
 marmot-forensics.workspace = true
 nostr-relay-builder.workspace = true
+openmls.workspace = true
+openmls_basic_credential.workspace = true
+openmls_rust_crypto.workspace = true
+parking_lot = "0.12"
+tls_codec.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = "0.26"

@@ -351,9 +351,20 @@ impl MarmotApp {
                     let selected = storage.selected_message_draft(&group_hex)?;
                     if selected.revision == *revision {
                         if let Some(selected) = selected.draft {
+                            let plaintext_hashes =
+                                storage.message_draft_plaintext_hashes(revision).map_err(
+                                    |error| crate::drafts::revision_error(error, &group_hex),
+                                )?;
                             if selected.content.trim() != request.content.trim()
                                 || selected.reply_to_message_id_hex != request.reply_to
                                 || !draft_media_describes_refs(&selected, &request.attachments)
+                                || plaintext_hashes.len() != request.attachments.len()
+                                || !plaintext_hashes.iter().zip(&request.attachments).all(
+                                    |(hash, reference)| {
+                                        hex::decode(&reference.plaintext_sha256)
+                                            .is_ok_and(|submitted| submitted.as_slice() == hash)
+                                    },
+                                )
                             {
                                 return Err(AppError::InvalidMessageDraft(
                                     "captured media must describe the draft selected for consumption".into(),

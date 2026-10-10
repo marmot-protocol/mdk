@@ -1,13 +1,17 @@
 # Marmot Integrations
 
 Connectors that let you chat with an agent runtime you already run (Hermes, OpenClaw, Claude Code, Codex, OpenCode,
-or Pi) from White Noise, over end-to-end encrypted Marmot groups. Each connector runs next to the local `wn-agent`
+Pi, or Goose) from White Noise, over end-to-end encrypted Marmot groups. Each connector runs next to the local `wn-agent`
 service on your Mac or Linux machine. Start with [Get Started](#get-started-white-noise--agents); the later sections
 explain topology, identities, and sharing for operators.
 
 ## Contents
 
 - [Get Started: White Noise + Agents](#get-started-white-noise--agents)
+- [Optional latest release selection](#optional-latest-release-selection)
+- [Recommended chat setup](#recommended-chat-setup)
+- [Connector capabilities](#connector-capabilities)
+- [First-install verification](#first-install-verification)
 - [How The Connectors Fit Together](#how-the-connectors-fit-together)
 - [Default Install Topology](#default-install-topology)
 - [Identity Model](#identity-model)
@@ -31,17 +35,30 @@ Choose the runtime you already use:
 | Runtime | Connector style | Best fit |
 | --- | --- | --- |
 | Hermes | Gateway plugin | Rich chat history, reactions, media, and live previews |
-| OpenClaw | Channel plugin | Rich gateway routing, media, and live previews |
+| OpenClaw | Channel plugin | Gateway routing, history and media |
 | Claude Code | Terminal harness | Repository and coding tasks through Claude Code |
 | Codex | Terminal harness | Repository and coding tasks through Codex |
 | OpenCode | Terminal harness | Repository and coding tasks through OpenCode |
 | Pi | Terminal harness | Repository and coding tasks through Pi |
+| Goose | Terminal harness | Repository and coding tasks through Goose |
 
 The guided installers prompt on the terminal for the White Noise account that
-may invite and message the agent. They install release `wn-agent-v0.12.0`, create
+may invite and message the agent. They install the selected WN Agent release, create
 an isolated White Noise identity for the selected connector, and start same-user
 services where supported. Download each installer with its adjacent checksum,
 verify it, and only then execute the local file:
+
+### Verified installer helper
+
+Define this helper once, then choose a runtime below. It downloads the installer
+and its sibling checksum, verifies the bytes, and runs only the verified local
+file. The release publisher is the trust anchor; the checksum is not an
+independent endorsement.
+
+For the documented release, use the pinned `base_url` below. Its installers and
+companion assets stay in the same cohort. Remove stale `MARMOT_RELEASE_REPO`,
+`MARMOT_RELEASE_TAG`, `WN_AGENT_VERSION` and `WN_AGENT_SHA` overrides for a default
+install; explicit overrides describe a custom deployment.
 
 ```sh
 install_verified() (
@@ -49,11 +66,22 @@ install_verified() (
   installer_url="$1"
   checksum_url="$2"
   shift 2
+  case "$installer_url" in
+    *[!a-zA-Z0-9:/._-]*) echo "error: invalid installer URL" >&2; exit 1 ;;
+  esac
+  if ! printf '%s\n' "$installer_url" | LC_ALL=C grep -Eq '^https://github[.]com/marmot-protocol/mdk/releases/download/wn-agent-v[0-9]+[.][0-9]+[.][0-9]+/install-(hermes|openclaw|claude|codex|opencode|pi|goose)-marmot[.]sh$'; then
+    echo "error: select a numeric WN Agent release before installing" >&2
+    exit 1
+  fi
+  if [ "$checksum_url" != "$installer_url.sha256" ]; then
+    echo "error: checksum must accompany the same release installer" >&2
+    exit 1
+  fi
   installer_script="${installer_url##*/}"
   tmpdir="$(mktemp -d)"
   trap 'rm -rf "$tmpdir"' 0 HUP INT TERM
-  curl -fsSL "$installer_url" -o "$tmpdir/$installer_script"
-  curl -fsSL "$checksum_url" -o "$tmpdir/$installer_script.sha256"
+  curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 180 "$installer_url" -o "$tmpdir/$installer_script"
+  curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 180 "$checksum_url" -o "$tmpdir/$installer_script.sha256"
   if command -v shasum >/dev/null 2>&1; then
     (cd "$tmpdir" && shasum -a 256 -c "$installer_script.sha256")
   elif command -v sha256sum >/dev/null 2>&1; then
@@ -64,13 +92,21 @@ install_verified() (
   fi
   bash "$tmpdir/$installer_script" "$@"
 )
+```
 
+```sh
 base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
 ```
 
 ### Hermes
 
 Hermes 0.19.0 or newer must already be installed and working.
+
+If Hermes has multiple profiles or a custom home, read
+[first install and profile selection](hermes/marmot/README.md#first-install-and-profile-selection)
+**before** invoking the installer. Export the intended `HERMES_HOME`, and choose
+separate connector homes/sockets/service names for independent agents. The
+installer does not infer the intended profile from the installation prompt.
 
 Run this example in the same shell where `install_verified` above was defined.
 
@@ -135,6 +171,19 @@ install_verified "$base_url/install-pi-marmot.sh" \
   "$base_url/install-pi-marmot.sh.sha256"
 ```
 
+### Goose
+
+Goose 1.53.0 or newer must already be installed, configured with a provider,
+and runnable as `goose`. The Goose harness supports the `inherit` and
+`unrestricted` execution profiles only.
+
+Run this example in the same shell where `install_verified` above was defined.
+
+```sh
+install_verified "$base_url/install-goose-marmot.sh" \
+  "$base_url/install-goose-marmot.sh.sha256"
+```
+
 ### Finish In White Noise
 
 Each installer records the new agent's `npub` and `nprofile` in the
@@ -145,23 +194,56 @@ python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["npub"]); p
   "$HOME/.marmot-agents/codex/bootstrap.json"
 ```
 
-Use `hermes`, `openclaw`, `claude`, `codex`, `harnesses` (OpenCode), or `pi` in that path.
+Use `hermes`, `openclaw`, `claude`, `codex`, `harnesses` (OpenCode), `pi`, or `goose` in that path.
 The installers also show these values directly and render a terminal QR when
 `qrencode` is installed.
 
-1. Add the displayed agent identity in White Noise.
-2. Invite it to a direct message or group from the account you authorized.
-3. Send a test message.
+1. Compare the **entire agent npub** displayed on your trusted computer with the
+   account you add in White Noise. Check the account before accepting an
+   agent-created invitation or sending a task. A name, emoji, group title, or
+   public profile is not proof of identity.
+2. Give the verified account a local nickname, where your app supports it. The
+   terminal installers do not publish a public agent profile. Suggested cues
+   are `🧑‍💻 Codex`, `🦀 Claude Code`, `🥧 Pi`, and `🛠️ OpenCode`; different
+   installations can have different private nicknames.
+3. Invite it from the account you authorized. Terminal task groups can use a
+   normal group; ordinary messaging does not require an admin grant.
+4. Send a harmless test prompt with a fresh word you choose, asking the agent
+   to echo that word without running tools or changing files. Check that the
+   backend's reply contains that word and arrives in the same verified group;
+   an older reply or a service-start acknowledgement does not prove this test
+   succeeded.
+
+For terminal harnesses (Claude Code, Codex, OpenCode, and Pi), first select a
+workspace with `/<path>` beneath your home directory. For Codex, choose a Git
+repository. A terminal harness `/status` response alone does not prove that its
+backend can answer a phone prompt. Hermes and OpenClaw use their own gateway
+workspace/session configuration instead of this terminal picker.
+
+Connector files being installed is one milestone; a verified phone-to-backend
+conversation is another. Terminal automatic titles require an instruction plus
+matching group-profile-capable connector and harness releases. They are not enabled by
+the installation steps alone. Once that capability is available, you can grant
+the verified agent admin permission for title edits in a normal group. This
+also allows group and member changes. Direct messages do not provide the same
+editable group-title workflow. See the shared
+[session workflow](terminal-harness/README.md#organize-your-task-groups) and
+[onboarding design](terminal-harness/onboarding-design.md) for the proposed
+defaults and their remaining dependencies.
 
 Hermes and OpenClaw print one final gateway restart command because the installer
-does not restart an existing gateway. Claude Code, Codex, OpenCode, and Pi services are
+does not restart an existing gateway. Claude Code, Codex, OpenCode, Pi, and Goose services are
 started by the default install. Their first group message can be `/<path>` to
 select a working directory under your home directory.
 
 ### Repeatable Agent Or CI Setup
 
-Use the immutable release URL and provide the authorized White Noise account
-explicitly. Terminal harnesses use the welcomer entry for both invitation and
+For repeatable CI, save the exact numeric release URL printed during a
+reviewed setup and set `base_url` to that saved URL instead of selecting a newer release
+again on every run. Set `WN_AGENT_PINNED_BASE_URL` in the CI environment to that
+reviewed exact URL; the example clears a previously resolved value if the pin
+is missing, so the installer helper refuses it before any download.
+Provide the authorized White Noise account explicitly. Terminal harnesses use the welcomer entry for both invitation and
 prompt authorization. OpenClaw keeps those boundaries separate: `--allow-welcomer`
 is invite admission only, and inbound sender authorization is a distinct
 `senderPolicy` / `MARMOT_ALLOWED_USERS` configuration.
@@ -170,12 +252,13 @@ Run this example in the same shell where `install_verified` above was defined.
 
 ```sh
 OWNER_NPUB=npub1...
+base_url="${WN_AGENT_PINNED_BASE_URL:-}"
 install_verified "$base_url/install-codex-marmot.sh" \
   "$base_url/install-codex-marmot.sh.sha256" \
   --yes --allow-welcomer "$OWNER_NPUB"
 ```
 
-Replace `codex` in the URL with `claude`, `openclaw`, `opencode`, or `pi`. Hermes keeps
+Replace `codex` in the URL with `claude`, `openclaw`, `opencode`, `pi`, or `goose`. Hermes keeps
 invite acceptance and message-sender authorization explicit:
 
 Run this example in the same shell where `install_verified` above was defined.
@@ -194,6 +277,174 @@ before running it.
 Use each connector's README for existing-identity imports, shared deployments,
 execution profiles, manual service control, and development workflows.
 
+## Optional latest release selection
+
+The default commands above use the release documented by this checkout. To
+choose a newer release, first review its matching installation guide and
+compatibility notes in the [release list](https://github.com/marmot-protocol/mdk/releases).
+This optional lookup requires Python 3 with working TLS and GitHub API access;
+it accepts published numeric WN Agent tags, including pre-releases, and excludes
+drafts and suffixed tags. GitHub's repository-wide `/releases/latest` can select
+a different product. The lookup stops after 1,000 entries and clears `base_url`
+on failure. Fix API, network or certificate errors, or choose a numeric release
+explicitly. Installer and checksum verification remain required.
+
+Run this optional lookup in the same shell as the helper, then use the selected
+runtime's `install_verified` command. Save the printed URL for repeatable installs.
+
+```sh
+if base_url="$(python3 - <<'RELEASE'
+import json, re, urllib.request
+candidates = []
+for page in range(1, 11):
+    url = f"https://api.github.com/repos/marmot-protocol/mdk/releases?per_page=100&page={page}"
+    with urllib.request.urlopen(url, timeout=30) as response:
+        releases = json.load(response)
+    for release in releases:
+        tag = release["tag_name"]
+        match = re.fullmatch(r"wn-agent-v([0-9]+)\.([0-9]+)\.([0-9]+)", tag)
+        if match and not release["draft"] and release["published_at"]:
+            candidates.append((tuple(map(int, match.groups())), tag))
+    if len(releases) < 100:
+        break
+else:
+    raise SystemExit("Release listing exceeded 1000 entries; choose a reviewed tag explicitly")
+if not candidates:
+    raise SystemExit("No published WN Agent release found")
+tag = max(candidates)[1]
+print(f"https://github.com/marmot-protocol/mdk/releases/download/{tag}")
+RELEASE
+)" && test -n "$base_url"; then
+  printf 'Selected WN Agent release: %s\n' "$base_url"
+else
+  base_url=""
+  printf '%s\n' 'error: release lookup failed; installation is unavailable until resolved' >&2
+fi
+```
+
+## Recommended chat setup
+
+For a personal agent chat, the recommended setup is a dedicated group/DM with
+**the agent promoted to group admin** so it can maintain a useful task title.
+The phone owner performs the promotion through White Noise's group management.
+Group admin carries real membership/profile authority; keep the human owner as
+an admin too. This is recommended for trusted agents, not an automatic grant
+in every shared group. Admin status does not authorize new senders or grant
+backend tools. Ordinary messages and reactions do not require admin status.
+
+Before installation, settle the few choices that change the setup:
+
+- Which runtime/profile and existing account should this chat use? Default to
+  the selected runtime's isolated connector identity; reuse an identity only
+  when requested.
+- Which phone account may invite and prompt it, and which project directory
+  should terminal-harness work start in?
+- Is this a trusted personal agent chat with admin/title management? Recommend
+  yes; keep a shared group member-only unless its owner chooses otherwise.
+- Which files are needed, and is generated-file delivery supported/configured?
+  Keep the selected runtime's existing permissions as the execution default.
+
+Agent setup and chat policy is collected in
+[the integration instructions](AGENTS.md#suggested-agent-chat-instructions).
+These instructions are not installed automatically; tools still need deployment
+configuration and the acceptance check below.
+
+### Check the tools before promising the experience
+
+- **Hermes:** `marmot_group_profile` updates a name/description as an admin;
+  `marmot_reaction` adds/removes a message reaction. The optional presence
+  policy and model-issued reactions need one consistent owner so they do not
+  compete. See [the Hermes guide](hermes/marmot/README.md#what-you-can-do).
+- **OpenClaw:** `marmot_group_profile` updates the group name or description
+  when the account is an admin. The normal `message` tool supports `react` with
+  an emoji, target message id and chat target; `remove: true` removes it.
+- **Claude Code, Codex, OpenCode and Pi:** each ordinary turn supplies the
+  shared `wn-agent group-profile` route for admin name/description updates.
+  The backend needs `wn-agent` on its PATH and shell/sandbox permission to reach
+  the selected connector's local socket. See the
+  [admin profile guide](terminal-harness/README.md#admin-group-profile-updates).
+  Harnesses do not provide a built-in reaction tool. A deployment that needs
+  progress reactions must separately configure and verify that capability.
+  Bind every operation to the actual conversation and connector account; never
+  guess a chat from its name, put control secrets in prompts, or start a second
+  writer against the same account home. Verify the installed release exposes
+  the documented command/tool before promising title updates.
+
+### Acceptance check on the phone
+
+1. Invite the bootstrapped agent from the authorized phone account and grant
+   admin in the intended chat when title management is selected.
+2. Select the project for a terminal harness, then send a small ordinary model
+   request. Verify the response lands in that same chat.
+3. If title/reaction tools are configured, verify a meaningful task title and
+   a 👀 → ✅ transition on the request, without a duplicate emoji message. Make
+   a new request to verify session continuity; a status question should keep
+   the task title. Never mark an unavailable command/tool or rejected admin change as passed.
+4. Test one required file type and generated-file return if supported. Check
+   [the capability guide](#connector-capabilities) before choosing the test.
+5. Report which runtime/profile, connector identity, services and chat were
+   verified, and list remaining phone/tool checks explicitly. A service start,
+   local `/status` reply or readiness probe alone is not this acceptance check.
+
+## Connector capabilities
+
+All seven connectors provide encrypted White Noise conversations with an agent
+runtime you already use. The runtime supplies the model, tools and permissions;
+`wn-agent` supplies Marmot identity, encrypted transport and durable delivery.
+Choose by the features you need:
+
+| Connector | Conversation and controls | Files |
+| --- | --- | --- |
+| [Hermes](hermes/marmot/README.md#what-you-can-do) | DM/group activation; history, quotes, reactions, own-message deletion, admin group profile updates; optional live previews/presence/approval reactions | Inbound media; image/document/video/voice sends with approved-root staging |
+| [OpenClaw](openclaw/marmot/README.md#what-you-can-do) | Gateway routing; DM/group activation; history, quotes, quiet changes, own-message deletion, reactions, admin group profile updates, consent-based public profile naming; current inbound turns are final-only | Host-authorized inbound/outbound media via normal message tool |
+| [Claude Code](claude/marmot/README.md#what-you-can-do) | Per-chat session/project/goal; shared chat and recovery commands; admin group profile updates; text replies | Text-only; no attachments or generated-file return |
+| [Codex](codex/marmot/README.md#what-you-can-do) | Per-chat thread/project/goal; shared chat and recovery commands; admin group profile updates; completed text replies | Native images and supported staged files; opt-in generated-file return with exact grants |
+| [OpenCode](opencode/marmot/README.md#what-you-can-do) | Per-chat session/project/goal; shared chat and recovery commands; admin group profile updates; text-event replies | Supported images/PDFs/text; no generated-file return |
+| [Pi](pi/marmot/README.md#what-you-can-do) | Per-chat session/project/goal; shared chat and recovery commands; admin group profile updates; completed text replies | Supported images/text; no generated-file return |
+| [Goose](goose/marmot/README.md) | Per-chat session/project/goal; shared chat and recovery commands; text replies between tool calls | Text-only; no attachments or generated-file return |
+
+For terminal harnesses, start with `/cd src/my-project`, send an ordinary request,
+then use `/status`, `/goal <instruction>` or `/new` as needed. The complete
+[chat-command reference](terminal-harness/README.md#chat-commands) explains
+recovery, session resets and slash escaping. These harnesses do not add gateway
+mention activation, reaction tools or live previews.
+
+For gateway plugins, ask in the current chat and use the runtime's registered
+Marmot tools and media-delivery contract. A file accepted by a connector is not
+a promise that the selected model can interpret it. Voice/audio upload shares
+the group's configured media endpoint and limits; personal kind-10063 discovery
+is not yet implemented. Each linked guide explains opt-ins, restrictions and
+verification steps; installing another connector does not inherit its features.
+
+## First-install verification
+
+For a copied White Noise installation prompt, use the connector's
+[first-install checklist](../crates/agent-connector/README.md#first-installation-from-a-white-noise-prompt)
+and the selected runtime's guide. Resolve the actual runtime/profile home,
+choose one owner for each connector socket/service, verify the downloaded
+installer checksum and release cohort, and configure both invitation and
+message-sender authorization. A successful install/bootstrap is not proof of
+an agent reply reaching the phone: finish with an invited, allowed-account
+White Noise round trip.
+
+Before installing, follow the runtime-specific checklist: [Hermes](hermes/marmot/README.md#first-install-and-profile-selection),
+[OpenClaw](openclaw/marmot/README.md#first-install-checklist),
+[Claude Code](claude/marmot/README.md#first-install-checklist),
+[Codex](codex/marmot/README.md#first-install-checklist),
+[OpenCode](opencode/marmot/README.md#first-install-checklist),
+[Pi](pi/marmot/README.md#first-install-checklist), or
+[Goose](goose/marmot/README.md#install-goose-already-installed). The five terminal harnesses also
+share a [two-process/environment verification guide](terminal-harness/README.md#first-installation-and-verification).
+These guides distinguish invitation authorization from prompt authorization and
+actual backend replies from local setup/status acknowledgements.
+
+For Hermes files, stage a regular file under the adapter's approved source root
+before returning `MEDIA:<absolute-path>`; see the
+[copy-and-send example](hermes/marmot/README.md#sending-a-generated-file).
+The default source root is the connector home's `dev/inbound-media`, not an
+arbitrary workspace. OpenClaw and terminal harnesses have their own documented
+attachment/export contracts; do not apply Hermes's `MEDIA:` syntax to them.
+
 ## How The Connectors Fit Together
 
 Current integrations:
@@ -204,8 +455,9 @@ Current integrations:
 - [`codex/marmot`](codex/marmot) - `wn-codex` Codex harness binary.
 - [`opencode/marmot`](opencode/marmot) - `wn-opencode` OpenCode harness binary.
 - [`pi/marmot`](pi/marmot) - `wn-pi` Pi harness binary.
+- [`goose/marmot`](goose/marmot) - `wn-goose` Goose harness binary.
 - [`terminal-harness`](terminal-harness) - shared hardened runtime for the
-  Claude Code, Codex, OpenCode, and Pi terminal harnesses.
+  Claude Code, Codex, OpenCode, Pi, and Goose terminal harnesses.
 
 All integrations are intentionally thin at the Marmot boundary. They do not own MLS
 state, Nostr transport, local account storage, relay access, QUIC preview
@@ -223,6 +475,7 @@ The release installers are published with the `wn-agent-v*` release family:
 - `scripts/install-codex-marmot.sh`
 - `scripts/install-opencode-marmot.sh`
 - `scripts/install-pi-marmot.sh`
+- `scripts/install-goose-marmot.sh`
 
 By default the production-shaped installs create separate local agent identities
 per connector:
@@ -235,24 +488,25 @@ per connector:
 | Codex harness | `$HOME/.marmot-agents/codex` | `wn-agent-codex.service` / `org.marmot.wn-agent.codex` plus `wn-codex.service` / `org.marmot.wn-codex` |
 | OpenCode harness | `$HOME/.marmot-agents/harnesses` | `wn-agent-harnesses.service` / `org.marmot.wn-agent.harnesses` plus `wn-opencode.service` / `org.marmot.wn-opencode` |
 | Pi harness | `$HOME/.marmot-agents/pi` | `wn-agent-pi.service` / `org.marmot.wn-agent.pi` plus `wn-pi.service` / `org.marmot.wn-pi` |
+| Goose harness | `$HOME/.marmot-agents/goose` | `wn-agent-goose.service` / `org.marmot.wn-agent.goose` plus `wn-goose.service` / `org.marmot.wn-goose` |
 
 Each home derives its own default socket at `$MARMOT_HOME/dev/wn-agent.sock` and
 uses the public relay defaults shared with the phone app pilot setup. Claude Code,
-Codex, OpenCode, and Pi use separate connector homes and Marmot identities by default. They share
+Codex, OpenCode, Pi, and Goose use separate connector homes and Marmot identities by default. They share
 implementation in `integrations/terminal-harness`, but they do not share prompts,
 sessions, sockets, or services unless an operator explicitly configures a shared
 deployment.
 
 Hermes and OpenClaw install or patch their host-runtime plugin configuration and
 then print restart guidance for the existing gateway. They do not restart the
-gateway automatically. `wn-claude`, `wn-codex`, `wn-opencode`, and `wn-pi` each install their own harness
+gateway automatically. `wn-claude`, `wn-codex`, `wn-opencode`, `wn-pi`, and `wn-goose` each install their own harness
 binary and service in addition to `wn-agent`, because they are standalone
 harnesses rather than plugins loaded by an existing gateway.
 
 ## Identity Model
 
 The default topology creates or reuses one Marmot account per connector home,
-which means Hermes, OpenClaw, Claude Code, Codex, OpenCode, and Pi present as separate Nostr
+which means Hermes, OpenClaw, Claude Code, Codex, OpenCode, Pi, and Goose present as separate Nostr
 identities when installed with default options.
 
 Within each home, `wn-agent bootstrap` lists local-signing accounts and reuses one
@@ -268,8 +522,9 @@ The installers persist the selected account into connector-specific config:
 - `wn-codex` uses `WN_CODEX_ACCOUNT_ID_HEX`.
 - `wn-opencode` uses `WN_OPENCODE_ACCOUNT_ID_HEX`.
 - `wn-pi` uses `WN_PI_ACCOUNT_ID_HEX`.
+- `wn-goose` uses `WN_GOOSE_ACCOUNT_ID_HEX`.
 
-Installing all six connectors on one machine with default options therefore
+Installing all seven connectors on one machine with default options therefore
 creates distinct agent identities and distinct chat/group memberships.
 
 ## What Is Shared
@@ -308,6 +563,10 @@ Each host runtime keeps its own runtime state:
 - `wn-pi` keeps harness configuration in `$MARMOT_HOME/dev/wn-pi.env`, connector
   state under `$XDG_STATE_HOME/wn-pi`, and Pi sessions under
   `$MARMOT_HOME/dev/pi-sessions` by default.
+- `wn-goose` keeps harness configuration in `$MARMOT_HOME/dev/wn-goose.env`
+  and connector state under `$XDG_STATE_HOME/wn-goose` by default. Goose
+  sessions live in the operator's Goose session store, or under
+  `WN_GOOSE_PATH_ROOT` when that is set.
 
 Each integration also makes its own activation decision:
 
@@ -316,21 +575,22 @@ Each integration also makes its own activation decision:
   mention-style activation and always reply in effective DMs. Activation cannot
   widen sender authorization. They also support richer gateway features such as
   live previews, durable reply routing, profile onboarding, and media handling.
-- `wn-claude`, `wn-codex`, `wn-opencode`, and `wn-pi` are pure harnesses. They currently support only
+- `wn-claude`, `wn-codex`, `wn-opencode`, `wn-pi`, and `wn-goose` are pure harnesses. They currently support only
   `always` activation for prompt messages from explicitly allowed senders, and
   have no profile onboarding or live-preview behavior. Their shared runtime
   validates and privately stages bounded ordered attachment batches. `wn-codex`
   maps image batches to ordered Codex image inputs; `wn-opencode` passes each
   file as an ordered `opencode run --file` argument; `wn-pi` passes each image
   or UTF-8 text file as an ordered `@file` operand and rejects the whole batch
-  before spawning Pi if any file is another type; `wn-claude` rejects every
-  non-empty batch, including its accompanying text, before spawning its backend.
+  before spawning Pi if any file is another type; `wn-claude` and `wn-goose`
+  reject every non-empty batch, including its accompanying text, before
+  spawning their backend.
 
 Because activation is per integration, there is no global "claim this message"
 lease in shared-account deployments. If several integrations subscribe to the
 same account and group, every eligible integration can reply. For example, a
 direct message from an allowlisted sender could trigger Hermes/OpenClaw,
-`wn-claude`, `wn-codex`, `wn-opencode`, and `wn-pi` if all are running and configured for that account.
+`wn-claude`, `wn-codex`, `wn-opencode`, `wn-pi`, and `wn-goose` if all are running and configured for that account.
 
 ## Allowlist Behavior
 
@@ -384,7 +644,7 @@ several integrations:
 
 The current Hermes, OpenClaw, and terminal-harness release installers are
 optimized for isolated defaults. They also expose `MARMOT_HOME`,
-`MARMOT_AGENT_SOCKET`, `MARMOT_AGENT_SERVICE_NAME`, and
+`MARMOT_AGENT_SOCKET`, `MARMOT_AGENT_LABEL`, `MARMOT_AGENT_SERVICE_NAME`, and
 `MARMOT_AGENT_LAUNCHD_LABEL` overrides for advanced layouts.
 
 If `wn-agent` and a host gateway run as different local users, keep the socket
@@ -429,6 +689,10 @@ cargo test -p marmot-terminal-harness
 cargo test -p wn-pi
 just pi-dev-e2e-connector
 just pi-installer-test
+
+cargo test -p wn-goose
+just goose-dev-e2e-connector
+just goose-installer-test
 ```
 
 For release-installer work, test dry-runs and real release assets from the

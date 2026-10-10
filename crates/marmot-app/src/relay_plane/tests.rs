@@ -5799,7 +5799,9 @@ struct ObservedPublishClient {
     inner: NostrSdkRelayClient,
     account_id: MemberId,
     attempts: Mutex<Vec<TransportEndpoint>>,
+    events: Mutex<Vec<NostrTransportEvent>>,
     completed: AtomicUsize,
+    cancelled: AtomicUsize,
     completion: PublishCompletion,
 }
 
@@ -5816,9 +5818,20 @@ impl ObservedPublishClient {
             inner,
             account_id,
             attempts: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             completed: AtomicUsize::new(0),
+            cancelled: AtomicUsize::new(0),
             completion,
         }
+    }
+}
+
+/// Observe cancellation after the relay accepted but before its ACK was returned.
+struct HeldPublishGuard<'a>(&'a AtomicUsize);
+
+impl Drop for HeldPublishGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -5860,7 +5873,9 @@ impl NostrRelayClient for ObservedPublishClient {
         event: &NostrTransportEvent,
         required_acks: usize,
     ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        assert_eq!(account_id, &self.account_id);
         self.attempts.lock().await.extend_from_slice(endpoints);
+        self.events.lock().await.push(event.clone());
         let result = self
             .inner
             .publish_event_for_account(account_id, endpoints, event, required_acks)
@@ -5870,6 +5885,7 @@ impl NostrRelayClient for ObservedPublishClient {
             if matches!(self.completion, PublishCompletion::Hold) {
                 // The real relay accepted, but the caller never observes its
                 // ACK. Cancellation must not preserve the initial rejection.
+                let _guard = HeldPublishGuard(&self.cancelled);
                 std::future::pending::<()>().await;
             }
         }
@@ -5877,7 +5893,7 @@ impl NostrRelayClient for ObservedPublishClient {
     }
 }
 
-/// Quorum success must retry observed auth rejections without losing receipts.
+/// Public and authenticated receipts must satisfy one required quorum.
 #[tokio::test]
 async fn publish_auth_receipts() {
     use nostr_relay_builder::builder::{RelayBuilderNip42, RelayBuilderNip42Mode};
@@ -5921,11 +5937,13 @@ async fn publish_auth_receipts() {
     );
     assert!(outcome.failed.is_empty());
     assert_eq!(*fallback.attempts.lock().await, vec![endpoints[1].clone()]);
+    assert_eq!(*fallback.events.lock().await, vec![event]);
     fallback.inner.shutdown_accounts().await;
     fallback.inner.client().shutdown().await;
     plane.shutdown().await;
 }
 
+/// Below-quorum authentication retries share the original publication deadline.
 #[tokio::test]
 async fn publish_auth_deadline() {
     use nostr_relay_builder::builder::{RelayBuilderNip42, RelayBuilderNip42Mode};
@@ -5966,6 +5984,110 @@ async fn publish_auth_deadline() {
     let started = tokio::time::Instant::now();
     let publication = tokio::spawn(async move {
         adapter
+            .publish_signed_event(publisher.as_ref(), &targets, &event, 2)
+            .await
+    });
+    timeout(Duration::from_secs(10), async {
+        while fallback.completed.load(Ordering::SeqCst) != 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both authenticated publications must run concurrently");
+    gate.0.add_permits(1);
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let RelayPoolNotification::Message {
+                relay_url, message, ..
+            } = notifications.next().await.unwrap()
+                && matches!(*message, RelayMessage::Ok { status: true, .. })
+                && relay_url.as_str() == public_url.as_str()
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the public relay must acknowledge before the deadline");
+    assert!(
+        !publication.is_finished(),
+        "a public receipt below quorum must not cancel authenticated attempts"
+    );
+    tokio::time::pause();
+    tokio::time::advance(
+        ACCOUNT_PUBLISH_WAIT.saturating_sub(started.elapsed()) + Duration::from_millis(10),
+    )
+    .await;
+    tokio::task::yield_now().await;
+    assert!(
+        publication.is_finished(),
+        "auth must not start a fresh publication budget"
+    );
+    let error = publication.await.unwrap().unwrap_err();
+    tokio::time::resume();
+    assert_eq!(
+        error.publish_message_id(),
+        Some(&MessageId::new(signed.id.to_bytes().to_vec()))
+    );
+    assert!(error.to_string().contains("accepted 1 of required 2"));
+    assert_eq!(fallback.cancelled.load(Ordering::SeqCst), 2);
+    let failures = error.publish_endpoint_failures();
+    assert_eq!(failures.len(), 2);
+    for endpoint in endpoints.into_iter().skip(1) {
+        let failure = failures
+            .iter()
+            .find(|failure| failure.endpoint == endpoint)
+            .unwrap();
+        assert_eq!(failure.kind, TransportEndpointFailureKind::PossiblyExposed);
+        assert_eq!(failure.rejection_category, None);
+    }
+    fallback.inner.shutdown_accounts().await;
+    fallback.inner.client().shutdown().await;
+    plane.shutdown().await;
+}
+
+/// Quorum cancellation must preserve the same conservative exposure evidence as timeout.
+#[tokio::test]
+async fn publish_auth_quorum_does_not_wait_for_unobserved_fallback() {
+    use nostr_relay_builder::builder::{RelayBuilderNip42, RelayBuilderNip42Mode};
+    use nostr_relay_builder::{LocalRelay, RelayBuilder};
+
+    let gate = PublicAckGate(Arc::new(tokio::sync::Semaphore::new(0)));
+    let public = LocalRelay::new(RelayBuilder::default().write_policy(gate.clone()));
+    let first = LocalRelay::new(RelayBuilder::default().nip42(RelayBuilderNip42 {
+        mode: RelayBuilderNip42Mode::Write,
+    }));
+    let second = LocalRelay::new(RelayBuilder::default().nip42(RelayBuilderNip42 {
+        mode: RelayBuilderNip42Mode::Write,
+    }));
+    public.run().await.unwrap();
+    first.run().await.unwrap();
+    second.run().await.unwrap();
+    let public_url = public.url().await;
+    let endpoints = vec![
+        TransportEndpoint(public_url.to_string()),
+        TransportEndpoint(first.url().await.to_string()),
+        TransportEndpoint(second.url().await.to_string()),
+    ];
+    let plane = MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(30), true);
+    let fallback = Arc::new(ObservedPublishClient::new(PublishCompletion::Hold).await);
+    let adapter = plane.account_adapter(fallback.account_id.clone(), fallback.clone());
+    let mut notifications = adapter
+        .anonymous_publish_client
+        .as_ref()
+        .unwrap()
+        .client()
+        .notifications();
+    let signed = EventBuilder::new(Kind::TextNote, "quorum cancels held authentication")
+        .finalize(&Keys::generate())
+        .unwrap();
+    let event = NostrTransportEvent::from_nostr_event(&signed).unwrap();
+    let expected_event = event.clone();
+    let publisher = fallback.clone();
+    let targets = endpoints.clone();
+
+    let publication = tokio::spawn(async move {
+        adapter
             .publish_signed_event(publisher.as_ref(), &targets, &event, 1)
             .await
     });
@@ -5991,29 +6113,22 @@ async fn publish_auth_deadline() {
     })
     .await
     .expect("the public relay must acknowledge before the deadline");
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    assert!(
-        !publication.is_finished(),
-        "observed auth rejections must still be retried after quorum"
-    );
-    tokio::time::pause();
-    tokio::time::advance(
-        ACCOUNT_PUBLISH_WAIT.saturating_sub(started.elapsed()) + Duration::from_millis(10),
-    )
-    .await;
-    tokio::task::yield_now().await;
-    assert!(
-        publication.is_finished(),
-        "auth must not start a fresh publication budget"
-    );
-    let outcome = publication.await.unwrap().unwrap();
-    tokio::time::resume();
+    let outcome = timeout(Duration::from_secs(1), publication)
+        .await
+        .expect("met quorum must not wait for an unobserved authenticated ACK")
+        .unwrap()
+        .unwrap();
     assert_eq!(
         outcome.message_id,
         Some(MessageId::new(signed.id.to_bytes().to_vec()))
     );
     assert_eq!(outcome.accepted.len(), 1);
     assert_eq!(outcome.accepted[0].endpoint, endpoints[0]);
+    assert_eq!(fallback.cancelled.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        *fallback.events.lock().await,
+        vec![expected_event.clone(), expected_event]
+    );
     let failures = &outcome.failed;
     assert_eq!(failures.len(), 2);
     for endpoint in endpoints.into_iter().skip(1) {

@@ -11,16 +11,68 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 - Add `marmot_send_prepared_media_with_client_token` for captured ordinary-media admission and conditional draft consumption. Inputs are borrowed; the nullable captured revision remains owned by its selected-draft root. The owned result uses the existing `marmot_local_send_acceptance_free`; layouts and status values are unchanged. Use matching regenerated headers and libraries.
 
+
+- File-backed media upload inputs, token-aware upload calls and operation
+  cancellation/progress handles. New symbols and borrowed input records require
+  matching headers/libraries; existing byte-array APIs retain their bounds.
+- Add `marmot_propose_onboarding_relay_repair` and nested typed relay-repair
+  preview records. `MarmotOnboardingRepairProposal` gains an optional
+  `relay_repair` pointer; regenerate and recompile with the matching header
+  and library. The preview is non-publishing, and `ManualReview` has no
+  approvable action.
+- The C event surface appends local-copy termination/restoration and removed-device-leaf
+  events; existing discriminants remain unchanged. Recompile with the matching
+  header and native library and handle the new event kinds. Restoration describes
+  retained-history repair, not automatic scheduler restoration of removed copies.
+- `MarmotPresentedChatRow` gains a nullable row-owned `MarmotChatListDraftVersion` handle and
+  `marmot_message_draft_revision_includes_chat_list_version` compares it against
+  a borrowed selected revision. Both inputs are opaque read-only borrows; only
+  the selected revision authorizes revision-checked mutation.
+  Newer identical drafts remain distinguishable. Rebuild with matching generated
+  headers/libraries; the row layout and comparison signature change. Identical-text
+  saves emit a replacement snapshot because their draft revision changes. See the
+  shared chat-list contract.
+- Append `MarmotMarkdownInline::Timestamp` with signed `int64_t` Unix seconds
+  and `MarmotMarkdownTimestampStyle` for local-time timestamp display nodes.
+  Existing inline discriminants are unchanged; the new payload owns no
+  allocations. Recompile consumers against the regenerated `marmot.h` and ship
+  the matching library; older headers cannot handle the new tag. Hosts format
+  labels with the device locale/time zone and refresh visible relative labels.
 - Add `marmot_message_reactions` and the owned
   `MarmotTimelineUserReactionList` root/free for complete exact-message details.
   Existing record layouts are unchanged; the new symbols require matching
   generated headers and native libraries.
+- Per-account NIP-46 sessions for bunker links and client-initiated pairing,
+  with identity pinning, approval URLs, relay switching, cancellation and logout.
+  Local-key accounts and separate remote signers can run in the same client.
 
 ### Changed
+
+- Relay-repair C preview content, tag fields and optional endpoints use JSON
+  string literals to preserve embedded NULs and all UTF-8 bytes. Decode once
+  with a length-aware parser before consent or editing. Pointer layouts and
+  snapshot frees are unchanged, but consumers must adopt the new encoding.
 
 - `MarmotAttachmentEntry` adds `role: MarmotAttachmentRole` (`Shared` or
   `InlineEmoji`) for gallery filtering without changing slot or acquisition identity.
   This changes the record layout; rebuild clients with the matching header/library.
+- External account SQLCipher keys use the configured host secret store. Existing
+  plaintext key files migrate only after a verified secret-store write.
+
+### Fixed
+
+- NIP-46 signing requests contain only `kind`, `content`, `tags`, and `created_at`.
+  SDK-only event IDs and public keys stay local for response verification.
+- Publication signing failures report the event kind. Signer error text stays
+  out of the message because it can carry relay URLs.
+- NIP-46 request publication failures report how many relays rejected the
+  request, without relay URLs or relay-supplied text.
+- Account onboarding can establish inbox-list absence from a completed read of
+  freshly discovered outboxes even when a discovery indexer is unavailable.
+
+- Group activity preserves per-commit reaction targets across author and peer
+  replay, including before disband. See `marmot-app`'s Unreleased fixes for
+  projection and push-token behavior.
 
 ## [0.12.0] - 2026-10-02
 
@@ -66,7 +118,6 @@ record layouts changed. See the [client upgrade guide](../../docs/integration/0.
   stays silent and blocked senders remain suppressed; C hosts still apply
   their own notification permission, channel, and foreground policy. No C ABI
   layout changes. (marmot-protocol/whitenoise-android#2984)
-
 
 ## [0.11.0] - 2026-09-29
 

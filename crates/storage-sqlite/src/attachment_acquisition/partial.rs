@@ -56,6 +56,190 @@ pub(super) fn valid_publication_attempt(
 }
 
 impl SqliteAccountStorage {
+    /// Inspect a current checkpoint without reading or allocating its body.
+    /// This is sink selection only; the selected loader still authenticates chunks.
+    pub fn attachment_partial_total(
+        &self,
+        job: &AttachmentAcquisition,
+        now: u64,
+        expected: (&[u8; 32], &[u8; 32]),
+    ) -> StorageResult<Option<u64>> {
+        let conn = self.lock()?;
+        if !valid_attempt(&conn, job, now)? {
+            return Ok(None);
+        }
+        let total = conn
+            .query_row(
+                "SELECT total FROM attachment_partial WHERE token=?1
+             AND ciphertext_digest=?2 AND locator_digest=?3 AND expires_at>?4
+             AND received<=total AND total<=?5",
+                params![
+                    job.reference.token,
+                    &expected.0[..],
+                    &expected.1[..],
+                    u64_to_i64(now)?,
+                    u64_to_i64(MAX_RETAINED_FILE_ATTACHMENT_BYTES)?
+                ],
+                |row| nonnegative(row, 0),
+            )
+            .optional()
+            .storage()?;
+        Ok(total)
+    }
+
+    /// Restore a verified ciphertext prefix into a bounded writer rather than
+    /// returning a whole-file array. Lease and expiry gates include caller I/O.
+    pub fn load_attachment_partial_to_writer(
+        &self,
+        job: &AttachmentAcquisition,
+        now: u64,
+        max_bytes: u64,
+        expected: (&[u8; 32], &[u8; 32]),
+        writer: &mut dyn std::io::Write,
+    ) -> StorageResult<Option<(AttachmentPartialIdentity, u64)>> {
+        let started = std::time::Instant::now();
+        let current_time = || now.saturating_add(started.elapsed().as_secs());
+        let metadata = |conn: &Connection| {
+            conn.query_row(
+                "SELECT ciphertext_digest,locator_digest,etag,total,received,expires_at
+                 FROM attachment_partial WHERE token=?1",
+                [&job.reference.token],
+                |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, Vec<u8>>(1)?,
+                        r.get::<_, String>(2)?,
+                        nonnegative(r, 3)?,
+                        nonnegative(r, 4)?,
+                        nonnegative(r, 5)?,
+                    ))
+                },
+            )
+            .optional()
+            .storage()
+        };
+        let snapshot = self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let now = current_time();
+            if !valid_attempt(&conn, job, now)? {
+                return Ok(None);
+            }
+            let Some(row) = metadata(&conn)? else {
+                return Ok(None);
+            };
+            if row.0 != expected.0 || row.1 != expected.1 {
+                return Ok(None);
+            }
+            if row.5 <= now
+                || row.3 > max_bytes
+                || row.3 > MAX_RETAINED_FILE_ATTACHMENT_BYTES
+                || row.4 > row.3
+            {
+                conn.execute(
+                    "DELETE FROM attachment_partial WHERE token=?1",
+                    [&job.reference.token],
+                )
+                .storage()?;
+                return Ok(None);
+            }
+            Ok(Some(row))
+        })?;
+        let Some(snapshot) = snapshot else {
+            return Ok(None);
+        };
+        let identity = AttachmentPartialIdentity {
+            ciphertext_digest: snapshot
+                .0
+                .clone()
+                .try_into()
+                .map_err(|_| invalid("invalid partial digest"))?,
+            locator_digest: snapshot
+                .1
+                .clone()
+                .try_into()
+                .map_err(|_| invalid("invalid partial locator"))?,
+            etag: snapshot.2.clone(),
+            total: snapshot.3,
+        };
+        // Recheck the frozen representation as well as the attempt/source before
+        // each bounded read and once after the last caller write. Neither the
+        // account guard nor its transaction survives into hashing or caller I/O.
+        let mut copied = 0u64;
+        let mut previous_offset = -1i64;
+        loop {
+            let next = self.connection.with_transaction(|| {
+                let conn = self.lock()?;
+                let now = current_time();
+                if !valid_attempt(&conn, job, now)? || metadata(&conn)?.as_ref() != Some(&snapshot)
+                {
+                    return Ok(None);
+                }
+                if snapshot.5 <= now {
+                    conn.execute(
+                        "DELETE FROM attachment_partial WHERE token=?1",
+                        [&job.reference.token],
+                    )
+                    .storage()?;
+                    return Ok(None);
+                }
+                let chunk = conn
+                    .query_row(
+                        "SELECT offset,bytes,digest FROM attachment_partial_chunk
+                     WHERE token=?1 AND offset>?2 ORDER BY offset LIMIT 1",
+                        params![job.reference.token, previous_offset],
+                        |r| {
+                            Ok((
+                                nonnegative(r, 0)?,
+                                r.get::<_, Vec<u8>>(1)?,
+                                r.get::<_, Vec<u8>>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .storage()?;
+                Ok(Some(chunk))
+            })?;
+            let Some(next) = next else {
+                return Ok(None);
+            };
+            let corrupt = match &next {
+                Some((offset, bytes, digest)) => {
+                    *offset != copied
+                        || bytes.is_empty()
+                        || bytes.len() > ATTACHMENT_CHECKPOINT_BYTES
+                        || copied.saturating_add(bytes.len() as u64) > snapshot.4
+                        || Sha256::digest(bytes).as_slice() != digest
+                }
+                None => copied != snapshot.4,
+            };
+            if corrupt {
+                // A cancelled loader must not clear a replacement checkpoint.
+                self.connection.with_transaction(|| {
+                    let conn = self.lock()?;
+                    if valid_attempt(&conn, job, current_time())?
+                        && metadata(&conn)?.as_ref() == Some(&snapshot)
+                    {
+                        conn.execute(
+                            "DELETE FROM attachment_partial WHERE token=?1",
+                            [&job.reference.token],
+                        )
+                        .storage()?;
+                    }
+                    Ok(())
+                })?;
+                return Ok(None);
+            }
+            let Some((offset, bytes, _)) = next else {
+                return Ok(Some((identity, copied)));
+            };
+            writer
+                .write_all(&bytes)
+                .map_err(|_| invalid("partial checkpoint copy failed"))?;
+            previous_offset = u64_to_i64(offset)?;
+            copied += bytes.len() as u64;
+        }
+    }
+
     /// Append at an exact offset, in bounded chunks. A new zero-offset checkpoint
     /// atomically replaces the prior representation. Source/attempt/quota checks
     /// precede all writes; a late task cannot recreate a removed source.
@@ -74,7 +258,7 @@ impl SqliteAccountStorage {
         if bytes.is_empty()
             || bytes.len() > ATTACHMENT_CHECKPOINT_BYTES
             || end > identity.total
-            || identity.total > MAX_RETAINED_ATTACHMENT_BYTES as u64
+            || identity.total > MAX_RETAINED_FILE_ATTACHMENT_BYTES
             || identity.etag.len() > 1024
             || !identity.etag.starts_with('"')
             || !identity.etag.ends_with('"')
@@ -198,9 +382,14 @@ impl SqliteAccountStorage {
                 |r| nonnegative(r, 0),
             )
             .storage()?;
+        let own_import: u64 = conn.query_row(
+            "SELECT coalesce((SELECT byte_len FROM retained_attachment_files WHERE token=?1 AND completed=0),0)",
+            [&reference.token], |r| nonnegative(r,0),
+        ).storage()?;
         let required = if own > 0 { own.min(maximum) } else { maximum };
         Ok(reserved_bytes(&conn)?
             .saturating_sub(own)
+            .saturating_sub(own_import)
             .saturating_add(required)
             <= budget)
     }
@@ -250,12 +439,17 @@ impl SqliteAccountStorage {
             if expiry <= now
                 || total > max_bytes
                 || received > total
-                || total > MAX_RETAINED_ATTACHMENT_BYTES as u64
+                || total > MAX_RETAINED_FILE_ATTACHMENT_BYTES
             {
                 discard()?;
                 return Ok(None);
             }
             if expected.is_some_and(|(c, l)| cipher != c || locator != l) {
+                return Ok(None);
+            }
+            // The legacy array API cannot restore a large prefix. Leave it
+            // intact for the file-backed API rather than destroying resumability.
+            if total > MAX_RETAINED_ATTACHMENT_BYTES as u64 {
                 return Ok(None);
             }
             let mut stmt = conn

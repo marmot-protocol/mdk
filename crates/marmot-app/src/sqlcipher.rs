@@ -33,7 +33,6 @@ use storage_sqlite::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
 use zeroize::Zeroizing;
 
 use crate::{AppError, MarmotApp};
-use marmot_account::EXTERNAL_SQLCIPHER_SECRET_FILE;
 
 mod open_lock;
 pub(crate) use open_lock::{DatabaseOpenGuard, database_open_lock};
@@ -227,8 +226,16 @@ impl MarmotApp {
         kind: SqlcipherDatabaseKind,
     ) -> Result<SqlCipherKey, AppError> {
         let db_path = database.path;
+        let allow_create = !self.account_storage_path(label).try_exists()?
+            && !self.legacy_account_projection_path(label).try_exists()?
+            && !self.directory_cache_path(label).try_exists()?;
+        let mode = if allow_create {
+            marmot_account::ExternalSecretMode::Create
+        } else {
+            marmot_account::ExternalSecretMode::Existing
+        };
+        let secret = self.account_home().external_database_secret(label, mode)?;
         let salt = self.external_sqlcipher_salt(db_path)?;
-        let secret = self.external_sqlcipher_secret(label)?;
         Ok(SqlCipherKey::new(derive_external_sqlcipher_key_material(
             label,
             account_id_hex,
@@ -248,34 +255,6 @@ impl MarmotApp {
     ) -> Result<SqlCipherKey, AppError> {
         let lock = database_open_lock(path);
         self.sqlcipher_key_locked(label, keys, &lock.lock(), kind)
-    }
-
-    fn external_sqlcipher_secret(
-        &self,
-        label: &str,
-    ) -> Result<Zeroizing<[u8; SQLCIPHER_KEY_LEN]>, AppError> {
-        let path = self.account_dir(label).join(EXTERNAL_SQLCIPHER_SECRET_FILE);
-        if path.exists() {
-            let raw = fs::read_to_string(&path)?;
-            let bytes = hex::decode(raw.trim())?;
-            let secret: [u8; SQLCIPHER_KEY_LEN] = bytes.try_into().map_err(|_| {
-                AppError::SqlcipherKeyDerivation(format!(
-                    "invalid external SQLCipher secret length in {}",
-                    path.display()
-                ))
-            })?;
-            return Ok(Zeroizing::new(secret));
-        }
-        let mut secret = [0_u8; SQLCIPHER_KEY_LEN];
-        OsRng.fill_bytes(&mut secret);
-        let encoded = hex::encode(secret);
-        match write_private_new(&path, encoded.as_bytes()) {
-            Ok(()) => Ok(Zeroizing::new(secret)),
-            Err(AppError::Io(err)) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                self.external_sqlcipher_secret(label)
-            }
-            Err(err) => Err(err),
-        }
     }
 
     fn external_sqlcipher_salt(

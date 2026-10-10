@@ -57,7 +57,8 @@ struct SortKey {
 }
 
 const KEY: &str = "(list_pin_section, list_pin_order, list_activity_order, group_id_hex)";
-const KEY_COLUMNS: &str = "list_pin_section, list_pin_order, list_activity_order, group_id_hex";
+pub(super) const KEY_COLUMNS: &str =
+    "list_pin_section, list_pin_order, list_activity_order, group_id_hex";
 const REVERSE: &str =
     "list_pin_section DESC, list_pin_order DESC, list_activity_order DESC, group_id_hex DESC";
 impl ChatListView {
@@ -77,7 +78,7 @@ impl ChatListView {
             }
         }
     }
-    fn index(self) -> &'static str {
+    pub(super) fn index(self) -> &'static str {
         if self == Self::Unread {
             "idx_chat_list_unread_page"
         } else {

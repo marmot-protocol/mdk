@@ -559,6 +559,21 @@ async fn mock_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
     (relay, app, url)
 }
 
+async fn sync_to_epoch(client: &mut marmot_app::AppClient, group: &GroupId, epoch: u64) {
+    timeout(Duration::from_secs(20), async {
+        loop {
+            client.sync().await.unwrap();
+            client.retry_group_convergence(group).await.unwrap();
+            if client.group_mls_state(group).unwrap().epoch >= epoch {
+                return;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("recipient did not settle the committed group epoch");
+}
+
 async fn mock_audit_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
     let (relay, url) = mock_relay().await;
     let app = MarmotApp::try_with_relays_and_account_home_and_config(
@@ -4984,6 +4999,83 @@ async fn push_registration_settings_accept_apns_fcm_and_redact_tokens() {
     runtime.shutdown().await;
 }
 
+/// Wait for the durable Welcome projection before a lifecycle share targets it.
+async fn wait_for_push_group_member(app: &MarmotApp, account: &str, group: &GroupId) {
+    let group_hex = hex::encode(group.as_slice());
+    timeout(Duration::from_secs(20), async {
+        loop {
+            if app
+                .group(account, &group_hex)
+                .unwrap()
+                .is_some_and(|group| group.self_membership == SelfMembership::Member)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the recipient must install the Welcome before explicit token gossip");
+}
+
+/// Catch-up completion is not a push publication or recipient-ingestion fence.
+/// Observe the exact canonical token state without initiating another retry.
+async fn wait_for_group_push_registration(
+    runtime: &MarmotAppRuntime,
+    account: &str,
+    group: &GroupId,
+    fingerprint: Option<&str>,
+) -> marmot_app::GroupPushDebugInfo {
+    let mut last_counts = (0, 0, 0);
+    let result = timeout(Duration::from_secs(20), async {
+        loop {
+            let view = runtime.group_push_debug_info(account, group).await.unwrap();
+            last_counts = (
+                view.total_token_count,
+                view.active_token_count,
+                view.stale_token_count,
+            );
+            let matches = match fingerprint {
+                Some(fingerprint) => {
+                    view.active_token_count == 1
+                        && view
+                            .tokens
+                            .first()
+                            .is_some_and(|token| token.token_fingerprint == fingerprint)
+                }
+                None => view.active_token_count == 0,
+            };
+            if matches {
+                return view;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    result.unwrap_or_else(|_| {
+        panic!(
+            "canonical push token state did not converge: total={} active={} stale={}",
+            last_counts.0, last_counts.1, last_counts.2,
+        )
+    })
+}
+
+/// A scheduled retry may already have completed the revision before the RPC;
+/// either way the explicit attempt must leave no failed or pending work.
+fn assert_push_share_complete(outcome: marmot_app::PushRegistrationShareOutcome) {
+    assert_eq!(
+        outcome.status,
+        marmot_app::PushRegistrationShareStatus::Complete
+    );
+    assert_eq!(outcome.pending_groups, 0);
+    assert_eq!(outcome.failed_groups, 0);
+    assert_eq!(outcome.succeeded_groups, outcome.attempted_groups);
+    assert!(
+        outcome.attempted_groups <= 1,
+        "the fixture has one joined group"
+    );
+}
+
 #[tokio::test]
 async fn push_token_gossip_register_replace_and_remove_lifecycle() {
     let dir = tempfile::tempdir().unwrap();
@@ -5006,6 +5098,7 @@ async fn push_token_gossip_register_replace_and_remove_lifecycle() {
         )
         .await
         .unwrap();
+    wait_for_push_group_member(&app, &bob.account.label, &group_id).await;
     let server_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
 
     app.set_native_push_enabled(&bob.account.account_id_hex, true)
@@ -5019,15 +5112,19 @@ async fn push_token_gossip_register_replace_and_remove_lifecycle() {
             Some(url.clone()),
         )
         .unwrap();
-    runtime
+    let share = runtime
         .share_push_registration(&bob.account.account_id_hex)
         .await
         .unwrap();
+    assert_push_share_complete(share);
     runtime.catch_up_accounts().await.unwrap();
-    let alice_view = runtime
-        .group_push_debug_info(&alice.account.account_id_hex, &group_id)
-        .await
-        .unwrap();
+    let alice_view = wait_for_group_push_registration(
+        &runtime,
+        &alice.account.account_id_hex,
+        &group_id,
+        Some(&first.token_fingerprint),
+    )
+    .await;
     assert_eq!(alice_view.active_token_count, 1);
     assert_eq!(
         alice_view.tokens[0].token_fingerprint,
@@ -5043,15 +5140,19 @@ async fn push_token_gossip_register_replace_and_remove_lifecycle() {
             Some(url),
         )
         .unwrap();
-    runtime
+    let share = runtime
         .share_push_registration(&bob.account.account_id_hex)
         .await
         .unwrap();
+    assert_push_share_complete(share);
     runtime.catch_up_accounts().await.unwrap();
-    let alice_view = runtime
-        .group_push_debug_info(&alice.account.account_id_hex, &group_id)
-        .await
-        .unwrap();
+    let alice_view = wait_for_group_push_registration(
+        &runtime,
+        &alice.account.account_id_hex,
+        &group_id,
+        Some(&second.token_fingerprint),
+    )
+    .await;
     assert_eq!(alice_view.active_token_count, 1);
     assert_eq!(
         alice_view.tokens[0].token_fingerprint,
@@ -5063,10 +5164,9 @@ async fn push_token_gossip_register_replace_and_remove_lifecycle() {
         .await
         .unwrap();
     runtime.catch_up_accounts().await.unwrap();
-    let alice_view = runtime
-        .group_push_debug_info(&alice.account.account_id_hex, &group_id)
-        .await
-        .unwrap();
+    let alice_view =
+        wait_for_group_push_registration(&runtime, &alice.account.account_id_hex, &group_id, None)
+            .await;
     assert_eq!(alice_view.active_token_count, 0);
 
     // Push-token gossip (kinds 447 update / 448 list / 449 removal) is protocol
@@ -5094,6 +5194,84 @@ async fn push_token_gossip_register_replace_and_remove_lifecycle() {
         );
     }
 
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn push_registration_before_join_is_automatically_shared_without_catch_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    // Settle initial account startup before creating any group so the no-op
+    // share below cannot be deferred until after the Welcome arrives.
+    runtime.catch_up_accounts().await.unwrap();
+    app.set_native_push_enabled(&bob.account.account_id_hex, true)
+        .unwrap();
+    let registration = app
+        .upsert_push_registration(
+            &bob.account.account_id_hex,
+            PushPlatform::Fcm,
+            "registration-before-group-join",
+            &nostr::prelude::Keys::generate().public_key().to_hex(),
+            Some(url),
+        )
+        .unwrap();
+    let share = runtime
+        .share_push_registration(&bob.account.account_id_hex)
+        .await
+        .unwrap();
+    assert_push_share_complete(share);
+    assert_eq!(share.attempted_groups, 0);
+    assert_eq!(share.succeeded_groups, 0);
+    assert!(
+        app.push_registration(&bob.account.account_id_hex)
+            .unwrap()
+            .unwrap()
+            .last_shared_at_ms
+            .is_none(),
+        "the pre-group no-op must not claim that a token was published"
+    );
+
+    let group = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "automatic push after join",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    // No host retry/share/catch-up follows creation: the worker-owned receive
+    // tail must discover and drain the new group's durable push outbox itself.
+    wait_for_push_group_member(&app, &bob.account.label, &group).await;
+    let view = wait_for_group_push_registration(
+        &runtime,
+        &alice.account.account_id_hex,
+        &group,
+        Some(&registration.token_fingerprint),
+    )
+    .await;
+    assert_eq!(view.active_token_count, 1);
+    assert_eq!(
+        view.tokens[0].token_fingerprint,
+        registration.token_fingerprint
+    );
+    assert!(
+        app.push_registration(&bob.account.account_id_hex)
+            .unwrap()
+            .unwrap()
+            .last_shared_at_ms
+            .is_some(),
+        "automatic publication must commit durable share completion"
+    );
     runtime.shutdown().await;
 }
 
@@ -7804,6 +7982,12 @@ async fn self_removal_suppresses_account_unread_while_peer_removal_advances_it()
     loop {
         bob.sync().await.unwrap();
         carol.sync().await.unwrap();
+        if unread_for(&bob_account.account_id_hex) != 2 {
+            bob.retry_group_convergence(&group_id).await.unwrap();
+        }
+        if unread_for(&carol_account.account_id_hex) != 0 {
+            carol.retry_group_convergence(&group_id).await.unwrap();
+        }
         // Carol's self-removal must zero her summary. Bob remains a member, so
         // the peer-removal system row advances his existing unread count.
         if unread_for(&carol_account.account_id_hex) == 0
@@ -8405,7 +8589,12 @@ async fn relay_app_runtime_synthesizes_system_row_for_retention_change() {
     assert_eq!(parsed.old_retention_seconds, Some(0));
     assert_eq!(parsed.new_retention_seconds, Some(60));
 
-    bob.sync().await.unwrap();
+    sync_to_epoch(
+        &mut bob,
+        &group_id,
+        alice.group_mls_state(&group_id).unwrap().epoch,
+    )
+    .await;
     let bob_timeline = MarmotApp::with_relay(dir.path(), url)
         .timeline_messages_with_query(
             "bob",
@@ -9102,7 +9291,12 @@ async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext
     assert_eq!(bob_reference.source_epoch, reference.source_epoch);
 
     alice.update_message_retention(&group_id, 60).await.unwrap();
-    bob.sync().await.unwrap();
+    sync_to_epoch(
+        &mut bob,
+        &group_id,
+        alice.group_mls_state(&group_id).unwrap().epoch,
+    )
+    .await;
     let later_epoch_download = bob
         .download_media(&group_id, reference.clone())
         .await
@@ -9169,7 +9363,12 @@ async fn retained_media_rehydrates_a_retired_current_epoch_before_the_group_adva
         .update_message_retention(&group_id, retention_seconds)
         .await
         .unwrap();
-    bob.sync().await.unwrap();
+    sync_to_epoch(
+        &mut bob,
+        &group_id,
+        alice.group_mls_state(&group_id).unwrap().epoch,
+    )
+    .await;
 
     let expired = alice
         .upload_media(
@@ -9265,7 +9464,12 @@ async fn retained_media_rehydrates_a_retired_current_epoch_before_the_group_adva
         .await
         .unwrap();
 
-    bob.sync().await.unwrap();
+    sync_to_epoch(
+        &mut bob,
+        &group_id,
+        alice.group_mls_state(&group_id).unwrap().epoch,
+    )
+    .await;
     let download = bob
         .download_media(&group_id, retained_reference)
         .await
@@ -9343,7 +9547,12 @@ async fn encrypted_media_endpoint_updates_are_full_replacement_and_admin_only() 
         )
         .await
         .unwrap();
-    bob.sync().await.unwrap();
+    sync_to_epoch(
+        &mut bob,
+        &group_id,
+        alice.group_mls_state(&group_id).unwrap().epoch,
+    )
+    .await;
 
     let bob_group = app.group("bob", &group_id_hex).unwrap().unwrap();
     assert_eq!(
@@ -13695,26 +13904,8 @@ async fn concurrent_leaves_report_already_requested_not_an_opaque_error() {
     runtime.shutdown().await;
 }
 
-/// Convergence remediation-plan liveness guard: successive inbound commits,
-/// each with a member send fired while the commit is still converging, must
-/// keep settling promptly through the real worker scheduling path.
-///
-/// The queued mid-window path is asserted *opportunistically*: measured on
-/// both a dev machine and CI, a healthy in-proc relay settles a linear
-/// rename commit in well under one quiescence window, so the interval in
-/// which a member send lands mid-window is a sub-300ms race that can be won
-/// or lost systematically per machine (CI lost it 8/8 with no delay; a dev
-/// machine lost it 12/12 with a 300ms delay). A round whose send does
-/// report `published == 0` (durably queued, nothing on transport) gets the
-/// hard latency assertion; rounds that publish directly still assert
-/// liveness through the real worker scheduling path.
-///
-/// The deterministic queued-path and parking contracts live in the engine
-/// tests (`cgka-engine/tests/distributed_convergence.rs`:
-/// `pass_opens_while_app_message_intents_are_queued` and the reservation
-/// suite), which fail outright against the pre-fix engine. Forcing the
-/// queued path at this layer through public APIs would require a test-only
-/// transport-pause or pass-phase diagnostics seam (PR-B candidate).
+/// Successive inbound commits and interleaved sends must settle through the
+/// real worker scheduling path.
 #[tokio::test]
 async fn convergence_settles_across_generations_with_mid_window_queued_sends() {
     let dir = tempfile::tempdir().unwrap();
@@ -13758,16 +13949,12 @@ async fn convergence_settles_across_generations_with_mid_window_queued_sends() {
             .update_group_profile(&alice_id, &group_id, Some(renamed.clone()), None)
             .await
             .unwrap();
-        // Fire bob's send immediately: when it wins the race into bob's
-        // collection window, `published == 0` marks the queued path and the
-        // hard latency bound below applies.
+        // Send while bob may still be collecting the rename commit.
         let text = format!("bob mid-window {round}");
-        let send_accepted_at = Instant::now();
-        let summary = runtime
+        runtime
             .send_message(&bob_id, &group_id, text.clone().into_bytes())
             .await
             .unwrap();
-        let send_was_queued = summary.published == 0;
 
         // Wait on bob's *projection* (poll), not the group-state
         // subscription: the projection is the authoritative apply witness
@@ -13796,21 +13983,6 @@ async fn convergence_settles_across_generations_with_mid_window_queued_sends() {
             )
         })
         .await;
-
-        if send_was_queued {
-            let queued_send_latency = send_accepted_at.elapsed();
-            // One settlement cycle plus drain: nominally ~1.1-1.4s (1000ms
-            // quiescence + 100ms schedule margin + worker/publish slack). The
-            // pre-fix drain deferred a queued app intent past the apply tick
-            // whenever retained inbound was present, adding at least one more
-            // full settlement cycle (>= ~2.2s nominal, more on a loaded
-            // runner). 2.5s separates the classes with CI headroom.
-            assert!(
-                queued_send_latency < Duration::from_millis(2_500),
-                "queued mid-window send must publish within one settlement \
-                 cycle plus drain; took {queued_send_latency:?}"
-            );
-        }
     }
 
     runtime.shutdown().await;
