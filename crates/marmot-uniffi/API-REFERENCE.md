@@ -4425,7 +4425,7 @@ must enforce those separately and bound any untrusted JSON before passing it.
 </details>
 
 <details>
-<summary>Account attachment history</summary>
+<summary>Audit v5 tracker and configuration</summary>
 
 ### `Marmot::post_audit_log_tracker_update_v5`
 

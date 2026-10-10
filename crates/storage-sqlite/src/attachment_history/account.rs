@@ -58,7 +58,7 @@ impl AccountAttachmentQuery {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct AccountAttachmentVersion {
     store_epoch: Vec<u8>,
     revision: i64,
@@ -66,6 +66,15 @@ pub struct AccountAttachmentVersion {
     expiry_watermark: Option<u64>,
     pub next_expiry: Option<u64>,
 }
+impl PartialEq for AccountAttachmentVersion {
+    fn eq(&self, other: &Self) -> bool {
+        self.store_epoch == other.store_epoch
+            && self.revision == other.revision
+            && self.additions == other.additions
+            && self.expiry_watermark == other.expiry_watermark
+    }
+}
+impl Eq for AccountAttachmentVersion {}
 impl AccountAttachmentVersion {
     /// Source/visibility/incarnation changes invalidate loaded rows; additions advertise a separate refresh.
     pub fn requires_restart_since(&self, previous: &Self) -> bool {
@@ -94,6 +103,7 @@ private_debug!(AccountAttachmentVersion, "AccountAttachmentVersion");
 private_debug!(AccountAttachmentCursor, "AccountAttachmentCursor");
 #[derive(Clone)]
 pub struct AccountAttachmentEntry {
+    pub metadata_limited: bool,
     pub group_id_hex: String,
     pub attachment: AttachmentHistoryEntry,
 }
@@ -151,8 +161,8 @@ fn version(
                 |r| r.get(0),
             )
             .storage()?,
-        expiry_watermark: conn.query_row_cached("SELECT max(retention_expires_at) FROM app_events WHERE retention_expires_at IS NOT NULL AND retention_expires_at<=?1",[now],|r|r.get::<_,Option<i64>>(0)).storage()?.map(|v|u64::try_from(v).map_err(|_|AccountAttachmentHistoryError::InvalidQuery)).transpose()?,
-        next_expiry: conn.query_row_cached("SELECT min(retention_expires_at) FROM app_events WHERE retention_expires_at IS NOT NULL AND retention_expires_at>?1",[now],|r|r.get::<_,Option<i64>>(0)).storage()?.map(|v|u64::try_from(v).map_err(|_|AccountAttachmentHistoryError::InvalidQuery)).transpose()?,
+        expiry_watermark: conn.query_row_cached("SELECT max(retention_expires_at) FROM attachment_history WHERE visible=1 AND retention_expires_at IS NOT NULL AND retention_expires_at<=?1",[now],|r|r.get::<_,Option<i64>>(0)).storage()?.map(|v|u64::try_from(v).map_err(|_|AccountAttachmentHistoryError::InvalidQuery)).transpose()?,
+        next_expiry: conn.query_row_cached("SELECT min(retention_expires_at) FROM attachment_history WHERE visible=1 AND retention_expires_at IS NOT NULL AND retention_expires_at>?1",[now],|r|r.get::<_,Option<i64>>(0)).storage()?.map(|v|u64::try_from(v).map_err(|_|AccountAttachmentHistoryError::InvalidQuery)).transpose()?,
     })
 }
 const MAX_SLOT_BYTES: usize = 32 * 1024;
@@ -168,7 +178,7 @@ fn sql(seek: bool) -> String {
         substr(slot_json,1,32769),substr((SELECT json_group_array(json(e.value)) FROM message_timeline t,
             json_each(CASE WHEN json_valid(t.tags_json) THEN CASE WHEN json_type(t.tags_json)='array' THEN t.tags_json ELSE '[]' END ELSE '[]' END)e
             WHERE t.group_id_hex=h.group_id_hex AND t.message_id_hex=h.message_id_hex
-            AND CASE WHEN e.type='array' THEN json_extract(e.value,'$[0]')='emoji' ELSE 0 END),1,32769),group_id_hex,(SELECT retention_expires_at FROM app_events a WHERE a.group_id_hex=h.group_id_hex AND a.message_id_hex=h.message_id_hex)
+            AND CASE WHEN e.type='array' THEN json_extract(e.value,'$[0]')='emoji' ELSE 0 END),1,32769),group_id_hex,retention_expires_at
         FROM attachment_history h INDEXED BY idx_account_attachment_history_page
         WHERE visible=1 AND timeline_at>=?1 AND timeline_at<=?2{seek}
         ORDER BY timeline_at DESC,group_id_hex DESC,message_id_hex DESC,attachment_order DESC LIMIT ?3")
@@ -199,7 +209,7 @@ impl SqliteAccountStorage {
         self.account_attachment_history_page_at(query, limit, cursor, now)
     }
     /// Clock-injected read for deterministic retention qualification.
-    pub fn account_attachment_history_page_at(
+    pub(crate) fn account_attachment_history_page_at(
         &self,
         query: &AccountAttachmentQuery,
         limit: usize,
@@ -249,31 +259,43 @@ impl SqliteAccountStorage {
                 seen += 1;
                 let group: String = row.get(14).storage()?;
                 let sender: String = row.get(9).storage()?;
-                key = Some((
+                let current_key = (
                     row.get(1).storage()?,
                     group.clone(),
                     row.get(4).storage()?,
                     row.get(5).storage()?,
-                ));
+                );
                 let expiry: Option<i64> = row.get(15).storage()?;
                 if expiry.is_some_and(|v| v < 0 || v as u64 <= now)
                     || !query.accepts(&group, &sender)
                 {
+                    key = Some(current_key);
                     continue;
                 }
                 let slot: String = row.get(12).storage()?;
                 let emojis: String = row.get(13).storage()?;
-                bytes += slot.len() + emojis.len() + group.len() + sender.len() + 256;
-                if slot.len() > MAX_SLOT_BYTES
-                    || emojis.len() > MAX_SLOT_BYTES
-                    || bytes > MAX_PAGE_BYTES
-                {
-                    return Err(AccountAttachmentHistoryError::ResponseTooLarge);
+                let metadata_limited = slot.len() > MAX_SLOT_BYTES || emojis.len() > MAX_SLOT_BYTES;
+                let cost = if metadata_limited {
+                    group.len() + sender.len() + 256
+                } else {
+                    slot.len() + emojis.len() + group.len() + sender.len() + 256
+                };
+                if bytes + cost > MAX_PAGE_BYTES {
+                    more = true;
+                    break;
                 }
+                bytes += cost;
+                let attachment = if metadata_limited {
+                    entry_with_metadata(row, serde_json::Value::Null, Vec::new()).storage()?
+                } else {
+                    entry_from_row(row).storage()?
+                };
                 entries.push(AccountAttachmentEntry {
                     group_id_hex: group,
-                    attachment: entry_from_row(row).storage()?,
+                    attachment,
+                    metadata_limited,
                 });
+                key = Some(current_key);
             }
             Ok(AccountAttachmentPage {
                 entries,

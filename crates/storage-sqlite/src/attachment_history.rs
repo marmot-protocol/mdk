@@ -272,6 +272,29 @@ impl SqliteAccountStorage {
 
 fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentHistoryEntry> {
     let json: String = r.get(12)?;
+    let slot = serde_json::from_str(&json).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            12,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "attachment index contains invalid JSON",
+            )),
+        )
+    })?;
+    let emoji_tags = serde_json::from_str::<Vec<serde_json::Value>>(&r.get::<_, String>(13)?)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|tag| serde_json::from_value(tag).ok())
+        .collect();
+    entry_with_metadata(r, slot, emoji_tags)
+}
+
+fn entry_with_metadata(
+    r: &rusqlite::Row<'_>,
+    slot: serde_json::Value,
+    emoji_tags: Vec<Vec<String>>,
+) -> rusqlite::Result<AttachmentHistoryEntry> {
     Ok(AttachmentHistoryEntry {
         message_id_hex: r.get(4)?,
         attachment_index: usize::try_from(nonnegative(r, 6)?)
@@ -284,21 +307,8 @@ fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentHistoryEn
         sender: r.get(9)?,
         timeline_at: nonnegative(r, 10)?,
         received_at: nonnegative(r, 11)?,
-        emoji_tags: serde_json::from_str::<Vec<serde_json::Value>>(&r.get::<_, String>(13)?)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|tag| serde_json::from_value(tag).ok())
-            .collect(),
-        slot: serde_json::from_str(&json).map_err(|_| {
-            rusqlite::Error::FromSqlConversionFailure(
-                12,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "attachment index contains invalid JSON",
-                )),
-            )
-        })?,
+        emoji_tags,
+        slot,
     })
 }
 

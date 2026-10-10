@@ -23,7 +23,7 @@ fn add(s: &storage_sqlite::SqliteAccountStorage, group: &str, id: u64) {
 #[tokio::test]
 async fn account_pages_are_local_account_isolated_and_keep_typed_rejections() {
     let dir = tempfile::tempdir().unwrap();
-    let home = AccountHome::open(dir.path()).unwrap();
+    let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
     home.create_account("bob").unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
@@ -88,4 +88,58 @@ async fn account_pages_are_local_account_isolated_and_keep_typed_rejections() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn native_block_policy_fences_global_pages_and_never_returns_hidden_sender_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let s = app.account_storage("alice").unwrap();
+    let runtime = app.runtime();
+    add(&s, "aa", 1);
+    add(&s, "bb", 2);
+    let AccountAttachmentPageRead::Page(first) = runtime
+        .account_attachment_history_page("alice", AccountAttachmentQuery::default(), 1, None)
+        .await
+        .unwrap()
+    else {
+        panic!("page")
+    };
+    let list = storage_sqlite::StoredBlockList {
+        event_id: "01".repeat(32),
+        event_created_at: 1,
+        ..Default::default()
+    };
+    s.adopt_block_list(
+        &list,
+        &[("11".repeat(32), false)],
+        100,
+        &account.account_id_hex,
+        &|_, _| false,
+    )
+    .unwrap();
+    assert!(matches!(
+        runtime
+            .account_attachment_history_page(
+                "alice",
+                AccountAttachmentQuery::default(),
+                1,
+                first.next_cursor
+            )
+            .await
+            .unwrap(),
+        AccountAttachmentPageRead::RestartRequired
+    ));
+    let AccountAttachmentPageRead::Page(page) = runtime
+        .account_attachment_history_page("alice", AccountAttachmentQuery::default(), 100, None)
+        .await
+        .unwrap()
+    else {
+        panic!("page")
+    };
+    assert!(page.entries.is_empty());
+    runtime.shutdown_and_close().await.unwrap();
 }

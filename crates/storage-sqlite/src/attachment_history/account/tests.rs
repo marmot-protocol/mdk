@@ -197,10 +197,12 @@ fn invalid_bounds_ids_ceilings_and_oversized_metadata_fail_without_partial_resul
             [serde_json::json!({"imeta":[["imeta","x".repeat(40000)]]}).to_string()],
         )
         .unwrap();
-    assert!(matches!(
-        s.account_attachment_history_page(&AccountAttachmentQuery::default(), 100, None),
-        Err(AccountAttachmentHistoryError::ResponseTooLarge)
-    ));
+    let page = s
+        .account_attachment_history_page(&AccountAttachmentQuery::default(), 100, None)
+        .unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert!(page.entries[0].metadata_limited);
+    assert!(page.entries[0].attachment.slot.is_null());
 }
 #[test]
 fn account_seek_uses_index_without_a_history_sized_sort() {
@@ -275,4 +277,151 @@ fn expiry_fences_existing_cursors_before_maintenance_erases_sources() {
         fresh.entries[0].attachment.message_id_hex,
         format!("{:064x}", 1)
     );
+}
+
+#[test]
+fn oversized_slots_and_page_budgets_never_block_older_files() {
+    let s = SqliteAccountStorage::in_memory().unwrap();
+    for id in 0..20 {
+        seed(&s, "aa", id, 1, id as i64);
+    }
+    s.lock()
+        .unwrap()
+        .execute(
+            "UPDATE message_timeline SET media_json=?1 WHERE message_id_hex=?2",
+            params![
+                serde_json::json!({"imeta":[["imeta","x".repeat(40000)]]}).to_string(),
+                format!("{:064x}", 10)
+            ],
+        )
+        .unwrap();
+    // Many legal but large rows also exceed a full-page budget; its continuation must not skip one.
+    for id in (0..20).filter(|id| *id != 10) {
+        s.lock()
+            .unwrap()
+            .execute(
+                "UPDATE message_timeline SET media_json=?1 WHERE message_id_hex=?2",
+                params![
+                    serde_json::json!({"imeta":[["imeta","x".repeat(30000)]]}).to_string(),
+                    format!("{id:064x}")
+                ],
+            )
+            .unwrap();
+    }
+    let mut cursor = None;
+    let mut ids = Vec::new();
+    let mut limited = 0;
+    let mut pages = 0;
+    loop {
+        let page = s
+            .account_attachment_history_page(
+                &AccountAttachmentQuery::default(),
+                100,
+                cursor.as_ref(),
+            )
+            .unwrap();
+        pages += 1;
+        for entry in page.entries {
+            ids.push(entry.attachment.message_id_hex);
+            limited += usize::from(entry.metadata_limited);
+        }
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        ids,
+        (0..20)
+            .rev()
+            .map(|id| format!("{id:064x}"))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(limited, 1);
+    assert!(pages > 1);
+}
+#[test]
+fn blocked_senders_and_blocked_welcomers_are_excluded_and_fence_existing_pages() {
+    let s = SqliteAccountStorage::in_memory().unwrap();
+    seed(&s, "aa", 1, 2, 1);
+    seed(&s, "bb", 2, 1, 2);
+    let first = s
+        .account_attachment_history_page(&AccountAttachmentQuery::default(), 1, None)
+        .unwrap();
+    s.lock()
+        .unwrap()
+        .execute("INSERT INTO user_blocks VALUES(?1,0,0)", ["11".repeat(32)])
+        .unwrap();
+    assert!(matches!(
+        s.account_attachment_history_page(
+            &AccountAttachmentQuery::default(),
+            1,
+            first.next_cursor.as_ref()
+        ),
+        Err(AccountAttachmentHistoryError::RestartRequired)
+    ));
+    assert!(
+        s.account_attachment_history_page(&AccountAttachmentQuery::default(), 100, None)
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+    s.lock()
+        .unwrap()
+        .execute("DELETE FROM user_blocks", [])
+        .unwrap();
+    assert_eq!(
+        s.account_attachment_history_page(&AccountAttachmentQuery::default(), 100, None)
+            .unwrap()
+            .entries
+            .len(),
+        3
+    );
+    let first = s
+        .account_attachment_history_page(&AccountAttachmentQuery::default(), 1, None)
+        .unwrap();
+    s.lock().unwrap().execute("INSERT INTO account_groups(group_id_hex,endpoint,pending_confirmation,welcomer_account_id_hex,updated_at) VALUES('aa','wss://relay.example',1,?1,0)",["22".repeat(32)]).unwrap();
+    s.lock()
+        .unwrap()
+        .execute("INSERT INTO user_blocks VALUES(?1,0,0)", ["22".repeat(32)])
+        .unwrap();
+    assert!(matches!(
+        s.account_attachment_history_page(
+            &AccountAttachmentQuery::default(),
+            1,
+            first.next_cursor.as_ref()
+        ),
+        Err(AccountAttachmentHistoryError::RestartRequired)
+    ));
+    let page = s
+        .account_attachment_history_page(&AccountAttachmentQuery::default(), 100, None)
+        .unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].group_id_hex, "bb");
+}
+#[test]
+fn same_group_additions_keep_seek_and_non_attachment_expiry_is_quiet() {
+    let s = SqliteAccountStorage::in_memory().unwrap();
+    seed(&s, "aa", 1, 2, 1);
+    let first = s
+        .account_attachment_history_page_at(&AccountAttachmentQuery::default(), 1, None, 10)
+        .unwrap();
+    seed(&s, "aa", 2, 1, 2);
+    let next = s
+        .account_attachment_history_page_at(
+            &AccountAttachmentQuery::default(),
+            1,
+            first.next_cursor.as_ref(),
+            10,
+        )
+        .unwrap();
+    assert_eq!(next.entries[0].attachment.attachment_index, 1);
+    assert!(!next.version.requires_restart_since(&first.version));
+    assert_ne!(next.version, first.version);
+    // Deadline scheduling data is not an attachment mutation or an additions count.
+    let mut a = next.version.clone();
+    let mut b = a.clone();
+    a.next_expiry = Some(12);
+    b.next_expiry = Some(13);
+    assert_eq!(a, b);
 }

@@ -7,6 +7,7 @@ pub use storage_sqlite::{
 
 #[derive(Clone)]
 pub struct AccountAttachmentEntry {
+    pub metadata_limited: bool,
     pub group_id_hex: String,
     pub entry: super::AttachmentEntry,
 }
@@ -53,6 +54,7 @@ impl MarmotAppRuntime {
                                 .into_iter()
                                 .map(|e| {
                                     Ok(AccountAttachmentEntry {
+                                        metadata_limited: e.metadata_limited,
                                         group_id_hex: e.group_id_hex,
                                         entry: present(e.attachment, loopback)?,
                                     })
@@ -66,9 +68,11 @@ impl MarmotAppRuntime {
                                 .account_attachment_history_version()
                                 .map_err(|error| match error {
                                     E::Storage(error) => AppError::from(error),
-                                    _ => AppError::InvalidEncryptedMedia(
-                                        "account attachment version unavailable".into(),
-                                    ),
+                                    _ => {
+                                        AppError::from(cgka_traits::storage::StorageError::Backend(
+                                            "account attachment version unavailable".into(),
+                                        ))
+                                    }
                                 })?;
                         if current.requires_restart_since(&parsed.version) {
                             AccountAttachmentPageRead::RestartRequired
@@ -97,9 +101,9 @@ impl MarmotAppRuntime {
                 .account_attachment_history_version()
                 .map_err(|e| match e {
                     storage_sqlite::AccountAttachmentHistoryError::Storage(error) => error.into(),
-                    _ => AppError::InvalidEncryptedMedia(
+                    _ => AppError::from(cgka_traits::storage::StorageError::Backend(
                         "account attachment version unavailable".into(),
-                    ),
+                    )),
                 })
         })
         .await

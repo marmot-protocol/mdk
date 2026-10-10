@@ -1475,6 +1475,7 @@ typedef struct MarmotAttachmentEntry {
 } MarmotAttachmentEntry;
 
 typedef struct MarmotAccountAttachmentEntry {
+  bool metadata_limited;
   char *group_id_hex;
   struct MarmotAttachmentEntry entry;
 } MarmotAccountAttachmentEntry;

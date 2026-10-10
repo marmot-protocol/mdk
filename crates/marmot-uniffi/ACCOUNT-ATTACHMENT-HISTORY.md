@@ -18,7 +18,7 @@ Retain handles in memory only and discard them after runtime reconstruction. Acc
 
 ## Bounds and privacy
 
-The account page uses an indexed seek, not a per-chat fan-out or an account-wide filtered scan. At most 101 slots are visited per read and only bounded result metadata crosses the API. Slot and emoji metadata each have a 32 KiB bound; a page has a 512 KiB metadata budget. Oversized metadata returns `ResponseTooLarge` with no partial page. This is a typed read failure, not an empty library or permission to download the source.
+The account page uses an indexed seek, not a per-chat fan-out or an account-wide filtered scan. At most 101 slots are visited per read and only bounded result metadata crosses the API. Slot and emoji metadata each have a 32 KiB bound; a page has a 512 KiB metadata budget. Oversized slot or emoji metadata becomes a per-slot rejected placeholder with `metadata_limited=true`; its original source identity and continuation remain usable. Reaching the page budget ends the page early with a continuation before the unconsumed row. One sender cannot block every older file by supplying oversized metadata. The placeholder is not permission to download the source.
 
 The query, entries and opaque native handles have redacted Debug implementations. Do not log identifiers, filenames, URLs, query text or parser payloads. Source visibility is maintained by the existing block/invite/deletion/invalidation and retention machinery; the account cursor is invalidated by its shared revision triggers. Looking up an attachment does not grant permission to download it.
 

@@ -45,6 +45,7 @@ impl AccountAttachmentVersion {
 }
 #[derive(Clone, uniffi::Record)]
 pub struct AccountAttachmentEntryFfi {
+    pub metadata_limited: bool,
     pub group_id_hex: String,
     pub entry: AttachmentEntryFfi,
 }
@@ -81,6 +82,7 @@ impl From<app::AccountAttachmentPageRead> for AccountAttachmentPageReadFfi {
                         .entries
                         .into_iter()
                         .map(|e| AccountAttachmentEntryFfi {
+                            metadata_limited: e.metadata_limited,
                             group_id_hex: e.group_id_hex,
                             entry: e.entry.into(),
                         })

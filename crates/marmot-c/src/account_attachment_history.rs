@@ -55,7 +55,7 @@ impl MarmotAccountAttachmentQuery {
         })
     }
 }
-c_mirror! {MarmotAccountAttachmentEntry from AccountAttachmentEntryFfi {str group_id_hex,rec entry:MarmotAttachmentEntry,}}
+c_mirror! {MarmotAccountAttachmentEntry from AccountAttachmentEntryFfi {copy metadata_limited:bool,str group_id_hex,rec entry:MarmotAttachmentEntry,}}
 /// Owned result fields; borrow handles only while the result is live, or clone the version baseline.
 #[repr(C)]
 pub struct MarmotAccountAttachmentPage {
