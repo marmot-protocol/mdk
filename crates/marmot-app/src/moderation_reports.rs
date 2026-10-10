@@ -149,6 +149,9 @@ struct AccountSlot {
     /// or retried. Sign-out and wipe hold one from purge through teardown,
     /// because the account stays signed in until teardown commits.
     fences: std::sync::atomic::AtomicUsize,
+    /// Reports with a publish running in this process. A retry skips them
+    /// instead of taking their in-flight mark for an interrupted attempt.
+    publishing: Mutex<std::collections::HashSet<String>>,
 }
 
 impl AccountSlot {
@@ -159,6 +162,35 @@ impl AccountSlot {
     fn admits(&self, generation: &watch::Receiver<u64>) -> bool {
         self.fences.load(std::sync::atomic::Ordering::Acquire) == 0
             && !generation.has_changed().unwrap_or(true)
+    }
+}
+
+/// Claims one report's publish in this process until dropped.
+struct PublishClaim<'a> {
+    slot: &'a AccountSlot,
+    report_id: String,
+}
+
+impl<'a> PublishClaim<'a> {
+    fn try_claim(slot: &'a AccountSlot, report_id: &str) -> Option<Self> {
+        slot.publishing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(report_id.to_owned())
+            .then(|| Self {
+                slot,
+                report_id: report_id.to_owned(),
+            })
+    }
+}
+
+impl Drop for PublishClaim<'_> {
+    fn drop(&mut self) {
+        self.slot
+            .publishing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.report_id);
     }
 }
 
@@ -186,6 +218,7 @@ impl ModerationReportState {
                     generation: watch::channel(0).0,
                     retrying: std::sync::atomic::AtomicBool::new(false),
                     fences: std::sync::atomic::AtomicUsize::new(0),
+                    publishing: Mutex::default(),
                 })
             })
             .clone()
@@ -405,7 +438,7 @@ impl MarmotApp {
             return Err(AppError::CannotReportSelf);
         }
         let explanation = normalize_explanation(explanation);
-        let dedupe_key = dedupe_key(&reported, reason, origin);
+        let dedupe_key = dedupe_key(&config.recipient, &reported, reason, origin);
 
         let slot = self.moderation_reports.slot(label);
         let mut generation = slot.generation.subscribe();
@@ -465,6 +498,9 @@ impl MarmotApp {
         })?;
         // Durably mark the attempt before relay I/O: if it is interrupted,
         // shutdown, cancellation or process death leave it `CompletionUnknown`.
+        // The claim keeps a concurrent retry pass off this live attempt.
+        let _claim = PublishClaim::try_claim(&slot, &report_id)
+            .ok_or_else(|| AppError::Publish("moderation report already publishing".into()))?;
         storage.begin_moderation_report_attempt(&report_id)?;
         // Publish without the account lock so a slow relay never blocks another
         // report, a retry selection or a purge. A purge that lands meanwhile
@@ -554,6 +590,11 @@ impl MarmotApp {
                 summary.abandoned += 1;
                 continue;
             };
+            // A report still publishing in this process is not interrupted.
+            let Some(_claim) = PublishClaim::try_claim(&slot, &entry.report_id) else {
+                summary.pending += 1;
+                continue;
+            };
             if !storage.begin_moderation_report_attempt(&entry.report_id)? {
                 // Purged or published since selection.
                 continue;
@@ -612,9 +653,23 @@ impl MarmotApp {
         slot.generation
             .send_modify(|generation| *generation = generation.wrapping_add(1));
         let _work = slot.work.lock().await;
-        let purged = self
-            .account_storage(label)
-            .and_then(|storage| Ok(storage.purge_moderation_reports()?));
+        // An account that cannot sign, or whose database was never created,
+        // has no reports. Do not create and migrate a database to learn that.
+        let purged = match self.account_home.account(label) {
+            Ok(account) if !account.can_sign() => Ok(0),
+            Ok(_) if !self.account_storage_path(label).exists() => Ok(0),
+            _ => self
+                .account_storage(label)
+                .and_then(|storage| Ok(storage.purge_moderation_reports()?)),
+        };
+        if let Err(error) = &purged {
+            tracing::warn!(
+                target: "marmot_app::moderation_reports",
+                method = "fence_moderation_reports",
+                error_kind = error.privacy_safe_kind(),
+                "failed to purge queued moderation reports"
+            );
+        }
         (fence, purged)
     }
 
@@ -683,7 +738,10 @@ pub(crate) fn normalize_explanation(explanation: &str) -> String {
         .to_owned()
 }
 
+/// Scoped to the recipient: after a reports-key change, a repeat is a new report
+/// to the new key, never an echo of a wrap addressed to the old one.
 fn dedupe_key(
+    recipient: &PublicKey,
     reported: &PublicKey,
     reason: ReportReason,
     origin: ModerationReportOrigin,
@@ -691,6 +749,7 @@ fn dedupe_key(
     let mut hasher = Sha256::new();
     for part in [
         DEDUPE_DOMAIN,
+        &recipient.to_bytes()[..],
         &reported.to_bytes()[..],
         reason.as_str().as_bytes(),
         origin.label().as_bytes(),

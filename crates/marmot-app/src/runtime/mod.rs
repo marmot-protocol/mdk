@@ -4189,7 +4189,9 @@ impl MarmotAppRuntime {
         // stop any in-flight publish, delete them, and keep report admission
         // closed until the teardown below has committed the sign-out.
         let (_report_fence, report_purge) = self
-            .fence_moderation_reports_for_teardown(&account.label, "sign_out")
+            .accounts
+            .app
+            .fence_moderation_reports(&account.label)
             .await;
 
         // Step 2 (local teardown): shut the worker down (deactivating its
@@ -4355,14 +4357,6 @@ impl MarmotAppRuntime {
                 ),
             }),
         }
-
-        // Queued moderation reports belong to this account: stop any in-flight
-        // publish, delete them, and keep report admission closed until the
-        // directory is gone, so nothing is staged or published during the wipe.
-        // Removing the directory deletes the rows even when this purge fails.
-        let (_report_fence, _) = self
-            .fence_moderation_reports_for_teardown(&account.label, "sign_out_and_wipe")
-            .await;
 
         // Stages 3-5: local cleanup. `remove_account` shuts the worker down,
         // drops in-memory caches, and removes the account directory (MLS DB,
@@ -6482,6 +6476,10 @@ impl AccountManager {
     }
 
     pub async fn remove_account(&self, account_ref: &str) -> Result<(), AppError> {
+        // Stop and delete the account's moderation reports, and admit none
+        // until the removal below has committed (every removal entry point).
+        // Fenced before the global lock: the purge may open account storage.
+        let _report_fence = self.fence_moderation_reports(account_ref).await;
         let lock_wait = self
             .shared
             .app_performance_telemetry()
@@ -6678,7 +6676,21 @@ impl AccountManager {
     ///
     /// Dropping the in-memory caches is harmless when the directory is kept: a
     /// later sign-in simply re-warms them from the unchanged on-disk database.
+    /// Fence `account_ref`'s moderation reports for a teardown. An unknown
+    /// account has none; the teardown reports that itself.
+    async fn fence_moderation_reports(
+        &self,
+        account_ref: &str,
+    ) -> Option<crate::moderation_reports::ModerationReportFence> {
+        let label = self.app.account_home().account(account_ref).ok()?.label;
+        Some(self.app.fence_moderation_reports(&label).await.0)
+    }
+
     pub async fn deactivate_account(&self, account_ref: &str) -> Result<(), AppError> {
+        // Queued moderation reports never outlive a sign-out: stop and delete
+        // them, and admit none until the sign-out below has committed. Fenced
+        // before the global lock: the purge may open account storage.
+        let _report_fence = self.fence_moderation_reports(account_ref).await;
         let lock_wait = self
             .shared
             .app_performance_telemetry()

@@ -1103,6 +1103,75 @@ async fn reports_that_keep_failing_do_not_starve_newer_ones() {
 }
 
 #[tokio::test]
+async fn dedupe_is_scoped_to_the_configured_recipient() {
+    for queued in [true, false] {
+        let fixture = Fixture::configured(if queued { Mode::Refuse } else { Mode::Accept });
+        let reported = Keys::generate().public_key().to_hex();
+        let now = unix_now_ms();
+        let (first, _) = fixture.submit_at(&reported, now).await.unwrap();
+
+        let rotated = Keys::generate();
+        fixture
+            .app
+            .set_moderation_report_config(Some(ModerationReportConfig {
+                recipient_pubkey: rotated.public_key().to_hex(),
+                relays: vec![REPORT_RELAY.into()],
+            }))
+            .unwrap();
+        fixture.publisher.set_mode(Mode::Accept);
+        let (second, repeated) = fixture.submit_at(&reported, now + 60_000).await.unwrap();
+        assert!(!repeated, "queued={queued}: a new key gets its own report");
+        assert_ne!(second.report_id, first.report_id);
+        assert_eq!(second.status, ModerationReportStatus::Published);
+        let events = fixture.publisher.events();
+        let latest = events.last().unwrap();
+        assert_eq!(
+            latest.tags,
+            vec![vec!["p".to_owned(), rotated.public_key().to_hex()]]
+        );
+        assert!(
+            UnwrappedGift::from_gift_wrap(&rotated, &latest.to_verified_nostr_event().unwrap())
+                .is_ok()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_retry_pass_skips_a_report_that_is_still_publishing() {
+    let fixture = Arc::new(Fixture::configured(Mode::Accept));
+    fixture.publisher.hang_next.store(true, Ordering::SeqCst);
+    let submitting = {
+        let fixture = fixture.clone();
+        tokio::spawn(async move {
+            fixture
+                .submit(
+                    &Keys::generate().public_key().to_hex(),
+                    ReportReason::Spam,
+                    "",
+                    ModerationReportOrigin::Report,
+                )
+                .await
+        })
+    };
+    while fixture.publisher.hung.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    let summary = fixture
+        .app
+        .retry_pending_moderation_reports("alice", None)
+        .await
+        .unwrap();
+    assert_eq!(summary.published, 0);
+    assert_eq!(summary.pending, 1);
+    assert_eq!(
+        fixture.publisher.publishes().len(),
+        1,
+        "no second publish of a live attempt"
+    );
+    submitting.abort();
+}
+
+#[tokio::test]
 async fn runtime_stop_leaves_the_report_queued_for_retry() {
     let fixture = Fixture::configured(Mode::Hang);
     let (stop, stopping) = watch::channel(false);
@@ -1364,6 +1433,68 @@ mod runtime {
             error,
             AppError::AccountHome(AccountHomeError::SecretNotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn direct_account_removal_stops_an_in_flight_report() {
+        let fixture = Arc::new(runtime_fixture(Mode::Hang).await);
+        let submitting = {
+            let fixture = fixture.clone();
+            tokio::spawn(async move {
+                fixture
+                    .runtime
+                    .submit_moderation_report(
+                        &fixture.account_id,
+                        &Keys::generate().public_key().to_hex(),
+                        ReportReason::Spam,
+                        "",
+                        ModerationReportOrigin::Report,
+                    )
+                    .await
+            })
+        };
+        while fixture.publisher.hung.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        fixture
+            .runtime
+            .accounts()
+            .remove_account(&fixture.account_id)
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(10), submitting)
+            .await
+            .expect("removal stops the in-flight report")
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AppError::AccountHome(AccountHomeError::SecretNotFound(_))
+            ),
+            "{error:?}"
+        );
+        assert_eq!(fixture.publisher.publishes().len(), 1);
+        assert!(
+            fixture
+                .app
+                .account_home()
+                .account(&fixture.account_id)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_deactivation_purges_queued_reports() {
+        let fixture = runtime_fixture(Mode::Refuse).await;
+        fixture.queue_one().await;
+        fixture
+            .runtime
+            .accounts()
+            .deactivate_account(&fixture.account_id)
+            .await
+            .unwrap();
+        assert_eq!(fixture.pending_count(), 0);
     }
 
     #[tokio::test]
