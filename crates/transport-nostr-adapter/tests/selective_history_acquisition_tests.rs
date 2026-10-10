@@ -20,7 +20,15 @@ use transport_nostr_adapter::{
 };
 
 const ROUTE: [u8; 32] = [0xc3; 32];
-const LARGE_EVENT_BYTES: usize = 40 * 1024;
+/// The adapter's ordinary per-pass, per-relay result budgets.
+const PASS_BYTE_BUDGET: usize = 1024 * 1024;
+const PASS_ITEM_BUDGET: usize = 256;
+/// Three fit one pass's byte budget, so a gap of eight needs several passes.
+const LARGE_EVENT_BYTES: usize = 320 * 1024;
+/// Over the ordinary pass budget but under the 5-MiB single-object ceiling.
+/// The odd 11 bytes keep the fixed fixture key's ID order, which puts a small
+/// event before this one.
+const OVER_PASS_EVENT_BYTES: usize = PASS_BYTE_BUDGET + 256 * 1024 + 11;
 
 #[derive(Default)]
 struct Cursor(Mutex<Option<[u8; 32]>>);
@@ -48,6 +56,9 @@ struct WireCounts {
     drop_requests: AtomicBool,
     suppress_events: AtomicBool,
     extra_event_copies: AtomicUsize,
+    /// Simulated round trip: each client frame reaches the relay this long
+    /// after it was sent, in order, without delaying the frames behind it.
+    latency_ms: AtomicUsize,
 }
 
 impl WireCounts {
@@ -74,8 +85,23 @@ async fn counted_proxy(backend: String) -> (String, Arc<WireCounts>) {
                 };
                 let (mut client_write, mut client_read) = client.split();
                 let (mut relay_write, mut relay_read) = upstream.split();
-                let to_relay = async {
+                // Stamp each client frame on arrival and release it once its
+                // latency has passed, so concurrent requests overlap as they
+                // would on a real link.
+                let (delayed_tx, mut delayed_rx) = tokio::sync::mpsc::unbounded_channel();
+                let stamp = async {
                     while let Some(Ok(message)) = client_read.next().await {
+                        let latency = counts.latency_ms.load(Ordering::SeqCst) as u64;
+                        let due =
+                            tokio::time::Instant::now() + std::time::Duration::from_millis(latency);
+                        if delayed_tx.send((due, message)).is_err() {
+                            break;
+                        }
+                    }
+                };
+                let to_relay = async {
+                    while let Some((due, message)) = delayed_rx.recv().await {
+                        tokio::time::sleep_until(due).await;
                         if let Message::Text(text) = &message {
                             counts.received_text.fetch_add(text.len(), Ordering::SeqCst);
                             counts
@@ -134,7 +160,7 @@ async fn counted_proxy(backend: String) -> (String, Arc<WireCounts>) {
                         }
                     }
                 };
-                tokio::select! { _ = to_relay => {}, _ = to_client => {} }
+                tokio::select! { _ = stamp => {}, _ = to_relay => {}, _ = to_client => {} }
             });
         }
     });
@@ -257,11 +283,11 @@ async fn large_retained_history_and_sparse_gap_use_finite_bounded_acquisition() 
         let left_payload = left_counts.sent_event_json.load(Ordering::SeqCst) - before_left;
         let right_payload = right_counts.sent_event_json.load(Ordering::SeqCst) - before_right;
         assert!(
-            left_payload <= 180 * 1024,
+            left_payload <= PASS_BYTE_BUDGET + LARGE_EVENT_BYTES + 64 * 1024,
             "left sent {left_payload} prefilter EVENT bytes"
         );
         assert!(
-            right_payload <= 180 * 1024,
+            right_payload <= PASS_BYTE_BUDGET + LARGE_EVENT_BYTES + 64 * 1024,
             "right sent {right_payload} prefilter EVENT bytes"
         );
         for event in events {
@@ -321,6 +347,107 @@ async fn large_retained_history_and_sparse_gap_use_finite_bounded_acquisition() 
         left_counts.requests.load(Ordering::SeqCst),
         right_counts.requests.load(Ordering::SeqCst),
     );
+    sdk.client().shutdown().await;
+    left.shutdown();
+    right.shutdown();
+}
+
+/// What recovering a large gap of ordinary-sized events costs over a link
+/// with a realistic round trip: passes, wall time, requests and the largest
+/// per-relay event payload one pass carried. Prints its measurement.
+#[tokio::test]
+async fn large_gap_of_small_events_recovers_in_few_passes() {
+    const MISSING: usize = 512;
+    let keys = Keys::generate();
+    let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
+        events: true,
+        max_events: Some(4_096),
+    });
+    let mut retained = Vec::new();
+    let mut missing = Vec::new();
+    for index in 0..(100 + MISSING) {
+        // About the size of an encrypted chat message.
+        let content = format!("{index}-{}", "x".repeat(1_200));
+        let event = EventBuilder::new(Kind::MlsGroupMessage, content)
+            .tags([Tag::custom("h", [hex::encode(ROUTE)])])
+            .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(
+                1_700_000_000 + index as u64,
+            ))
+            .finalize(&keys)
+            .unwrap();
+        database
+            .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+            .await
+            .unwrap();
+        let item = NostrReconciliationItem {
+            event_id: event.id.to_bytes(),
+            created_at: event.created_at.as_secs(),
+        };
+        if index >= 100 {
+            missing.push(item)
+        } else {
+            retained.push(item)
+        }
+    }
+    let left = LocalRelay::new(RelayBuilder::default().database(database.clone()));
+    let right = LocalRelay::new(RelayBuilder::default().database(database));
+    left.run().await.unwrap();
+    right.run().await.unwrap();
+    let (left_url, left_counts) = counted_proxy(left.url().await.to_string()).await;
+    let (right_url, right_counts) = counted_proxy(right.url().await.to_string()).await;
+    left_counts.latency_ms.store(40, Ordering::SeqCst);
+    right_counts.latency_ms.store(40, Ordering::SeqCst);
+    let urls = vec![left_url, right_url];
+    let sdk = NostrSdkRelayClient::new(Client::builder().build());
+    for url in &urls {
+        sdk.client().add_relay(url.as_str()).await.unwrap();
+    }
+    sdk.client().connect().await;
+    let cursor = Cursor::default();
+    let route = subscription(&urls);
+    let wanted: HashSet<_> = missing.iter().map(|item| item.event_id).collect();
+    let mut admitted = retained;
+    let mut seen = HashSet::new();
+    let mut passes = 0usize;
+    let mut largest_pass_payload = 0usize;
+    let started = std::time::Instant::now();
+    while seen.len() < wanted.len() && passes < 200 {
+        passes += 1;
+        let before = [
+            left_counts.sent_event_json.load(Ordering::SeqCst),
+            right_counts.sent_event_json.load(Ordering::SeqCst),
+        ];
+        let (_, events) = sdk
+            .reconcile_subscription(route.clone(), &admitted, 0, u64::MAX, &cursor)
+            .await
+            .unwrap();
+        largest_pass_payload = largest_pass_payload
+            .max(left_counts.sent_event_json.load(Ordering::SeqCst) - before[0])
+            .max(right_counts.sent_event_json.load(Ordering::SeqCst) - before[1]);
+        for event in events {
+            let id: [u8; 32] = hex::decode(event.event.id).unwrap().try_into().unwrap();
+            if wanted.contains(&id) && seen.insert(id) {
+                admitted.push(
+                    missing
+                        .iter()
+                        .find(|item| item.event_id == id)
+                        .unwrap()
+                        .clone(),
+                );
+            }
+        }
+    }
+    let elapsed = started.elapsed();
+    let requests =
+        left_counts.requests.load(Ordering::SeqCst) + right_counts.requests.load(Ordering::SeqCst);
+    let payload = left_counts.sent_event_json.load(Ordering::SeqCst)
+        + right_counts.sent_event_json.load(Ordering::SeqCst);
+    eprintln!(
+        "large gap: missing={MISSING} passes={passes} elapsed_ms={} requests={requests} \
+         event_json_bytes={payload} largest_pass_payload_per_relay={largest_pass_payload}",
+        elapsed.as_millis()
+    );
+    assert_eq!(seen, wanted, "every missing event is recovered");
     sdk.client().shutdown().await;
     left.shutdown();
     right.shutdown();
@@ -471,7 +598,7 @@ async fn warm_full_event_cache_resumes_under_combined_result_budget() {
             .reconcile_subscription(route.clone(), &admitted, 0, u64::MAX, &cursor)
             .await
             .unwrap();
-        assert!(returned_json_bytes(&events) <= 128 * 1024);
+        assert!(returned_json_bytes(&events) <= PASS_BYTE_BUDGET);
         assert!(events.len() <= 3);
         if seen.len() + events.len() < expected.len() {
             assert_eq!(summary.relays_failed, 2);
@@ -522,7 +649,7 @@ async fn cached_id_over_single_object_ceiling_keeps_smaller_id_reachable() {
         .expect("a later affordable cached candidate remains reachable");
     assert!(items.iter().any(|item| item.event_id != small.event_id));
     assert_eq!(events.len(), 1);
-    assert!(returned_json_bytes(&events) < 128 * 1024);
+    assert!(returned_json_bytes(&events) < PASS_BYTE_BUDGET);
     assert_eq!(summary.relays_failed, 2);
     assert_eq!(
         summary.incomplete_endpoints.len(),
@@ -539,7 +666,7 @@ async fn cached_id_over_single_object_ceiling_keeps_smaller_id_reachable() {
 #[tokio::test]
 async fn one_large_network_event_is_recovered_within_single_object_ceiling() {
     let (left, right, sdk, route, left_counts, right_counts, items) =
-        cached_fixture(&[160 * 1024], &[]).await;
+        cached_fixture(&[OVER_PASS_EVENT_BYTES], &[]).await;
     let (summary, events) = sdk
         .reconcile_subscription(route, &[], 0, u64::MAX, &Cursor::default())
         .await
@@ -547,10 +674,10 @@ async fn one_large_network_event_is_recovered_within_single_object_ceiling() {
     assert_eq!(summary.relays_failed, 0);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].event.id, hex::encode(items[0].event_id));
-    assert!(returned_json_bytes(&events) > 128 * 1024);
+    assert!(returned_json_bytes(&events) > PASS_BYTE_BUDGET);
     assert!(returned_json_bytes(&events) <= 5 * 1024 * 1024);
-    assert!(left_counts.sent_event_json.load(Ordering::SeqCst) > 128 * 1024);
-    assert!(right_counts.sent_event_json.load(Ordering::SeqCst) > 128 * 1024);
+    assert!(left_counts.sent_event_json.load(Ordering::SeqCst) > PASS_BYTE_BUDGET);
+    assert!(right_counts.sent_event_json.load(Ordering::SeqCst) > PASS_BYTE_BUDGET);
     sdk.client().shutdown().await;
     left.shutdown();
     right.shutdown();
@@ -560,7 +687,7 @@ async fn one_large_network_event_is_recovered_within_single_object_ceiling() {
 async fn warm_large_event_waits_for_empty_next_pass_after_smaller_event() {
     // With the fixed signing key, ID order puts index 1 before index 0.
     let (left, right, sdk, route, left_counts, right_counts, items) =
-        cached_fixture(&[160 * 1024, 1024], &[0, 1]).await;
+        cached_fixture(&[OVER_PASS_EVENT_BYTES, 1024], &[0, 1]).await;
     assert_eq!(items[0].created_at, 1_700_001_001);
     assert_eq!(items[1].created_at, 1_700_001_000);
     let cursor = Cursor::default();
@@ -571,7 +698,7 @@ async fn warm_large_event_waits_for_empty_next_pass_after_smaller_event() {
     assert_eq!(first.relays_failed, 2);
     assert_eq!(small.len(), 1);
     assert_eq!(small[0].event.id, hex::encode(items[0].event_id));
-    assert!(returned_json_bytes(&small) < 128 * 1024);
+    assert!(returned_json_bytes(&small) < PASS_BYTE_BUDGET);
     let (next, large) = sdk
         .reconcile_subscription(route, &items[..1], 0, u64::MAX, &cursor)
         .await
@@ -579,7 +706,7 @@ async fn warm_large_event_waits_for_empty_next_pass_after_smaller_event() {
     assert_eq!(next.relays_failed, 0);
     assert_eq!(large.len(), 1);
     assert_eq!(large[0].event.id, hex::encode(items[1].event_id));
-    assert!(returned_json_bytes(&large) > 128 * 1024);
+    assert!(returned_json_bytes(&large) > PASS_BYTE_BUDGET);
     assert!(returned_json_bytes(&large) <= 5 * 1024 * 1024);
     assert_eq!(left_counts.requests.load(Ordering::SeqCst), 0);
     assert_eq!(right_counts.requests.load(Ordering::SeqCst), 0);
@@ -591,7 +718,7 @@ async fn warm_large_event_waits_for_empty_next_pass_after_smaller_event() {
 #[tokio::test]
 async fn large_network_id_retries_after_a_smaller_cached_prefix() {
     let (left, right, sdk, route, left_counts, right_counts, items) =
-        cached_fixture(&[160 * 1024, 1024], &[0]).await;
+        cached_fixture(&[OVER_PASS_EVENT_BYTES, 1024], &[0]).await;
     assert_eq!(items[0].created_at, 1_700_001_001);
     let cursor = Cursor::default();
     let (first, small) = sdk
@@ -601,7 +728,7 @@ async fn large_network_id_retries_after_a_smaller_cached_prefix() {
     assert_eq!(first.relays_failed, 2);
     assert_eq!(small.len(), 1);
     assert_eq!(small[0].event.id, hex::encode(items[0].event_id));
-    assert!(returned_json_bytes(&small) < 128 * 1024);
+    assert!(returned_json_bytes(&small) < PASS_BYTE_BUDGET);
     let (next, large) = sdk
         .reconcile_subscription(route, &items[..1], 0, u64::MAX, &cursor)
         .await
@@ -609,7 +736,7 @@ async fn large_network_id_retries_after_a_smaller_cached_prefix() {
     assert_eq!(next.relays_failed, 0);
     assert_eq!(large.len(), 1);
     assert_eq!(large[0].event.id, hex::encode(items[1].event_id));
-    assert!(returned_json_bytes(&large) > 128 * 1024);
+    assert!(returned_json_bytes(&large) > PASS_BYTE_BUDGET);
     assert!(returned_json_bytes(&large) <= 5 * 1024 * 1024);
     assert!(left_counts.requests.load(Ordering::SeqCst) >= 2);
     assert!(right_counts.requests.load(Ordering::SeqCst) >= 2);
@@ -622,7 +749,8 @@ async fn large_network_id_retries_after_a_smaller_cached_prefix() {
 async fn unadmitted_small_network_id_does_not_hide_deferred_large_id() {
     // The fixed fixture key puts the small ID first. Keep the caller's durable
     // inventory empty on every pass: returning A is not admission of A.
-    let (left, right, sdk, route, _, _, items) = cached_fixture(&[160 * 1024, 1024], &[]).await;
+    let (left, right, sdk, route, _, _, items) =
+        cached_fixture(&[OVER_PASS_EVENT_BYTES, 1024], &[]).await;
     assert_eq!(items[0].created_at, 1_700_001_001);
     let cursor = Cursor::default();
     let (first_summary, first) = sdk
@@ -638,7 +766,7 @@ async fn unadmitted_small_network_id_does_not_hide_deferred_large_id() {
         .unwrap();
     assert_eq!(second.len(), 1, "the deferred ID must lead the next pass");
     assert_eq!(second[0].event.id, hex::encode(items[1].event_id));
-    assert!(returned_json_bytes(&second) > 128 * 1024);
+    assert!(returned_json_bytes(&second) > PASS_BYTE_BUDGET);
     assert_eq!(second_summary.relays_failed, 2, "A remains unadmitted");
     sdk.client().shutdown().await;
     left.shutdown();
@@ -687,7 +815,7 @@ async fn duplicate_route_endpoint_preserves_cached_prefix_and_unique_obligations
 #[tokio::test]
 async fn large_network_result_survives_one_withholding_endpoint() {
     let (left, right, sdk, route, left_counts, right_counts, items) =
-        cached_fixture(&[160 * 1024], &[]).await;
+        cached_fixture(&[OVER_PASS_EVENT_BYTES], &[]).await;
     right_counts.suppress_events.store(true, Ordering::SeqCst);
     let (summary, events) = sdk
         .reconcile_subscription(route, &[], 0, u64::MAX, &Cursor::default())
@@ -697,9 +825,9 @@ async fn large_network_result_survives_one_withholding_endpoint() {
     assert_eq!(summary.relays_failed, 1);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].event.id, hex::encode(items[0].event_id));
-    assert!(returned_json_bytes(&events) > 128 * 1024);
-    assert!(left_counts.sent_event_json.load(Ordering::SeqCst) > 128 * 1024);
-    assert!(right_counts.sent_event_json.load(Ordering::SeqCst) > 128 * 1024);
+    assert!(returned_json_bytes(&events) > PASS_BYTE_BUDGET);
+    assert!(left_counts.sent_event_json.load(Ordering::SeqCst) > PASS_BYTE_BUDGET);
+    assert!(right_counts.sent_event_json.load(Ordering::SeqCst) > PASS_BYTE_BUDGET);
     sdk.client().shutdown().await;
     left.shutdown();
     right.shutdown();
@@ -716,7 +844,7 @@ async fn mixed_cache_and_network_share_one_return_budget() {
         .unwrap();
     assert_eq!(summary.relays_failed, 2);
     assert_eq!(first.len(), 3);
-    assert!(returned_json_bytes(&first) <= 128 * 1024);
+    assert!(returned_json_bytes(&first) <= PASS_BYTE_BUDGET);
     assert!(
         first
             .iter()
@@ -755,7 +883,10 @@ async fn mixed_cache_and_network_share_one_return_budget() {
 async fn duplicated_endpoint_item_limit_keeps_partial_event_and_incomplete_summary() {
     let (left, right, sdk, route, left_counts, right_counts, event_id) =
         one_missing_event_fixture().await;
-    right_counts.extra_event_copies.store(20, Ordering::SeqCst);
+    // More copies than one pass's item budget.
+    right_counts
+        .extra_event_copies
+        .store(PASS_ITEM_BUDGET + 20, Ordering::SeqCst);
     let (summary, events) = sdk
         .reconcile_subscription(route, &[], 0, u64::MAX, &Cursor::default())
         .await
@@ -766,7 +897,7 @@ async fn duplicated_endpoint_item_limit_keeps_partial_event_and_incomplete_summa
     assert_eq!(events[0].event.id, event_id);
     assert!(left_counts.sent_event_json.load(Ordering::SeqCst) > 0);
     assert!(right_counts.sent_event_json.load(Ordering::SeqCst) > 0);
-    assert!(right_counts.sent_event_json.load(Ordering::SeqCst) < 16 * 1024);
+    assert!(right_counts.sent_event_json.load(Ordering::SeqCst) < (PASS_ITEM_BUDGET + 21) * 1024);
     sdk.client().shutdown().await;
     left.shutdown();
     right.shutdown();

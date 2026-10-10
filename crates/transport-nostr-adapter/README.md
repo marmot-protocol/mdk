@@ -111,9 +111,13 @@ active route's progress. State adds at most one 32-byte cursor to each existing 
 
 Pass budgets:
 
-- The NIP-77 remote-only selection holds at most 128 IDs from a 16,384-ID reconciliation set.
-- Each pass sends at most 16 request-local one-ID acquisitions within the two-second comparison deadline and the
-  aggregate 16-item / 128-KiB-serialized-event allowance.
+- The NIP-77 remote-only selection holds at most 512 IDs from a 16,384-ID reconciliation set.
+- Each pass sends at most 16 request-local exact-ID acquisitions within the two-second comparison deadline and the
+  aggregate 256-item / 1-MiB-serialized-event allowance. The first request names one ID; later ones name up to 64
+  consecutive IDs the same endpoints claimed, sized to the byte room left at the largest event the pass has seen,
+  because a relay streams every event a request names before the byte limit can stop it. Until an event has
+  returned, batches start at one ID and double. When a budget cuts a request short, its first unreturned ID leads
+  the next pass.
 - One event up to 5 MiB can occupy an otherwise empty pass, matching the pinned SDK's default normalized-message
   ceiling; larger events remain incomplete. Full-event SDK cache hits share this rule with fetched events.
 - The first exact-ID request may temporarily retain up to 5 MiB per endpoint before deduplication, and the SDK can
