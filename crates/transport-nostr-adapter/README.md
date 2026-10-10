@@ -149,19 +149,25 @@ past older messages still missing, which can then never be read (mdk#2086).
   the bracket. A probe counts as fitting only when every relay asked answered it: a relay that missed it may hold
   older history the others lack.
 - **Unfinished searches.** A pass whose search did not find such a window fetches nothing and the next pass resumes
-  its bracket, because fetching a window larger than a pass would return part of it in ID order. It fetches the
-  narrowest window anyway when the bracket can no longer shrink or the previous pass already waited, and falls back
-  to ID-order selection when no relay answers. At most one pass in a row returns nothing this way.
-- **Time prefix.** A window the byte budget or deadline cuts short returns only events no newer than any it left for
-  the next pass, found with one more probe round just before the returned events' timestamps; events sharing a second
-  with one left behind may still be returned. Events held back are fetched again. IDs it tried and may never get
-  (over the single-object ceiling, withheld by every claimant, or claimed only by a relay that did not answer) do not
-  hold delivery back. Ordered passes reserve part of the deadline for that probe round.
+  its bracket, because fetching a window larger than a pass would return part of it in ID order. It fetches anyway
+  when the bracket can no longer shrink or the previous pass already waited: the narrowest window a complete probe
+  measured, or else the whole gap, with delivery still held to a time prefix. It falls back to ID-order selection
+  only when no relay answers.
+- **Time prefix.** A window the byte budget or deadline cuts short returns only events older than every one it left
+  for the next pass, found with one more probe round up to the returned events' timestamps; timestamps are whole
+  seconds, so a second split by the budget is held together. When no probe gets a complete answer the boundary is
+  unknown and the pass holds everything. Events held back are fetched again. IDs it tried and may never get (over
+  the single-object ceiling, withheld by every claimant, or claimed only by a relay that did not answer) do not hold
+  delivery back. Ordered passes reserve part of the deadline for that probe round.
+- **Waiting is bounded.** Recovery parks a route after three quiet passes, so a route returns nothing on purpose for
+  at most two passes in a row; the next returns what it fetched even without a proven order. A relay that answers
+  the opening comparison but never the probes leaves no way to learn the order of what only it holds.
 - **Memory.** The client remembers, per route and in memory only, the last bound that fit, how far past it to look
   next, an unfinished bracket, and the route's average event size, so a backlog being worked through usually needs
   one round. It also sets aside IDs a pass returned that the account has not admitted since, and IDs every claimant
-  answered without: they yield to history not tried yet and are retried with leftover room. Once 1,024 IDs are set
-  aside the route uses ID-order selection, which cannot stall behind them. Losing this memory costs at most extra
+  answered without, or that can never fit the single-object ceiling: they yield to history not tried yet and are
+  retried with leftover room. A route keeps as many as one comparison can name; past 65,536 across routes the least
+  recently used route's memory is dropped, and it sets its IDs aside again. Losing this memory costs at most extra
   narrowing or a refetch.
 
 A window is fetched in the cursor's rotation, grouped by claiming relays so requests batch fully, and returned in time

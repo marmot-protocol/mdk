@@ -59,6 +59,9 @@ struct WireCounts {
     suppress_ids: Mutex<HashSet<String>>,
     /// Once set, NEG-OPEN frames after this many go unanswered.
     comparisons_answered: Mutex<Option<usize>>,
+    /// Once set, only NEG-OPEN frames whose filter ends at this `until` (a
+    /// pass's opening comparison) are answered; narrower probes are not.
+    answer_only_until: Mutex<Option<u64>>,
     extra_event_copies: AtomicUsize,
     /// Simulated round trip: each client frame reaches the relay this long
     /// after it was sent, in order, without delaying the frames behind it.
@@ -126,6 +129,14 @@ async fn counted_proxy(backend: String) -> (String, Arc<WireCounts>) {
                                     .is_some_and(|answered| seen >= answered)
                                 {
                                     continue;
+                                }
+                                if let Some(until) = *counts.answer_only_until.lock().unwrap() {
+                                    let frame_until = serde_json::from_str::<Vec<Value>>(text)
+                                        .ok()
+                                        .and_then(|frame| frame.get(2)?.get("until")?.as_u64());
+                                    if frame_until != Some(until) {
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -829,15 +840,15 @@ async fn older_history_that_appears_later_still_arrives_first() {
     older_relay.shutdown();
 }
 
-/// More old events the account never admits than a route keeps set aside
-/// cannot stall it: past that limit the route falls back to ID-order
-/// selection, which reaches the wanted history in turn.
+/// Hundreds of old events the account never admits do not turn ordering off:
+/// they are set aside, and a wanted gap larger than one pass behind them still
+/// arrives oldest first.
 #[tokio::test]
-async fn more_never_admitted_history_than_can_be_set_aside_still_lets_the_gap_arrive() {
+async fn never_admitted_history_ahead_of_a_large_gap_keeps_it_ordered() {
     let keys = Keys::generate();
     let database = relay_database();
     let junk = timed_events(&keys, 1_700_000_000, 1_100, "junk", &database).await;
-    let wanted = timed_events(&keys, 1_700_100_000, 50, "wanted", &database).await;
+    let wanted = timed_events(&keys, 1_700_100_000, 300, "wanted", &database).await;
     let relay = LocalRelay::new(RelayBuilder::default().database(database));
     relay.run().await.unwrap();
     let (url, _) = counted_proxy(relay.url().await.to_string()).await;
@@ -849,11 +860,8 @@ async fn more_never_admitted_history_than_can_be_set_aside_still_lets_the_gap_ar
         .map(|item| item.event_id)
         .collect::<HashSet<_>>();
     let mut admitted = Vec::new();
-    let mut pending = wanted
-        .iter()
-        .map(|item| item.event_id)
-        .collect::<HashSet<_>>();
-    for _ in 0..30 {
+    let mut pending = wanted.clone();
+    for pass in 1..=30 {
         if pending.is_empty() {
             break;
         }
@@ -861,17 +869,32 @@ async fn more_never_admitted_history_than_can_be_set_aside_still_lets_the_gap_ar
             .reconcile_subscription(route.clone(), &admitted, SINCE, UNTIL, &cursor)
             .await
             .unwrap();
-        for event in events {
-            let id: [u8; 32] = hex::decode(&event.event.id).unwrap().try_into().unwrap();
-            if !junk_ids.contains(&id) && pending.remove(&id) {
-                admitted.push(
-                    wanted
-                        .iter()
-                        .find(|item| item.event_id == id)
-                        .unwrap()
-                        .clone(),
-                );
+        let returned = events
+            .iter()
+            .map(|event| <[u8; 32]>::try_from(hex::decode(&event.event.id).unwrap()).unwrap())
+            .filter(|id| !junk_ids.contains(id))
+            .collect::<HashSet<_>>();
+        let newest_wanted = pending
+            .iter()
+            .filter(|item| returned.contains(&item.event_id))
+            .map(|item| item.created_at)
+            .max();
+        pending.retain(|item| {
+            if returned.contains(&item.event_id) {
+                admitted.push(item.clone());
+                false
+            } else {
+                true
             }
+        });
+        if let (Some(newest), Some(oldest_missing)) = (
+            newest_wanted,
+            pending.iter().map(|item| item.created_at).min(),
+        ) {
+            assert!(
+                newest < oldest_missing,
+                "pass {pass} returned wanted history newer than some still missing"
+            );
         }
     }
     assert!(
@@ -953,10 +976,11 @@ async fn a_gap_too_large_in_bytes_still_arrives_oldest_first() {
     relay.shutdown();
 }
 
-/// A relay that answers the opening comparison but not the window probes may
-/// hold older history the others lack. Its silence cannot make a window of
-/// the others' history look like the oldest one: that pass fetches nothing
-/// rather than newer history first, and the next still makes progress.
+/// A relay that answers each pass's opening comparison but not the probes may
+/// hold older history the others lack. Its silence cannot make the others'
+/// history look oldest: neither the pass that waits for the search nor the one
+/// after, which has no proven boundary, returns newer history first. Once the
+/// route has waited as long as recovery allows, it returns what it fetched.
 #[tokio::test]
 async fn a_relay_that_misses_the_probes_cannot_make_newer_history_look_oldest() {
     let keys = Keys::generate();
@@ -970,8 +994,7 @@ async fn a_relay_that_misses_the_probes_cannot_make_newer_history_look_oldest() 
     newer_relay.run().await.unwrap();
     let (older_url, older_counts) = counted_proxy(older_relay.url().await.to_string()).await;
     let (newer_url, _) = counted_proxy(newer_relay.url().await.to_string()).await;
-    // The opening comparison is answered; every probe after it is not.
-    *older_counts.comparisons_answered.lock().unwrap() = Some(1);
+    *older_counts.answer_only_until.lock().unwrap() = Some(UNTIL);
     let urls = vec![older_url, newer_url];
     let sdk = sdk_on(&urls).await;
     let route = subscription(&urls);
@@ -980,25 +1003,254 @@ async fn a_relay_that_misses_the_probes_cannot_make_newer_history_look_oldest() 
         .iter()
         .map(|item| hex::encode(item.event_id))
         .collect::<HashSet<_>>();
+    let wanted = older_gap
+        .iter()
+        .chain(&newer_gap)
+        .map(|item| item.event_id)
+        .collect::<HashSet<_>>();
+    let mut admitted = Vec::new();
+    for pass in 1..=2 {
+        let (_, events) = sdk
+            .reconcile_subscription(route.clone(), &admitted, SINCE, UNTIL, &cursor)
+            .await
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|event| !newer_ids.contains(&event.event.id)),
+            "pass {pass} returned newer history while older history went unseen"
+        );
+        for event in events {
+            let id: [u8; 32] = hex::decode(&event.event.id).unwrap().try_into().unwrap();
+            admitted.push(
+                older_gap
+                    .iter()
+                    .chain(&newer_gap)
+                    .find(|item| item.event_id == id)
+                    .unwrap()
+                    .clone(),
+            );
+        }
+    }
+    // The route keeps making progress afterwards.
+    for _ in 0..20 {
+        if admitted.len() == wanted.len() {
+            break;
+        }
+        let (_, events) = sdk
+            .reconcile_subscription(route.clone(), &admitted, SINCE, UNTIL, &cursor)
+            .await
+            .unwrap();
+        for event in events {
+            let id: [u8; 32] = hex::decode(&event.event.id).unwrap().try_into().unwrap();
+            if !admitted.iter().any(|item| item.event_id == id) {
+                admitted.push(
+                    older_gap
+                        .iter()
+                        .chain(&newer_gap)
+                        .find(|item| item.event_id == id)
+                        .unwrap()
+                        .clone(),
+                );
+            }
+        }
+    }
+    assert_eq!(
+        admitted.len(),
+        wanted.len(),
+        "every event eventually arrives"
+    );
+    sdk.client().shutdown().await;
+    older_relay.shutdown();
+    newer_relay.shutdown();
+}
+
+/// A pass the byte budget cuts short, whose delivery-boundary probes all go
+/// unanswered, has no proven time prefix: it holds what it fetched rather
+/// than return it in ID order.
+#[tokio::test]
+async fn an_unproven_delivery_boundary_holds_a_cut_short_pass() {
+    let keys = Keys::generate();
+    let database = relay_database();
+    let mut missing = Vec::new();
+    for index in 0..60u64 {
+        let event = EventBuilder::new(
+            Kind::MlsGroupMessage,
+            format!("large-{index}-{}", "x".repeat(50 * 1024)),
+        )
+        .tags([Tag::custom("h", [hex::encode(ROUTE)])])
+        .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(
+            1_700_100_000 + index,
+        ))
+        .finalize(&keys)
+        .unwrap();
+        database
+            .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+            .await
+            .unwrap();
+        missing.push(NostrReconciliationItem {
+            event_id: event.id.to_bytes(),
+            created_at: event.created_at.as_secs(),
+        });
+    }
+    let relay = LocalRelay::new(RelayBuilder::default().database(database));
+    relay.run().await.unwrap();
+    let (url, counts) = counted_proxy(relay.url().await.to_string()).await;
+    *counts.answer_only_until.lock().unwrap() = Some(UNTIL);
+    let sdk = sdk_on(std::slice::from_ref(&url)).await;
+    let route = subscription(&[url]);
+    let cursor = Cursor::default();
     let (_, first) = sdk
         .reconcile_subscription(route.clone(), &[], SINCE, UNTIL, &cursor)
         .await
         .unwrap();
-    assert!(
-        first
-            .iter()
-            .all(|event| !newer_ids.contains(&event.event.id)),
-        "newer history arrived while older history went unseen"
+    assert!(first.is_empty(), "no proven prefix, so nothing is returned");
+    let mut admitted = Vec::new();
+    for _ in 0..30 {
+        if admitted.len() == missing.len() {
+            break;
+        }
+        let (_, events) = sdk
+            .reconcile_subscription(route.clone(), &admitted, SINCE, UNTIL, &cursor)
+            .await
+            .unwrap();
+        for event in events {
+            let id: [u8; 32] = hex::decode(&event.event.id).unwrap().try_into().unwrap();
+            admitted.push(
+                missing
+                    .iter()
+                    .find(|item| item.event_id == id)
+                    .unwrap()
+                    .clone(),
+            );
+        }
+    }
+    assert_eq!(
+        admitted.len(),
+        missing.len(),
+        "the route still makes progress"
     );
-    let (_, second) = sdk
+    sdk.client().shutdown().await;
+    relay.shutdown();
+}
+
+/// Whole seconds are the finest order there is. When the byte budget returns
+/// only some of the events sharing a second, none of that second is returned
+/// until the rest of it is in hand.
+#[tokio::test]
+async fn a_second_the_budget_splits_is_held_together() {
+    let keys = Keys::generate();
+    let database = relay_database();
+    let mut items = Vec::new();
+    let mut save = async |content: String, created_at: u64| {
+        let event = EventBuilder::new(Kind::MlsGroupMessage, content)
+            .tags([Tag::custom("h", [hex::encode(ROUTE)])])
+            .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(created_at))
+            .finalize(&keys)
+            .unwrap();
+        database
+            .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+            .await
+            .unwrap();
+        items.push(NostrReconciliationItem {
+            event_id: event.id.to_bytes(),
+            created_at,
+        });
+    };
+    const SHARED: u64 = 1_700_100_100;
+    for index in 0..30 {
+        save(format!("shared-{index}-{}", "x".repeat(60 * 1024)), SHARED).await;
+    }
+    let relay = LocalRelay::new(RelayBuilder::default().database(database));
+    relay.run().await.unwrap();
+    let (url, _) = counted_proxy(relay.url().await.to_string()).await;
+    let sdk = sdk_on(std::slice::from_ref(&url)).await;
+    let route = subscription(&[url]);
+    let cursor = Cursor::default();
+    let (_, first) = sdk
         .reconcile_subscription(route, &[], SINCE, UNTIL, &cursor)
         .await
         .unwrap();
-    assert!(!second.is_empty(), "the next pass still makes progress");
-    assert!(older_gap.len() + newer_gap.len() > 0);
+    assert!(
+        first.is_empty(),
+        "{} events of a second the budget split were returned",
+        first.len()
+    );
+    assert_eq!(items.len(), 30);
     sdk.client().shutdown().await;
-    older_relay.shutdown();
-    newer_relay.shutdown();
+    relay.shutdown();
+}
+
+/// A cached event over the single-object ceiling can never be returned. Once a
+/// large event has shrunk the route's window to one ID, that cached event is
+/// the whole oldest window; it must be set aside, or every later pass would
+/// select it again and newer history would never arrive.
+#[tokio::test]
+async fn a_cached_event_over_the_ceiling_cannot_hold_a_narrow_window() {
+    const T: u64 = 1_700_100_000;
+    let mut specs = vec![(5 * 1024 * 1024 + 1024, T), (900 * 1024, T + 1)];
+    specs.extend((0..4).map(|index| (200 * 1024, T + 2 + index)));
+    // ID order: the cached over-ceiling event, then the large one, then the
+    // rest, so the first pass returns only the large event.
+    let events = events_with_id_order(&specs, |events| {
+        events[0].id < events[1].id && events[2..].iter().all(|later| events[1].id < later.id)
+    });
+    let relay_db = relay_database();
+    for event in &events {
+        relay_db
+            .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+            .await
+            .unwrap();
+    }
+    let sdk_db = Arc::new(SdkMemoryDatabase::unbounded());
+    nostr_sdk::prelude::NostrDatabase::save_event(sdk_db.as_ref(), &events[0])
+        .await
+        .unwrap();
+    let relay = LocalRelay::new(RelayBuilder::default().database(relay_db));
+    relay.run().await.unwrap();
+    let (url, _) = counted_proxy(relay.url().await.to_string()).await;
+    let sdk = NostrSdkRelayClient::new(Client::builder().database(sdk_db).build());
+    sdk.client().add_relay(url.as_str()).await.unwrap();
+    sdk.client().connect().await;
+    let route = subscription(&[url]);
+    let cursor = Cursor::default();
+    let wanted = events[1..]
+        .iter()
+        .map(|event| event.id.to_hex())
+        .collect::<HashSet<_>>();
+    let mut admitted = Vec::new();
+    let mut seen = HashSet::new();
+    let mut empty_in_a_row = 0;
+    for _ in 0..16 {
+        if seen.len() == wanted.len() {
+            break;
+        }
+        let (_, returned) = sdk
+            .reconcile_subscription(route.clone(), &admitted, SINCE, UNTIL, &cursor)
+            .await
+            .unwrap();
+        // Recovery parks a route after three quiet passes in a row.
+        empty_in_a_row = if returned.is_empty() {
+            empty_in_a_row + 1
+        } else {
+            0
+        };
+        assert!(empty_in_a_row < 3, "three passes in a row returned nothing");
+        for event in returned {
+            if wanted.contains(&event.event.id) && seen.insert(event.event.id.clone()) {
+                admitted.push(NostrReconciliationItem {
+                    event_id: hex::decode(&event.event.id).unwrap().try_into().unwrap(),
+                    created_at: event.event.created_at,
+                });
+            }
+        }
+    }
+    assert_eq!(
+        seen, wanted,
+        "newer history arrives past the unreturnable cached event"
+    );
+    sdk.client().shutdown().await;
+    relay.shutdown();
 }
 
 /// Old events the account never admits (malformed, or refused every time)

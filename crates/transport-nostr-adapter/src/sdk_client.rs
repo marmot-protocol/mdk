@@ -110,8 +110,17 @@ const SDK_RECONCILIATION_WINDOW_ROUNDS: usize = 6;
 const SDK_RECONCILIATION_WINDOW_PROBES: usize = 8;
 /// Routes whose advisory acquisition memory one client keeps.
 const SDK_RECONCILIATION_MEMORY_ROUTES: usize = 1024;
-/// IDs one route keeps set aside as fetched or withheld without admission.
-const SDK_RECONCILIATION_SET_ASIDE_IDS: usize = 2 * SDK_RECONCILIATION_REPLAY_BATCH;
+/// IDs one route keeps set aside as fetched, refused or withheld without
+/// admission: as many as one comparison can name, so the list never fills
+/// while those IDs are still missing.
+const SDK_RECONCILIATION_SET_ASIDE_IDS: usize = SDK_RECONCILIATION_SET_LIMIT;
+/// Set-aside IDs across all routes; past it the least recently used route's
+/// memory is dropped, and that route sets its IDs aside again.
+const SDK_RECONCILIATION_SET_ASIDE_TOTAL: usize = 65_536;
+/// Passes in a row an oldest-first route may return nothing on purpose, to
+/// wait for a search or a delivery boundary. Recovery parks a route after
+/// three quiet passes; the next pass returns what it fetched.
+const SDK_RECONCILIATION_HELD_PASSES: u8 = 2;
 
 /// Memory-only hints for fetching one group route's gap oldest-first. Losing
 /// them costs at most extra narrowing or one more fetch of an event the
@@ -130,15 +139,34 @@ struct AcquisitionRouteMemory {
     search_high: Option<u64>,
     /// Passes in a row whose search did not finish.
     unfinished_passes: u8,
+    /// Passes in a row that returned nothing.
+    empty_passes: u8,
+    /// When this route's memory was last used, for eviction.
+    last_used: u64,
     /// The average event size this route returned last, so a window fits the
     /// byte allowance as well as the item count.
     event_bytes: Option<usize>,
     /// IDs a pass fetched, or asked for and was answered without, that the
     /// account has not admitted since, in the order they were set aside. They
     /// yield to history not tried yet, so events that can never be admitted
-    /// cannot hold the oldest window. Once it is full the route uses ID-order
-    /// selection, which cannot stall behind them.
+    /// cannot hold the oldest window.
     set_aside: VecDeque<EventId>,
+}
+
+#[derive(Default)]
+struct AcquisitionMemory {
+    routes: HashMap<AcquisitionRouteKey, AcquisitionRouteMemory>,
+    tick: u64,
+}
+
+/// What a pass reads from its route's memory.
+#[derive(Default)]
+struct AcquisitionHints {
+    seed: Option<WindowSeed>,
+    event_bytes: Option<usize>,
+    unfinished_passes: u8,
+    empty_passes: u8,
+    set_aside: Vec<EventId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -156,11 +184,12 @@ enum WindowSearch {
         over_until: Option<u64>,
     },
     /// No such window in the rounds and time allowed. The window up to `low`
-    /// fits, the one up to `high` holds `over_ids`, more than a pass.
+    /// fits; the one up to `high` holds more than a pass, all of `over_ids`
+    /// when every relay asked answered that probe.
     Unfinished {
         low: u64,
         high: u64,
-        over_ids: HashSet<EventId>,
+        over_ids: Option<HashSet<EventId>>,
     },
 }
 
@@ -190,6 +219,26 @@ enum AcquisitionUpdate {
 }
 
 /// IDs one pass can fetch when events average `event_bytes`.
+/// The oldest timestamp among a pass's returned events.
+fn sdk_events_oldest(events: &[(RelayUrl, NostrTransportEvent)]) -> u64 {
+    events
+        .iter()
+        .map(|(_, event)| event.created_at)
+        .min()
+        .unwrap_or(u64::MAX)
+}
+
+/// Drop the least recently used route's memory.
+fn evict_least_recent(routes: &mut HashMap<AcquisitionRouteKey, AcquisitionRouteMemory>) {
+    if let Some(evicted) = routes
+        .iter()
+        .min_by_key(|(_, route)| route.last_used)
+        .map(|(key, _)| key.clone())
+    {
+        routes.remove(&evicted);
+    }
+}
+
 fn window_target(event_bytes: Option<usize>) -> usize {
     event_bytes.map_or(SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT, |bytes| {
         (SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT * 4 / 5 / bytes.max(1))
@@ -617,7 +666,7 @@ pub struct NostrSdkRelayClient {
     registration_log: Arc<Mutex<HashMap<MemberId, HashMap<RelayUrl, bool>>>>,
     /// Advisory per-route hints for oldest-first acquisition. A std lock,
     /// never held across an await.
-    acquisition_memory: Arc<StdMutex<HashMap<AcquisitionRouteKey, AcquisitionRouteMemory>>>,
+    acquisition_memory: Arc<StdMutex<AcquisitionMemory>>,
     /// Test-only: select every route in ID order, to exercise the cursor alone.
     #[cfg(test)]
     id_order_only: bool,
@@ -1245,10 +1294,19 @@ impl NostrSdkRelayClient {
             }),
             _ => None,
         };
-        let (window_seed, event_bytes, unfinished_passes, set_aside) = route_key
+        let AcquisitionHints {
+            seed: window_seed,
+            event_bytes,
+            unfinished_passes,
+            empty_passes,
+            set_aside,
+        } = route_key
             .as_ref()
             .map(|key| self.acquisition_memory_for(key, &remote))
             .unwrap_or_default();
+        // A pass may return nothing on purpose only while the route has not
+        // already done so for long; then it returns what it fetched.
+        let may_hold = empty_passes < SDK_RECONCILIATION_HELD_PASSES;
         let skip = set_aside.iter().copied().collect::<HashSet<_>>();
         let target = window_target(event_bytes);
         let answering = remote_by_endpoint.keys().cloned().collect::<Vec<_>>();
@@ -1256,9 +1314,6 @@ impl NostrSdkRelayClient {
         let mut skip_pass = false;
         // The fresh IDs this pass fetches oldest-first, when it does.
         let window: Option<HashSet<EventId>> = match &route_key {
-            // More IDs set aside than the route keeps out of the way: ID-order
-            // selection reaches every one of them in turn and cannot stall.
-            Some(_) if set_aside.len() >= SDK_RECONCILIATION_SET_ASIDE_IDS => None,
             // A gap within one pass by count is still one window: its bytes
             // may not fit, and then only a time prefix may be returned.
             Some(_) if remote.len() - remote.intersection(&skip).count() <= target => {
@@ -1305,14 +1360,22 @@ impl NostrSdkRelayClient {
                         high,
                         over_ids,
                     }) => {
-                        let fetch_anyway = high.saturating_sub(low) <= 1 || unfinished_passes >= 1;
+                        let fetch_anyway =
+                            high.saturating_sub(low) <= 1 || unfinished_passes >= 1 || !may_hold;
                         acquisition_update = AcquisitionUpdate::Unfinished {
                             low,
                             high,
                             skipped: !fetch_anyway,
                         };
                         skip_pass = !fetch_anyway;
-                        (fetch_anyway && !over_ids.is_empty()).then_some(over_ids)
+                        // Still an ordered pass: the narrowest window a
+                        // complete probe measured, or else the whole gap, with
+                        // its delivery held to a time prefix like any other.
+                        fetch_anyway.then(|| {
+                            over_ids
+                                .filter(|ids| !ids.is_empty())
+                                .unwrap_or_else(|| remote.difference(&skip).copied().collect())
+                        })
                     }
                 }
             }
@@ -1359,6 +1422,8 @@ impl NostrSdkRelayClient {
         // tried; anything else it tried and did not get, it may never get.
         let mut attempted = HashSet::new();
         let mut cut_short = HashSet::new();
+        // IDs whose events can never fit the single-object ceiling.
+        let mut over_ceiling = HashSet::new();
         let mut sdk_events = Vec::new();
         let mut spent_items = 0usize;
         let mut spent_bytes = 0usize;
@@ -1424,6 +1489,7 @@ impl NostrSdkRelayClient {
                         // past it so smaller missing IDs remain reachable;
                         // durable inventory still keeps it eligible on wrap.
                         attempted.insert(event_id);
+                        over_ceiling.insert(event_id);
                         progress.save_cursor(Some(event_id.to_bytes()))?;
                         continue;
                     }
@@ -1635,6 +1701,9 @@ impl NostrSdkRelayClient {
                 );
             }
             attempted.extend(batch.iter().copied());
+            if limited && single_object_request && !returned_ids.contains(&event_id.to_hex()) {
+                over_ceiling.insert(event_id);
+            }
             if limited && !single_object_request {
                 cut_short.extend(
                     batch
@@ -1698,9 +1767,8 @@ impl NostrSdkRelayClient {
                 })
                 .copied()
                 .collect::<HashSet<_>>();
-            if !left_behind.is_empty()
-                && !sdk_events.is_empty()
-                && let Some(boundary) = self
+            if !left_behind.is_empty() && !sdk_events.is_empty() {
+                let boundary = self
                     .delivery_boundary(
                         &plan.filter,
                         &answering,
@@ -1711,15 +1779,26 @@ impl NostrSdkRelayClient {
                         &left_behind,
                         deadline,
                     )
-                    .await
-            {
-                sdk_events.retain(|(_, event)| {
-                    let keep = event.created_at <= boundary;
-                    if !keep {
-                        returned_ids.remove(&event.id);
+                    .await;
+                // An unknown boundary is not permission: hold everything, as
+                // when nothing is safe, until the route has waited long enough
+                // that recovery would park it.
+                let keep_up_to = match boundary {
+                    Some(boundary) if may_hold || boundary >= sdk_events_oldest(&sdk_events) => {
+                        Some(boundary)
                     }
-                    keep
-                });
+                    Some(_) | None if may_hold => Some(0),
+                    _ => None,
+                };
+                if let Some(boundary) = keep_up_to {
+                    sdk_events.retain(|(_, event)| {
+                        let keep = event.created_at <= boundary;
+                        if !keep {
+                            returned_ids.remove(&event.id);
+                        }
+                        keep
+                    });
+                }
             }
         }
         // An ID an endpoint claimed but this pass did not return is still debt
@@ -1749,6 +1828,7 @@ impl NostrSdkRelayClient {
                 .iter()
                 .filter_map(|id| EventId::from_hex(id).ok())
                 .chain(withheld)
+                .chain(over_ceiling)
                 .collect::<Vec<_>>();
             // Step past this window by what reaches a pass at the density of
             // the events it returned, or else by the distance to the nearest
@@ -1769,7 +1849,13 @@ impl NostrSdkRelayClient {
                 },
                 other => other,
             };
-            self.remember_acquisition(key, update, fetched_event_bytes, tried);
+            self.remember_acquisition(
+                key,
+                update,
+                fetched_event_bytes,
+                !sdk_events.is_empty(),
+                tried,
+            );
         }
         // Negentropy reports a set. MLS input is sequential, so replay the
         // materialized difference in the same authored-time/id order used by
@@ -1806,32 +1892,36 @@ impl NostrSdkRelayClient {
     }
 
     /// Where the route's window search left off, its typical event size, the
-    /// passes in a row its search did not finish, and the IDs still in
-    /// `remote` that earlier passes set aside, pruning the ones since admitted.
+    /// passes in a row its search did not finish or it returned nothing, and
+    /// the IDs still in `remote` that earlier passes set aside, pruning the
+    /// ones since admitted.
     fn acquisition_memory_for(
         &self,
         key: &AcquisitionRouteKey,
         remote: &HashSet<EventId>,
-    ) -> (Option<WindowSeed>, Option<usize>, u8, Vec<EventId>) {
+    ) -> AcquisitionHints {
         let mut memory = self
             .acquisition_memory
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let Some(route) = memory.get_mut(key) else {
-            return (None, None, 0, Vec::new());
+        memory.tick += 1;
+        let tick = memory.tick;
+        let Some(route) = memory.routes.get_mut(key) else {
+            return AcquisitionHints::default();
         };
+        route.last_used = tick;
         route.set_aside.retain(|id| remote.contains(id));
-        let seed = route.window_until.map(|low| WindowSeed {
-            low,
-            step: route.window_step,
-            high: route.search_high,
-        });
-        (
-            seed,
-            route.event_bytes,
-            route.unfinished_passes,
-            route.set_aside.iter().copied().collect(),
-        )
+        AcquisitionHints {
+            seed: route.window_until.map(|low| WindowSeed {
+                low,
+                step: route.window_step,
+                high: route.search_high,
+            }),
+            event_bytes: route.event_bytes,
+            unfinished_passes: route.unfinished_passes,
+            empty_passes: route.empty_passes,
+            set_aside: route.set_aside.iter().copied().collect(),
+        }
     }
 
     fn remember_acquisition(
@@ -1839,19 +1929,22 @@ impl NostrSdkRelayClient {
         key: AcquisitionRouteKey,
         update: AcquisitionUpdate,
         event_bytes: Option<usize>,
+        returned_any: bool,
         tried: Vec<EventId>,
     ) {
         let mut memory = self
             .acquisition_memory
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if !memory.contains_key(&key)
-            && memory.len() >= SDK_RECONCILIATION_MEMORY_ROUTES
-            && let Some(evicted) = memory.keys().next().cloned()
+        memory.tick += 1;
+        let tick = memory.tick;
+        if !memory.routes.contains_key(&key)
+            && memory.routes.len() >= SDK_RECONCILIATION_MEMORY_ROUTES
         {
-            memory.remove(&evicted);
+            evict_least_recent(&mut memory.routes);
         }
-        let route = memory.entry(key).or_default();
+        let route = memory.routes.entry(key.clone()).or_default();
+        route.last_used = tick;
         match update {
             AcquisitionUpdate::Fits { until, step } => {
                 route.window_until = Some(until);
@@ -1870,11 +1963,14 @@ impl NostrSdkRelayClient {
             }
             AcquisitionUpdate::None => {}
         }
+        route.empty_passes = if returned_any {
+            0
+        } else {
+            route.empty_passes.saturating_add(1)
+        };
         if event_bytes.is_some() {
             route.event_bytes = event_bytes;
         }
-        // Once full, the route falls back to ID-order selection rather than
-        // forgetting IDs that would then hold the oldest window again.
         for id in tried {
             if route.set_aside.len() < SDK_RECONCILIATION_SET_ASIDE_IDS
                 && !route.set_aside.contains(&id)
@@ -1882,13 +1978,34 @@ impl NostrSdkRelayClient {
                 route.set_aside.push_back(id);
             }
         }
+        // Bound memory across routes by dropping whole routes, least recently
+        // used first; a dropped route sets its IDs aside again as it meets them.
+        while memory
+            .routes
+            .values()
+            .map(|route| route.set_aside.len())
+            .sum::<usize>()
+            > SDK_RECONCILIATION_SET_ASIDE_TOTAL
+            && memory.routes.len() > 1
+        {
+            let Some(evicted) = memory
+                .routes
+                .iter()
+                .filter(|(other, _)| **other != key)
+                .min_by_key(|(_, route)| route.last_used)
+                .map(|(other, _)| other.clone())
+            else {
+                break;
+            };
+            memory.routes.remove(&evicted);
+        }
     }
 
     /// The newest second a pass may return up to when `left_behind` IDs of
     /// its window were not fetched: the largest of the returned events'
-    /// timestamps with none of those IDs older than it. Events sharing that
-    /// second may be returned; finer order is not known. Returns `None` when
-    /// no probe gets a complete answer, and the pass returns what it fetched.
+    /// timestamps with none of those IDs at or before it, or one second
+    /// before the oldest returned event when there is none. Returns `None`
+    /// when no probe gets a complete answer and the boundary is unknown.
     #[allow(clippy::too_many_arguments)]
     async fn delivery_boundary(
         &self,
@@ -1912,10 +2029,12 @@ impl NostrSdkRelayClient {
         candidates.dedup();
         let answers = futures::future::join_all(candidates.iter().map(|at| async move {
             // Nothing in scope is older than the window's floor.
-            if *at <= since {
+            if *at < since {
                 return Some((HashSet::new(), true));
             }
-            self.window_remote_ids(filter, endpoints, items, options, (since, at - 1), deadline)
+            // Whole seconds: a left-behind event sharing a second with
+            // returned ones holds that second back too.
+            self.window_remote_ids(filter, endpoints, items, options, (since, *at), deadline)
                 .await
         }))
         .await;
@@ -1930,8 +2049,8 @@ impl NostrSdkRelayClient {
                 boundary = Some(at);
             }
         }
-        // Every complete probe saw something left behind older than the
-        // oldest returned event: return nothing this pass.
+        // Every complete probe saw something left behind at or before the
+        // oldest returned event: nothing is safe to return.
         answered.then(|| boundary.unwrap_or(oldest.saturating_sub(1)))
     }
 
@@ -1959,7 +2078,9 @@ impl NostrSdkRelayClient {
         // The largest probed bound whose window fits a pass, and the smallest
         // that does not. The whole comparison window is already known not to.
         let mut fits: Option<(u64, HashSet<EventId>)> = None;
-        let mut over: Option<(u64, HashSet<EventId>)> = None;
+        // The smallest bound found too large, its IDs, and whether every relay
+        // answered that probe.
+        let mut over: Option<(u64, HashSet<EventId>, bool)> = None;
         // A relay rejects events dated far in the future, so a probe past
         // shortly after now would only measure the whole remaining gap.
         let until = until.min(crate::unix_now_seconds().saturating_add(15 * 60));
@@ -1986,7 +2107,7 @@ impl NostrSdkRelayClient {
                 .map_or((search_low, 0), |(bound, ids)| (*bound, ids.len()));
             let high = over
                 .as_ref()
-                .map_or((search_high, gap), |(bound, ids)| (*bound, ids.len()));
+                .map_or((search_high, gap), |(bound, ids, _)| (*bound, ids.len()));
             let probes = window_probes(low, high, target, first_round_step.take());
             (search_low, search_high) = (low.0, high.0);
             if probes.is_empty() {
@@ -2009,8 +2130,8 @@ impl NostrSdkRelayClient {
                 // A partial answer can show a window is too large, never
                 // that it fits.
                 if ids.len() > target {
-                    if over.as_ref().is_none_or(|(bound, _)| probe < *bound) {
-                        over = Some((probe, ids));
+                    if over.as_ref().is_none_or(|(bound, _, _)| probe < *bound) {
+                        over = Some((probe, ids, complete));
                     }
                 } else if complete && fits.as_ref().is_none_or(|(bound, _)| probe > *bound) {
                     fits = Some((probe, ids));
@@ -2042,7 +2163,7 @@ impl NostrSdkRelayClient {
         if !ever_answered {
             return None;
         }
-        let over_until = over.as_ref().map(|(bound, _)| *bound);
+        let over_until = over.as_ref().map(|(bound, _, _)| *bound);
         Some(match fits {
             Some((until, ids)) if !ids.is_empty() => WindowSearch::Fits {
                 until,
@@ -2052,7 +2173,7 @@ impl NostrSdkRelayClient {
             fits => WindowSearch::Unfinished {
                 low: fits.map_or(search_low, |(bound, _)| bound),
                 high: over_until.unwrap_or(until),
-                over_ids: over.map(|(_, ids)| ids).unwrap_or_default(),
+                over_ids: over.and_then(|(_, ids, complete)| complete.then_some(ids)),
             },
         })
     }
