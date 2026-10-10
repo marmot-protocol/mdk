@@ -1306,9 +1306,13 @@ impl NostrSdkRelayClient {
         // The fresh IDs this pass fetches oldest-first, when it does.
         let window: Option<HashSet<EventId>> = match &route_key {
             // More never-admitted IDs than every relay's inventory could hold
-            // set aside: ID-order selection still reaches every one of them,
-            // where a window would keep finding the ones it could not record.
-            Some(_) if set_aside.len() >= set_aside_cap(answering.len()) => None,
+            // set aside: a window would keep finding the ones it could not
+            // record, and ID-order selection has no order to keep. The route
+            // stays quiet, and recovery parks it with its notice.
+            Some(_) if set_aside.len() >= set_aside_cap(answering.len()) => {
+                skip_pass = true;
+                None
+            }
             // A gap within one pass by count is still one window: its bytes
             // may not fit, and then only a time prefix may be returned.
             Some(_) if remote.len() - remote.intersection(&skip).count() <= target => {
@@ -1685,7 +1689,9 @@ impl NostrSdkRelayClient {
             if largest_event_bytes == 0 {
                 unsized_batch = (unsized_batch * 2).min(SDK_RECONCILIATION_MAX_IDS_PER_REQUEST);
             }
-            if every_claimant_satisfied {
+            // Withheld only when every relay answered without the ID and this
+            // pass's own allowance did not drop it from what a relay served.
+            if every_claimant_satisfied && !limited {
                 withheld.extend(
                     batch
                         .iter()

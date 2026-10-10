@@ -166,9 +166,10 @@ past older messages still missing, which can then never be read (mdk#2086).
 - **Memory.** The client remembers, per route and in memory only, the last bound that fit, how far past it to look
   next, an unfinished bracket, and the route's average event size, so a backlog being worked through usually needs
   one round. It also sets aside IDs a pass returned that the account has not admitted since, and IDs every claimant
-  answered without, or that can never fit the single-object ceiling: they yield to history not tried yet and are
-  retried with leftover room. A route keeps as many as its relays' comparisons can name together, up to 65,536,
-  and only beyond that falls back to ID-order selection; past 65,536 across routes the least recently used route's
+  answered without (not ones this pass's own allowance dropped), or that can never fit the single-object ceiling:
+  they yield to history not tried yet and are
+  retried with leftover room. A route keeps as many as its relays' comparisons can name together, up to 65,536;
+  beyond that it cannot keep an order and stays quiet. Past 65,536 across routes the least recently used route's
   memory is dropped, and it sets its IDs aside again. Losing this memory costs at most extra narrowing or a refetch.
 
 A window is fetched in the cursor's rotation, grouped by claiming relays so requests batch fully, and returned in time

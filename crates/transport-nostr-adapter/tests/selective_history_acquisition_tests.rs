@@ -1235,6 +1235,89 @@ async fn a_cached_event_over_the_ceiling_cannot_hold_a_narrow_window() {
     relay.shutdown();
 }
 
+/// An event the pass allowance dropped from what a relay served is still
+/// missing, not withheld: it is not set aside, and newer events wait for it.
+#[tokio::test]
+async fn an_event_the_shared_allowance_dropped_still_holds_newer_ones() {
+    // A small event first in ID order; then, in one batch, a 600-KiB event
+    // and an older 600-KiB event, each served by only one of two relays that
+    // both claim them. The union exceeds the pass allowance, and the older
+    // one is the one dropped.
+    let events = events_with_id_order(
+        &[
+            (1_024, 1_700_100_000),
+            (600 * 1024, 1_700_100_002),
+            (600 * 1024, 1_700_100_001),
+        ],
+        |events| events[0].id < events[1].id && events[0].id < events[2].id,
+    );
+    let database = relay_database();
+    for event in &events {
+        database
+            .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+            .await
+            .unwrap();
+    }
+    let left = LocalRelay::new(RelayBuilder::default().database(database.clone()));
+    let right = LocalRelay::new(RelayBuilder::default().database(database));
+    left.run().await.unwrap();
+    right.run().await.unwrap();
+    let (left_url, left_counts) = counted_proxy(left.url().await.to_string()).await;
+    let (right_url, right_counts) = counted_proxy(right.url().await.to_string()).await;
+    left_counts
+        .suppress_ids
+        .lock()
+        .unwrap()
+        .insert(events[2].id.to_hex());
+    right_counts
+        .suppress_ids
+        .lock()
+        .unwrap()
+        .insert(events[1].id.to_hex());
+    let urls = vec![left_url, right_url];
+    let sdk = sdk_on(&urls).await;
+    let route = subscription(&urls);
+    let cursor = Cursor::default();
+    let mut admitted = Vec::new();
+    for pass in 1..=6 {
+        if admitted.len() == events.len() {
+            break;
+        }
+        let (_, returned) = sdk
+            .reconcile_subscription(route.clone(), &admitted, SINCE, UNTIL, &cursor)
+            .await
+            .unwrap();
+        for event in &returned {
+            let id: [u8; 32] = hex::decode(&event.event.id).unwrap().try_into().unwrap();
+            admitted.push(NostrReconciliationItem {
+                event_id: id,
+                created_at: event.event.created_at,
+            });
+        }
+        if let (Some(newest), Some(oldest_missing)) = (
+            returned.iter().map(|event| event.event.created_at).max(),
+            events
+                .iter()
+                .filter(|event| {
+                    !admitted
+                        .iter()
+                        .any(|item| item.event_id == event.id.to_bytes())
+                })
+                .map(|event| event.created_at.as_secs())
+                .min(),
+        ) {
+            assert!(
+                newest < oldest_missing,
+                "pass {pass} returned an event newer than one the allowance dropped"
+            );
+        }
+    }
+    assert_eq!(admitted.len(), events.len(), "every event arrives");
+    sdk.client().shutdown().await;
+    left.shutdown();
+    right.shutdown();
+}
+
 /// When no relay answers a window probe, the gap's order is unknown: the pass
 /// fetches nothing rather than an ID-order slice of it.
 #[tokio::test]
