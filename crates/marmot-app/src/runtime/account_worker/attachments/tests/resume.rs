@@ -1689,7 +1689,7 @@ async fn attachment_resume_hash_miss_retries_from_zero_after_reopen() {
 
 #[tokio::test]
 async fn attachment_controls_interrupt_http_and_release_capacity_without_publishing() {
-    for disable in [false, true] {
+    for mode in 0..3 {
         let (listener, reference, cipher) =
             listener_fixture(&vec![42; 2 * ATTACHMENT_CHECKPOINT_BYTES]).await;
         let (sent, started) = oneshot::channel();
@@ -1711,6 +1711,8 @@ async fn attachment_controls_interrupt_http_and_release_capacity_without_publish
         let dir = tempfile::tempdir().unwrap();
         let (mut client, store) = client_at(dir.path(), &reference, true).await;
         let shared = RuntimeSharedServices::default();
+        let mut runtime = client.app.runtime();
+        runtime.shared = shared.clone();
         let (http, mut completions) = context();
         let mut admission = Admission::default();
         schedule(&client, &shared, &http, &mut admission).unwrap();
@@ -1735,17 +1737,30 @@ async fn attachment_controls_interrupt_http_and_release_capacity_without_publish
             .unwrap()
             .reference
             .unwrap();
-        if disable {
+        if mode == 1 {
             let mut policy =
                 super::super::super::super::attachment_controls::default_policy(&client.app.config);
             policy.automatic = false;
             store
                 .set_attachment_download_policy(&policy, crate::unix_now_seconds())
                 .unwrap();
+        } else if mode == 2 {
+            let cursor = runtime
+                .begin_attachment_cancellation("alice", Some(GROUP.into()), false)
+                .await
+                .unwrap();
+            let batch = runtime
+                .cancel_attachment_batch("alice", cursor)
+                .await
+                .unwrap();
+            assert_eq!(batch.requested, 1);
+            assert!(batch.next_cursor.is_none());
         } else {
             store.cancel_attachment_acquisition(&asset).unwrap();
         }
-        shared.attachment_cancellations.send_modify(|_| {});
+        if mode != 2 {
+            shared.attachment_cancellations.send_modify(|_| {});
+        }
         let done = tokio::time::timeout(Duration::from_secs(3), completions.recv())
             .await
             .unwrap()
@@ -1766,17 +1781,18 @@ async fn attachment_controls_interrupt_http_and_release_capacity_without_publish
                     &entry.source_message_id_hex,
                     0,
                     crate::unix_now_seconds(),
-                    !disable
+                    mode != 1
                 )
                 .unwrap()
                 .unwrap()
                 .state,
-            if disable {
+            if mode == 1 {
                 storage_sqlite::AttachmentTransferState::Paused
             } else {
                 storage_sqlite::AttachmentTransferState::Cancelled
             }
         );
+        runtime.shutdown_and_close().await.unwrap();
         server.abort();
         let _ = server.await;
     }

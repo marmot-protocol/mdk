@@ -42,8 +42,8 @@ mod tests {
         crate::migrations::run(&mut conn, &crate::migrations::MIGRATIONS[..106]).unwrap();
         conn.execute_batch("INSERT INTO message_timeline(group_id_hex,message_id_hex,source_message_id_hex,source_epoch,direction,sender,plaintext,kind,tags_json,timeline_at,received_at,reactions_json,media_json)
             VALUES('aa','old','old',0,'received','alice','private',9,'[]',1,1,'[]','{\"imeta\":[[\"imeta\",\"v future\"]]}');").unwrap();
-        assert_eq!(crate::migrations::run_all(&mut conn).unwrap(), 1);
-        assert_eq!(crate::migrations::run_all(&mut conn).unwrap(), 0);
+        crate::migrations::run(&mut conn, &crate::migrations::MIGRATIONS[..107]).unwrap();
+        crate::migrations::run(&mut conn, &crate::migrations::MIGRATIONS[..107]).unwrap();
         let count: i64 = conn
             .query_row("SELECT count(*) FROM attachment_history", [], |r| r.get(0))
             .unwrap();

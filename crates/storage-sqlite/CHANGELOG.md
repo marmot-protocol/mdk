@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Added
+
+- Migration 0108 advances account storage to schema 108 with monotonic intent sequencing and bounded management indexes. Readers supporting older schemas must refuse this database; retain the matching database and native library when restoring a cohort. Schema downgrade is unsupported.
+- Add bounded account/chat download management, old-intent cancellation and independently observed recovery health. Shared bindings require matching artifacts and C layouts require the generated matching header.
+
 ### Breaking changes
 
 - Migration 0102 advances account storage to schema 102 on first open and

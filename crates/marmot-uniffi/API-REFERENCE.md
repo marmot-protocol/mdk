@@ -4483,3 +4483,98 @@ Read the constant-work local account attachment change token, including after ex
 [Source](src/commands/account_attachment_history.rs#L26)
 
 </details>
+
+<details>
+<summary>Download management and chat health</summary>
+
+### `AttachmentManagementSubscription::cancel`
+
+```rust
+pub fn cancel(&self)
+```
+
+Close observation and wake a waiting receiver without cancelling network transfers, deleting ready bytes or accepting incomplete history. Returned snapshots remain independently managed objects. Use bounded native cancellation commands for an intentional transfer stop.
+
+[Source](src/commands/attachment_management.rs#L14)
+
+### `AttachmentManagementSubscription::next`
+
+```rust
+pub async fn next(&self) -> Result<Option<AttachmentManagementSnapshotFfi>, MarmotKitError>
+```
+
+Receive the revalidated initial head, then coalesced complete replacements. None means closed; an error terminates this observation. Reconstruct after account/runtime changes. Keep the returned counts' completeness flag and source-scoped action handles, and preserve explicit continuation behavior for older pages.
+
+[Source](src/commands/attachment_management.rs#L10)
+
+### `AttachmentManagementVersion::same_as`
+
+```rust
+pub fn same_as(&self, previous: Arc<AttachmentManagementVersion>) -> bool
+```
+
+Compare complete replacement generations within the same account and query scope. False requires replacing the displayed frame. The opaque comparison includes intent/progress, source/privacy/retention, permission and recovery evidence, rather than establishing a healthy state. Do not serialize the handle.
+
+[Source](src/conversions/attachment_management.rs#L90)
+
+### `Marmot::attachment_management_snapshot`
+
+```rust
+pub async fn attachment_management_snapshot( &self, account_ref: String, query: AttachmentJobQueryFfi, ) -> Result<AttachmentManagementSnapshotFfi, MarmotKitError>
+```
+
+Read a local management head and independently observed recovery health. At most50 details/notices are returned; counts explicitly indicate whether their1024-candidate bound produced only lower bounds. Unavailable evidence is not healthy, and a failed file is not a synchronization diagnosis. Account-wide and chat notices stay separate.
+
+[Source](src/commands/attachment_management.rs#L40)
+
+### `Marmot::begin_attachment_cancellation`
+
+```rust
+pub async fn begin_attachment_cancellation( &self, account_ref: String, group_id_hex: Option<String>, automatic_only: bool, ) -> Result<Arc<AttachmentCancellationCursor>, MarmotKitError>
+```
+
+Capture existing intent for one account or optional chat. This read-only operation changes no jobs; automatic_only excludes explicit intent. Keep the returned opaque account-bound cursor for bounded batch cancellation. New requests and later user intent remain outside its cutoff.
+
+[Source](src/commands/attachment_management.rs#L52)
+
+### `Marmot::cancel_attachment_batch`
+
+```rust
+pub async fn cancel_attachment_batch( &self, account_ref: String, cursor: Arc<AttachmentCancellationCursor>, ) -> Result<AttachmentCancellationBatchFfi, MarmotKitError>
+```
+
+Persist at most64 old-intent cancellation candidates, then wake the existing native worker cancellation path. Requested acknowledges durable intent, not a closed network connection. Preserve ready files, newer retries and newly inserted work; follow the returned continuation until absent. An old cursor cannot cancel a later intent.
+
+[Source](src/commands/attachment_management.rs#L66)
+
+### `Marmot::control_managed_attachment`
+
+```rust
+pub async fn control_managed_attachment( &self, account_ref: String, action: Arc<AttachmentJobActionToken>, retry: bool, ) -> Result<bool, MarmotKitError>
+```
+
+Cancel or explicitly retry only the observed source/intent generation. False means stale, unavailable or no permitted change: refresh first. Privacy, expiry and account scope are revalidated before effects; a later cancellation or retry invalidates old actions. Existing retry/admission behavior remains authoritative.
+
+[Source](src/commands/attachment_management.rs#L78)
+
+### `Marmot::managed_attachment_page`
+
+```rust
+pub async fn managed_attachment_page( &self, account_ref: String, query: AttachmentJobQueryFfi, limit: u32, cursor: Option<Arc<AttachmentJobCursor>>, ) -> Result<ManagedAttachmentPageFfi, MarmotKitError>
+```
+
+Read one account-wide or chat-scoped page of current native transfer candidates, with limit1..50. Continue through empty filtered pages when a cursor remains; discard the cursor on an error or source/privacy change. This local read starts no demand. Keep opaque handles with their originating account and query.
+
+[Source](src/commands/attachment_management.rs#L21)
+
+### `Marmot::subscribe_attachment_management`
+
+```rust
+pub async fn subscribe_attachment_management( &self, account_ref: String, query: AttachmentJobQueryFfi, ) -> Result<Arc<AttachmentManagementSubscription>, MarmotKitError>
+```
+
+Observe revalidated initial and coalesced replacement heads, at most4Hz. Existing native events and one-shot expiry invalidate the view without an idle polling loop. Continued pages remain explicit reads. Close observation when leaving/backgrounding the screen; closure does not cancel downloads or dismiss history notices.
+
+[Source](src/commands/attachment_management.rs#L90)
+
+</details>

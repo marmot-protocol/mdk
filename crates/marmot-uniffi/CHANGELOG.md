@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add bounded account/chat download management, old-intent cancellation and independently observed recovery health. Shared bindings require matching artifacts and C layouts require the generated matching header.
+
 ### Added
 
 - Account-wide attachment candidate pages, group/sender/date queries and opaque account/query-bound cursor/version handles. Filtered empty pages can continue; source changes require restart. Existing group history and acquisition primitives are unchanged.

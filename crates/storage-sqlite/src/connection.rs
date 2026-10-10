@@ -540,6 +540,16 @@ impl SharedConnection {
         Ok(value)
     }
 
+    /// Compose nested storage reads with deferred admission and one snapshot.
+    /// Unlike with_deferred_read, the callback may re-enter storage read APIs.
+    pub(crate) fn with_read_snapshot<T, E, F>(&self, f: F) -> Result<T, E>
+    where
+        E: From<StorageError>,
+        F: FnOnce() -> Result<T, E>,
+    {
+        self.with_transaction_mode(true, f)
+    }
+
     pub(crate) fn with_transaction<T, E, F>(&self, f: F) -> Result<T, E>
     where
         E: From<StorageError>,

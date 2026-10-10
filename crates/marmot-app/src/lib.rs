@@ -7743,3 +7743,11 @@ pub use runtime::{
     AccountAttachmentCursor, AccountAttachmentEntry, AccountAttachmentPage,
     AccountAttachmentPageRead, AccountAttachmentQuery, AccountAttachmentVersion,
 };
+
+pub use runtime::{
+    AttachmentCancellationBatch, AttachmentCancellationCursor, AttachmentFailureCategory,
+    AttachmentJobActionToken, AttachmentJobCounts, AttachmentJobCursor, AttachmentJobOrigin,
+    AttachmentJobQuery, AttachmentJobView, AttachmentManagementSnapshot,
+    AttachmentManagementVersion, ManagedAttachmentEntry, ManagedAttachmentPage,
+    RuntimeAttachmentManagementSubscription,
+};

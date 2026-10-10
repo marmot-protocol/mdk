@@ -9029,3 +9029,6 @@ pub use account_attachment_history::{
     AccountAttachmentCursor, AccountAttachmentEntry, AccountAttachmentPage,
     AccountAttachmentPageRead, AccountAttachmentQuery, AccountAttachmentVersion,
 };
+
+mod attachment_management;
+pub use attachment_management::*;

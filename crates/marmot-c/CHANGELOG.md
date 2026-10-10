@@ -7,6 +7,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- Add bounded account/chat download management, old-intent cancellation and independently observed recovery health. Shared bindings require matching artifacts and C layouts require the generated matching header.
+
 ### Added
 
 - Account attachment pages, bounded borrowed query inputs and opaque cursor/version handles with deep-free and version-clone functions. New records/symbols require matching headers and libraries; existing group history remains supported.

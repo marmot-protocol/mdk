@@ -164,3 +164,12 @@ pub use attachment_acquisition::{
     AttachmentDownloadPolicy, AttachmentTransferFrame, AttachmentTransferState,
     AttachmentTransferStatus,
 };
+
+pub use attachment_acquisition::{
+    AttachmentCancellationBatch, AttachmentCancellationCursor, AttachmentFailureCategory,
+    AttachmentJobActionToken, AttachmentJobCounts, AttachmentJobCursor, AttachmentJobEntry,
+    AttachmentJobOrigin, AttachmentJobPage, AttachmentJobQuery, AttachmentJobView,
+    AttachmentManagementFrame, AttachmentManagementVersion,
+};
+
+pub use attachment_acquisition::AttachmentManagementPermission;

@@ -17,7 +17,7 @@ per feature.
 - [Onboarding relay repair](#onboarding-relay-repair)
 - [NIP-46 accounts](#nip-46-accounts)
 - Feature notes: [runtime construction](#runtime-construction), [local sends](#local-sends),
-  [file-backed media upload](#file-backed-media-upload), [account attachment history](#account-attachment-history),
+  [file-backed media upload](#file-backed-media-upload), [account attachment history](#account-attachment-history), [download management and chat health](#download-management-and-chat-health),
   [public event verification](#public-event-verification), [host performance stages](#host-performance-stages),
   [Markdown rendering](#markdown-rendering), [identity references and pseudonyms](#identity-references-and-pseudonyms),
   [KeyPackage inventory](#keypackage-inventory), [selected chat-list presentation](#selected-chat-list-presentation),
@@ -461,6 +461,10 @@ just c-header
 The mirror surface is macro-generated, so header generation runs cbindgen
 with macro expansion (`RUSTC_BOOTSTRAP=1` on the stable toolchain). CI
 diff-gates the checked-in header.
+
+## Download management and chat health
+
+Use the [download management contract](../marmot-uniffi/ATTACHMENT-MANAGEMENT.md) for global/chat transfer visibility, explicit partial totals, intent-fenced cancellation and independently observed recovery health. Replacement feeds use existing native invalidations with no idle polling. Queries and embedded handles are borrowed; C results have deep-free roots and independently cloneable continuations/actions.
 
 ## Account attachment history
 
