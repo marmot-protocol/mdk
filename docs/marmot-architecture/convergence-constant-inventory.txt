@@ -49,6 +49,7 @@ A10|crates/marmot-app/src/client/epoch_stall.rs|EPOCH_STALL_CLOCK_SKEW_ALLOWANCE
 # A11 keeps only the process credit pool; #2068 deleted the bounded exact-ID path.
 A11|crates/marmot-app/src/runtime/account_worker/recovery_credits.rs|MAX_CONCURRENT_JOBS
 A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MAX_ID_REQUESTS
+A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MAX_IDS_PER_REQUEST
 A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT
 A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT
 A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES

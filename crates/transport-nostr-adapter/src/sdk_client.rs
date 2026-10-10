@@ -80,12 +80,16 @@ const SDK_RECONCILIATION_WAIT: Duration = Duration::from_secs(2);
 const SDK_RECONCILIATION_NEGOTIATION_WAIT: Duration = Duration::from_millis(500);
 /// Fetch a bounded rotating portion of the remote-only set. Durable admission
 /// removes accepted ids; rotation reaches dependencies beyond refused ids.
-const SDK_RECONCILIATION_REPLAY_BATCH: usize = 128;
+const SDK_RECONCILIATION_REPLAY_BATCH: usize = 512;
 /// An exact-ID request may return a large event or duplicate copies. Spend a
 /// finite aggregate budget across all request-local acquisitions in one pass.
 const SDK_RECONCILIATION_MAX_ID_REQUESTS: usize = 16;
-const SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT: usize = 16;
-const SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT: usize = 128 * 1024;
+/// IDs one exact-ID request names after a pass's first request. Each request
+/// is a round trip inside the route deadline, so batching is what lets a pass
+/// carry more than a handful of ordinary events (mdk#2086).
+const SDK_RECONCILIATION_MAX_IDS_PER_REQUEST: usize = 64;
+const SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT: usize = 256;
+const SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT: usize = 1024 * 1024;
 // A single supported event can exceed the ordinary pass allowance. The pinned
 // SDK's default normalized-message ceiling is 5 MiB; one otherwise-empty pass
 // may return one such object, then stops. This is an MDK acquisition ceiling,
@@ -104,6 +108,11 @@ const SDK_RECONCILIATION_SET_LIMIT: usize = 16_384 + 1;
 pub trait NostrReconciliationProgress: Send + Sync {
     fn load_cursor(&self) -> Result<Option<[u8; 32]>, TransportAdapterError>;
     fn save_cursor(&self, cursor: Option<[u8; 32]>) -> Result<(), TransportAdapterError>;
+}
+
+/// Serialized JSON length of a returned event, as the SDK budgets count it.
+fn event_json_bytes(event: &NostrTransportEvent) -> usize {
+    serde_json::to_string(event).map_or(0, |json| json.len())
 }
 
 fn select_reconciliation_remote_ids(
@@ -1033,22 +1042,51 @@ impl NostrSdkRelayClient {
         }
         // Compare without SDK-managed downloads. An exact-ID acquisition owns
         // each partial result and has finite per-endpoint item/byte budgets.
-        // One ID per REQ prevents a relay's fixed response order from repeating
-        // the same affordable prefix when a later event exceeds the budget.
-        // The durable cursor rotates refused and oversized IDs on later passes.
+        // A pass's first request names one ID, so a lone event up to the
+        // single-object ceiling stays reachable. Later requests batch
+        // consecutive IDs the same endpoints claimed. When a budget cuts a
+        // batch short, the first ID it left unreturned leads the next pass, so
+        // a relay's fixed response order cannot keep returning the same
+        // affordable prefix. The durable cursor rotates refused and oversized
+        // IDs on later passes.
         let remote_item_count = remote.len();
         let remote_ids = select_reconciliation_remote_ids(&remote, progress)?;
         drop(remote);
         let mut sdk_events = Vec::new();
         let mut spent_items = 0usize;
         let mut spent_bytes = 0usize;
+        // The distinct events this pass returns. With several IDs per request,
+        // different relays can each return a different event within their own
+        // limits, so the union is bounded by the same pass allowance.
+        let mut returned_items = 0usize;
+        let mut returned_bytes = 0usize;
         let mut returned_ids = HashSet::new();
         let mut requests = 0usize;
+        // The largest event JSON this pass has returned. A relay streams every
+        // event a request names before our byte limit can stop it, so batches
+        // are sized to the room left at this size.
+        let mut largest_event_bytes = 0usize;
+        // Until the pass has seen an event, batches start at one ID and double
+        // after each request that returned none, so IDs relays never serve
+        // cannot spend every request one at a time.
+        let mut unsized_batch = 1usize;
         // A pass that stops early leaves the unreturned IDs' claimants
         // incomplete, or failed when it ran out of time; an endpoint that
         // claimed nothing left behind still succeeds.
         let mut out_of_time = false;
-        for event_id in remote_ids {
+        let claimants_of = |event_id: &EventId| {
+            endpoints
+                .iter()
+                .filter(|endpoint| {
+                    remote_by_endpoint
+                        .get(*endpoint)
+                        .is_some_and(|ids: &HashSet<EventId>| ids.contains(event_id))
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let mut remote_ids = remote_ids.into_iter().peekable();
+        while let Some(event_id) = remote_ids.next() {
             if tokio::time::Instant::now() >= deadline {
                 out_of_time = true;
                 break;
@@ -1088,6 +1126,9 @@ impl NostrSdkRelayClient {
                 progress.save_cursor(Some(event_id.to_bytes()))?;
                 spent_items += 1;
                 spent_bytes += event_bytes;
+                returned_items += 1;
+                returned_bytes += event_bytes;
+                largest_event_bytes = largest_event_bytes.max(event_bytes);
                 returned_ids.insert(event_id.to_hex());
                 sdk_events.push((
                     replay_endpoint.clone(),
@@ -1110,8 +1151,10 @@ impl NostrSdkRelayClient {
                 SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT.saturating_sub(spent_items);
             // The first request must offer enough room to discover the size of
             // a single event before the SDK can accept or reject it. All later
-            // requests share the ordinary aggregate allowance.
-            let byte_allowance = if sdk_events.is_empty() && spent_bytes == 0 {
+            // requests share the ordinary aggregate allowance, even when the
+            // first returned nothing: a lone large event they cut short leads
+            // the next pass, as its first request.
+            let byte_allowance = if requests == 0 && sdk_events.is_empty() && spent_bytes == 0 {
                 SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES
             } else {
                 SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT
@@ -1130,32 +1173,61 @@ impl NostrSdkRelayClient {
             // Ask only the endpoints that claimed this ID. An endpoint that
             // lacks it has nothing to return, and a silent one must not spend
             // the budget of IDs it never claimed.
-            let claimants = endpoints
-                .iter()
-                .filter(|endpoint| {
-                    remote_by_endpoint
-                        .get(*endpoint)
-                        .is_some_and(|ids: &HashSet<EventId>| ids.contains(&event_id))
-                })
-                .cloned()
-                .collect::<Vec<_>>();
+            let claimants = claimants_of(&event_id);
             if claimants.is_empty() {
                 continue;
             }
+            let mut batch = vec![event_id];
+            if !single_object_request {
+                let sized = match largest_event_bytes {
+                    0 => unsized_batch,
+                    largest => (remaining_bytes / largest).max(1),
+                };
+                let room = SDK_RECONCILIATION_MAX_IDS_PER_REQUEST
+                    .min(remaining_items)
+                    .min(sized);
+                while batch.len() < room {
+                    let Some(next) = remote_ids.peek().copied() else {
+                        break;
+                    };
+                    // A cached event is returned from the SDK database on its
+                    // own turn, not requested again.
+                    let cached = self
+                        .client
+                        .database()
+                        .event_by_id(&next)
+                        .await
+                        .map_err(|_| {
+                            TransportAdapterError::Subscription(
+                                "read reconciled event from SDK database failed".to_owned(),
+                            )
+                        })?
+                        .is_some();
+                    if cached || claimants_of(&next) != claimants {
+                        break;
+                    }
+                    batch.push(next);
+                    remote_ids.next();
+                }
+            }
+            // Save only the first ID before I/O, as a one-ID request did; the
+            // response decides how far past it the cursor moves.
             progress.save_cursor(Some(event_id.to_bytes()))?;
             requests += 1;
             let result = self
                 .acquire_history(
                     NostrAcquisitionRequest {
                         account_id: subscription.account_id().clone(),
-                        scope: NostrAcquisitionScope::KnownEventIds(vec![event_id.to_bytes()]),
+                        scope: NostrAcquisitionScope::KnownEventIds(
+                            batch.iter().map(|id| id.to_bytes()).collect(),
+                        ),
                         endpoints: claimants
                             .iter()
                             .map(|endpoint| TransportEndpoint(endpoint.to_string()))
                             .collect(),
                         limits: NostrAcquisitionLimits {
                             max_endpoints: claimants.len(),
-                            max_requested_event_ids: 1,
+                            max_requested_event_ids: batch.len(),
                             max_received_items_per_endpoint: remaining_items,
                             max_serialized_event_bytes_per_endpoint: remaining_bytes,
                             max_duration: remaining_time,
@@ -1175,16 +1247,22 @@ impl NostrSdkRelayClient {
             // except for the one event observed at the rejection boundary.
             let mut request_items = 0usize;
             let mut request_bytes = 0usize;
-            let mut byte_limited = false;
-            let wanted_id = event_id.to_hex();
+            let mut limited = false;
+            let mut answered_by_any = false;
+            let wanted_ids = batch.iter().map(|id| id.to_hex()).collect::<HashSet<_>>();
             for (endpoint, outcome) in claimants.iter().zip(result.endpoints) {
                 request_items = request_items.max(outcome.stats.received_items);
                 request_bytes = request_bytes.max(outcome.stats.serialized_event_bytes);
-                byte_limited |= outcome.end == NostrAcquisitionEnd::ByteLimitReached;
-                let claimed_id_missing = !outcome.events.iter().any(|event| event.id == wanted_id);
+                limited |= matches!(
+                    outcome.end,
+                    NostrAcquisitionEnd::ByteLimitReached | NostrAcquisitionEnd::ItemLimitReached
+                );
+                let claimed_id_missing = wanted_ids
+                    .iter()
+                    .any(|wanted| !outcome.events.iter().any(|event| &event.id == wanted));
                 // A relay that served the request to EOSE or to our limits
                 // answered. It stays incomplete unless it reached EOSE with
-                // the ID it claimed: a request our limits cut short proves
+                // every ID it claimed: a request our limits cut short proves
                 // nothing about what that relay still had to send.
                 let answered = matches!(
                     outcome.end,
@@ -1192,6 +1270,7 @@ impl NostrSdkRelayClient {
                         | NostrAcquisitionEnd::ItemLimitReached
                         | NostrAcquisitionEnd::ByteLimitReached
                 );
+                answered_by_any |= answered;
                 if !answered {
                     failed_endpoints.insert(endpoint.clone());
                 } else if claimed_id_missing
@@ -1200,34 +1279,69 @@ impl NostrSdkRelayClient {
                     incomplete_endpoints.insert(endpoint.clone());
                 }
                 for event in outcome.events {
-                    if event.id != wanted_id {
+                    if !wanted_ids.contains(&event.id) {
                         failed_endpoints.insert(endpoint.clone());
                         continue;
                     }
                     if returned_ids.contains(&event.id) {
                         continue;
                     }
-                    // SDK stats charge every received EVENT before accepting
-                    // it, using the same event JSON length. The maximum
-                    // endpoint cost therefore dominates this deduped batch.
+                    // Each endpoint stayed within its own limits, but relays
+                    // can return different events; the union must fit the
+                    // pass allowance too. An event it cannot fit stays
+                    // unreturned and leads the next pass.
+                    let event_bytes = event_json_bytes(&event);
+                    if returned_items >= SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT
+                        || returned_bytes.saturating_add(event_bytes) > byte_allowance
+                    {
+                        limited = true;
+                        continue;
+                    }
+                    returned_items += 1;
+                    returned_bytes += event_bytes;
+                    largest_event_bytes = largest_event_bytes.max(event_bytes);
                     returned_ids.insert(event.id.clone());
                     sdk_events.push((endpoint.clone(), event));
                 }
             }
-            spent_items = spent_items.saturating_add(request_items);
-            spent_bytes = spent_bytes.saturating_add(request_bytes);
-            if !single_object_request
-                && byte_limited
-                && !returned_ids.contains(&wanted_id)
-                && request_bytes <= SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES
-            {
-                // This ID was dispatched with only the bytes left after an
-                // earlier result. Keep the pre-I/O save for cancellation, but
-                // after a completed bounded rejection let this ID lead the
-                // next pass, even if that earlier result stays unadmitted.
-                // An object beyond the single-event ceiling still rotates.
-                progress.save_cursor(prior_cursor)?;
-                break;
+            spent_items = spent_items
+                .saturating_add(request_items)
+                .max(returned_items);
+            spent_bytes = spent_bytes
+                .saturating_add(request_bytes)
+                .max(returned_bytes);
+            if largest_event_bytes == 0 {
+                unsized_batch = (unsized_batch * 2).min(SDK_RECONCILIATION_MAX_IDS_PER_REQUEST);
+            }
+            let first_unreturned = batch
+                .iter()
+                .position(|id| !returned_ids.contains(&id.to_hex()));
+            match first_unreturned {
+                None => progress.save_cursor(batch.last().map(|id| id.to_bytes()))?,
+                // A budget cut this request short: the first ID it left
+                // unreturned leads the next pass, where it is the one-ID first
+                // request with the single-object allowance, even if an earlier
+                // result stays unadmitted. A one-ID first request that is cut
+                // short is over that ceiling and rotates.
+                Some(position) if limited && !single_object_request => {
+                    progress.save_cursor(match position {
+                        0 => prior_cursor,
+                        _ => Some(batch[position - 1].to_bytes()),
+                    })?;
+                    break;
+                }
+                // No relay answered: advance through what returned, at least
+                // the first ID, and leave the rest of the batch to the next
+                // pass, as one-ID requests did after a timeout.
+                Some(position) if !answered_by_any => {
+                    if position > 0 {
+                        progress.save_cursor(Some(batch[position - 1].to_bytes()))?;
+                    }
+                    break;
+                }
+                // Relays answered without some IDs: those rotate, as a withheld
+                // one-ID request did.
+                Some(_) => progress.save_cursor(batch.last().map(|id| id.to_bytes()))?,
             }
             if spent_bytes > SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT {
                 // A first oversized result, or expensive duplicate/boundary
@@ -5130,7 +5244,7 @@ mod tests {
         let expected_next = expected_next
             .into_iter()
             .filter(|id| id.to_bytes() > after_cancel)
-            .take(SDK_RECONCILIATION_MAX_ID_REQUESTS)
+            .take(SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT)
             .collect::<HashSet<_>>();
         assert_eq!(resumed_ids, expected_next);
         progress.save_cursor(None).unwrap();
@@ -5139,7 +5253,7 @@ mod tests {
             .reconcile_subscription(subscription.clone(), &[], 0, u64::MAX, &progress)
             .await
             .unwrap();
-        assert_eq!(first.len(), SDK_RECONCILIATION_MAX_ID_REQUESTS);
+        assert_eq!(first.len(), SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT);
         while let Some(notification) =
             tokio::time::timeout(Duration::from_millis(10), notifications.next())
                 .await
