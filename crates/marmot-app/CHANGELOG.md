@@ -53,8 +53,8 @@
 ### Fixed
 
 - Catch-up downloads missed group history in far fewer round trips. Each
-  comparison pass now fetches up to 256 events (1 MiB) per relay in batched
-  requests instead of 16 one-at-a-time requests, so a backlog of a few hundred
+  comparison pass now fetches up to 256 events (1 MiB), across all relays, in
+  batched requests instead of 16 one-at-a-time requests, so a backlog of a few hundred
   messages arrives in a couple of passes instead of dozens. A long drip gave
   commits time to move a member's epoch past older messages it had not
   downloaded yet (#2086).
