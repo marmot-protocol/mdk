@@ -169,6 +169,11 @@ cargo test -p <crate>        # targeted tests for the crate you changed
 just ci                      # full local parity with GitHub CI (slow)
 ```
 
+CI builds the workspace test archive, runs its five shards, and checks doctests and diagnostic exporters on runners
+labelled `self-hosted`, `linux`, and `x64`. The jobs install `build-essential`, `pkg-config`, and Perl, bootstrap Rustup
+when absent, and install the pinned toolchain. Runners need `apt-get` and either root access or passwordless `sudo`.
+Archive builders and test shards need compatible system libraries. Other CI jobs use GitHub-hosted runners.
+
 Common targeted runs:
 
 ```sh
