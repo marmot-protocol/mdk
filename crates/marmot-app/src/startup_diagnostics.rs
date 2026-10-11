@@ -136,6 +136,7 @@ impl NativeStartupDiagnostics {
     }
 }
 impl State {
+    /// Evict the oldest historical observation and count omissions at the fixed history limit.
     fn event(&mut self, observation: NativeStartupObservation) {
         if self.events.len() == MAX_EVENTS {
             self.events.pop_front();
@@ -145,6 +146,7 @@ impl State {
     }
 }
 impl Active {
+    /// Refresh monotonic durations without changing the stored phase or operation identity.
     fn snapshot(&self) -> NativeStartupObservation {
         let mut value = self.observation.clone();
         value.elapsed_ms = self
@@ -170,9 +172,12 @@ pub(crate) struct NativeStartupProbe {
     generation: u64,
 }
 impl NativeStartupProbe {
+    /// Move to a non-migration phase, clearing the previous migration number and restarting its timer.
     pub(crate) fn phase(&self, stage: NativeStartupStage) {
         self.progress(stage, None, false);
     }
+    /// Publish fixed progress only while this scope belongs to the enabled capture generation.
+    /// `completed` counts a successful migration; failed migrations retain their version at retirement.
     pub(crate) fn progress(
         &self,
         stage: NativeStartupStage,
@@ -203,6 +208,7 @@ impl NativeStartupProbe {
         let observation = active.snapshot();
         state.event(observation);
     }
+    /// Consume the probe with an explicit result so its later drop cannot report abandonment.
     pub(crate) fn finish(mut self, success: bool) {
         self.retire(if success {
             NativeStartupOutcome::Success
@@ -210,6 +216,7 @@ impl NativeStartupProbe {
             NativeStartupOutcome::Failure
         });
     }
+    /// Remove the active scope once; a revoked generation can never append to a newer capture.
     fn retire(&mut self, outcome: NativeStartupOutcome) {
         let Some(owner) = self.owner.take() else {
             return;
@@ -230,6 +237,7 @@ impl NativeStartupProbe {
     }
 }
 impl Drop for NativeStartupProbe {
+    /// Retire cancellation or unwinding as abandoned without retaining the underlying error.
     fn drop(&mut self) {
         self.retire(NativeStartupOutcome::Abandoned);
     }

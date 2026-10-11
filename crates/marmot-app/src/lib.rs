@@ -6342,6 +6342,7 @@ impl MarmotApp {
         self.audit_export_lifecycle.admit(attempt, work).transpose()
     }
 
+    /// Observe account-open admission before analytics or cache locks; preserve the original storage result.
     fn account_storage(&self, label: &str) -> Result<SqliteAccountStorage, AppError> {
         let probe = self
             .startup_diagnostics
@@ -6357,6 +6358,7 @@ impl MarmotApp {
         result
     }
 
+    /// Reuse a cached store or perform the guarded key/open path, reporting only fixed phases to the probe.
     fn account_storage_unobserved(
         &self,
         label: &str,

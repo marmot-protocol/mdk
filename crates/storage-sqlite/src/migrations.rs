@@ -781,6 +781,7 @@ const MIGRATIONS: &[Migration] = &[
     },
 ];
 
+/// Apply pending account migrations and return only the count newly committed by this open.
 pub(crate) fn run_all(connection: &mut Connection) -> StorageResult<usize> {
     run_with_summary(connection, MIGRATIONS)
 }
@@ -790,16 +791,20 @@ pub(crate) fn run(connection: &mut Connection, migrations: &[Migration]) -> Stor
     run_with_summary(connection, migrations).map(|_| ())
 }
 
+/// Run a registry with the same validation and transaction rules but no progress callback.
 fn run_with_summary(connection: &mut Connection, migrations: &[Migration]) -> StorageResult<usize> {
     run_with_summary_observed(connection, migrations, None)
 }
 
+/// Observe inspection and pending migration boundaries; already-recorded versions emit no apply events.
 pub(crate) fn run_all_observed(
     connection: &mut Connection,
     observer: Option<&dyn Fn(crate::StorageOpenProgress)>,
 ) -> StorageResult<usize> {
     run_with_summary_observed(connection, MIGRATIONS, observer)
 }
+/// Validate ledger history before any body runs, then report each migration's returned outcome.
+/// Observation faults cannot replace a storage error or allow a failed ledger entry to commit.
 fn run_with_summary_observed(
     connection: &mut Connection,
     migrations: &[Migration],
@@ -1022,6 +1027,7 @@ struct MigrationForeignKeys<'a> {
     restore_enabled: bool,
 }
 impl<'a> MigrationForeignKeys<'a> {
+    /// Suspend enabled FK enforcement only for the metadata rebuild, before starting its transaction.
     fn new(connection: &'a mut Connection, rebuild: bool) -> StorageResult<Self> {
         let enabled = rebuild
             && connection
@@ -1037,6 +1043,7 @@ impl<'a> MigrationForeignKeys<'a> {
             restore_enabled: enabled,
         })
     }
+    /// Restore and verify the original enabled setting after the transaction has committed or rolled back.
     fn restore(&mut self) -> StorageResult<()> {
         if self.restore_enabled {
             self.connection
@@ -1057,6 +1064,7 @@ impl<'a> MigrationForeignKeys<'a> {
     }
 }
 impl Drop for MigrationForeignKeys<'_> {
+    /// Make a best-effort restoration during unwinding; the transaction is dropped before this guard.
     fn drop(&mut self) {
         let _ = self.restore();
     }

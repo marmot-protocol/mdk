@@ -2,6 +2,7 @@
 use super::*;
 use crate::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
 
+/// Create an owner-only encrypted fixture with a valid job parent and production cipher hardening.
 fn encrypted_fixture() -> (tempfile::TempDir, Connection) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("fixture.sqlite");
@@ -16,6 +17,7 @@ fn encrypted_fixture() -> (tempfile::TempDir, Connection) {
     (directory, connection)
 }
 
+/// Detect persistent payload duplication, including freed pages that a table replacement leaves behind.
 fn pages(connection: &Connection) -> i64 {
     connection
         .pragma_query_value(None, "page_count", |row| row.get(0))

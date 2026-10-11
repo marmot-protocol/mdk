@@ -24,6 +24,7 @@ pub enum NativeStartupStageFfi {
     ProductAnalyticsAdmission,
 }
 impl From<marmot_app::NativeStartupStage> for NativeStartupStageFfi {
+    /// Map the closed native stage set exhaustively, without deriving labels from operation inputs.
     fn from(value: marmot_app::NativeStartupStage) -> Self {
         match value {
             marmot_app::NativeStartupStage::AttachmentTaskQueued => Self::AttachmentTaskQueued,
@@ -60,6 +61,7 @@ pub enum NativeStartupOutcomeFfi {
     Abandoned,
 }
 impl From<marmot_app::NativeStartupOutcome> for NativeStartupOutcomeFfi {
+    /// Preserve cancellation versus explicit success/failure across the binding boundary.
     fn from(value: marmot_app::NativeStartupOutcome) -> Self {
         match value {
             marmot_app::NativeStartupOutcome::Active => Self::Active,
@@ -81,6 +83,7 @@ pub struct NativeStartupObservationFfi {
     pub outcome: NativeStartupOutcomeFfi,
 }
 impl From<marmot_app::NativeStartupObservation> for NativeStartupObservationFfi {
+    /// Transfer anonymous timings and numeric schema progress without consulting an account store.
     fn from(v: marmot_app::NativeStartupObservation) -> Self {
         Self {
             token: v.token,
@@ -103,6 +106,7 @@ pub struct NativeStartupSnapshotFfi {
     pub dropped_scopes: u64,
 }
 impl From<marmot_app::NativeStartupSnapshot> for NativeStartupSnapshotFfi {
+    /// Move the already-bounded arrays and omission counters into an owned host snapshot.
     fn from(v: marmot_app::NativeStartupSnapshot) -> Self {
         Self {
             enabled: v.enabled,

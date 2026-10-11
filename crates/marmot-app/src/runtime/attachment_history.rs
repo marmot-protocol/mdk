@@ -147,6 +147,8 @@ fn attachment_role(attachment: &MediaAttachmentOutcome, tags: &[Vec<String>]) ->
 }
 
 impl MarmotAppRuntime {
+    /// Read local attachment state on a blocking task with separate queue/work and future-delivery scopes.
+    /// Shutdown preserves its existing cancellation policy; probes retire even when the future is dropped.
     pub(super) async fn attachment_read<T: Send + 'static>(
         &self,
         account_ref: &str,

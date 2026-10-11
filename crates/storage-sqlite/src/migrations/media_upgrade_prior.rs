@@ -3,6 +3,7 @@ use crate::SqliteResultExt;
 use cgka_traits::storage::StorageResult;
 use rusqlite::{Transaction, params};
 use zeroize::Zeroizing;
+/// Reproduce the published 0104 layout so reopening exercises ledger compatibility, not the new writer.
 pub(super) fn retained(tx: &Transaction<'_>) -> StorageResult<()> {
     tx.execute_batch(
         "DROP TRIGGER attachment_bytes_added;
@@ -80,6 +81,7 @@ pub(super) fn retained(tx: &Transaction<'_>) -> StorageResult<()> {
     Ok(())
 }
 
+/// Reproduce published 0105 parent/chunk tables; keep its body frozen for historical reopen fixtures.
 pub(super) fn partial(tx: &Transaction<'_>) -> StorageResult<()> {
     tx.execute_batch(
         "DROP TRIGGER attachment_partial_reserved_added;

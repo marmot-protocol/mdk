@@ -1065,10 +1065,12 @@ impl SqliteAccountStorage {
         Self::from_connection_with_options(connection, options)
     }
 
+    /// Open a private encrypted account store with the standard privacy and durability defaults.
     pub fn open_encrypted(path: impl AsRef<Path>, key: &SqlCipherKey) -> StorageResult<Self> {
         Self::open_encrypted_with_options(path, key, SqliteStorageOptions::default())
     }
 
+    /// Apply the caller's cipher/operational options and pending migrations before publishing the store.
     pub fn open_encrypted_with_options(
         path: impl AsRef<Path>,
         key: &SqlCipherKey,
@@ -1091,6 +1093,7 @@ impl SqliteAccountStorage {
             Some(observer),
         )
     }
+    /// Create private database files before opening and observing the unpublished connection.
     fn open_encrypted_observed_options(
         path: impl AsRef<Path>,
         key: &SqlCipherKey,
@@ -1102,6 +1105,7 @@ impl SqliteAccountStorage {
         let connection = rusqlite::Connection::open(path).storage()?;
         Self::from_unkeyed_observed(connection, key, options, observer)
     }
+    /// Exercise raw unkeyed connections with production keying defaults and no diagnostic callback.
     #[cfg(test)]
     fn from_unkeyed_encrypted_connection_with_options(
         connection: rusqlite::Connection,
@@ -1110,6 +1114,7 @@ impl SqliteAccountStorage {
     ) -> StorageResult<Self> {
         Self::from_unkeyed_observed(connection, key, options, None)
     }
+    /// Pin cipher configuration before key application, reporting each boundary before it can block.
     fn from_unkeyed_observed(
         connection: rusqlite::Connection,
         key: &SqlCipherKey,
@@ -1128,12 +1133,14 @@ impl SqliteAccountStorage {
         apply_sqlcipher_key(&connection, key)?;
         Self::from_connection_observed(connection, options, observer)
     }
+    /// Finish an existing connection without recording progress; options and migrations remain identical.
     pub(crate) fn from_connection_with_options(
         connection: rusqlite::Connection,
         options: SqliteStorageOptions,
     ) -> StorageResult<Self> {
         Self::from_connection_observed(connection, options, None)
     }
+    /// Apply operational settings and all pending migrations before sharing a closeable connection.
     fn from_connection_observed(
         mut connection: rusqlite::Connection,
         options: SqliteStorageOptions,
