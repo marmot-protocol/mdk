@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Opt-in native startup memory capture reports anonymous account/store/key-opening phases, migration progress and async completion, with bounded history/drop counters. Snapshotting does not query storage or the keystore, and ordinary construction keeps capture disabled.
+
 ### Breaking changes
 
 - `AppError` adds `ModerationReportingNotConfigured`, `InvalidModerationReportConfig`,

@@ -16,6 +16,7 @@
 //! block.
 
 use crate::attachment_access::MarmotAttachmentLocalBytes;
+use crate::types::MarmotNativeStartupSnapshot;
 use crate::types::avatar::{MarmotAvatarAssetList, MarmotAvatarBytesList};
 use crate::types::presentation::{MarmotPresentedChatListSnapshot, MarmotPresentedChatRow};
 use std::ffi::c_char;
@@ -3657,4 +3658,9 @@ mod nostr_verification_tests {
         );
         assert_eq!(out, 0);
     }
+}
+
+c_cmd! {
+    sync fn marmot_set_startup_diagnostics_enabled(enabled: flag) -> unit = set_startup_diagnostics_enabled;
+    sync fn marmot_startup_diagnostics_snapshot() -> rec(MarmotNativeStartupSnapshot) = startup_diagnostics_snapshot;
 }

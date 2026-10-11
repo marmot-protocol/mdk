@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Expose `set_startup_diagnostics_enabled` and `startup_diagnostics_snapshot` with fixed phase/outcome records. Regenerate paired Swift/Kotlin bindings; local capture is off by default and changes no upload consent or database state.
+
 ### Breaking changes
 
 - `MarmotKitError` adds `ModerationReportingNotConfigured`,

@@ -158,21 +158,36 @@ impl MarmotAppRuntime {
         let app = self.accounts.app.clone();
         let account_ref = account_ref.to_owned();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
+        let future_probe = app
+            .startup_diagnostics
+            .observe(crate::NativeStartupStage::AttachmentFutureWait);
+        let probe = app
+            .startup_diagnostics
+            .observe(crate::NativeStartupStage::AttachmentTaskQueued);
         let work = blocking_app_task(move || {
-            // Account resolution, store opening, SQL and parser work all stay off the caller thread.
-            let account = app.account_home().account(&account_ref)?;
-            let storage = app.account_storage(&account.label)?;
-            if app.account_home().account(&account.label)?.account_id_hex != account.account_id_hex
-            {
-                return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
-            }
-            read(storage, app.allow_loopback_blob_endpoints())
+            let result = (|| {
+                probe.phase(crate::NativeStartupStage::AccountResolution);
+                // Account resolution, store opening, SQL and parser work all stay off the caller thread.
+                let account = app.account_home().account(&account_ref)?;
+                let storage = app.account_storage(&account.label)?;
+                if app.account_home().account(&account.label)?.account_id_hex
+                    != account.account_id_hex
+                {
+                    return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
+                }
+                probe.phase(crate::NativeStartupStage::AttachmentLocalRead);
+                read(storage, app.allow_loopback_blob_endpoints())
+            })();
+            probe.finish(result.is_ok());
+            result
         });
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut stopping) => Err(AppError::RuntimeStopping),
             result = work => result,
-        }
+        };
+        future_probe.finish(result.is_ok());
+        result
     }
     /// Read bounded original slots in canonical order, including rejected attachments.
     /// Categories support client-side per-page filtering; continue while next_cursor

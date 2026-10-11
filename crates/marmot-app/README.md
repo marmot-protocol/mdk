@@ -24,6 +24,8 @@ the generic account, session, and engine crates. Read this if you are building a
 - [Run the tests](#run-the-tests)
 
 ## Runtime overview
+The opt-in native startup recorder distinguishes task dispatch, account/key lookup, store-opening waits, SQLCipher phases, schema inspection and each migration transaction. `set_startup_diagnostics_enabled` and `startup_diagnostics_snapshot` change only bounded process-local diagnostic memory. Snapshots use their own short lock and remain readable while an account open is blocked; they do not open storage or query the keystore. Normal construction leaves capture disabled. Host exports must be explicitly requested and serialized within a separate size bound.
+
 
 `MarmotAppRuntime` owns restored signing accounts, a shared relay plane, live per-account workers, runtime event hubs,
 and the shared agent stream watch manager. The relay plane also owns shared directory discovery fetches for relay lists,

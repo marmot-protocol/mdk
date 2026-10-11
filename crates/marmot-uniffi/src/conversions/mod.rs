@@ -826,3 +826,6 @@ pub use attachment_access::*;
 
 mod attachment_controls;
 pub use attachment_controls::*;
+
+mod startup_diagnostics;
+pub use startup_diagnostics::*;

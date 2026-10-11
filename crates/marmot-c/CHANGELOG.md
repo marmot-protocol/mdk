@@ -7,6 +7,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- Mirror bounded native startup progress with opt-in enable/snapshot functions and a deep-free snapshot API. The synchronous observation remains usable before native startup completes.
+
 ### Added
 
 - `marmot_submit_moderation_report`, `marmot_moderation_reporting_available`,

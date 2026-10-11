@@ -1074,30 +1074,82 @@ impl SqliteAccountStorage {
         key: &SqlCipherKey,
         options: SqliteStorageOptions,
     ) -> StorageResult<Self> {
+        Self::open_encrypted_observed_options(path, key, options, None)
+    }
+
+    /// Observe fixed phases and migration numbers without exposing database paths, SQL or keys.
+    /// Callback faults are isolated; ordinary callers keep the same defaults and no callback.
+    pub fn open_encrypted_observed(
+        path: impl AsRef<Path>,
+        key: &SqlCipherKey,
+        observer: &dyn Fn(crate::StorageOpenProgress),
+    ) -> StorageResult<Self> {
+        Self::open_encrypted_observed_options(
+            path,
+            key,
+            SqliteStorageOptions::default(),
+            Some(observer),
+        )
+    }
+    fn open_encrypted_observed_options(
+        path: impl AsRef<Path>,
+        key: &SqlCipherKey,
+        options: SqliteStorageOptions,
+        observer: Option<&dyn Fn(crate::StorageOpenProgress)>,
+    ) -> StorageResult<Self> {
         let path = path.as_ref();
         ensure_private_db_files(path)?;
         let connection = rusqlite::Connection::open(path).storage()?;
-        Self::from_unkeyed_encrypted_connection_with_options(connection, key, options)
+        Self::from_unkeyed_observed(connection, key, options, observer)
     }
-
+    #[cfg(test)]
     fn from_unkeyed_encrypted_connection_with_options(
         connection: rusqlite::Connection,
         key: &SqlCipherKey,
         options: SqliteStorageOptions,
     ) -> StorageResult<Self> {
-        apply_cipher_pragmas(&connection, &options)?;
-        apply_sqlcipher_key(&connection, key)?;
-        Self::from_connection_with_options(connection, options)
+        Self::from_unkeyed_observed(connection, key, options, None)
     }
-
+    fn from_unkeyed_observed(
+        connection: rusqlite::Connection,
+        key: &SqlCipherKey,
+        options: SqliteStorageOptions,
+        observer: Option<&dyn Fn(crate::StorageOpenProgress)>,
+    ) -> StorageResult<Self> {
+        crate::open_progress::observe(
+            observer,
+            crate::StorageOpenProgress::Phase(crate::StorageOpenPhase::CipherConfiguration),
+        );
+        apply_cipher_pragmas(&connection, &options)?;
+        crate::open_progress::observe(
+            observer,
+            crate::StorageOpenProgress::Phase(crate::StorageOpenPhase::CipherKeyApplication),
+        );
+        apply_sqlcipher_key(&connection, key)?;
+        Self::from_connection_observed(connection, options, observer)
+    }
     pub(crate) fn from_connection_with_options(
-        mut connection: rusqlite::Connection,
+        connection: rusqlite::Connection,
         options: SqliteStorageOptions,
     ) -> StorageResult<Self> {
+        Self::from_connection_observed(connection, options, None)
+    }
+    fn from_connection_observed(
+        mut connection: rusqlite::Connection,
+        options: SqliteStorageOptions,
+        observer: Option<&dyn Fn(crate::StorageOpenProgress)>,
+    ) -> StorageResult<Self> {
+        crate::open_progress::observe(
+            observer,
+            crate::StorageOpenProgress::Phase(crate::StorageOpenPhase::OperationalPragmas),
+        );
         apply_operational_pragmas(&connection, &options)?;
         connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
         let migration_started = std::time::Instant::now();
-        let migrations_applied = migrations::run_all(&mut connection)?;
+        let migrations_applied = match observer {
+            Some(observer) => migrations::run_all_observed(&mut connection, Some(observer))?,
+            None => migrations::run_all(&mut connection)?,
+        };
         let migration_duration = migration_started.elapsed();
         let connection = SharedConnection::new(connection);
         let openmls = SqliteOpenMlsStorage::new(connection.clone());

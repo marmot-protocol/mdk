@@ -1,3 +1,9 @@
+#[cfg(test)]
+#[path = "migrations/media_open_upgrade_bench.rs"]
+mod media_open_upgrade_bench;
+#[cfg(test)]
+#[path = "migrations/media_open_upgrade_tests.rs"]
+mod media_open_upgrade_tests;
 #[path = "migrations/0001_initial_schema.rs"]
 mod migration_0001_initial_schema;
 #[path = "migrations/0002_account_device_signers.rs"]
@@ -145,6 +151,7 @@ mod migration_0072_chat_list_pages;
 #[cfg(test)]
 #[path = "migrations/query_work_tests.rs"]
 mod query_work_tests;
+
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
@@ -784,6 +791,24 @@ pub(crate) fn run(connection: &mut Connection, migrations: &[Migration]) -> Stor
 }
 
 fn run_with_summary(connection: &mut Connection, migrations: &[Migration]) -> StorageResult<usize> {
+    run_with_summary_observed(connection, migrations, None)
+}
+
+pub(crate) fn run_all_observed(
+    connection: &mut Connection,
+    observer: Option<&dyn Fn(crate::StorageOpenProgress)>,
+) -> StorageResult<usize> {
+    run_with_summary_observed(connection, MIGRATIONS, observer)
+}
+fn run_with_summary_observed(
+    connection: &mut Connection,
+    migrations: &[Migration],
+    observer: Option<&dyn Fn(crate::StorageOpenProgress)>,
+) -> StorageResult<usize> {
+    crate::open_progress::observe(
+        observer,
+        crate::StorageOpenProgress::Phase(crate::StorageOpenPhase::MigrationInspection),
+    );
     ensure_migration_table(connection)?;
     ensure_ordered(migrations)?;
     reconcile_legacy_migration_names(connection, migrations)?;
@@ -800,7 +825,19 @@ fn run_with_summary(connection: &mut Connection, migrations: &[Migration]) -> St
                 )));
             }
             None => {
-                apply_migration(connection, migration)?;
+                crate::open_progress::observe(
+                    observer,
+                    crate::StorageOpenProgress::MigrationStarted(migration.version as u32),
+                );
+                let result = apply_migration(connection, migration);
+                crate::open_progress::observe(
+                    observer,
+                    crate::StorageOpenProgress::MigrationFinished {
+                        version: migration.version as u32,
+                        success: result.is_ok(),
+                    },
+                );
+                result?;
                 applied += 1;
             }
         }
@@ -945,19 +982,84 @@ fn applied_name(connection: &Connection, version: i64) -> StorageResult<Option<S
         .storage()
 }
 
+/// Payload-preserving parent replacement requires a connection-local FK suspension before BEGIN.
+/// Constraints are checked inside the transaction before its ledger row can commit.
 fn apply_migration(connection: &mut Connection, migration: &Migration) -> StorageResult<()> {
-    let tx = connection.transaction().storage()?;
-    (migration.apply)(&tx)?;
-    tx.execute(
-        "INSERT INTO cgka_schema_migrations
-            (version, name, applied_at_unix_seconds)
-         VALUES (?1, ?2, CAST(strftime('%s', 'now') AS INTEGER))",
-        params![migration.version, migration.name],
-    )
-    .storage()?;
-    #[cfg(test)]
-    migration_crash_pause(migration.version);
-    tx.commit().storage()
+    let rebuild = migration.version == 105 && migration.name == "0105_file_attachment_partials";
+    let mut mode = MigrationForeignKeys::new(connection, rebuild)?;
+    let result = (|| {
+        let tx = mode.connection.transaction().storage()?;
+        (migration.apply)(&tx)?;
+        if rebuild {
+            let violations: i64 = tx
+                .query_row("SELECT (SELECT count(*) FROM pragma_foreign_key_check('attachment_partial')) + (SELECT count(*) FROM pragma_foreign_key_check('attachment_partial_chunk'))", [], |r| {
+                    r.get(0)
+                })
+                .storage()?;
+            if violations != 0 {
+                return Err(StorageError::Backend(
+                    "migration would violate foreign keys".into(),
+                ));
+            }
+        }
+        tx.execute(
+            "INSERT INTO cgka_schema_migrations (version, name, applied_at_unix_seconds)
+             VALUES (?1, ?2, CAST(strftime('%s', 'now') AS INTEGER))",
+            params![migration.version, migration.name],
+        )
+        .storage()?;
+        #[cfg(test)]
+        migration_crash_pause(migration.version);
+        tx.commit().storage()
+    })();
+    let restored = mode.restore();
+    result.and(restored)
+}
+
+/// A panic or transaction error also restores the original connection setting.
+struct MigrationForeignKeys<'a> {
+    connection: &'a mut Connection,
+    restore_enabled: bool,
+}
+impl<'a> MigrationForeignKeys<'a> {
+    fn new(connection: &'a mut Connection, rebuild: bool) -> StorageResult<Self> {
+        let enabled = rebuild
+            && connection
+                .pragma_query_value(None, "foreign_keys", |r| r.get::<_, bool>(0))
+                .storage()?;
+        if enabled {
+            connection
+                .pragma_update(None, "foreign_keys", false)
+                .storage()?;
+        }
+        Ok(Self {
+            connection,
+            restore_enabled: enabled,
+        })
+    }
+    fn restore(&mut self) -> StorageResult<()> {
+        if self.restore_enabled {
+            self.connection
+                .pragma_update(None, "foreign_keys", true)
+                .storage()?;
+            let enabled = self
+                .connection
+                .pragma_query_value(None, "foreign_keys", |r| r.get::<_, bool>(0))
+                .storage()?;
+            if !enabled {
+                return Err(StorageError::Backend(
+                    "migration foreign keys could not be restored".into(),
+                ));
+            }
+            self.restore_enabled = false;
+        }
+        Ok(())
+    }
+}
+impl Drop for MigrationForeignKeys<'_> {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
 }
 
 #[cfg(test)]

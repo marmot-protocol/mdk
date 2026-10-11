@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Media upgrades 0104/0105 preserve retained bodies and checkpoint chunks in place instead of copying payloads during account open. Metadata validation/accounting runs on mutation; affected foreign keys are verified transactionally and enforcement is restored on failure/unwind. Already-upgraded physical schemas remain supported. Optional encrypted-open progress reports fixed phases and migration numbers without private data.
+
 ### Breaking changes
 
 - Migration 0102 advances account storage to schema 102 on first open and

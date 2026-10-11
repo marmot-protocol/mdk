@@ -158,6 +158,8 @@ never free handles during concurrent use. Returned plaintext and copies made by 
 remain the host's responsibility, including removal of downstream copies after local deletion.
 
 ### Localization, privacy and diagnostics
+Native startup investigation can explicitly call `set_startup_diagnostics_enabled(true)` before the first account query, then read `startup_diagnostics_snapshot()` while a call remains unfinished. The snapshot uses independent bounded memory and fixed phases, including key lookup, database-open waiting and migration numbers; it contains no paths, account identifiers or error text. Keep normal builds disabled, bound host serialization separately, and revoke capture with `false` when it is no longer needed. Neither method changes upload consent or database state. See the [API reference](API-REFERENCE.md).
+
 
 `record_host_performance` accepts 28 shared host stages for runtime/UI initialization,
 accounts, lists, profiles, timelines, sending/search, media and preferences, plus
