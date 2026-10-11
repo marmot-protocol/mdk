@@ -33,6 +33,7 @@ not "fix" it into the per-account database.
 | `src/chat_presentation.rs` | Durable selected-presentation foundation (runtime orchestration owns hydration). |
 | `src/group_system.rs` | Local presentation of kind-1210 content (not a wire-format change). |
 | `src/user_blocks.rs` | Account-private NIP-51 block state; never stored in the shared database. |
+| `src/moderation_reports.rs` | Account-private outbox of signed NIP-59 moderation-report wraps: idempotency and rate-limit metadata, retry state, purge. Never stores the reported key or explanation in the clear. |
 | `src/message_drafts.rs` | Revisioned encrypted composer drafts (`message_drafts/revisioned.rs`). |
 | `src/prepared_group_image_upload.rs` | Staged founding-image upload (component data + Blossom upload secret; keep both out of diagnostics). |
 | `src/attachment_acquisition.rs` | Source-bound durable acquisition jobs, leased attempts, protected retained bytes, bounded worker demand and explicit-removal suppression. Network orchestration stays in marmot-app. |

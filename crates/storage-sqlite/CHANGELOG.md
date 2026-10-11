@@ -9,10 +9,15 @@
   Downgrade is unsupported. The public `AttachmentHistoryEntry` adds the required
   `emoji_tags` field; update Rust struct literals. Selected entries read these
   canonical source tags in the page snapshot without a history backfill.
-- Migrations 0103 through 0106 advance account storage to schema 106 on first
+- Migrations 0103 through 0107 advance account storage to schema 107 on first
   open. Older binaries reject the upgraded database; downgrade is unsupported.
 
 ### Added
+
+- Migration 0107 adds the account-private `moderation_report_outbox` with
+  `SqliteAccountStorage` methods to stage, retry, deduplicate, rate-count,
+  prune and purge signed moderation-report wraps. Rows never hold the reported
+  key or explanation in the clear, and a published row drops its wrap.
 
 - Test-only `test-migrated-template` feature adds
   `SqliteAccountStorage::in_memory_from_migrated_template`, which copies one

@@ -2797,7 +2797,10 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::OnboardingRequired
         | AppError::AccountSetupResetNotApplicable
         | AppError::AccountSetupKeyPackageRecoveryAvailable
-        | AppError::ReactionNotFound => SubjectFailureCategory::ExpectedRefusal,
+        | AppError::ReactionNotFound
+        | AppError::InvalidReportedPublicKey
+        | AppError::CannotReportSelf
+        | AppError::ModerationReportRateLimited => SubjectFailureCategory::ExpectedRefusal,
         AppError::Account(_)
         | AppError::AccountHome(_)
         | AppError::Session(_)
@@ -2808,7 +2811,9 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::CreatedGroupProjectionUnavailable(_)
         | AppError::SqlcipherKeyDerivation(_)
         | AppError::BlockListUnavailable
-        | AppError::BlockPublicationUncertain => SubjectFailureCategory::Environment,
+        | AppError::BlockPublicationUncertain
+        | AppError::ModerationReportingNotConfigured
+        | AppError::InvalidModerationReportConfig(_) => SubjectFailureCategory::Environment,
     };
     SubjectError::classified(
         category,

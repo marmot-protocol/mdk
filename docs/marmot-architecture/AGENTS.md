@@ -83,6 +83,9 @@ order and the roles agents most often need.
 - **Path:** `invitation-recovery.md`
   - **Role:** Recovery of invites whose Welcome landed on a losing branch (durable intent, re-invite, `Conflict`).
 
+- **Path:** `moderation-reports.md`
+  - **Role:** Wire contract for private gift-wrapped NIP-56 reports to the deployment operator and the operator's reader.
+
 - **Path:** `distributed-convergence.md`
   - **Role:** Branch selection, retained anchors, and convergence model.
 

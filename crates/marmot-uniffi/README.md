@@ -23,6 +23,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
 - Messages and moderation: [deletion provenance and custom events](#deletion-provenance-and-custom-events),
   [group-system previews](#group-system-previews),
   [device-local membership events](#device-local-membership-events), [group reporting](#group-reporting),
+  [moderation reports to the operator](#moderation-reports-to-the-operator),
   [history may be incomplete notices](#history-may-be-incomplete-notices)
 - Media: [file-backed media upload](#file-backed-media-upload),
   [bounded attachment history](#bounded-attachment-history), [local attachment access](#local-attachment-access)
@@ -811,6 +812,30 @@ or winning review decision is imposed on hosts.
 
 Pages are capped at 100 and cursors are exclusive. `reported_message` uses the ordinary
 timeline record. Use existing projection subscriptions to refresh client review views.
+
+## Moderation reports to the operator
+
+`submit_moderation_report` privately reports an account to the deployment's
+moderation team, in addition to in-group reporting. Group reporting is unchanged
+and remains the primary path. The report is a NIP-56 kind-1984 rumor, sealed by
+the account key and gift-wrapped per NIP-59 to the configured reports key. It
+carries only the reported key, the report type from `ReportReasonFfi`, the
+`ModerationReportOriginFfi` label and the trimmed explanation (at most 1,000
+characters). It never carries message or group identifiers. "Block and Report"
+sends `BlockAndReport` with `Other` unless the user chose a reason, and still calls
+`block_user` separately.
+
+Set `MarmotOptions.moderation_report_config` per build flavor, or call
+`configure_moderation_reporting` to see why a destination was rejected. Show the
+report-to-operator action only when `moderation_reporting_available()` is true;
+otherwise the call fails with `ModerationReportingNotConfigured`.
+`ModerationReportOutcomeFfi.accept_disposition` uses the send-summary
+vocabulary. Treat `AcceptedPending` and `CompletionUnknown` as submitted, because
+`catch_up_accounts` retries them, and never resubmit them. A repeat within 10
+minutes returns the same `report_id`. Each account may send 20 reports per hour
+(`ModerationReportRateLimited`). Sign-out and wipe delete the account's queued
+reports. The C ABI mirrors these calls. See the
+[wire format](../../docs/marmot-architecture/moderation-reports.md).
 
 ## History may be incomplete notices
 

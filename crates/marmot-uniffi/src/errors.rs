@@ -10,6 +10,19 @@ pub enum MarmotKitError {
     BlockListUnavailable,
     #[error("block list publication outcome uncertain")]
     BlockPublicationUncertain,
+    /// No valid moderation-report destination is installed; nothing was published.
+    #[error("moderation reporting is not configured")]
+    ModerationReportingNotConfigured,
+    /// The moderation-report destination was rejected as a whole.
+    #[error("invalid moderation report configuration: {details}")]
+    InvalidModerationReportConfig { details: String },
+    #[error("reported user public key is invalid")]
+    InvalidReportedPublicKey,
+    #[error("an account cannot report itself")]
+    CannotReportSelf,
+    /// Local per-account cap against runaway clients; retry later.
+    #[error("too many moderation reports; try again later")]
+    ModerationReportRateLimited,
     #[error("usage and diagnostics consent required")]
     ConsentRequired,
     #[error("invalid product analytics configuration")]
@@ -342,6 +355,15 @@ impl From<&AppError> for MarmotKitError {
             AppError::UserBlocked => Self::UserBlocked,
             AppError::BlockListUnavailable => Self::BlockListUnavailable,
             AppError::BlockPublicationUncertain => Self::BlockPublicationUncertain,
+            AppError::ModerationReportingNotConfigured => Self::ModerationReportingNotConfigured,
+            AppError::InvalidModerationReportConfig(details) => {
+                Self::InvalidModerationReportConfig {
+                    details: details.clone(),
+                }
+            }
+            AppError::InvalidReportedPublicKey => Self::InvalidReportedPublicKey,
+            AppError::CannotReportSelf => Self::CannotReportSelf,
+            AppError::ModerationReportRateLimited => Self::ModerationReportRateLimited,
             AppError::ProductAnalytics(marmot_app::ProductAnalyticsError::ConsentRequired) => {
                 Self::ConsentRequired
             }
@@ -613,6 +635,30 @@ mod tests {
         assert!(matches!(
             MarmotKitError::from(AppError::AttachmentAccountSignedOut),
             MarmotKitError::AttachmentAccountSignedOut
+        ));
+    }
+
+    #[test]
+    fn moderation_report_errors_stay_typed() {
+        assert!(matches!(
+            MarmotKitError::from(AppError::ModerationReportingNotConfigured),
+            MarmotKitError::ModerationReportingNotConfigured
+        ));
+        assert!(matches!(
+            MarmotKitError::from(AppError::InvalidModerationReportConfig("relay 0 is unsafe".into())),
+            MarmotKitError::InvalidModerationReportConfig { details } if details == "relay 0 is unsafe"
+        ));
+        assert!(matches!(
+            MarmotKitError::from(AppError::InvalidReportedPublicKey),
+            MarmotKitError::InvalidReportedPublicKey
+        ));
+        assert!(matches!(
+            MarmotKitError::from(AppError::CannotReportSelf),
+            MarmotKitError::CannotReportSelf
+        ));
+        assert!(matches!(
+            MarmotKitError::from(AppError::ModerationReportRateLimited),
+            MarmotKitError::ModerationReportRateLimited
         ));
     }
 

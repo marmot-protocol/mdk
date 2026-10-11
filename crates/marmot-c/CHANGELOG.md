@@ -9,6 +9,14 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `marmot_submit_moderation_report`, `marmot_moderation_reporting_available`,
+  `marmot_configure_moderation_reporting` and
+  `marmot_moderation_report_outcome_free` mirror the private moderation-report
+  calls. `MarmotModerationReportOrigin` and `MarmotModerationReportOutcome` are new
+  types, and statuses 96–100 cover the new errors. `MarmotClientOptions` is
+  unchanged; configure the destination with the new call. These are new symbols,
+  so use the matching header and library.
+
 - `marmot_create_identity_with_initial_profile` creates a generated identity
   whose first public kind-0 is the borrowed onboarding profile. New symbol;
   use the matching header and library.

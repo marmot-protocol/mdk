@@ -206,6 +206,11 @@ pub struct MarmotOptions {
     pub secret_store: Option<Arc<dyn SecretStore>>,
     #[uniffi(default = None)]
     pub attachment_acquisition_mode: Option<AttachmentAcquisitionModeFfi>,
+    /// Destination for private moderation reports (`submit_moderation_report`). Set per
+    /// build flavor. Invalid values leave reporting unconfigured; `configure_moderation_reporting`
+    /// reports why.
+    #[uniffi(default = None)]
+    pub moderation_report_config: Option<ModerationReportConfigFfi>,
 }
 
 impl MarmotOptions {
@@ -229,6 +234,7 @@ impl MarmotOptions {
                     .into(),
             )
             .with_key_package_client_name(self.client_name.clone())
+            .with_moderation_report_config(self.moderation_report_config.clone().map(Into::into))
     }
 }
 

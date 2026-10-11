@@ -4,6 +4,11 @@
 
 ### Breaking changes
 
+- `MarmotKitError` adds `ModerationReportingNotConfigured`,
+  `InvalidModerationReportConfig`, `InvalidReportedPublicKey`, `CannotReportSelf`
+  and `ModerationReportRateLimited`. Regenerate bindings with the matching
+  library and update exhaustive Swift `switch` / Kotlin `when` handling.
+
 - `OnboardingRepairProposalFfi.relay_repair` is a new optional field without
   a binding default. Regenerate matching Swift/Kotlin bindings and pass `nil`
   (Swift) or `null` (Kotlin) in host record initializers without a typed preview.
@@ -27,6 +32,13 @@
   after filtered pages as described in [the handoff](ATTACHMENT-HISTORY.md).
 
 ### Added
+
+- `submit_moderation_report`, `moderation_reporting_available` and
+  `configure_moderation_reporting` add private, NIP-59 gift-wrapped NIP-56
+  reports to the deployment's moderation team (`ModerationReportOriginFfi`,
+  `ModerationReportOutcomeFfi`). `MarmotOptions.moderation_report_config` is
+  optional, defaults to unset, and is set per build flavor. This is additive:
+  `report_message`, `content_reports` and `dismiss_reports` are unchanged.
 
 - `create_identity_with_initial_profile` creates a generated identity whose
   first public kind-0 is the onboarding-selected profile. Prefer it over
