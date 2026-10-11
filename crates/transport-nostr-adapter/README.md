@@ -173,8 +173,9 @@ past older messages still missing, which can then never be read (mdk#2086).
   beyond that it cannot keep an order and stays quiet. Past 65,536 across routes the least recently used route's
   memory is dropped, and it sets its IDs aside again. Losing this memory costs at most extra narrowing or a refetch.
 
-A window is fetched in the cursor's rotation, grouped by claiming relays so requests batch fully, and returned in time
-order. Selection never changes the summary's endpoint results: a relay that claimed an ID this pass left unfetched stays incomplete. The
+A window is fetched in the cursor's rotation and returned in time order. The rotation's first ID leads, and the rest
+are grouped by claiming relays so requests batch fully. A budget cut leaves the cursor just before the ID it deferred,
+so that ID is the next pass's first request with the single-object allowance, whichever relays claim it. Selection never changes the summary's endpoint results: a relay that claimed an ID this pass left unfetched stays incomplete. The
 account inbox route keeps ID-order selection. The extra dry-run comparisons are control traffic: about 200 KiB to
 fetch an eight-event, 2.6-MB gap against 1,100 retained events in the adapter fixture.
 

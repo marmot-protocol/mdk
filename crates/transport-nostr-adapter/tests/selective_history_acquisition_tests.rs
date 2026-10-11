@@ -681,6 +681,97 @@ async fn complementary_relay_results_share_one_pass_allowance() {
 /// A large event a batch's byte limit cuts off, behind smaller batch-mates the
 /// relay sends first, leads the next pass, where it fits as a one-ID request
 /// under the single-object ceiling.
+/// An event a budget cut deferred leads the next pass whichever relays claim
+/// it: grouping IDs by claimants must not put a newer, smaller event from
+/// another relay ahead of it on every pass.
+#[tokio::test]
+async fn a_deferred_event_leads_the_next_pass_across_disjoint_relays() {
+    deferred_event_leads_across_disjoint_relays(false).await;
+}
+
+/// The same for events already in the SDK cache, which a pass defers on its
+/// own turn rather than by cutting a request short.
+#[tokio::test]
+async fn a_deferred_cached_event_leads_the_next_pass_across_disjoint_relays() {
+    deferred_event_leads_across_disjoint_relays(true).await;
+}
+
+async fn deferred_event_leads_across_disjoint_relays(cached: bool) {
+    let keys = Keys::generate();
+    let event = |content: String, created_at: u64| {
+        EventBuilder::new(Kind::MlsGroupMessage, content)
+            .tags([Tag::custom("h", [hex::encode(ROUTE)])])
+            .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(created_at))
+            .finalize(&keys)
+            .unwrap()
+    };
+    // The first relay claims only a newer small event, the second only an
+    // older one too large to follow it within the pass allowance.
+    let small = event("small".to_owned(), 1_700_100_001);
+    let large = event("x".repeat(OVER_PASS_EVENT_BYTES), 1_700_100_000);
+    let first_database = relay_database();
+    let second_database = relay_database();
+    for (database, event) in [(&first_database, &small), (&second_database, &large)] {
+        database
+            .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+            .await
+            .unwrap();
+    }
+    let first = LocalRelay::new(RelayBuilder::default().database(first_database));
+    let second = LocalRelay::new(RelayBuilder::default().database(second_database));
+    first.run().await.unwrap();
+    second.run().await.unwrap();
+    let (first_url, _) = counted_proxy(first.url().await.to_string()).await;
+    let (second_url, _) = counted_proxy(second.url().await.to_string()).await;
+    let urls = vec![first_url, second_url];
+    let sdk = if cached {
+        let sdk_database = Arc::new(SdkMemoryDatabase::unbounded());
+        for event in [&small, &large] {
+            nostr_sdk::prelude::NostrDatabase::save_event(sdk_database.as_ref(), event)
+                .await
+                .unwrap();
+        }
+        let sdk = NostrSdkRelayClient::new(Client::builder().database(sdk_database).build());
+        for url in &urls {
+            sdk.client().add_relay(url.as_str()).await.unwrap();
+        }
+        sdk.client().connect().await;
+        sdk
+    } else {
+        sdk_on(&urls).await
+    };
+    let route = subscription(&urls);
+    let cursor = Cursor::default();
+    let mut admitted = Vec::new();
+    for pass in 1..=4 {
+        if admitted.len() == 2 {
+            break;
+        }
+        let (_, returned) = sdk
+            .reconcile_subscription(route.clone(), &admitted, SINCE, UNTIL, &cursor)
+            .await
+            .unwrap();
+        let large_admitted = admitted
+            .iter()
+            .any(|item: &NostrReconciliationItem| item.event_id == large.id.to_bytes());
+        assert!(
+            large_admitted
+                || returned
+                    .iter()
+                    .all(|event| event.event.id != small.id.to_hex()),
+            "pass {pass} returned the newer event ahead of the older one"
+        );
+        admitted.extend(returned.iter().map(|event| NostrReconciliationItem {
+            event_id: hex::decode(&event.event.id).unwrap().try_into().unwrap(),
+            created_at: event.event.created_at,
+        }));
+    }
+    assert_eq!(admitted.len(), 2, "both events arrive, the older one first");
+    sdk.client().shutdown().await;
+    first.shutdown();
+    second.shutdown();
+}
+
 #[tokio::test]
 async fn large_event_cut_from_a_batch_leads_the_next_pass() {
     // Thirty 80-KiB events, which the relay sends before the older large

@@ -302,9 +302,11 @@ fn event_json_bytes(event: &NostrTransportEvent) -> usize {
 /// One oldest-first pass's selection: the window's IDs, then IDs set aside by
 /// earlier passes with whatever room is left. The window keeps the durable
 /// cursor's rotation, which matters only when it holds more than one pass.
-/// Each part is then grouped, stably, by the relays that claimed its IDs, so
-/// exact-ID requests batch fully; the pass returns its events in time order
-/// whatever order it fetched them in.
+/// The rotation's first ID leads, whichever relays claim it: a budget cut
+/// leaves the cursor just before the ID it deferred, which must be the next
+/// pass's first request. The rest of each part is grouped, stably, by the
+/// relays that claimed its IDs, so exact-ID requests batch fully; the pass
+/// returns its events in time order whatever order it fetched them in.
 fn oldest_first_remote_ids(
     window: &HashSet<EventId>,
     set_aside: &[EventId],
@@ -313,7 +315,9 @@ fn oldest_first_remote_ids(
 ) -> Result<Vec<EventId>, TransportAdapterError> {
     let after = progress.load_cursor()?.map(EventId::from_byte_array);
     let mut fresh = bounded_reconciliation_remote_ids(window, after);
-    fresh.sort_by_cached_key(&claimants);
+    if let Some((_, rest)) = fresh.split_first_mut() {
+        rest.sort_by_cached_key(&claimants);
+    }
     let mut retry = set_aside
         .iter()
         .filter(|id| !window.contains(id))
@@ -323,6 +327,19 @@ fn oldest_first_remote_ids(
     let mut ids = fresh.into_iter().chain(retry).collect::<Vec<_>>();
     ids.truncate(SDK_RECONCILIATION_REPLAY_BATCH);
     Ok(ids)
+}
+
+/// The cursor that makes `id` the first ID of the next pass's rotation: the
+/// ID just before it in `remote`'s ID order, wrapping. In ID-order selection
+/// that is the ID attempted before it; in oldest-first selection, which groups
+/// IDs by claimants, it may be one this pass never reached.
+fn cursor_before(remote: &HashSet<EventId>, id: &EventId) -> Option<[u8; 32]> {
+    remote
+        .iter()
+        .filter(|other| *other < id)
+        .max()
+        .or_else(|| remote.iter().filter(|other| *other != id).max())
+        .map(|before| before.to_bytes())
 }
 
 fn select_reconciliation_remote_ids(
@@ -1428,7 +1445,6 @@ impl NostrSdkRelayClient {
             }
             None => deadline,
         };
-        drop(remote);
         // Requested IDs every claimant answered without.
         let mut withheld = HashSet::new();
         // IDs whose events can never fit the single-object ceiling.
@@ -1503,6 +1519,7 @@ impl NostrSdkRelayClient {
                     }
                     // A fitting object deferred by earlier results must be
                     // the first candidate on the next pass.
+                    progress.save_cursor(cursor_before(&remote, &event_id))?;
                     break;
                 }
                 progress.save_cursor(Some(event_id.to_bytes()))?;
@@ -1551,7 +1568,6 @@ impl NostrSdkRelayClient {
             // Do not advance past an ID merely because this pass ran out of
             // capacity. A dispatched request saves progress before its I/O;
             // only worker admission removes the ID from later comparisons.
-            let prior_cursor = progress.load_cursor()?;
             let single_object_request = byte_allowance == SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES;
             // Ask only the endpoints that claimed this ID. An endpoint that
             // lacks it has nothing to return, and a silent one must not spend
@@ -1723,10 +1739,7 @@ impl NostrSdkRelayClient {
                 // result stays unadmitted. A one-ID first request that is cut
                 // short is over that ceiling and rotates.
                 Some(position) if limited && !single_object_request => {
-                    progress.save_cursor(match position {
-                        0 => prior_cursor,
-                        _ => Some(batch[position - 1].to_bytes()),
-                    })?;
+                    progress.save_cursor(cursor_before(&remote, &batch[position]))?;
                     break;
                 }
                 // No relay answered: advance through what returned, at least
@@ -1749,6 +1762,7 @@ impl NostrSdkRelayClient {
                 break;
             }
         }
+        drop(remote);
         // A window the budget or deadline cut short returns only a time
         // prefix: no event newer than one it left behind, or the older one
         // could arrive after commits that carry the epoch past it. Events held
