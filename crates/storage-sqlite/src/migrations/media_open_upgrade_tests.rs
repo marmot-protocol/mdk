@@ -24,6 +24,182 @@ fn pages(connection: &Connection) -> i64 {
         .unwrap()
 }
 
+/// Measure native SQLite allocation in a dedicated child so concurrent tests cannot affect its global counter.
+#[test]
+fn retained_mutations_do_not_materialize_old_payloads() {
+    const CHILD: &str = "MDK_RETAINED_MUTATION_MEMORY_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "migrations::media_open_upgrade_tests::retained_mutations_do_not_materialize_old_payloads",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated native-memory regression failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the child must execute the exact memory regression"
+        );
+        return;
+    }
+    let mib: i64 = std::env::var("MDK_RETAINED_MUTATION_MEMORY_MIB")
+        .unwrap_or_else(|_| "16".to_owned())
+        .parse()
+        .unwrap();
+    assert!((16..=512).contains(&mib));
+    let body_len = mib * 1024 * 1024;
+    let _trace = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::INFO)
+            .finish(),
+    );
+    const MAX_EXTRA: i64 = 4 * 1024 * 1024;
+    for declared in [true, false] {
+        for cascade in [false, true] {
+            let (_directory, mut connection) = encrypted_fixture();
+            connection.execute_batch("PRAGMA cache_size=-512; PRAGMA secure_delete=ON;
+                CREATE TABLE retained_attachment_bytes(token BLOB PRIMARY KEY REFERENCES attachment_acquisition(token) ON DELETE CASCADE,bytes BLOB NOT NULL CHECK(length(bytes)<=536870912));
+                CREATE TABLE attachment_retention_usage(id INTEGER PRIMARY KEY,byte_count INTEGER);
+                CREATE TRIGGER attachment_bytes_added AFTER INSERT ON retained_attachment_bytes BEGIN SELECT 1; END;
+                CREATE TRIGGER attachment_bytes_removed AFTER DELETE ON retained_attachment_bytes BEGIN SELECT 1; END;
+                CREATE TRIGGER attachment_bytes_updated AFTER UPDATE OF bytes ON retained_attachment_bytes BEGIN SELECT 1; END;").unwrap();
+            connection
+                .execute(
+                    "INSERT INTO retained_attachment_bytes VALUES(x'01',zeroblob(?1))",
+                    [body_len],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO attachment_retention_usage VALUES(1,?1)",
+                    [body_len],
+                )
+                .unwrap();
+            let transaction = connection.transaction().unwrap();
+            migration_0104_file_attachment_retention::apply(&transaction).unwrap();
+            transaction.commit().unwrap();
+            if declared {
+                connection
+                    .execute(
+                        "UPDATE retained_attachment_bytes SET byte_len=length(bytes)",
+                        [],
+                    )
+                    .unwrap();
+            }
+            connection.execute_batch("PRAGMA shrink_memory").unwrap();
+            let delete = if cascade {
+                "DELETE FROM attachment_acquisition"
+            } else {
+                "DELETE FROM retained_attachment_bytes"
+            };
+            let transaction = connection.transaction().unwrap();
+            let peak = native_sqlite_allocation_peak(|| {
+                transaction.execute(delete, []).unwrap();
+            });
+            assert!(
+                peak < MAX_EXTRA,
+                "deletion materialized a retained body: declared={declared}, cascade={cascade}, extra_bytes={peak}"
+            );
+            tracing::info!(target: "storage_sqlite::mutation_memory", method = "retained_delete",
+                mib, declared, cascade, extra_bytes = peak, "synthetic deletion allocation bound verified");
+            transaction.rollback().unwrap();
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT byte_count FROM attachment_retention_usage",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                body_len
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT length(bytes) FROM retained_attachment_bytes",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                body_len
+            );
+            if !cascade {
+                let transaction = connection.transaction().unwrap();
+                let peak = native_sqlite_allocation_peak(|| {
+                    transaction
+                        .execute(
+                            "UPDATE retained_attachment_bytes SET bytes=x'010203',byte_len=3",
+                            [],
+                        )
+                        .unwrap();
+                });
+                assert!(
+                    peak < MAX_EXTRA,
+                    "replacement materialized the old retained body: declared={declared}, extra_bytes={peak}"
+                );
+                tracing::info!(target: "storage_sqlite::mutation_memory", method = "retained_replace",
+                    mib, declared, extra_bytes = peak, "synthetic replacement allocation bound verified");
+                assert_eq!(
+                    transaction
+                        .query_row(
+                            "SELECT byte_count FROM attachment_retention_usage",
+                            [],
+                            |r| r.get::<_, i64>(0)
+                        )
+                        .unwrap(),
+                    3
+                );
+                transaction.rollback().unwrap();
+            }
+            connection.execute(delete, []).unwrap();
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT byte_count FROM attachment_retention_usage",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                connection
+                    .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r
+                        .get::<_, i64>(
+                        0
+                    ))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+}
+
+/// Reset the linked SQLCipher allocator high-water mark around one statement, excluding fixture construction.
+fn native_sqlite_allocation_peak(operation: impl FnOnce()) -> i64 {
+    // SAFETY: These SQLite status APIs take no pointers and are called only in the isolated single-test child.
+    let baseline = unsafe { rusqlite::ffi::sqlite3_memory_used() };
+    assert!(
+        baseline > 0,
+        "native SQLite allocation tracking must be enabled"
+    );
+    // SAFETY: Resetting this process-global counter is isolated from every other test process.
+    unsafe { rusqlite::ffi::sqlite3_memory_highwater(1) };
+    operation();
+    // SAFETY: The same pointer-free status API reads the peak from the just-completed statement.
+    unsafe { rusqlite::ffi::sqlite3_memory_highwater(0) }.saturating_sub(baseline)
+}
+
 #[test]
 fn retained_upgrade_preserves_payload_pages_and_rollback() {
     let (_directory, mut connection) = encrypted_fixture();

@@ -15,10 +15,19 @@ impl Marmot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Exercise capture before startup with an isolated local test home, without an OS credential service.
     #[test]
     fn startup_capture_is_disabled_until_explicitly_enabled() {
         let root = tempfile::tempdir().unwrap();
-        let marmot = Marmot::new(root.path().to_string_lossy().into_owned(), vec![]).unwrap();
+        let marmot = Marmot::open(
+            root.path().to_string_lossy().into_owned(),
+            vec![],
+            marmot_app::MarmotAppConfig::default(),
+            Some(std::sync::Arc::new(
+                marmot_account::LocalFileSecretStore::new(root.path()),
+            )),
+        )
+        .unwrap();
         assert!(!marmot.startup_diagnostics_snapshot().unwrap().enabled);
         marmot.set_startup_diagnostics_enabled(true).unwrap();
         assert!(marmot.startup_diagnostics_snapshot().unwrap().enabled);

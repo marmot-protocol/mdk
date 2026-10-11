@@ -7,6 +7,12 @@ mod max_startup_investigation {
     fn encrypted_retention_upgrade_measurement() {
         use crate::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
         use std::time::Instant;
+        let _trace = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_max_level(tracing::Level::INFO)
+                .finish(),
+        );
         let mib: usize = std::env::var("MAX_REPRO_MIB")
             .unwrap_or_else(|_| "32".into())
             .parse()
@@ -94,8 +100,11 @@ mod max_startup_investigation {
             )
             .unwrap();
         assert_eq!(remaining, 0);
-        println!(
-            "MAX_REPRO strategy={strategy} mib={mib} enhanced_memory={enhanced} apply_ms={apply_ms} total_ms={total_ms} bytes_verified={len} integrity=ok cascade_usage=ok"
+        tracing::info!(
+            target: "storage_sqlite::upgrade_measurement", method = "retained_upgrade",
+            strategy, mib, enhanced_memory = enhanced, apply_ms = apply_ms as u64,
+            total_ms = total_ms as u64, verified_bytes = len,
+            "synthetic retained upgrade verified"
         );
     }
 }
@@ -108,6 +117,12 @@ mod max_partial_investigation {
     fn encrypted_partial_upgrade_measurement() {
         use crate::{SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher};
         use std::time::Instant;
+        let _trace = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_max_level(tracing::Level::INFO)
+                .finish(),
+        );
         let mib: usize = std::env::var("MAX_REPRO_MIB")
             .unwrap_or_else(|_| "512".into())
             .parse()
@@ -185,8 +200,11 @@ mod max_partial_investigation {
             )
             .unwrap();
         assert_eq!(usage, 0);
-        println!(
-            "MAX_PARTIAL mib={mib} apply_ms={apply_ms} total_ms={total_ms} bytes_verified={verified} integrity=ok fk=ok cascade_usage=ok"
+        tracing::info!(
+            target: "storage_sqlite::upgrade_measurement", method = "partial_upgrade",
+            mib, apply_ms = apply_ms as u64, total_ms = total_ms as u64,
+            verified_bytes = verified,
+            "synthetic partial upgrade verified"
         );
     }
 }

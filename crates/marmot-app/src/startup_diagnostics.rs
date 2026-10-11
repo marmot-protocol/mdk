@@ -71,6 +71,8 @@ struct Active {
     observation: NativeStartupObservation,
     started: Instant,
     stage_started: Instant,
+    history: bool,
+    pending_initial: Option<NativeStartupObservation>,
 }
 const MAX_ACTIVE: usize = 16;
 const MAX_EVENTS: usize = 96;
@@ -91,6 +93,14 @@ impl NativeStartupDiagnostics {
     }
     /// Start a scope before scheduling or potentially blocking native work.
     pub(crate) fn observe(&self, stage: NativeStartupStage) -> NativeStartupProbe {
+        self.start_scope(stage, true)
+    }
+    /// Keep cache/admission waits visible in active memory without filling history on successful hits.
+    pub(crate) fn observe_pending_open(&self, stage: NativeStartupStage) -> NativeStartupProbe {
+        self.start_scope(stage, false)
+    }
+    /// Reserve bounded active state; pending opens retain their first phase until a miss or failure.
+    fn start_scope(&self, stage: NativeStartupStage, history: bool) -> NativeStartupProbe {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if !state.enabled {
             return NativeStartupProbe::default();
@@ -115,8 +125,12 @@ impl NativeStartupDiagnostics {
             observation: observation.clone(),
             started: now,
             stage_started: now,
+            history,
+            pending_initial: (!history).then(|| observation.clone()),
         });
-        state.event(observation);
+        if history {
+            state.event(observation);
+        }
         NativeStartupProbe {
             owner: Some(self.clone()),
             token,
@@ -172,6 +186,31 @@ pub(crate) struct NativeStartupProbe {
     generation: u64,
 }
 impl NativeStartupProbe {
+    /// Commit a cache miss to history, including its initial admission and current cache-wait timing.
+    pub(crate) fn record_history(&self) {
+        let Some(owner) = &self.owner else {
+            return;
+        };
+        let mut state = owner.0.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.enabled || state.generation != self.generation {
+            return;
+        }
+        let Some(active) = state
+            .active
+            .iter_mut()
+            .find(|a| a.observation.token == self.token && !a.history)
+        else {
+            return;
+        };
+        active.history = true;
+        let initial = active.pending_initial.take();
+        let observation = active.snapshot();
+        if let Some(initial) = initial {
+            state.event(initial);
+        }
+        state.event(observation);
+    }
+
     /// Move to a non-migration phase, clearing the previous migration number and restarting its timer.
     pub(crate) fn phase(&self, stage: NativeStartupStage) {
         self.progress(stage, None, false);
@@ -205,8 +244,10 @@ impl NativeStartupProbe {
             active.observation.migrations_completed =
                 active.observation.migrations_completed.saturating_add(1);
         }
-        let observation = active.snapshot();
-        state.event(observation);
+        let observation = active.history.then(|| active.snapshot());
+        if let Some(observation) = observation {
+            state.event(observation);
+        }
     }
     /// Consume the probe with an explicit result so its later drop cannot report abandonment.
     pub(crate) fn finish(mut self, success: bool) {
@@ -217,6 +258,7 @@ impl NativeStartupProbe {
         });
     }
     /// Remove the active scope once; a revoked generation can never append to a newer capture.
+    /// Successful cache hits stay silent; failures and unwinds still retain their terminal phase.
     fn retire(&mut self, outcome: NativeStartupOutcome) {
         let Some(owner) = self.owner.take() else {
             return;
@@ -230,9 +272,15 @@ impl NativeStartupProbe {
             .iter()
             .position(|a| a.observation.token == self.token)
         {
-            let mut observation = state.active.remove(index).snapshot();
-            observation.outcome = outcome;
-            state.event(observation);
+            let mut active = state.active.remove(index);
+            if active.history || outcome != NativeStartupOutcome::Success {
+                if let Some(initial) = active.pending_initial.take() {
+                    state.event(initial);
+                }
+                let mut observation = active.snapshot();
+                observation.outcome = outcome;
+                state.event(observation);
+            }
         }
     }
 }
@@ -264,10 +312,13 @@ mod tests {
         recorder.set_enabled(true);
         disabled.phase(NativeStartupStage::AttachmentLocalRead);
         let old = recorder.observe(NativeStartupStage::SigningKeys);
+        let old_pending = recorder.observe_pending_open(NativeStartupStage::SigningKeys);
         recorder.set_enabled(false);
         recorder.set_enabled(true);
         old.phase(NativeStartupStage::RecoveryProbe);
         old.finish(true);
+        old_pending.record_history();
+        old_pending.finish(false);
         assert!(recorder.snapshot().events.is_empty());
     }
     #[test]
@@ -339,6 +390,77 @@ mod tests {
         assert_eq!(
             snapshot.events.last().unwrap().outcome,
             NativeStartupOutcome::Failure
+        );
+    }
+
+    /// Normal reads of an already-open store must not evict the first-open migration evidence.
+    #[test]
+    fn cached_account_reads_preserve_first_open_history() {
+        let root = tempfile::tempdir().unwrap();
+        let app = crate::MarmotApp::with_relays(root.path(), Vec::new());
+        app.account_storages.lock().unwrap().insert(
+            "synthetic-private-label".to_owned(),
+            storage_sqlite::SqliteAccountStorage::in_memory().unwrap(),
+        );
+        app.set_startup_diagnostics_enabled(true);
+        let first_open = app
+            .startup_diagnostics
+            .observe(NativeStartupStage::MigrationApply);
+        first_open.progress(NativeStartupStage::MigrationApply, Some(104), true);
+        first_open.finish(true);
+        let before = app.startup_diagnostics_snapshot();
+        for _ in 0..128 {
+            app.account_storage("synthetic-private-label").unwrap();
+        }
+        let after = app.startup_diagnostics_snapshot();
+        assert_eq!(after.events, before.events);
+        assert_eq!(after.dropped_events, 0);
+        assert!(after.active.is_empty());
+    }
+
+    /// Deferred cache observations become history on a miss, failure or unwind while remaining revocable.
+    #[test]
+    fn pending_open_scopes_preserve_misses_and_terminal_failures() {
+        let recorder = NativeStartupDiagnostics::default();
+        recorder.set_enabled(true);
+        let miss = recorder.observe_pending_open(NativeStartupStage::ProductAnalyticsAdmission);
+        miss.phase(NativeStartupStage::AccountStorageCache);
+        let pending = recorder.snapshot();
+        assert!(pending.events.is_empty());
+        assert_eq!(
+            pending.active[0].stage,
+            NativeStartupStage::AccountStorageCache
+        );
+        miss.record_history();
+        miss.progress(NativeStartupStage::MigrationApply, Some(105), true);
+        miss.finish(true);
+        let completed = recorder.snapshot();
+        assert_eq!(
+            completed.events[0].stage,
+            NativeStartupStage::ProductAnalyticsAdmission
+        );
+        assert_eq!(
+            completed.events[1].stage,
+            NativeStartupStage::AccountStorageCache
+        );
+        assert_eq!(
+            completed.events.last().unwrap().migration_version,
+            Some(105)
+        );
+
+        recorder
+            .observe_pending_open(NativeStartupStage::AccountStorageCache)
+            .finish(false);
+        assert_eq!(
+            recorder.snapshot().events.last().unwrap().outcome,
+            NativeStartupOutcome::Failure
+        );
+        drop(recorder.observe_pending_open(NativeStartupStage::AccountStorageCache));
+        let abandoned = recorder.snapshot();
+        assert!(abandoned.active.is_empty());
+        assert_eq!(
+            abandoned.events.last().unwrap().outcome,
+            NativeStartupOutcome::Abandoned
         );
     }
 

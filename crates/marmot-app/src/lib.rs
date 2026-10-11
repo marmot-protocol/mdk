@@ -6346,7 +6346,7 @@ impl MarmotApp {
     fn account_storage(&self, label: &str) -> Result<SqliteAccountStorage, AppError> {
         let probe = self
             .startup_diagnostics
-            .observe(NativeStartupStage::ProductAnalyticsAdmission);
+            .observe_pending_open(NativeStartupStage::ProductAnalyticsAdmission);
         let permit = self.product_analytics.permit();
         probe.phase(NativeStartupStage::AccountStorageCache);
         let result = self.account_storage_unobserved(label, &probe);
@@ -6374,6 +6374,7 @@ impl MarmotApp {
         {
             return Ok(storage);
         }
+        probe.record_history();
         probe.phase(NativeStartupStage::StorageAdmission);
         let _lifecycle = self.begin_storage_open("account storage")?;
         let _span = tracing::debug_span!(

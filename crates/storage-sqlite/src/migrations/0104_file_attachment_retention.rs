@@ -7,6 +7,7 @@ use rusqlite::Transaction;
 /// Existing rows retain a sentinel length and are accounted from SQLite's BLOB length.
 /// No bytes or stored quota are rewritten while an account opens. Validation triggers
 /// enforce new metadata on mutation; an ADD COLUMN CHECK would scan existing payloads.
+/// Before mutation, indexed length queries handle legacy rows without binding the BLOB into OLD.
 pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     tx.execute_batch(
         "ALTER TABLE retained_attachment_bytes ADD COLUMN byte_len INTEGER NOT NULL DEFAULT -1;
@@ -29,13 +30,17 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             UPDATE attachment_retention_usage SET byte_count=byte_count+
                 CASE WHEN NEW.byte_len<0 THEN length(NEW.bytes) ELSE NEW.byte_len END WHERE id=1;
         END;
-        CREATE TRIGGER attachment_bytes_removed AFTER DELETE ON retained_attachment_bytes BEGIN
+        CREATE TRIGGER attachment_bytes_removed BEFORE DELETE ON retained_attachment_bytes BEGIN
             UPDATE attachment_retention_usage SET byte_count=byte_count-
-                CASE WHEN OLD.byte_len<0 THEN length(OLD.bytes) ELSE OLD.byte_len END WHERE id=1;
+                CASE WHEN OLD.byte_len<0 THEN
+                    (SELECT length(bytes) FROM retained_attachment_bytes WHERE token=OLD.token)
+                ELSE OLD.byte_len END WHERE id=1;
         END;
-        CREATE TRIGGER attachment_bytes_updated AFTER UPDATE OF bytes ON retained_attachment_bytes BEGIN
+        CREATE TRIGGER attachment_bytes_updated BEFORE UPDATE OF bytes ON retained_attachment_bytes BEGIN
             UPDATE attachment_retention_usage SET byte_count=byte_count-
-                CASE WHEN OLD.byte_len<0 THEN length(OLD.bytes) ELSE OLD.byte_len END+
+                CASE WHEN OLD.byte_len<0 THEN
+                    (SELECT length(bytes) FROM retained_attachment_bytes WHERE token=OLD.token)
+                ELSE OLD.byte_len END+
                 CASE WHEN NEW.byte_len<0 THEN length(NEW.bytes) ELSE NEW.byte_len END WHERE id=1;
         END;",
     ).storage()?;
