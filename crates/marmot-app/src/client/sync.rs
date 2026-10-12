@@ -2985,7 +2985,8 @@ impl AppClient {
                         // Settled, not complete: a relay that refused a REQ for
                         // good will never report EOSE, so waiting longer brings
                         // nothing. Ending the drain early ends it exactly as a
-                        // timeout would; the cursor gates still require EOSE.
+                        // timeout would, checkpoint included; live promotion
+                        // and activation reuse still require EOSE.
                         Err(_) if self.adapter.account_subscription_eose().await.settled() => {
                             return Ok(None);
                         }

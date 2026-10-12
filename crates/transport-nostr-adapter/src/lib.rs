@@ -490,7 +490,7 @@ impl AccountSubscriptionEose {
     ///
     /// Weaker than [`Self::complete`] on purpose: a refusal is not evidence
     /// that the refused relay's history was served. Use this only to stop
-    /// waiting, never to advance a durable floor past the refused relays.
+    /// waiting; never gate live cursor promotion or activation reuse on it.
     pub fn settled(&self) -> bool {
         self.relay_subscription_attempts > 0
             && self.relay_subscription_attempts_with_eose + self.relay_subscription_attempts_refused

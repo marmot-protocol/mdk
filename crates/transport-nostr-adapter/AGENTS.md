@@ -76,8 +76,8 @@ for reconnect/backoff and relay status mechanics.
   the SDK registry when the queued notification is handled, since a later re-send may have changed it. An unknown
   authenticator keeps `auth-required:` pending. The forwarder test pins the table against the SDK registry. Treat a
   staged group-sync REQ as live. A dropped refusal before EOSE settles that relay's replay coverage but never
-  completes it: `AccountSubscriptionEose::settled` may end a wait, only `complete` may advance a durable floor or
-  reuse an activation. EOSE is final; a later `CLOSED` does not undo it. Ignore closes for ids that are not live
+  completes it: `AccountSubscriptionEose::settled` may end a wait, only `complete` may gate live cursor promotion or
+  activation reuse. Ending a drain early on `settled` must leave its checkpoint exactly as the drain's timeout would. EOSE is final; a later `CLOSED` does not undo it. Ignore closes for ids that are not live
   (superseded attempts, one-shot fetches). Keep only the reason's category, never its text, in state, logs,
   telemetry and the audit queue.
 - Keep real relay clients behind `NostrRelayClient`.
