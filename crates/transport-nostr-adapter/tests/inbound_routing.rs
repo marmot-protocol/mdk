@@ -5293,3 +5293,111 @@ async fn relay_closed_reaches_telemetry_and_per_account_reports() {
     assert_eq!(reports.reports.len(), SUBSCRIPTION_REFUSAL_REPORT_LIMIT);
     assert_eq!(reports.dropped, 3);
 }
+
+/// Refuses every group REQ with a dropped `CLOSED` before `subscribe`
+/// returns, the way a fast relay answers while the rest of a batch is still
+/// being sent.
+#[derive(Default)]
+struct RefusingGroupRelayClient {
+    adapter: Mutex<Option<NostrTransportAdapter>>,
+}
+
+#[async_trait]
+impl NostrRelayClient for RefusingGroupRelayClient {
+    async fn subscribe(
+        &self,
+        subscription: transport_nostr_adapter::NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        let NostrSubscription::Group { endpoints, .. } = &subscription else {
+            return Ok(());
+        };
+        let adapter = self.adapter.lock().unwrap().clone();
+        if let Some(adapter) = adapter {
+            adapter
+                .handle_relay_closed(
+                    endpoints[0].clone(),
+                    subscription.subscription_id(),
+                    refusal(
+                        Some(TransportEndpointRejectionCategory::Restricted),
+                        SubscriptionRefusalDisposition::Dropped,
+                    ),
+                )
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn unsubscribe(
+        &self,
+        _subscription: transport_nostr_adapter::NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn unsubscribe_account(
+        &self,
+        _account_id: &MemberId,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn publish_event(
+        &self,
+        endpoints: &[TransportEndpoint],
+        _event: &NostrTransportEvent,
+        _required_acks: usize,
+    ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
+        Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
+    }
+}
+
+/// A group sync stages its new routes before the REQs go out and commits
+/// them only after every subscribe returns. A relay that refuses a new group
+/// REQ inside that window is still refusing a live REQ: the refusal must
+/// reach telemetry and the account's reports, because a dropped REQ sends
+/// nothing more once the batch commits.
+#[tokio::test]
+async fn relay_closed_during_group_sync_subscribe_is_recorded() {
+    let relay = Arc::new(RefusingGroupRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    *relay.adapter.lock().unwrap() = Some(adapter.clone());
+    let account_id = MemberId::new(vec![0xD7; 32]);
+    let group_endpoint = TransportEndpoint("wss://group.example".to_owned());
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".to_owned())],
+            group_subscriptions: Vec::new(),
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id: account_id.clone(),
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: cgka_traits::GroupId::new(vec![0x99; 16]),
+                transport_group_id: vec![0xAA; 32],
+                endpoints: vec![group_endpoint.clone()],
+                retained_since: None,
+            }],
+            since: None,
+        })
+        .await
+        .expect("group sync succeeds");
+
+    let reports = adapter.take_subscription_refusals(&account_id);
+    assert_eq!(
+        reports.reports,
+        vec![SubscriptionRefusalReport {
+            route_kind: SubscriptionRouteKind::Group,
+            endpoint: group_endpoint,
+            category: Some(TransportEndpointRejectionCategory::Restricted),
+            disposition: SubscriptionRefusalDisposition::Dropped,
+            count: 1,
+        }]
+    );
+    let sync = adapter.relay_sync().await;
+    assert_eq!(sync.refusals.len(), 1);
+    assert_eq!(sync.refusals[0].route_kind, SubscriptionRouteKind::Group);
+}

@@ -2462,6 +2462,12 @@ trait RelayNotificationSource: Send + Sync {
         NostrNotificationLossFloor::Unbounded
     }
     fn receiver_replaced(&self) {}
+    /// Classify a relay's `CLOSED` reason as this source's SDK client settles
+    /// the REQ. Without a known client the authenticator is unknown, which
+    /// keeps an `auth-required:` close pending.
+    fn subscription_refusal(&self, reason: &str) -> transport_nostr_adapter::SubscriptionRefusal {
+        transport_nostr_adapter::sdk_subscription_refusal(reason, None)
+    }
     #[cfg(test)]
     fn worker_failure_hook(&self) -> Option<Arc<NotificationWorkerFailureHook>> {
         None
@@ -2507,6 +2513,13 @@ impl RelayNotificationSource for SdkRelayNotificationSource {
     fn receiver_replaced(&self) {
         if let Some(loss) = &self.loss {
             loss.notification_receiver_replaced();
+        }
+    }
+
+    fn subscription_refusal(&self, reason: &str) -> transport_nostr_adapter::SubscriptionRefusal {
+        match &self.loss {
+            Some(client) => client.subscription_refusal(reason),
+            None => transport_nostr_adapter::sdk_subscription_refusal(reason, None),
         }
     }
 }
@@ -2740,7 +2753,11 @@ async fn run_relay_notification_consumer(
     loop {
         match receiver.next().await {
             Some(NotificationUpdate::Notification(notification)) => {
-                let should_shutdown = handle_relay_notification(notification, &adapter, None).await;
+                let should_shutdown =
+                    handle_relay_notification(notification, &adapter, None, &|reason| {
+                        transport_nostr_adapter::sdk_subscription_refusal(reason, None)
+                    })
+                    .await;
                 if should_shutdown {
                     return RelayNotificationConsumerOutcome::new(
                         receiver,
@@ -2794,6 +2811,7 @@ async fn run_relay_notification_consumer_scoped(
     let worker_pending = pending.clone();
     #[cfg(test)]
     let worker_failure_hook = source.worker_failure_hook();
+    let classifier = Arc::clone(&source);
     let mut worker = tokio::spawn(async move {
         while let Some(notification) = event_rx.recv().await {
             #[cfg(test)]
@@ -2807,7 +2825,10 @@ async fn run_relay_notification_consumer_scoped(
                     }
                 }
             }
-            if handle_relay_notification(notification, &adapter, account_id.as_ref()).await {
+            let classify = |reason: &str| classifier.subscription_refusal(reason);
+            if handle_relay_notification(notification, &adapter, account_id.as_ref(), &classify)
+                .await
+            {
                 worker_pending.fetch_sub(1, Ordering::SeqCst);
                 return true;
             }
@@ -2896,6 +2917,7 @@ async fn handle_relay_notification(
     notification: ClientNotification,
     adapter: &NostrTransportAdapter,
     account_id: Option<&MemberId>,
+    classify_closed: &(dyn Fn(&str) -> transport_nostr_adapter::SubscriptionRefusal + Sync),
 ) -> bool {
     match notification {
         ClientNotification::Event {
@@ -2951,6 +2973,20 @@ async fn handle_relay_notification(
                         .handle_relay_eose(
                             TransportEndpoint(relay_url.to_string()),
                             subscription_id.to_string(),
+                        )
+                        .await;
+                }
+                // Classified from this message's reason, not from the SDK's
+                // registry, which a later re-send may already have changed.
+                RelayMessage::Closed {
+                    subscription_id,
+                    message,
+                } => {
+                    adapter
+                        .handle_relay_closed(
+                            TransportEndpoint(relay_url.to_string()),
+                            subscription_id.to_string(),
+                            classify_closed(&message),
                         )
                         .await;
                 }

@@ -69,9 +69,13 @@ for reconnect/backoff and relay status mechanics.
   got nothing has its re-issue released and counted in `EoseReissueSummary::failed_relays` so the caller repairs it
   again later. Never wait for queue room under the lifecycle lock. Never infer EOSE at a lag, change
   a re-issued REQ's filter, or reopen a closed REQ.
-- Hand every relay `CLOSED` to `handle_relay_closed`, classified by the SDK's own disposition: after the SDK settles
-  the REQ, it is `Pending` if the relay still holds it (`Relay::subscription`) and `Dropped` otherwise. Never
-  re-derive nostr-sdk's prefix table. A dropped refusal before EOSE settles that relay's replay coverage but never
+- Hand every relay `CLOSED` on a live REQ to `handle_relay_closed` from every notification consumer: this crate's
+  `spawn_notification_forwarder` and `marmot-app`'s relay-plane consumer (`handle_relay_notification`). Classify each
+  message on its own with `sdk_subscription_refusal` / `NostrSdkRelayClient::subscription_refusal`, which mirrors how
+  nostr-sdk settles that REQ (kept for `rate-limited:`, and for `auth-required:` with an authenticator); never read
+  the SDK registry when the queued notification is handled, since a later re-send may have changed it. An unknown
+  authenticator keeps `auth-required:` pending. The forwarder test pins the table against the SDK registry. Treat a
+  staged group-sync REQ as live. A dropped refusal before EOSE settles that relay's replay coverage but never
   completes it: `AccountSubscriptionEose::settled` may end a wait, only `complete` may advance a durable floor or
   reuse an activation. EOSE is final; a later `CLOSED` does not undo it. Ignore closes for ids that are not live
   (superseded attempts, one-shot fetches). Keep only the reason's category, never its text, in state, logs,

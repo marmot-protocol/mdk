@@ -93,7 +93,7 @@ pub use relay_list::{
 pub use sdk_client::{
     NostrReconciliationItem, NostrReconciliationProgress, NostrReconciliationSummary,
     NostrSdkRelayClient, NostrSdkRelayHealth, NostrSdkSubscriptionPlan, RelayRegistrationOutcome,
-    sign_transport_event_for_publish,
+    sdk_subscription_refusal, sign_transport_event_for_publish,
 };
 use telemetry::EoseRepairClaim;
 pub use telemetry::{
@@ -2341,6 +2341,10 @@ struct AdapterState {
     /// flight; both success and failure rebuild the index before returning.
     by_transport_group: HashMap<Vec<u8>, Vec<GroupRouteEntry>>,
     maintenance_routes: HashMap<String, NostrSubscription>,
+    /// Owning account of each group REQ a sync has sent but not yet committed
+    /// to `accounts`, so a relay's `CLOSED` inside the subscribe window still
+    /// finds a live REQ. Cleared on commit and rollback.
+    staged_group_subscriptions: HashMap<String, MemberId>,
     /// Unconfirmed relay unsubscribes retained until teardown succeeds.
     /// Routing state (`accounts`/`by_transport_group`) already reflects the
     /// removal; these are relay-side cleanups only, drained on later
@@ -2650,6 +2654,16 @@ impl AdapterState {
 
     fn stage_subscription_starts(&mut self, subscriptions: &[NostrSubscription], now_ms: u64) {
         self.sync.begin_staged_subscription_starts();
+        self.staged_group_subscriptions = subscriptions
+            .iter()
+            .filter(|subscription| matches!(subscription, NostrSubscription::Group { .. }))
+            .map(|subscription| {
+                (
+                    subscription.subscription_id(),
+                    subscription.account_id().clone(),
+                )
+            })
+            .collect();
         for subscription in subscriptions {
             let relays: Vec<RelayIndex> = subscription
                 .endpoints()
@@ -2663,10 +2677,12 @@ impl AdapterState {
 
     fn commit_staged_subscription_starts(&mut self) {
         self.sync.commit_staged_subscription_starts();
+        self.staged_group_subscriptions.clear();
     }
 
     fn rollback_staged_subscription_starts(&mut self) {
         self.sync.rollback_staged_subscription_starts();
+        self.staged_group_subscriptions.clear();
     }
 
     /// Evict sync-telemetry progress for subscriptions being removed, so the
@@ -2826,7 +2842,8 @@ impl AdapterState {
     }
 
     /// The account and route kind of a live subscription id: an account's
-    /// inbox, one of its group routes, or post-join maintenance. `None` for a
+    /// inbox, one of its group routes (committed, or staged by a group sync
+    /// whose REQs are going out), or post-join maintenance. `None` for a
     /// superseded attempt's id, a one-shot fetch, or anything else not live.
     fn live_subscription_route(
         &self,
@@ -2837,6 +2854,9 @@ impl AdapterState {
                 subscription.account_id().clone(),
                 SubscriptionRouteKind::Maintenance,
             ));
+        }
+        if let Some(account_id) = self.staged_group_subscriptions.get(subscription_id) {
+            return Some((account_id.clone(), SubscriptionRouteKind::Group));
         }
         self.accounts.keys().find_map(|account_id| {
             // `account_subscription_ids` lists the inbox first.
