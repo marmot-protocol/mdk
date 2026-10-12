@@ -33,6 +33,13 @@
 
 ### Added
 
+- The runtime follows the opt-in `WN_SOCKS5_*` proxy settings described in
+  the marmot-app [SOCKS5 routing](../marmot-app/README.md#socks5-routing)
+  section. With the variables unset, nothing changes. When they are invalid,
+  `Marmot::new` and `Marmot::new_with_options` return an error instead of
+  connecting directly. Agent preview publishing and watching are unavailable
+  while SOCKS5 is on.
+
 - `submit_moderation_report`, `moderation_reporting_available` and
   `configure_moderation_reporting` add private, NIP-59 gift-wrapped NIP-56
   reports to the deployment's moderation team (`ModerationReportOriginFfi`,

@@ -16,6 +16,23 @@
 
 ### Added
 
+- Opt-in SOCKS5 routing. Set `WN_SOCKS5_PROXY` (a numeric `ip:port`) and,
+  optionally, both `WN_SOCKS5_USERNAME` and `WN_SOCKS5_PASSWORD` before the
+  runtime starts. Relay publishing, account receive and history pools,
+  directory reads, moderation reports, Blossom media, Open Ranking and
+  collector/audit uploads then connect through the proxy. Relay hostnames
+  resolve at the proxy; HTTP still sends the locally validated IP. The policy
+  is read once per process, ignores `ALL_PROXY`/`NO_PROXY`, and never falls
+  back to a direct connection. With all three variables unset, routing is
+  unchanged. See [SOCKS5 routing](README.md#socks5-routing).
+  - `MarmotApp::try_with_relays_and_account_home_and_config` now fails with an
+    `InvalidInput` I/O error when the `WN_SOCKS5_*` settings are invalid
+    (partial credentials, a hostname or a zero port). The infallible dev
+    constructors open, but every relay and HTTP connection is refused.
+  - `MarmotAppRuntime` agent preview publishing and watching return an
+    `Unsupported` I/O error while SOCKS5 is on, because the proxy cannot carry
+    QUIC.
+
 - `MarmotAppRuntime::submit_moderation_report` privately reports an account to
   the deployment's moderation team. It sends a NIP-56 kind-1984 rumor, sealed by
   the account key and gift-wrapped per NIP-59 (through the shared Welcome wrap
