@@ -75,6 +75,7 @@ impl MarmotAppRuntime {
         options: AgentPublisherOptions,
     ) -> Result<Arc<AgentPublisher>, AppError> {
         self.shared.lifecycle().ensure_running()?;
+        crate::network_proxy::require_direct_transport()?;
         if options.chunk_bytes == 0
             || options.chunk_bytes > AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize
         {

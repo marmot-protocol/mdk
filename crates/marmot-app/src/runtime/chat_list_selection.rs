@@ -1,5 +1,8 @@
 //! Frozen complete fixed-view intent, never a second display/presentation cache.
-use super::{ChatListView, MarmotAppRuntime, RuntimeLifecycle, wait_for_runtime_shutdown};
+use super::{
+    ChatListView, MarmotAppRuntime, RuntimeLifecycle, wait_for_account_reset,
+    wait_for_runtime_shutdown,
+};
 use crate::AppError;
 use std::sync::{Arc, Mutex};
 use storage_sqlite::{
@@ -182,64 +185,84 @@ impl MarmotAppRuntime {
         // Keep a separate cursor for delivery checks. Resubscribing after
         // capture or per call would silently skip already queued resets.
         let delivery_resets = resets.resubscribe();
-        let app = self.accounts.app.clone();
-        let label = account.label.clone();
-        let capture = tokio::task::spawn_blocking(move || {
-            let current = app.account_home().account(&label).map_err(AppError::from)?;
-            if current.account_id_hex != account.account_id_hex {
-                return Err(ChatSelectionError::Closed);
+        let capture = async {
+            loop {
+                let app = self.accounts.app.clone();
+                let account = account.clone();
+                let attempt_rule = rule.clone();
+                let attempt = tokio::task::spawn_blocking(move || {
+                    let current = app
+                        .account_home()
+                        .account(&account.label)
+                        .map_err(AppError::from)?;
+                    if current.account_id_hex != account.account_id_hex {
+                        return Err(ChatSelectionError::Closed);
+                    }
+                    let store = app.account_storage(&account.label)?;
+                    let text_source = if attempt_rule
+                        .as_ref()
+                        .map(ChatFolderSelectionRule::requires_text)
+                        .transpose()?
+                        .unwrap_or(false)
+                    {
+                        Some(app.shared_storage()?)
+                    } else {
+                        None
+                    };
+                    if attempt_rule.is_some() {
+                        crate::chat_presentation::maintenance::prepare_batch(
+                            &store,
+                            &app.shared_storage()?,
+                            &account.account_id_hex,
+                        )?;
+                    } else {
+                        crate::chat_presentation::maintenance::prepare_base_rows(
+                            &store,
+                            &account.account_id_hex,
+                        )?;
+                    }
+                    let text_head = text_source
+                        .as_ref()
+                        .map(|shared| folder_text_head(&store, shared))
+                        .transpose()
+                        .inspect_err(|_| app.presentation_signals.wake())?;
+                    let snapshot = match attempt_rule {
+                        Some(rule) => store.chat_folder_selection_snapshot(rule),
+                        None => store.chat_list_selection_snapshot(view),
+                    }
+                    .inspect_err(|_| app.presentation_signals.wake())?;
+                    if let (Some(shared), Some(head)) = (&text_source, &text_head)
+                        && shared
+                            .directory_presentation_version()
+                            .map_err(AppError::from)?
+                            != *head
+                    {
+                        app.presentation_signals.wake();
+                        return Err(
+                            storage_sqlite::ChatListSelectionError::ProjectionNotReady.into()
+                        );
+                    }
+                    Ok::<_, ChatSelectionError>((store, snapshot, text_source))
+                });
+                match attempt
+                    .await
+                    .map_err(|e| AppError::BlockingTask(e.to_string()))?
+                {
+                    Err(ChatSelectionError::Selection(
+                        storage_sqlite::ChatListSelectionError::ProjectionNotReady,
+                    )) if rule.is_none() => {
+                        // Complete fixed-view base preparation in bounded, cancellable batches.
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    result => return result,
+                }
             }
-            let store = app.account_storage(&label)?;
-            let text_source = if rule
-                .as_ref()
-                .map(ChatFolderSelectionRule::requires_text)
-                .transpose()?
-                .unwrap_or(false)
-            {
-                Some(app.shared_storage()?)
-            } else {
-                None
-            };
-            if rule.is_some() {
-                crate::chat_presentation::maintenance::prepare_batch(
-                    &store,
-                    &app.shared_storage()?,
-                    &account.account_id_hex,
-                )?;
-            } else {
-                crate::chat_presentation::maintenance::prepare_base_rows(
-                    &store,
-                    &account.account_id_hex,
-                )?;
-            }
-            let text_head = text_source
-                .as_ref()
-                .map(|shared| folder_text_head(&store, shared))
-                .transpose()
-                .inspect_err(|_| app.presentation_signals.wake())?;
-            let snapshot = match rule {
-                Some(rule) => store.chat_folder_selection_snapshot(rule),
-                None => store.chat_list_selection_snapshot(view),
-            }
-            .inspect_err(|_| {
-                app.presentation_signals.wake();
-            })?;
-            if let (Some(shared), Some(head)) = (&text_source, &text_head)
-                && shared
-                    .directory_presentation_version()
-                    .map_err(AppError::from)?
-                    != *head
-            {
-                app.presentation_signals.wake();
-                return Err(storage_sqlite::ChatListSelectionError::ProjectionNotReady.into());
-            }
-            Ok::<_, ChatSelectionError>((store, snapshot, text_source))
-        });
+        };
         let (store, snapshot, text_source) = tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut stopping) => return Err(ChatSelectionError::Closed),
-            _ = wait_for_reset(&mut resets, &account.label) => return Err(ChatSelectionError::Closed),
-            result = capture => result.map_err(|e| AppError::BlockingTask(e.to_string()))??,
+            _ = wait_for_account_reset(&mut resets, &account.label) => return Err(ChatSelectionError::Closed),
+            result = capture => result?,
         };
         // Subscribe before capture, and recheck all terminal signals before publishing.
         self.shared.lifecycle().ensure_running()?;
@@ -287,7 +310,7 @@ async fn run(
             biased;
             _ = wait_for_runtime_shutdown(&mut closing) => return,
             _ = wait_for_runtime_shutdown(&mut stopping) => return,
-            _ = wait_for_reset(&mut resets, &label) => return,
+            _ = wait_for_account_reset(&mut resets, &label) => return,
             command = commands.recv() => match command { Some(c) => c, None => return },
         };
         // A caller cancelled while waiting for admission never mutates intent.
@@ -308,7 +331,7 @@ async fn run(
             biased;
             _ = wait_for_runtime_shutdown(&mut closing) => return,
             _ = wait_for_runtime_shutdown(&mut stopping) => return,
-            _ = wait_for_reset(&mut resets, &label) => return,
+            _ = wait_for_account_reset(&mut resets, &label) => return,
             result = task => match result { Ok(value) => value, Err(_) => return },
         };
         state = next;
@@ -333,10 +356,7 @@ fn apply(
         }
         Action::Deselect(id) => {
             if store.deselect_chat_list_selection_id(&mut state.snapshot, &id)? {
-                state.revision = state
-                    .revision
-                    .checked_add(1)
-                    .ok_or(ChatSelectionError::Closed)?;
+                state.revision += 1;
             }
         }
         Action::Revalidate => {
@@ -356,10 +376,7 @@ fn apply(
             }
             // Every action-validation result supersedes previously paged action intent,
             // even when the count stayed the same. No old page can be spliced into it.
-            state.revision = state
-                .revision
-                .checked_add(1)
-                .ok_or(ChatSelectionError::Closed)?;
+            state.revision += 1;
             state.snapshot = next;
         }
     }
@@ -403,15 +420,5 @@ fn reset_observed(resets: &mut broadcast::Receiver<String>, label: &str) -> bool
         }
     }
 }
-async fn wait_for_reset(resets: &mut broadcast::Receiver<String>, label: &str) {
-    loop {
-        match resets.recv().await {
-            Ok(reset) if reset == label => return,
-            Err(_) => return,
-            _ => {}
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests;

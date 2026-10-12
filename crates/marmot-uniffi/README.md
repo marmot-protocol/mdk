@@ -23,6 +23,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
 - Messages and moderation: [deletion provenance and custom events](#deletion-provenance-and-custom-events),
   [group-system previews](#group-system-previews),
   [device-local membership events](#device-local-membership-events), [group reporting](#group-reporting),
+  [moderation reports to the operator](#moderation-reports-to-the-operator),
   [history may be incomplete notices](#history-may-be-incomplete-notices)
 - Media: [file-backed media upload](#file-backed-media-upload),
   [bounded attachment history](#bounded-attachment-history), [local attachment access](#local-attachment-access)
@@ -157,6 +158,8 @@ never free handles during concurrent use. Returned plaintext and copies made by 
 remain the host's responsibility, including removal of downstream copies after local deletion.
 
 ### Localization, privacy and diagnostics
+Native startup investigation can explicitly call `set_startup_diagnostics_enabled(true)` before the first account query, then read `startup_diagnostics_snapshot()` while a call remains unfinished. The snapshot uses independent bounded memory and fixed phases, including key lookup, database-open waiting and migration numbers; it contains no paths, account identifiers or error text. Keep normal builds disabled, bound host serialization separately, and revoke capture with `false` when it is no longer needed. Neither method changes upload consent or database state. See the [API reference](API-REFERENCE.md).
+
 
 `record_host_performance` accepts 28 shared host stages for runtime/UI initialization,
 accounts, lists, profiles, timelines, sending/search, media and preferences, plus
@@ -820,6 +823,30 @@ or winning review decision is imposed on hosts.
 Pages are capped at 100 and cursors are exclusive. `reported_message` uses the ordinary
 timeline record. Use existing projection subscriptions to refresh client review views.
 
+## Moderation reports to the operator
+
+`submit_moderation_report` privately reports an account to the deployment's
+moderation team, in addition to in-group reporting. Group reporting is unchanged
+and remains the primary path. The report is a NIP-56 kind-1984 rumor, sealed by
+the account key and gift-wrapped per NIP-59 to the configured reports key. It
+carries only the reported key, the report type from `ReportReasonFfi`, the
+`ModerationReportOriginFfi` label and the trimmed explanation (at most 1,000
+characters). It never carries message or group identifiers. "Block and Report"
+sends `BlockAndReport` with `Other` unless the user chose a reason, and still calls
+`block_user` separately.
+
+Set `MarmotOptions.moderation_report_config` per build flavor, or call
+`configure_moderation_reporting` to see why a destination was rejected. Show the
+report-to-operator action only when `moderation_reporting_available()` is true;
+otherwise the call fails with `ModerationReportingNotConfigured`.
+`ModerationReportOutcomeFfi.accept_disposition` uses the send-summary
+vocabulary. Treat `AcceptedPending` and `CompletionUnknown` as submitted, because
+`catch_up_accounts` retries them, and never resubmit them. A repeat within 10
+minutes returns the same `report_id`. Each account may send 20 reports per hour
+(`ModerationReportRateLimited`). Sign-out and wipe delete the account's queued
+reports. The C ABI mirrors these calls. See the
+[wire format](../../docs/marmot-architecture/moderation-reports.md).
+
 ## History may be incomplete notices
 
 Automatic recovery stops retrying an obligation after a fixed budget of attempts that
@@ -1069,7 +1096,11 @@ check, not a comparison benchmark. It builds Kotlin/Swift generation and every
 Android or Apple native target once in parallel, transfers those inputs only
 within the current workflow run, verifies their source, builder, toolchain,
 profile, feature and run provenance, then assembles and validates the Android,
-iOS and macOS candidate packages. Pull requests restore the trusted release
+iOS and macOS candidate packages. Pull requests build the Apple inputs and
+packages only when they change `crates/marmot-uniffi/` (other than Markdown) or a
+MarmotKit bindings workflow, because macOS runners are scarce; every other pull
+request still builds and validates the Android package, and `master` pushes always
+build the complete matrix. Pull requests restore the trusted release
 cache read-only; only runs using the workflow from `master` may update it. A
 weekly scheduled exact-head run on `master` provides drift detection and
 refreshes those trusted cache seeds; it intentionally executes the complete

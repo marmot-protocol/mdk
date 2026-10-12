@@ -1,3 +1,9 @@
+#[cfg(test)]
+#[path = "migrations/media_open_upgrade_bench.rs"]
+mod media_open_upgrade_bench;
+#[cfg(test)]
+#[path = "migrations/media_open_upgrade_tests.rs"]
+mod media_open_upgrade_tests;
 #[path = "migrations/0001_initial_schema.rs"]
 mod migration_0001_initial_schema;
 #[path = "migrations/0002_account_device_signers.rs"]
@@ -145,6 +151,7 @@ mod migration_0072_chat_list_pages;
 #[cfg(test)]
 #[path = "migrations/query_work_tests.rs"]
 mod query_work_tests;
+
 #[cfg(test)]
 #[path = "migrations/test_support.rs"]
 mod test_support;
@@ -219,8 +226,10 @@ mod migration_0104_file_attachment_retention;
 mod migration_0105_file_attachment_partials;
 #[path = "migrations/0106_retained_attachment_chunks.rs"]
 mod migration_0106_retained_attachment_chunks;
-#[path = "migrations/0107_chat_folder_inputs.rs"]
-mod migration_0107_chat_folder_inputs;
+#[path = "migrations/0107_moderation_report_outbox.rs"]
+mod migration_0107_moderation_report_outbox;
+#[path = "migrations/0108_chat_folder_inputs.rs"]
+mod migration_0108_chat_folder_inputs;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -233,6 +242,8 @@ mod migration_0088_draft_attachment_descriptors;
 pub(crate) struct Migration {
     pub(crate) version: i64,
     pub(crate) name: &'static str,
+    /// Tables whose references must be checked while foreign keys are suspended before BEGIN.
+    pub(crate) suspend_foreign_keys: &'static [&'static str],
     pub(crate) apply: fn(&Transaction<'_>) -> StorageResult<()>,
 }
 
@@ -240,542 +251,658 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
         name: "0001_initial_schema",
+        suspend_foreign_keys: &[],
         apply: migration_0001_initial_schema::apply,
     },
     Migration {
         version: 2,
         name: "0002_account_device_signers",
+        suspend_foreign_keys: &[],
         apply: migration_0002_account_device_signers::apply,
     },
     Migration {
         version: 3,
         name: "0003_group_foreign_keys",
+        suspend_foreign_keys: &[],
         apply: migration_0003_group_foreign_keys::apply,
     },
     Migration {
         version: 4,
         name: "0004_app_timeline",
+        suspend_foreign_keys: &[],
         apply: migration_0004_app_timeline::apply,
     },
     Migration {
         version: 5,
         name: "0005_account_projection",
+        suspend_foreign_keys: &[],
         apply: migration_0005_account_projection::apply,
     },
     Migration {
         version: 6,
         name: "0006_chat_list_projection",
+        suspend_foreign_keys: &[],
         apply: migration_0006_chat_list_projection::apply,
     },
     Migration {
         version: 7,
         name: "0007_timeline_projection_indexes",
+        suspend_foreign_keys: &[],
         apply: migration_0007_timeline_projection_indexes::apply,
     },
     Migration {
         version: 8,
         name: "0008_timeline_invalidation_status",
+        suspend_foreign_keys: &[],
         apply: migration_0008_timeline_invalidation_status::apply,
     },
     Migration {
         version: 9,
         name: "0009_app_event_source_epoch",
+        suspend_foreign_keys: &[],
         apply: migration_0009_app_event_source_epoch::apply,
     },
     Migration {
         version: 10,
         name: "0010_encrypted_media_epoch_secrets",
+        suspend_foreign_keys: &[],
         apply: migration_0010_encrypted_media_epoch_secrets::apply,
     },
     Migration {
         version: 11,
         name: "0011_chat_list_avatar_url",
+        suspend_foreign_keys: &[],
         apply: migration_0011_chat_list_avatar_url::apply,
     },
     Migration {
         version: 12,
         name: "0012_app_event_origin_commit",
+        suspend_foreign_keys: &[],
         apply: migration_0012_app_event_origin_commit::apply,
     },
     Migration {
         version: 13,
         name: "0013_app_event_kind_order_index",
+        suspend_foreign_keys: &[],
         apply: migration_0013_app_event_kind_order_index::apply,
     },
     Migration {
         version: 14,
         name: "0014_message_timeline_reply_lookup_index",
+        suspend_foreign_keys: &[],
         apply: migration_0014_message_timeline_reply_lookup_index::apply,
     },
     Migration {
         version: 15,
         name: "0015_member_validation_cache",
+        suspend_foreign_keys: &[],
         apply: migration_0015_member_validation_cache::apply,
     },
     Migration {
         version: 16,
         name: "0016_leave_requests",
+        suspend_foreign_keys: &[],
         apply: migration_0016_leave_requests::apply,
     },
     Migration {
         version: 17,
         name: "0017_notification_settings_default_on",
+        suspend_foreign_keys: &[],
         apply: migration_0017_notification_settings_default_on::apply,
     },
     Migration {
         version: 18,
         name: "0018_account_group_self_membership",
+        suspend_foreign_keys: &[],
         apply: migration_0018_account_group_self_membership::apply,
     },
     Migration {
         version: 19,
         name: "0019_chat_list_unread_mention_count",
+        suspend_foreign_keys: &[],
         apply: migration_0019_chat_list_unread_mention_count::apply,
     },
     Migration {
         version: 20,
         name: "0020_message_modifier_edges",
+        suspend_foreign_keys: &[],
         apply: migration_0020_message_modifier_edges::apply,
     },
     Migration {
         version: 21,
         name: "0021_push_token_owner_signatures",
+        suspend_foreign_keys: &[],
         apply: migration_0021_push_token_owner_signatures::apply,
     },
     Migration {
         version: 22,
         name: "0022_chat_list_self_membership",
+        suspend_foreign_keys: &[],
         apply: migration_0022_chat_list_self_membership::apply,
     },
     Migration {
         version: 23,
         name: "0023_chat_list_projection_version",
+        suspend_foreign_keys: &[],
         apply: migration_0023_chat_list_projection_version::apply,
     },
     Migration {
         version: 24,
         name: "0024_pending_welcome_delivery",
+        suspend_foreign_keys: &[],
         apply: migration_0024_pending_welcome_delivery::apply,
     },
     Migration {
         version: 25,
         name: "0025_chat_notification_settings",
+        suspend_foreign_keys: &[],
         apply: migration_0025_chat_notification_settings::apply,
     },
     Migration {
         version: 26,
         name: "0026_message_drafts",
+        suspend_foreign_keys: &[],
         apply: migration_0026_message_drafts::apply,
     },
     Migration {
         version: 27,
         name: "0027_app_event_moderation_grant",
+        suspend_foreign_keys: &[],
         apply: migration_0027_app_event_moderation_grant::apply,
     },
     Migration {
         version: 28,
         name: "0028_ingress_dedup",
+        suspend_foreign_keys: &[],
         apply: migration_0028_ingress_dedup::apply,
     },
     Migration {
         version: 29,
         name: "0029_app_event_retention_decision",
+        suspend_foreign_keys: &[],
         apply: migration_0029_app_event_retention_decision::apply,
     },
     Migration {
         version: 30,
         name: "0030_prior_nostr_routes",
+        suspend_foreign_keys: &[],
         apply: migration_0030_prior_nostr_routes::apply,
     },
     Migration {
         version: 31,
         name: "0031_outbound_fanout",
+        suspend_foreign_keys: &[],
         apply: migration_0031_outbound_fanout::apply,
     },
     Migration {
         version: 32,
         name: "0032_encrypted_media_secret_references",
+        suspend_foreign_keys: &[],
         apply: migration_0032_encrypted_media_secret_references::apply,
     },
     Migration {
         version: 33,
         name: "0033_push_registration_gossip_outbox",
+        suspend_foreign_keys: &[],
         apply: migration_0033_push_registration_gossip_outbox::apply,
     },
     Migration {
         version: 34,
         name: "0034_maintenance_publication",
+        suspend_foreign_keys: &[],
         apply: migration_0034_maintenance_publication::apply,
     },
     Migration {
         version: 35,
         name: "0035_durable_convergence_passes",
+        suspend_foreign_keys: &[],
         apply: migration_0035_durable_convergence_passes::apply,
     },
     Migration {
         version: 36,
         name: "0036_agent_stream_publisher_sequences",
+        suspend_foreign_keys: &[],
         apply: migration_0036_agent_stream_publisher_sequences::apply,
     },
     Migration {
         version: 37,
         name: "0037_chat_list_semantic_timestamps",
+        suspend_foreign_keys: &[],
         apply: migration_0037_chat_list_semantic_timestamps::apply,
     },
     Migration {
         version: 38,
         name: "0038_chat_list_interaction_state",
+        suspend_foreign_keys: &[],
         apply: migration_0038_chat_list_interaction_state::apply,
     },
     Migration {
         version: 39,
         name: "0039_chat_pin_positions",
+        suspend_foreign_keys: &[],
         apply: migration_0039_chat_pin_positions::apply,
     },
     Migration {
         version: 40,
         name: "0040_disband_requests",
+        suspend_foreign_keys: &[],
         apply: migration_0040_disband_requests::apply,
     },
     Migration {
         version: 41,
         name: "0041_secure_delete_checkpoint_intents",
+        suspend_foreign_keys: &[],
         apply: migration_0041_secure_delete_checkpoint_intents::apply,
     },
     Migration {
         version: 42,
         name: "0042_group_state_checkpoints",
+        suspend_foreign_keys: &[],
         apply: migration_0042_group_state_checkpoints::apply,
     },
     Migration {
         version: 43,
         name: "0043_transport_group_routes",
+        suspend_foreign_keys: &[],
         apply: migration_0043_transport_group_routes::apply,
     },
     Migration {
         version: 44,
         name: "0044_local_group_deletion_frontiers",
+        suspend_foreign_keys: &[],
         apply: migration_0044_local_group_deletion_frontiers::apply,
     },
     Migration {
         version: 45,
         name: "0045_timeline_canonical_order",
+        suspend_foreign_keys: &[],
         apply: migration_0045_timeline_canonical_order::apply,
     },
     Migration {
         version: 46,
         name: "0046_message_group_state_epoch_index",
+        suspend_foreign_keys: &[],
         apply: migration_0046_message_group_state_epoch_index::apply,
     },
     Migration {
         version: 47,
         name: "0047_normalized_message_records",
+        suspend_foreign_keys: &[],
         apply: migration_0047_normalized_message_records::apply,
     },
     Migration {
         version: 48,
         name: "0048_deferred_peel_generations",
+        suspend_foreign_keys: &[],
         apply: migration_0048_deferred_peel_generations::apply,
     },
     Migration {
         version: 49,
         name: "0049_pending_invite_index",
+        suspend_foreign_keys: &[],
         apply: migration_0049_pending_invite_index::apply,
     },
     Migration {
         version: 50,
         name: "0050_direct_conversation_members",
+        suspend_foreign_keys: &[],
         apply: migration_0050_direct_conversation_members::apply,
     },
     Migration {
         version: 51,
         name: "0051_prepared_group_image_uploads",
+        suspend_foreign_keys: &[],
         apply: migration_0051_prepared_group_image_uploads::apply,
     },
     Migration {
         version: 52,
         name: "0052_epoch_backfill_intents",
+        suspend_foreign_keys: &[],
         apply: migration_0052_epoch_backfill_intents::apply,
     },
     Migration {
         version: 53,
         name: "0053_account_delivery_recovery",
+        suspend_foreign_keys: &[],
         apply: migration_0053_account_delivery_recovery::apply,
     },
     Migration {
         version: 54,
         name: "0054_transport_reconciliation_items",
+        suspend_foreign_keys: &[],
         apply: migration_0054_transport_reconciliation_items::apply,
     },
     Migration {
         version: 55,
         name: "0055_epoch_stall_evidence",
+        suspend_foreign_keys: &[],
         apply: migration_0055_epoch_stall_evidence::apply,
     },
     Migration {
         version: 56,
         name: "0056_chat_list_accepted_activity_high_water",
+        suspend_foreign_keys: &[],
         apply: migration_0056_chat_list_accepted_activity_high_water::apply,
     },
     Migration {
         version: 57,
         name: "0057_openmls_values_msgpack",
+        suspend_foreign_keys: &[],
         apply: migration_0057_openmls_values_msgpack::apply,
     },
     Migration {
         version: 58,
         name: "0058_processed_transport_ids",
+        suspend_foreign_keys: &[],
         apply: migration_0058_processed_transport_ids::apply,
     },
     Migration {
         version: 59,
         name: "0059_chat_list_unread_membership",
+        suspend_foreign_keys: &[],
         apply: migration_0059_chat_list_unread_membership::apply,
     },
     Migration {
         version: 60,
         name: "0060_released_transport_receipts",
+        suspend_foreign_keys: &[],
         apply: migration_0060_released_transport_receipts::apply,
     },
     Migration {
         version: 61,
         name: "0061_transport_reconciliation_replay_cursor",
+        suspend_foreign_keys: &[],
         apply: migration_0061_transport_reconciliation_replay_cursor::apply,
     },
     Migration {
         version: 62,
         name: "0062_chat_list_preview_indexes",
+        suspend_foreign_keys: &[],
         apply: migration_0062_chat_list_preview_indexes::apply,
     },
     Migration {
         version: 63,
         name: "0063_query_indexes",
+        suspend_foreign_keys: &[],
         apply: migration_0063_query_indexes::apply,
     },
     Migration {
         version: 64,
         name: "0064_own_commit_intents",
+        suspend_foreign_keys: &[],
         apply: migration_0064_own_commit_intents::apply,
     },
     Migration {
         version: 65,
         name: "0065_chat_presentation",
+        suspend_foreign_keys: &[],
         apply: migration_0065_chat_presentation::apply,
     },
     Migration {
         version: 66,
         name: "0066_chat_presentation_maintenance",
+        suspend_foreign_keys: &[],
         apply: migration_0066_chat_presentation_maintenance::apply,
     },
     Migration {
         version: 67,
         name: "0067_invitation_recovery",
+        suspend_foreign_keys: &[],
         apply: migration_0067_invitation_recovery::apply,
     },
     Migration {
         version: 68,
         name: "0068_media_epoch_index",
+        suspend_foreign_keys: &[],
         apply: migration_0068_media_epoch_index::apply,
     },
     Migration {
         version: 69,
         name: "0069_chat_readiness_index",
+        suspend_foreign_keys: &[],
         apply: migration_0069_chat_readiness_index::apply,
     },
     Migration {
         version: 70,
         name: "0070_forgotten_groups",
+        suspend_foreign_keys: &[],
         apply: migration_0070_forgotten_groups::apply,
     },
     Migration {
         version: 71,
         name: "0071_group_reset_cutoff",
+        suspend_foreign_keys: &[],
         apply: migration_0071_group_reset_cutoff::apply,
     },
     Migration {
         version: 72,
         name: "0072_chat_list_pages",
+        suspend_foreign_keys: &[],
         apply: migration_0072_chat_list_pages::apply,
     },
     Migration {
         version: 73,
         name: "0073_message_draft_revisions",
+        suspend_foreign_keys: &[],
         apply: migration_0073_message_draft_revisions::apply,
     },
     Migration {
         version: 74,
         name: "0074_chat_list_invite_attention",
+        suspend_foreign_keys: &[],
         apply: migration_0074_chat_list_invite_attention::apply,
     },
     Migration {
         version: 75,
         name: "0075_user_blocks",
+        suspend_foreign_keys: &[],
         apply: migration_0075_user_blocks::apply,
     },
     Migration {
         version: 76,
         name: "0076_accepted_edits",
+        suspend_foreign_keys: &[],
         apply: migration_0076_accepted_edits::apply,
     },
     Migration {
         version: 77,
         name: "0077_avatar_cache",
+        suspend_foreign_keys: &[],
         apply: migration_0077_avatar_cache::apply,
     },
     Migration {
         version: 78,
         name: "0078_avatar_acquisition",
+        suspend_foreign_keys: &[],
         apply: migration_0078_avatar_acquisition::apply,
     },
     Migration {
         version: 79,
         name: "0079_content_reports",
+        suspend_foreign_keys: &[],
         apply: migration_0079_content_reports::apply,
     },
     Migration {
         version: 80,
         name: "0080_avatar_target_lookup",
+        suspend_foreign_keys: &[],
         apply: migration_0080_avatar_target_lookup::apply,
     },
     Migration {
         version: 81,
         name: "0081_attachment_history",
+        suspend_foreign_keys: &[],
         apply: migration_0081_attachment_history::apply,
     },
     Migration {
         version: 82,
         name: "0082_deletion_provenance",
+        suspend_foreign_keys: &[],
         apply: migration_0082_deletion_provenance::apply,
     },
     Migration {
         version: 83,
         name: "0083_attachment_acquisition",
+        suspend_foreign_keys: &[],
         apply: migration_0083_attachment_acquisition::apply,
     },
     Migration {
         version: 84,
         name: "0084_attachment_worker_demand",
+        suspend_foreign_keys: &[],
         apply: migration_0084_attachment_worker_demand::apply,
     },
     Migration {
         version: 85,
         name: "0085_attachment_partials",
+        suspend_foreign_keys: &[],
         apply: migration_0085_attachment_partials::apply,
     },
     Migration {
         version: 86,
         name: "0086_attachment_controls",
+        suspend_foreign_keys: &[],
         apply: migration_0086_attachment_controls::apply,
     },
     Migration {
         version: 87,
         name: "0087_attachment_automatic_history",
+        suspend_foreign_keys: &[],
         apply: migration_0087_attachment_automatic_history::apply,
     },
     Migration {
         version: 88,
         name: "0088_draft_attachment_descriptors",
+        suspend_foreign_keys: &[],
         apply: migration_0088_draft_attachment_descriptors::apply,
     },
     Migration {
         version: 89,
         name: "0089_local_submissions",
+        suspend_foreign_keys: &[],
         apply: migration_0089_local_submissions::apply,
     },
     Migration {
         version: 90,
         name: "0090_poll_response_edges",
+        suspend_foreign_keys: &[],
         apply: migration_0090_poll_response_edges::apply,
     },
     Migration {
         version: 91,
         name: "0091_account_local_identity",
+        suspend_foreign_keys: &[],
         apply: migration_0091_account_local_identity::apply,
     },
     Migration {
         version: 92,
         name: "0092_account_recovery_owner",
+        suspend_foreign_keys: &[],
         apply: migration_0092_account_recovery_owner::apply,
     },
     Migration {
         version: 93,
         name: "0093_recovery_route_snapshot",
+        suspend_foreign_keys: &[],
         apply: migration_0093_recovery_route_snapshot::apply,
     },
     Migration {
         version: 94,
         name: "0094_qualified_stall_observations",
+        suspend_foreign_keys: &[],
         apply: migration_0094_qualified_stall_observations::apply,
     },
     Migration {
         version: 95,
         name: "0095_recovery_comparison",
+        suspend_foreign_keys: &[],
         apply: migration_0095_recovery_comparison::apply,
     },
     Migration {
         version: 96,
         name: "0096_account_delivery_spill",
+        suspend_foreign_keys: &[],
         apply: migration_0096_account_delivery_spill::apply,
     },
     Migration {
         version: 97,
         name: "0097_loss_created_at_bound",
+        suspend_foreign_keys: &[],
         apply: migration_0097_loss_created_at_bound::apply,
     },
     Migration {
         version: 98,
         name: "0098_recovery_history_notices",
+        suspend_foreign_keys: &[],
         apply: migration_0098_recovery_history_notices::apply,
     },
     Migration {
         version: 99,
         name: "0099_attachment_preparation_deferrals",
+        suspend_foreign_keys: &[],
         apply: migration_0099_attachment_preparation_deferrals::apply,
     },
     Migration {
         version: 100,
         name: "0100_attachment_explicit_priority",
+        suspend_foreign_keys: &[],
         apply: migration_0100_attachment_explicit_priority::apply,
     },
     Migration {
         version: 101,
         name: "0101_outgoing_attachment_uploads",
+        suspend_foreign_keys: &[],
         apply: migration_0101_outgoing_attachment_uploads::apply,
     },
     Migration {
         version: 102,
         name: "0102_attachment_emoji_role",
+        suspend_foreign_keys: &[],
         apply: migration_0102_attachment_emoji_role::apply,
     },
     Migration {
         version: 103,
         name: "0103_outgoing_attachment_upload_bodies",
+        suspend_foreign_keys: &[],
         apply: migration_0103_outgoing_attachment_upload_bodies::apply,
     },
     Migration {
         version: 104,
         name: "0104_file_attachment_retention",
+        suspend_foreign_keys: &[],
         apply: migration_0104_file_attachment_retention::apply,
     },
     Migration {
         version: 105,
         name: "0105_file_attachment_partials",
+        suspend_foreign_keys:
+            crate::migrations::migration_0105_file_attachment_partials::SUSPEND_FOREIGN_KEYS,
         apply: migration_0105_file_attachment_partials::apply,
     },
     Migration {
         version: 106,
         name: "0106_retained_attachment_chunks",
+        suspend_foreign_keys: &[],
         apply: migration_0106_retained_attachment_chunks::apply,
     },
     Migration {
         version: 107,
-        name: "0107_chat_folder_inputs",
-        apply: migration_0107_chat_folder_inputs::apply,
+        name: "0107_moderation_report_outbox",
+        suspend_foreign_keys: &[],
+        apply: migration_0107_moderation_report_outbox::apply,
+    },
+    Migration {
+        version: 108,
+        name: "0108_chat_folder_inputs",
+        suspend_foreign_keys: &[],
+        apply: migration_0108_chat_folder_inputs::apply,
     },
 ];
 
+/// Test fixtures use the same default-registry entry point as production with observation disabled.
+#[cfg(test)]
 pub(crate) fn run_all(connection: &mut Connection) -> StorageResult<usize> {
-    run_with_summary(connection, MIGRATIONS)
+    run_all_observed(connection, None)
 }
 
 #[cfg(test)]
@@ -783,7 +910,30 @@ pub(crate) fn run(connection: &mut Connection, migrations: &[Migration]) -> Stor
     run_with_summary(connection, migrations).map(|_| ())
 }
 
+/// Run a registry with the same validation and transaction rules but no progress callback.
+#[cfg(test)]
 fn run_with_summary(connection: &mut Connection, migrations: &[Migration]) -> StorageResult<usize> {
+    run_with_summary_observed(connection, migrations, None)
+}
+
+/// Observe inspection and pending migration boundaries; already-recorded versions emit no apply events.
+pub(crate) fn run_all_observed(
+    connection: &mut Connection,
+    observer: Option<&dyn Fn(crate::StorageOpenProgress)>,
+) -> StorageResult<usize> {
+    run_with_summary_observed(connection, MIGRATIONS, observer)
+}
+/// Validate ledger history before any body runs, then report each migration's returned outcome.
+/// Observation faults cannot replace a storage error or allow a failed ledger entry to commit.
+fn run_with_summary_observed(
+    connection: &mut Connection,
+    migrations: &[Migration],
+    observer: Option<&dyn Fn(crate::StorageOpenProgress)>,
+) -> StorageResult<usize> {
+    crate::open_progress::observe(
+        observer,
+        crate::StorageOpenProgress::Phase(crate::StorageOpenPhase::MigrationInspection),
+    );
     ensure_migration_table(connection)?;
     ensure_ordered(migrations)?;
     reconcile_legacy_migration_names(connection, migrations)?;
@@ -800,7 +950,19 @@ fn run_with_summary(connection: &mut Connection, migrations: &[Migration]) -> St
                 )));
             }
             None => {
-                apply_migration(connection, migration)?;
+                crate::open_progress::observe(
+                    observer,
+                    crate::StorageOpenProgress::MigrationStarted(migration.version as u32),
+                );
+                let result = apply_migration(connection, migration);
+                crate::open_progress::observe(
+                    observer,
+                    crate::StorageOpenProgress::MigrationFinished {
+                        version: migration.version as u32,
+                        success: result.is_ok(),
+                    },
+                );
+                result?;
                 applied += 1;
             }
         }
@@ -945,19 +1107,88 @@ fn applied_name(connection: &Connection, version: i64) -> StorageResult<Option<S
         .storage()
 }
 
+/// Honor each migration's declared connection-local FK scope before BEGIN and validate it before ledger commit.
 fn apply_migration(connection: &mut Connection, migration: &Migration) -> StorageResult<()> {
-    let tx = connection.transaction().storage()?;
-    (migration.apply)(&tx)?;
-    tx.execute(
-        "INSERT INTO cgka_schema_migrations
-            (version, name, applied_at_unix_seconds)
-         VALUES (?1, ?2, CAST(strftime('%s', 'now') AS INTEGER))",
-        params![migration.version, migration.name],
-    )
-    .storage()?;
-    #[cfg(test)]
-    migration_crash_pause(migration.version);
-    tx.commit().storage()
+    let mut mode =
+        MigrationForeignKeys::new(connection, !migration.suspend_foreign_keys.is_empty())?;
+    let result = (|| {
+        let tx = mode.connection.transaction().storage()?;
+        (migration.apply)(&tx)?;
+        for table in migration.suspend_foreign_keys {
+            let violations: i64 = tx
+                .query_row(
+                    "SELECT count(*) FROM pragma_foreign_key_check(?1)",
+                    [table],
+                    |r| r.get(0),
+                )
+                .storage()?;
+            if violations != 0 {
+                return Err(StorageError::Backend(
+                    "migration would violate foreign keys".into(),
+                ));
+            }
+        }
+        tx.execute(
+            "INSERT INTO cgka_schema_migrations (version, name, applied_at_unix_seconds)
+             VALUES (?1, ?2, CAST(strftime('%s', 'now') AS INTEGER))",
+            params![migration.version, migration.name],
+        )
+        .storage()?;
+        #[cfg(test)]
+        migration_crash_pause(migration.version);
+        tx.commit().storage()
+    })();
+    let restored = mode.restore();
+    result.and(restored)
+}
+
+/// A panic or transaction error also restores the original connection setting.
+struct MigrationForeignKeys<'a> {
+    connection: &'a mut Connection,
+    restore_enabled: bool,
+}
+impl<'a> MigrationForeignKeys<'a> {
+    /// Suspend enabled enforcement for a declared migration scope before starting its transaction.
+    fn new(connection: &'a mut Connection, suspend: bool) -> StorageResult<Self> {
+        let enabled = suspend
+            && connection
+                .pragma_query_value(None, "foreign_keys", |r| r.get::<_, bool>(0))
+                .storage()?;
+        if enabled {
+            connection
+                .pragma_update(None, "foreign_keys", false)
+                .storage()?;
+        }
+        Ok(Self {
+            connection,
+            restore_enabled: enabled,
+        })
+    }
+    /// Restore and verify the original enabled setting after the transaction has committed or rolled back.
+    fn restore(&mut self) -> StorageResult<()> {
+        if self.restore_enabled {
+            self.connection
+                .pragma_update(None, "foreign_keys", true)
+                .storage()?;
+            let enabled = self
+                .connection
+                .pragma_query_value(None, "foreign_keys", |r| r.get::<_, bool>(0))
+                .storage()?;
+            if !enabled {
+                return Err(StorageError::Backend(
+                    "migration foreign keys could not be restored".into(),
+                ));
+            }
+            self.restore_enabled = false;
+        }
+        Ok(())
+    }
+}
+impl Drop for MigrationForeignKeys<'_> {
+    /// Make a best-effort restoration during unwinding; the transaction is dropped before this guard.
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
 }
 
 #[cfg(test)]
@@ -1199,6 +1430,7 @@ mod tests {
                 &Migration {
                     version: 93,
                     name: "0093_recovery_route_snapshot",
+                    suspend_foreign_keys: &[],
                     apply: interrupted
                 }
             )
@@ -1245,6 +1477,7 @@ mod tests {
                 &Migration {
                     version: 94,
                     name: "0094_qualified_stall_observations",
+                    suspend_foreign_keys: &[],
                     apply: interrupted_stall,
                 }
             )
@@ -1280,6 +1513,7 @@ mod tests {
                 &Migration {
                     version: 95,
                     name: "0095_recovery_comparison",
+                    suspend_foreign_keys: &[],
                     apply: interrupted_comparison,
                 }
             )
@@ -1535,6 +1769,7 @@ mod tests {
         let migration = Migration {
             version: 92,
             name: "0092_account_recovery_owner",
+            suspend_foreign_keys: &[],
             apply: fail_after_conversion,
         };
         assert!(apply_migration(&mut conn, &migration).is_err());
@@ -3476,46 +3711,55 @@ mod tests {
             Migration {
                 version: 1,
                 name: "0001_initial_schema",
+                suspend_foreign_keys: &[],
                 apply: migration_0001_initial_schema::apply,
             },
             Migration {
                 version: 2,
                 name: "0002_account_device_signers",
+                suspend_foreign_keys: &[],
                 apply: migration_0002_account_device_signers::apply,
             },
             Migration {
                 version: 3,
                 name: "0003_group_foreign_keys",
+                suspend_foreign_keys: &[],
                 apply: migration_0003_group_foreign_keys::apply,
             },
             Migration {
                 version: 4,
                 name: "0004_app_timeline",
+                suspend_foreign_keys: &[],
                 apply: migration_0004_app_timeline::apply,
             },
             Migration {
                 version: 5,
                 name: "0005_account_projection",
+                suspend_foreign_keys: &[],
                 apply: migration_0005_account_projection::apply,
             },
             Migration {
                 version: 6,
                 name: "0006_chat_list_projection",
+                suspend_foreign_keys: &[],
                 apply: migration_0006_chat_list_projection::apply,
             },
             Migration {
                 version: 7,
                 name: "0007_timeline_projection_indexes",
+                suspend_foreign_keys: &[],
                 apply: migration_0007_timeline_projection_indexes::apply,
             },
             Migration {
                 version: 8,
                 name: "0008_timeline_invalidation_status",
+                suspend_foreign_keys: &[],
                 apply: migration_0008_timeline_invalidation_status::apply,
             },
             Migration {
                 version: 9,
                 name: "0009_chat_list_avatar_url",
+                suspend_foreign_keys: &[],
                 apply: |tx| {
                     tx.execute_batch("ALTER TABLE chat_list_rows ADD COLUMN avatar_url TEXT;")
                         .storage()
@@ -3773,6 +4017,7 @@ mod tests {
             &[Migration {
                 version: 1,
                 name: "0001_initial_schema",
+                suspend_foreign_keys: &[],
                 apply: migration_0001_initial_schema::apply,
             }],
         )
@@ -3790,16 +4035,19 @@ mod tests {
                 Migration {
                     version: 1,
                     name: "0001_initial_schema",
+                    suspend_foreign_keys: &[],
                     apply: migration_0001_initial_schema::apply,
                 },
                 Migration {
                     version: 2,
                     name: "0002_account_device_signers",
+                    suspend_foreign_keys: &[],
                     apply: migration_0002_account_device_signers::apply,
                 },
                 Migration {
                     version: 3,
                     name: "0003_group_foreign_keys",
+                    suspend_foreign_keys: &[],
                     apply: migration_0003_group_foreign_keys::apply,
                 },
             ],
@@ -3816,6 +4064,7 @@ mod tests {
             Migration {
                 version: 1,
                 name: "0001_create_fixture",
+                suspend_foreign_keys: &[],
                 apply: |tx| {
                     tx.execute_batch(
                         "CREATE TABLE transform_fixture (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
@@ -3827,6 +4076,7 @@ mod tests {
             Migration {
                 version: 2,
                 name: "0002_transform_fixture",
+                suspend_foreign_keys: &[],
                 apply: |tx| {
                     let value: String = tx
                         .query_row(

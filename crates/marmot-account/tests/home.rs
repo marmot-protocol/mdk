@@ -1216,3 +1216,41 @@ fn onboarding_latest_evidence_and_recovery_journal_are_private() {
         }
     }
 }
+
+#[test]
+fn replaceable_record_floors_only_advance_and_survive_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(root.path());
+    let account = home.create_nostr_account().unwrap();
+    assert!(
+        home.replaceable_record_floors(&account.label)
+            .unwrap()
+            .is_empty()
+    );
+
+    home.advance_replaceable_record_floor(&account.label, 3, 20)
+        .unwrap();
+    home.advance_replaceable_record_floor(&account.label, 3, 10)
+        .unwrap();
+    home.advance_replaceable_record_floor(&account.label, 0, 5)
+        .unwrap();
+
+    let reopened = AccountHome::open(root.path());
+    let floors = reopened
+        .replaceable_record_floors(&account.account_id_hex)
+        .unwrap();
+    assert_eq!(floors.get(&3), Some(&20), "a floor never moves backwards");
+    assert_eq!(floors.get(&0), Some(&5));
+    #[cfg(unix)]
+    {
+        let mode = std::fs::metadata(
+            reopened
+                .account_dir(&account.label)
+                .join("replaceable-floors.json"),
+        )
+        .unwrap()
+        .permissions()
+        .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+}

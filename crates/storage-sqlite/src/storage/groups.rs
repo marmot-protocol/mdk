@@ -60,7 +60,7 @@ impl GroupStorage for SqliteAccountStorage {
 
     fn put_group(&self, group: &Group) -> StorageResult<()> {
         self.connection.with_transaction(|| {
-            let conn = self.lock()?;
+            let mut conn = self.lock()?;
             conn.execute_cached(
                 "INSERT INTO cgka_groups (id, epoch, record)
                  VALUES (?1, ?2, ?3)
@@ -74,7 +74,14 @@ impl GroupStorage for SqliteAccountStorage {
                 ],
             )
             .storage()?;
-            crate::chat_list::folders::replace_roster(&conn, group)
+            // The group-write trigger already retained roster work. An error in this
+            // disposable projection must roll back only its own partial writes.
+            let mut projection = conn.savepoint().storage()?;
+            if crate::chat_list::folders::replace_roster(&projection, group).is_err() {
+                projection.rollback().storage()?;
+            }
+            projection.commit().storage()?;
+            Ok(())
         })
     }
 
@@ -231,6 +238,61 @@ mod tests {
     };
     use cgka_traits::types::{EpochId, MemberId};
     use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
+
+    #[test]
+    fn folder_projection_failure_retains_authoritative_group_and_rebuild_work() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mut group = sample_group(gid(1), 0, 0);
+        store.put_group(&group).unwrap();
+        let old_members = group.members.len() as i64;
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_folder_projection BEFORE INSERT ON chat_folder_members
+             BEGIN SELECT RAISE(ABORT, 'injected disposable projection failure'); END;",
+            )
+            .unwrap();
+        group.epoch = EpochId(1);
+        group.members.push(cgka_traits::group::Member {
+            id: MemberId::new(vec![77; 32]),
+            credential: vec![],
+        });
+        store.put_group(&group).unwrap();
+        assert_eq!(store.get_group(&group.id).unwrap(), group);
+        {
+            let conn = store.lock().unwrap();
+            let retained: i64 = conn
+                .query_row(
+                    "SELECT member_count FROM chat_folder_rosters WHERE group_id=?1",
+                    [group.id.as_slice()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(retained, old_members, "partial roster writes rolled back");
+            let work: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM chat_folder_roster_work WHERE group_id=?1",
+                    [group.id.as_slice()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(work, 1);
+            conn.execute_batch("DROP TRIGGER fail_folder_projection")
+                .unwrap();
+        }
+        assert!(!store.prepare_chat_folder_rosters().unwrap());
+        let rebuilt: i64 = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT member_count FROM chat_folder_rosters WHERE group_id=?1",
+                [group.id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rebuilt, old_members + 1);
+    }
 
     #[test]
     fn list_group_records_returns_every_stored_record() {

@@ -2,6 +2,37 @@ use super::*;
 use crate::SqlCipherKey;
 
 #[test]
+fn restored_orphan_can_refresh_display_without_certifying_unknown_folder_text() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "11");
+    let input = store.chat_presentation_input("11").unwrap().unwrap();
+    // A raw restoration can temporarily retain a presentation row without its source.
+    store
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF; DELETE FROM account_groups WHERE group_id_hex='11';
+         PRAGMA foreign_keys=ON;",
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .store_chat_presentation(&input, &value("bb", "Peer", 1))
+            .unwrap(),
+        ChatPresentationWrite::Applied,
+    );
+    let (title, description): (Option<String>, Option<String>) = store.lock().unwrap().query_row(
+        "SELECT folder_title_fold,folder_description_fold FROM chat_list_rows WHERE group_id_hex='11'",
+        [], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!(title.as_deref(), Some("peer"));
+    assert!(
+        description.is_none(),
+        "unknown metadata keeps folder capture fenced"
+    );
+}
+
+#[test]
 fn presented_rows_expose_draft_versions_for_identical_edits_and_deletion() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     seed(&store, "11");

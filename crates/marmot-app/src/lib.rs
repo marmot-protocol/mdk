@@ -56,8 +56,7 @@ use marmot_account::{
     TransportRoutingPolicy,
 };
 use nostr_sdk::prelude::{
-    Client as NostrSdkClient, EventBuilder, FinalizeUnsignedEvent, Kind, PublicKey, Tag,
-    Timestamp as NostrTimestamp,
+    EventBuilder, FinalizeUnsignedEvent, Kind, PublicKey, Tag, Timestamp as NostrTimestamp,
 };
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -81,6 +80,7 @@ pub use user_blocks::{BlockListSnapshot, BlockedUser};
 mod agent_streams;
 mod app_telemetry;
 mod collector_host_safety;
+mod network_proxy;
 pub mod product_analytics;
 pub use product_analytics::*;
 mod audit_log;
@@ -110,6 +110,13 @@ mod profile_pseudonyms;
 pub use media::MediaDownloadBenchmarkTransport;
 mod audit_export_lifecycle;
 mod messages;
+mod moderation_reports;
+pub use moderation_reports::{
+    MODERATION_REPORT_EXPLANATION_MAX_CHARS, MODERATION_REPORT_IDEMPOTENCY_WINDOW,
+    MODERATION_REPORT_LABEL_NAMESPACE, MODERATION_REPORT_RATE_LIMIT, MODERATION_REPORT_RATE_WINDOW,
+    ModerationReportConfig, ModerationReportOrigin, ModerationReportOutcome,
+    ModerationReportRetrySummary, ModerationReportStatus,
+};
 mod nostr_secret;
 mod nostr_verification;
 mod notifications;
@@ -120,6 +127,10 @@ mod relay_telemetry_export;
 mod root_runtime_lease;
 mod runtime;
 mod sqlcipher;
+mod startup_diagnostics;
+pub use startup_diagnostics::{
+    NativeStartupObservation, NativeStartupOutcome, NativeStartupSnapshot, NativeStartupStage,
+};
 #[cfg(feature = "test-policy-overrides")]
 mod test_support;
 
@@ -284,7 +295,8 @@ pub use storage_sqlite::{
 };
 pub use transport_nostr_adapter::{
     DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics, RelayDeliverySpread,
-    RelayDeliveryStats, RelayLabelResolution, RelayLatencyStats, RelaySyncSnapshot,
+    RelayDeliveryStats, RelayLabelResolution, RelayLatencyStats, RelayRefusalStats,
+    RelaySyncSnapshot, SubscriptionRefusalDisposition, SubscriptionRouteKind,
 };
 
 /// Canonical group-create result at the host response boundary.
@@ -468,6 +480,7 @@ type LegacyProjectionOpenHook = Arc<dyn Fn() + Send + Sync>;
 #[derive(Clone)]
 pub struct MarmotApp {
     block_list_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    moderation_reports: Arc<moderation_reports::ModerationReportState>,
     pub(crate) block_list_updates: Arc<tokio::sync::watch::Sender<u64>>,
     root: PathBuf,
     /// Present for exclusive-root entry points. Every clone shares this cell,
@@ -527,12 +540,16 @@ pub struct MarmotApp {
     chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
     audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
     product_analytics: ProductAnalytics,
+    startup_diagnostics: startup_diagnostics::NativeStartupDiagnostics,
     external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
     /// One signer-bound publisher per account. Setup publishes and the managed
     /// account worker share this client so the worker can reuse the same relay
     /// pool instead of constructing another TCP/TLS/WebSocket stack.
     account_publish_clients: Arc<Mutex<HashMap<String, Arc<dyn NostrRelayClient>>>>,
     public_indexer_copy_tasks: Arc<Mutex<PublicIndexerCopyTasks>>,
+    /// In-memory view of the persisted per-kind authoring floors; see
+    /// `sign_replaceable_identity_event`.
+    replaceable_identity_created_at: Arc<Mutex<HashMap<(String, u64), u64>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -606,6 +623,8 @@ pub(crate) struct GeneratedAccountBootstrapPublication {
     pub relay_and_follow_duration: Duration,
     pub default_profile_duration: Duration,
     pub indexer_copy: Option<PublicIndexerCopy>,
+    /// The published profile, stamped with its signed kind-0 `created_at`.
+    pub profile: UserProfileMetadata,
 }
 
 pub(crate) struct PublicIndexerCopy {
@@ -645,6 +664,103 @@ impl PublicIndexerCopy {
         )
         .await;
     }
+}
+
+/// Background completion for replaceable identity records (kind 0, kind 3,
+/// relay lists) saved with a one-acknowledgement quorum. Reaching the quorum
+/// aborts sends still in flight, and a relay left unsent keeps serving the
+/// previous version to every reader that queries it (mdk#2216). Each
+/// cancelled relay gets one bounded send of the identical signed event after
+/// the save has already returned.
+pub(crate) struct QuorumCancelledDelivery {
+    relay_client: Arc<dyn NostrRelayClient>,
+    account_id: MemberId,
+    requests: Vec<NostrEventPublishRequest>,
+}
+
+impl QuorumCancelledDelivery {
+    pub(crate) fn new(relay_client: Arc<dyn NostrRelayClient>, account_id: MemberId) -> Self {
+        Self {
+            relay_client,
+            account_id,
+            requests: Vec::new(),
+        }
+    }
+
+    /// Queue `event` for every attempted endpoint the quorum outcome neither
+    /// accepted nor reported as failed. A reported failure already used the
+    /// transport's own retries; only cancellation left a relay unattempted.
+    pub(crate) fn add(
+        &mut self,
+        event: &NostrTransportEvent,
+        attempted: &[TransportEndpoint],
+        outcome: &transport_nostr_adapter::NostrPublishOutcome,
+    ) {
+        // Re-signing would create a different event, not complete this one.
+        if event.sig.is_none() {
+            debug_assert!(false, "quorum completion requires a pre-signed event");
+            return;
+        }
+        let mut settled = outcome
+            .accepted
+            .iter()
+            .map(|receipt| relay_endpoint_key(&receipt.endpoint))
+            .chain(
+                outcome
+                    .failed
+                    .iter()
+                    .map(|failure| relay_endpoint_key(&failure.endpoint)),
+            )
+            .collect::<HashSet<_>>();
+        for endpoint in attempted {
+            if settled.insert(relay_endpoint_key(endpoint)) {
+                self.requests.push(NostrEventPublishRequest {
+                    endpoints: vec![endpoint.clone()],
+                    event: event.clone(),
+                    required_acks: 1,
+                });
+            }
+        }
+    }
+
+    async fn run(self) {
+        let outcomes = self
+            .relay_client
+            .publish_events_for_account(&self.account_id, &self.requests)
+            .await;
+        let delivered = outcomes
+            .iter()
+            .filter(|outcome| {
+                outcome
+                    .as_ref()
+                    .is_ok_and(|outcome| !outcome.accepted.is_empty())
+            })
+            .count();
+        let undelivered = self.requests.len().saturating_sub(delivered);
+        if undelivered == 0 {
+            tracing::debug!(
+                target: "marmot_app::directory",
+                method = "complete_quorum_cancelled_delivery",
+                delivered,
+                "replaceable identity records reached quorum-cancelled relays"
+            );
+        } else {
+            tracing::warn!(
+                target: "marmot_app::directory",
+                method = "complete_quorum_cancelled_delivery",
+                delivered,
+                undelivered,
+                "replaceable identity records did not reach every quorum-cancelled relay"
+            );
+        }
+    }
+}
+
+/// Compare relay endpoints the way the transport reports them in receipts.
+fn relay_endpoint_key(endpoint: &TransportEndpoint) -> String {
+    nostr::prelude::RelayUrl::parse(endpoint.as_str())
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| endpoint.0.clone())
 }
 
 /// A relay list the account is missing. Typed so FFI clients can localize
@@ -1518,6 +1634,7 @@ impl MarmotApp {
             config,
             directory_sync: Arc::new(RwLock::new(None)),
             block_list_locks: Arc::default(),
+            moderation_reports: Arc::default(),
             block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
@@ -1549,9 +1666,11 @@ impl MarmotApp {
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             product_analytics,
+            startup_diagnostics: Default::default(),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
+            replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1609,6 +1728,7 @@ impl MarmotApp {
             config,
             directory_sync: Arc::new(RwLock::new(None)),
             block_list_locks: Arc::default(),
+            moderation_reports: Arc::default(),
             block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
@@ -1640,9 +1760,11 @@ impl MarmotApp {
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
             product_analytics,
+            startup_diagnostics: Default::default(),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
+            replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1659,6 +1781,7 @@ impl MarmotApp {
         account_home: AccountHome,
         config: MarmotAppConfig,
     ) -> Result<Self, AppError> {
+        network_proxy::socks5_proxy().map_err(network_proxy::config_error)?;
         let root = root.as_ref().to_path_buf();
         let lease = MarmotRootRuntimeLease::try_acquire(&root)?;
         audit_log::cleanup_legacy_audit_logs(&root);
@@ -2183,15 +2306,13 @@ impl MarmotApp {
             ),
             required_acks: 1,
         });
+        // Sign before sending so indexer copies and quorum completion carry
+        // the exact events the operational relays acknowledged.
         let nostr_signer = signer.as_nostr_signer();
-        if !indexer_endpoints.is_empty() {
-            for request in requests
-                .iter_mut()
-                .filter(|request| request.event.kind != KIND_NOSTR_CONTACT_LIST)
-            {
-                request.event =
-                    sign_account_publication_event(nostr_signer.clone(), &request.event).await?;
-            }
+        for request in &mut requests {
+            request.event = self
+                .sign_replaceable_identity_event(label, nostr_signer.clone(), &request.event)
+                .await?;
         }
         let relay_client = self.relay_client_for_account_id(&account.account_id_hex, nostr_signer);
         let record_kinds = [
@@ -2224,14 +2345,30 @@ impl MarmotApp {
             .max()
             .unwrap_or_default();
         let default_profile_duration = batch.request_durations[3];
-        let mut outcomes = outcomes.into_iter();
-        for record_kind in record_kinds {
-            let outcome = outcomes.next().expect("checked bootstrap outcome count");
-            if outcome?.accepted.is_empty() {
-                return Err(AppError::Publish(format!(
-                    "relay acknowledged zero events for bootstrap record {record_kind}"
-                )));
+        // Every record was already sent. Complete the acknowledged ones even
+        // when another record fails, then report the first failure.
+        let mut completion = QuorumCancelledDelivery::new(relay_client.clone(), account_id.clone());
+        let mut failure = None;
+        for ((record_kind, outcome), request) in
+            record_kinds.into_iter().zip(outcomes).zip(&requests)
+        {
+            match outcome {
+                Ok(outcome) if !outcome.accepted.is_empty() => {
+                    completion.add(&request.event, &request.endpoints, &outcome);
+                }
+                Ok(_) => {
+                    failure.get_or_insert(AppError::Publish(format!(
+                        "relay acknowledged zero events for bootstrap record {record_kind}"
+                    )));
+                }
+                Err(error) => {
+                    failure.get_or_insert(error.into());
+                }
             }
+        }
+        self.spawn_quorum_cancelled_delivery(completion);
+        if let Some(failure) = failure {
+            return Err(failure);
         }
         let relays = bootstrap
             .default_relays
@@ -2277,7 +2414,16 @@ impl MarmotApp {
                     .collect(),
             },
         )?;
-        self.remember_directory_profile(&account.account_id_hex, profile)?;
+        // Cache the signed kind-0 timestamp: retries can author it ahead of the
+        // clock, and a reopened app recovers its timestamp floor from here.
+        let mut profile = profile.clone();
+        if let Some(request) = requests
+            .iter()
+            .find(|request| request.event.kind == KIND_NOSTR_METADATA)
+        {
+            profile.created_at = request.event.created_at;
+        }
+        self.remember_directory_profile(&account.account_id_hex, &profile)?;
         let indexer_events = requests
             .into_iter()
             .filter(|request| request.event.kind != KIND_NOSTR_CONTACT_LIST)
@@ -2293,6 +2439,7 @@ impl MarmotApp {
                 indexer_events,
                 indexer_endpoints,
             ),
+            profile,
         })
     }
 
@@ -2342,7 +2489,10 @@ impl MarmotApp {
             publish_endpoints: operational.clone(),
         }
         .to_event()?;
-        events.push(sign_account_publication_event(nostr_signer.clone(), &nip65_event).await?);
+        events.push(
+            self.sign_replaceable_identity_event(label, nostr_signer.clone(), &nip65_event)
+                .await?,
+        );
         let inbox_event = NostrAccountRelayListPublication {
             account_id: account_id.clone(),
             list_kind: NostrAccountRelayListKind::Inbox,
@@ -2356,14 +2506,20 @@ impl MarmotApp {
             publish_endpoints: operational,
         }
         .to_event()?;
-        events.push(sign_account_publication_event(nostr_signer.clone(), &inbox_event).await?);
+        events.push(
+            self.sign_replaceable_identity_event(label, nostr_signer.clone(), &inbox_event)
+                .await?,
+        );
         let profile_event = NostrTransportEvent::new_unsigned(
             account.account_id_hex.clone(),
             KIND_NOSTR_METADATA,
             Vec::new(),
             serde_json::to_string(&directory::records::profile_content_json(profile))?,
         );
-        events.push(sign_account_publication_event(nostr_signer.clone(), &profile_event).await?);
+        events.push(
+            self.sign_replaceable_identity_event(label, nostr_signer.clone(), &profile_event)
+                .await?,
+        );
         let relay_client = self.relay_client_for_account_id(&account.account_id_hex, nostr_signer);
         Ok(PublicIndexerCopy::new(
             relay_client,
@@ -2692,11 +2848,12 @@ impl MarmotApp {
                 required_acks: 1,
             });
         }
-        if !indexer_endpoints.is_empty() {
-            for request in &mut requests {
-                request.event =
-                    sign_account_publication_event(nostr_signer.clone(), &request.event).await?;
-            }
+        // Sign before sending so indexer copies and quorum completion carry
+        // the exact events the operational relays acknowledged.
+        for request in &mut requests {
+            request.event = self
+                .sign_replaceable_identity_event(label, nostr_signer.clone(), &request.event)
+                .await?;
         }
         let outcomes = relay_client
             .publish_events_for_account(&account_id, &requests)
@@ -2706,14 +2863,28 @@ impl MarmotApp {
                 "relay-list publication returned incomplete outcomes".into(),
             ));
         }
-        let mut outcomes = outcomes.into_iter();
-        for _ in list_kinds {
-            let outcome = outcomes.next().expect("checked relay-list outcome count");
-            if outcome?.accepted.is_empty() {
-                return Err(AppError::Publish(
-                    "relay acknowledged zero account relay-list events".to_owned(),
-                ));
+        // Every record was already sent. Complete the acknowledged ones even
+        // when another record fails, then report the first failure.
+        let mut completion = QuorumCancelledDelivery::new(relay_client.clone(), account_id.clone());
+        let mut failure = None;
+        for (outcome, request) in outcomes.into_iter().zip(&requests) {
+            match outcome {
+                Ok(outcome) if !outcome.accepted.is_empty() => {
+                    completion.add(&request.event, &request.endpoints, &outcome);
+                }
+                Ok(_) => {
+                    failure.get_or_insert(AppError::Publish(
+                        "relay acknowledged zero account relay-list events".to_owned(),
+                    ));
+                }
+                Err(error) => {
+                    failure.get_or_insert(error.into());
+                }
             }
+        }
+        self.spawn_quorum_cancelled_delivery(completion);
+        if let Some(failure) = failure {
+            return Err(failure);
         }
 
         // The signed replaceable events above are the authoritative effect of
@@ -2912,6 +3083,74 @@ impl MarmotApp {
 
     pub(crate) fn spawn_public_indexer_copy(&self, copy: PublicIndexerCopy) {
         let account_id_hex = hex::encode(copy.account_id.as_slice());
+        self.spawn_account_publication_copy(account_id_hex, copy.run());
+    }
+
+    /// Sign a replaceable identity record (kind 0, kind 3, relay lists) with a
+    /// `created_at` strictly after the previous version authored for the same
+    /// account and kind. Relays keep the lower event id on a timestamp tie, so
+    /// a same-second older version delivered late by quorum completion could
+    /// otherwise replace a newer save. The floor is persisted before signing,
+    /// so it survives a restart even when the publication then fails.
+    pub(crate) async fn sign_replaceable_identity_event(
+        &self,
+        account_ref: &str,
+        signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
+        event: &NostrTransportEvent,
+    ) -> Result<NostrTransportEvent, AppError> {
+        let created_at = self.reserve_replaceable_identity_created_at(account_ref, event)?;
+        let event = NostrTransportEvent::new_unsigned_at(
+            event.pubkey.clone(),
+            event.kind,
+            event.tags.clone(),
+            event.content.clone(),
+            created_at,
+        );
+        sign_account_publication_event(signer, &event).await
+    }
+
+    fn reserve_replaceable_identity_created_at(
+        &self,
+        account_ref: &str,
+        event: &NostrTransportEvent,
+    ) -> Result<u64, AppError> {
+        let kind = event.kind;
+        let mut latest = self
+            .replaceable_identity_created_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (event.pubkey.clone(), kind);
+        let floor = match latest.get(&key) {
+            Some(floor) => *floor,
+            None => self
+                .account_home()
+                .replaceable_record_floors(account_ref)?
+                .get(&kind)
+                .copied()
+                .unwrap_or(0),
+        };
+        let created_at = event.created_at.max(floor.saturating_add(1));
+        self.account_home()
+            .advance_replaceable_record_floor(account_ref, kind, created_at)?;
+        latest.insert(key, created_at);
+        Ok(created_at)
+    }
+
+    pub(crate) fn spawn_quorum_cancelled_delivery(&self, delivery: QuorumCancelledDelivery) {
+        if delivery.requests.is_empty() {
+            return;
+        }
+        let account_id_hex = hex::encode(delivery.account_id.as_slice());
+        self.spawn_account_publication_copy(account_id_hex, delivery.run());
+    }
+
+    /// Track a best-effort copy of already-acknowledged public records so
+    /// account removal and shutdown abort it with the indexer copies.
+    fn spawn_account_publication_copy(
+        &self,
+        account_id_hex: String,
+        copy: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
         let mut tasks = self
             .public_indexer_copy_tasks
             .lock()
@@ -2924,7 +3163,7 @@ impl MarmotApp {
         }
         let handles = tasks.by_account.entry(account_id_hex).or_default();
         handles.retain(|handle| !handle.is_finished());
-        handles.push(tokio::spawn(copy.run()));
+        handles.push(tokio::spawn(copy));
     }
 
     pub(crate) fn abort_public_indexer_copies_for_account(
@@ -6108,9 +6347,26 @@ impl MarmotApp {
         self.audit_export_lifecycle.admit(attempt, work).transpose()
     }
 
+    /// Observe account-open admission before analytics or cache locks; preserve the original storage result.
     fn account_storage(&self, label: &str) -> Result<SqliteAccountStorage, AppError> {
+        let probe = self
+            .startup_diagnostics
+            .observe_pending_open(NativeStartupStage::ProductAnalyticsAdmission);
+        let result = self.account_storage_observed(label, &probe);
+        probe.finish(result.is_ok());
+        result
+    }
+
+    /// Reuse the caller's scope across analytics admission and native open work; the caller owns retirement.
+    fn account_storage_observed(
+        &self,
+        label: &str,
+        probe: &startup_diagnostics::NativeStartupProbe,
+    ) -> Result<SqliteAccountStorage, AppError> {
+        probe.phase(NativeStartupStage::ProductAnalyticsAdmission);
         let permit = self.product_analytics.permit();
-        let result = self.account_storage_unobserved(label);
+        probe.phase(NativeStartupStage::AccountStorageCache);
+        let result = self.account_storage_unobserved(label, probe);
         if let Err(error) = &result {
             self.product_analytics
                 .storage_failure(permit.as_ref(), error);
@@ -6118,7 +6374,12 @@ impl MarmotApp {
         result
     }
 
-    fn account_storage_unobserved(&self, label: &str) -> Result<SqliteAccountStorage, AppError> {
+    /// Reuse a cached store or perform the guarded key/open path, reporting only fixed phases to the probe.
+    fn account_storage_unobserved(
+        &self,
+        label: &str,
+        probe: &startup_diagnostics::NativeStartupProbe,
+    ) -> Result<SqliteAccountStorage, AppError> {
         self.ensure_storage_open("account storage")?;
         if let Some(storage) = self
             .account_storages
@@ -6129,6 +6390,8 @@ impl MarmotApp {
         {
             return Ok(storage);
         }
+        probe.record_history();
+        probe.phase(NativeStartupStage::StorageAdmission);
         let _lifecycle = self.begin_storage_open("account storage")?;
         let _span = tracing::debug_span!(
             target: "marmot_app::storage",
@@ -6138,6 +6401,7 @@ impl MarmotApp {
         .entered();
         let path = self.account_storage_path(label);
         let lock = sqlcipher::database_open_lock(&path);
+        probe.phase(NativeStartupStage::DatabaseOpenLock);
         let database = lock.lock();
         // Another opener may have filled the cache while we waited. Hold the
         // database guard through key selection, migrations and publication.
@@ -6150,11 +6414,15 @@ impl MarmotApp {
         {
             return Ok(storage);
         }
+        probe.phase(NativeStartupStage::AccountResolution);
         let account = self.account_home().account(label)?;
         let key = if account.local_signing {
+            probe.phase(NativeStartupStage::SigningKeys);
             let keys = self.account_home().load_signing_keys(label)?;
+            probe.phase(NativeStartupStage::KeyDerivation);
             self.sqlcipher_key_locked(label, &keys, &database, SqlcipherDatabaseKind::Session)?
         } else {
+            probe.phase(NativeStartupStage::ExternalDatabaseSecret);
             self.external_sqlcipher_key(
                 label,
                 &account.account_id_hex,
@@ -6165,7 +6433,31 @@ impl MarmotApp {
         let migration_observation =
             self.product_analytics
                 .begin(ProductFamily::Storage, "migration", ProductUnit::Attempt);
-        let opened = SqliteAccountStorage::open_encrypted(&path, &key);
+        probe.phase(NativeStartupStage::EncryptedStoreOpen);
+        let observer = |progress| {
+            use storage_sqlite::{StorageOpenPhase as Phase, StorageOpenProgress as Progress};
+            match progress {
+                Progress::Phase(phase) => probe.phase(match phase {
+                    Phase::CipherConfiguration => NativeStartupStage::CipherConfiguration,
+                    Phase::CipherKeyApplication => NativeStartupStage::CipherKeyApplication,
+                    Phase::OperationalPragmas => NativeStartupStage::OperationalPragmas,
+                    Phase::MigrationInspection => NativeStartupStage::MigrationInspection,
+                }),
+                Progress::MigrationStarted(version) => {
+                    probe.progress(NativeStartupStage::MigrationApply, Some(version), false)
+                }
+                Progress::MigrationFinished { version, success } => probe.progress(
+                    if success {
+                        NativeStartupStage::MigrationInspection
+                    } else {
+                        NativeStartupStage::MigrationApply
+                    },
+                    Some(version),
+                    success,
+                ),
+            }
+        };
+        let opened = SqliteAccountStorage::open_encrypted_observed(&path, &key, &observer);
         if let Some(observation) = migration_observation {
             match &opened {
                 Ok(storage) if storage.migration_summary().0 > 0 => {
@@ -6831,7 +7123,7 @@ impl MarmotApp {
         clients
             .entry(account_id_hex.to_owned())
             .or_insert_with(|| {
-                let client = NostrSdkClient::builder()
+                let client = network_proxy::nostr_builder()
                     .authenticator(nostr_sdk::authenticator::SignerAuthenticator::new(
                         transport_nostr_peeler::SdkSigner(signer.clone()),
                     ))

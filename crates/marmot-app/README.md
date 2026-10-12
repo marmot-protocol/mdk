@@ -8,6 +8,7 @@ the generic account, session, and engine crates. Read this if you are building a
 ## Contents
 
 - [Runtime overview](#runtime-overview)
+- [SOCKS5 routing](#socks5-routing)
 - [Local storage](#local-storage)
 - [Account bootstrap and KeyPackages](#account-bootstrap-and-keypackages)
 - [User directory and search](#user-directory-and-search)
@@ -19,10 +20,13 @@ the generic account, session, and engine crates. Read this if you are building a
 - [History may be incomplete notices](#history-may-be-incomplete-notices)
 - [User blocking](#user-blocking)
 - [Group reports and admin deletion](#group-reports-and-admin-deletion)
+- [Moderation reports to the operator](#moderation-reports-to-the-operator)
 - [Audit v5 Welcome evidence](#audit-v5-welcome-evidence)
 - [Run the tests](#run-the-tests)
 
 ## Runtime overview
+The opt-in native startup recorder distinguishes task dispatch, account/key lookup, store-opening waits, SQLCipher phases, schema inspection and each migration transaction. `set_startup_diagnostics_enabled` and `startup_diagnostics_snapshot` change only bounded process-local diagnostic memory. Snapshots use their own short lock and remain readable while an account open is blocked; they do not open storage or query the keystore. Successful cached attachment reads and account-store lookups omit history events so ordinary reads preserve first-open evidence. An attachment read shares one active scope across queueing, account opening and result delivery; cache/admission waits remain visible, and misses, failures or unwinds retain evidence. Dropping its host future leaves running native work observable until the worker exits. Normal construction leaves capture disabled. Host exports must be explicitly requested and serialized within a separate size bound.
+
 
 `MarmotAppRuntime` owns restored signing accounts, a shared relay plane, live per-account workers, runtime event hubs,
 and the shared agent stream watch manager. The relay plane also owns shared directory discovery fetches for relay lists,
@@ -95,6 +99,33 @@ database and releases file locks; `shutdown` alone does not. See
 
 For where the code lives (`src/runtime/`, `src/client/`, `src/directory/`, `src/media/`, and so on) see
 [`AGENTS.md`](AGENTS.md).
+
+## SOCKS5 routing
+
+Set the process environment before the first network-policy use (including runtime or NIP-46 client construction):
+
+| Variable | Value |
+| --- | --- |
+| `WN_SOCKS5_PROXY` | Numeric IP address and nonzero port, such as `127.0.0.1:9050` or `[::1]:9050`. |
+| `WN_SOCKS5_USERNAME` | Optional SOCKS5 username. |
+| `WN_SOCKS5_PASSWORD` | Optional SOCKS5 password. |
+
+Unset or empty values select direct routing when all three variables are empty. With a proxy endpoint, leave both
+credential variables empty for anonymous SOCKS5, or supply both for RFC 1929 username/password authentication. Each
+credential must contain 1 to 255 UTF-8 bytes without NUL. Partial credentials, credentials without an endpoint,
+hostnames, URL-form endpoints, and zero ports are rejected. The first use snapshots the policy for the entire process,
+including invalid configuration. Later environment changes, including clearing these variables, do not change routing
+or unblock an invalid policy. Restart the process to apply a different configuration.
+
+The policy covers relay publishing, account receive/history pools, directory relay clients (including completion-aware
+reads), C NIP-46 signer sessions, and the shared HTTP clients for media, Open Ranking, and collectors (including audit
+uploads). Completion-aware reads retain pre-admission wire-event counts under the proxy transport. Relay hostnames are
+resolved by the proxy. HTTP clients still resolve and validate destinations locally, then send the pinned IP through
+SOCKS5 while retaining the original HTTP Host header and TLS identity. The proxy is an explicitly trusted egress.
+
+`ALL_PROXY` cannot replace this policy and `NO_PROXY` cannot bypass it. Invalid configuration, connection failure,
+and authentication rejection do not fall back to direct connections. QUIC agent preview publishing and watching
+are unavailable with SOCKS5 enabled because this TCP proxy path cannot carry QUIC.
 
 ## Local storage
 
@@ -438,6 +469,23 @@ deletion while retained.
 
 See [the implementation contract](../../docs/marmot-architecture/overview/content-moderation.md) for source-state
 authorization, durable recovery, retention, and client compatibility.
+
+## Moderation reports to the operator
+
+`MarmotAppRuntime::submit_moderation_report` privately reports an account to the deployment's moderation team. It
+sends a kind-1984 NIP-56 rumor, sealed by the account key and gift-wrapped per NIP-59 to the configured reports key.
+The rumor carries the reported key, its report type, a `chat.whitenoise.report` origin label (`report` or `block`) and
+the optional explanation. It never carries conversation identifiers. This channel is additive: `report_message` and
+the rest of group moderation are unchanged.
+
+The destination is `MarmotAppConfig::moderation_report_config` or `MarmotApp::set_moderation_report_config`. An
+invalid key or any unsafe relay rejects it whole. Wraps go only to the configured relays, through a publisher that
+never authenticates as the account. The signed wrap is staged in the account database first. `AcceptedPending` and
+`CompletionUnknown` outcomes are retried in the background after `catch_up_accounts`, or on demand with
+`retry_pending_moderation_reports`. Repeats within 10 minutes return the existing outcome. Each account may send 20
+reports per hour. Sign-out and wipe delete the account's queued reports.
+
+See [moderation reports](../../docs/marmot-architecture/moderation-reports.md) for the wire format and reader steps.
 
 ## Audit v5 Welcome evidence
 

@@ -1030,6 +1030,17 @@ async fn wait_for_runtime_shutdown(stopping: &mut watch::Receiver<bool>) {
     }
 }
 
+async fn wait_for_account_reset(resets: &mut broadcast::Receiver<String>, label: &str) {
+    loop {
+        match resets.recv().await {
+            Ok(reset) if reset == label => return,
+            // A lost teardown signal is terminal, never a reason to rebind a handle.
+            Err(_) => return,
+            _ => {}
+        }
+    }
+}
+
 fn runtime_shutdown_requested(stopping: &watch::Receiver<bool>) -> bool {
     *stopping.borrow()
 }
@@ -1801,7 +1812,9 @@ impl MarmotAppRuntime {
     }
 
     pub async fn catch_up_accounts(&self) -> Result<(), AppError> {
-        self.accounts.catch_up_accounts().await.map(|_| ())
+        let result = self.accounts.catch_up_accounts().await.map(|_| ());
+        self.spawn_moderation_report_retries();
+        result
     }
 
     /// Notify every running account worker that the host has observed usable
@@ -1816,7 +1829,9 @@ impl MarmotAppRuntime {
     /// workers were considered. Used by reconciliation drivers that expose
     /// aggregate per-pass work telemetry (mdk#1380).
     pub async fn catch_up_accounts_reporting(&self) -> Result<CatchUpAccountsSummary, AppError> {
-        self.accounts.catch_up_accounts().await
+        let result = self.accounts.catch_up_accounts().await;
+        self.spawn_moderation_report_retries();
+        result
     }
 
     /// Explicitly repair a potentially incomplete incremental history.
@@ -4472,18 +4487,15 @@ impl MarmotAppRuntime {
         {
             profile = merge_user_profile_update(current, profile);
         }
-        // Stamp the just-published profile with the current time before caching
-        // it. The published kind-0 event is authored with `now`, so the cached
-        // own-account entry must carry a matching `created_at`. Callers that
-        // arrive via FFI hardcode `created_at == 0` (see
-        // `UserProfileMetadataFfi -> UserProfileMetadata`), and a zero stamp
-        // loses to *any* fetched kind-0 in `remember_directory_profile_if_newer`
-        // (it only retains the cache when `cached.created_at > fetched`). That
-        // let a stale pre-edit copy served by a lagging relay revert the local
-        // edit on the next directory refresh. Stamping `now` protects the edit
-        // against relay copies published before this moment.
+        // Cache the published event's own `created_at`. FFI callers pass
+        // `created_at == 0` (see `UserProfileMetadataFfi -> UserProfileMetadata`),
+        // which loses to any fetched kind-0 in `remember_directory_profile_if_newer`,
+        // and rapid saves author timestamps that run ahead of the clock. Either
+        // way, a stale or intermediate relay copy could otherwise revert the
+        // local edit on the next directory refresh.
         stamp_published_profile_created_at(&mut profile, unix_now_seconds());
-        self.accounts
+        profile.created_at = self
+            .accounts
             .app
             .publish_user_profile_to_endpoints_and_indexers(
                 &account.label,
@@ -6454,6 +6466,11 @@ impl AccountManager {
     }
 
     pub async fn remove_account(&self, account_ref: &str) -> Result<(), AppError> {
+        // Stop and delete the account's moderation reports, and admit none
+        // until the removal below has committed (every removal entry point).
+        // Fenced before the global lock: the purge may open account storage.
+        // Removing the directory deletes the rows even if this purge fails.
+        let (_report_fence, _) = self.fence_moderation_reports(account_ref).await;
         let lock_wait = self
             .shared
             .app_performance_telemetry()
@@ -6650,7 +6667,29 @@ impl AccountManager {
     ///
     /// Dropping the in-memory caches is harmless when the directory is kept: a
     /// later sign-in simply re-warms them from the unchanged on-disk database.
+    /// Fence `account_ref`'s moderation reports for a teardown. An unknown
+    /// account has none; the teardown reports that itself.
+    async fn fence_moderation_reports(
+        &self,
+        account_ref: &str,
+    ) -> (
+        Option<crate::moderation_reports::ModerationReportFence>,
+        Result<(), AppError>,
+    ) {
+        let Ok(account) = self.app.account_home().account(account_ref) else {
+            return (None, Ok(()));
+        };
+        let (fence, purged) = self.app.fence_moderation_reports(&account.label).await;
+        (Some(fence), purged.map(|_| ()))
+    }
+
     pub async fn deactivate_account(&self, account_ref: &str) -> Result<(), AppError> {
+        // Queued moderation reports never outlive a sign-out: stop and delete
+        // them, and admit none until the sign-out below has committed. Fenced
+        // before the global lock: the purge may open account storage. A failed
+        // purge does not stop the sign-out, but it is reported: reports left on
+        // disk would be retried at the next sign-in.
+        let (_report_fence, report_purge) = self.fence_moderation_reports(account_ref).await;
         let lock_wait = self
             .shared
             .app_performance_telemetry()
@@ -6676,9 +6715,10 @@ impl AccountManager {
                 .forget_account(&account.account_id_hex);
             self.shared.attachment_cancellations.send_modify(|_| {});
             self.app.drop_account_caches(&account.label);
-            Ok(())
+            Ok::<(), AppError>(())
         }
-        .await
+        .await?;
+        report_purge
     }
 
     async fn restore_signed_out_after_key_package_failure(&self, account_ref: &str) {
@@ -8133,7 +8173,7 @@ impl AccountManager {
         if let Some(copy) = publication.indexer_copy {
             self.app.spawn_public_indexer_copy(copy);
         }
-        Ok((publication.status, Some(profile)))
+        Ok((publication.status, Some(publication.profile)))
     }
 
     fn setup_failure_can_roll_back(

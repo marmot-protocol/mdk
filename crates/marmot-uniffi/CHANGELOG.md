@@ -2,9 +2,32 @@
 
 ## Unreleased
 
-- Export `capture_chat_folder_selection` and the version-1 flat/smart folder rule to Kotlin/Swift. Invalid filters return a typed selection error. Regenerate bindings with the matching native library.
+- `capture_chat_folder_selection` and the version-1 flat/smart folder rule for Kotlin/Swift. Invalid filters return a typed selection error; use matching generated bindings/native libraries.
+
+- `capture_chat_list_selection` and the `ChatListSelection` object expose complete
+  fixed-view count, revision-fenced ID pages, deselection, remove-only action
+  revalidation and terminal close. Three typed selection errors distinguish
+  closed intent, stale revision and invalid pages. Folder predicates remain
+  separate; use matching generated bindings and native libraries.
+
+## 0.13.0 - 2026-10-12
+
+Regenerate Swift/Kotlin bindings with the matching native library. See the
+[release notes](../../docs/release/0.13.0.md) and the
+[client upgrade guide](../../docs/integration/0.13.0.md).
 
 ### Breaking changes
+
+- External-signer accounts move their device-local SQLCipher key from the
+  plaintext `.external-sqlcipher-secret` file into the configured `SecretStore`
+  (`.external-sqlcipher/<account label>`) on first open, then scrub and remove the
+  file. Older binaries cannot open these databases; downgrade is unsupported.
+  Opening a database with neither credential fails instead of generating a key.
+
+- `MarmotKitError` adds `ModerationReportingNotConfigured`,
+  `InvalidModerationReportConfig`, `InvalidReportedPublicKey`, `CannotReportSelf`
+  and `ModerationReportRateLimited`. Regenerate bindings with the matching
+  library and update exhaustive Swift `switch` / Kotlin `when` handling.
 
 - `OnboardingRepairProposalFfi.relay_repair` is a new optional field without
   a binding default. Regenerate matching Swift/Kotlin bindings and pass `nil`
@@ -30,12 +53,24 @@
 
 ### Added
 
-- `capture_chat_list_selection` and the `ChatListSelection` object expose complete
-  fixed-view count, revision-fenced ID pages, deselection, remove-only action
-  revalidation and terminal close. Three typed selection errors distinguish
-  closed intent, stale revision and invalid pages. Folder predicates remain
-  separate; use matching generated bindings and native libraries.
+- `set_startup_diagnostics_enabled` and `startup_diagnostics_snapshot`
+  (`NativeStartupSnapshotFfi`) report fixed startup phases, outcomes and
+  migration progress. Local capture is off by default and changes no upload
+  consent or database state.
 
+- The runtime follows the opt-in `WN_SOCKS5_*` proxy settings described in
+  the marmot-app [SOCKS5 routing](../marmot-app/README.md#socks5-routing)
+  section. With the variables unset, nothing changes. When they are invalid,
+  `Marmot::new` and `Marmot::new_with_options` return an error instead of
+  connecting directly. Agent preview publishing and watching are unavailable
+  while SOCKS5 is on.
+
+- `submit_moderation_report`, `moderation_reporting_available` and
+  `configure_moderation_reporting` add private, NIP-59 gift-wrapped NIP-56
+  reports to the deployment's moderation team (`ModerationReportOriginFfi`,
+  `ModerationReportOutcomeFfi`). `MarmotOptions.moderation_report_config` is
+  optional, defaults to unset, and is set per build flavor. This is additive:
+  `report_message`, `content_reports` and `dismiss_reports` are unchanged.
 - `create_identity_with_initial_profile` creates a generated identity whose
   first public kind-0 is the onboarding-selected profile. Prefer it over
   `create_identity_with_profile` followed by `publish_user_profile`, which
@@ -67,6 +102,8 @@
 
 ### Changed
 
+- Polls can be created in direct conversations as well as groups.
+
 - `retired_relay_hosts()` no longer includes `relay.damus.io`, and
   `classify_relay_endpoints` now reports it as `Allowed`.
 
@@ -78,7 +115,7 @@
   target, avoiding false missing-target errors from a broken pipe.
 
 - Group activity uses shared per-commit reaction targets for authors and peers,
-  including commits preceding a disband. See `marmot-app`'s Unreleased fixes
+  including commits preceding a disband. See `marmot-app`'s 0.13.0 fixes
   for projection and push-token behavior.
 
 ## 0.12.0 - 2026-10-02

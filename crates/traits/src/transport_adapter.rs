@@ -875,7 +875,7 @@ pub struct TransportEndpointReceipt {
 /// Transport adapters may map wire-level rejection signals into this enum
 /// (for example authentication-required, policy-blocked, or invalid-payload).
 /// Only the category is retained; arbitrary remote suffix text is discarded.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TransportEndpointRejectionCategory {
     Duplicate,

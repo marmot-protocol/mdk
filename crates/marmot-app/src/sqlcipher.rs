@@ -277,6 +277,21 @@ impl MarmotApp {
         db_path: &Path,
         kind: SqlcipherDatabaseKind,
     ) -> Result<[u8; SQLCIPHER_SALT_LEN], AppError> {
+        let probe = self
+            .startup_diagnostics
+            .observe(crate::NativeStartupStage::SaltRead);
+        let result = self.sqlcipher_salt_observed(label, keys, db_path, kind, &probe);
+        probe.finish(result.is_ok());
+        result
+    }
+    fn sqlcipher_salt_observed(
+        &self,
+        label: &str,
+        keys: &nostr::prelude::Keys,
+        db_path: &Path,
+        kind: SqlcipherDatabaseKind,
+        probe: &crate::startup_diagnostics::NativeStartupProbe,
+    ) -> Result<[u8; SQLCIPHER_SALT_LEN], AppError> {
         let salt_path = sqlcipher_salt_path(db_path);
         let marker_path = sqlcipher_migration_marker_path(db_path);
 
@@ -316,6 +331,7 @@ impl MarmotApp {
                         "recovery",
                         crate::ProductUnit::Attempt,
                     );
+                    probe.phase(crate::NativeStartupStage::RecoveryProbe);
                     let recovery =
                         finish_interrupted_sqlcipher_migration(label, keys, db_path, kind, &salt);
                     if let Some(observation) = observation {
@@ -361,6 +377,7 @@ impl MarmotApp {
                 "recovery",
                 crate::ProductUnit::Attempt,
             );
+            probe.phase(crate::NativeStartupStage::RecoveryRekey);
             let rekey = rekey_legacy_sqlcipher_database(db_path, &legacy_key, &new_key);
             if let Some(observation) = observation {
                 observation.finish(if rekey.is_ok() {

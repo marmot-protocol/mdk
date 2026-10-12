@@ -89,7 +89,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   Never add a row per scheduler evaluation, per live ingest, or on the router path; the router only counts
   placements. Rows are best effort: an audit-only read that fails skips the row, never the recovery step. The
   relay plane's lag-lost EOSE repair only queues a bounded `EoseRepairReport`; the worker's
-  `publish_history_notice_changes` seam records it as `subscription_eose_repaired`. Scenario tests live in
+  `publish_history_notice_changes` seam records it as `subscription_eose_repaired`. The same seam drains the
+  adapter's queued subscription refusals (`take_subscription_refusals`) into one `subscription_refused` row. Scenario
+  tests live in
   `src/client/audit_recovery/scenario_tests.rs` and `sync/comparison_job.rs`.
 - Keep the configured audit OTLP/HTTP sender in `src/audit_otlp_sender.rs`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,
@@ -258,7 +260,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   resolution requires it, and export points carry only a `relay` label. Keep the OTLP wire encoding and HTTP push behind
   the `otlp-export` feature; keep the privacy-critical mapping (`build_export_batch`) and the opt-in gate in the default
   build. Keep per-attempt collector DNS validation and pinning in `collector_host_safety.rs`: validate
-  every address, pin reqwest, disable redirects/proxies, and retain TLS verification. Only exact `localhost` or a
+  every address, pin reqwest, disable redirects/system proxies, and retain TLS verification. Explicit SOCKS5 routing
+  must send the validated IP rather than delegate HTTP DNS to the proxy. Build every relay client with
+  `network_proxy::nostr_builder()` and every HTTP client through `network_proxy::http_builder()`; `clippy.toml` rejects
+  direct `nostr_sdk`/`reqwest` constructors. Allow that lint only where a fresh reqwest builder goes straight into
+  `http_builder()` or in local test fixtures. Only exact `localhost` or a
   loopback IP literal is a local-test endpoint, and all its addresses must be loopback. The default build includes this
   helper so forensic audit uploads share it; do not feature-gate the module or introduce a second uploader. See
   `docs/marmot-architecture/relay-observability.md`, `audit-logging.md`, and `overview/dial-safety.md`.
@@ -271,7 +277,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `conversation_presentation/` (C5 header, capability, and window selectors; they never subscribe, acknowledge
   reads, or fetch media), `local_submissions.rs` + `local_submissions/` (durable device-local send admission and host
   correlation; no relay I/O),
-  `user_blocks.rs` (block policy and NIP-51 sync), `history_notices.rs` (public notice DTOs and opaque id codec),
+  `user_blocks.rs` (block policy and NIP-51 sync), `moderation_reports.rs` (private NIP-59-wrapped NIP-56 reports
+  to the deployment operator: config validation, staged outbox, retry, purge; tests in
+  `moderation_reports/tests.rs`), `history_notices.rs` (public notice DTOs and opaque id codec),
   `notifications.rs` (push platform, triggers, settings), `external_signer.rs` (`ExternalAccountSigner` and the
   internal `AccountSigner`), `nostr_secret.rs` (secret-key shape classification shared with CLI/UniFFI),
   `nostr_verification.rs` (stateless public-event verification), `profile_pseudonyms.rs` (cosmetic display names; not a
@@ -284,7 +292,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - `src/runtime/`: `worker_startup.rs` (per-account startup admission and retry backoff),
   `account_worker/recovery_credits.rs` (process-wide recovery credit pool), `conversation_window.rs`, `chat_list_window.rs`,
   `presentation.rs`, `presented_chat_list.rs`, `account_attention.rs` (presentation windows and account-switcher
-  attention), `user_blocks.rs`, `moderation.rs` (reports and admin labels), `local_submissions.rs`,
+  attention), `user_blocks.rs`, `moderation.rs` (reports, admin labels and operator moderation reports),
+  `local_submissions.rs`,
   `agent_publisher.rs` (host-driven agent publishing), `attachment_controls.rs`, `attachment_permission.rs`
   (runtime-only network approval; never restore it from disk).
 - `src/client/`: `recovery.rs` (recovery grant authorization), `invite_recovery.rs` (durable invitation recovery),

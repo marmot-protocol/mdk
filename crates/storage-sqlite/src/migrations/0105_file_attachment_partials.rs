@@ -1,9 +1,23 @@
 //! Preserve bounded ciphertext checkpoints while widening only file transfers.
 use crate::SqliteResultExt;
+use cgka_traits::StorageError;
 use cgka_traits::storage::StorageResult;
 use rusqlite::Transaction;
 
+/// The registry suspends enforcement before this parent rebuild and checks both parent and chunk references.
+pub(crate) const SUSPEND_FOREIGN_KEYS: &[&str] =
+    &["attachment_partial", "attachment_partial_chunk"];
+
+/// Rebuild only small parent records; the defensive precondition also protects direct calls outside the runner.
 pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
+    if tx
+        .pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))
+        .storage()?
+    {
+        return Err(StorageError::Backend(
+            "partial metadata rebuild requires migration-runner foreign-key scope".into(),
+        ));
+    }
     tx.execute_batch(
         "DROP TRIGGER attachment_partial_reserved_added;
         DROP TRIGGER attachment_partial_reserved_removed;
@@ -18,18 +32,8 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             expires_at INTEGER NOT NULL CHECK(expires_at>=0)
         );
         INSERT INTO attachment_partial_next SELECT * FROM attachment_partial;
-        CREATE TABLE attachment_partial_chunk_next (
-            token BLOB NOT NULL REFERENCES attachment_partial_next(token) ON DELETE CASCADE,
-            offset INTEGER NOT NULL CHECK(offset>=0),
-            bytes BLOB NOT NULL CHECK(typeof(bytes)='blob' AND length(bytes) BETWEEN 1 AND 1048576),
-            digest BLOB NOT NULL CHECK(length(digest)=32),
-            PRIMARY KEY(token,offset)
-        );
-        INSERT INTO attachment_partial_chunk_next SELECT * FROM attachment_partial_chunk;
-        DROP TABLE attachment_partial_chunk;
         DROP TABLE attachment_partial;
         ALTER TABLE attachment_partial_next RENAME TO attachment_partial;
-        ALTER TABLE attachment_partial_chunk_next RENAME TO attachment_partial_chunk;
         CREATE INDEX attachment_partial_expiry ON attachment_partial(expires_at,token);
         CREATE TRIGGER attachment_partial_reserved_added AFTER INSERT ON attachment_partial BEGIN
             UPDATE attachment_partial_usage SET reserved_bytes=reserved_bytes+NEW.total WHERE id=1;
@@ -59,6 +63,7 @@ mod tests {
             INSERT INTO attachment_acquisition(token,state) VALUES(x'01',1);",
         )
         .unwrap();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
         let tx = conn.transaction().unwrap();
         crate::migrations::migration_0085_attachment_partials::apply(&tx).unwrap();
         tx.execute("INSERT INTO attachment_partial(token,ciphertext_digest,locator_digest,etag,total,received,expires_at) VALUES(x'01',zeroblob(32),zeroblob(32),'\"v1\"',10,3,100)",[]).unwrap();
@@ -106,6 +111,7 @@ mod tests {
         let tx = conn.transaction().unwrap();
         apply(&tx).unwrap();
         tx.commit().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
         check(&conn);
         // Cancellation and revoked automatic permission preserve resumability.
         conn.execute("UPDATE attachment_acquisition SET state=4,cancelled=1", [])

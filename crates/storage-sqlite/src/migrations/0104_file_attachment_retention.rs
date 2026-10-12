@@ -1,80 +1,46 @@
-//! Preserve retained sources while admitting bounded, file-backed large bodies.
+//! Add retained-body metadata without rewriting encrypted legacy payloads.
 use crate::SqliteResultExt;
 use cgka_traits::storage::StorageResult;
-use rusqlite::{Transaction, params};
-use zeroize::Zeroizing;
+use rusqlite::Transaction;
 
+/// Keep the legacy byte-array bound; larger file bodies use migration 0106's chunk tables.
+/// Existing rows retain a sentinel length and are accounted from SQLite's BLOB length.
+/// No bytes or stored quota are rewritten while an account opens. Validation triggers
+/// enforce new metadata on mutation; an ADD COLUMN CHECK would scan existing payloads.
+/// Before mutation, indexed length queries handle legacy rows without binding the BLOB into OLD.
 pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     tx.execute_batch(
-        "DROP TRIGGER attachment_bytes_added;
+        "ALTER TABLE retained_attachment_bytes ADD COLUMN byte_len INTEGER NOT NULL DEFAULT -1;
+        DROP TRIGGER attachment_bytes_added;
         DROP TRIGGER attachment_bytes_removed;
         DROP TRIGGER attachment_bytes_updated;
-        CREATE TABLE retained_attachment_bytes_next (
-            token BLOB PRIMARY KEY NOT NULL REFERENCES attachment_acquisition(token) ON DELETE CASCADE,
-            byte_len INTEGER NOT NULL DEFAULT -1 CHECK(byte_len BETWEEN -1 AND 943718400),
-            bytes BLOB NOT NULL CHECK(typeof(bytes)='blob' AND
-                ((byte_len=-1 AND length(bytes)<=536870912) OR (byte_len>=0 AND length(bytes)=byte_len)))
-        );",
-    ).storage()?;
-    let mut statement = tx
-        .prepare("SELECT rowid,token,length(bytes) FROM retained_attachment_bytes")
-        .storage()?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })
-        .storage()?;
-    let mut buffer = Zeroizing::new(vec![0u8; 64 * 1024]);
-    for row in rows {
-        let (row, token, len) = row.storage()?;
-        tx.execute("INSERT INTO retained_attachment_bytes_next(token,byte_len,bytes) VALUES(?1,?2,zeroblob(?2))",
-            params![token, len]).storage()?;
-        let target = tx.last_insert_rowid();
-        let source = tx
-            .blob_open("main", "retained_attachment_bytes", "bytes", row, true)
-            .storage()?;
-        let mut destination = tx
-            .blob_open(
-                "main",
-                "retained_attachment_bytes_next",
-                "bytes",
-                target,
-                false,
-            )
-            .storage()?;
-        let mut offset = 0usize;
-        while offset < len as usize {
-            let count = buffer.len().min(len as usize - offset);
-            source
-                .read_at_exact(&mut buffer[..count], offset)
-                .storage()?;
-            destination.write_at(&buffer[..count], offset).storage()?;
-            offset += count;
-        }
-        source.close().storage()?;
-        destination.close().storage()?;
-    }
-    drop(statement);
-    tx.execute_batch(
-        "DROP TABLE retained_attachment_bytes;
-        ALTER TABLE retained_attachment_bytes_next RENAME TO retained_attachment_bytes;
+        CREATE TRIGGER attachment_body_metadata_insert BEFORE INSERT ON retained_attachment_bytes
+        WHEN NOT (typeof(NEW.byte_len)='integer' AND NEW.byte_len BETWEEN -1 AND 536870912
+            AND (NEW.byte_len=-1 OR length(NEW.bytes)=NEW.byte_len)) BEGIN
+            SELECT RAISE(ABORT,'invalid retained body length');
+        END;
+        CREATE TRIGGER attachment_body_metadata_update BEFORE UPDATE OF bytes,byte_len ON retained_attachment_bytes
+        WHEN NOT (typeof(NEW.byte_len)='integer' AND NEW.byte_len BETWEEN -1 AND 536870912
+            AND (NEW.byte_len=-1 OR length(NEW.bytes)=NEW.byte_len)) BEGIN
+            SELECT RAISE(ABORT,'invalid retained body length');
+        END;
         CREATE TRIGGER attachment_bytes_added AFTER INSERT ON retained_attachment_bytes BEGIN
             UPDATE retained_attachment_bytes SET byte_len=length(NEW.bytes)
                 WHERE token=NEW.token AND NEW.byte_len<0;
             UPDATE attachment_retention_usage SET byte_count=byte_count+
                 CASE WHEN NEW.byte_len<0 THEN length(NEW.bytes) ELSE NEW.byte_len END WHERE id=1;
         END;
-        CREATE TRIGGER attachment_bytes_removed AFTER DELETE ON retained_attachment_bytes BEGIN
+        CREATE TRIGGER attachment_bytes_removed BEFORE DELETE ON retained_attachment_bytes BEGIN
             UPDATE attachment_retention_usage SET byte_count=byte_count-
-                OLD.byte_len WHERE id=1;
+                CASE WHEN OLD.byte_len<0 THEN
+                    (SELECT length(bytes) FROM retained_attachment_bytes WHERE token=OLD.token)
+                ELSE OLD.byte_len END WHERE id=1;
         END;
-        CREATE TRIGGER attachment_bytes_updated AFTER UPDATE OF bytes ON retained_attachment_bytes BEGIN
+        CREATE TRIGGER attachment_bytes_updated BEFORE UPDATE OF bytes ON retained_attachment_bytes BEGIN
             UPDATE attachment_retention_usage SET byte_count=byte_count-
-                OLD.byte_len+
+                CASE WHEN OLD.byte_len<0 THEN
+                    (SELECT length(bytes) FROM retained_attachment_bytes WHERE token=OLD.token)
+                ELSE OLD.byte_len END+
                 CASE WHEN NEW.byte_len<0 THEN length(NEW.bytes) ELSE NEW.byte_len END WHERE id=1;
         END;",
     ).storage()?;

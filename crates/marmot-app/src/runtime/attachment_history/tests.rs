@@ -3,6 +3,167 @@ use crate::MarmotApp;
 use marmot_account::AccountHome;
 use storage_sqlite::{SqliteAccountStorage, StoredAppEvent};
 
+/// Warm a real account, then retain a synthetic first-open migration observation.
+fn cached_diagnostic_runtime() -> (tempfile::TempDir, std::sync::Arc<MarmotAppRuntime>, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relays(dir.path(), Vec::new());
+    app.account_storage(&account.label).unwrap();
+    app.set_startup_diagnostics_enabled(true);
+    let first = app
+        .startup_diagnostics
+        .observe(crate::NativeStartupStage::MigrationApply);
+    first.progress(crate::NativeStartupStage::MigrationApply, Some(105), true);
+    first.finish(true);
+    (dir, std::sync::Arc::new(app.runtime()), account.label)
+}
+
+/// Drive the same public policy boundary as startup, rather than only its nested storage cache.
+#[tokio::test]
+async fn cached_attachment_policy_reads_preserve_first_open_history() {
+    let (_dir, runtime, account) = cached_diagnostic_runtime();
+    let before = runtime.accounts.app.startup_diagnostics_snapshot();
+    for _ in 0..128 {
+        runtime.attachment_download_policy(&account).await.unwrap();
+    }
+    let after = runtime.accounts.app.startup_diagnostics_snapshot();
+    runtime.shutdown_and_close().await.unwrap();
+    assert_eq!(after.events, before.events);
+    assert_eq!(after.dropped_events, 0);
+    assert_eq!(after.dropped_scopes, 0);
+    assert!(after.active.is_empty());
+}
+
+/// Concurrent cache-lock waits consume one scope each and remain snapshot-visible without evicting history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "Exercise snapshotting while an independent native cache resource is held."
+)]
+async fn blocked_attachment_policy_reads_use_one_scope_each() {
+    const READS: usize = 8;
+    let (_dir, runtime, account) = cached_diagnostic_runtime();
+    let before = runtime.accounts.app.startup_diagnostics_snapshot();
+    let held = runtime.accounts.app.account_storages.lock().unwrap();
+    let reads: Vec<_> = (0..READS)
+        .map(|_| {
+            let runtime = runtime.clone();
+            let account = account.clone();
+            tokio::spawn(async move { runtime.attachment_download_policy(&account).await })
+        })
+        .collect();
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let snapshot = runtime.accounts.app.startup_diagnostics_snapshot();
+            if snapshot.active.len() == READS
+                && snapshot
+                    .active
+                    .iter()
+                    .all(|scope| scope.stage == crate::NativeStartupStage::AccountStorageCache)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let blocked = runtime.accounts.app.startup_diagnostics_snapshot();
+    // Release the resource and join every reader before assertions, including on a regression failure.
+    drop(held);
+    for read in reads {
+        tokio::time::timeout(std::time::Duration::from_secs(5), read)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    let after = runtime.accounts.app.startup_diagnostics_snapshot();
+    runtime.shutdown_and_close().await.unwrap();
+    assert!(
+        ready.is_ok(),
+        "each blocked policy read must have one observable cache-wait scope"
+    );
+    assert_eq!(blocked.active.len(), READS);
+    assert_eq!(blocked.events, before.events);
+    assert_eq!(blocked.dropped_scopes, 0);
+    assert_eq!(after.events, before.events);
+    assert_eq!(after.dropped_events, 0);
+    assert!(after.active.is_empty());
+}
+
+/// Dropping the host future cannot hide a still-running blocking read; its last owner records abandonment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "Exercise cancellation while an independent native read resource is held."
+)]
+async fn dropped_attachment_future_keeps_worker_observable_until_exit() {
+    let (_dir, runtime, account) = cached_diagnostic_runtime();
+    let before = runtime.accounts.app.startup_diagnostics_snapshot();
+    let resource = std::sync::Arc::new(std::sync::Mutex::new(()));
+    let held = resource.lock().unwrap();
+    let read = {
+        let runtime = runtime.clone();
+        let resource = resource.clone();
+        tokio::spawn(async move {
+            runtime
+                .attachment_read(&account, move |_, _| {
+                    let _held = resource.lock().unwrap();
+                    Ok(())
+                })
+                .await
+        })
+    };
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if runtime
+                .accounts
+                .app
+                .startup_diagnostics_snapshot()
+                .active
+                .iter()
+                .any(|scope| scope.stage == crate::NativeStartupStage::AttachmentLocalRead)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    read.abort();
+    let aborted = read.await;
+    let blocked = runtime.accounts.app.startup_diagnostics_snapshot();
+    drop(held);
+    let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if runtime
+                .accounts
+                .app
+                .startup_diagnostics_snapshot()
+                .active
+                .is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let after = runtime.accounts.app.startup_diagnostics_snapshot();
+    runtime.shutdown_and_close().await.unwrap();
+    assert!(ready.is_ok());
+    assert!(aborted.unwrap_err().is_cancelled());
+    assert_eq!(blocked.active.len(), 1);
+    assert_eq!(blocked.events, before.events);
+    assert!(drained.is_ok());
+    assert_eq!(
+        after.events.last().unwrap().outcome,
+        crate::NativeStartupOutcome::Abandoned
+    );
+}
+
 fn tag(mime: &str) -> Vec<String> {
     vec![
         "imeta".into(),

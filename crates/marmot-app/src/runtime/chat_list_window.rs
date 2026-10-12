@@ -1,7 +1,9 @@
 //! One actor owns each bounded window. Commands and invalidations never splice
 //! independently read pages; every replacement resolves current stable anchors.
 use super::event_routing::{chat_list_event_route, projection_update_from_event};
-use super::{MarmotAppRuntime, blocking_app_task, wait_for_runtime_shutdown};
+use super::{
+    MarmotAppRuntime, blocking_app_task, wait_for_account_reset, wait_for_runtime_shutdown,
+};
 use crate::chat_presentation::signals::PresentationInvalidation;
 use crate::{AppError, MarmotApp, MarmotAppEvent, PresentedChatRow};
 use std::{sync::Arc, time::Duration};
@@ -709,17 +711,6 @@ async fn run(
                 dirty = true;
                 failed = true;
             }
-        }
-    }
-}
-
-async fn wait_for_account_reset(resets: &mut broadcast::Receiver<String>, label: &str) {
-    loop {
-        match resets.recv().await {
-            Ok(reset) if reset == label => return,
-            // A lost teardown signal is terminal, never a reason to rebind a handle.
-            Err(_) => return,
-            _ => {}
         }
     }
 }

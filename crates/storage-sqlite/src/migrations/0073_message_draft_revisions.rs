@@ -67,6 +67,7 @@ mod tests {
         let interrupted = [Migration {
             version: 73,
             name: "0073_message_draft_revisions",
+            suspend_foreign_keys: &[],
             apply: aborted,
         }];
         assert!(run(&mut conn, &interrupted).is_err());

@@ -11,18 +11,24 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::StreamExt;
 use nostr_sdk::prelude::Url;
-use nostr_sdk::transport::websocket::{
-    DefaultWebsocketTransport, WebSocketSink, WebSocketStream, WebSocketTransport,
-};
+use nostr_sdk::transport::websocket::{WebSocketSink, WebSocketStream, WebSocketTransport};
 use serde::Deserializer;
 use serde::de::{IgnoredAny, SeqAccess, Visitor};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(super) struct DirectoryWireTransport {
+    transport: Arc<dyn WebSocketTransport>,
     events: Arc<AtomicUsize>,
 }
 
 impl DirectoryWireTransport {
+    pub(super) fn new(transport: Arc<dyn WebSocketTransport>) -> Self {
+        Self {
+            transport,
+            events: Arc::default(),
+        }
+    }
+
     pub(super) fn event_count(&self) -> usize {
         self.events.load(Ordering::Acquire)
     }
@@ -83,7 +89,7 @@ type DirectoryConnectFuture<'a> = std::pin::Pin<
 
 impl WebSocketTransport for DirectoryWireTransport {
     fn support_ping(&self) -> bool {
-        DefaultWebsocketTransport.support_ping()
+        self.transport.support_ping()
     }
 
     fn connect<'a>(
@@ -92,7 +98,7 @@ impl WebSocketTransport for DirectoryWireTransport {
         proxy: Option<SocketAddr>,
     ) -> DirectoryConnectFuture<'a> {
         Box::pin(async move {
-            let (sink, stream) = DefaultWebsocketTransport.connect(url, proxy).await?;
+            let (sink, stream) = self.transport.connect(url, proxy).await?;
             let observer = self.clone();
             let stream: WebSocketStream = Box::pin(stream.inspect(move |item| {
                 if let Ok(message) = item

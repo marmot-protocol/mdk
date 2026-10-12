@@ -2,7 +2,10 @@
 //! Account-owned fields share a read boundary; directory enrichment is separate.
 use super::account_worker::AccountWorkerCommand;
 use super::event_routing::{chat_list_event_route, projection_update_from_event};
-use super::{AccountManager, MarmotAppRuntime, blocking_app_task, wait_for_runtime_shutdown};
+use super::{
+    AccountManager, MarmotAppRuntime, blocking_app_task, wait_for_account_reset,
+    wait_for_runtime_shutdown,
+};
 use crate::app_telemetry::runtime::{Observation, Outcome as TelemetryOutcome};
 use crate::chat_presentation::signals::PresentationInvalidation;
 use crate::conversation_presentation::{
@@ -1316,16 +1319,6 @@ async fn run(
                     refresh_at = tokio::time::Instant::now() + RETRY_DELAY;
                 }
             }
-        }
-    }
-}
-async fn wait_for_account_reset(resets: &mut broadcast::Receiver<String>, label: &str) {
-    loop {
-        match resets.recv().await {
-            Ok(reset) if reset == label => return,
-            // A lost teardown signal is terminal, never a reason to rebind a handle.
-            Err(_) => return,
-            _ => {}
         }
     }
 }

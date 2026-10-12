@@ -335,13 +335,15 @@ impl SqliteAccountStorage {
                 // Localized fallback labels are not literal searchable metadata.
                 _ => String::new(),
             };
-            let description: String = conn
+            let description: Option<String> = conn
                 .query_row_cached(
                     "SELECT profile_description FROM account_groups WHERE group_id_hex=?1",
                     [&input.group_id_hex],
-                    |row| row.get(0),
+                    |row| row.get::<_, Option<String>>(0),
                 )
-                .storage()?;
+                .optional()
+                .storage()?
+                .flatten();
             conn.execute_cached(
                 "UPDATE chat_list_rows SET presentation_json = ?2,
                     presentation_applied_source_revision = presentation_source_revision,
@@ -351,7 +353,9 @@ impl SqliteAccountStorage {
                     input.group_id_hex,
                     bytes,
                     title_fold,
-                    crate::chat_list::folders::fold_literal(&description)
+                    description
+                        .as_deref()
+                        .map(crate::chat_list::folders::fold_literal)
                 ],
             )
             .storage()?;

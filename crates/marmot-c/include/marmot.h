@@ -178,10 +178,24 @@ enum MarmotStatus
    */
   MARMOT_STATUS_ATTACHMENT_ACCOUNT_SIGNED_OUT = 94,
   MARMOT_STATUS_INVALID_APP_COMPONENT = 95,
-  MARMOT_STATUS_CHAT_SELECTION_CLOSED = 96,
-  MARMOT_STATUS_CHAT_SELECTION_STALE = 97,
-  MARMOT_STATUS_CHAT_SELECTION_INVALID_PAGE = 98,
-  MARMOT_STATUS_CHAT_SELECTION_INVALID_FILTER = 99,
+  /**
+   * No valid moderation-report destination is installed; nothing was published.
+   */
+  MARMOT_STATUS_MODERATION_REPORTING_NOT_CONFIGURED = 96,
+  /**
+   * The moderation-report destination was rejected as a whole.
+   */
+  MARMOT_STATUS_INVALID_MODERATION_REPORT_CONFIG = 97,
+  MARMOT_STATUS_INVALID_REPORTED_PUBLIC_KEY = 98,
+  MARMOT_STATUS_CANNOT_REPORT_SELF = 99,
+  /**
+   * Local per-account moderation-report cap; retry later.
+   */
+  MARMOT_STATUS_MODERATION_REPORT_RATE_LIMITED = 100,
+  MARMOT_STATUS_CHAT_SELECTION_CLOSED = 101,
+  MARMOT_STATUS_CHAT_SELECTION_STALE = 102,
+  MARMOT_STATUS_CHAT_SELECTION_INVALID_PAGE = 103,
+  MARMOT_STATUS_CHAT_SELECTION_INVALID_FILTER = 104,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -834,6 +848,36 @@ typedef enum MarmotReportReason {
   MARMOT_REPORT_REASON_OTHER,
 } MarmotReportReason;
 
+typedef enum MarmotNativeStartupStage {
+  MARMOT_NATIVE_STARTUP_STAGE_ATTACHMENT_TASK_QUEUED,
+  MARMOT_NATIVE_STARTUP_STAGE_ACCOUNT_RESOLUTION,
+  MARMOT_NATIVE_STARTUP_STAGE_ACCOUNT_STORAGE_CACHE,
+  MARMOT_NATIVE_STARTUP_STAGE_STORAGE_ADMISSION,
+  MARMOT_NATIVE_STARTUP_STAGE_DATABASE_OPEN_LOCK,
+  MARMOT_NATIVE_STARTUP_STAGE_SIGNING_KEYS,
+  MARMOT_NATIVE_STARTUP_STAGE_EXTERNAL_DATABASE_SECRET,
+  MARMOT_NATIVE_STARTUP_STAGE_KEY_DERIVATION,
+  MARMOT_NATIVE_STARTUP_STAGE_SALT_READ,
+  MARMOT_NATIVE_STARTUP_STAGE_RECOVERY_PROBE,
+  MARMOT_NATIVE_STARTUP_STAGE_RECOVERY_REKEY,
+  MARMOT_NATIVE_STARTUP_STAGE_ENCRYPTED_STORE_OPEN,
+  MARMOT_NATIVE_STARTUP_STAGE_CIPHER_CONFIGURATION,
+  MARMOT_NATIVE_STARTUP_STAGE_CIPHER_KEY_APPLICATION,
+  MARMOT_NATIVE_STARTUP_STAGE_OPERATIONAL_PRAGMAS,
+  MARMOT_NATIVE_STARTUP_STAGE_MIGRATION_INSPECTION,
+  MARMOT_NATIVE_STARTUP_STAGE_MIGRATION_APPLY,
+  MARMOT_NATIVE_STARTUP_STAGE_ATTACHMENT_LOCAL_READ,
+  MARMOT_NATIVE_STARTUP_STAGE_ATTACHMENT_FUTURE_WAIT,
+  MARMOT_NATIVE_STARTUP_STAGE_PRODUCT_ANALYTICS_ADMISSION,
+} MarmotNativeStartupStage;
+
+typedef enum MarmotNativeStartupOutcome {
+  MARMOT_NATIVE_STARTUP_OUTCOME_ACTIVE,
+  MARMOT_NATIVE_STARTUP_OUTCOME_SUCCESS,
+  MARMOT_NATIVE_STARTUP_OUTCOME_FAILURE,
+  MARMOT_NATIVE_STARTUP_OUTCOME_ABANDONED,
+} MarmotNativeStartupOutcome;
+
 /**
  * Why a timeline delta fired.
  */
@@ -1150,6 +1194,14 @@ typedef enum MarmotHostPerformanceOutcome {
   MARMOT_HOST_PERFORMANCE_OUTCOME_TIMEOUT,
   MARMOT_HOST_PERFORMANCE_OUTCOME_UNAVAILABLE,
 } MarmotHostPerformanceOutcome;
+
+/**
+ * Which user action produced a private moderation report.
+ */
+typedef enum MarmotModerationReportOrigin {
+  MARMOT_MODERATION_REPORT_ORIGIN_REPORT,
+  MARMOT_MODERATION_REPORT_ORIGIN_BLOCK_AND_REPORT,
+} MarmotModerationReportOrigin;
 
 /**
  * Free before its client. Concurrent next and commands are supported; never free during a call.
@@ -4530,6 +4582,39 @@ typedef struct MarmotReportDismissalPage {
   uintptr_t labels_len;
   char *next_cursor;
 } MarmotReportDismissalPage;
+
+/**
+ * Outcome of marmot_submit_moderation_report. AcceptedPending and
+ * CompletionUnknown are queued and retried on catch-up; never resubmit them.
+ */
+typedef struct MarmotModerationReportOutcome {
+  char *report_id;
+  enum MarmotSendAcceptDisposition accept_disposition;
+} MarmotModerationReportOutcome;
+
+typedef struct MarmotNativeStartupObservation {
+  uint64_t token;
+  enum MarmotNativeStartupStage stage;
+  uint64_t elapsed_ms;
+  uint64_t stage_elapsed_ms;
+  bool has_migration_version;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint32_t migration_version;
+  uint32_t migrations_completed;
+  enum MarmotNativeStartupOutcome outcome;
+} MarmotNativeStartupObservation;
+
+typedef struct MarmotNativeStartupSnapshot {
+  bool enabled;
+  struct MarmotNativeStartupObservation *active;
+  uintptr_t active_len;
+  struct MarmotNativeStartupObservation *events;
+  uintptr_t events_len;
+  uint64_t dropped_events;
+  uint64_t dropped_scopes;
+} MarmotNativeStartupSnapshot;
 
 /**
  * Borrowed private input. Its path is local only and is never published.
@@ -9430,6 +9515,42 @@ MarmotStatus marmot_report_message(const struct MarmotClient *client,
                                    struct MarmotSendSummary **out);
 
 /**
+ * Privately report a user to the configured moderation team (NIP-56 report,
+ * NIP-59 gift-wrapped). Additive to marmot_report_message, which is unchanged.
+ * `reason` is a MarmotReportReason and `origin` a MarmotModerationReportOrigin
+ * discriminant. Release `*out` with marmot_moderation_report_outcome_free.
+ * # Safety
+ * Client, strings and output pointer must be valid. Inputs are borrowed.
+ */
+MarmotStatus marmot_submit_moderation_report(const struct MarmotClient *client,
+                                             const char *account_ref,
+                                             const char *reported_pubkey,
+                                             uint32_t reason,
+                                             const char *explanation,
+                                             uint32_t origin,
+                                             struct MarmotModerationReportOutcome **out);
+
+/**
+ * Write whether a valid moderation-report destination is installed.
+ * # Safety
+ * `client` must be a live handle and `out` writable.
+ */
+MarmotStatus marmot_moderation_reporting_available(const struct MarmotClient *client, bool *out);
+
+/**
+ * Install the moderation-report destination, or clear it when
+ * `recipient_pubkey` is NULL (`relays` is then ignored). An invalid
+ * destination is rejected whole and leaves reporting unconfigured.
+ * # Safety
+ * `client` must be a live handle; `recipient_pubkey` NULL or a valid string;
+ * `relays` must hold `relays_len` valid strings. Inputs are borrowed.
+ */
+MarmotStatus marmot_configure_moderation_reporting(const struct MarmotClient *client,
+                                                   const char *recipient_pubkey,
+                                                   const char *const *relays,
+                                                   uintptr_t relays_len);
+
+/**
  * Verify a public Nostr event's canonical ID and BIP-340 signature.
  * Invalid event JSON returns success with `*out = 0`. No client is required.
  * The caller must enforce application-specific author, kind, and tag policy.
@@ -9439,6 +9560,28 @@ MarmotStatus marmot_report_message(const struct MarmotClient *client,
  * Input is borrowed and never retained.
  */
 MarmotStatus marmot_verify_public_nostr_event_json(const char *event_json, uint8_t *out);
+
+/**
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_set_startup_diagnostics_enabled(const struct MarmotClient *client,
+                                                    uint8_t enabled);
+
+/**
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_startup_diagnostics_snapshot(const struct MarmotClient *client,
+                                                 struct MarmotNativeStartupSnapshot **out);
 
 /**
  * Create a control; free it with marmot_media_file_transfer_control_free after upload returns.
@@ -12074,6 +12217,16 @@ void marmot_avatar_bytes_list_free(struct MarmotAvatarBytesList *list);
  * The pointer must be NULL or an unfreed pointer returned by
  * this library.
  */
+void marmot_moderation_report_outcome_free(struct MarmotModerationReportOutcome *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
 void marmot_content_report_page_free(struct MarmotContentReportPage *ptr);
 
 /**
@@ -12085,6 +12238,16 @@ void marmot_content_report_page_free(struct MarmotContentReportPage *ptr);
  * this library.
  */
 void marmot_report_dismissal_page_free(struct MarmotReportDismissalPage *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_native_startup_snapshot_free(struct MarmotNativeStartupSnapshot *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL

@@ -311,6 +311,8 @@ Null output pointers are rejected before capture or local intent mutation.
 See the [shared selection contract](../marmot-uniffi/CHAT-LIST-ROWS.md#complete-fixed-view-selection)
 for revisions, cancellation and account lifecycle. `marmot_capture_chat_folder_selection`
 accepts a borrowed version-1 rule, copying strings and arrays before returning.
+The version-1 record layout is frozen; a future layout requires a new record type
+and entry point. The version field does not authorize appending fields to this struct.
 Its nullable `smart_filter_json` accepts the bounded private smart-rule envelope;
 NULL uses flat criteria. Rebuild this new record with matching generated headers
 and native libraries; never mix its previous draft layout with the updated ABI.
@@ -336,6 +338,11 @@ Keep one `MarmotNip46Session` per remote-signer account. Local-key accounts use
 their normal login path in the same client. The session pins three separate keys:
 the client communication key, the remote signer's communication key, and the
 user's account key. Only the last identifies the MDK account.
+
+NIP-46 sessions use the shared [SOCKS5 routing policy](../marmot-app/README.md#socks5-routing).
+Invalid `WN_SOCKS5_*` configuration makes `marmot_nip46_new` fail with
+`MARMOT_STATUS_INVALID_ARGUMENT`, without connecting directly. The process policy is frozen at first use;
+clearing or correcting the environment afterward does not unblock it.
 
 1. Create an offline handle with `marmot_nip46_new`. Configuration accepts a bunker
    link in `uri`, or a `relays` array with an optional `name` for client pairing.

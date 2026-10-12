@@ -2434,8 +2434,17 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
         assert!(alice.drain_events().is_empty());
         let mut replay_events = Vec::new();
         let mut turns = 0;
-        for turn in 0..8 {
-            let delayed_preparation = turn < 2 && !matches!(mode, Advance::DeterministicInputs);
+        // Drain and Inputs bound each turn by real elapsed time as well as rows,
+        // so a slow runner admits fewer rows per turn. Bound the loop by work,
+        // not speed: an admitted turn completes at least one row, so one turn
+        // per retained row suffices. A wall-budget turn whose deadline expires
+        // before replay admission yields with no row; tolerate a few of those.
+        const MAX_EMPTY_TURNS: usize = 16;
+        let mut empty_turns = 0;
+        let mut delayed_turns = 0;
+        for _ in 0..retained_ids.len() + MAX_EMPTY_TURNS {
+            let delayed_preparation =
+                delayed_turns < 2 && !matches!(mode, Advance::DeterministicInputs);
             if delayed_preparation {
                 fault.replay_delay.arm(1);
             }
@@ -2461,7 +2470,18 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
                 delivered <= 64,
                 "one background turn exceeded its shared row allowance: {delivered}"
             );
-            if delayed_preparation {
+            if delivered == 0 {
+                assert!(
+                    !matches!(mode, Advance::DeterministicInputs),
+                    "without a wall-time budget, every turn must make progress"
+                );
+                empty_turns += 1;
+                assert!(
+                    empty_turns <= MAX_EMPTY_TURNS,
+                    "background replay repeatedly yielded before admitting a row"
+                );
+            } else if delayed_preparation {
+                delayed_turns += 1;
                 assert_eq!(
                     delivered, 1,
                     "slow preparation must allow one complete row, then yield"
@@ -2474,6 +2494,12 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
             {
                 break;
             }
+            if matches!(mode, Advance::DeterministicInputs) {
+                assert_eq!(
+                    delivered, 64,
+                    "without a wall-time budget, only the row allowance yields"
+                );
+            }
             assert!(
                 alice.drain_pending_convergence_groups().contains(&group_id),
                 "yield must rearm retry scheduling"
@@ -2484,6 +2510,9 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
             turns >= 2,
             "96 retained messages must require multiple background turns"
         );
+        if !matches!(mode, Advance::DeterministicInputs) {
+            assert_eq!(delayed_turns, 2, "both slow preparations must admit a row");
+        }
         assert!(
             retained_ids
                 .iter()

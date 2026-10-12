@@ -2219,11 +2219,14 @@ fn telemetry_rollup_reshapes_and_joins_per_relay_snapshots() {
                 eose: hist(1),
             },
         ],
+        refusals: Vec::new(),
     };
     let metrics = NostrAdapterMetrics {
         publish_attempts: 4,
         publish_successes: 3,
         publish_failures: 1,
+        reconciliation_attempts: 7,
+        reconciliation_order_unproven_passes: 2,
         ..NostrAdapterMetrics::default()
     };
     let health = RelayPlaneHealth {
@@ -2270,6 +2273,8 @@ fn telemetry_rollup_reshapes_and_joins_per_relay_snapshots() {
     assert_eq!(rollup.connection_attempts, 6);
     assert_eq!(rollup.connection_successes, 5);
     assert_eq!(rollup.publish_successes, 3);
+    assert_eq!(rollup.reconciliation_attempts, 7);
+    assert_eq!(rollup.reconciliation_order_unproven_passes, 2);
     assert_eq!(rollup.observed_reorg_rate(), None);
 }
 
@@ -6145,6 +6150,7 @@ async fn publish_auth_quorum_does_not_wait_for_unobserved_fallback() {
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)]
 async fn publish_allows_independent_account_registration() {
     use nostr_relay_builder::{LocalRelay, RelayBuilder};
     use nostr_sdk::prelude::{EventBuilder, Keys};
@@ -6245,4 +6251,78 @@ async fn publish_allows_independent_account_registration() {
     .unwrap();
     assert_eq!(outcome.accepted.len(), 1);
     plane.shutdown().await;
+}
+
+/// The account relay plane's live notification consumer, not only the
+/// adapter crate's standalone forwarder, hands a relay's `CLOSED` to the
+/// adapter: the refusal reaches the account's reports and settles its inbox
+/// replay without completing it.
+#[tokio::test]
+async fn live_notification_consumer_reports_relay_closed() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account = MemberId::new(vec![0xA2; 32]);
+    let endpoint = TransportEndpoint("wss://relay.example".into());
+    let adapter = relay_plane.account_adapter(account.clone(), relay.clone());
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![endpoint.clone()],
+            group_subscriptions: Vec::new(),
+            since: None,
+        })
+        .await
+        .unwrap();
+    let inbox_id = issued_id(&relay, |subscription| {
+        matches!(subscription, NostrSubscription::AccountInbox { .. })
+    });
+    let source = Arc::new(TestNotificationSource::steady());
+    let supervisor = spawn_relay_notification_supervisor_scoped(
+        source.clone(),
+        relay_plane.inner.transport.clone(),
+        Some(account.clone()),
+    );
+    timeout(Duration::from_secs(2), async {
+        while source.subscriptions.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the supervised consumer subscribes");
+    source.send(RelayPoolNotification::Message {
+        relay_url: RelayUrl::parse(endpoint.as_str()).unwrap(),
+        message: Box::new(RelayMessage::Closed {
+            subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(inbox_id)),
+            message: std::borrow::Cow::Borrowed("restricted: members only"),
+        }),
+    });
+    let reports = timeout(Duration::from_secs(2), async {
+        loop {
+            let reports = relay_plane.take_subscription_refusals(&account);
+            if !reports.reports.is_empty() {
+                break reports;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the live consumer reports the refusal");
+    let report = &reports.reports[0];
+    assert_eq!(
+        report.route_kind,
+        transport_nostr_adapter::SubscriptionRouteKind::Inbox
+    );
+    assert_eq!(
+        report.category,
+        Some(cgka_traits::TransportEndpointRejectionCategory::Restricted)
+    );
+    assert_eq!(
+        report.disposition,
+        transport_nostr_adapter::SubscriptionRefusalDisposition::Dropped
+    );
+    let progress = adapter.account_subscription_eose().await;
+    assert!(progress.settled());
+    assert!(!progress.complete());
+    supervisor.abort();
+    let _ = supervisor.await;
 }

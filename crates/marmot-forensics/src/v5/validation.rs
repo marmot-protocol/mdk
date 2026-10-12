@@ -584,6 +584,21 @@ fn validate_operational(kind: &crate::audit::AuditEventKind) -> Result<(), Contr
                 "a follow-up repair needs a failed relay",
             )
         }
+        AuditEventKind::SubscriptionRefused { refusals, dropped } => {
+            let limit = crate::audit::SUBSCRIPTION_REFUSAL_AUDIT_MAX_ENTRIES;
+            require(
+                !refusals.is_empty() && refusals.len() <= limit,
+                "a refusal row lists between one and the bounded number of refusals",
+            )?;
+            require(
+                refusals.iter().all(|refusal| refusal.count > 0),
+                "every listed refusal happened at least once",
+            )?;
+            require(
+                *dropped == 0 || refusals.len() == limit,
+                "refusals are shed only once the bound is full",
+            )
+        }
         _ => Ok(()),
     }
 }

@@ -398,6 +398,8 @@ async fn publish(client: &Client, event: &Event) -> Result<()> {
     );
     Ok(())
 }
+// The fixture signer dials the loopback relay directly.
+#[allow(clippy::disallowed_methods)]
 async fn sdk(relay: &str) -> Result<Client> {
     let client = Client::new();
     client.add_relay(relay).await?;

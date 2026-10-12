@@ -1,0 +1,11 @@
+# Every relay and HTTP client must follow the process SOCKS5 policy.
+# Build them through `crate::network_proxy` instead.
+disallowed-methods = [
+    { path = "nostr_sdk::client::Client::builder", reason = "use crate::network_proxy::nostr_builder()" },
+    { path = "nostr_sdk::client::Client::new", reason = "use crate::network_proxy::nostr_builder()" },
+    { path = "nostr_sdk::client::ClientBuilder::new", reason = "use crate::network_proxy::nostr_builder()" },
+    { path = "reqwest::Client::builder", reason = "wrap with crate::network_proxy::http_builder()" },
+    { path = "reqwest::Client::new", reason = "wrap with crate::network_proxy::http_builder()" },
+    { path = "reqwest::ClientBuilder::new", reason = "wrap with crate::network_proxy::http_builder()" },
+    { path = "reqwest::get", reason = "wrap with crate::network_proxy::http_builder()" },
+]

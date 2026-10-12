@@ -1181,6 +1181,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)]
     fn audit_upload_request_overrides_the_collector_timeout() {
         let client = reqwest::Client::builder()
             .timeout(collector_host_safety::REQUEST_TIMEOUT)

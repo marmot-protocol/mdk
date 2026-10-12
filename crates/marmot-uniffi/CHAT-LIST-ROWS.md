@@ -45,7 +45,7 @@ move chats, change pin order, alter filters or create unread activity. A draft o
 Continue using the revisioned conversation draft API for editing and sending; do
 not reconstruct a composer from the shortened list preview.
 
-## Pending-send draft presentation (unreleased)
+## Pending-send draft presentation (0.13.0)
 
 `PresentedChatRowFfi.draft_version` is an optional opaque `ChatListDraftVersionFfi`
 object holding device-local store/group/revision metadata,
@@ -115,8 +115,8 @@ Keep the row itself, ordering and unread state authoritative to MDK.
 `captureChatListSelection(accountRef, view)` captures every eligible ID in one
 Chats, Unread, Archived or Left view, independently of the screen's 50/200-row
 window. The frozen order/count holds only IDs; capture and action revalidation
-are O(eligible IDs), without profile, roster or message-body hydration. Pending
-base preparation returns `ChatPresentationNotReady`, never a complete partial count.
+are O(eligible IDs), without profile, roster or message-body hydration. Capture prepares pending base rows in bounded batches and yields between them,
+with reset and shutdown cancellation; it never returns a partial count.
 
 Call `count()` for the complete count/current revision, then `page(revision,
 offset, limit)` for at most 200 IDs. New messages, order changes and late chats
@@ -140,7 +140,7 @@ revalidate/close/free calls. Every output pointer is validated before work;
 results own their allocations. Deep-free summaries/pages with their matching
 free functions; free the handle only without active calls, before its client.
 `ChatSelectionClosed`, `ChatSelectionStale` and `ChatSelectionInvalidPage` append
-statuses96,97 and98 without renumbering existing statuses. Ship the generated
+statuses 101, 102 and 103 without renumbering existing statuses. Ship the generated
 header, Swift/Kotlin source and matching native library together.
 
 The fixed-view entry point remains unchanged. `capture_chat_folder_selection`
@@ -154,7 +154,7 @@ per-action eligibility aggregation and filtered live windows remain open.
 (maximum1024 each) are variable-length nonempty even hexadecimal strings up to512
 characters. Uppercase IDs normalize to lowercase. The keyword is at most1024 UTF-8
 bytes, trimmed once; empty or whitespace-only means absent. Excessive/malformed
-inputs and unsupported versions return `ChatSelectionInvalidFilter` (C status99).
+inputs and unsupported versions return `ChatSelectionInvalidFilter` (C status104).
 
 The member-any and keyword criteria combine with OR. Unread-only, unread-mentions,
 groups-only, direct-chats-only, pinned-only, archive-side and effective mute
@@ -173,12 +173,12 @@ metadata. Display strings remain unchanged. Roster matching uses a separate comp
 current-roster index, not the two-person peer-presentation table. Engine writes,
 raw restores/imports and deletes invalidate or atomically replace those inputs;
 upgrade/backfill runs in batches of50 without network or message-history access.
-Migration107 also creates partial pending-send indexes, which requires a one-time
+Migration108 also creates partial pending-send indexes, which requires a one-time
 scan of existing timeline/submission rows during the transactional upgrade. Later
 pending-send matching uses those indexes, not a message-history traversal.
 
 If present, `smart_filter_json` replaces flat automatic criteria, preserving
-manual inclusion/exclusion. This private JSON envelope has `version:1` and a
+manual inclusion/exclusion. This public version-1 JSON input contract has `version:1` and a
 `root` group with `kind:"group"`, `all` (AND when true, OR otherwise), `not`,
 and `children`. Conditions have `kind:"condition"`, uppercase `field` and `mode`,
 `values` and `not`. Nested groups and conditions support negation. An empty root

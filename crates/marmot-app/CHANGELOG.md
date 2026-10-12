@@ -2,16 +2,7 @@
 
 ## Unreleased
 
-- Add complete flat and bounded smart-folder selection with native roster/text, draft and outbox matching, strict rule validation and remove-only revalidation. Relative-time predicates and filtered live windows remain separate.
-
-### Breaking changes
-
-- Attachment history adds `AttachmentRole` and the required `AttachmentEntry.role`
-  field. Update Rust struct literals; gallery consumers can exclude `InlineEmoji`
-  without changing original slots, parser verdicts or acquisition references.
-  See [the attachment-history handoff](../marmot-uniffi/ATTACHMENT-HISTORY.md).
-
-### Added
+- Complete flat and bounded smart-folder selection with native roster/text, draft and outbox matching, strict rule validation and remove-only revalidation. Relative-time predicates and filtered live windows remain separate.
 
 - `MarmotAppRuntime::capture_chat_list_selection` exposes complete frozen
   fixed-view selection independently of display pagination. Handles serialize
@@ -19,6 +10,95 @@
   shutdown or explicit cancellation. Revalidation only removes IDs and does
   not grant mutation authority. Automatic-folder predicates remain separate.
 
+## 0.13.0 - 2026-10-12
+
+### Breaking changes
+
+- External-signer accounts move their device-local SQLCipher key from the
+  plaintext `.external-sqlcipher-secret` file into the configured `SecretStore`
+  (`.external-sqlcipher/<account label>`) on first open, then scrub and remove the
+  file. Older binaries cannot open these databases; downgrade is unsupported.
+  Opening a database with neither credential fails instead of generating a key.
+
+- `PresentedChatRow` adds `draft_version: Option<ChatListDraftVersion>`; struct
+  literals must set it. `MessageDraftRevision::includes_chat_list_version`
+  compares the two. An identical-text draft save now advances the revision.
+
+- `GroupEvent` adds `LocalGroupCopyTerminated`, `LocalGroupCopyRestored` and
+  `GroupMemberLeavesRemoved`; update exhaustive matches. See Fixed for their
+  semantics.
+
+- `AppError` adds `ModerationReportingNotConfigured`, `InvalidModerationReportConfig`,
+  `InvalidReportedPublicKey`, `CannotReportSelf` and `ModerationReportRateLimited`;
+  update exhaustive matches. `MarmotAppConfig` adds `moderation_report_config`;
+  struct literals that do not use `..Default::default()` must set it.
+
+- Attachment history adds `AttachmentRole` and the required `AttachmentEntry.role`
+  field. Update Rust struct literals; gallery consumers can exclude `InlineEmoji`
+  without changing original slots, parser verdicts or acquisition references.
+  See [the attachment-history handoff](../marmot-uniffi/ATTACHMENT-HISTORY.md).
+
+- `RelaySyncSnapshot` adds `refusals: Vec<RelayRefusalStats>`. Struct literals
+  must set it (`Vec::new()` keeps the old meaning); serialized snapshots omit it
+  when empty and older ones still deserialize.
+
+### Added
+
+- `MarmotApp::set_startup_diagnostics_enabled` and `startup_diagnostics_snapshot`
+  (`NativeStartupSnapshot`, `NativeStartupStage`, `NativeStartupOutcome`,
+  `NativeStartupObservation`) report opt-in, in-memory account, store and
+  key-opening phases, migration progress and async completion, with bounded
+  history and drop counters. Snapshotting does not query storage or the keystore,
+  and ordinary construction keeps capture disabled.
+
+- Relay refusals of live subscriptions are no longer dropped silently (#2247).
+  When a relay answers an inbox, group or maintenance REQ with `CLOSED`, the
+  account's v5 audit records a `subscription_refused` row: per relay (hashed)
+  and route kind, the reason category, whether the relay client kept the REQ
+  for a later AUTH or dropped it, and how often. `RelaySyncSnapshot.refusals`
+  (and `wn relay-stats`) counts refusals by opaque relay index, route kind,
+  category and disposition. `RelayRefusalStats`, `SubscriptionRouteKind` and
+  `SubscriptionRefusalDisposition` are re-exported.
+
+- Opt-in SOCKS5 routing. Set `WN_SOCKS5_PROXY` (a numeric `ip:port`) and,
+  optionally, both `WN_SOCKS5_USERNAME` and `WN_SOCKS5_PASSWORD` before the
+  runtime starts. Relay publishing, account receive and history pools,
+  directory reads, moderation reports, Blossom media, Open Ranking and
+  collector/audit uploads then connect through the proxy. Relay hostnames
+  resolve at the proxy; HTTP still sends the locally validated IP. The policy
+  is read once per process, ignores `ALL_PROXY`/`NO_PROXY`, and never falls
+  back to a direct connection. With all three variables unset, routing is
+  unchanged. See [SOCKS5 routing](README.md#socks5-routing).
+  - `MarmotApp::try_with_relays_and_account_home_and_config` now fails with an
+    `InvalidInput` I/O error when the `WN_SOCKS5_*` settings are invalid
+    (partial credentials, a hostname or a zero port). The infallible dev
+    constructors open, but every relay and HTTP connection is refused.
+  - `MarmotAppRuntime` agent preview publishing and watching return an
+    `Unsupported` I/O error while SOCKS5 is on, because the proxy cannot carry
+    QUIC.
+
+- `MarmotAppRuntime::submit_moderation_report` privately reports an account to
+  the deployment's moderation team. It sends a NIP-56 kind-1984 rumor, sealed by
+  the account key and gift-wrapped per NIP-59 (through the shared Welcome wrap
+  path) to the configured reports key, and publishes only to the configured
+  relays without account AUTH. This is additive: `report_message`,
+  `content_reports` and `dismiss_reports` are unchanged. Reports never carry
+  message, group or relay identifiers. Signed wraps are staged before publishing,
+  retried after `catch_up_accounts` and purged on sign-out and wipe. Repeats
+  within 10 minutes return the existing outcome, and each account may send 20
+  reports per hour. The new
+  `moderation_reporting_available`, `retry_pending_moderation_reports` and
+  `MarmotApp::set_moderation_report_config` complete the surface. See
+  `docs/marmot-architecture/moderation-reports.md`.
+
+- Opt-in relay telemetry exports `relay_reconciliation_attempts` and
+  `relay_reconciliation_order_unproven_passes`: device-wide, unlabeled counts
+  of NIP-77 history-repair passes, and of group passes that returned nothing
+  because no time order covered the missing history (#2086). Repeated, those
+  passes end in a "history may be incomplete" notice.
+  `NostrAdapterMetrics` gains `reconciliation_order_unproven_passes` and
+  `NostrReconciliationSummary` gains `order_unproven`; struct literals need
+  the field or `..Default::default()`.
 - `MarmotAppRuntime::create_identity_local_ready_with_initial_profile` makes a
   caller-selected profile the first public kind-0 of a generated account, so
   contacts never see the key-derived default name. A setup resumed past
@@ -53,12 +133,44 @@
 
 ### Changed
 
+- Polls can be created in direct conversations as well as groups. Renaming or
+  reclassifying a conversation does not disable an existing open poll.
+
+- A sync drain stops waiting once every relay has answered its history REQs,
+  counting a relay that refused one for good as answered, instead of running
+  to `SDK_FIRST_SYNC_WAIT` / `SDK_DRAIN_WAIT`. A refusal is not evidence of
+  served history, so live cursor promotion and incremental activation reuse
+  still require end-of-stored-events from every relay.
+
 - `relay.damus.io` is no longer on the retired-relay denylist; the relay is
   still operating. `retired_relay_hosts()` now returns only
   `relay.nostr.band`. Members whose kind-10050 inbox list names only
   `relay.damus.io` can be invited again.
 
 ### Fixed
+
+- Invites recover a member's KeyPackage from up to eight discovery relays when
+  their advertised outboxes have no usable one, checking signed deletions and
+  newer slot replacements before using it. Lookup stays within the existing
+  50-second deadline and incomplete coverage stays retryable (#2200).
+- Durably accepted sends no longer wait behind startup recovery, automatic push
+  gossip, a pending retry deadline or an older publication's secondary-relay
+  retry once required acknowledgements and MLS confirmation complete.
+
+- Catch-up downloads a large group backlog oldest first. When more history
+  is missing than one comparison pass fetches, the pass narrows to the oldest
+  part that fits, so commits no longer arrive ahead of older messages and move
+  a member's epoch past messages it can then never read (#2086).
+- Catch-up downloads missed group history in far fewer round trips. Each
+  comparison pass now fetches up to 256 events (1 MiB), across all relays, in
+  batched requests instead of 16 one-at-a-time requests, so a backlog of a few hundred
+  messages arrives in a couple of passes instead of dozens. A long drip gave
+  commits time to move a member's epoch past older messages it had not
+  downloaded yet (#2086).
+- Profile, follow-list and relay-list saves still return on the first relay
+  acknowledgement, but relays the quorum cancelled now receive the identical
+  signed record in a bounded background send. Previously those relays kept
+  serving the older version, such as a generated signup name (#2216).
 
 - Explicit onboarding relay edits now preview and publish the selected endpoint
   changes without rebuilding untouched tags: mixed NIP-65 roles, duplicate

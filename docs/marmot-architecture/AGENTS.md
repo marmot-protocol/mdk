@@ -55,7 +55,8 @@ order and the roles agents most often need.
 
 - **Path:** `further-context/dial-safety-collector-inventory.md`
   - **Role:** Per-attempt collector and forensic-audit HTTP inventory: structural URL gates, resolve/validate/pin,
-    disabled redirects and proxies, timeout budgets, retired-host rejection, and context-free errors.
+    disabled redirects and system proxies, explicit SOCKS5 pin preservation, timeout budgets, retired-host rejection,
+    and context-free errors.
 
 - **Path:** `overview/multi-step-state-changes.md`
   - **Role:** No-torn-writes convention for multi-step state changes: validation/mutation ordering, compensation,
@@ -82,6 +83,9 @@ order and the roles agents most often need.
 
 - **Path:** `invitation-recovery.md`
   - **Role:** Recovery of invites whose Welcome landed on a losing branch (durable intent, re-invite, `Conflict`).
+
+- **Path:** `moderation-reports.md`
+  - **Role:** Wire contract for private gift-wrapped NIP-56 reports to the deployment operator and the operator's reader.
 
 - **Path:** `distributed-convergence.md`
   - **Role:** Branch selection, retained anchors, and convergence model.
