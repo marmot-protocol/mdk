@@ -11,6 +11,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 - Account attachment pages, bounded borrowed query inputs and opaque cursor/version handles with deep-free and version-clone functions. New records/symbols require matching headers and libraries; existing group history remains supported.
 
+- Add `marmot_send_prepared_media_with_client_token` for captured ordinary-media admission and conditional draft consumption. Inputs are borrowed; the nullable captured revision remains owned by its selected-draft root. The owned result uses the existing `marmot_local_send_acceptance_free`; layouts and status values are unchanged. Use matching regenerated headers and libraries.
+
 ## [0.13.0] - 2026-10-12
 
 Recompile against the matching `marmot.h` and library: several record layouts changed and new event, Markdown and
@@ -42,7 +44,6 @@ status values are appended. See the [client upgrade guide](../../docs/integratio
 - `marmot_create_identity_with_initial_profile` creates a generated identity
   whose first public kind-0 is the borrowed onboarding profile. New symbol;
   use the matching header and library.
-
 - File-backed media upload inputs, token-aware upload calls and operation
   cancellation/progress handles: `marmot_upload_media_files`,
   `marmot_upload_media_files_with_client_token`,
