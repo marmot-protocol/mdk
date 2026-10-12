@@ -45,7 +45,7 @@ move chats, change pin order, alter filters or create unread activity. A draft o
 Continue using the revisioned conversation draft API for editing and sending; do
 not reconstruct a composer from the shortened list preview.
 
-## Pending-send draft presentation (unreleased)
+## Pending-send draft presentation (0.13.0)
 
 `PresentedChatRowFfi.draft_version` is an optional opaque `ChatListDraftVersionFfi`
 object holding device-local store/group/revision metadata,

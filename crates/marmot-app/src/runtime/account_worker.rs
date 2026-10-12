@@ -6130,7 +6130,16 @@ async fn publish_next_local_submission(
                 Ok(true) => {
                     deferred_groups.insert(candidate.group_id_hex.clone());
                 }
-                Err(_) => return Some(Duration::from_millis(100)),
+                Err(_) => {
+                    // Preserve the failing group's order and retained payload, while
+                    // allowing independent groups to make progress on this same tick.
+                    deferred_groups.insert(candidate.group_id_hex.clone());
+                    tracing::warn!(
+                        target: "marmot_app::runtime",
+                        method = "publish_next_local_submission",
+                        "local edit dependency lookup failed; deferring its group"
+                    );
+                }
                 Ok(false) => {
                     selected = Some(candidate);
                     break;

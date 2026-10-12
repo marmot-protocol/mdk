@@ -4234,6 +4234,8 @@ impl AppClient {
         &self,
         submission: &storage_sqlite::LocalSubmission,
     ) -> Result<bool, AppError> {
+        use cgka_traits::storage::{OutboundFanoutStorage, OutboundIntentStorage};
+        use sha2::{Digest, Sha256};
         let Some(json) = submission.request_json.as_deref() else {
             return Ok(false);
         };
@@ -4269,7 +4271,30 @@ impl AppClient {
         let group = GroupId::new(hex::decode(&submission.group_id_hex).map_err(|_| {
             AppError::InvalidAppMessagePayload("invalid local submission group".into())
         })?);
-        Ok(!self.runtime.group_record(&group)?.is_terminal())
+        if self.runtime.group_record(&group)?.is_terminal() {
+            return Ok(false);
+        }
+        // Engine acceptance survives completion and abandonment. Defer only while the
+        // exact original still has durable publication work, never for its state alone.
+        if storage
+            .list_queued_outbound_intents(&group)?
+            .iter()
+            .any(|queued| {
+                matches!(&queued.intent, SendIntent::AppMessage { payload, .. }
+                if Sha256::digest(payload)[..] == original.payload_hash[..])
+            })
+        {
+            return Ok(true);
+        }
+        Ok(storage
+            .list_outbound_fanouts_for_group(&group)?
+            .iter()
+            .any(|fanout| {
+                fanout
+                    .application_message()
+                    .is_some_and(|message| message.app_event_id == original.message_id_hex)
+                    && !fanout.outcome().fanout_complete
+            }))
     }
 
     pub(crate) async fn publish_local_submission<F>(

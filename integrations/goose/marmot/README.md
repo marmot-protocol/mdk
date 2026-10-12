@@ -46,7 +46,7 @@ Versioned `wn-agent-v*` releases publish `wn-agent`, `wn-goose`, checksums, and
 a same-user service installer. Define the [verified installer helper](../../README.md#verified-installer-helper) first, then run this command in the same shell with `install_verified`:
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.13.0"
 install_verified "$base_url/install-goose-marmot.sh" \
   "$base_url/install-goose-marmot.sh.sha256" \
   --yes --allow-welcomer npub1...
