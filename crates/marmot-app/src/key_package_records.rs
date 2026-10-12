@@ -351,6 +351,7 @@ fn select_preferred_key_package(
     let mut slots = BTreeSet::new();
     let mut observed_legacy = false;
     let mut all_slots_legacy = true;
+    let mut legacy_error = None;
     for record in records.into_iter().rev() {
         if record.event.kind != KIND_MARMOT_KEY_PACKAGE || record.event.pubkey != account_id_hex {
             continue;
@@ -382,7 +383,14 @@ fn select_preferred_key_package(
                     .is_ok();
                 observed_legacy |= legacy;
                 all_slots_legacy &= legacy;
-                newest_error.get_or_insert(error);
+                if legacy {
+                    // Valid legacy bytes are diagnostic evidence. Their strict
+                    // profile rejection must not mask a current publication's
+                    // malformed metadata or group capability rejection.
+                    legacy_error.get_or_insert(error);
+                } else {
+                    newest_error.get_or_insert(error);
+                }
                 continue;
             }
         };
@@ -406,7 +414,7 @@ fn select_preferred_key_package(
         return Err(AppError::ObsoleteKeyPackage(account_id_hex.to_owned()));
     }
     if selected.is_none()
-        && let Some(error) = newest_error
+        && let Some(error) = newest_error.or(legacy_error)
     {
         return Err(error);
     }

@@ -386,28 +386,31 @@ async fn legacy_slot_does_not_hide_current_capability_rejection() {
     let legacy = fresh_key_package_for_account(&app, account, true).await;
     let mut current = member_resolution_key_package_event(account, limited);
     current.tags.iter_mut().find(|tag| tag[0] == "d").unwrap()[1] = "limited-current".into();
-    let records = [
-        member_resolution_key_package_event(account, legacy),
-        current,
-    ]
-    .into_iter()
-    .map(|event| RelayEventRecord {
-        event,
-        endpoints: vec![],
-    })
-    .collect::<Vec<_>>();
-    let error = preferred_member_key_package_from_records(
-        &account.account_id_hex,
-        &records,
-        app.directory_freshness(),
-        Some(&requirements),
-    )
-    .err()
-    .expect("a valid current publication must retain its capability error");
-    assert!(matches!(
-        error,
-        AppError::Session(cgka_session::SessionError::Engine(
-            cgka_traits::EngineError::MissingRequiredCapabilities { .. }
-        ))
-    ));
+    let mut legacy = member_resolution_key_package_event(account, legacy);
+    let now = unix_now_seconds();
+    for legacy_is_newer in [false, true] {
+        current.created_at = now - if legacy_is_newer { 2 } else { 1 };
+        legacy.created_at = now - if legacy_is_newer { 1 } else { 2 };
+        let records = [legacy.clone(), current.clone()]
+            .into_iter()
+            .map(|event| RelayEventRecord {
+                event,
+                endpoints: vec![],
+            })
+            .collect::<Vec<_>>();
+        let error = preferred_member_key_package_from_records(
+            &account.account_id_hex,
+            &records,
+            app.directory_freshness(),
+            Some(&requirements),
+        )
+        .err()
+        .expect("a valid current publication must retain its capability error");
+        assert!(matches!(
+            error,
+            AppError::Session(cgka_session::SessionError::Engine(
+                cgka_traits::EngineError::MissingRequiredCapabilities { .. }
+            ))
+        ));
+    }
 }
