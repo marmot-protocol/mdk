@@ -813,8 +813,16 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
+      # Three jobs, balanced by measured runtime, keep this matrix off the
+      # critical path while holding fewer of the organization's runner slots.
       matrix:
-        lane: [smoke-1, smoke-2, offline-history, process, models]
+        include:
+          - lane: offline-history
+            groups: offline-history
+          - lane: smoke-1, models
+            groups: smoke-1 models
+          - lane: smoke-2, process
+            groups: smoke-2 process
 
     steps:
       - name: Check out repository
@@ -851,7 +859,7 @@ jobs:
 
       - name: Run archived simulator tests
         env:
-          LANE: ${{ matrix.lane }}
+          SIM_GROUPS: ${{ matrix.groups }}
         run: |
           set -euo pipefail
           nextest=(cargo nextest run
@@ -859,26 +867,41 @@ jobs:
             --binaries-metadata target/nextest/binaries-metadata.json
             --workspace-remap "$GITHUB_WORKSPACE"
             --target-dir-remap "$GITHUB_WORKSPACE/target")
-          case "$LANE" in
-            smoke-*)
-              "${nextest[@]}" --profile ci --partition "count:${LANE#smoke-}/2" \
-                -E "$(just --evaluate simulator-smoke-filter) and not binary(offline_catchup_regression)"
-              ;;
-            offline-history)
-              # Preserve the complete suite, including both 1024-message cases.
-              "${nextest[@]}" --profile ci -E 'binary(=offline_catchup_regression)'
-              ;;
-            process)
-              "${nextest[@]}" --profile ci \
-                -E "binary(=process_orchestrator) and ($(just --evaluate simulator-process-filter))"
-              ;;
-            models)
-              for binary in route_assurance independent_reference_model lifecycle_model mutation_adequacy protocol_decision_gate semantic_reduction; do
-                "${nextest[@]}" --profile ci -E "binary(=$binary)"
-              done
-              ;;
-            *) exit 2 ;;
-          esac
+          # Callers run each group under `||`, where errexit is suspended, so
+          # every group returns its own status and the models loop collects it.
+          run_group() {
+            case "$1" in
+              smoke-*)
+                "${nextest[@]}" --profile ci --partition "count:${1#smoke-}/2" \
+                  -E "$(just --evaluate simulator-smoke-filter) and not binary(offline_catchup_regression)"
+                ;;
+              offline-history)
+                # Preserve the complete suite, including both 1024-message cases.
+                "${nextest[@]}" --profile ci -E 'binary(=offline_catchup_regression)'
+                ;;
+              process)
+                "${nextest[@]}" --profile ci \
+                  -E "binary(=process_orchestrator) and ($(just --evaluate simulator-process-filter))"
+                ;;
+              models)
+                local status=0
+                for binary in route_assurance independent_reference_model lifecycle_model mutation_adequacy protocol_decision_gate semantic_reduction; do
+                  "${nextest[@]}" --profile ci -E "binary(=$binary)" || status=1
+                done
+                return "$status"
+                ;;
+              *) return 2 ;;
+            esac
+          }
+          # Run every group even after a failure so one job reports all of them.
+          failed=()
+          for group in $SIM_GROUPS; do
+            run_group "$group" || failed+=("$group")
+          done
+          if (( ${#failed[@]} )); then
+            echo "error: simulator groups failed: ${failed[*]}" >&2
+            exit 1
+          fi
 
   conformance-extras:
     name: Convergence gates and simulator doctests

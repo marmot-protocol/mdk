@@ -55,10 +55,12 @@ jobs:
     outputs:
       source_sha: ${{ steps.identity.outputs.source_sha }}
       builder_sha: ${{ steps.identity.outputs.builder_sha }}
+      run_apple: ${{ steps.lanes.outputs.run_apple }}
     steps:
       - name: Check out exact candidate head
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
+          fetch-depth: ${{ github.event_name == 'pull_request' && '0' || '1' }}
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Record exact candidate identity
@@ -77,6 +79,31 @@ jobs:
             echo "source_sha=$source_sha"
             echo "builder_sha=$source_sha"
           } >> "$GITHUB_OUTPUT"
+      # The organization shares five macOS runners across every repository.
+      # Pull requests build the Apple candidates only when MarmotKit or its
+      # workflows change; master pushes, the weekly schedule, and manual runs
+      # always build them, so a dependency or toolchain bump is still covered
+      # when it merges.
+      - name: Select Apple lanes
+        id: lanes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          run_apple=true
+          if [[ "$EVENT_NAME" == "pull_request" ]] && git cat-file -e "${BASE_SHA}^{commit}"; then
+            changed="$(git diff --no-renames --name-only "$BASE_SHA...HEAD")"
+            if ! awk '
+              /\.md$/ { next }
+              /^crates\/marmot-uniffi\// { found = 1 }
+              /^\.github\/workflows\/(bindings\.yaml|bindings-profile\.yml|bindings-profile-measurement\.yml)$/ { found = 1 }
+              END { exit !found }
+            ' <<<"$changed"; then
+              run_apple=false
+            fi
+          fi
+          echo "run_apple=$run_apple" >> "$GITHUB_OUTPUT"
       - name: Run inexpensive orchestration regressions
         run: |
           set -euo pipefail
@@ -89,6 +116,7 @@ jobs:
     name: Build Apple candidate input (${{ matrix.part }})
     runs-on: macos-latest
     needs: identity
+    if: needs.identity.outputs.run_apple == 'true'
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -554,10 +582,19 @@ jobs:
           ANDROID_RESULT: ${{ needs.android-package.result }}
           IOS_RESULT: ${{ needs.ios-package.result }}
           MACOS_RESULT: ${{ needs.macos-package.result }}
+          RUN_APPLE: ${{ needs.identity.outputs.run_apple }}
           SOURCE_SHA: ${{ needs.identity.outputs.source_sha }}
         run: |
           set -euo pipefail
-          for result in "$IDENTITY_RESULT" "$ANDROID_RESULT" "$IOS_RESULT" "$MACOS_RESULT"; do
+          for result in "$IDENTITY_RESULT" "$ANDROID_RESULT"; do
+            [[ "$result" == success ]] || exit 1
+          done
+          if [[ "$RUN_APPLE" == "false" ]]; then
+            [[ "$IOS_RESULT" == skipped && "$MACOS_RESULT" == skipped ]] || exit 1
+            echo "Validated the Android candidate package for $SOURCE_SHA; Apple lanes not selected"
+            exit 0
+          fi
+          for result in "$IOS_RESULT" "$MACOS_RESULT"; do
             [[ "$result" == success ]] || exit 1
           done
           echo "Validated Android, iOS, and macOS candidate packages for $SOURCE_SHA"
