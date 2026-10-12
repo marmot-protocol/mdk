@@ -370,7 +370,7 @@ impl MarmotApp {
                 // No authenticator: relays see only the one-time wrap key, never an
                 // AUTH linking the account to the report.
                 Arc::new(NostrSdkRelayClient::from_builder(
-                    nostr_sdk::prelude::Client::builder(),
+                    crate::network_proxy::nostr_builder(),
                 ))
             })
             .clone()
