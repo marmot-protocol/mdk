@@ -7,9 +7,17 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
-- Mirror bounded native startup progress with opt-in enable/snapshot functions and a deep-free snapshot API. The synchronous observation remains usable before native startup completes.
+## [0.13.0] - 2026-10-12
+
+Recompile against the matching `marmot.h` and library: several record layouts changed and new event, Markdown and
+status values are appended. See the [client upgrade guide](../../docs/integration/0.13.0.md).
 
 ### Added
+
+- `marmot_set_startup_diagnostics_enabled`, `marmot_startup_diagnostics_snapshot`
+  and `marmot_native_startup_snapshot_free` mirror opt-in native startup
+  progress (`MarmotNativeStartupSnapshot`). The snapshot remains usable before
+  native startup completes.
 
 - NIP-46 signer sessions and the runtime follow the opt-in `WN_SOCKS5_*`
   proxy settings described in the marmot-app
@@ -32,7 +40,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   use the matching header and library.
 
 - File-backed media upload inputs, token-aware upload calls and operation
-  cancellation/progress handles. New symbols and borrowed input records require
+  cancellation/progress handles: `marmot_upload_media_files`,
+  `marmot_upload_media_files_with_client_token`,
+  `marmot_media_file_transfer_control_*` and
+  `marmot_max_file_media_ciphertext_bytes`. New symbols and borrowed input records require
   matching headers/libraries; existing byte-array APIs retain their bounds.
 - Add `marmot_propose_onboarding_relay_repair` and nested typed relay-repair
   preview records. `MarmotOnboardingRepairProposal` gains an optional
@@ -51,7 +62,7 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   headers/libraries; the row layout and comparison signature change. Identical-text
   saves emit a replacement snapshot because their draft revision changes. See the
   shared chat-list contract.
-- Append `MarmotMarkdownInline::Timestamp` with signed `int64_t` Unix seconds
+- Append the `MARMOT_MARKDOWN_INLINE_TIMESTAMP` inline tag with signed `int64_t` Unix seconds
   and `MarmotMarkdownTimestampStyle` for local-time timestamp display nodes.
   Existing inline discriminants are unchanged; the new payload owns no
   allocations. Recompile consumers against the regenerated `marmot.h` and ship
@@ -76,7 +87,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `InlineEmoji`) for gallery filtering without changing slot or acquisition identity.
   This changes the record layout; rebuild clients with the matching header/library.
 - External account SQLCipher keys use the configured host secret store. Existing
-  plaintext key files migrate only after a verified secret-store write.
+  plaintext key files migrate only after a verified secret-store write. Older
+  binaries cannot open migrated databases; downgrade is unsupported.
+- `marmot_create_poll` accepts direct conversations as well as groups.
+- `marmot_retired_relay_hosts` no longer returns `relay.damus.io`, and endpoint
+  classification reports it allowed.
 
 ### Fixed
 
@@ -90,7 +105,7 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   freshly discovered outboxes even when a discovery indexer is unavailable.
 
 - Group activity preserves per-commit reaction targets across author and peer
-  replay, including before disband. See `marmot-app`'s Unreleased fixes for
+  replay, including before disband. See `marmot-app`'s 0.13.0 fixes for
   projection and push-token behavior.
 
 ## [0.12.0] - 2026-10-02
@@ -474,7 +489,8 @@ downgrade is unsupported. See the [cohort upgrade notes](../cli/CHANGELOG.md#092
   just a local account's. Both return `MarmotAccountRelayLists`.
   ([#1605](https://github.com/marmot-protocol/mdk/pull/1605))
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.12.0...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.13.0...HEAD
+[0.13.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.12.0...marmotc-v0.13.0
 [0.12.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.11.0...marmotc-v0.12.0
 [0.11.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.10.4...marmotc-v0.11.0
 [0.9.20]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.9.19...marmotc-v0.9.20
