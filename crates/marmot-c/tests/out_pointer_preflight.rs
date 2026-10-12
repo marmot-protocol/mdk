@@ -146,3 +146,39 @@ fn explicit_mention_send_checks_output_before_any_input() {
     };
     assert_eq!(status, MarmotStatus::NullPointer);
 }
+
+#[test]
+fn prepared_media_snapshot_output_is_preflighted_before_any_input_is_used() {
+    unsafe {
+        assert_eq!(
+            marmot_c::commands::marmot_send_prepared_media_with_client_token(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::dangling(),
+                usize::MAX,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::dangling(),
+                std::ptr::null_mut(),
+            ),
+            MarmotStatus::NullPointer
+        );
+        let mut out = std::ptr::dangling_mut();
+        assert_eq!(
+            marmot_c::commands::marmot_send_prepared_media_with_client_token(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::dangling(),
+                usize::MAX,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::dangling(),
+                &raw mut out,
+            ),
+            MarmotStatus::NullPointer
+        );
+        assert!(out.is_null());
+    }
+}
