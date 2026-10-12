@@ -186,6 +186,7 @@ Regenerate Swift/Kotlin bindings with the matching native library. See the
   missing key from retained epoch state, recovering attachments whose key was
   never cached. Retry budgets are unchanged. (#2106)
 
+
 ## 0.11.0 - 2026-09-29
 
 ### Changed

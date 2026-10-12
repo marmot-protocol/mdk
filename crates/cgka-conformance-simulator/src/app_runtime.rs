@@ -2699,6 +2699,7 @@ fn app_error_retryable(error: &AppError) -> bool {
             | AppError::TransportClosed
             | AppError::ChatPresentationNotReady
             | AppError::DirectConversationIndexNotReady
+            | AppError::MemberDiscoveryIncomplete(_)
     )
 }
 fn app_error(error: AppError) -> SubjectError {
@@ -3092,6 +3093,16 @@ mod tests {
     #[test]
     fn app_errors_are_classified_without_serializing_inner_details() {
         let marker = "private-storage-path";
+        let incomplete = AppError::MemberDiscoveryIncomplete(marker.into());
+        assert!(app_error_retryable(&incomplete));
+        assert_eq!(app_error_kind(&incomplete), "member_discovery_incomplete");
+        let incomplete = app_error(incomplete);
+        assert_eq!(incomplete.category, SubjectFailureCategory::Resource);
+        assert!(!incomplete.message.contains(marker));
+        let obsolete = AppError::ObsoleteKeyPackage(marker.into());
+        assert!(!app_error_retryable(&obsolete));
+        let obsolete = app_error(obsolete);
+        assert!(!obsolete.message.contains(marker));
         let environment = app_error(AppError::SqlcipherKeyDerivation(marker.into()));
         assert_eq!(environment.category, SubjectFailureCategory::Environment);
         assert!(!environment.message.contains(marker));

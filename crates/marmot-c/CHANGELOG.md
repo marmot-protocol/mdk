@@ -9,7 +9,7 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
-- Append invitation diagnostic statuses `MARMOT_STATUS_OBSOLETE_KEY_PACKAGE` (101) and `MARMOT_STATUS_MEMBER_DISCOVERY_INCOMPLETE` (102). Existing status values remain unchanged; detail strings omit recipient identity.
+- Append invitation diagnostic statuses `MARMOT_STATUS_OBSOLETE_KEY_PACKAGE` (101) and `MARMOT_STATUS_MEMBER_DISCOVERY_INCOMPLETE` (102). Existing status values remain unchanged; detail strings omit recipient identity. Member discovery failures previously mapped to the relay-directory status use 102; hosts should offer retry for this outcome.
 - Add `marmot_send_prepared_media_with_client_token` for captured ordinary-media admission and conditional draft consumption. Inputs are borrowed; the nullable captured revision remains owned by its selected-draft root. The owned result uses the existing `marmot_local_send_acceptance_free`; layouts and status values are unchanged. Use matching regenerated headers and libraries.
 
 ## [0.13.0] - 2026-10-12
@@ -49,7 +49,6 @@ status values are appended. See the [client upgrade guide](../../docs/integratio
   `marmot_media_file_transfer_control_*` and
   `marmot_max_file_media_ciphertext_bytes`. New symbols and borrowed input records require
   matching headers/libraries; existing byte-array APIs retain their bounds.
-
 - Add `marmot_propose_onboarding_relay_repair` and nested typed relay-repair
   preview records. `MarmotOnboardingRepairProposal` gains an optional
   `relay_repair` pointer; regenerate and recompile with the matching header

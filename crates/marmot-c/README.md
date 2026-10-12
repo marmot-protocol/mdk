@@ -288,7 +288,7 @@ Each entry embeds the existing `MarmotAccountKeyPackage` record plus `MarmotAcco
 
 ### Invitation lookup errors
 
-`MARMOT_STATUS_OBSOLETE_KEY_PACKAGE` identifies validated legacy-only packages on the searched relays. `MARMOT_STATUS_MEMBER_DISCOVERY_INCOMPLETE` means missing or obsolete-only packages could not be established. Preserve these distinct recovery actions without parsing detail strings. Details omit the recipient identity. See the [shared invitation lookup contract](../marmot-uniffi/README.md#invitation-lookup-errors).
+`MARMOT_STATUS_OBSOLETE_KEY_PACKAGE` identifies validated legacy-only packages on the searched relays. `MARMOT_STATUS_MEMBER_DISCOVERY_INCOMPLETE` means missing or obsolete-only packages could not be established. Preserve these distinct recovery actions without parsing detail strings. Details omit the recipient identity. Obsolete-only guidance does not account for unseen deletions of legacy packages. See the [shared invitation lookup contract](../marmot-uniffi/README.md#invitation-lookup-errors).
 
 ## Selected chat-list presentation
 

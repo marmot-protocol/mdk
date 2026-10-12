@@ -337,13 +337,77 @@ async fn member_diagnosis_preserves_current_selection_and_newest_slot_validation
         select(vec![wrong_identity]),
         Err(AppError::InvalidKeyPackageEvent(_))
     ));
+    let mut replacement = old.clone();
+    replacement
+        .tags
+        .iter_mut()
+        .find(|tag| tag[0] == "d")
+        .unwrap()[1] = "current".into();
+    assert!(matches!(
+        select(vec![current_event.clone(), replacement]),
+        Err(AppError::ObsoleteKeyPackage(_))
+    ));
     let mut future = current_event;
     future.created_at = u64::MAX;
-    assert!(!matches!(
+    assert!(matches!(
         select(vec![old.clone(), future]),
-        Err(AppError::ObsoleteKeyPackage(_))
+        Err(AppError::InvalidKeyPackageEvent(_))
     ));
     let mut legacy_kind = old;
     legacy_kind.kind = 443;
     assert!(select(vec![legacy_kind]).unwrap().value.is_none());
+}
+
+#[tokio::test]
+async fn legacy_slot_does_not_hide_current_capability_rejection() {
+    let (_dir, app, accounts, _) = member_resolution_fixture(1, false).await;
+    let account = &accounts[0];
+    app.account_home().create_account("alice").unwrap();
+    let mut alice = client_on_app_relay_plane(&app, "alice").await;
+    let group = alice
+        .create_group("diagnostic capabilities", &[])
+        .await
+        .unwrap();
+    let requirements = alice
+        .runtime
+        .session()
+        .invite_key_package_requirements(&group)
+        .unwrap();
+    let limited = fresh_key_package_with_components(
+        &app,
+        account,
+        false,
+        app.supported_app_component_ids()
+            .into_iter()
+            .filter(|id| *id != GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID)
+            .collect(),
+    )
+    .await;
+    let legacy = fresh_key_package_for_account(&app, account, true).await;
+    let mut current = member_resolution_key_package_event(account, limited);
+    current.tags.iter_mut().find(|tag| tag[0] == "d").unwrap()[1] = "limited-current".into();
+    let records = [
+        member_resolution_key_package_event(account, legacy),
+        current,
+    ]
+    .into_iter()
+    .map(|event| RelayEventRecord {
+        event,
+        endpoints: vec![],
+    })
+    .collect::<Vec<_>>();
+    let error = preferred_member_key_package_from_records(
+        &account.account_id_hex,
+        &records,
+        app.directory_freshness(),
+        Some(&requirements),
+    )
+    .err()
+    .expect("a valid current publication must retain its capability error");
+    assert!(matches!(
+        error,
+        AppError::Session(cgka_session::SessionError::Engine(
+            cgka_traits::EngineError::MissingRequiredCapabilities { .. }
+        ))
+    ));
 }
