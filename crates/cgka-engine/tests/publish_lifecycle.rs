@@ -2434,7 +2434,12 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
         assert!(alice.drain_events().is_empty());
         let mut replay_events = Vec::new();
         let mut turns = 0;
-        for turn in 0..8 {
+        // Drain and Inputs bound each turn by real elapsed time as well as rows,
+        // so a slow runner admits fewer rows per turn. Bound the loop by work,
+        // not speed: every turn must complete at least one row, so one turn per
+        // retained row always suffices.
+        let max_turns = retained_ids.len();
+        for turn in 0..max_turns {
             let delayed_preparation = turn < 2 && !matches!(mode, Advance::DeterministicInputs);
             if delayed_preparation {
                 fault.replay_delay.arm(1);
@@ -2461,6 +2466,7 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
                 delivered <= 64,
                 "one background turn exceeded its shared row allowance: {delivered}"
             );
+            assert!(delivered >= 1, "every background turn must make progress");
             if delayed_preparation {
                 assert_eq!(
                     delivered, 1,
@@ -2473,6 +2479,12 @@ async fn confirmed_publish_retries_failed_inbound_replay_through_normal_advance(
                 .all(|id| storage.get_message(id).unwrap().state == MessageState::Processed)
             {
                 break;
+            }
+            if matches!(mode, Advance::DeterministicInputs) {
+                assert_eq!(
+                    delivered, 64,
+                    "without a wall-time budget, only the row allowance yields"
+                );
             }
             assert!(
                 alice.drain_pending_convergence_groups().contains(&group_id),
