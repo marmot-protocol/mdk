@@ -90,6 +90,9 @@
 //! `legitimate_count + 1` because the below-live-cutoff event is already present in
 //! the exact reconciliation set.
 
+// Test fixtures dial local relays directly; the proxy policy is crate-private.
+#![allow(clippy::disallowed_methods)]
+
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;

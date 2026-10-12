@@ -1720,6 +1720,8 @@ async fn resolve_pinned_media_host_for_url(
     resolve_media_host_with(url, allow_loopback, &system_dns_resolver()).await
 }
 
+// `build_pinned_media_http_client_from_builder` applies the process proxy policy.
+#[allow(clippy::disallowed_methods)]
 fn build_pinned_media_http_client(
     pin: Option<(String, Vec<SocketAddr>)>,
 ) -> Result<reqwest::Client, AppError> {
@@ -1730,6 +1732,8 @@ fn build_pinned_media_http_client(
     )
 }
 
+// `build_pinned_media_http_client_from_builder` applies the process proxy policy.
+#[allow(clippy::disallowed_methods)]
 fn build_pinned_media_blob_download_client(
     pin: Option<(String, Vec<SocketAddr>)>,
     read_timeout: Duration,
@@ -1737,6 +1741,8 @@ fn build_pinned_media_blob_download_client(
     build_pinned_media_http_client_from_builder(reqwest::Client::builder(), pin, Some(read_timeout))
 }
 
+// `build_pinned_media_http_client_from_builder` applies the process proxy policy.
+#[allow(clippy::disallowed_methods)]
 fn build_pinned_media_upload_client(
     pin: Option<(String, Vec<SocketAddr>)>,
 ) -> Result<reqwest::Client, AppError> {
@@ -1769,6 +1775,7 @@ fn build_pinned_media_http_client_from_builder(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 pub(super) fn build_pinned_media_http_client_with_proxy_for_test(
     pin: Option<(String, Vec<SocketAddr>)>,
     proxy_url: &str,

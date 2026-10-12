@@ -310,6 +310,7 @@ async fn download_profile_image_bounds_raw_redirect_before_normalization() {
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)]
 async fn profile_image_shared_reader_bounds_content_length_and_chunked_to_caller_max() {
     let caller_max = 5_u64;
     let over_body = spawn_http_response(http_ok_response(&[0_u8; 8]));

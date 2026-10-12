@@ -6149,6 +6149,7 @@ async fn publish_auth_quorum_does_not_wait_for_unobserved_fallback() {
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)]
 async fn publish_allows_independent_account_registration() {
     use nostr_relay_builder::{LocalRelay, RelayBuilder};
     use nostr_sdk::prelude::{EventBuilder, Keys};

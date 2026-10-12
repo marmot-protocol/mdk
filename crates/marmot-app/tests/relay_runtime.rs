@@ -1,3 +1,6 @@
+// Test fixtures dial local relays directly; the proxy policy is crate-private.
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;

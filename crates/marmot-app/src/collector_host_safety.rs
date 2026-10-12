@@ -38,6 +38,8 @@ pub(crate) struct PinnedCollector {
 }
 
 impl PinnedCollector {
+    // `build_client_from` applies the process proxy policy.
+    #[allow(clippy::disallowed_methods)]
     pub(crate) fn build_client(&self) -> Result<reqwest::Client, CollectorRequestError> {
         self.build_client_from(reqwest::Client::builder())
     }

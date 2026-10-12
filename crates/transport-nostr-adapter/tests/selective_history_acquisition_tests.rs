@@ -1,4 +1,6 @@
 #![cfg(feature = "sdk")]
+// Test fixtures dial local relays directly.
+#![allow(clippy::disallowed_methods)]
 
 use cgka_traits::{GroupId, MemberId, TransportAdapterError, TransportEndpoint};
 use futures::{SinkExt, StreamExt};

@@ -229,6 +229,7 @@ async fn group_events(
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)]
 async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let gate = HeldCommitRequest::default();

@@ -32,6 +32,9 @@
 //! `cursor_persistence.rs`, following the established test convention of
 //! duplicating these helpers rather than sharing them.
 
+// Test fixtures dial local relays directly; the proxy policy is crate-private.
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 

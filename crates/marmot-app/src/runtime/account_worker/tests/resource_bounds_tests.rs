@@ -164,6 +164,7 @@ async fn acquire_exact(
         .1
 }
 
+#[allow(clippy::disallowed_methods)]
 async fn acquire_exact_with_client(
     endpoints: &[String],
     id: [u8; 32],

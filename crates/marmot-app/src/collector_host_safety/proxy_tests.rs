@@ -50,6 +50,7 @@ fn clear_proxy_environment() {
 // Run the environment-sensitive consumer in a subprocess so parallel tests
 // never observe changes to their process-wide network policy.
 #[tokio::test]
+#[allow(clippy::disallowed_methods)]
 async fn socks5_pins_dns_fail_closed() {
     use crate::relay_plane::{
         DirectoryEventQuery, DirectoryFetchRequest, DirectoryRelayFetcher,

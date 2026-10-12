@@ -983,14 +983,13 @@ impl NostrSdkRelayClient {
                 "account signer changed without removing prior context".to_owned(),
             ));
         }
-        let builder = Client::builder().authenticator(
-            nostr_sdk::authenticator::SignerAuthenticator::new(SdkSigner(signer.clone())),
-        );
         // Account receive/history pools are independent SDK clients, so they
         // must carry the explicit process routing policy as well.
         let proxy = process_proxy::socks5_proxy()
             .map_err(|detail| TransportAdapterError::Subscription(detail.to_owned()))?;
-        let builder = process_proxy::apply_proxy(builder, proxy);
+        let builder = process_proxy::nostr_builder(Ok(proxy)).authenticator(
+            nostr_sdk::authenticator::SignerAuthenticator::new(SdkSigner(signer.clone())),
+        );
         let mut context = Self::from_builder(builder);
         context.signer = Some(SdkSigner(signer));
         context.account_id = Some(account_id.clone());
@@ -4270,6 +4269,8 @@ fn relay_rejection_endpoint_failure(
 }
 
 #[cfg(test)]
+// Test fixtures dial local relays directly.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::{NostrKeyPackagePublication, SubscriptionAttempt};

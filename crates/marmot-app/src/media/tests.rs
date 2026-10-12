@@ -2465,6 +2465,7 @@ async fn empty_response_records_first_byte_failure_without_body_transfer_timing(
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)]
 async fn limited_body_reader_rejects_chunked_body_over_cap() {
     let server = spawn_http_response(
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n6\r\nabcdef\r\n0\r\n\r\n"
@@ -3130,6 +3131,7 @@ async fn policy_refused_and_attempted_candidates_classify_as_a_download_failure(
 
 /// Drive the bounded-redirect loop with a client factory that refuses the
 /// hop at `refused_hop` the way DNS destination-policy validation does.
+#[allow(clippy::disallowed_methods)]
 async fn redirect_loop_with_policy_refusal_at(refused_hop: usize) -> AppError {
     let hash = valid_hash();
     let redirecting = spawn_http_response(http_redirect_response(&format!(

@@ -94,7 +94,7 @@ fn parse_proxy(endpoint: &str) -> Result<SocketAddr, &'static str> {
 }
 
 /// Apply a validated policy to an SDK builder.
-pub fn apply_proxy(builder: ClientBuilder, config: Option<Arc<ProxyConfig>>) -> ClientBuilder {
+fn apply_proxy(builder: ClientBuilder, config: Option<Arc<ProxyConfig>>) -> ClientBuilder {
     match config {
         Some(config) if config.credentials.is_some() => {
             builder.websocket_transport(AuthenticatedTransport { config })
@@ -105,6 +105,8 @@ pub fn apply_proxy(builder: ClientBuilder, config: Option<Arc<ProxyConfig>>) -> 
 }
 
 /// Build an SDK client, refusing connections when configuration is invalid.
+// The one sanctioned SDK client constructor; see this crate's `clippy.toml`.
+#[allow(clippy::disallowed_methods)]
 pub fn nostr_builder(config: Result<Option<Arc<ProxyConfig>>, &'static str>) -> ClientBuilder {
     let builder = Client::builder();
     match config {

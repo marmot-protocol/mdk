@@ -20,6 +20,9 @@
 //! `epoch_backfill_pending` this call hangs, and the timeout below is the RED
 //! signal.
 
+// Test fixtures dial local relays directly; the proxy policy is crate-private.
+#![allow(clippy::disallowed_methods)]
+
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;

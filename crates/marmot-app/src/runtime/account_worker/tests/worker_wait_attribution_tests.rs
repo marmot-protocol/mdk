@@ -73,6 +73,7 @@ impl QueryPolicy for HeldBroadRequest {
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)]
 async fn known_event_demand_runs_as_a_job_without_a_broad_request() {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let gate = HeldBroadRequest::default();
