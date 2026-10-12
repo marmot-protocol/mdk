@@ -14,7 +14,20 @@
   without changing original slots, parser verdicts or acquisition references.
   See [the attachment-history handoff](../marmot-uniffi/ATTACHMENT-HISTORY.md).
 
+- `RelaySyncSnapshot` adds `refusals: Vec<RelayRefusalStats>`. Struct literals
+  must set it (`Vec::new()` keeps the old meaning); serialized snapshots omit it
+  when empty and older ones still deserialize.
+
 ### Added
+
+- Relay refusals of live subscriptions are no longer dropped silently (#2247).
+  When a relay answers an inbox, group or maintenance REQ with `CLOSED`, the
+  account's v5 audit records a `subscription_refused` row: per relay (hashed)
+  and route kind, the reason category, whether the relay client kept the REQ
+  for a later AUTH or dropped it, and how often. `RelaySyncSnapshot.refusals`
+  (and `wn relay-stats`) counts refusals by opaque relay index, route kind,
+  category and disposition. `RelayRefusalStats`, `SubscriptionRouteKind` and
+  `SubscriptionRefusalDisposition` are re-exported.
 
 - Opt-in SOCKS5 routing. Set `WN_SOCKS5_PROXY` (a numeric `ip:port`) and,
   optionally, both `WN_SOCKS5_USERNAME` and `WN_SOCKS5_PASSWORD` before the
@@ -89,6 +102,12 @@
   File uploads require the server descriptor's `sha256` and `size`. (#2175)
 
 ### Changed
+
+- A sync drain stops waiting once every relay has answered its history REQs,
+  counting a relay that refused one for good as answered, instead of running
+  to `SDK_FIRST_SYNC_WAIT` / `SDK_DRAIN_WAIT`. A refusal is not evidence of
+  served history, so live cursor promotion and incremental activation reuse
+  still require end-of-stored-events from every relay.
 
 - `relay.damus.io` is no longer on the retired-relay denylist; the relay is
   still operating. `retired_relay_hosts()` now returns only

@@ -11,6 +11,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- `wn relay-stats` reports relay refusals of live subscriptions under
+  `sync.refusals`: counts by opaque relay index, route kind (`inbox`, `group`,
+  `maintenance`), reason category and whether the relay client kept or dropped
+  the REQ. No relay URLs or reason text. (#2247)
+
 - WN Agent releases now include the `wn-goose` terminal-harness connector and
   `install-goose-marmot.sh` for [Goose](https://github.com/aaif-goose/goose)
   1.53.0 or newer. It runs one `goose run` per prompt under a connector-generated

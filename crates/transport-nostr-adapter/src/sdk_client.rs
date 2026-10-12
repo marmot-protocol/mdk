@@ -37,7 +37,7 @@ use crate::{
     NostrAcquisitionScope, NostrAcquisitionStats, NostrEventPublishRequest, NostrNotificationLoss,
     NostrNotificationLossFloor, NostrNotificationLossScope, NostrPublishBatch, NostrPublishOutcome,
     NostrRelayClient, NostrRelayEvent, NostrSubscription, NostrTransportAdapter, RelayReissue,
-    SubscriptionReissue,
+    SubscriptionRefusal, SubscriptionRefusalDisposition, SubscriptionReissue,
 };
 
 const SDK_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
@@ -2313,6 +2313,21 @@ impl NostrSdkRelayClient {
         outcomes
     }
 
+    /// Classify a relay's `CLOSED` reason as this client's SDK settles the REQ
+    /// (see [`sdk_subscription_refusal`]). A client built with
+    /// [`Self::from_builder`] knows whether it has an authenticator; an opaque
+    /// client does not.
+    pub fn subscription_refusal(&self, reason: &str) -> SubscriptionRefusal {
+        let authenticator = match &self.publication {
+            SdkPublication::OwnedRelay {
+                authenticator_available,
+                ..
+            } => Some(*authenticator_available),
+            SdkPublication::OpaqueClient => None,
+        };
+        sdk_subscription_refusal(reason, authenticator)
+    }
+
     /// Start forwarding `nostr-sdk` notifications into the adapter's delivery
     /// queue. The task exits when the relay pool shuts down.
     pub fn spawn_notification_forwarder(&self, adapter: NostrTransportAdapter) -> JoinHandle<()> {
@@ -2326,6 +2341,7 @@ impl NostrSdkRelayClient {
             let worker_pending = pending.clone();
             #[cfg(test)]
             let forwarder_event_entered = loss.forwarder_event_entered.clone();
+            let classifier = loss.clone();
             let mut worker = tokio::spawn(async move {
                 while let Some(notification) = event_rx.recv().await {
                     #[cfg(test)]
@@ -2375,6 +2391,18 @@ impl NostrSdkRelayClient {
                                     .handle_relay_eose(
                                         TransportEndpoint(relay_url.to_string()),
                                         subscription_id.to_string(),
+                                    )
+                                    .await;
+                            }
+                            RelayMessage::Closed {
+                                subscription_id,
+                                message,
+                            } => {
+                                adapter
+                                    .handle_relay_closed(
+                                        TransportEndpoint(relay_url.to_string()),
+                                        subscription_id.to_string(),
+                                        classifier.subscription_refusal(&message),
                                     )
                                     .await;
                             }
@@ -4216,6 +4244,42 @@ fn map_relay_rejection_category(
     }
 }
 
+/// The category of a relay's `CLOSED` reason. Unlike a publish rejection, an
+/// unknown prefix is unclassified (`None`) rather than `error`: the relay did
+/// not say why it refused.
+fn subscription_refusal_category(reason: &str) -> Option<TransportEndpointRejectionCategory> {
+    match nostr::message::MachineReadablePrefix::parse(reason)? {
+        nostr::message::MachineReadablePrefix::Custom(_) => None,
+        prefix => Some(map_relay_rejection_category(prefix)),
+    }
+}
+
+/// Classify a relay's `CLOSED` the way nostr-sdk settles that one REQ: it keeps
+/// a `rate-limited:` REQ, and an `auth-required:` one when the client has an
+/// authenticator, to send again later; it drops everything else.
+///
+/// Decided from this message alone, never from the SDK's registry, which a
+/// later re-send and close of the same id may already have changed by the time
+/// a queued notification is handled. `authenticator` is `None` when unknown;
+/// that keeps an `auth-required:` close pending, so it never settles coverage
+/// the relay may still serve after AUTH.
+pub fn sdk_subscription_refusal(reason: &str, authenticator: Option<bool>) -> SubscriptionRefusal {
+    let category = subscription_refusal_category(reason);
+    let kept = match category {
+        Some(TransportEndpointRejectionCategory::RateLimited) => true,
+        Some(TransportEndpointRejectionCategory::AuthRequired) => authenticator.unwrap_or(true),
+        _ => false,
+    };
+    SubscriptionRefusal {
+        category,
+        disposition: if kept {
+            SubscriptionRefusalDisposition::Pending
+        } else {
+            SubscriptionRefusalDisposition::Dropped
+        },
+    }
+}
+
 fn relay_rejection_endpoint_failure(
     endpoint: TransportEndpoint,
     relay_message: &str,
@@ -5592,6 +5656,192 @@ mod tests {
             "nothing goes out, and a later repair may try again"
         );
         root.shutdown_accounts().await;
+    }
+
+    /// A relay that answers every REQ with `CLOSED` and `reason`, on every
+    /// connection.
+    async fn closing_relay(
+        reason: &'static str,
+    ) -> (TransportEndpoint, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    while let Some(Ok(message)) = socket.next().await {
+                        let Ok(text) = message.into_text() else {
+                            continue;
+                        };
+                        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                            continue;
+                        };
+                        if value[0] != "REQ" {
+                            continue;
+                        }
+                        let closed = serde_json::json!(["CLOSED", value[1], reason]);
+                        if socket.send(closed.to_string().into()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (endpoint, server)
+    }
+
+    /// The forwarder hands a relay's `CLOSED` to the adapter, classified per
+    /// message by its prefix and the client's authenticator. For a client that
+    /// knows whether it has one, the classification must match what the SDK
+    /// actually did with the REQ: still registered when pending, removed when
+    /// dropped. A dropped inbox refusal settles the replay without completing
+    /// it.
+    #[tokio::test]
+    async fn forwarder_reports_relay_closed_with_the_sdk_disposition() {
+        use crate::{SubscriptionRefusalDisposition, SubscriptionRouteKind};
+        use SubscriptionRefusalDisposition::{Dropped, Pending};
+        use TransportEndpointRejectionCategory::{AuthRequired, RateLimited, Restricted};
+
+        #[derive(Clone, Copy, Debug)]
+        enum Auth {
+            Anonymous,
+            Authenticator,
+            Opaque,
+        }
+        let cases = [
+            (
+                "auth-required: sign in",
+                Auth::Anonymous,
+                Some(AuthRequired),
+                Dropped,
+            ),
+            (
+                "auth-required: sign in",
+                Auth::Authenticator,
+                Some(AuthRequired),
+                Pending,
+            ),
+            // Unknown authenticator: kept pending, so coverage keeps waiting.
+            (
+                "auth-required: sign in",
+                Auth::Opaque,
+                Some(AuthRequired),
+                Pending,
+            ),
+            (
+                "rate-limited: slow down",
+                Auth::Anonymous,
+                Some(RateLimited),
+                Pending,
+            ),
+            (
+                "restricted: members only",
+                Auth::Authenticator,
+                Some(Restricted),
+                Dropped,
+            ),
+            ("not today", Auth::Anonymous, None, Dropped),
+        ];
+        for (reason, auth, category, disposition) in cases {
+            let (endpoint, server) = closing_relay(reason).await;
+            let keys = Keys::generate();
+            let account = MemberId::new(keys.public_key().to_bytes().to_vec());
+            let sdk = match auth {
+                Auth::Anonymous => NostrSdkRelayClient::from_builder(Client::builder()),
+                Auth::Authenticator => {
+                    NostrSdkRelayClient::from_builder(Client::builder().authenticator(
+                        nostr_sdk::authenticator::SignerAuthenticator::new(SdkSigner(Arc::new(
+                            keys.clone(),
+                        ))),
+                    ))
+                }
+                Auth::Opaque => NostrSdkRelayClient::new(Client::default()),
+            };
+            let adapter = NostrTransportAdapter::new(Arc::new(sdk.clone()));
+            let forwarder = sdk.spawn_notification_forwarder(adapter.clone());
+            adapter
+                .activate_account(crate::TransportAccountActivation {
+                    account_id: account.clone(),
+                    inbox_endpoints: vec![endpoint.clone()],
+                    group_subscriptions: Vec::new(),
+                    since: None,
+                })
+                .await
+                .unwrap();
+            let case = format!("{reason:?} {auth:?}");
+            let reports = timeout(Duration::from_secs(5), async {
+                loop {
+                    let reports = adapter.take_subscription_refusals(&account);
+                    if !reports.reports.is_empty() {
+                        return reports;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("the forwarder reports {case}"));
+            let report = &reports.reports[0];
+            assert_eq!(report.route_kind, SubscriptionRouteKind::Inbox, "{case}");
+            assert_eq!(report.endpoint, endpoint, "{case}");
+            assert_eq!(report.category, category, "{case}");
+            assert_eq!(report.disposition, disposition, "{case}");
+            if !matches!(auth, Auth::Opaque) {
+                let relay = sdk
+                    .client()
+                    .relay(endpoint.as_str())
+                    .await
+                    .unwrap()
+                    .expect("the relay is in the pool");
+                let wire_id = SubscriptionId::new(
+                    NostrSubscription::AccountInbox {
+                        account_id: account.clone(),
+                        endpoints: vec![endpoint.clone()],
+                        since: None,
+                        attempt: adapter
+                            .account_subscription_attempt(&account)
+                            .await
+                            .unwrap(),
+                    }
+                    .subscription_id(),
+                );
+                assert_eq!(
+                    relay.subscription(&wire_id).await.is_some(),
+                    disposition == Pending,
+                    "the SDK agrees: {case}"
+                );
+            }
+            let progress = adapter.account_subscription_eose(&account).await;
+            assert_eq!(progress.settled(), disposition == Dropped, "{case}");
+            assert!(!progress.complete());
+            sdk.client().shutdown().await;
+            forwarder.abort();
+            server.abort();
+        }
+    }
+
+    /// Each `CLOSED` is classified from its own reason, so a kept refusal
+    /// stays pending even when a later close of the same id, after AUTH and a
+    /// re-send, drops the REQ before the first notification is handled.
+    #[test]
+    fn sdk_subscription_refusal_classifies_each_close_on_its_own() {
+        use SubscriptionRefusalDisposition::{Dropped, Pending};
+        let pending = sdk_subscription_refusal("auth-required: sign in", Some(true));
+        let dropped = sdk_subscription_refusal("restricted: members only", Some(true));
+        assert_eq!(pending.disposition, Pending);
+        assert_eq!(dropped.disposition, Dropped);
+        assert_eq!(
+            sdk_subscription_refusal("auth-required: sign in", Some(false)).disposition,
+            Dropped
+        );
+        assert_eq!(
+            sdk_subscription_refusal("auth-required: sign in", None).disposition,
+            Pending
+        );
+        let custom = sdk_subscription_refusal("paywall: subscribe first", Some(true));
+        assert_eq!(custom.category, None);
+        assert_eq!(custom.disposition, Dropped);
     }
 
     #[tokio::test]

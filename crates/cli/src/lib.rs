@@ -1584,7 +1584,8 @@ mod tests {
     use marmot_app::{
         AppMessageRecord, DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics,
         RelayDeliverySpread, RelayDeliveryStats, RelayLatencyStats, RelayPlaneHealth,
-        RelaySyncSnapshot, RelayTelemetrySnapshot,
+        RelayRefusalStats, RelaySyncSnapshot, RelayTelemetrySnapshot,
+        SubscriptionRefusalDisposition, SubscriptionRouteKind,
     };
 
     fn one_sample_histogram(upper_bound_ms: u64) -> DurationHistogramSnapshot {
@@ -1630,6 +1631,13 @@ mod tests {
                     relay_index: 0,
                     first_event: one_sample_histogram(20),
                     eose: one_sample_histogram(100),
+                }],
+                refusals: vec![RelayRefusalStats {
+                    relay_index: 0,
+                    route_kind: SubscriptionRouteKind::Inbox,
+                    category: Some(cgka_traits::TransportEndpointRejectionCategory::AuthRequired),
+                    disposition: SubscriptionRefusalDisposition::Dropped,
+                    count: 2,
                 }],
             },
             health: RelayPlaneHealth {
@@ -1943,6 +1951,7 @@ mod tests {
         assert!(plain.contains("relay#0"));
         assert!(plain.contains("first_deliverer=75%"));
         assert!(plain.contains("eose_p50=100ms"));
+        assert!(plain.contains("relay#0 inbox auth-required dropped x2"));
         assert!(
             !plain.contains("wss://") && !plain.contains("ws://"),
             "local relay stats must not surface relay URLs: {plain}"
@@ -1958,6 +1967,11 @@ mod tests {
             0
         );
         assert_eq!(output.json["sync"]["synced_subscriptions"], 1);
+        assert_eq!(
+            output.json["sync"]["refusals"][0]["category"],
+            "auth-required"
+        );
+        assert_eq!(output.json["sync"]["refusals"][0]["route_kind"], "inbox");
         assert_eq!(output.json["health"]["connected"], 1);
     }
 

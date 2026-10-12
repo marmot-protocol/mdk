@@ -115,6 +115,11 @@ Its snapshot is `RelaySyncSnapshot`, included as `RelayTelemetrySnapshot.sync`.
 | `per_relay[].relay_index` | Opaque device-local relay index. | Local-only index; not a URL. |
 | `per_relay[].first_event` | Per-relay first-event latency histogram. | Histogram by opaque index. |
 | `per_relay[].eose` | Per-relay EOSE latency histogram. | Histogram by opaque index. |
+| `refusals[].relay_index` | Opaque relay index that answered a live subscription with `CLOSED`. | Local-only index; not a URL. |
+| `refusals[].route_kind` | `inbox`, `group` or `maintenance`. | Closed vocabulary. |
+| `refusals[].category` | The reason's machine-readable prefix (`auth-required`, `restricted`, ...), or `null` for none or an unknown one. | Closed vocabulary; reason text discarded. |
+| `refusals[].disposition` | `pending` (the relay client re-sends after AUTH or reconnect) or `dropped`. | Closed vocabulary. |
+| `refusals[].count` | Cumulative refusals with that key. | Count by opaque index. |
 
 `NostrTransportAdapter::subscription_synced(subscription_id)` can answer whether every relay in a tracked subscription
 has reached EOSE, but subscription ids are not included in telemetry snapshots.

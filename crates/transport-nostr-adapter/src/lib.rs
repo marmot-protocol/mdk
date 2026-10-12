@@ -20,8 +20,9 @@ use cgka_traits::transport::{Timestamp, TransportEnvelope, TransportMessage, Tra
 use cgka_traits::{
     GroupId, MemberId, TransportAccountActivation, TransportAdapter, TransportAdapterError,
     TransportDelivery, TransportDeliveryPlane, TransportDeliverySource, TransportEndpoint,
-    TransportEndpointFailure, TransportEndpointReceipt, TransportGroupSubscription,
-    TransportGroupSync, TransportPublishReport, TransportPublishRequest, TransportWireMetadata,
+    TransportEndpointFailure, TransportEndpointReceipt, TransportEndpointRejectionCategory,
+    TransportGroupSubscription, TransportGroupSync, TransportPublishReport,
+    TransportPublishRequest, TransportWireMetadata,
 };
 use nostr::prelude::RelayUrl;
 use sha2::{Digest, Sha256};
@@ -95,13 +96,14 @@ pub use relay_list::{
 pub use sdk_client::{
     NostrReconciliationItem, NostrReconciliationProgress, NostrReconciliationSummary,
     NostrSdkRelayClient, NostrSdkRelayHealth, NostrSdkSubscriptionPlan, RelayRegistrationOutcome,
-    sign_transport_event_for_publish,
+    sdk_subscription_refusal, sign_transport_event_for_publish,
 };
 use telemetry::EoseRepairClaim;
 pub use telemetry::{
     DurationHistogramSnapshot, HistogramBucket, RelayDeliverySpread, RelayDeliveryStats,
     RelayDeliveryTelemetry, RelayExportConsent, RelayIndex, RelayIndexRegistry,
-    RelayLabelResolution, RelayLatencyStats, RelaySyncSnapshot, RelaySyncTelemetry,
+    RelayLabelResolution, RelayLatencyStats, RelayRefusalStats, RelaySyncSnapshot,
+    RelaySyncTelemetry,
 };
 
 const DELIVERY_BUFFER: usize = 1024;
@@ -463,6 +465,15 @@ pub struct AccountSubscriptionEose {
     pub relay_subscription_attempts: usize,
     /// Of those endpoint-scoped attempts, how many reported EOSE.
     pub relay_subscription_attempts_with_eose: usize,
+    /// Endpoint-scoped attempts a relay ended with a dropped refusal before
+    /// reporting EOSE (see [`SubscriptionRefusalDisposition::Dropped`]). They
+    /// will never report EOSE. A pending refusal is not counted: the relay
+    /// client re-sends that REQ, so it still awaits EOSE.
+    pub relay_subscription_attempts_refused: usize,
+    /// Subscriptions whose every relay ended them with a dropped refusal
+    /// before reporting EOSE: no relay is serving them at all. An inbox here
+    /// means the account receives no invitations.
+    pub subscriptions_refused: usize,
 }
 
 impl AccountSubscriptionEose {
@@ -477,12 +488,112 @@ impl AccountSubscriptionEose {
             && self.relay_subscription_attempts_with_eose == self.relay_subscription_attempts
     }
 
+    /// Whether every endpoint-scoped attempt has answered, with EOSE or with a
+    /// dropped refusal, so waiting longer brings no more stored history.
+    ///
+    /// Weaker than [`Self::complete`] on purpose: a refusal is not evidence
+    /// that the refused relay's history was served. Use this only to stop
+    /// waiting; never gate live cursor promotion or activation reuse on it.
+    pub fn settled(&self) -> bool {
+        self.relay_subscription_attempts > 0
+            && self.relay_subscription_attempts_with_eose + self.relay_subscription_attempts_refused
+                == self.relay_subscription_attempts
+    }
+
     /// Whether any relay reported end-of-stored-events at all. `false` after a
     /// wait is the shape of an account whose relays accepted the subscription
     /// registration but never served it.
     pub fn any(&self) -> bool {
         self.relay_subscription_attempts_with_eose > 0
     }
+}
+
+/// Which of an account's live subscriptions a relay refused.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscriptionRouteKind {
+    /// The account inbox (gift-wrapped Welcomes).
+    Inbox,
+    /// A group route, current or retained.
+    Group,
+    /// A post-join or recovery maintenance subscription.
+    Maintenance,
+}
+
+impl SubscriptionRouteKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Inbox => "inbox",
+            Self::Group => "group",
+            Self::Maintenance => "maintenance",
+        }
+    }
+}
+
+/// What the relay client does with a REQ that a relay closed.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscriptionRefusalDisposition {
+    /// The client keeps the REQ and sends it again after authenticating or
+    /// reconnecting, as `nostr-sdk` does for `auth-required:` with an
+    /// authenticator and for `rate-limited:`.
+    Pending,
+    /// The client dropped the REQ. Reconnecting does not restore it.
+    Dropped,
+}
+
+impl SubscriptionRefusalDisposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Dropped => "dropped",
+        }
+    }
+}
+
+/// A relay's `CLOSED` for a live subscription, classified by the relay
+/// client. The relay's reason text is discarded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SubscriptionRefusal {
+    /// The reason's machine-readable prefix, or `None` when it had no prefix
+    /// or an unknown one.
+    pub category: Option<TransportEndpointRejectionCategory>,
+    pub disposition: SubscriptionRefusalDisposition,
+}
+
+/// Distinct refusals [`NostrTransportAdapter::take_subscription_refusals`]
+/// holds per account between drains. Repeats of one refusal coalesce into one
+/// entry, so this bounds distinct relay/route/category combinations, not
+/// closes.
+pub const SUBSCRIPTION_REFUSAL_REPORT_LIMIT: usize = 32;
+
+/// Repeated refusals of one route kind on one relay, for the forensic audit.
+///
+/// Carries the relay endpoint, which the consented audit channel records the
+/// same way it records subscription and publish relays. Never log it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubscriptionRefusalReport {
+    pub route_kind: SubscriptionRouteKind,
+    pub endpoint: TransportEndpoint,
+    pub category: Option<TransportEndpointRejectionCategory>,
+    pub disposition: SubscriptionRefusalDisposition,
+    /// How many times the relay sent this refusal since the last drain.
+    pub count: u64,
+}
+
+/// One drain of an account's subscription refusals, from
+/// [`NostrTransportAdapter::take_subscription_refusals`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubscriptionRefusalReports {
+    /// Distinct refusals in arrival order.
+    pub reports: Vec<SubscriptionRefusalReport>,
+    /// Refusals shed because [`SUBSCRIPTION_REFUSAL_REPORT_LIMIT`] distinct
+    /// entries were already held.
+    pub dropped: u64,
 }
 
 /// The moment of a notification lag on the adapter's subscription clock, from
@@ -780,6 +891,11 @@ pub struct NostrTransportAdapter {
     monotonic_start: std::time::Instant,
     /// Shared by [`Clone`] and by every account adapter on this relay plane.
     publish_accounting: Arc<publish_accounting::PublishAccounting>,
+    /// Refusals of each account's live subscriptions awaiting the next
+    /// forensic drain. A plain mutex, never held across an await, so the
+    /// account worker drains it from a synchronous seam. Bounded per account
+    /// by [`SUBSCRIPTION_REFUSAL_REPORT_LIMIT`].
+    subscription_refusals: Arc<std::sync::Mutex<HashMap<MemberId, PendingSubscriptionRefusals>>>,
 }
 
 impl NostrTransportAdapter {
@@ -793,6 +909,7 @@ impl NostrTransportAdapter {
             subscription_lock: Arc::new(Mutex::new(())),
             monotonic_start: std::time::Instant::now(),
             publish_accounting: publish_accounting::PublishAccounting::new(),
+            subscription_refusals: Arc::default(),
         }
     }
 
@@ -1574,6 +1691,62 @@ impl NostrTransportAdapter {
         }
     }
 
+    /// Record a relay's `CLOSED` for a subscription on one relay endpoint.
+    ///
+    /// For a live inbox, group or maintenance REQ, a dropped refusal settles
+    /// that relay's replay coverage (see [`AccountSubscriptionEose::settled`])
+    /// without completing it, and every refusal is counted in
+    /// [`Self::relay_sync`] and queued for [`Self::take_subscription_refusals`].
+    /// A close for any other id, such as a superseded attempt or a one-shot
+    /// fetch, is ignored. This produces no delivery and sends nothing.
+    pub async fn handle_relay_closed(
+        &self,
+        endpoint: TransportEndpoint,
+        subscription_id: String,
+        refusal: SubscriptionRefusal,
+    ) {
+        let live = self.state.write().await.record_subscription_refusal(
+            &subscription_id,
+            &endpoint,
+            refusal,
+        );
+        if let Some((account_id, route_kind)) = &live {
+            self.subscription_refusals
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(account_id.clone())
+                .or_default()
+                .record(*route_kind, &endpoint, refusal);
+        }
+        let route_kind = live.map(|(_, route_kind)| route_kind);
+        tracing::debug!(
+            target: "transport_nostr_adapter::adapter",
+            method = "handle_relay_closed",
+            live = route_kind.is_some(),
+            route_kind = route_kind.map(SubscriptionRouteKind::as_str),
+            category = refusal.category.map(TransportEndpointRejectionCategory::as_str),
+            disposition = refusal.disposition.as_str(),
+            "handled relay closed"
+        );
+    }
+
+    /// Drain the subscription refusals recorded for `account_id` since the
+    /// last drain, for the forensic audit. Carries relay endpoints: record
+    /// them only on the consented audit channel, never in logs. Reports
+    /// outlive deactivation, bounded per account, until drained.
+    pub fn take_subscription_refusals(&self, account_id: &MemberId) -> SubscriptionRefusalReports {
+        let pending = self
+            .subscription_refusals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(account_id)
+            .unwrap_or_default();
+        SubscriptionRefusalReports {
+            reports: pending.reports,
+            dropped: pending.dropped,
+        }
+    }
+
     /// Record an end-of-stored-events signal for a subscription on one relay
     /// endpoint. This advances the initial-sync gate; it produces no delivery.
     pub async fn handle_relay_eose(&self, endpoint: TransportEndpoint, subscription_id: String) {
@@ -1983,40 +2156,106 @@ struct AccountRoutes {
 /// change from shrinking the proof obligation of the already-issued replay.
 #[derive(Clone, Default)]
 struct AccountReplayCoverage {
-    subscriptions: HashMap<String, HashMap<RelayIndex, bool>>,
+    subscriptions: HashMap<String, HashMap<RelayIndex, RelayReplay>>,
+}
+
+/// One relay's answer to one REQ of an activation's replay.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RelayReplay {
+    /// No answer yet, or a pending refusal whose REQ the relay client will
+    /// re-send.
+    #[default]
+    Awaiting,
+    /// The relay reported end-of-stored-events. Final: a later `CLOSED` ends
+    /// the live REQ but cannot take back history already served.
+    Eose,
+    /// The relay ended the REQ with a dropped refusal before EOSE.
+    Refused,
 }
 
 impl AccountReplayCoverage {
     fn snapshot(&self) -> AccountSubscriptionEose {
-        let subscriptions = self.subscriptions.len();
-        let with_eose = self
-            .subscriptions
-            .values()
-            .filter(|relays| relays.values().any(|eose_seen| *eose_seen))
-            .count();
-        let relay_subscription_attempts =
-            self.subscriptions.values().map(HashMap::len).sum::<usize>();
-        let relay_subscription_attempts_with_eose = self
-            .subscriptions
-            .values()
-            .flat_map(HashMap::values)
-            .filter(|eose_seen| **eose_seen)
-            .count();
-        AccountSubscriptionEose {
-            subscriptions,
-            with_eose,
-            relay_subscription_attempts,
-            relay_subscription_attempts_with_eose,
+        let count = |relays: &HashMap<RelayIndex, RelayReplay>, wanted| {
+            relays.values().filter(|replay| **replay == wanted).count()
+        };
+        let mut progress = AccountSubscriptionEose {
+            subscriptions: self.subscriptions.len(),
+            ..AccountSubscriptionEose::default()
+        };
+        for relays in self.subscriptions.values() {
+            let eose = count(relays, RelayReplay::Eose);
+            let refused = count(relays, RelayReplay::Refused);
+            progress.relay_subscription_attempts += relays.len();
+            progress.relay_subscription_attempts_with_eose += eose;
+            progress.relay_subscription_attempts_refused += refused;
+            progress.with_eose += usize::from(eose > 0);
+            progress.subscriptions_refused +=
+                usize::from(!relays.is_empty() && refused == relays.len());
         }
+        progress
     }
 
     fn record_eose(&mut self, subscription_id: &str, relay: RelayIndex) {
-        if let Some(eose_seen) = self
-            .subscriptions
+        if let Some(replay) = self.replay_mut(subscription_id, relay) {
+            *replay = RelayReplay::Eose;
+        }
+    }
+
+    fn record_refusal(
+        &mut self,
+        subscription_id: &str,
+        relay: RelayIndex,
+        disposition: SubscriptionRefusalDisposition,
+    ) {
+        if let Some(replay) = self.replay_mut(subscription_id, relay)
+            && *replay != RelayReplay::Eose
+        {
+            *replay = match disposition {
+                SubscriptionRefusalDisposition::Pending => RelayReplay::Awaiting,
+                SubscriptionRefusalDisposition::Dropped => RelayReplay::Refused,
+            };
+        }
+    }
+
+    fn replay_mut(&mut self, subscription_id: &str, relay: RelayIndex) -> Option<&mut RelayReplay> {
+        self.subscriptions
             .get_mut(subscription_id)
             .and_then(|relays| relays.get_mut(&relay))
-        {
-            *eose_seen = true;
+    }
+}
+
+/// An account's subscription refusals awaiting the next forensic drain,
+/// coalesced and bounded by [`SUBSCRIPTION_REFUSAL_REPORT_LIMIT`].
+#[derive(Default)]
+struct PendingSubscriptionRefusals {
+    reports: Vec<SubscriptionRefusalReport>,
+    dropped: u64,
+}
+
+impl PendingSubscriptionRefusals {
+    fn record(
+        &mut self,
+        route_kind: SubscriptionRouteKind,
+        endpoint: &TransportEndpoint,
+        refusal: SubscriptionRefusal,
+    ) {
+        if let Some(report) = self.reports.iter_mut().find(|report| {
+            report.route_kind == route_kind
+                && report.endpoint == *endpoint
+                && report.category == refusal.category
+                && report.disposition == refusal.disposition
+        }) {
+            report.count = report.count.saturating_add(1);
+        } else if self.reports.len() < SUBSCRIPTION_REFUSAL_REPORT_LIMIT {
+            self.reports.push(SubscriptionRefusalReport {
+                route_kind,
+                endpoint: endpoint.clone(),
+                category: refusal.category,
+                disposition: refusal.disposition,
+                count: 1,
+            });
+        } else {
+            self.dropped = self.dropped.saturating_add(1);
         }
     }
 }
@@ -2105,6 +2344,10 @@ struct AdapterState {
     /// flight; both success and failure rebuild the index before returning.
     by_transport_group: HashMap<Vec<u8>, Vec<GroupRouteEntry>>,
     maintenance_routes: HashMap<String, NostrSubscription>,
+    /// Owning account of each group REQ a sync has sent but not yet committed
+    /// to `accounts`, so a relay's `CLOSED` inside the subscribe window still
+    /// finds a live REQ. Cleared on commit and rollback.
+    staged_group_subscriptions: HashMap<String, MemberId>,
     /// Unconfirmed relay unsubscribes retained until teardown succeeds.
     /// Routing state (`accounts`/`by_transport_group`) already reflects the
     /// removal; these are relay-side cleanups only, drained on later
@@ -2403,7 +2646,7 @@ impl AdapterState {
                 let relays = subscription
                     .endpoints()
                     .iter()
-                    .map(|endpoint| (self.relay_index.index_for(endpoint), false))
+                    .map(|endpoint| (self.relay_index.index_for(endpoint), RelayReplay::Awaiting))
                     .collect();
                 (subscription.subscription_id(), relays)
             })
@@ -2414,6 +2657,16 @@ impl AdapterState {
 
     fn stage_subscription_starts(&mut self, subscriptions: &[NostrSubscription], now_ms: u64) {
         self.sync.begin_staged_subscription_starts();
+        self.staged_group_subscriptions = subscriptions
+            .iter()
+            .filter(|subscription| matches!(subscription, NostrSubscription::Group { .. }))
+            .map(|subscription| {
+                (
+                    subscription.subscription_id(),
+                    subscription.account_id().clone(),
+                )
+            })
+            .collect();
         for subscription in subscriptions {
             let relays: Vec<RelayIndex> = subscription
                 .endpoints()
@@ -2427,10 +2680,12 @@ impl AdapterState {
 
     fn commit_staged_subscription_starts(&mut self) {
         self.sync.commit_staged_subscription_starts();
+        self.staged_group_subscriptions.clear();
     }
 
     fn rollback_staged_subscription_starts(&mut self) {
         self.sync.rollback_staged_subscription_starts();
+        self.staged_group_subscriptions.clear();
     }
 
     /// Evict sync-telemetry progress for subscriptions being removed, so the
@@ -2587,6 +2842,57 @@ impl AdapterState {
         for coverage in self.account_replay_coverage.values_mut() {
             coverage.record_eose(subscription_id, relay);
         }
+    }
+
+    /// The account and route kind of a live subscription id: an account's
+    /// inbox, one of its group routes (committed, or staged by a group sync
+    /// whose REQs are going out), or post-join maintenance. `None` for a
+    /// superseded attempt's id, a one-shot fetch, or anything else not live.
+    fn live_subscription_route(
+        &self,
+        subscription_id: &str,
+    ) -> Option<(MemberId, SubscriptionRouteKind)> {
+        if let Some(subscription) = self.maintenance_routes.get(subscription_id) {
+            return Some((
+                subscription.account_id().clone(),
+                SubscriptionRouteKind::Maintenance,
+            ));
+        }
+        if let Some(account_id) = self.staged_group_subscriptions.get(subscription_id) {
+            return Some((account_id.clone(), SubscriptionRouteKind::Group));
+        }
+        self.accounts.keys().find_map(|account_id| {
+            // `account_subscription_ids` lists the inbox first.
+            self.account_subscription_ids(account_id)
+                .iter()
+                .position(|id| id == subscription_id)
+                .map(|position| {
+                    let route_kind = if position == 0 {
+                        SubscriptionRouteKind::Inbox
+                    } else {
+                        SubscriptionRouteKind::Group
+                    };
+                    (account_id.clone(), route_kind)
+                })
+        })
+    }
+
+    /// Record a relay's refusal of a live subscription in replay coverage and
+    /// telemetry. Returns the owning account and route kind, or `None` when
+    /// the id is not live and nothing was recorded.
+    fn record_subscription_refusal(
+        &mut self,
+        subscription_id: &str,
+        endpoint: &TransportEndpoint,
+        refusal: SubscriptionRefusal,
+    ) -> Option<(MemberId, SubscriptionRouteKind)> {
+        let (account_id, route_kind) = self.live_subscription_route(subscription_id)?;
+        let relay = self.relay_index.index_for(endpoint);
+        if let Some(coverage) = self.account_replay_coverage.get_mut(&account_id) {
+            coverage.record_refusal(subscription_id, relay, refusal.disposition);
+        }
+        self.sync.record_refusal(relay, route_kind, refusal);
+        Some((account_id, route_kind))
     }
 
     fn routes_for(

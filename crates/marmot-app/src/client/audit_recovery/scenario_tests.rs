@@ -22,6 +22,7 @@ struct Fixture {
     app: crate::MarmotApp,
     client: AppClient,
     storage: storage_sqlite::SqliteAccountStorage,
+    relay: Arc<ScriptedPushRelayClient>,
 }
 
 /// One account with audit v5 enabled, one group and a checkpointed cursor,
@@ -36,7 +37,7 @@ async fn fixture() -> Fixture {
         .with_test_relay_client(relay.clone());
     app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
         .unwrap();
-    let pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
+    let pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
     let mut state = app.load_state("alice").unwrap();
     state.last_transport_timestamp = Some(unix_now_seconds().saturating_sub(60));
     app.save_state(&state).unwrap();
@@ -49,6 +50,7 @@ async fn fixture() -> Fixture {
         app,
         client,
         storage,
+        relay,
     }
 }
 
@@ -572,6 +574,59 @@ async fn a_lag_lost_eose_repair_pass_is_recorded_at_the_worker_seam() {
     fixture.client.record_eose_repair_reports();
     assert_eq!(
         recorded_v5_rows(&fixture.app, "subscription_eose_repaired").len(),
+        1
+    );
+}
+
+/// A relay's `CLOSED` of a live subscription is queued by the adapter and
+/// recorded at the worker seam as one `subscription_refused` row, repeats
+/// coalesced, the relay as a hashed reference and no reason text.
+#[tokio::test]
+async fn a_relay_refusal_is_recorded_at_the_worker_seam() {
+    let fixture = fixture().await;
+    let inbox = fixture
+        .relay
+        .accepted_subscriptions()
+        .into_iter()
+        .rev()
+        .find(|subscription| {
+            matches!(
+                subscription,
+                transport_nostr_adapter::NostrSubscription::AccountInbox { .. }
+            )
+        })
+        .expect("the account subscribed its inbox");
+    for _ in 0..2 {
+        fixture
+            .app
+            .relay_plane
+            .handle_relay_closed_for_test(
+                inbox.endpoints()[0].clone(),
+                inbox.subscription_id(),
+                transport_nostr_adapter::SubscriptionRefusal {
+                    category: Some(cgka_traits::TransportEndpointRejectionCategory::AuthRequired),
+                    disposition: transport_nostr_adapter::SubscriptionRefusalDisposition::Dropped,
+                },
+            )
+            .await;
+    }
+    fixture.client.record_subscription_refusals();
+    let rows = recorded_v5_rows(&fixture.app, "subscription_refused");
+    assert_eq!(rows.len(), 1);
+    let event = &rows[0]["event"];
+    assert_eq!(event["dropped"], 0);
+    let refusals = event["refusals"].as_array().unwrap();
+    assert_eq!(refusals.len(), 1);
+    assert_eq!(refusals[0]["route_kind"], "inbox");
+    assert_eq!(refusals[0]["refusal_category"], "auth_required");
+    assert_eq!(refusals[0]["disposition"], "dropped");
+    assert_eq!(refusals[0]["count"], 2);
+    assert_eq!(refusals[0]["endpoint_ref"].as_str().unwrap().len(), 64);
+    assert!(rows[0]["group_ref"].is_null());
+    // Taken once: another seam records nothing new.
+    fixture.client.record_subscription_refusals();
+    assert_eq!(
+        recorded_v5_rows(&fixture.app, "subscription_refused").len(),
         1
     );
 }

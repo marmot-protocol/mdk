@@ -29,8 +29,11 @@ use std::collections::HashSet;
 
 use cgka_traits::MessageId;
 use cgka_traits::TransportEndpoint;
+use cgka_traits::TransportEndpointRejectionCategory;
 use nostr::prelude::{RelayUrl, Url};
 use serde::{Deserialize, Serialize};
+
+use crate::{SubscriptionRefusal, SubscriptionRefusalDisposition, SubscriptionRouteKind};
 
 /// Upper bounds, in milliseconds, of the duration histogram buckets shared by
 /// spread and sync-timing measurements.
@@ -522,7 +525,15 @@ pub struct RelaySyncTelemetry {
     first_event: HashMap<RelayIndex, DurationHistogram>,
     eose: HashMap<RelayIndex, DurationHistogram>,
     staged: StagedSubscriptionProgress,
+    refusals: HashMap<RefusalKey, u64>,
 }
+
+type RefusalKey = (
+    RelayIndex,
+    SubscriptionRouteKind,
+    Option<TransportEndpointRejectionCategory>,
+    SubscriptionRefusalDisposition,
+);
 
 impl RelaySyncTelemetry {
     /// Record that `subscription_id` was (re)issued to `relays` at `now_ms`.
@@ -665,6 +676,22 @@ impl RelaySyncTelemetry {
         }
     }
 
+    /// Count one relay refusal of a live subscription. Cumulative, like the
+    /// latency histograms, and bounded by relays times the closed route,
+    /// category and disposition vocabularies.
+    pub fn record_refusal(
+        &mut self,
+        relay: RelayIndex,
+        route_kind: SubscriptionRouteKind,
+        refusal: SubscriptionRefusal,
+    ) {
+        let count = self
+            .refusals
+            .entry((relay, route_kind, refusal.category, refusal.disposition))
+            .or_default();
+        *count = count.saturating_add(1);
+    }
+
     /// Forget the progress entry for `subscription_id`.
     ///
     /// Called when the subscription is unsubscribed, replaced by a rotation
@@ -796,12 +823,37 @@ impl RelaySyncTelemetry {
             })
             .collect();
 
+        let mut refusals: Vec<RelayRefusalStats> = self
+            .refusals
+            .iter()
+            .map(
+                |(&(relay, route_kind, category, disposition), &count)| RelayRefusalStats {
+                    relay_index: relay.0,
+                    route_kind,
+                    category,
+                    disposition,
+                    count,
+                },
+            )
+            .collect();
+        refusals.sort_unstable_by_key(|stats| {
+            (
+                stats.relay_index,
+                stats.route_kind,
+                stats
+                    .category
+                    .map(TransportEndpointRejectionCategory::as_str),
+                stats.disposition,
+            )
+        });
+
         RelaySyncSnapshot {
             tracked_subscriptions: tracked as u64,
             synced_subscriptions: synced as u64,
             first_event: aggregate_histograms(first_event.values()),
             eose: aggregate_histograms(eose.values()),
             per_relay,
+            refusals,
         }
     }
 }
@@ -902,6 +954,26 @@ pub struct RelaySyncSnapshot {
     pub eose: DurationHistogramSnapshot,
     /// Per-relay first-event / EOSE latency, ascending by index.
     pub per_relay: Vec<RelayLatencyStats>,
+    /// Cumulative relay refusals (`CLOSED`) of live subscriptions, ascending
+    /// by index. Absent from older serialized snapshots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refusals: Vec<RelayRefusalStats>,
+}
+
+/// How often one relay refused one kind of live subscription for one reason.
+///
+/// Opaque relay index and closed vocabularies only: no subscription ids,
+/// relay endpoints or reason text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayRefusalStats {
+    /// Opaque device-local relay index.
+    pub relay_index: u32,
+    pub route_kind: SubscriptionRouteKind,
+    /// The reason's machine-readable prefix; `None` when it had none or an
+    /// unknown one.
+    pub category: Option<TransportEndpointRejectionCategory>,
+    pub disposition: SubscriptionRefusalDisposition,
+    pub count: u64,
 }
 
 #[cfg(test)]
