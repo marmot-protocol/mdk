@@ -2219,6 +2219,7 @@ fn telemetry_rollup_reshapes_and_joins_per_relay_snapshots() {
                 eose: hist(1),
             },
         ],
+        refusals: Vec::new(),
     };
     let metrics = NostrAdapterMetrics {
         publish_attempts: 4,

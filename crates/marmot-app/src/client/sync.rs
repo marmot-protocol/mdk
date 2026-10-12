@@ -2982,7 +2982,11 @@ impl AppClient {
                 loop {
                     match timeout(EOSE_QUIET_WAIT, self.adapter.receive_account_delivery()).await {
                         Ok(result) => return result,
-                        Err(_) if self.adapter.account_subscription_eose().await.complete() => {
+                        // Settled, not complete: a relay that refused a REQ for
+                        // good will never report EOSE, so waiting longer brings
+                        // nothing. Ending the drain early ends it exactly as a
+                        // timeout would; the cursor gates still require EOSE.
+                        Err(_) if self.adapter.account_subscription_eose().await.settled() => {
                             return Ok(None);
                         }
                         Err(_) => {}
@@ -9291,6 +9295,58 @@ mod tests {
             }
         }
         assert!(client.adapter.account_subscription_eose().await.complete());
+        let started = tokio::time::Instant::now();
+        client.sync_sdk_relay().await.unwrap();
+        assert!(started.elapsed() >= super::EOSE_QUIET_WAIT);
+        assert!(started.elapsed() <= super::EOSE_QUIET_WAIT + Duration::from_millis(1));
+    }
+
+    /// A relay that refuses a subscription for good will never report its
+    /// end of stored events, so the drain stops waiting for it once every
+    /// other relay has answered. The refusal is not evidence that history
+    /// was served, so the replay stays incomplete and the live cursor is not
+    /// promoted past it.
+    #[tokio::test]
+    async fn dropped_refusal_shortens_quiet_drain_without_completing_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        client.sync_runtime_groups().await.unwrap();
+        tokio::time::pause();
+        client.sync_sdk_relay().await.unwrap();
+        let subscriptions = relay.accepted_subscriptions();
+        let (refused, served) = subscriptions
+            .split_first()
+            .expect("the account holds a subscription");
+        for endpoint in refused.endpoints() {
+            app.relay_plane
+                .handle_relay_closed_for_test(
+                    endpoint.clone(),
+                    refused.subscription_id(),
+                    transport_nostr_adapter::SubscriptionRefusal {
+                        category: Some(cgka_traits::TransportEndpointRejectionCategory::Restricted),
+                        disposition:
+                            transport_nostr_adapter::SubscriptionRefusalDisposition::Dropped,
+                    },
+                )
+                .await;
+        }
+        for subscription in served {
+            for endpoint in subscription.endpoints() {
+                app.relay_plane
+                    .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+                    .await;
+            }
+        }
+        let progress = client.adapter.account_subscription_eose().await;
+        assert!(progress.settled());
+        assert!(!progress.complete());
+        assert!(!client.live_cursor_promotion_ready().await);
         let started = tokio::time::Instant::now();
         client.sync_sdk_relay().await.unwrap();
         assert!(started.elapsed() >= super::EOSE_QUIET_WAIT);

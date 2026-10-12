@@ -1533,6 +1533,18 @@ impl MarmotRelayPlane {
     /// shared across accounts, which the first account to take them records
     /// once. An account with no v5 recorder takes only its own, so it never
     /// consumes a shared report another account could record.
+    /// Drain the relay refusals of `account`'s live subscriptions since the
+    /// last drain, for its `subscription_refused` audit row.
+    pub(crate) fn take_subscription_refusals(
+        &self,
+        account: &MemberId,
+    ) -> transport_nostr_adapter::SubscriptionRefusalReports {
+        self.inner
+            .transport
+            .adapter
+            .take_subscription_refusals(account)
+    }
+
     pub(crate) fn take_eose_repair_reports(
         &self,
         account: &MemberId,
@@ -2219,6 +2231,22 @@ impl MarmotRelayPlane {
             .transport
             .adapter
             .handle_relay_eose(endpoint, subscription_id)
+            .await;
+    }
+
+    /// Report a relay's `CLOSED` for one subscription on one endpoint, the
+    /// way the SDK notification forwarder does.
+    #[cfg(test)]
+    pub(crate) async fn handle_relay_closed_for_test(
+        &self,
+        endpoint: TransportEndpoint,
+        subscription_id: String,
+        refusal: transport_nostr_adapter::SubscriptionRefusal,
+    ) {
+        self.inner
+            .transport
+            .adapter
+            .handle_relay_closed(endpoint, subscription_id, refusal)
             .await;
     }
 

@@ -8,7 +8,15 @@ use marmot_forensics::{
     AuditEventContext, AuditEventKind, AuditHumanActionContext, EpochBackfillActivationOutcome,
     EpochBackfillCompletionKind, EpochBackfillDeferredReason, EpochBackfillExecutionSeam,
     EpochBackfillReplayScope, EpochStallBackfillTrigger, RelayRegistration,
+    SUBSCRIPTION_REFUSAL_AUDIT_MAX_ENTRIES, SubscriptionRefusalCategory, SubscriptionRefusalEntry,
+    SubscriptionRefusalOutcome, SubscriptionRefusalRoute,
 };
+use transport_nostr_adapter::{
+    SUBSCRIPTION_REFUSAL_REPORT_LIMIT, SubscriptionRefusalDisposition, SubscriptionRouteKind,
+};
+
+// Every report the adapter holds for an account fits one audit row.
+const _: () = assert!(SUBSCRIPTION_REFUSAL_REPORT_LIMIT <= SUBSCRIPTION_REFUSAL_AUDIT_MAX_ENTRIES);
 
 use crate::messages::AppMessageIntent;
 use crate::{AppError, AppGroupRecord};
@@ -320,6 +328,49 @@ impl AppClient {
                 since_secs,
                 lookback_secs: self.relay_plane.subscription_rebuild_lookback_secs(),
                 relay_results,
+            },
+        );
+    }
+
+    /// Record the relay refusals of this account's live subscriptions since
+    /// the last call as one `subscription_refused` row. The adapter only
+    /// queued them as each `CLOSED` arrived, so relay traffic never waits on
+    /// audit. Without a v5 recorder the reports are still drained and
+    /// discarded, so a later enable does not replay stale refusals.
+    /// Account-scoped, so `group_ref` is `None`.
+    pub(crate) fn record_subscription_refusals(&self) {
+        let reports = self
+            .relay_plane
+            .take_subscription_refusals(self.adapter.account_id());
+        if reports.reports.is_empty() || !self.audit_v5_enabled() {
+            return;
+        }
+        let refusals = reports
+            .reports
+            .into_iter()
+            .map(|report| SubscriptionRefusalEntry {
+                route_kind: match report.route_kind {
+                    SubscriptionRouteKind::Inbox => SubscriptionRefusalRoute::Inbox,
+                    SubscriptionRouteKind::Group => SubscriptionRefusalRoute::Group,
+                    SubscriptionRouteKind::Maintenance => SubscriptionRefusalRoute::Maintenance,
+                },
+                relay_url: report.endpoint.0,
+                refusal_category: report
+                    .category
+                    .map_or(SubscriptionRefusalCategory::Unclassified, refusal_category),
+                disposition: match report.disposition {
+                    SubscriptionRefusalDisposition::Pending => SubscriptionRefusalOutcome::Pending,
+                    SubscriptionRefusalDisposition::Dropped => SubscriptionRefusalOutcome::Dropped,
+                },
+                count: report.count,
+            })
+            .collect();
+        self.runtime.session().record_audit_event(
+            None,
+            None,
+            AuditEventKind::SubscriptionRefused {
+                refusals,
+                dropped: reports.dropped,
             },
         );
     }
@@ -734,6 +785,23 @@ impl AppClient {
             audit.from_epoch,
             audit.to_epoch,
         );
+    }
+}
+
+fn refusal_category(
+    category: cgka_traits::TransportEndpointRejectionCategory,
+) -> SubscriptionRefusalCategory {
+    use cgka_traits::TransportEndpointRejectionCategory as Category;
+    match category {
+        Category::Duplicate => SubscriptionRefusalCategory::Duplicate,
+        Category::Pow => SubscriptionRefusalCategory::Pow,
+        Category::Blocked => SubscriptionRefusalCategory::Blocked,
+        Category::RateLimited => SubscriptionRefusalCategory::RateLimited,
+        Category::Invalid => SubscriptionRefusalCategory::Invalid,
+        Category::Error => SubscriptionRefusalCategory::Error,
+        Category::Unsupported => SubscriptionRefusalCategory::Unsupported,
+        Category::AuthRequired => SubscriptionRefusalCategory::AuthRequired,
+        Category::Restricted => SubscriptionRefusalCategory::Restricted,
     }
 }
 

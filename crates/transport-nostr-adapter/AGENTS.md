@@ -69,6 +69,13 @@ for reconnect/backoff and relay status mechanics.
   got nothing has its re-issue released and counted in `EoseReissueSummary::failed_relays` so the caller repairs it
   again later. Never wait for queue room under the lifecycle lock. Never infer EOSE at a lag, change
   a re-issued REQ's filter, or reopen a closed REQ.
+- Hand every relay `CLOSED` to `handle_relay_closed`, classified by the SDK's own disposition: after the SDK settles
+  the REQ, it is `Pending` if the relay still holds it (`Relay::subscription`) and `Dropped` otherwise. Never
+  re-derive nostr-sdk's prefix table. A dropped refusal before EOSE settles that relay's replay coverage but never
+  completes it: `AccountSubscriptionEose::settled` may end a wait, only `complete` may advance a durable floor or
+  reuse an activation. EOSE is final; a later `CLOSED` does not undo it. Ignore closes for ids that are not live
+  (superseded attempts, one-shot fetches). Keep only the reason's category, never its text, in state, logs,
+  telemetry and the audit queue.
 - Keep real relay clients behind `NostrRelayClient`.
 - Keep the `nostr-sdk` dependency behind the `sdk` feature.
 - Relay endpoints are host-safety filtered before any connect at the `RelaySafetyPolicy` chokepoint in `marmot-app`

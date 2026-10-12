@@ -288,7 +288,8 @@ pub use storage_sqlite::{
 };
 pub use transport_nostr_adapter::{
     DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics, RelayDeliverySpread,
-    RelayDeliveryStats, RelayLabelResolution, RelayLatencyStats, RelaySyncSnapshot,
+    RelayDeliveryStats, RelayLabelResolution, RelayLatencyStats, RelayRefusalStats,
+    RelaySyncSnapshot, SubscriptionRefusalDisposition, SubscriptionRouteKind,
 };
 
 /// Canonical group-create result at the host response boundary.
