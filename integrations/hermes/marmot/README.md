@@ -268,7 +268,7 @@ First copy the [verified installer helper](../../README.md#verified-installer-he
 into this shell. Then select the release documented here:
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.13.0"
 ```
 
 Run this example in the same shell where `install_verified` was defined.

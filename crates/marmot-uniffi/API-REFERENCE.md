@@ -1,9 +1,9 @@
 # Complete MarmotKit method reference
 
-This reference inventories the UniFFI exports in the 0.10.2 source baseline and is maintained
-alongside source changes. Start with the [integration guide](README.md#integration-guide-and-api-reference)
-for API selection, lifecycle, localization and ownership. For this release's changes, read
-[0.10.1 → 0.10.2](../../docs/integration/0.10.2.md).
+This reference inventories the UniFFI exports and is maintained alongside source changes.
+Start with the [integration guide](README.md#integration-guide-and-api-reference)
+for API selection, lifecycle, localization and ownership. For the 0.13.0 changes, read
+[0.12.0 → 0.13.0](../../docs/integration/0.13.0.md).
 
 This inventories runtime/object methods, free functions and host callback methods. `AttachmentHistoryCursor` is an opaque object with no exported
 methods. Generated disposal/concurrency helpers are platform scaffolding, not additional
@@ -3446,7 +3446,7 @@ Observe block-list snapshots.
 pub fn includes_chat_list_version(&self, version: Arc<ChatListDraftVersionFfi>) -> bool
 ```
 
-Compare a chat-list row’s opaque `draft_version` with this captured composer revision. True means the same account store/group and a version no newer than this revision; false includes foreign store/group metadata and newer identical edits. This is presentation correlation, not mutation authorization. Keep both values device-local and use revision-checked cleanup. See [pending-send draft presentation](CHAT-LIST-ROWS.md#pending-send-draft-presentation-unreleased).
+Compare a chat-list row’s opaque `draft_version` with this captured composer revision. True means the same account store/group and a version no newer than this revision; false includes foreign store/group metadata and newer identical edits. This is presentation correlation, not mutation authorization. Keep both values device-local and use revision-checked cleanup. See [pending-send draft presentation](CHAT-LIST-ROWS.md#pending-send-draft-presentation-0130).
 
 [Source](src/conversions/conversation_window.rs#L340)
 

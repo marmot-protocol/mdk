@@ -2,9 +2,15 @@
 
 ## Unreleased
 
-- Media upgrades 0104/0105 preserve retained bodies and checkpoint chunks in place instead of copying payloads during account open. Metadata validation/accounting runs on mutation; affected foreign keys are verified transactionally and enforcement is restored on failure/unwind. Already-upgraded physical schemas remain supported. Optional encrypted-open progress reports fixed phases and migration numbers without private data.
+## 0.13.0 - 2026-10-12
+
+Account storage advances from migration 101 through 107 on first open; downgrade
+is unsupported.
 
 ### Breaking changes
+
+- `PresentedChatRow` adds `draft_version: Option<ChatListDraftVersion>`; struct
+  literals must set it.
 
 - Migration 0102 advances account storage to schema 102 on first open and
   invalidates attachment-history versions when source emoji tags change.
@@ -15,6 +21,17 @@
   open. Older binaries reject the upgraded database; downgrade is unsupported.
 
 ### Added
+
+- `SqliteAccountStorage::open_encrypted_observed` reports fixed open phases and
+  migration numbers (`StorageOpenPhase`, `StorageOpenProgress`) without paths,
+  SQL or keys. Migrations 0104/0105 validate and account metadata on mutation;
+  affected foreign keys are verified transactionally and enforcement is restored
+  on failure or unwind. Already-upgraded physical schemas remain supported.
+- `chat_list_selection_snapshot`, `chat_list_selection_count`,
+  `chat_list_selection_page` and `revalidate_chat_list_selection` capture every
+  eligible chat id for a fixed chat-list view in one read transaction
+  (`ChatListSelectionSnapshot`, `ChatListSelectionError`), so batch actions are
+  not limited to the loaded display window.
 
 - Migration 0107 adds the account-private `moderation_report_outbox` with
   `SqliteAccountStorage` methods to stage, retry, deduplicate, rate-count,

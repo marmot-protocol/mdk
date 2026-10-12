@@ -468,7 +468,7 @@ not create or update a mutable latest alias. A verified install for the current 
 ```sh
 (
 set -eu
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.13.0"
 
 install_verified() (
   set -eu
