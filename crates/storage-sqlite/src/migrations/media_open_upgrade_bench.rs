@@ -152,6 +152,8 @@ mod max_partial_investigation {
         let migration = super::super::Migration {
             version: 105,
             name: "0105_file_attachment_partials",
+            suspend_foreign_keys:
+                crate::migrations::migration_0105_file_attachment_partials::SUSPEND_FOREIGN_KEYS,
             apply: super::super::migration_0105_file_attachment_partials::apply,
         };
         super::super::apply_migration(&mut conn, &migration).unwrap();

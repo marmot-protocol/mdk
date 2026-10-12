@@ -1046,7 +1046,7 @@ impl SqliteAccountStorage {
             let mut template = rusqlite::Connection::open_in_memory().storage()?;
             apply_cipher_pragmas(&template, &template_options)?;
             apply_operational_pragmas(&template, &template_options)?;
-            migrations::run_all(&mut template)?;
+            migrations::run_all_observed(&mut template, None)?;
             // A concurrent first caller may win; either template is complete.
             let _ = TEMPLATE.set(Mutex::new(template));
         }
@@ -1153,10 +1153,7 @@ impl SqliteAccountStorage {
         apply_operational_pragmas(&connection, &options)?;
         connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
         let migration_started = std::time::Instant::now();
-        let migrations_applied = match observer {
-            Some(observer) => migrations::run_all_observed(&mut connection, Some(observer))?,
-            None => migrations::run_all(&mut connection)?,
-        };
+        let migrations_applied = migrations::run_all_observed(&mut connection, observer)?;
         let migration_duration = migration_started.elapsed();
         let connection = SharedConnection::new(connection);
         let openmls = SqliteOpenMlsStorage::new(connection.clone());

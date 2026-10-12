@@ -501,6 +501,14 @@ fn copy_staged_body(
         conn.execute("INSERT INTO retained_attachment_files(token,nonce,attempt,byte_len,completed) VALUES(?1,?2,zeroblob(16),?3,1)",params![retained,nonce,u64_to_i64(size)?]).storage()?;
         return Ok(());
     }
+    // Published byte-array staging is capped at 512 MiB. Larger file uploads use
+    // the chunk-manifest branch above, including in the first 0103 snapshot.
+    // Enforce the same producer contract on both physical 0104 layouts before reserving a BLOB.
+    if size_usize > MAX_RETAINED_ATTACHMENT_BYTES {
+        return Err(StorageError::InvalidAttachmentBody(
+            "retained attachment exceeds byte-array storage bound",
+        ));
+    }
     let (table, rowid) = staged_body(conn, staged)?;
     conn.execute(
         "INSERT INTO retained_attachment_bytes(token,byte_len,bytes) VALUES(?1,?2,zeroblob(?2))",
@@ -545,6 +553,17 @@ fn copy_staged_body(
     source.close().storage()?;
     target.close().storage()?;
     Ok(())
+}
+
+/// Exercise the legacy/file ceiling contract against both historical layouts without allocating oversized bytes.
+#[cfg(test)]
+pub(crate) fn copy_staged_body_for_test(
+    conn: &Connection,
+    staged: &[u8],
+    retained: &[u8],
+    size: u64,
+) -> StorageResult<()> {
+    copy_staged_body(conn, staged, retained, size)
 }
 
 pub(super) fn read_some(reader: &mut dyn std::io::Read, buffer: &mut [u8]) -> StorageResult<usize> {

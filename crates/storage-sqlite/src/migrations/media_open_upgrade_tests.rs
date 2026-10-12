@@ -264,6 +264,8 @@ fn partial_upgrade_preserves_chunk_pages_and_restores_foreign_keys() {
     let migration = Migration {
         version: 105,
         name: "0105_file_attachment_partials",
+        suspend_foreign_keys:
+            crate::migrations::migration_0105_file_attachment_partials::SUSPEND_FOREIGN_KEYS,
         apply: migration_0105_file_attachment_partials::apply,
     };
     apply_migration(&mut connection, &migration).unwrap();
@@ -335,6 +337,8 @@ fn failed_parent_rebuild_rolls_back_and_restores_foreign_key_enforcement() {
     let migration = Migration {
         version: 105,
         name: "0105_file_attachment_partials",
+        suspend_foreign_keys:
+            crate::migrations::migration_0105_file_attachment_partials::SUSPEND_FOREIGN_KEYS,
         apply: |tx| {
             migration_0105_file_attachment_partials::apply(tx)?;
             Err(StorageError::Backend(
@@ -425,8 +429,15 @@ fn observer_faults_do_not_change_storage_results_and_progress_names_the_migratio
 #[path = "media_upgrade_prior.rs"]
 mod prior;
 
-#[test]
-fn published_media_schema_reopens_without_rewriting_or_reapplying() {
+/// Build either physical 0104 layout through its actual migration body, preserving the original fixture.
+fn media_layout_fixture(
+    published: bool,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    SqlCipherKey,
+    Connection,
+) {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("prior.sqlite");
     fs_private::ensure_private_db_files(&path).unwrap();
@@ -441,14 +452,25 @@ fn published_media_schema_reopens_without_rewriting_or_reapplying() {
         .map(|m| Migration {
             version: m.version,
             name: m.name,
-            apply: match m.version {
-                104 => prior::retained,
-                105 => prior::partial,
-                _ => m.apply,
+            suspend_foreign_keys: m.suspend_foreign_keys,
+            apply: if published {
+                match m.version {
+                    104 => prior::retained,
+                    105 => prior::partial,
+                    _ => m.apply,
+                }
+            } else {
+                m.apply
             },
         })
         .collect();
     run_with_summary(&mut connection, &prior).unwrap();
+    (root, path, key, connection)
+}
+
+#[test]
+fn published_media_schema_reopens_without_rewriting_or_reapplying() {
+    let (_root, path, key, connection) = media_layout_fixture(true);
     let (group, message): (String, String) = connection
         .query_row(
             "SELECT group_id_hex,message_id_hex FROM app_events LIMIT 1",
@@ -493,6 +515,160 @@ fn published_media_schema_reopens_without_rewriting_or_reapplying() {
     );
 }
 
+/// Legacy promotion uses the public byte-array ceiling on both layouts, before allocating a BLOB.
+#[test]
+fn physical_media_layouts_share_legacy_staging_ceiling() {
+    for published in [false, true] {
+        let (_root, _path, _key, connection) = media_layout_fixture(published);
+        let (group, message): (String, String) = connection
+            .query_row(
+                "SELECT group_id_hex,message_id_hex FROM app_events LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let staged = [2u8; 16];
+        let retained = [3u8; 16];
+        connection.execute("INSERT INTO outgoing_attachment_uploads(token,group_id_hex,source_epoch,plaintext_digest,bytes,expires_at) VALUES(?1,?2,1,zeroblob(32),x'010203',1000)", params![staged,group]).unwrap();
+        connection.execute("INSERT INTO attachment_acquisition(token,group_id_hex,message_id_hex,attachment_index,source_message_id_hex,source_epoch,slot_json,plaintext_digest,state,due) VALUES(?1,?2,?3,0,?3,1,'{}',zeroblob(32),3,NULL)",params![retained,group,message]).unwrap();
+        crate::attachment_acquisition::copy_staged_body_for_test(
+            &connection,
+            &staged,
+            &retained,
+            3,
+        )
+        .unwrap();
+        let before = connection.total_changes();
+        let result = crate::attachment_acquisition::copy_staged_body_for_test(
+            &connection,
+            &staged,
+            &[4u8; 16],
+            crate::MAX_RETAINED_ATTACHMENT_BYTES as u64 + 1,
+        );
+        assert!(matches!(
+            result,
+            Err(cgka_traits::StorageError::InvalidAttachmentBody(
+                "retained attachment exceeds byte-array storage bound"
+            ))
+        ));
+        assert_eq!(connection.total_changes(), before);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT bytes FROM retained_attachment_bytes WHERE token=?1",
+                    [retained],
+                    |row| row.get::<_, Vec<u8>>(0)
+                )
+                .unwrap(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT byte_count FROM attachment_retention_usage WHERE id=1",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            6
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+}
+
+/// An arbitrary migration version/table name can request FK-safe rebuilding while preserving the prior setting.
+#[test]
+fn declared_foreign_key_scope_preserves_children_and_original_mode() {
+    for enabled in [false, true] {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE parent(id INTEGER PRIMARY KEY); CREATE TABLE child(id INTEGER REFERENCES parent(id) ON DELETE CASCADE); INSERT INTO parent VALUES(1); INSERT INTO child VALUES(1);").unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", enabled)
+            .unwrap();
+        let migration = Migration {
+            version: 1,
+            name: "synthetic_parent_rebuild",
+            suspend_foreign_keys: &["child"],
+            apply: |tx| {
+                tx.execute_batch("CREATE TABLE replacement(id INTEGER PRIMARY KEY); INSERT INTO replacement SELECT * FROM parent; DROP TABLE parent; ALTER TABLE replacement RENAME TO parent;").storage()
+            },
+        };
+        assert_eq!(run_with_summary(&mut connection, &[migration]).unwrap(), 1);
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM child", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))
+                .unwrap(),
+            enabled
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+}
+
+/// A declared-table violation rolls back the body and ledger even when enforcement was originally disabled.
+#[test]
+fn declared_foreign_key_scope_rejects_orphans_and_restores_mode() {
+    for enabled in [false, true] {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE parent(id INTEGER PRIMARY KEY); CREATE TABLE child(id INTEGER REFERENCES parent(id) ON DELETE CASCADE); INSERT INTO parent VALUES(1); INSERT INTO child VALUES(1);").unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", enabled)
+            .unwrap();
+        let migration = Migration {
+            version: 1,
+            name: "synthetic_invalid_rebuild",
+            suspend_foreign_keys: &["child"],
+            apply: |tx| tx.execute_batch("DELETE FROM parent;").storage(),
+        };
+        assert!(run_with_summary(&mut connection, &[migration]).is_err());
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM parent", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM child", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM cgka_schema_migrations", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))
+                .unwrap(),
+            enabled
+        );
+    }
+}
+
 #[test]
 fn rebuild_rejects_invalid_references_before_committing_a_ledger_row() {
     let (_directory, mut connection) = encrypted_fixture();
@@ -511,6 +687,8 @@ fn rebuild_rejects_invalid_references_before_committing_a_ledger_row() {
     let migration = Migration {
         version: 105,
         name: "0105_file_attachment_partials",
+        suspend_foreign_keys:
+            crate::migrations::migration_0105_file_attachment_partials::SUSPEND_FOREIGN_KEYS,
         apply: migration_0105_file_attachment_partials::apply,
     };
     assert!(apply_migration(&mut connection, &migration).is_err());
@@ -549,6 +727,8 @@ fn unwinding_rebuild_restores_enforcement_and_rolls_back_metadata() {
     let migration = Migration {
         version: 105,
         name: "0105_file_attachment_partials",
+        suspend_foreign_keys:
+            crate::migrations::migration_0105_file_attachment_partials::SUSPEND_FOREIGN_KEYS,
         apply: |tx| {
             migration_0105_file_attachment_partials::apply(tx)?;
             panic!("synthetic migration unwind");

@@ -6347,10 +6347,21 @@ impl MarmotApp {
         let probe = self
             .startup_diagnostics
             .observe_pending_open(NativeStartupStage::ProductAnalyticsAdmission);
+        let result = self.account_storage_observed(label, &probe);
+        probe.finish(result.is_ok());
+        result
+    }
+
+    /// Reuse the caller's scope across analytics admission and native open work; the caller owns retirement.
+    fn account_storage_observed(
+        &self,
+        label: &str,
+        probe: &startup_diagnostics::NativeStartupProbe,
+    ) -> Result<SqliteAccountStorage, AppError> {
+        probe.phase(NativeStartupStage::ProductAnalyticsAdmission);
         let permit = self.product_analytics.permit();
         probe.phase(NativeStartupStage::AccountStorageCache);
-        let result = self.account_storage_unobserved(label, &probe);
-        probe.finish(result.is_ok());
+        let result = self.account_storage_unobserved(label, probe);
         if let Err(error) = &result {
             self.product_analytics
                 .storage_failure(permit.as_ref(), error);

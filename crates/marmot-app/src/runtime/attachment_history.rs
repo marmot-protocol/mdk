@@ -147,8 +147,8 @@ fn attachment_role(attachment: &MediaAttachmentOutcome, tags: &[Vec<String>]) ->
 }
 
 impl MarmotAppRuntime {
-    /// Read local attachment state on a blocking task with separate queue/work and future-delivery scopes.
-    /// Shutdown preserves its existing cancellation policy; probes retire even when the future is dropped.
+    /// Share one pending scope across task queueing, account opening, local reads and successful result delivery.
+    /// Cached successes stay out of history; a dropped future leaves running work observable until its last owner exits.
     pub(super) async fn attachment_read<T: Send + 'static>(
         &self,
         account_ref: &str,
@@ -160,27 +160,30 @@ impl MarmotAppRuntime {
         let app = self.accounts.app.clone();
         let account_ref = account_ref.to_owned();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
-        let future_probe = app
-            .startup_diagnostics
-            .observe(crate::NativeStartupStage::AttachmentFutureWait);
-        let probe = app
-            .startup_diagnostics
-            .observe(crate::NativeStartupStage::AttachmentTaskQueued);
+        let probe = std::sync::Arc::new(
+            app.startup_diagnostics
+                .observe_pending_open(crate::NativeStartupStage::AttachmentTaskQueued),
+        );
+        let worker_probe = probe.clone();
         let work = blocking_app_task(move || {
             let result = (|| {
-                probe.phase(crate::NativeStartupStage::AccountResolution);
+                worker_probe.phase(crate::NativeStartupStage::AccountResolution);
                 // Account resolution, store opening, SQL and parser work all stay off the caller thread.
                 let account = app.account_home().account(&account_ref)?;
-                let storage = app.account_storage(&account.label)?;
+                let storage = app.account_storage_observed(&account.label, &worker_probe)?;
+                worker_probe.phase(crate::NativeStartupStage::AccountResolution);
                 if app.account_home().account(&account.label)?.account_id_hex
                     != account.account_id_hex
                 {
                     return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
                 }
-                probe.phase(crate::NativeStartupStage::AttachmentLocalRead);
+                worker_probe.phase(crate::NativeStartupStage::AttachmentLocalRead);
                 read(storage, app.allow_loopback_blob_endpoints())
             })();
-            probe.finish(result.is_ok());
+            // Keep a failed native phase/version intact until retirement.
+            if result.is_ok() {
+                worker_probe.phase(crate::NativeStartupStage::AttachmentFutureWait);
+            }
             result
         });
         let result = tokio::select! {
@@ -188,7 +191,11 @@ impl MarmotAppRuntime {
             _ = wait_for_runtime_shutdown(&mut stopping) => Err(AppError::RuntimeStopping),
             result = work => result,
         };
-        future_probe.finish(result.is_ok());
+        // On shutdown/cancellation the worker may still own this scope. Its eventual last drop
+        // records abandonment; do not hide the blocked native work when its caller stops waiting.
+        if let Ok(probe) = std::sync::Arc::try_unwrap(probe) {
+            probe.finish(result.is_ok());
+        }
         result
     }
     /// Read bounded original slots in canonical order, including rejected attachments.

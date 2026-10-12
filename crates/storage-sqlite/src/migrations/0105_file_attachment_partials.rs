@@ -4,7 +4,11 @@ use cgka_traits::StorageError;
 use cgka_traits::storage::StorageResult;
 use rusqlite::Transaction;
 
-/// Rebuild only the small parent records; the runner restores and validates foreign keys.
+/// The registry suspends enforcement before this parent rebuild and checks both parent and chunk references.
+pub(crate) const SUSPEND_FOREIGN_KEYS: &[&str] =
+    &["attachment_partial", "attachment_partial_chunk"];
+
+/// Rebuild only small parent records; the defensive precondition also protects direct calls outside the runner.
 pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     if tx
         .pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))

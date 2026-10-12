@@ -15,12 +15,12 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
         DROP TRIGGER attachment_bytes_removed;
         DROP TRIGGER attachment_bytes_updated;
         CREATE TRIGGER attachment_body_metadata_insert BEFORE INSERT ON retained_attachment_bytes
-        WHEN NOT (typeof(NEW.byte_len)='integer' AND NEW.byte_len BETWEEN -1 AND 943718400
+        WHEN NOT (typeof(NEW.byte_len)='integer' AND NEW.byte_len BETWEEN -1 AND 536870912
             AND (NEW.byte_len=-1 OR length(NEW.bytes)=NEW.byte_len)) BEGIN
             SELECT RAISE(ABORT,'invalid retained body length');
         END;
         CREATE TRIGGER attachment_body_metadata_update BEFORE UPDATE OF bytes,byte_len ON retained_attachment_bytes
-        WHEN NOT (typeof(NEW.byte_len)='integer' AND NEW.byte_len BETWEEN -1 AND 943718400
+        WHEN NOT (typeof(NEW.byte_len)='integer' AND NEW.byte_len BETWEEN -1 AND 536870912
             AND (NEW.byte_len=-1 OR length(NEW.bytes)=NEW.byte_len)) BEGIN
             SELECT RAISE(ABORT,'invalid retained body length');
         END;
