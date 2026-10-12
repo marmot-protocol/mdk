@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `MarmotAppRuntime::submit_prepared_media_snapshot` admits the captured ordinary-media payload with a stable token and consumes only its unchanged captured draft in the same transaction. Newer or cleared drafts cannot replace the payload or block admission.
+
 ### Breaking changes
 
 - `AttachmentTransferState` adds `StorageBlocked`: free disk cannot cover the
@@ -137,7 +139,6 @@
   contacts never see the key-derived default name. A setup resumed past
   its first local step ignores the profile and returns what its bootstrap
   publishes.
-
 - `AccountManager::propose_onboarding_relay_repair` previews exact ordered
   tags, content and minimal relay changes without signing or publishing.
   Approval retains the existing revision and source-event checks; typed

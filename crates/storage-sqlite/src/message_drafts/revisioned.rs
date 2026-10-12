@@ -101,6 +101,37 @@ impl SqliteAccountStorage {
             .with_deferred_read(|conn| selected_tx(conn, group))
     }
 
+    /// Hash ordered plaintext in the caller's draft-admission snapshot. Ordinary
+    /// selected-draft reads remain metadata-only; attachment bytes are borrowed
+    /// one row at a time and never copied into a hydrated draft.
+    #[doc(hidden)]
+    pub fn message_draft_plaintext_hashes(
+        &self,
+        expected: &MessageDraftRevision,
+    ) -> Result<Vec<[u8; 32]>, MessageDraftRevisionError> {
+        use sha2::{Digest, Sha256};
+        self.connection.with_deferred_read(|conn| {
+            check_revision_tx(conn, expected)?;
+            let mut statement = conn
+                .prepare_cached(
+                    "SELECT plaintext FROM message_draft_attachments
+                     WHERE group_id_hex = ?1 ORDER BY position ASC",
+                )
+                .storage()?;
+            let mut rows = statement.query([&expected.group_id_hex]).storage()?;
+            let mut hashes = Vec::new();
+            while let Some(row) = rows.next().storage()? {
+                let plaintext = row.get_ref(0).storage()?;
+                let plaintext = plaintext
+                    .as_blob()
+                    .map_err(rusqlite::Error::from)
+                    .storage()?;
+                hashes.push(Sha256::digest(plaintext).into());
+            }
+            Ok(hashes)
+        })
+    }
+
     pub fn save_message_draft_if_revision(
         &self,
         expected: &MessageDraftRevision,
