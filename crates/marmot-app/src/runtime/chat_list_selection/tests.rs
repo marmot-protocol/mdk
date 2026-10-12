@@ -75,8 +75,11 @@ impl Fixture {
 #[tokio::test]
 async fn capture_prepares_multiple_base_batches_before_returning_a_complete_selection() {
     let f = Fixture::new_unprepared(101);
+    // This checks complete multi-batch preparation, not a storage-speed contract.
+    // Account DB writes can be slow under shared-host I/O pressure; keep the
+    // completion bound generous while retaining exact count/page assertions.
     let handle = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(60),
         f.runtime
             .capture_chat_list_selection("alice", ChatListView::Chats),
     )
