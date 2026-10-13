@@ -5406,6 +5406,9 @@ Release a standalone version returned by a version read or clone. NULL is harmle
 
 </details>
 
+<details>
+<summary>Moderation reporting</summary>
+
 ### `marmot_configure_moderation_reporting`
 
 ```c
@@ -5415,11 +5418,6 @@ MarmotStatus marmot_configure_moderation_reporting(const struct MarmotClient *cl
 Install the private moderation-report destination at runtime, or clear it when `recipient_pubkey` is NULL. C hosts use this instead of a `MarmotClientOptions` field so the borrowed options layout stays unchanged. The recipient is 64-character hex or `npub`; every relay must pass the relay safety policy. One bad entry rejects the whole destination with `MARMOT_STATUS_INVALID_MODERATION_REPORT_CONFIG` and leaves reporting unconfigured.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotconfigure_moderation_reporting) · [Header contract](include/marmot.h#L9633)
-
-</details>
-
-<details>
-<summary>marmot_d…</summary>
 
 
 ### `marmot_moderation_report_outcome_free`
@@ -5432,11 +5430,6 @@ Free a value of this type returned by this library. NULL is a no-op.
 
 [Header contract](include/marmot.h#L12209)
 
-</details>
-
-<details>
-<summary>marmot_n…</summary>
-
 
 ### `marmot_moderation_reporting_available`
 
@@ -5447,6 +5440,8 @@ MarmotStatus marmot_moderation_reporting_available(const struct MarmotClient *cl
 Write whether a valid moderation-report destination is installed. Hosts gate the "Report to White Noise" affordance on it; submitting without one fails with `MARMOT_STATUS_MODERATION_REPORTING_NOT_CONFIGURED` and publishes nothing.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotmoderation_reporting_available) · [Header contract](include/marmot.h#L9623)
+
+</details>
 
 <details>
 <summary>Native startup diagnostics</summary>
@@ -5483,6 +5478,9 @@ Read bounded fixed phases and migration progress without database or keystore qu
 
 </details>
 
+<details>
+<summary>Captured media admission</summary>
+
 ### `marmot_send_prepared_media_with_client_token`
 
 ```c
@@ -5492,3 +5490,5 @@ MarmotStatus marmot_send_prepared_media_with_client_token(const struct MarmotCli
 C binding for [captured ordinary-media admission](../marmot-uniffi/LOCAL-SENDS.md#captured-ordinary-media-drafts). Inputs and the nullable captured revision are borrowed; free the owned result with `marmot_local_send_acceptance_free`. Use the matching generated header and native library.
 
 [Header contract](include/marmot.h#L8749)
+
+</details>

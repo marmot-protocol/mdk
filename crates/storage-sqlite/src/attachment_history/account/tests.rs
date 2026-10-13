@@ -436,3 +436,77 @@ fn same_group_additions_keep_seek_and_non_attachment_expiry_is_quiet() {
     b.next_expiry = Some(13);
     assert_eq!(a, b);
 }
+
+#[test]
+fn record_time_retention_copies_expiry_before_any_maintenance_or_update() {
+    let s = SqliteAccountStorage::in_memory().unwrap();
+    for id in [1u64, 2] {
+        s.record_app_event_with_retention(
+            &crate::StoredAppEvent {
+                group_id_hex: "aa".into(),
+                message_id_hex: format!("{id:064x}"),
+                source_message_id_hex: Some(format!("{id:064x}")),
+                source_epoch: Some(0),
+                direction: "received".into(),
+                sender: "11".repeat(32),
+                plaintext: "private".into(),
+                kind: 9,
+                tags: vec![vec!["imeta".into(), "v future".into()]],
+                recorded_at: id,
+                received_at: id,
+                origin_commit_id: None,
+                moderation_grant: false,
+            },
+            Some(cgka_traits::app_event::AppMessageRetentionDecision::new(
+                id, 10,
+            )),
+        )
+        .unwrap();
+    }
+    let copied: Vec<i64> = s
+        .lock()
+        .unwrap()
+        .prepare("SELECT retention_expires_at FROM attachment_history ORDER BY message_id_hex")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(copied, vec![11, 12]);
+    let first = s
+        .account_attachment_history_page_at(&AccountAttachmentQuery::default(), 1, None, 10)
+        .unwrap();
+    assert_eq!(first.entries.len(), 1);
+    assert_eq!(first.version.next_expiry, Some(11));
+    assert!(matches!(
+        s.account_attachment_history_page_at(
+            &AccountAttachmentQuery::default(),
+            1,
+            first.next_cursor.as_ref(),
+            11
+        ),
+        Err(AccountAttachmentHistoryError::RestartRequired)
+    ));
+    let remaining = s
+        .account_attachment_history_page_at(&AccountAttachmentQuery::default(), 10, None, 11)
+        .unwrap();
+    assert_eq!(remaining.entries.len(), 1);
+    assert_eq!(
+        remaining.entries[0].attachment.message_id_hex,
+        format!("{:064x}", 2)
+    );
+    assert_eq!(remaining.version.next_expiry, Some(12));
+    let expired = s
+        .account_attachment_history_page_at(&AccountAttachmentQuery::default(), 10, None, 12)
+        .unwrap();
+    assert!(expired.entries.is_empty());
+    assert!(expired.next_cursor.is_none());
+    assert_eq!(
+        s.lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM app_events", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+}
