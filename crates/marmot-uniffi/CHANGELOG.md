@@ -2,8 +2,6 @@
 
 ## Unreleased
 
-- `Marmot::send_prepared_media_with_client_token` exposes captured ordinary-media admission with transactional conditional draft consumption. Use the original token and revision for live retries, recover ownership by token after interruption, and pair regenerated Swift/Kotlin bindings with the matching library. See [local sends](LOCAL-SENDS.md).
-
 ### Breaking changes
 
 - `AttachmentTransferStateFfi` adds `StorageBlocked`: free disk cannot cover
@@ -12,6 +10,12 @@
   Swift/Kotlin handling and regenerate bindings with the matching native
   library; render a storage prompt rather than a retry timer. See
   [the attachment access contract](ATTACHMENT-ACCESS.md).
+
+### Added
+
+- Account-wide attachment candidate pages, group/sender/date queries and opaque account/query-bound cursor/version handles. Filtered empty pages can continue; source changes require restart. Existing group history and acquisition primitives are unchanged.
+
+- `Marmot::send_prepared_media_with_client_token` exposes captured ordinary-media admission with transactional conditional draft consumption. Use the original token and revision for live retries, recover ownership by token after interruption, and pair regenerated Swift/Kotlin bindings with the matching library. See [local sends](LOCAL-SENDS.md).
 
 ## 0.13.0 - 2026-10-12
 

@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use marmot_uniffi::Marmot;
 
+pub mod account_attachment_history;
 pub mod attachment_access;
 pub mod attachment_history;
 pub mod commands;

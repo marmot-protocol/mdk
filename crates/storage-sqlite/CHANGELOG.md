@@ -4,7 +4,8 @@
 
 ### Breaking changes
 
-- Migration 0108 advances account storage to schema 108 on first open. Older
+- Migration 0108 advances account storage to schema 108 with account-wide attachment seek/expiry indexes and invalidation counters. Older binaries reject the upgraded database; downgrade is unsupported.
+- Migration 0109 advances account storage to schema 109 on first open. Older
   binaries reject the upgraded database; downgrade is unsupported. It adds
   `attachment_acquisition.storage_blocked_headroom` and `storage_park_count`,
   a partial index for parked rows, and keeps ciphertext checkpoints for jobs
@@ -13,6 +14,7 @@
 
 ### Added
 
+- Bounded account-wide attachment pages with group/sender selections, inclusive date bounds and account/query-bound continuation cursors.
 - `SqliteAccountStorage::block_attachment_storage` parks a live attempt whose
   publication disk reserve the device cannot cover. It records the free space
   the next attempt needs beyond the reserve, refreshes the checkpoint's idle

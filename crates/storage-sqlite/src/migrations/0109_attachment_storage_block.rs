@@ -1,6 +1,6 @@
-//! Migration 0108: durable "not enough free disk to publish" outcome for
-//! attachment acquisition. It follows master's 0107 moderation-report outbox,
-//! which touches no attachment table or trigger.
+//! Migration 0109: durable "not enough free disk to publish" outcome for
+//! attachment acquisition. It follows 0108's account attachment history,
+//! which touches no acquisition table or trigger.
 use cgka_traits::storage::StorageResult;
 use rusqlite::Transaction;
 
@@ -55,11 +55,11 @@ mod tests {
     #[test]
     fn storage_block_migration_preserves_jobs_and_is_transactional() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        // Everything before this migration, through master's 0107 outbox.
-        run(&mut conn, &MIGRATIONS[..107]).unwrap();
-        assert_eq!(MIGRATIONS[106].version, 107);
+        // Everything before this migration, through 0108's attachment history.
+        run(&mut conn, &MIGRATIONS[..108]).unwrap();
         assert_eq!(MIGRATIONS[107].version, 108);
-        assert_eq!(MIGRATIONS[107].name, "0108_attachment_storage_block");
+        assert_eq!(MIGRATIONS[108].version, 109);
+        assert_eq!(MIGRATIONS[108].name, "0109_attachment_storage_block");
         let trigger = |conn: &rusqlite::Connection| -> String {
             conn.query_row(
                 "SELECT sql FROM sqlite_master WHERE name='attachment_partial_terminal'",
