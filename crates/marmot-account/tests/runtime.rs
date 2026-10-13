@@ -390,7 +390,7 @@ struct RecordingAdapterInner {
     accept_policy: Mutex<Option<Vec<TransportEndpoint>>>,
     error_endpoints: Mutex<Vec<TransportEndpoint>>,
     error_kind: Mutex<Option<TransportEndpointFailureKind>>,
-    error_reason: Mutex<Option<String>>,
+    error_reasons: Mutex<Vec<(TransportEndpoint, String)>>,
     publish_errors: Mutex<VecDeque<bool>>,
     reported_message_ids: Mutex<VecDeque<MessageId>>,
     welcome_gate: Mutex<Option<Arc<WelcomePublishGate>>>,
@@ -453,18 +453,27 @@ impl RecordingAdapter {
     ) {
         *self.inner.error_endpoints.lock().unwrap() = endpoints;
         *self.inner.error_kind.lock().unwrap() = Some(kind);
-        *self.inner.error_reason.lock().unwrap() = None;
+        self.inner.error_reasons.lock().unwrap().clear();
     }
 
-    /// Like [`Self::fail_endpoints_as`], with a fixed adapter reason phrase.
-    fn fail_endpoints_with_reason(
+    /// Like [`Self::fail_endpoints_as`], with a fixed adapter reason phrase
+    /// per endpoint.
+    fn fail_endpoints_with_reasons(
         &self,
-        endpoints: Vec<TransportEndpoint>,
         kind: TransportEndpointFailureKind,
-        reason: &str,
+        reasons: Vec<(TransportEndpoint, &str)>,
     ) {
-        self.fail_endpoints_as(endpoints, kind);
-        *self.inner.error_reason.lock().unwrap() = Some(reason.to_owned());
+        self.fail_endpoints_as(
+            reasons
+                .iter()
+                .map(|(endpoint, _)| endpoint.clone())
+                .collect(),
+            kind,
+        );
+        *self.inner.error_reasons.lock().unwrap() = reasons
+            .into_iter()
+            .map(|(endpoint, reason)| (endpoint, reason.to_owned()))
+            .collect();
     }
 
     fn report_message_id_next(&self, message_id: MessageId) {
@@ -559,21 +568,21 @@ impl TransportAdapter for RecordingAdapter {
                     .all(|endpoint| error_endpoints.contains(endpoint))
             {
                 if let Some(kind) = *self.inner.error_kind.lock().unwrap() {
-                    let reason = self
-                        .inner
-                        .error_reason
-                        .lock()
-                        .unwrap()
-                        .clone()
-                        .unwrap_or_else(|| "injected typed endpoint failure".into());
+                    let reasons = self.inner.error_reasons.lock().unwrap().clone();
                     let failures = request
                         .target
                         .endpoints()
                         .iter()
                         .cloned()
                         .map(|endpoint| TransportEndpointFailure {
+                            reason: reasons
+                                .iter()
+                                .find(|(reasoned, _)| reasoned == &endpoint)
+                                .map_or_else(
+                                    || "injected typed endpoint failure".into(),
+                                    |(_, reason)| reason.clone(),
+                                ),
                             endpoint,
-                            reason: reason.clone(),
                             kind,
                             rejection_category: None,
                         })
@@ -3209,10 +3218,12 @@ async fn adapter_publish_failure_records_per_relay_causes() {
     let timed_out = TransportEndpoint("wss://group-timed-out.example".into());
     let refused = TransportEndpoint("wss://group-refused.example".into());
     let adapter = RecordingAdapter::default();
-    adapter.fail_endpoints_with_reason(
-        vec![timed_out.clone(), refused.clone()],
+    adapter.fail_endpoints_with_reasons(
         TransportEndpointFailureKind::RetryableUnavailable,
-        "connect relay failed",
+        vec![
+            (timed_out.clone(), "connect relay timed out"),
+            (refused.clone(), "connect relay failed"),
+        ],
     );
     let routing =
         StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())])
@@ -3257,9 +3268,9 @@ async fn adapter_publish_failure_records_per_relay_causes() {
             cgka_traits::TransportFanoutAttemptState::AttemptedFailed
         );
         assert_eq!(target.attempt_count, 1);
-        assert_eq!(
+        assert_ne!(
             target.failure_code.as_deref(),
-            Some("transport_rejected"),
+            Some("adapter_error"),
             "each relay's reported failure must reach its fanout target"
         );
     }
@@ -3290,12 +3301,18 @@ async fn adapter_publish_failure_records_per_relay_causes() {
     assert_eq!(outcome["event"]["met_required_acks"], false);
     let failed_relays = outcome["event"]["failed_relays"].as_array().unwrap();
     assert_eq!(failed_relays.len(), 2);
-    assert!(
-        failed_relays
+    for (endpoint, reason) in [
+        (&timed_out, "connect_relay_timed_out"),
+        (&refused, "connect_relay_failed"),
+    ] {
+        let endpoint_ref =
+            marmot_forensics::v5::EndpointRef::from_normalized_url(&endpoint.0).unwrap();
+        let relay = failed_relays
             .iter()
-            .all(|relay| relay["reason"] == "connect_relay_failed"),
-        "{failed_relays:?}"
-    );
+            .find(|relay| relay["endpoint_ref"] == endpoint_ref.as_str())
+            .unwrap_or_else(|| panic!("missing relay row: {failed_relays:?}"));
+        assert_eq!(relay["reason"], reason, "{failed_relays:?}");
+    }
 }
 
 #[tokio::test]
