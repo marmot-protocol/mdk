@@ -868,9 +868,9 @@ pub struct AppClient {
     pub(crate) pending_epoch_stall_escalations: Vec<crate::EpochStallEscalation>,
     pub(crate) pending_convergence_groups: HashSet<GroupId>,
     /// Groups whose epoch-gap hold the user explicitly accepted, with the
-    /// local epoch they accepted it at (mdk#2258). An acknowledgement covers
-    /// that epoch only, so it lapses once the group moves. Process-local: a
-    /// rebuilt client asks again.
+    /// local epoch they accepted it at (mdk#2258). An acknowledgement admits
+    /// one group change attempt at that epoch only. Process-local: a rebuilt
+    /// client asks again.
     pub(crate) stale_commit_acknowledgements: HashMap<GroupId, cgka_traits::EpochId>,
     /// Batch-start local-deletion frontiers crossed by authenticated fresh
     /// activity. They remain pending until the crossing projection and marker
@@ -5967,12 +5967,15 @@ impl AppClient {
     /// lift the gate.
     ///
     /// Application messages and leave are not gated: neither commits.
-    fn ensure_group_caught_up(&self, group_id: &GroupId) -> Result<(), AppError> {
+    fn ensure_group_caught_up(&mut self, group_id: &GroupId) -> Result<(), AppError> {
         let epoch = self.runtime.group_record(group_id)?.epoch;
+        // An acknowledgement admits exactly one attempt: consumed here even if
+        // the change then fails, so a different change asks again.
+        let acknowledged = self.stale_commit_acknowledgements.remove(group_id) == Some(epoch);
         if self.epoch_gap_open_since(group_id, epoch)?.is_none() {
             return Ok(());
         }
-        if self.stale_commit_acknowledgements.get(group_id) == Some(&epoch) {
+        if acknowledged {
             tracing::info!(
                 target: "marmot_app::client",
                 method = "ensure_group_caught_up",
@@ -5990,7 +5993,8 @@ impl AppClient {
 
     /// Record that the user accepts the fork risk of changing a group that is
     /// still catching up, after [`AppError::GroupCatchingUp`]. The next group
-    /// change at the current local epoch proceeds. Returns `false`, recording
+    /// change attempt at the current local epoch proceeds; the attempt
+    /// consumes the acknowledgement whether or not it commits. Returns `false`, recording
     /// nothing, when the group is not catching up.
     pub fn acknowledge_group_catching_up(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
         self.ensure_group(group_id)?;

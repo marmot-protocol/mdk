@@ -880,7 +880,8 @@ The check is advisory, because the evidence behind it cannot be authenticated. A
 user, for example: "This chat may be out of date on this device. Changing the group now
 could split it for everyone. Wait for it to sync, or continue anyway?" To continue, call
 `acknowledge_group_catching_up(account_ref, group_id_hex)` and retry the change. The
-acknowledgement covers the device's current epoch only and is not persisted. Use the
+acknowledgement admits one change attempt at the device's current epoch, is consumed even
+if that attempt fails, and is not persisted. Use the
 strongest wording for invites: a member invited onto a branch that later loses is left
 with a Welcome that no longer works. Without an acknowledgement, the check lifts once
 recovery catches the group up or the device moves past that epoch. Dismissing the group's

@@ -23177,6 +23177,28 @@ async fn group_changes_refuse_while_epoch_gap_recovery_holds_the_group() {
     assert_eq!(client.runtime.group_record(&group_id).unwrap().epoch, epoch);
     assert_eq!(relay.published_event_ids().len(), publishes);
 
+    // An acknowledgement admits one attempt: a change that fails after the
+    // gate does not leave a different change authorized.
+    assert!(client.acknowledge_group_catching_up(&group_id).unwrap());
+    assert!(matches!(
+        client
+            .update_group_avatar_url(
+                &group_id,
+                Some("http://insecure.example/a.png".into()),
+                None,
+                None
+            )
+            .await,
+        Err(AppError::InvalidGroupAvatarUrl(_))
+    ));
+    assert_group_catching_up(
+        client
+            .update_group_profile(&group_id, Some("renamed"), None)
+            .await,
+        &group_hex,
+        "update_group_profile after a failed acknowledged attempt",
+    );
+
     // The gate is advisory: the user can accept the fork risk for this epoch.
     assert!(client.acknowledge_group_catching_up(&group_id).unwrap());
     client

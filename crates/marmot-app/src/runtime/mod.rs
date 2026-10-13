@@ -2422,9 +2422,10 @@ impl MarmotAppRuntime {
     /// catching up, after a group change failed with
     /// [`AppError::GroupCatchingUp`] (mdk#2258). The device may be behind its
     /// group, so the change can split the group for everyone. Retry the change
-    /// afterwards. The acknowledgement covers the device's current epoch only
-    /// and is not persisted. Returns false, recording nothing, when the group
-    /// is not catching up.
+    /// afterwards. The acknowledgement admits one group change attempt at the
+    /// device's current epoch, consumed even if that attempt fails, and is not
+    /// persisted. Returns false, recording nothing, when the group is not
+    /// catching up.
     pub async fn acknowledge_group_catching_up(
         &self,
         account_ref: &str,

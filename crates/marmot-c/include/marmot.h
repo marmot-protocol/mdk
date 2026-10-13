@@ -6776,8 +6776,8 @@ MarmotStatus marmot_group_app_component(const struct MarmotClient *client,
 /**
  * After a group change returns `MARMOT_STATUS_GROUP_CATCHING_UP`, record
  * that the user accepts the risk of splitting the group, then retry the
- * change. Covers the current epoch only; not persisted. Writes false when
- * the group is not catching up.
+ * change. Admits one attempt at the current epoch, consumed even if it
+ * fails; not persisted. Writes false when the group is not catching up.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid

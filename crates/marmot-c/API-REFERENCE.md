@@ -2112,7 +2112,7 @@ Current caller permissions plus per-member action availability. Free with `marmo
 MarmotStatus marmot_acknowledge_group_catching_up(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, bool *out);
 ```
 
-After a group change returns `MARMOT_STATUS_GROUP_CATCHING_UP` and the user chooses to continue, record that they accept the change may split the group, then retry the change. Covers the device's current epoch only and is not persisted. Writes false, recording nothing, when the group is not catching up. No network I/O.
+After a group change returns `MARMOT_STATUS_GROUP_CATCHING_UP` and the user chooses to continue, record that they accept the change may split the group, then retry the change. Admits one change attempt at the device's current epoch, consumed even if it fails, and is not persisted. Writes false, recording nothing, when the group is not catching up. No network I/O.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotacknowledge_group_catching_up) · [Header contract](include/marmot.h#L6788)
 

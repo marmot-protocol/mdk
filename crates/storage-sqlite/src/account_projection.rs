@@ -561,6 +561,11 @@ impl SqliteAccountStorage {
     /// up, and retiring a "history may be incomplete" notice changes no MLS
     /// state. Only recovery that clears the gap, or a local epoch above the
     /// stalled one, closes it.
+    ///
+    /// The time is when the group's obligation row was first armed. Re-arming
+    /// it at a higher stalled epoch does not restart it, and nor does any
+    /// later revision (several of which, such as capacity deferral, flooding
+    /// can drive). A bound measured from it can end early, never be extended.
     pub fn epoch_gap_recovery_open_since(
         &self,
         group_id: &[u8],
