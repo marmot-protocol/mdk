@@ -64,6 +64,9 @@
   in-memory publication stores a body larger than one 64 KiB staging chunk as
   chunk rows, so SQLite keeps no bind, record or trigger-rewrite copy of it.
   Integrity checks, resume and retention behavior are unchanged (#2241).
+- Self-update maintenance commits now publish through the same durable frozen fanout as every other commit. They still confirm on the first relay acknowledgement, and the app's fanout retry schedule keeps retrying every group relay that missed them. Self-updates staged before upgrading finish on their legacy record, which no longer stops retrying when its post-confirmation marker write fails.
+- Every publish pass, including secondary retries after a commit confirmed, writes `publish_attempt` and `publish_outcome` audit rows with the endpoints attempted, accepted and failed in that pass.
+- A relay still pending when a multi-relay signed publish meets quorum is now reported as `publish acknowledgement unknown` instead of being dropped from the outcome.
 
 ## 0.13.0 - 2026-10-12
 

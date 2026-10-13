@@ -3416,8 +3416,8 @@ impl MarmotRelayPlaneAccountAdapter {
                         // longer proves non-exposure: retain the same unknown
                         // evidence as deadline cancellation for exact-event retry.
                         publishes.clear();
-                        pending.clear();
                         retries.clear();
+                        outcome.failed.extend(pending.drain().map(unknown));
                         outcome.failed.extend(retrying.drain().map(unknown));
                     }
                 }

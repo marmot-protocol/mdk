@@ -541,30 +541,35 @@ Emitted after `do_create_group()` returns `Err(err)`.
 
 ### `publish_attempt`
 
-Emitted by the account runtime before calling the transport adapter for one outbound transport message.
+Emitted by the account runtime before each publish pass for one outbound transport message: the first pass and
+every later retry of the same exact event, including retries to endpoints that missed a commit after its first
+acknowledgement confirmed it.
 
 | Field | Meaning |
 | --- | --- |
 | `msg_id` | Hex id of the outbound transport message. |
-| `target_kind` | `group` or `inbox`. |
-| `relay_urls` | Full endpoint strings selected by routing. For Nostr these are relay URLs. |
+| `target_kind` | `group`, `inbox`, or `frozen_group_fanout` for durable frozen fanouts (commits, including self-updates, and application messages). |
+| `relay_urls` | Endpoint strings attempted in this pass. For Nostr these are relay URLs. |
 | `required_acks` | Adapter quorum target for this publish attempt. |
 
 Metadata notes:
 
 - Group publishes have `group_ref`; inbox publishes do not.
-- The event context includes `operation_id = "publish-<msg_id>"`.
+- `group` and `inbox` publishes carry `operation_id = "publish-<msg_id>"`. `frozen_group_fanout` publishes carry the
+  caller's operation context; application messages use their application send operation.
 
 ### `publish_outcome`
 
-Emitted after the transport adapter returns endpoint-level results.
+Emitted after the transport adapter returns endpoint-level results for one publish pass. A legacy publish whose
+adapter error carries per-endpoint failures also emits this row, with empty `accepted_relay_urls`, before its
+`adapter`-stage `publish_failure`.
 
 | Field | Meaning |
 | --- | --- |
 | `msg_id` | Hex id of the published transport message. |
-| `target_kind` | `group` or `inbox`. |
-| `accepted_relay_urls` | Endpoints that accepted the message. |
-| `failed_relays` | Endpoint failure objects with `relay_url` and `reason`. |
+| `target_kind` | `group`, `inbox`, or `frozen_group_fanout`. |
+| `accepted_relay_urls` | Endpoints that accepted the message in this pass. |
+| `failed_relays` | Endpoint failure objects with `relay_url` and `reason` for this pass. An endpoint whose result is unknown, such as one cancelled once quorum was met, reports `publish acknowledgement unknown` and stays owed for retry. |
 | `required_acks` | Adapter quorum target. |
 | `met_required_acks` | Whether accepted endpoint count satisfied `required_acks`. |
 
@@ -578,7 +583,10 @@ Emitted when publish cannot complete or does not satisfy the required acknowledg
 | `stage` | `routing`, `adapter`, or `required_acks`. |
 | `target_kind` | `unknown`, `group`, or `inbox`. |
 | `relay_urls` | Routed endpoint strings when known. |
-| `reason` | Human-readable failure reason. |
+| `reason` | Failure category. `adapter`-stage rows use `TransportAdapterError::privacy_safe_kind`, never its `Display`. |
+
+Nostr per-relay `reason` phrases separate `connect relay timed out` (the 5 s connect budget elapsed) from
+`connect relay failed` (an immediate dial error such as refused, DNS, TLS, or proxy).
 
 ### `epoch_confirmed`
 
