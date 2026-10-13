@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- `SqliteAccountStorage::epoch_gap_recovery_open_at` reports whether an unresolved epoch-gap obligation (pending, parked or retired by the user) covers a group's local epoch.
+- `SqliteAccountStorage::epoch_gap_recovery_open_since` reports when an unresolved epoch-gap obligation (pending, parked or retired by the user) covering a group's local epoch was first armed.
 
 ## 0.13.0 - 2026-10-12
 

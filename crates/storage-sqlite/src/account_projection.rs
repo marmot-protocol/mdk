@@ -554,25 +554,28 @@ impl SqliteAccountStorage {
             .collect()
     }
 
-    /// Whether unresolved epoch-gap recovery says this group moved past
-    /// `local_epoch` without this device (mdk#2258). Pending, parked and
+    /// When unresolved epoch-gap recovery first said this group moved past
+    /// `local_epoch` without this device (mdk#2258), in wall-clock
+    /// milliseconds, or `None` when no such gap is open. Pending, parked and
     /// user-retired obligations all count: none of them has caught the device
     /// up, and retiring a "history may be incomplete" notice changes no MLS
     /// state. Only recovery that clears the gap, or a local epoch above the
-    /// stalled one, ends the hold.
-    pub fn epoch_gap_recovery_open_at(
+    /// stalled one, closes it.
+    pub fn epoch_gap_recovery_open_since(
         &self,
         group_id: &[u8],
         local_epoch: u64,
-    ) -> StorageResult<bool> {
-        self.lock()?
+    ) -> StorageResult<Option<u64>> {
+        let since: Option<i64> = self
+            .lock()?
             .query_row_cached(
-                "SELECT EXISTS(SELECT 1 FROM account_recovery_obligations
-                 WHERE cause = 1 AND state IN (0, 2) AND group_id = ?1 AND stalled_epoch >= ?2)",
+                "SELECT MIN(created_at_ms) FROM account_recovery_obligations
+                 WHERE cause = 1 AND state IN (0, 2) AND group_id = ?1 AND stalled_epoch >= ?2",
                 params![group_id, u64_to_i64(local_epoch)?],
                 |row| row.get(0),
             )
-            .storage()
+            .storage()?;
+        since.map(i64_to_u64).transpose()
     }
 
     /// Consume only the exact epochs one completed replay served. A newer arm

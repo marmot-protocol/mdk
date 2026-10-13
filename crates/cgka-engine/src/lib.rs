@@ -79,7 +79,7 @@ pub mod wire_format;
 pub use convergence_clock::{
     ConvergenceClock, ConvergenceTime, ManualConvergenceClock, SystemConvergenceClock,
 };
-pub use engine::{Ciphersuite, CommitHold, DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
+pub use engine::{Ciphersuite, DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
 pub use engine_metrics::{
     EngineMetrics, EngineMetricsSnapshot, HistogramBucket, HistogramSnapshot,
 };

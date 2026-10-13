@@ -869,15 +869,22 @@ full-history repair remains available and can still complete parked history that
 comparison of the retained window certifies. Notices carry no relay, message or key identities; keep them out of
 analytics. C callers: see the [C guide](../marmot-c/README.md#history-may-be-incomplete-notices).
 
-While unresolved epoch-gap recovery covers a group's current local epoch, the group has
-moved past this device. Group changes (invite, remove, admin changes, profile, image,
-retention, disbanding and app components) fail with `MarmotKitError::GroupCatchingUp`
-instead of committing from the stale epoch, which would fork the group. Scheduled
-self-updates, queued group changes and automatic removals of departing members wait too.
-Messages and leaving still work; a message already queued behind a group change waits with
-it. Show it as "This chat is still catching up; try again once it has synced". The hold
-lifts once recovery catches the group up or the device moves past that epoch. Dismissing
-the group's history notice does not lift it: the device is still behind.
+While unresolved epoch-gap recovery covers a group's current local epoch, the group may
+have moved past this device. Group changes (invite, remove, admin changes, profile, image,
+retention, disbanding and app components) then fail with `MarmotKitError::GroupCatchingUp`:
+a change committed from a stale epoch can split the group for everyone. Messages and
+leaving are not affected.
+
+The check is advisory, because the evidence behind it cannot be authenticated. Ask the
+user, for example: "This chat may be out of date on this device. Changing the group now
+could split it for everyone. Wait for it to sync, or continue anyway?" To continue, call
+`acknowledge_group_catching_up(account_ref, group_id_hex)` and retry the change. The
+acknowledgement covers the device's current epoch only and is not persisted. Use the
+strongest wording for invites: a member invited onto a branch that later loses is left
+with a Welcome that no longer works. Without an acknowledgement, the check lifts once
+recovery catches the group up or the device moves past that epoch. Dismissing the group's
+history notice does not lift it. Scheduled self-updates wait up to a day for the group to
+catch up, then proceed.
 
 ## File-backed media upload
 

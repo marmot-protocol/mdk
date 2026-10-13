@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- `MarmotKitError` adds `GroupCatchingUp`: a group change was refused because the group has moved past this device and recovery has not caught it up yet (mdk#2258). It is retryable. Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
+- `MarmotKitError` adds `GroupCatchingUp`: a group change was refused because the group may have moved past this device and recovery has not caught it up yet (mdk#2258). Retry after it syncs, or call the new `acknowledge_group_catching_up` once the user accepts that the change may split the group, then retry. Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling. See [the epoch-gap notes](README.md#history-may-be-incomplete-notices).
 - `Marmot::send_prepared_media_with_client_token` exposes captured ordinary-media admission with transactional conditional draft consumption. Use the original token and revision for live retries, recover ownership by token after interruption, and pair regenerated Swift/Kotlin bindings with the matching library. See [local sends](LOCAL-SENDS.md).
 
 ## 0.13.0 - 2026-10-12

@@ -23056,7 +23056,8 @@ fn assert_group_catching_up<T: std::fmt::Debug>(
 
 /// mdk#2258: a device with unresolved epoch-gap recovery knows the group moved
 /// past its local epoch. Any commit it authors from there forks the group, so
-/// every group change and the maintenance self-update wait until it catches up.
+/// every group change is refused and the maintenance self-update waits, unless
+/// the user accepts the fork risk for that epoch.
 #[tokio::test]
 async fn group_changes_refuse_while_epoch_gap_recovery_holds_the_group() {
     let dir = tempfile::tempdir().unwrap();
@@ -23176,93 +23177,40 @@ async fn group_changes_refuse_while_epoch_gap_recovery_holds_the_group() {
     assert_eq!(client.runtime.group_record(&group_id).unwrap().epoch, epoch);
     assert_eq!(relay.published_event_ids().len(), publishes);
 
-    // Recovery that ends the gap lifts the hold.
-    storage
-        .clear_epoch_backfill_intents(std::slice::from_ref(&intent))
-        .unwrap();
+    // The gate is advisory: the user can accept the fork risk for this epoch.
+    assert!(client.acknowledge_group_catching_up(&group_id).unwrap());
     client
         .update_group_profile(&group_id, Some("renamed"), None)
         .await
         .unwrap();
-    assert!(client.runtime.group_record(&group_id).unwrap().epoch.0 > epoch.0);
-}
+    let moved = client.runtime.group_record(&group_id).unwrap().epoch;
+    assert!(moved.0 > epoch.0);
 
-/// mdk#2258: a due peer leave in a held group cannot stage its removal, but
-/// the group keeps a timed wake instead of going idle. Recovery can clear
-/// the gap without any inbound traffic to wake the group.
-#[tokio::test]
-async fn held_peer_leave_keeps_a_timed_wake_and_commits_after_release() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = AccountHome::open(dir.path());
-    let alice_account = home.create_account("alice").unwrap();
-    home.create_account("carol").unwrap();
-    let bob = home.create_account("bob").unwrap();
-    let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-        .with_test_relay_client(relay.clone());
-    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
-    remember_test_member_inbox(&app, &alice_account.account_id_hex, "wss://relay.example");
-    let plane = MarmotRelayPlane::new(None, relay.clone());
-    let mut alice = app
-        .client_with_relay_plane("alice", &plane, None)
-        .await
-        .unwrap();
-    let mut bob_client = app
-        .client_with_relay_plane("bob", &plane, None)
-        .await
-        .unwrap();
-    let mut carol = app
-        .client_with_relay_plane("carol", &plane, None)
-        .await
-        .unwrap();
-    alice.sync().await.unwrap();
-    bob_client.sync().await.unwrap();
-    let group_id = carol
-        .create_group(
-            "held leave",
-            &[&alice_account.account_id_hex, &bob.account_id_hex],
-        )
-        .await
-        .unwrap();
-    bob_client.sync().await.unwrap();
-    alice.sync().await.unwrap();
-    bob_client.leave_group(&group_id).await.unwrap();
-    alice.sync().await.unwrap();
-    let delay = alice
-        .runtime
-        .scheduled_self_remove_auto_commit_delay_ms(&group_id)
-        .unwrap()
-        .expect("the processed peer leave arms the removal timer");
-
-    let epoch = alice.runtime.group_record(&group_id).unwrap().epoch;
-    let storage = app.account_storage("alice").unwrap();
-    let intent = storage_sqlite::StoredEpochBackfillIntent {
-        group_id_hex: hex::encode(group_id.as_slice()),
-        stalled_epoch: epoch.0,
+    // The acknowledgement covered that epoch only; a gap at the next asks again.
+    let next = storage_sqlite::StoredEpochBackfillIntent {
+        group_id_hex: group_hex.clone(),
+        stalled_epoch: moved.0,
     };
     storage
-        .arm_epoch_backfill_intents(std::slice::from_ref(&intent))
+        .arm_epoch_backfill_intents(std::slice::from_ref(&next))
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(delay + 1)).await;
-    assert!(
-        matches!(
-            alice.convergence_schedule_state(&group_id).unwrap(),
-            ConvergenceScheduleState::Collecting { remaining_ms } if remaining_ms >= 60_000
-        ),
-        "a held removal keeps a hold-paced wake instead of going idle"
+    assert_group_catching_up(
+        client
+            .update_group_profile(&group_id, Some("again"), None)
+            .await,
+        &group_hex,
+        "update_group_profile after the acknowledged epoch",
     );
-    alice.retry_group_convergence(&group_id).await.unwrap();
-    assert_eq!(alice.runtime.group_record(&group_id).unwrap().epoch, epoch);
 
+    // Recovery that ends the gap lifts the gate without any acknowledgement.
     storage
-        .clear_epoch_backfill_intents(std::slice::from_ref(&intent))
+        .clear_epoch_backfill_intents(&[intent, next])
         .unwrap();
-    assert!(matches!(
-        alice.convergence_schedule_state(&group_id).unwrap(),
-        ConvergenceScheduleState::Ready
-    ));
-    alice.retry_group_convergence(&group_id).await.unwrap();
-    assert!(alice.runtime.group_record(&group_id).unwrap().epoch.0 > epoch.0);
+    assert!(!client.acknowledge_group_catching_up(&group_id).unwrap());
+    client
+        .update_group_profile(&group_id, Some("caught up"), None)
+        .await
+        .unwrap();
 }
 
 /// mdk#2258: gap evidence armed at an epoch the device has since left does not

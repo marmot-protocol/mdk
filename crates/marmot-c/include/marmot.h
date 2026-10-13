@@ -6667,6 +6667,23 @@ MarmotStatus marmot_group_app_component(const struct MarmotClient *client,
                                         struct MarmotGroupAppComponent **out);
 
 /**
+ * After a group change returns `MARMOT_STATUS_GROUP_CATCHING_UP`, record
+ * that the user accepts the risk of splitting the group, then retry the
+ * change. Covers the current epoch only; not persisted. Writes false when
+ * the group is not catching up.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_acknowledge_group_catching_up(const struct MarmotClient *client,
+                                                  const char *account_ref,
+                                                  const char *group_id_hex,
+                                                  bool *out);
+
+/**
  * Query advisory membership health and pending rejoin offers.
  * Free with `marmot_group_recovery_status_free`.
  *

@@ -244,8 +244,6 @@ pub struct Engine<S: StorageProvider> {
     /// at every state-relevant decision point so a later analyzer can
     /// reconstruct what each device saw and decided.
     pub(crate) recorder: Box<dyn ForensicRecorder>,
-    /// Host-supplied commit hold; see [`Engine::set_commit_hold`].
-    pub(crate) commit_hold: Option<CommitHold>,
     pub(crate) audit_operation_counter: u64,
     /// Audit context for the in-flight local operation. The
     /// `*_with_audit_context` entry points set this around their `do_*` call so
@@ -650,7 +648,6 @@ impl<S: StorageProvider> EngineBuilder<S> {
             convergence_clock_instance_id: rand::rngs::OsRng.next_u64(),
             engine_metrics: crate::engine_metrics::EngineMetrics::default(),
             recorder: self.recorder.unwrap_or_else(|| Box::new(NoopRecorder)),
-            commit_hold: None,
             audit_operation_counter: 0,
             current_audit_context: None,
             quarantined_groups: HashMap::new(),
@@ -676,39 +673,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
     }
 }
 
-/// Whether new commits for a group at its current local epoch must wait.
-/// Returns `true` to hold; see [`Engine::set_commit_hold`].
-pub type CommitHold = Arc<dyn Fn(&GroupId, EpochId) -> bool + Send + Sync>;
-
 impl<S: StorageProvider> Engine<S> {
-    /// Hold automatic commit authoring for groups the host knows have moved
-    /// past this device's local epoch (mdk#2258). A commit authored from that
-    /// epoch forks the group.
-    ///
-    /// While the hold answers `true`, a convergence drain still settles inbound
-    /// input but prepares no pending disband, queued commit intent or
-    /// SelfRemove auto-commit, and a foreground send stages no SelfRemove
-    /// auto-commit. The drain stops at the first queued commit intent:
-    /// application messages and leave proposals ahead of it still drain, and
-    /// anything behind it keeps its order and waits. A due SelfRemove keeps
-    /// its schedule, so the host must not wake straight into a held drain.
-    /// Held work stays durable and runs on a later drain once the hold
-    /// releases. Republishing an already-staged commit is not held. Foreground
-    /// commit intents are the host's to refuse before they reach the engine.
-    pub fn set_commit_hold(&mut self, hold: Option<CommitHold>) {
-        self.commit_hold = hold;
-    }
-
-    /// Whether [`Self::set_commit_hold`] holds new commits for this group now.
-    pub(crate) fn commits_held(&self, group_id: &GroupId) -> bool {
-        let Some(hold) = &self.commit_hold else {
-            return false;
-        };
-        self.epoch_manager
-            .epoch(group_id)
-            .is_some_and(|epoch| hold(group_id, epoch))
-    }
-
     /// Change the explicit replay-probe ceiling for a running exhaustion
     /// campaign. Production builds do not expose this method.
     #[cfg(feature = "test-policy-overrides")]

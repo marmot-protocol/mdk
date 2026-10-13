@@ -160,11 +160,12 @@ pub enum AppError {
     /// "disbanding" for it tells the user something false.
     #[error("this device was removed from the group; outbound work is blocked")]
     GroupRemoved(String),
-    /// The group moved past this device's local epoch and recovery has not
-    /// caught it up yet. A commit authored now would fork the group
-    /// (mdk#2258), so group changes wait. Retryable once recovery clears the
-    /// gap or the local epoch moves past it; dismissing the group's history
-    /// notice does not release it.
+    /// The group may have moved past this device's local epoch and recovery has
+    /// not caught it up yet. A commit authored now could fork the group
+    /// (mdk#2258). Retryable once recovery clears the gap or the local epoch
+    /// moves past it. Or, after the user accepts that risk,
+    /// `acknowledge_group_catching_up` and retry. Dismissing the group's
+    /// history notice does not release it.
     #[error("group is still catching up on missed changes; try again once it has synced")]
     GroupCatchingUp(String),
     /// Host-supplied draft attachment metadata failed validation before storage.

@@ -387,8 +387,9 @@ on `MARMOT_EVENT_HISTORY_NOTICES_CHANGED`; a group's own occurrences also set
 [shared contract](../marmot-uniffi/README.md#history-may-be-incomplete-notices) for when notices appear,
 disappear and return.
 Group changes for a group whose unresolved epoch-gap recovery covers its current local epoch
-return `MARMOT_STATUS_GROUP_CATCHING_UP`; retry after it syncs. Dismissing the notice does not
-lift the hold.
+return `MARMOT_STATUS_GROUP_CATCHING_UP`. Retry after it syncs, or, once the user accepts that
+the change may split the group, call `marmot_acknowledge_group_catching_up` and retry. See the
+[shared contract](../marmot-uniffi/README.md#history-may-be-incomplete-notices).
 
 ## Group reporting
 

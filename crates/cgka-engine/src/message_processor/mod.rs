@@ -1077,12 +1077,7 @@ impl<S: StorageProvider> Engine<S> {
         if !settled {
             return Ok(Vec::new());
         }
-        // Inbound input settled above. A held group authors no new commit: its
-        // pending disband, queued commit intents (and anything queued behind
-        // them) and SelfRemove wait for the release. Queued application
-        // messages and leave proposals ahead of them still drain.
-        let held = self.commits_held(group_id);
-        if !held && let Some(result) = self.prepare_pending_disband(group_id).await? {
+        if let Some(result) = self.prepare_pending_disband(group_id).await? {
             return Ok(vec![result]);
         }
 
@@ -1102,14 +1097,6 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(Vec::new());
         }
         for record in queued {
-            if held
-                && !matches!(
-                    record.intent,
-                    SendIntent::Leave { .. } | SendIntent::AppMessage { .. }
-                )
-            {
-                break;
-            }
             // A regenerated intent the host has not yet confirmed or retired
             // is still the host's obligation: re-preparing it would publish
             // the same logical message twice (mdk#1472).
