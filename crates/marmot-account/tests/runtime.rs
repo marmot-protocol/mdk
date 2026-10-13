@@ -3441,11 +3441,8 @@ async fn adapter_publish_failure_records_per_relay_causes() {
         .unwrap();
     let group_id = created.group_id;
     let welcome = match &created.effects.publish[0] {
-        PublishWork::GroupCreated { welcomes, pending } => {
-            initial.confirm_published(*pending).await.unwrap();
-            welcomes[0].clone()
-        }
-        other => panic!("expected GroupCreated publish work, got {other:?}"),
+        PublishWork::FoundingGroupCreated { welcomes } => welcomes[0].clone(),
+        other => panic!("expected FoundingGroupCreated publish work, got {other:?}"),
     };
     drop(initial);
 
