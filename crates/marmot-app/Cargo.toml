@@ -80,6 +80,8 @@ rcgen.workspace = true
 rustls.workspace = true
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 criterion.workspace = true
+storage-sqlite = { workspace = true, features = ["test-support"] }
+tokio-tungstenite.workspace = true
 keyring-core.workspace = true
 marmot-forensics.workspace = true
 nostr-relay-builder.workspace = true

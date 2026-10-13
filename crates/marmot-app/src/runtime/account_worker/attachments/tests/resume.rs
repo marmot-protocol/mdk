@@ -575,9 +575,9 @@ async fn check_disk_reserve(length: ResponseLength) {
     assert!(
         matches!(
             result.await,
-            Err(AttachmentDownloadFailure::Retry(AppError::BlobStore(_)))
+            Err(AttachmentDownloadFailure::StorageBlocked { .. })
         ),
-        "disk pressure must defer before private staging consumes the reserve"
+        "disk pressure must park the job before private staging consumes the reserve"
     );
     assert!(
         store
@@ -2195,15 +2195,27 @@ async fn attachment_revocation_waits_for_in_progress_verified_receipt() {
     assert_eq!(task.await.unwrap().unwrap().plaintext, b"verified");
 }
 
+/// Disk pressure on an opted-in body is not a timer retry (mdk#2239): the job
+/// parks as storage-blocked without a receipt, and readmits once the reserve fits.
 #[tokio::test]
-async fn attachment_transient_disk_pressure_defers_before_receipt() {
+async fn attachment_disk_pressure_parks_before_receipt_and_readmits_when_space_frees() {
     let body = b"disk pressure can recover";
     let (listener, reference, cipher) = listener_fixture(body).await;
     let server = tokio::spawn(async move {
         for _ in 0..2 {
             let (mut socket, _) = listener.accept().await.unwrap();
             headers(&mut socket).await;
-            respond(&mut socket, "200 OK", "", &cipher, cipher.len()).await;
+            // The parked client may close before reading this small body.
+            let _ = socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        cipher.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+            let _ = socket.write_all(&cipher).await;
         }
     });
     let dir = tempfile::tempdir().unwrap();
@@ -2217,14 +2229,19 @@ async fn attachment_transient_disk_pressure_defers_before_receipt() {
     opt_in(&client).await;
     let job = claim(&store);
     let mut context = resume_context(&store, &job, dir.path(), &reference);
-    context.policy.disk_reserve = i64::MAX as u64 / 2;
+    let unavailable_reserve = i64::MAX as u64 / 2;
+    context.policy.disk_reserve = unavailable_reserve;
     let group = GroupId::new(vec![0xab; 16]);
     let prepared = client
         .prepare_background_attachment_download(&group, reference.clone(), 64 * 1024 * 1024)
         .unwrap()
         .unwrap();
     let result = prepared.run_classified(context).await;
-    assert!(matches!(&result, Err(AttachmentDownloadFailure::Retry(_))));
+    // No validator, so the park target is the publication reserve alone.
+    assert!(matches!(
+        &result,
+        Err(AttachmentDownloadFailure::StorageBlocked { headroom, .. }) if *headroom == 4 * body.len() as u64
+    ));
     complete(&client, &job, result, 128 * 1024 * 1024).unwrap();
     let status = store
         .attachment_acquisition_status(&job.reference)
@@ -2232,7 +2249,39 @@ async fn attachment_transient_disk_pressure_defers_before_receipt() {
         .unwrap();
     assert_eq!(
         status.state,
-        storage_sqlite::AttachmentAcquisitionState::RetryScheduled
+        storage_sqlite::AttachmentAcquisitionState::Blocked
+    );
+    assert_eq!(status.due, None, "no timer runs while parked");
+    assert_eq!(
+        store
+            .attachment_transfer_status(GROUP, &"11".repeat(32), &"22".repeat(32), 0, 20, true)
+            .unwrap()
+            .unwrap()
+            .state,
+        storage_sqlite::AttachmentTransferState::StorageBlocked
+    );
+    let now = crate::unix_now_seconds();
+    let free = fs4::available_space(dir.path()).unwrap();
+    assert_eq!(
+        store
+            .readmit_storage_blocked_attachments(now, unavailable_reserve, free, 1, true)
+            .unwrap(),
+        0,
+        "still parked while the reserve stays out of reach"
+    );
+    assert_eq!(
+        store
+            .readmit_storage_blocked_attachments(now, 0, free, 1, true)
+            .unwrap(),
+        1
+    );
+    let status = store
+        .attachment_acquisition_status(&job.reference)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        status.state,
+        storage_sqlite::AttachmentAcquisitionState::Queued
     );
     let due = status.due.unwrap();
     let next = store

@@ -43,6 +43,24 @@ fn retry(message: &str) -> AttachmentDownloadFailure {
 fn stop(message: &str) -> AttachmentDownloadFailure {
     AttachmentDownloadFailure::Stop(AppError::BlobStore(message.into()))
 }
+/// Publishing `bytes` needs `disk_reserve + 4 * bytes` free (SQLite row, WAL and
+/// private staging copies). Below that, the job parks as `StorageBlocked` with
+/// its checkpoints instead of re-fetching on a timer. The payload is the
+/// headroom beyond the reserve a retried attempt needs, in the worker's frame.
+fn storage_blocked(headroom: u64) -> AttachmentDownloadFailure {
+    AttachmentDownloadFailure::StorageBlocked { headroom }
+}
+
+/// Free bytes on the volume holding `path`, as every capacity decision and the
+/// worker's readmission measure it. Tests pin a value per account directory so
+/// window tests do not depend on the host's live free space.
+pub(crate) fn available_space(path: &std::path::Path) -> std::io::Result<u64> {
+    #[cfg(test)]
+    if let Some(free) = test_free_space::lookup(path) {
+        return Ok(free);
+    }
+    fs4::available_space(path)
+}
 
 /// Distinguish revocation from transport errors without nesting Result values.
 pub(crate) enum NetworkPollError<E> {
@@ -128,6 +146,7 @@ impl AttachmentResume {
         Ok(())
     }
     /// Final progress keeps ciphertext units; only the receipt uses plaintext length.
+    /// The decrypted file is this attempt's own staging at the receipt.
     pub(crate) async fn completed_file_body(
         &self,
         plaintext_len: usize,
@@ -137,30 +156,24 @@ impl AttachmentResume {
             .ok_or_else(|| stop("attachment length overflow"))?;
         self.progress(ciphertext_len, Some(ciphertext_len), false)
             .await?;
-        self.completed_body(plaintext_len).await
+        self.completed_body(plaintext_len, plaintext_len as u64)
+            .await
     }
 
+    /// `held` is the staging this attempt occupies at the receipt; the
+    /// in-memory sink stages nothing and passes zero.
     pub(crate) async fn completed_body(
         &self,
         plaintext_len: usize,
+        held: u64,
     ) -> Result<(), AttachmentDownloadFailure> {
         self.finishing.store(true, Ordering::Release);
         let this = self.clone();
         let recorded = tokio::task::spawn_blocking(move || {
-            // Defer transient disk pressure before recording a completed receipt.
+            // Park on disk pressure before recording a completed receipt, so a
+            // blocked job never becomes an opted-in body with no retention.
             // Stable retention quota failures after this boundary remain terminal.
-            let policy = this
-                .storage
-                .attachment_download_policy(&this.policy)
-                .map_err(|_| retry("attachment publication policy unavailable"))?;
-            let free = fs4::available_space(&this.directory).unwrap_or(0);
-            if free
-                < policy
-                    .disk_reserve
-                    .saturating_add((plaintext_len as u64).saturating_mul(4))
-            {
-                return Err(retry("insufficient disk space for attachment publication"));
-            }
+            this.check_publication_capacity(plaintext_len as u64, 0, held)?;
             this.storage
                 .mark_attachment_body_completed(&this.job, crate::unix_now_seconds())
                 .map_err(|_| stop("attachment receipt failed"))
@@ -173,27 +186,78 @@ impl AttachmentResume {
         Ok(())
     }
 
-    fn check_file_capacity(&self, bytes: u64) -> Result<(), AttachmentDownloadFailure> {
+    /// Publishing `bytes` needs the durable policy's reserve plus four times
+    /// `bytes` free at the strictest point of the attempt. Both sinks apply
+    /// this as soon as a size is known, again as a body grows, and once more
+    /// before the completed-body receipt.
+    ///
+    /// `ahead` is the staging, checkpoint and decrypted-file growth this
+    /// attempt will still consume before that point, so the check anticipates
+    /// it instead of fetching a body it must then park. `held` is the staging
+    /// this attempt already occupies, which the worker's free-space
+    /// measurement (taken once that staging is gone) does not see. A shortage
+    /// parks the job with the headroom a retried attempt needs beyond the
+    /// reserve: `4 * bytes + ahead + held`. Readmission requires that headroom
+    /// in the worker's frame plus a margin wider than the sub-MiB tail a
+    /// checkpointed body still re-requests, so the first check a readmitted
+    /// attempt reaches passes. Each park records the need its own check
+    /// proved; saved progress may lower a later one, since the next attempt
+    /// then has less left to write. Unknown free space is a transient failure.
+    fn check_publication_capacity(
+        &self,
+        bytes: u64,
+        ahead: u64,
+        held: u64,
+    ) -> Result<(), AttachmentDownloadFailure> {
         let policy = self
             .storage
             .attachment_download_policy(&self.policy)
             .map_err(|_| retry("attachment publication policy unavailable"))?;
-        let free = fs4::available_space(&self.directory).unwrap_or(0);
-        if free < policy.disk_reserve.saturating_add(bytes.saturating_mul(4)) {
-            return Err(retry("insufficient disk space for attachment publication"));
+        let free =
+            available_space(&self.directory).map_err(|_| retry("free disk space unavailable"))?;
+        let needed = bytes.saturating_mul(4).saturating_add(ahead);
+        if free < policy.disk_reserve.saturating_add(needed) {
+            return Err(storage_blocked(needed.saturating_add(held)));
         }
         Ok(())
     }
 
-    /// Check staging headroom without recording a completed-body receipt.
-    pub(super) async fn file_capacity(
+    /// Check publication headroom without recording a completed-body receipt.
+    pub(crate) async fn publication_capacity(
         self: &Arc<Self>,
         bytes: u64,
+        ahead: u64,
+        held: u64,
     ) -> Result<(), AttachmentDownloadFailure> {
         let this = Arc::clone(self);
-        tokio::task::spawn_blocking(move || this.check_file_capacity(bytes))
+        tokio::task::spawn_blocking(move || this.check_publication_capacity(bytes, ahead, held))
             .await
             .map_err(|_| retry("attachment capacity task failed"))?
+    }
+
+    /// Early in-memory capacity check: a definite shortage parks the job, but
+    /// an unobservable policy or free-space figure must not mask a later
+    /// cryptographic verdict. The completed-body receipt repeats the check
+    /// authoritatively. The in-memory sink stages nothing on disk.
+    async fn early_publication_capacity(
+        self: &Arc<Self>,
+        bytes: u64,
+        ahead: u64,
+    ) -> Result<(), AttachmentDownloadFailure> {
+        match self.publication_capacity(bytes, ahead, 0).await {
+            Err(blocked @ AttachmentDownloadFailure::StorageBlocked { .. }) => Err(blocked),
+            _ => Ok(()),
+        }
+    }
+
+    /// Largest ciphertext body an explicit acquisition buffers in memory: the
+    /// same bound automatic work already has. Larger explicit bodies stream
+    /// through the private file sink, so receiving never holds a whole-file
+    /// array beyond the configured transfer limit.
+    pub(super) fn memory_sink_limit(&self) -> u64 {
+        self.policy
+            .transfer_limit
+            .min(super::blossom::MAX_ENCRYPTED_MEDIA_BLOB_BYTES)
     }
 
     pub(crate) async fn progress(
@@ -310,7 +374,7 @@ impl AttachmentResume {
     ) -> Result<(), AttachmentDownloadFailure> {
         let this = self.clone();
         let saved = tokio::task::spawn_blocking(move || {
-            let free = fs4::available_space(&this.directory).unwrap_or(0);
+            let free = available_space(&this.directory).unwrap_or(0);
             if free
                 < this
                     .policy
@@ -352,15 +416,26 @@ impl AttachmentResume {
         let this = self.clone();
         let locator_digest: [u8; 32] = Sha256::digest(url.as_str().as_bytes()).into();
         tokio::task::spawn_blocking(move || {
-            let total = this
+            let (total, saved) = this
                 .storage
-                .attachment_partial_total(
+                .attachment_partial_extent(
                     &this.job,
                     crate::unix_now_seconds(),
                     (&this.ciphertext_digest, &locator_digest),
                 )
-                .map_err(|_| retry("partial checkpoint metadata unavailable"))?;
-            this.check_file_capacity(total.unwrap_or(0))?;
+                .map_err(|_| retry("partial checkpoint metadata unavailable"))?
+                .unwrap_or((0, 0));
+            // Restoring stages the saved prefix again, and the download then
+            // grows both the staging file and the checkpoint from there to the
+            // total: the same frame as the header and mid-transfer checks.
+            this.check_publication_capacity(
+                total,
+                total
+                    .saturating_sub(saved)
+                    .saturating_mul(2)
+                    .saturating_add(saved),
+                0,
+            )?;
             let mut file = super::file_transfer::PrivateMediaFile::create(&directory)?;
             let mut writer = file.writer()?;
             let part = this
@@ -468,6 +543,24 @@ pub(super) async fn read_body(
             max,
         ));
     }
+    if let Some(total) = expected_total {
+        // The size is known now: refuse before fetching a body the device
+        // cannot publish, counting the checkpoint bytes a validated body will
+        // still add, and reserve the buffer once so it never doubles. A
+        // peer-declared length must not abort the process on allocation.
+        let checkpoint_growth = identity
+            .as_ref()
+            .map_or(0, |_| total.saturating_sub(bytes.len() as u64));
+        context
+            .early_publication_capacity(
+                total.saturating_sub(super::file_transfer::MEDIA_AEAD_TAG_BYTES),
+                checkpoint_growth,
+            )
+            .await?;
+        bytes
+            .try_reserve_exact((total as usize).saturating_sub(bytes.len()))
+            .map_err(|_| retry("attachment body buffer unavailable"))?;
+    }
     context
         .progress(bytes.len() as u64, expected_total, true)
         .await?;
@@ -507,6 +600,14 @@ pub(super) async fn read_body(
         if expected_total.is_some_and(|n| size > n) {
             return Err(stop("download exceeds response size bound"));
         }
+        if bytes.capacity() < bytes.len() + chunk.len() {
+            // A failed reservation never aborts.
+            let wanted =
+                next_body_capacity(bytes.capacity(), bytes.len() + chunk.len(), max as usize);
+            bytes
+                .try_reserve_exact(wanted - bytes.len())
+                .map_err(|_| retry("attachment body buffer unavailable"))?;
+        }
         bytes.extend_from_slice(&chunk);
         if reported.elapsed() >= PROGRESS_INTERVAL {
             context
@@ -530,6 +631,20 @@ pub(super) async fn read_body(
         }
         return Err(retry("incomplete media body"));
     }
+    // Space may have shrunk during the transfer. Keep the complete ciphertext
+    // checkpointed, so readmission verifies it locally without another request.
+    if let Err(error) = context
+        .early_publication_capacity(
+            (bytes.len() as u64).saturating_sub(super::file_transfer::MEDIA_AEAD_TAG_BYTES),
+            0,
+        )
+        .await
+    {
+        if let Some(identity) = &identity {
+            let _ = checkpoint_tail(context, identity, &bytes, &mut saved).await;
+        }
+        return Err(error);
+    }
     // Complete bodies go straight to verification/publication. Do not write a
     // final tiny checkpoint only to delete it on success.
     context
@@ -537,6 +652,20 @@ pub(super) async fn read_body(
         .await?;
     Ok(bytes)
 }
+/// Next buffer capacity for an undeclared-length body that needs `needed`
+/// bytes, growing from `capacity` under the admitted `limit`: doubling up to
+/// half the limit, then one step to the limit itself. Growth copies the old
+/// buffer into the new one, so the buffer never exceeds the limit and the
+/// transient peak during a copy never exceeds 1.5 times it.
+pub(crate) fn next_body_capacity(capacity: usize, needed: usize, limit: usize) -> usize {
+    let half = limit.div_ceil(2);
+    if needed <= half {
+        capacity.saturating_mul(2).max(needed).min(half)
+    } else {
+        limit
+    }
+}
+
 async fn checkpoint_tail(
     context: &AttachmentResume,
     identity: &AttachmentPartialIdentity,
@@ -550,4 +679,98 @@ async fn checkpoint_tail(
         *saved = bytes.len();
     }
     Ok(())
+}
+
+/// Per-directory free-space pins for tests, read by [`available_space`].
+///
+/// A modeled pin behaves like a volume holding the account: it reports the
+/// pinned figure less every byte currently staged under the account's media
+/// staging directory and less what the checkpoint table grew by since the pin.
+/// The pinned figure is therefore free space in the worker's frame (no
+/// attempt staging), and an attempt's own staging and checkpoint writes
+/// consume the space its later capacity checks see, as on a real device.
+#[cfg(test)]
+pub(crate) mod test_free_space {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use storage_sqlite::SqliteAccountStorage;
+
+    #[derive(Clone)]
+    struct Model {
+        staging: PathBuf,
+        storage: SqliteAccountStorage,
+        checkpoint_base: u64,
+    }
+
+    #[derive(Clone)]
+    struct Pin {
+        free: u64,
+        model: Option<Model>,
+    }
+
+    static PINS: Mutex<BTreeMap<PathBuf, Pin>> = Mutex::new(BTreeMap::new());
+
+    /// Pin a constant free-space figure for `root` and everything beneath it.
+    pub(crate) fn set(root: &Path, free: u64) {
+        PINS.lock()
+            .unwrap()
+            .insert(root.to_path_buf(), Pin { free, model: None });
+    }
+
+    /// Pin `free` in the worker's frame for `root`, charging live staging
+    /// under `staging` and checkpoint growth in `storage` against it.
+    pub(crate) fn set_modeled(
+        root: &Path,
+        free: u64,
+        staging: &Path,
+        storage: &SqliteAccountStorage,
+    ) {
+        let checkpoint_base = storage.attachment_partial_bytes_for_test().unwrap();
+        PINS.lock().unwrap().insert(
+            root.to_path_buf(),
+            Pin {
+                free,
+                model: Some(Model {
+                    staging: staging.to_path_buf(),
+                    storage: storage.clone(),
+                    checkpoint_base,
+                }),
+            },
+        );
+    }
+
+    /// Drop the pin for `root`, returning it to live measurements.
+    pub(crate) fn clear(root: &Path) {
+        PINS.lock().unwrap().remove(root);
+    }
+
+    /// The modeled free space of the pinned root that contains `path`, if any.
+    pub(crate) fn lookup(path: &Path) -> Option<u64> {
+        // Copy the pin out first: the model queries storage and the file
+        // system, and must not do so under this lock.
+        let pin = PINS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(root, _)| path.starts_with(root))
+            .map(|(_, pin)| pin.clone())?;
+        let Some(model) = pin.model else {
+            return Some(pin.free);
+        };
+        let staged: u64 = std::fs::read_dir(&model.staging)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.metadata().ok())
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len())
+            .sum();
+        let grown = model
+            .storage
+            .attachment_partial_bytes_for_test()
+            .unwrap_or(model.checkpoint_base)
+            .saturating_sub(model.checkpoint_base);
+        Some(pin.free.saturating_sub(staged).saturating_sub(grown))
+    }
 }

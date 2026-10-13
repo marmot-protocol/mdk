@@ -626,6 +626,7 @@ pub(crate) fn group_state_subscribe_args(cli: &Cli) -> Result<String, String> {
     match &cli.command {
         crate::Command::Groups {
             command: crate::GroupsCommand::SubscribeState { group_id },
+            ..
         } => crate::normalize_group_id_hex(group_id).map_err(|err| err.to_string()),
         _ => Err("groups subscribe-state requires wn groups subscribe-state".to_owned()),
     }

@@ -9,6 +9,13 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Group changes on a group that may have moved past this device now fail with the JSON error code
+  `group_catching_up` (carrying `group_id`) instead of committing from the stale epoch and forking
+  the group (mdk#2258). Retry once the group has synced, or pass `--accept-stale` to `wn groups` to
+  make the change anyway. MarmotKit reports it as `GroupCatchingUp`.
+
 ## [0.13.0] - 2026-10-12
 
 Update generated Swift/Kotlin bindings, native libraries and C headers together. Account storage advances through

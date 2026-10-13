@@ -20,6 +20,15 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 - Account attachment pages, bounded borrowed query inputs and opaque cursor/version handles with deep-free and version-clone functions. New records/symbols require matching headers and libraries; existing group history remains supported.
 - Add `marmot_send_prepared_media_with_client_token` for captured ordinary-media admission and conditional draft consumption. Inputs are borrowed; the nullable captured revision remains owned by its selected-draft root. The owned result uses the existing `marmot_local_send_acceptance_free`; layouts and status values are unchanged. Use matching regenerated headers and libraries.
 
+- Add `MARMOT_STATUS_GROUP_CATCHING_UP` (101): a group change was refused because unresolved epoch-gap recovery covers the group's current local epoch (mdk#2258). Retry after it syncs, or call the new `marmot_acknowledge_group_catching_up` once the user accepts that the change may split the group, then retry. Use matching regenerated headers and libraries.
+
+### Changed
+
+- `MarmotAttachmentTransferState` appends
+  `MARMOT_ATTACHMENT_TRANSFER_STATE_STORAGE_BLOCKED`; existing discriminants
+  are unchanged. Recompile against the regenerated `marmot.h` with the matching
+  library and handle the new value as "free up storage", not as a retry timer.
+
 ## [0.13.0] - 2026-10-12
 
 Recompile against the matching `marmot.h` and library: several record layouts changed and new event, Markdown and

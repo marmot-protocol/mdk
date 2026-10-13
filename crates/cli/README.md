@@ -279,6 +279,11 @@ wn --account <npub-or-hex> groups subscribe-state <group-hex>
 The hidden legacy `group` namespace keeps `create`, `members`, `invite` (with `--admin`), `remove`, `update`, and
 `set-avatar-url` working.
 
+**Groups that are still catching up.** While this device's epoch-gap recovery says the group may have moved on without it,
+group changes (membership, admins, profile, image, retention, disbanding) fail with JSON error code
+`group_catching_up`. A change from a stale epoch can split the group for everyone. Retry once the group syncs, or pass
+`--accept-stale` to make the change anyway; scheduled self-updates wait up to a day for the group to catch up.
+
 **Group identifiers.** Every `<group-hex>` is the canonical MLS group id (`group_id` in JSON; opaque bytes, 16 bytes for
 OpenMLS-created groups). It is not the 32-byte Nostr routing handle shown under `nostr_routing.nostr_group_id_hex`,
 which is transport state the group can rotate. Filters, lookups, and JSON always key on the MLS group id.

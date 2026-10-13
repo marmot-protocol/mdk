@@ -5386,6 +5386,44 @@ async fn immediate_maintenance_timing_publishes_a_manual_self_update_without_wai
     );
 }
 
+/// mdk#2258: a self-update authored from an epoch the group already left forks
+/// the group. A caller that knows the group is behind holds it; the rotation
+/// stays owed and publishes once the hold lifts.
+#[tokio::test]
+async fn held_group_defers_a_due_self_update_until_the_hold_lifts() {
+    let (_dir, mut runtime, group_id, source_epoch) =
+        manual_only_group_runtime(MaintenanceTiming::immediate()).await;
+    let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
+    let held = [group_id.clone()];
+    for _ in 0..3 {
+        runtime.run_due_maintenance_holding(&held).await.unwrap();
+    }
+    let obligation = runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(obligation.phase, cgka_traits::MaintenancePhase::Retry);
+    assert_eq!(
+        obligation.last_failure_code.as_deref(),
+        Some("epoch_gap_hold")
+    );
+    assert_eq!(runtime.session().epoch(&group_id).unwrap(), source_epoch);
+
+    let effects = runtime.run_due_maintenance().await.unwrap();
+    assert!(
+        effects
+            .pending
+            .iter()
+            .any(|resolution| matches!(resolution, PendingResolution::Confirmed { .. })),
+        "{effects:?}"
+    );
+    assert_eq!(
+        runtime.session().epoch(&group_id).unwrap().0,
+        source_epoch.0 + 1
+    );
+}
+
 #[tokio::test]
 async fn default_maintenance_timing_holds_a_manual_self_update_in_its_quiet_window() {
     let (_dir, mut runtime, group_id, source_epoch) =
