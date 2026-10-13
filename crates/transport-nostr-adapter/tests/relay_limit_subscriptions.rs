@@ -1198,8 +1198,32 @@ async fn distinct_deliveries(adapter: &NostrTransportAdapter, wait: Duration) ->
     }
 }
 
+/// Store kind-445 events for group route 0 at the given `created_at` seconds.
+async fn store_events_at(database: &MemoryDatabase, timestamps: impl IntoIterator<Item = u64>) {
+    let keys = Keys::generate();
+    for (index, created_at) in timestamps.into_iter().enumerate() {
+        let event = EventBuilder::new(Kind::MlsGroupMessage, format!("history-{index}"))
+            .tags([Tag::custom("h", [hex::encode(route(0))])])
+            .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(created_at))
+            .finalize(&keys)
+            .unwrap();
+        database
+            .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+            .await
+            .unwrap();
+    }
+}
+
 /// Replay one group route over `stored` events and report what arrived.
 async fn replay_one_group(stored: usize, clamp: Option<u64>) -> (usize, bool, LimitStats) {
+    replay_one_group_at((0..stored as u64).map(|index| 1_700_000_000 + index), clamp).await
+}
+
+/// Replay one group route over events stored at `timestamps`.
+async fn replay_one_group_at(
+    timestamps: impl IntoIterator<Item = u64>,
+    clamp: Option<u64>,
+) -> (usize, bool, LimitStats) {
     let fx = Fixture::new(
         LimitConfig {
             req_limit_clamp: clamp,
@@ -1208,7 +1232,9 @@ async fn replay_one_group(stored: usize, clamp: Option<u64>) -> (usize, bool, Li
         false,
     )
     .await;
-    store_timed_events(&fx.database, stored).await;
+    let timestamps = timestamps.into_iter().collect::<Vec<_>>();
+    let stored = timestamps.len();
+    store_events_at(&fx.database, timestamps).await;
     let url = fx.limit.url();
     fx.adapter
         .activate_account(fx.activation(std::slice::from_ref(&url), groups(1, &url)))
@@ -1249,6 +1275,21 @@ async fn stored_replay_beyond_500_is_paged_before_counting_complete() {
             assert!(stats.total_reqs >= 4, "paged: {}", stats.summary());
         }
     }
+}
+
+/// More than a page of events sharing one second saturates the inclusive
+/// `until` bound: the backward page cannot move past that second, so the rest
+/// of it and everything older stay unfetched. Coverage must stay incomplete
+/// rather than count that relay's EOSE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn saturated_boundary_second_keeps_replay_incomplete() {
+    const BOUNDARY: u64 = 1_700_100_000;
+    let older = (0..100).map(|index| BOUNDARY - 1_000 + index);
+    let boundary = std::iter::repeat_n(BOUNDARY, 600);
+    let (delivered, complete, _) =
+        replay_one_group_at(older.chain(boundary), Some(limit_relay::REQ_LIMIT_CLAMP)).await;
+    assert!(delivered < 700, "the clamp hides part of the window");
+    assert!(!complete, "a saturated boundary must not count as coverage");
 }
 
 /// A replay that stays under a full page is complete as delivered and opens

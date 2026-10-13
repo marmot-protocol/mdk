@@ -58,13 +58,17 @@ for reconnect/backoff and relay status mechanics.
   - Never abort subscribe tasks. `subscribe_all` drains its siblings after an error and detaches them when dropped.
     Every lifecycle operation takes `lock_subscriptions`, which waits for those stragglers to register before any
     sweep.
+  - That wait is bounded so a hung relay client cannot wedge the adapter. When it gives up, it retires the barrier;
+    a task that finishes after its barrier was retired must close the REQ it just registered.
 - Never count a replay a relay may have clamped as coverage (#2263):
-  - `observe_relay_event` counts each relay's stored events per activation REQ until that relay's EOSE, so consumers
-    must pass a relay's copies in order with its EOSE.
+  - `observe_relay_event` counts each relay's stored events per activation REQ until that relay's EOSE, before
+    mapping them. Consumers must pass a relay's copies in order with its EOSE, and report events that fail
+    `from_nostr_event` through `observe_unconvertible_relay_event` instead of dropping them.
   - A relay that sent `RELAY_REPLAY_PAGE_LIMIT` or more moves to `RelayReplay::Paging`, which is neither complete nor
     settled. `page_replay` then fetches the window backwards with `acquire_history` until a page comes back short;
     only then does that relay's EOSE count.
-  - A failed or over-long paging stays incomplete for the next activation and recovery.
+  - A failed or over-long paging stays incomplete for the next activation and recovery. So does a full page that
+    cannot move past its oldest second, because that second may hide more events and everything older.
 - Record each REQ's filter `since` in its SDK account context before the REQ goes out, find it by subscription id
   when the REQ closes, and keep a closed REQ's floor for the rest of the context's life: routing is content-keyed,
   and a closed REQ's buffered or in-flight notifications have no deadline, so they can still be lost in a lag. Do

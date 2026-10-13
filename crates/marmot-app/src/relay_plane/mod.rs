@@ -2959,14 +2959,25 @@ async fn handle_relay_notification(
                     // Raw per-relay copy feeds telemetry and replay-page
                     // accounting, in order with this relay's EOSE. Delivery
                     // uses the deduplicated Event notification above.
-                    if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
-                        adapter
-                            .observe_relay_event(transport_nostr_adapter::NostrRelayEvent {
-                                endpoint: TransportEndpoint(relay_url.to_string()),
-                                subscription_id: Some(subscription_id.to_string()),
-                                event,
-                            })
-                            .await;
+                    match NostrTransportEvent::from_nostr_event(&event) {
+                        Ok(event) => {
+                            adapter
+                                .observe_relay_event(transport_nostr_adapter::NostrRelayEvent {
+                                    endpoint: TransportEndpoint(relay_url.to_string()),
+                                    subscription_id: Some(subscription_id.to_string()),
+                                    event,
+                                })
+                                .await;
+                        }
+                        Err(_) => {
+                            adapter
+                                .observe_unconvertible_relay_event(
+                                    TransportEndpoint(relay_url.to_string()),
+                                    subscription_id.to_string(),
+                                    event.created_at.as_secs(),
+                                )
+                                .await;
+                        }
                     }
                 }
                 RelayMessage::EndOfStoredEvents(subscription_id) => {

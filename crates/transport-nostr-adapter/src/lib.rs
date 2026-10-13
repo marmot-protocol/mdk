@@ -1131,10 +1131,26 @@ impl NostrTransportAdapter {
         let mut tasks = DetachOnDrop(JoinSet::new());
         for (sub_index, subscription) in subscriptions.iter().cloned().enumerate() {
             let relay_client = self.relay_client.clone();
-            let in_flight = self.current_subscribe_tasks().read_owned().await;
+            let barriers = self.subscribe_tasks.clone();
+            let barrier = self.current_subscribe_tasks();
+            let in_flight = barrier.clone().read_owned().await;
             tasks.0.spawn(async move {
                 let _in_flight = in_flight;
-                (sub_index, relay_client.subscribe(subscription).await)
+                let result = relay_client.subscribe(subscription.clone()).await;
+                // A lifecycle operation that gave up waiting for this task
+                // retired its barrier and may already have swept the account,
+                // so a REQ registered now would be live with nothing tracking
+                // it. Close it here instead.
+                let retired = !Arc::ptr_eq(
+                    &barrier,
+                    &barriers
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                );
+                if retired && result.is_ok() {
+                    let _ = relay_client.unsubscribe(subscription).await;
+                }
+                (sub_index, result)
             });
         }
         let tasks = &mut tasks.0;
@@ -1783,20 +1799,42 @@ impl NostrTransportAdapter {
     /// relay may have clamped (see [`RELAY_REPLAY_PAGE_LIMIT`]). Callers must
     /// pass a relay's copies in order with its EOSE.
     pub async fn observe_relay_event(&self, relay_event: NostrRelayEvent) {
-        let Ok(message) = relay_event.event.to_transport_message() else {
-            return;
-        };
         let now_ms = self.now_ms();
         let mut state = self.state.write().await;
-        state.record_delivery_timing(&message.id, &relay_event.endpoint, now_ms);
+        // Count before mapping: the relay spent a slot of its page on this
+        // event whether or not it maps to a transport message.
         if let Some(subscription_id) = &relay_event.subscription_id {
-            state.record_subscription_first_event(subscription_id, &relay_event.endpoint, now_ms);
             state.record_stored_replay_event(
                 subscription_id,
                 &relay_event.endpoint,
                 relay_event.event.created_at,
             );
         }
+        let Ok(message) = relay_event.event.to_transport_message() else {
+            return;
+        };
+        state.record_delivery_timing(&message.id, &relay_event.endpoint, now_ms);
+        if let Some(subscription_id) = &relay_event.subscription_id {
+            state.record_subscription_first_event(subscription_id, &relay_event.endpoint, now_ms);
+        }
+    }
+
+    /// Count one relay's copy of a stored event that could not be converted
+    /// to a [`NostrTransportEvent`] at all. The relay still spent a slot of
+    /// its replay page on it (see [`RELAY_REPLAY_PAGE_LIMIT`]), so notification
+    /// consumers report it here, in order with the relay's EOSE, instead of
+    /// dropping it.
+    pub async fn observe_unconvertible_relay_event(
+        &self,
+        endpoint: TransportEndpoint,
+        subscription_id: String,
+        created_at: u64,
+    ) {
+        self.state.write().await.record_stored_replay_event(
+            &subscription_id,
+            &endpoint,
+            created_at,
+        );
     }
 
     /// Record a relay's `CLOSED` for a subscription on one relay endpoint.
@@ -1940,11 +1978,13 @@ impl NostrTransportAdapter {
             }
             // `until` is inclusive, so the next page repeats the boundary
             // second; duplicates are harmless. A full page that cannot move
-            // past that second has nothing older left to reach.
+            // past that second is saturated by it: the rest of that second and
+            // everything older may be unfetched, so it stays incomplete.
             match oldest {
                 Some(oldest) if received >= RELAY_REPLAY_PAGE_LIMIT && oldest < until => {
                     until = oldest;
                 }
+                Some(_) if received >= RELAY_REPLAY_PAGE_LIMIT => break false,
                 _ => break true,
             }
         };

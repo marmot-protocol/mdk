@@ -2378,14 +2378,25 @@ impl NostrSdkRelayClient {
                                 // accounting, in order with that relay's EOSE;
                                 // delivery uses the SDK's deduplicated Event
                                 // notification above.
-                                if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
-                                    adapter
-                                        .observe_relay_event(NostrRelayEvent {
-                                            endpoint: TransportEndpoint(relay_url.to_string()),
-                                            subscription_id: Some(subscription_id.to_string()),
-                                            event,
-                                        })
-                                        .await;
+                                match NostrTransportEvent::from_nostr_event(&event) {
+                                    Ok(event) => {
+                                        adapter
+                                            .observe_relay_event(NostrRelayEvent {
+                                                endpoint: TransportEndpoint(relay_url.to_string()),
+                                                subscription_id: Some(subscription_id.to_string()),
+                                                event,
+                                            })
+                                            .await;
+                                    }
+                                    Err(_) => {
+                                        adapter
+                                            .observe_unconvertible_relay_event(
+                                                TransportEndpoint(relay_url.to_string()),
+                                                subscription_id.to_string(),
+                                                event.created_at.as_secs(),
+                                            )
+                                            .await;
+                                    }
                                 }
                             }
                             RelayMessage::EndOfStoredEvents(subscription_id) => {
