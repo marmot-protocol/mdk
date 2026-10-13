@@ -47,6 +47,8 @@
   representation with a fallible reservation: a refused allocation is a
   storage error that keeps the checkpoint, not a process abort (mdk#2241).
 
+- `SqliteAccountStorage::epoch_gap_recovery_open_since` reports when an unresolved epoch-gap obligation (pending, parked or retired by the user) covering a group's local epoch was first armed.
+
 ## 0.13.0 - 2026-10-12
 
 Account storage advances from migration 101 through 107 on first open; downgrade

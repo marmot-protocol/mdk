@@ -4,6 +4,7 @@
 
 ### Breaking changes
 
+- `MarmotKitError` adds `GroupCatchingUp`: a group change was refused because the group may have moved past this device and recovery has not caught it up yet (mdk#2258). Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
 - `AttachmentTransferStateFfi` adds `StorageBlocked`: free disk cannot cover
   the publication reserve for the body, checkpoints are kept, and the job
   readmits once space frees or on explicit Retry. Update exhaustive
@@ -16,6 +17,8 @@
 - Account-wide attachment candidate pages, group/sender/date queries and opaque account/query-bound cursor/version handles. Filtered empty pages can continue; source changes require restart. Existing group history and acquisition primitives are unchanged.
 
 - `Marmot::send_prepared_media_with_client_token` exposes captured ordinary-media admission with transactional conditional draft consumption. Use the original token and revision for live retries, recover ownership by token after interruption, and pair regenerated Swift/Kotlin bindings with the matching library. See [local sends](LOCAL-SENDS.md).
+
+- `Marmot::acknowledge_group_catching_up`: after `GroupCatchingUp`, call it once the user accepts that the change may split the group, then retry. See [the epoch-gap notes](README.md#history-may-be-incomplete-notices).
 
 ## 0.13.0 - 2026-10-12
 

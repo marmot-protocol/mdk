@@ -6,6 +6,11 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
+/// mdk#2258: a group change on a group that is still catching up fails with
+/// `group_catching_up` unless the caller accepts the fork risk.
+const ACCEPT_STALE_HELP: &str = "If the group is still catching up on missed changes, make this \
+group change anyway. The device may be behind, so the change can split the group for everyone";
+
 #[derive(Parser, Clone, Debug, Serialize, Deserialize)]
 #[command(
     name = "wn",
@@ -177,11 +182,17 @@ pub(crate) enum Command {
     Group {
         #[command(subcommand)]
         command: GroupCommand,
+        #[arg(long, global = true, help = ACCEPT_STALE_HELP)]
+        #[serde(default)]
+        accept_stale: bool,
     },
     #[command(about = "Create groups and manage membership and admin state")]
     Groups {
         #[command(subcommand)]
         command: GroupsCommand,
+        #[arg(long, global = true, help = ACCEPT_STALE_HELP)]
+        #[serde(default)]
+        accept_stale: bool,
     },
     #[command(hide = true)]
     Message {

@@ -13,6 +13,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 - Add `marmot_send_prepared_media_with_client_token` for captured ordinary-media admission and conditional draft consumption. Inputs are borrowed; the nullable captured revision remains owned by its selected-draft root. The owned result uses the existing `marmot_local_send_acceptance_free`; layouts and status values are unchanged. Use matching regenerated headers and libraries.
 
+- Add `MARMOT_STATUS_GROUP_CATCHING_UP` (101): a group change was refused because unresolved epoch-gap recovery covers the group's current local epoch (mdk#2258). Retry after it syncs, or call the new `marmot_acknowledge_group_catching_up` once the user accepts that the change may split the group, then retry. Use matching regenerated headers and libraries.
+
 ### Changed
 
 - `MarmotAttachmentTransferState` appends

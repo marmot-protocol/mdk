@@ -479,6 +479,10 @@ pub(crate) enum AccountWorkerCommand {
         notice_id: String,
         respond: oneshot::Sender<Result<bool, AppError>>,
     },
+    AcknowledgeGroupCatchingUp {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<bool, AppError>>,
+    },
     ConfirmGroupRejoin {
         welcome_id: cgka_traits::MessageId,
         token: Vec<u8>,
@@ -5304,6 +5308,17 @@ fn account_worker_command_future<'a>(
             );
             true
         }),
+        AccountWorkerCommand::AcknowledgeGroupCatchingUp { group_id, respond } => {
+            Box::pin(async move {
+                let _ = respond_diagnosed(
+                    shared,
+                    storage_permit.as_ref(),
+                    respond,
+                    client.acknowledge_group_catching_up(&group_id),
+                );
+                true
+            })
+        }
         AccountWorkerCommand::DismissHistoryNotice { notice_id, respond } => {
             Box::pin(async move {
                 let result = client.dismiss_history_notice(&notice_id);

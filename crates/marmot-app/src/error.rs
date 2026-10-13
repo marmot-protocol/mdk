@@ -160,6 +160,14 @@ pub enum AppError {
     /// "disbanding" for it tells the user something false.
     #[error("this device was removed from the group; outbound work is blocked")]
     GroupRemoved(String),
+    /// The group may have moved past this device's local epoch and recovery has
+    /// not caught it up yet. A commit authored now could fork the group
+    /// (mdk#2258). Retryable once recovery clears the gap or the local epoch
+    /// moves past it. Or, after the user accepts that risk,
+    /// `acknowledge_group_catching_up` and retry. Dismissing the group's
+    /// history notice does not release it.
+    #[error("group is still catching up on missed changes; try again once it has synced")]
+    GroupCatchingUp(String),
     /// Host-supplied draft attachment metadata failed validation before storage.
     #[error("invalid message draft: {0}")]
     InvalidMessageDraft(String),
@@ -450,6 +458,7 @@ impl AppError {
             Self::InvalidChatPin(_) => "invalid_chat_pin",
             Self::GroupDisbanding(_) => "group_disbanding",
             Self::GroupRemoved(_) => "group_removed",
+            Self::GroupCatchingUp(_) => "group_catching_up",
             Self::InvalidMessageDraft(_) => "invalid_message_draft",
             Self::MessageDraftRevisionConflict => "message_draft_revision_conflict",
             Self::AgentStreamMissingStart => "agent_stream_missing_start",
