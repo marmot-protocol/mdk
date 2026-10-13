@@ -3923,16 +3923,34 @@ fn array_publication_declares_length_and_skips_the_trigger_rewrite() {
         .claim_attachment_acquisition(&asset, 12, 100)
         .unwrap()
         .unwrap();
-    let before = store.lock().unwrap().total_changes();
+    // Count only body-row normalization, not unrelated acquisition metadata
+    // writes maintained by newer schema triggers.
+    sql(
+        &store,
+        "CREATE TEMP TABLE normalization_probe (rewrites INTEGER NOT NULL);
+         INSERT INTO normalization_probe VALUES (0);
+         CREATE TEMP TRIGGER observe_body_normalization
+         AFTER UPDATE OF byte_len ON retained_attachment_bytes
+         WHEN OLD.byte_len<0 AND NEW.byte_len>=0 BEGIN
+             UPDATE normalization_probe SET rewrites=rewrites+1;
+         END;",
+    );
     assert_eq!(
         store
             .complete_attachment_acquisition(&job, BODY, 12, 10000)
             .unwrap(),
         AttachmentPublishResult::Published
     );
-    // Exactly the row insert, the usage charge and the job state change: the
-    // `byte_len<0` normalizing UPDATE in the insert trigger matched no row.
-    assert_eq!(store.lock().unwrap().total_changes() - before, 3);
+    let normalization_count = || {
+        store
+            .lock()
+            .unwrap()
+            .query_row("SELECT rewrites FROM normalization_probe", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(normalization_count(), 0);
     let (byte_len, stored_len): (i64, i64) = store
         .lock()
         .unwrap()
@@ -3951,12 +3969,10 @@ fn array_publication_declares_length_and_skips_the_trigger_rewrite() {
         BODY.len() as u64
     );
     assert_eq!(read(&store, &asset), BODY);
-    // The retired bind-the-whole-body form pays the trigger rewrite inside one
-    // statement: insert, row rewrite and usage charge also count three, which
-    // is the copy the publication path no longer makes.
+    // The retired bind-the-whole-body form still rewrites the body row. This
+    // positive control proves the probe detects the copy we avoid above.
     seed(&store, "legacy");
     let legacy = request(&store, "legacy");
-    let before = store.lock().unwrap().total_changes();
     store
         .lock()
         .unwrap()
@@ -3965,7 +3981,7 @@ fn array_publication_declares_length_and_skips_the_trigger_rewrite() {
             params![legacy.token, BODY],
         )
         .unwrap();
-    assert_eq!(store.lock().unwrap().total_changes() - before, 3);
+    assert_eq!(normalization_count(), 1);
 }
 
 mod outgoing;

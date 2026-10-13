@@ -3424,38 +3424,13 @@ async fn adapter_publish_failure_records_per_relay_causes() {
     let key = SqlCipherKey::new("marmot adapter failure cause key").unwrap();
     let database = dir.path().join("alice.sqlite");
     let audit_path = dir.path().join("audit.jsonl");
-    let mut initial = current_session(database.clone(), &key, b"alice");
-    let created = initial
-        .create_group(CreateGroupRequest {
-            name: "adapter failure causes".into(),
-            description: String::new(),
-            members: Vec::new(),
-            required_features: Vec::new(),
-            app_components: Vec::new(),
-            initial_admins: Vec::new(),
-        })
-        .await
-        .unwrap();
-    let group_id = created.group_id;
-    drop(initial);
-
+    let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let bob_id = bob.self_id();
     let mut session = current_session(database, &key, b"alice");
-    session.set_audit_recorder(Box::new(
-        marmot_forensics::JsonlRecorder::open_v5_with_account_ref(
-            &audit_path,
-            "11".repeat(16),
-            Some("22".repeat(16)),
-            marmot_forensics::v5::Producer {
-                mdk_revision: None,
-                build_profile: marmot_forensics::v5::BuildProfile::Debug,
-                platform: marmot_forensics::v5::Platform::Other,
-                host_build: None,
-            },
-        )
-        .unwrap(),
-    ));
-    let timed_out = TransportEndpoint("wss://group-timed-out.example".into());
-    let refused = TransportEndpoint("wss://group-refused.example".into());
+    session.set_audit_recorder(v5_audit_recorder(&audit_path));
+    let timed_out = TransportEndpoint("wss://inbox-timed-out.example".into());
+    let refused = TransportEndpoint("wss://inbox-refused.example".into());
     let adapter = RecordingAdapter::default();
     adapter.fail_endpoints_with_reasons(
         TransportEndpointFailureKind::RetryableUnavailable,
@@ -3465,39 +3440,35 @@ async fn adapter_publish_failure_records_per_relay_causes() {
         ],
     );
     let routing =
-        StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())])
-            .with_group_route(
-                group_id.clone(),
-                group_id.as_slice().to_vec(),
-                vec![timed_out.clone(), refused.clone()],
-            );
-    let wall = Arc::new(TestWallClock::new(120_000));
-    let monotonic = Arc::new(TestMonotonicClock::default());
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+            .with_inbox_route(bob_id, vec![timed_out.clone(), refused.clone()]);
     let mut runtime = AccountDeviceRuntime::new(
         session,
         adapter.clone(),
         routing,
         RecordingKeyPackages::default(),
-    )
-    .with_maintenance_sources(
-        wall.clone(),
-        monotonic.clone(),
-        Arc::new(TestRandom::new(0)),
     );
 
-    let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
-    runtime.run_due_maintenance().await.unwrap();
-    monotonic.set_millis(60_000);
-    wall.set(120_060);
-    runtime.run_due_maintenance().await.unwrap();
-    let jittered = runtime
-        .session()
-        .maintenance_obligation(&obligation_id)
-        .unwrap()
+    // Welcomes still use the first legacy batched publish. New self-updates
+    // use frozen per-endpoint fanouts, a different diagnostics boundary.
+    let (_, effects) = runtime
+        .create_group(CreateGroupRequest {
+            name: "adapter failure causes".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
         .unwrap();
-    wall.set(jittered.not_before.unwrap().0);
-    runtime.run_due_maintenance().await.unwrap();
-    assert_eq!(adapter.publishes().len(), 1);
+    assert_eq!(effects.failures.len(), 1);
+    let publishes = adapter.publishes();
+    assert_eq!(publishes.len(), 1);
+    assert_eq!(
+        publishes[0].target.endpoints(),
+        &[timed_out.clone(), refused.clone()]
+    );
 
     let fanout = runtime.session().transport_fanouts().unwrap().remove(0);
     assert_eq!(fanout.targets.len(), 2);
