@@ -17,6 +17,7 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `marmot_public_event_cache_read_free`; embedded records have no separate free. These additive exports require the
   matching generated header and library; existing record layouts are unchanged. A coordinate key's `identifier`
   is a JSON string literal: decode once while preserving embedded NULs and UTF-8 lengths.
+- Account attachment pages, bounded borrowed query inputs and opaque cursor/version handles with deep-free and version-clone functions. New records/symbols require matching headers and libraries; existing group history remains supported.
 - Add `marmot_send_prepared_media_with_client_token` for captured ordinary-media admission and conditional draft consumption. Inputs are borrowed; the nullable captured revision remains owned by its selected-draft root. The owned result uses the existing `marmot_local_send_acceptance_free`; layouts and status values are unchanged. Use matching regenerated headers and libraries.
 
 ## [0.13.0] - 2026-10-12

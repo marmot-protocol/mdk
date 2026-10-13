@@ -5126,6 +5126,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         # reset the backoff attempt counter so the next failure starts at base.
         attempts = {"n": 0}
         delays = []
+        reconnected = asyncio.Event()
 
         class FakeClient:
             async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
@@ -5144,6 +5145,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                     })
                     raise RuntimeError("dropped after healthy")
                 else:
+                    reconnected.set()
                     await asyncio.sleep(3600)
                     return
 
@@ -5162,11 +5164,18 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.adapter_module.reconnect_backoff_ms = recording_backoff
         try:
             loop_task = asyncio.ensure_future(adapter._consume_inbound_loop(rand=lambda: 0.0))
-            for _ in range(300):
-                if attempts["n"] >= 2 and delays and adapter.events:
-                    break
-                await asyncio.sleep(0.005)
-            await adapter._inbound_queue.join()
+            # Wait for the actual reconnect, then drain the already-admitted
+            # message. A fixed 1.5-second polling window can expire while CI is
+            # still opening the durable spool, before there is anything to join.
+            await asyncio.wait_for(reconnected.wait(), timeout=10.0)
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=10.0)
+        except TimeoutError:
+            frames = loop_task.get_stack(limit=3)
+            self.fail(
+                f"reconnect did not complete: attempts={attempts['n']}, "
+                f"delays={len(delays)}, delivered={len(adapter.events)}, "
+                f"pending={[frame.f_code.co_name for frame in frames]}"
+            )
         finally:
             self.adapter_module.reconnect_backoff_ms = real_backoff
             loop_task.cancel()

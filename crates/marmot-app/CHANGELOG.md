@@ -10,6 +10,7 @@
   Each account retains at most 1,024 records and 32 MiB. Cohort eviction removes
   selections and deletion evidence together, suppressing subsequent deletion
   and preview writes in the same admission.
+- Account-wide local attachment pages expose bounded typed metadata, group/sender/date selection, continuation cursors and retention deadlines. Reads start no acquisition or relay activity.
 - `MarmotAppRuntime::submit_prepared_media_snapshot` admits the captured ordinary-media payload with a stable token and consumes only its unchanged captured draft in the same transaction. Newer or cleared drafts cannot replace the payload or block admission.
 
 ## 0.13.0 - 2026-10-12

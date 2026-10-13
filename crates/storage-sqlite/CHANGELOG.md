@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Migration 0108 advances account storage to schema 108 with account-wide attachment seek/expiry indexes and invalidation counters. Older binaries reject the upgraded database; downgrade is unsupported.
+
+### Added
+
+- Bounded account-wide attachment pages with group/sender selections, inclusive date bounds and account/query-bound continuation cursors.
+
 ## 0.13.0 - 2026-10-12
 
 Account storage advances from migration 101 through 107 on first open; downgrade

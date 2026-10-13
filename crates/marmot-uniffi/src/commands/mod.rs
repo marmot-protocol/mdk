@@ -60,4 +60,5 @@ pub use public_event_preview::{
     PublicEventCacheKeyFfi, PublicEventCacheKeyTypeFfi, PublicEventCacheReadFfi,
     PublicEventCacheStateFfi, PublicEventDeletionFfi, PublicEventPreviewFfi,
 };
+mod account_attachment_history;
 mod startup_diagnostics;

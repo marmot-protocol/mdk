@@ -5,6 +5,7 @@
 ### Added
 
 - Verified public-event previews expose ordered cached reads, signed-candidate admission and bounded native refresh, with canonical keys and Present, AuthoritativeDeleted, Missing and Busy states. Regenerate matching Swift/Kotlin bindings with the native library.
+- Account-wide attachment candidate pages, group/sender/date queries and opaque account/query-bound cursor/version handles. Filtered empty pages can continue; source changes require restart. Existing group history and acquisition primitives are unchanged.
 - `Marmot::send_prepared_media_with_client_token` exposes captured ordinary-media admission with transactional conditional draft consumption. Use the original token and revision for live retries, recover ownership by token after interruption, and pair regenerated Swift/Kotlin bindings with the matching library. See [local sends](LOCAL-SENDS.md).
 
 ## 0.13.0 - 2026-10-12
