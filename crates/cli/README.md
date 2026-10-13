@@ -279,7 +279,7 @@ wn --account <npub-or-hex> groups subscribe-state <group-hex>
 The hidden legacy `group` namespace keeps `create`, `members`, `invite` (with `--admin`), `remove`, `update`, and
 `set-avatar-url` working.
 
-**Groups that are still catching up.** While this device's epoch-gap recovery shows the group moved on without it,
+**Groups that are still catching up.** While this device's epoch-gap recovery says the group may have moved on without it,
 group changes (membership, admins, profile, image, retention, disbanding) fail with JSON error code
 `group_catching_up`. A change from a stale epoch can split the group for everyone. Retry once the group syncs, or pass
 `--accept-stale` to make the change anyway; scheduled self-updates wait up to a day for the group to catch up.
