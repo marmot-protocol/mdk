@@ -386,6 +386,8 @@ on `MARMOT_EVENT_HISTORY_NOTICES_CHANGED`; a group's own occurrences also set
 `marmot_group_recovery_status_free`. See the
 [shared contract](../marmot-uniffi/README.md#history-may-be-incomplete-notices) for when notices appear,
 disappear and return.
+Group changes for a group with pending or parked epoch-gap recovery return
+`MARMOT_STATUS_GROUP_CATCHING_UP`; retry after it syncs or after its notice is dismissed.
 
 ## Group reporting
 

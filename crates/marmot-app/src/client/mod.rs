@@ -1352,7 +1352,8 @@ impl AppClient {
             "sweep",
             crate::ProductUnit::Attempt,
         );
-        let effects = self.runtime.run_due_maintenance().await;
+        let held = self.epoch_gap_held_groups()?;
+        let effects = self.runtime.run_due_maintenance_holding(&held).await;
         let mut activity = self.runtime.take_maintenance_activity();
         activity.absorb(previous);
         // Timed executions replace their matching count-only sample, never add
@@ -2728,6 +2729,7 @@ impl AppClient {
         telemetry: Option<&AppPerformanceTelemetry>,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
+        self.ensure_group_caught_up(group_id)?;
 
         let key_package_started_at = Instant::now();
         let requirements = self
@@ -2993,6 +2995,7 @@ impl AppClient {
         member_refs: &[&str],
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
+        self.ensure_group_caught_up(group_id)?;
         let mut members = Vec::with_capacity(member_refs.len());
         for member in member_refs {
             members.push(self.app.member_id(member)?);
@@ -3073,6 +3076,7 @@ impl AppClient {
         group_id: &GroupId,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
+        self.ensure_group_caught_up(group_id)?;
         let audit_context = Self::local_human_action_context(
             "enable_group_disbanding",
             vec!["lifecycle"],
@@ -3130,6 +3134,7 @@ impl AppClient {
         group_id: &GroupId,
     ) -> Result<AppDisbandRequest, AppError> {
         self.ensure_group(group_id)?;
+        self.ensure_group_caught_up(group_id)?;
         let audit_context = Self::local_human_action_context(
             "disband_group",
             vec!["lifecycle", "membership", "admins"],
@@ -3825,6 +3830,7 @@ impl AppClient {
         audit_context: AuditEventContext,
         wake_targets: &[String],
     ) -> Result<SendSummary, AppError> {
+        self.ensure_group_caught_up(group_id)?;
         let component = AppGroupAdminPolicyComponent::new(admins).to_app_component_data()?;
 
         self.sync_runtime_groups().await?;
@@ -3874,6 +3880,7 @@ impl AppClient {
     ) -> Result<SendSummary, AppError> {
         validate_app_component(component_id, &data)?;
         self.ensure_group(group_id)?;
+        self.ensure_group_caught_up(group_id)?;
         self.sync_runtime_groups().await?;
         // `required_capabilities` is read out of the MLS GroupContext, not
         // from local config, so any admin in the group can mark an
@@ -3946,6 +3953,7 @@ impl AppClient {
         disappearing_message_secs: u64,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
+        self.ensure_group_caught_up(group_id)?;
         let component = AppGroupMessageRetentionComponent::new(disappearing_message_secs)
             .to_app_component_data()?;
         let audit_context = Self::local_human_action_context(
@@ -3982,6 +3990,7 @@ impl AppClient {
         endpoints: Vec<AppBlobEndpoint>,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
+        self.ensure_group_caught_up(group_id)?;
         let endpoint_count = endpoints.len() as u64;
         let mut allowed_locator_kinds = Vec::new();
         for endpoint in &endpoints {
@@ -4057,6 +4066,7 @@ impl AppClient {
         thumbhash: Option<String>,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
+        self.ensure_group_caught_up(group_id)?;
         let component = match url {
             Some(url) if !url.is_empty() => {
                 AppGroupAvatarUrlComponent::new(url, dim, thumbhash)?.to_app_component_data()?
@@ -5504,6 +5514,7 @@ impl AppClient {
         media_type: &str,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group_application_messages_allowed(group_id)?;
+        self.ensure_group_caught_up(group_id)?;
         let audit_context = Self::local_human_action_context(
             "update_group_image",
             vec!["image"],
@@ -5848,6 +5859,7 @@ impl AppClient {
         }
         validate_group_profile(name.unwrap_or(""), description.unwrap_or(""))?;
         self.ensure_group(group_id)?;
+        self.ensure_group_caught_up(group_id)?;
         let mut fields = Vec::new();
         if name.is_some() {
             fields.push("name");
@@ -5903,6 +5915,50 @@ impl AppClient {
         } else {
             Err(AppError::UnknownGroup(group_id_hex))
         }
+    }
+
+    /// Refuse a group change while unresolved epoch-gap recovery says the
+    /// group moved past this device's local epoch (mdk#2258). A commit
+    /// authored from that epoch forks the group, and fork choice can then
+    /// rewind everyone else's history onto it. The pre-send sync only
+    /// re-registers subscriptions, so it cannot prove the device caught up.
+    /// The hold lifts when recovery ends the gap, when the device leaves the
+    /// stalled epoch, or when the user dismisses the group's history notice.
+    ///
+    /// Application messages and leave are not held: neither commits from the
+    /// stale epoch.
+    fn ensure_group_caught_up(&self, group_id: &GroupId) -> Result<(), AppError> {
+        let epoch = self.runtime.group_record(group_id)?.epoch;
+        if self
+            .app
+            .account_storage(&self.state.label)?
+            .epoch_gap_recovery_open_at(group_id.as_slice(), epoch.0)?
+        {
+            tracing::info!(
+                target: "marmot_app::client",
+                method = "ensure_group_caught_up",
+                "group change held while epoch-gap recovery is unresolved"
+            );
+            return Err(AppError::GroupCatchingUp(hex::encode(group_id.as_slice())));
+        }
+        Ok(())
+    }
+
+    /// Groups whose new maintenance commits [`Self::ensure_group_caught_up`]
+    /// would refuse.
+    fn epoch_gap_held_groups(&self) -> Result<Vec<GroupId>, AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
+        let mut held = Vec::new();
+        for intent in storage.pending_epoch_backfill_intents()? {
+            let group_id = GroupId::new(hex::decode(&intent.group_id_hex)?);
+            let Ok(group) = self.runtime.group_record(&group_id) else {
+                continue;
+            };
+            if intent.stalled_epoch >= group.epoch.0 && !held.contains(&group_id) {
+                held.push(group_id);
+            }
+        }
+        Ok(held)
     }
 
     /// Fail before optimistic projection, media upload, or any other

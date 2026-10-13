@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `SqliteAccountStorage::epoch_gap_recovery_open_at` reports whether a pending or parked epoch-gap obligation covers a group's local epoch.
+
 ## 0.13.0 - 2026-10-12
 
 Account storage advances from migration 101 through 107 on first open; downgrade

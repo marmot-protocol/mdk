@@ -3070,8 +3070,13 @@ fn local_epoch_progress_does_not_clear_history_or_suppress_independent_gaps() {
             )
             .unwrap()
             .unwrap();
+        // The app refuses group changes while this gap is armed (mdk#2258),
+        // so advance the epoch at the engine instead.
         client
-            .update_group_profile(&group, Some("local progress during acquisition"), None)
+            .runtime
+            .send(cgka_traits::engine::SendIntent::SelfUpdate {
+                group_id: group.clone(),
+            })
             .await
             .unwrap();
         assert!(client.group_mls_state(&group).unwrap().epoch > epoch);
@@ -23036,6 +23041,180 @@ fn presentation_quarantine_preserves_existing_chat_kind_and_direct_reuse() {
             1
         );
     });
+}
+
+fn assert_group_catching_up<T: std::fmt::Debug>(
+    result: Result<T, AppError>,
+    group_hex: &str,
+    operation: &str,
+) {
+    match result {
+        Err(AppError::GroupCatchingUp(held)) => assert_eq!(held, group_hex, "{operation}"),
+        other => panic!("{operation} must refuse while the group is behind, got {other:?}"),
+    }
+}
+
+/// mdk#2258: a device with unresolved epoch-gap recovery knows the group moved
+/// past its local epoch. Any commit it authors from there forks the group, so
+/// every group change and the maintenance self-update wait until it catches up.
+#[tokio::test]
+async fn group_changes_refuse_while_epoch_gap_recovery_holds_the_group() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("behind", &[]).await.unwrap();
+    let group_hex = hex::encode(group_id.as_slice());
+    let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
+    let storage = app.account_storage("alice").unwrap();
+    let intent = storage_sqlite::StoredEpochBackfillIntent {
+        group_id_hex: group_hex.clone(),
+        stalled_epoch: epoch.0,
+    };
+    storage
+        .arm_epoch_backfill_intents(std::slice::from_ref(&intent))
+        .unwrap();
+    let publishes = relay.published_event_ids().len();
+    let member = Keys::generate().public_key().to_hex();
+
+    assert_group_catching_up(
+        client
+            .update_group_profile(&group_id, Some("renamed"), None)
+            .await,
+        &group_hex,
+        "update_group_profile",
+    );
+    assert_group_catching_up(
+        client.invite_members(&group_id, &[member.as_str()]).await,
+        &group_hex,
+        "invite_members",
+    );
+    assert_group_catching_up(
+        client.remove_members(&group_id, &[member.as_str()]).await,
+        &group_hex,
+        "remove_members",
+    );
+    assert_group_catching_up(
+        client.promote_admin(&group_id, &member).await,
+        &group_hex,
+        "promote_admin",
+    );
+    assert_group_catching_up(
+        client.self_demote_admin(&group_id).await,
+        &group_hex,
+        "self_demote_admin",
+    );
+    assert_group_catching_up(
+        client.enable_group_disbanding(&group_id).await,
+        &group_hex,
+        "enable_group_disbanding",
+    );
+    assert_group_catching_up(
+        client.disband_group(&group_id).await,
+        &group_hex,
+        "disband_group",
+    );
+    assert_group_catching_up(
+        client.update_message_retention(&group_id, 3_600).await,
+        &group_hex,
+        "update_message_retention",
+    );
+    assert_group_catching_up(
+        client
+            .update_group_avatar_url(&group_id, None, None, None)
+            .await,
+        &group_hex,
+        "update_group_avatar_url",
+    );
+    assert_group_catching_up(
+        client
+            .replace_encrypted_media_blob_endpoints(&group_id, Vec::new())
+            .await,
+        &group_hex,
+        "replace_encrypted_media_blob_endpoints",
+    );
+    assert_group_catching_up(
+        client
+            .update_group_image(&group_id, vec![0; 4], "image/png")
+            .await,
+        &group_hex,
+        "update_group_image",
+    );
+
+    // A due self-update is held the same way rather than authored.
+    client
+        .runtime
+        .schedule_manual_self_update(&group_id)
+        .unwrap();
+    let mut obligation = client
+        .runtime
+        .session()
+        .maintenance_obligations()
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("scheduled maintenance obligation");
+    obligation.phase = cgka_traits::MaintenancePhase::Retry;
+    client
+        .runtime
+        .session()
+        .put_maintenance_obligation(&obligation)
+        .unwrap();
+    client.run_due_maintenance().await.unwrap();
+    let held = client
+        .runtime
+        .session()
+        .maintenance_obligation(&obligation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.last_failure_code.as_deref(), Some("epoch_gap_hold"));
+
+    assert_eq!(client.runtime.group_record(&group_id).unwrap().epoch, epoch);
+    assert_eq!(relay.published_event_ids().len(), publishes);
+
+    // Recovery that ends the gap lifts the hold.
+    storage
+        .clear_epoch_backfill_intents(std::slice::from_ref(&intent))
+        .unwrap();
+    client
+        .update_group_profile(&group_id, Some("renamed"), None)
+        .await
+        .unwrap();
+    assert!(client.runtime.group_record(&group_id).unwrap().epoch.0 > epoch.0);
+}
+
+/// mdk#2258: gap evidence armed at an epoch the device has since left does not
+/// hold the group; only an unresolved gap at or above the local epoch does.
+#[tokio::test]
+async fn epoch_gap_below_the_local_epoch_does_not_hold_group_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("moved on", &[]).await.unwrap();
+    let stalled = client.runtime.group_record(&group_id).unwrap().epoch;
+    client
+        .update_group_profile(&group_id, Some("first"), None)
+        .await
+        .unwrap();
+    app.account_storage("alice")
+        .unwrap()
+        .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+            group_id_hex: hex::encode(group_id.as_slice()),
+            stalled_epoch: stalled.0,
+        }])
+        .unwrap();
+    client
+        .update_group_profile(&group_id, Some("second"), None)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

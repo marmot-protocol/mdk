@@ -192,6 +192,11 @@ enum MarmotStatus
    * Local per-account moderation-report cap; retry later.
    */
   MARMOT_STATUS_MODERATION_REPORT_RATE_LIMITED = 100,
+  /**
+   * The group moved past this device and recovery has not caught it up;
+   * group changes would fork it. Retry once it has synced (mdk#2258).
+   */
+  MARMOT_STATUS_GROUP_CATCHING_UP = 101,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L

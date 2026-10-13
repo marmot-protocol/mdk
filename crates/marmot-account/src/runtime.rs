@@ -1531,6 +1531,18 @@ where
     /// have elapsed. Callers may invoke this from any timer cadence; all
     /// deadlines and sampled jitter are persisted.
     pub async fn run_due_maintenance(&mut self) -> AccountResult<AccountDeviceEffects> {
+        self.run_due_maintenance_holding(&[]).await
+    }
+
+    /// [`Self::run_due_maintenance`], but no new self-update commit is
+    /// authored for a `held` group. The caller holds a group it knows has
+    /// moved past this device's local epoch: a commit from that epoch forks the
+    /// group (mdk#2258). A held obligation stays owed and retries on a later
+    /// sweep; publication of an already-staged commit is not held.
+    pub async fn run_due_maintenance_holding(
+        &mut self,
+        held: &[GroupId],
+    ) -> AccountResult<AccountDeviceEffects> {
         use sha2::{Digest, Sha256};
 
         self.sweep_expired_key_package_private_material()?;
@@ -1960,6 +1972,12 @@ where
             {
                 obligation.phase = MaintenancePhase::Retry;
                 obligation.last_failure_code = Some("safety_gate".into());
+                self.put_maintenance_obligation_if_changed(&original_obligation, &obligation)?;
+                continue;
+            }
+            if held.contains(&obligation.group_id) {
+                obligation.phase = MaintenancePhase::Retry;
+                obligation.last_failure_code = Some("epoch_gap_hold".into());
                 self.put_maintenance_obligation_if_changed(&original_obligation, &obligation)?;
                 continue;
             }
