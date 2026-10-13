@@ -2484,6 +2484,7 @@ impl MarmotApp {
             }
         };
         let immutable_known = matches!(key, PublicEventCacheKey::EventId { .. }) && known.is_some();
+        let mut target_completed = immutable_known;
         let mut best: Option<Event> = known.cloned();
         let mut candidates: Vec<String> = Vec::new();
         // One raw-traffic meter for the whole request, shared by every relay
@@ -2501,6 +2502,7 @@ impl MarmotApp {
                     deadline - RESOLVE_DEADLINE / 2,
                 )
                 .await;
+            target_completed = outcome.completed;
             for json in outcome.events_json {
                 // Only exact signed matches are kept; others never reach admission.
                 let Some(event) = verified_event(&json, reference).filter(|event| {
@@ -2564,7 +2566,7 @@ impl MarmotApp {
         // another relay. Never turn that partial read into a durable new Present
         // selection. Keep verified deletions below: they can still suppress an
         // already-cached target. Missing evidence is never evidence of absence.
-        if !outcome.completed {
+        if !target_completed || !outcome.completed {
             candidates.clear();
         }
         for json in outcome.events_json {

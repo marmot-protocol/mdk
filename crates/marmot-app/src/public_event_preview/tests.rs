@@ -1340,6 +1340,91 @@ fn eviction_removes_whole_cohorts_and_documents_the_end_of_deletion_knowledge() 
 }
 
 #[tokio::test]
+async fn incomplete_target_relay_cannot_admit_content_after_complete_evidence() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let keys = Keys::generate();
+    let note = signed(&keys, 1, crate::unix_now_seconds(), "partial target");
+    let reference = super_reference(&note);
+    let mut urls = Vec::new();
+    let mut servers = Vec::new();
+    for complete_target in [true, false] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        urls.push(format!("ws://{}", listener.local_addr().unwrap()));
+        let note_json = note.as_json();
+        servers.push(tokio::spawn(async move {
+            let mut sockets = tokio::task::JoinSet::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                let note_json = note_json.clone();
+                sockets.spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(socket).await else {
+                        return;
+                    };
+                    while let Some(Ok(message)) = ws.next().await {
+                        let Ok(text) = message.to_text() else {
+                            continue;
+                        };
+                        let Ok(request) = serde_json::from_str::<serde_json::Value>(text) else {
+                            continue;
+                        };
+                        if request[0] != "REQ" {
+                            continue;
+                        }
+                        let subscription = request[1].as_str().unwrap();
+                        let target = request[2]["ids"].is_array();
+                        if target {
+                            if ws
+                                .send(Message::text(format!(
+                                    "[\"EVENT\",\"{subscription}\",{note_json}]"
+                                )))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            if !complete_target {
+                                // Return a verified target, then withhold EOSE.
+                                // Still answer the later evidence request fully.
+                                continue;
+                            }
+                        }
+                        if ws
+                            .send(Message::text(
+                                serde_json::json!(["EOSE", subscription]).to_string(),
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        }));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), &urls[0]);
+    let candidates = app
+        .fetch_public_event_candidates(&reference, &urls[1..], None)
+        .await;
+    for server in servers {
+        server.abort();
+        let _ = server.await;
+    }
+    assert!(
+        candidates.is_empty(),
+        "a complete evidence phase cannot make a partial target phase complete"
+    );
+    let (_cache_dir, cache) = fixture();
+    assert!(matches!(
+        cache
+            .admit_state(&reference, &candidates, crate::unix_now_seconds())
+            .unwrap(),
+        PublicEventCacheResult::Missing
+    ));
+}
+
+#[tokio::test]
 async fn truncated_deletion_read_never_admits_a_new_target() {
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
