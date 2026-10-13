@@ -1291,6 +1291,77 @@ mod tests {
         }
     }
 
+    /// Documents a latent limit risk: the strict directory fetch sends every
+    /// query of a request as one filter of ONE REQ, with no cap. Production
+    /// relays allow at most 3 filters per REQ and refuse the rest with
+    /// `invalid: too many filters`, which this path reports as incomplete.
+    /// Today's callers pass at most two queries; a fourth would fail closed.
+    #[tokio::test]
+    async fn strict_directory_fetch_puts_every_query_in_one_req() {
+        use futures::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        const MAX_FILTERS_PER_REQ: usize = 3;
+        let author = nostr::prelude::Keys::generate().public_key().to_hex();
+        for query_count in [2_usize, 4] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+            let filter_counts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = filter_counts.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(stream).await.unwrap();
+                while let Some(Ok(message)) = socket.next().await {
+                    let Message::Text(text) = message else {
+                        continue;
+                    };
+                    let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if request[0] != "REQ" {
+                        continue;
+                    }
+                    let filters = request.as_array().unwrap().len() - 2;
+                    seen.lock().unwrap().push(filters);
+                    let reply = if filters > MAX_FILTERS_PER_REQ {
+                        serde_json::json!(["CLOSED", request[1], "invalid: too many filters"])
+                    } else {
+                        serde_json::json!(["EOSE", request[1]])
+                    };
+                    if socket
+                        .send(Message::Text(reply.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+            let queries = [0_u64, 3, 10002, 10050]
+                .into_iter()
+                .take(query_count)
+                .map(|kind| DirectoryEventQuery::new(kind, vec![author.clone()], 4))
+                .collect();
+            let request = DirectoryFetchRequest::new(vec![endpoint], queries)
+                .expect("no cap on queries per request");
+            let outcome = timeout(
+                Duration::from_secs(10),
+                NostrSdkDirectoryRelayFetcher::standalone()
+                    .fetch_directory_events_with_completion(request),
+            )
+            .await
+            .expect("strict fetch completes")
+            .unwrap();
+            server.abort();
+            let filter_counts = filter_counts.lock().unwrap().clone();
+            assert_eq!(
+                filter_counts,
+                vec![query_count],
+                "one REQ carries every query"
+            );
+            assert_eq!(outcome.complete, query_count <= MAX_FILTERS_PER_REQ);
+        }
+    }
+
     #[test]
     fn directory_event_validation_rejects_invalid_signatures_and_wrong_authors() {
         use nostr_sdk::prelude::{Event, EventBuilder, FinalizeEvent, Keys};
