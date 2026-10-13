@@ -126,6 +126,10 @@ classification without SQLite's database-controlled message. Fixture provenance 
 Account-database compatibility fixtures are described in [`fixtures/README.md`](fixtures/README.md). Old binaries
 refuse an upgraded schema; downgrading a binary requires a pre-upgrade backup.
 
+Migration 0108 adds `key_package_slot_observation`, a per-account singleton containing the coalesced
+verified winner as a serialized blob. Directory writers update this separately from publication lifecycle intent;
+maintenance clears the exact adopted observation so a newer concurrent winner remains pending.
+
 ## Recovery semantics
 
 **Retained anchors** are engine/group policy, not hidden SQLite policy. `max_rewind_commits` defaults to `5` when no

@@ -161,6 +161,13 @@ requires acknowledgements from its operational relays.
 **Publication.** KeyPackage publication keeps a stable replaceable `d` tag per account and tracks the decoded
 KeyPackage ref separately. Normal publish reuses only a cached current-profile last-resort package; explicit rotate, a
 legacy cache entry, or a lifetime-policy rejection creates a new current-profile package under the same slot.
+Running-account maintenance also generates a fresh package weekly (including startup catch-up), or sooner at the
+existing expiry-based deadline or after Welcome consumption. MLS lifetimes are unchanged. The worker keeps its
+15-second maintenance tick. Superseded unconsumed current and pending bundles get a 24-hour grace for Welcomes
+already in flight, capped by MLS expiry; consumed current bundles are deleted on the first replacement ACK.
+Verified own-author winning events occupying this installation's slot are handed off through a coalesced
+observation in the account's encrypted SQLite storage. Maintenance clears only the observation it adopted. The account worker persists coalesced conflict intent and
+regenerates at most once per hour for conflicts, across restarts. Known local event echoes do not trigger rotation.
 
 **Inventory.** `account_key_package_records` / `account_key_packages` expose one current relay event per addressable
 slot in the validated fetch window. `account_key_package_relay_events` returns that window's current and superseded

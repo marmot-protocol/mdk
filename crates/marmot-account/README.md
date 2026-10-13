@@ -68,6 +68,24 @@ An obligation stays live until its next deadline is durable. After reopen, the c
 that already committed, so completing their bookkeeping does not publish another MLS commit. Repaired deadlines stay
 within the 24–36-day policy window and do not reuse failed or completed periodic obligation IDs.
 
+## KeyPackage refresh
+
+Running accounts generate a fresh package and event in their installation's persistent random `d` slot every seven
+days, or at the existing expiry-based deadline if earlier. Startup catches up overdue maintenance. MLS lifetime and
+generator policy remain unchanged. Welcome consumption still triggers replacement on the next maintenance pass
+(the managed app worker ticks every 15 seconds).
+
+Superseded unconsumed current and pending bundles remain decryptable until a newer same-slot publication is
+acknowledged, then for 24 hours from that ACK’s persisted wall-clock `replaced_at`, capped by MLS expiry. Staging or
+unsuccessful publication never starts the grace period. This deliberately short grace covers Welcomes already in flight while gap filling is unavailable; sweeps
+run even when network maintenance is paused. Consumed current bundles are deleted atomically on the first replacement
+relay ACK, and consumed retained bundles are removed by the sweep.
+
+`observe_key_package_slot_event` accepts authenticated own-author slot observations under the serialized account
+owner. Unknown strictly newer events persist a coalesced conflict intent. Maintenance regenerates into the same slot
+at most once per hour for conflicts, preserving pending publication retries, ignoring known authored echoes, and
+enforcing the existing future-skew limit. Intent clears only when an acknowledged replacement is strictly newer.
+
 ## KeyPackage generator upgrades
 
 The lifecycle records the KeyPackage generator revision independently of app versions. Records written before revision
@@ -78,8 +96,8 @@ Embedders that use `AccountDeviceRuntime` directly must drive maintenance themse
 - Fresh private material, its revision, and replacement intent are stored atomically before signing/publication.
 - Only a relay acknowledgement promotes the current revision; remaining targets keep their existing fanout retries.
 - An old pending replacement is superseded with a strictly newer authoring timestamp in the same stable slot. Its
-  private bundle is retained until expiry, because publication may already have occurred.
-- Previous unused current bundles keep their existing expiry/consumption policy.
+  private bundle is retained for 24 hours from supersession (or until MLS expiry), because publication may already have occurred.
+- Previous unused current bundles get the same 24-hour grace; consumed bundles are deleted on replacement ACK.
 - Ordinary releases do not bump the generator revision.
 - Paused maintenance can finish a prepared current-revision publication, but waits for resume before replacing an
   older pending revision, because that requires generating new private material.

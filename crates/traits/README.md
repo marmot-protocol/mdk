@@ -77,3 +77,7 @@ Versioned with the workspace; no public consumers outside it. Snapshot tests cat
 is a normal trait-evolution change for now.
 
 Agent-facing scope and file map: [`AGENTS.md`](AGENTS.md).
+
+KeyPackage lifecycle records default missing slot-conflict intent, conflict cooldown and historical authored-event
+fields when reading older serialized state. These fields track account-device publication recovery without changing
+SQL schemas or MLS lifetime policy.

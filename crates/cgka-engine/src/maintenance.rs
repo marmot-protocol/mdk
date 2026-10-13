@@ -51,6 +51,26 @@ impl<S: StorageProvider> Engine<S> {
         refresh_lead_secs: u64,
         targets: Vec<TransportFanoutTarget>,
     ) -> Result<KeyPackage, EngineError> {
+        let now = self.wall_clock.now();
+        self.stage_key_package_replacement_at(
+            state,
+            authored_created_at,
+            now,
+            refresh_lead_secs,
+            targets,
+        )
+    }
+
+    /// Stage a replacement without confirming relay replacement. The staging time
+    /// argument is retained for API compatibility; retention starts only at ACK.
+    pub fn stage_key_package_replacement_at(
+        &mut self,
+        state: &mut KeyPackageLifecycleState,
+        authored_created_at: Timestamp,
+        _superseded_at: Timestamp,
+        refresh_lead_secs: u64,
+        targets: Vec<TransportFanoutTarget>,
+    ) -> Result<KeyPackage, EngineError> {
         let (staged, key_package) = self.storage.with_transaction(|storage| {
             let key_package = self.build_fresh_key_package(storage)?;
             let metadata = crate::key_package::key_package_metadata(&key_package)?;
@@ -65,7 +85,7 @@ impl<S: StorageProvider> Engine<S> {
                         key_package: previous.key_package,
                         key_package_ref: previous.key_package_ref,
                         not_after: previous.not_after,
-                        replaced_at: authored_created_at,
+                        replaced_at: None,
                     });
             }
             staged.pending_replacement = Some(PendingKeyPackageReplacement {

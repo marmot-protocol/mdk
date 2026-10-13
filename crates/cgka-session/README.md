@@ -30,7 +30,8 @@ the default.
 - Exposes convergence advancement (`advance_convergence`, `advance_convergence_inputs`) so queued outbound work can be
   regenerated from canonical state.
 - Exposes durable maintenance, KeyPackage-lifecycle, group-evolution, and transport-fanout records for the account
-  layer above it.
+  layer above it. `stage_key_package_replacement_at` preserves superseded pending bundles without starting their
+  retention grace; the account layer records actual wall-clock time when a newer same-slot publication is ACKed.
 - Provides compact `group_authority` reads and `with_group_authority_snapshot` for composing host-owned persisted
   reads with current engine facts on this session's store. The callback is synchronous and read-only; unhydrated groups
   return `GroupNotHydrated`. It does not serve a frozen startup snapshot or start relay work.

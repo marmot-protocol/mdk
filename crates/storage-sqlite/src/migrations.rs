@@ -228,6 +228,8 @@ mod migration_0105_file_attachment_partials;
 mod migration_0106_retained_attachment_chunks;
 #[path = "migrations/0107_moderation_report_outbox.rs"]
 mod migration_0107_moderation_report_outbox;
+#[path = "migrations/0108_key_package_slot_observation.rs"]
+mod migration_0108_key_package_slot_observation;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -888,6 +890,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0107_moderation_report_outbox",
         suspend_foreign_keys: &[],
         apply: migration_0107_moderation_report_outbox::apply,
+    },
+    Migration {
+        version: 108,
+        name: "0108_key_package_slot_observation",
+        suspend_foreign_keys: &[],
+        apply: migration_0108_key_package_slot_observation::apply,
     },
 ];
 
@@ -4391,6 +4399,53 @@ mod poll_response_edge_tests {
             )
             .unwrap(),
             1
+        );
+    }
+}
+
+#[cfg(test)]
+mod slot_observation_migration_tests {
+    use super::*;
+
+    #[test]
+    fn slot_observation_migration_is_transactional_and_preserves_lifecycle() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        // Versions 1-107 are the schema immediately before 0108.
+        run(&mut conn, &MIGRATIONS[..107]).unwrap();
+        conn.execute(
+            "INSERT INTO cgka_key_package_lifecycle(singleton, record) VALUES(1, ?1)",
+            [b"unchanged".as_slice()],
+        )
+        .unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            migration_0108_key_package_slot_observation::apply(&tx).unwrap();
+            tx.rollback().unwrap();
+        }
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'key_package_slot_observation'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(applied_name(&conn, 108).unwrap(), None);
+        run_all(&mut conn).unwrap();
+        assert!(applied_name(&conn, 108).unwrap().is_some());
+        assert_eq!(run_all(&mut conn).unwrap(), 0);
+        let bytes: Vec<u8> = conn
+            .query_row("SELECT record FROM cgka_key_package_lifecycle", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(bytes, b"unchanged");
+        assert!(
+            conn.execute(
+                "INSERT INTO key_package_slot_observation VALUES(2, X'00')",
+                []
+            )
+            .is_err()
         );
     }
 }

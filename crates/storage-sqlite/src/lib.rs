@@ -36,6 +36,8 @@ pub use delivery_spill::{
     SpilledDeliveryDeferral,
 };
 mod encrypted_media_secrets;
+mod key_package_slot_observation;
+pub use key_package_slot_observation::KeyPackageSlotObservation;
 mod local_submissions;
 mod message_drafts;
 pub use local_submissions::LocalSubmission;

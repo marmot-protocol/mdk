@@ -14,6 +14,7 @@ use cgka_engine::key_package::key_package_metadata;
 use cgka_traits::app_components::PRIVATE_USE_APP_COMPONENT_ID_START;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::group::ProtocolProfile;
+use cgka_traits::transport::Timestamp;
 use cgka_traits::{MessageId, TransportEndpoint};
 use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
@@ -618,9 +619,12 @@ fn relay_slot_key(record: &AccountKeyPackageRecord) -> Option<(&str, &str)> {
 }
 
 fn relay_event_id_cmp(left: &AccountKeyPackageRecord, right: &AccountKeyPackageRecord) -> bool {
-    right.published_at > left.published_at
-        || (right.published_at == left.published_at
-            && right.key_package_event_id < left.key_package_event_id)
+    cgka_traits::maintenance::publication_event_wins(
+        Timestamp(right.published_at),
+        right.key_package_event_id.as_bytes(),
+        Timestamp(left.published_at),
+        left.key_package_event_id.as_bytes(),
+    )
 }
 
 /// Deduplicate validated relay rows by exact event ID and union their
@@ -1539,7 +1543,7 @@ mod tests {
             key_package: KeyPackage::new(vec![1]),
             key_package_ref: retained.clone(),
             not_after: Timestamp(2),
-            replaced_at: Timestamp(1),
+            replaced_at: Some(Timestamp(1)),
         }];
 
         assert_eq!(

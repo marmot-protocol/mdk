@@ -29,7 +29,7 @@ use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage};
 use cgka_traits::maintenance::{
     DurableGroupEvolution, DurableTransportFanout, GroupEvolutionPhase, GroupMaintenanceState,
-    KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase, PeriodicMaintenancePolicy,
+    KeyPackageLifecycleState, MaintenanceObligation, PeriodicMaintenancePolicy,
 };
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
@@ -1833,25 +1833,7 @@ fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
     .peeler(Box::new(MockPeeler))
     .build()
     .unwrap();
-    let mut state = KeyPackageLifecycleState {
-        stable_slot_id: "stable-slot".into(),
-        phase: MaintenancePhase::Complete,
-        current_key_package: None,
-        current_key_package_ref: None,
-        current_not_before: None,
-        current_not_after: None,
-        authored_event_id: None,
-        authored_event_created_at: None,
-        authored_signed_event: None,
-        publication_targets: Vec::new(),
-        refresh_at: None,
-        upgrade_rotation_recorded: false,
-        generation_revision: 0,
-        last_consumed_key_package_ref: None,
-        last_consumed_at: None,
-        retained_private_material: Vec::new(),
-        pending_replacement: None,
-    };
+    let mut state = KeyPackageLifecycleState::slot_only("stable-slot".into());
 
     lifecycle_fault.arm(1);
     engine
@@ -1893,6 +1875,7 @@ fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
         state.retained_private_material[0].key_package,
         old_state.pending_replacement.unwrap().key_package
     );
+    assert_eq!(state.retained_private_material[0].replaced_at, None);
     assert_eq!(handle.stored_key_package_bundles().unwrap().len(), 2);
 }
 

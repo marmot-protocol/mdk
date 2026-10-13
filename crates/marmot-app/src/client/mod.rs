@@ -1318,6 +1318,20 @@ impl AppClient {
                 .maintenance_run_summary(&marmot_account::AccountDeviceEffects::default())?;
             return Ok(maintenance_run_summary_from_account(summary));
         }
+        // Directory ingestion never writes a lifecycle held across relay awaits.
+        // Adopt its durable coalesced observation under this serialized account owner.
+        if let Some(observed) = self
+            .app
+            .own_key_package_slot_observation(&self.state.label)?
+        {
+            self.runtime.observe_key_package_slot_event(
+                &observed.slot_id,
+                &observed.event_id,
+                observed.created_at,
+            )?;
+            self.app
+                .clear_own_key_package_slot_observation(&self.state.label, &observed)?;
+        }
         // Drain edges between ticks too. A new consent generation establishes a
         // baseline so earlier local work cannot become a post-consent backlog.
         let mut previous = self.runtime.take_maintenance_activity();

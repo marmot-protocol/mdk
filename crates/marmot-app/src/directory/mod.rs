@@ -28,3 +28,5 @@ pub use search::{
 #[cfg(test)]
 pub(crate) use sync::DirectorySyncBatch;
 pub(crate) use sync::{DirectorySyncHandle, DirectorySyncPlan};
+
+mod slot_observations;

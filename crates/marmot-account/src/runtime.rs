@@ -33,7 +33,7 @@ use cgka_traits::maintenance::{
 };
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
-    EpochId, FanoutMlsState, FanoutPendingKind, GroupId, MemberId, MessageState,
+    EpochId, FanoutMlsState, FanoutPendingKind, GroupId, MemberId, MessageId, MessageState,
     OutboundApplicationMessage, OutboundFanout, OutboundFanoutOutcome, StorageError, Timestamp,
     TransportAccountActivation, TransportAdapter, TransportAdapterError, TransportDelivery,
     TransportEndpoint, TransportEndpointAckKind, TransportEndpointFailure,
@@ -62,6 +62,14 @@ use crate::time::{
 const TRACE_TARGET: &str = "marmot_account::runtime";
 const WELCOME_PUBLISH_CONCURRENCY: usize = 8;
 const KEY_PACKAGE_MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
+/// Refresh the installation's slot age weekly without changing MLS lifetime policy.
+const KEY_PACKAGE_REPUBLISH_INTERVAL: u64 = 7 * 24 * 60 * 60;
+/// A short grace for Welcomes already in flight because gap filling does not
+/// exist yet; retain superseded unconsumed bundles for 24 hours after the
+/// first accepted newer same-slot publication, capped by MLS expiry.
+const REPLACED_KEY_PACKAGE_RETENTION: u64 = 24 * 60 * 60;
+/// Bound forced regeneration in a contested slot, including across restarts.
+const KEY_PACKAGE_SLOT_CONFLICT_REPUBLISH_INTERVAL: u64 = 60 * 60;
 const KEY_PACKAGE_REFRESH_MIN_LEAD_SECS: u64 = 14 * 24 * 60 * 60;
 const KEY_PACKAGE_REFRESH_MAX_LEAD_SECS: u64 = 21 * 24 * 60 * 60;
 const MAINTENANCE_EOSE_TIMEOUT_SECS: u64 = 5 * 60;
@@ -847,25 +855,7 @@ where
                             "key package slot is uninitialized; provision a durable slot before publication",
                         )
                     })?;
-                KeyPackageLifecycleState {
-                    stable_slot_id,
-                    phase: cgka_traits::MaintenancePhase::Complete,
-                    current_key_package: None,
-                    current_key_package_ref: None,
-                    current_not_before: None,
-                    current_not_after: None,
-                    authored_event_id: None,
-                    authored_event_created_at: None,
-                    authored_signed_event: None,
-                    publication_targets: Vec::new(),
-                    refresh_at: None,
-                    upgrade_rotation_recorded: false,
-                    generation_revision: 0,
-                    last_consumed_key_package_ref: None,
-                    last_consumed_at: None,
-                    retained_private_material: Vec::new(),
-                    pending_replacement: None,
-                }
+                KeyPackageLifecycleState::slot_only(stable_slot_id)
             }
         };
         if lifecycle.stable_slot_id.is_empty() {
@@ -879,11 +869,14 @@ where
             .pending_replacement
             .as_ref()
             .is_none_or(|pending| pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION)
+            || key_package_pending_conflict_replacement_due(&lifecycle, now)
         {
             let created_at = Timestamp(
                 lifecycle
                     .authored_event_created_at
                     .into_iter()
+                    .chain(lifecycle.slot_conflict_created_at)
+                    .chain(lifecycle.historical_authored_event_created_at)
                     .chain(
                         lifecycle
                             .pending_replacement
@@ -904,9 +897,13 @@ where
                 KEY_PACKAGE_REFRESH_MIN_LEAD_SECS,
                 KEY_PACKAGE_REFRESH_MAX_LEAD_SECS,
             );
-            self.session.stage_key_package_replacement(
+            if key_package_slot_conflict_due(&lifecycle, now) {
+                lifecycle.last_slot_conflict_republish_at = Some(now);
+            }
+            self.session.stage_key_package_replacement_at(
                 &mut lifecycle,
                 created_at,
+                now,
                 lead,
                 endpoints
                     .into_iter()
@@ -942,6 +939,12 @@ where
                     .collect(),
             };
             let artifact = self.key_packages.prepare_key_package(publication).await?;
+            // Each staged timestamp strictly advances the local floor, even without ACKs.
+            lifecycle.historical_authored_event_ids.clear();
+            lifecycle
+                .historical_authored_event_ids
+                .push(artifact.id.clone());
+            lifecycle.historical_authored_event_created_at = Some(artifact.created_at);
             lifecycle
                 .pending_replacement
                 .as_mut()
@@ -1054,6 +1057,13 @@ where
             &receipt.failed,
             self.wall_clock.now(),
         );
+        // All retained bundles belong to this stable slot and precede the
+        // strictly newer pending artifact. Start only unstamped grace periods;
+        // subsequent promotions and fanout ACKs must not extend earlier ones.
+        let acknowledged_at = self.wall_clock.now();
+        for material in &mut lifecycle.retained_private_material {
+            material.replaced_at.get_or_insert(acknowledged_at);
+        }
         let previous = lifecycle.current_key_package.clone();
         let previous_was_consumed = lifecycle.current_key_package_ref.is_some()
             && lifecycle.current_key_package_ref == lifecycle.last_consumed_key_package_ref;
@@ -1070,13 +1080,24 @@ where
                     key_package,
                     key_package_ref,
                     not_after,
-                    replaced_at: self.wall_clock.now(),
+                    replaced_at: Some(acknowledged_at),
                 });
         }
         lifecycle.current_key_package = Some(replacement.key_package.clone());
         lifecycle.current_key_package_ref = Some(replacement.key_package_ref);
         lifecycle.current_not_before = Some(replacement.not_before);
         lifecycle.current_not_after = Some(replacement.not_after);
+        if lifecycle
+            .slot_conflict_created_at
+            .is_some_and(|observed| observed < artifact.created_at)
+        {
+            lifecycle.slot_conflict_created_at = None;
+            lifecycle.slot_conflict_event_id = None;
+        }
+        // Preparation always authors strictly above current and pending times.
+        // All prior local identities therefore lose against this acknowledged floor.
+        lifecycle.historical_authored_event_ids.clear();
+        lifecycle.historical_authored_event_created_at = None;
         lifecycle.authored_event_id = Some(artifact.id.clone());
         lifecycle.authored_event_created_at = Some(artifact.created_at);
         lifecycle.authored_signed_event = Some(artifact);
@@ -1142,6 +1163,7 @@ where
             Some(lifecycle) => match lifecycle.pending_replacement.as_ref() {
                 Some(pending) => {
                     pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION
+                        || key_package_pending_conflict_replacement_due(&lifecycle, now)
                         || pending.signed_event.is_none()
                         || pending
                             .targets
@@ -1153,11 +1175,35 @@ where
                         || lifecycle.last_consumed_key_package_ref
                             == lifecycle.current_key_package_ref
                         || lifecycle.refresh_at.is_some_and(|deadline| deadline <= now)
+                        || key_package_weekly_refresh_due(&lifecycle, now)
+                        || key_package_slot_conflict_due(&lifecycle, now)
                         || !lifecycle.upgrade_rotation_recorded
                         || lifecycle.generation_revision < KEY_PACKAGE_GENERATION_REVISION
                 }
             },
         })
+    }
+
+    /// Observe an authenticated own-author event selected for this installation's
+    /// slot by the transport boundary. Unknown winning events coalesce
+    /// into durable intent; known local artifacts and losing events are ignored.
+    /// Call under the account's serialized owner, never from a directory writer.
+    pub fn observe_key_package_slot_event(
+        &mut self,
+        slot_id: &str,
+        event_id: &MessageId,
+        created_at: Timestamp,
+    ) -> AccountResult<()> {
+        let Some(mut lifecycle) = self.session.key_package_lifecycle()? else {
+            return Ok(());
+        };
+        if !lifecycle.is_foreign_slot_winner(slot_id, event_id, created_at) {
+            return Ok(());
+        }
+        lifecycle.slot_conflict_created_at = Some(created_at);
+        lifecycle.slot_conflict_event_id = Some(event_id.clone());
+        self.session.put_key_package_lifecycle(&lifecycle)?;
+        Ok(())
     }
 
     pub fn key_package_has_pending_fanout(&self) -> AccountResult<bool> {
@@ -1259,13 +1305,15 @@ where
                     && lifecycle.last_consumed_key_package_ref != lifecycle.current_key_package_ref
                     && (lifecycle.current_key_package.is_none()
                         || lifecycle.refresh_at.is_some_and(|deadline| deadline <= now)
+                        || key_package_weekly_refresh_due(&lifecycle, now)
+                        || key_package_slot_conflict_due(&lifecycle, now)
                         || !lifecycle.upgrade_rotation_recorded
                         || lifecycle.generation_revision < KEY_PACKAGE_GENERATION_REVISION)
             }
         })
     }
 
-    /// Delete expired private init-key material even when network maintenance
+    /// Delete expired or retired private init-key material even when network maintenance
     /// is paused or transport cursor persistence is frozen.
     pub fn sweep_expired_key_package_private_material(&mut self) -> AccountResult<usize> {
         let now = self.wall_clock.now();
@@ -1302,7 +1350,15 @@ where
         for material in lifecycle.retained_private_material.drain(..) {
             let was_consumed = consumed_ref
                 .is_some_and(|consumed| consumed == material.key_package_ref.as_slice());
-            if material.not_after <= now || was_consumed {
+            if material.not_after <= now
+                || material.replaced_at.is_some_and(|acknowledged_at| {
+                    acknowledged_at
+                        .0
+                        .saturating_add(REPLACED_KEY_PACKAGE_RETENTION)
+                        <= now.0
+                })
+                || was_consumed
+            {
                 consumed_retained_deleted |= was_consumed;
                 retired.push(material.key_package);
             } else {
@@ -1581,15 +1637,16 @@ where
         }
         let key_package_due = self.key_package_network_maintenance_due()?;
         // Paused maintenance may finish existing publication intent, but an
-        // obsolete pending generator revision requires fresh private material
-        // and therefore waits for resume like every other new preparation.
+        // obsolete generator revision or losing slot artifact requires fresh
+        // private material and waits for resume like every other new preparation.
         let key_package_prepared = self
             .session
             .key_package_lifecycle()?
             .is_some_and(|lifecycle| {
-                lifecycle.pending_replacement.is_some_and(|pending| {
-                    pending.generation_revision >= KEY_PACKAGE_GENERATION_REVISION
-                })
+                !key_package_pending_conflict_replacement_due(&lifecycle, now)
+                    && lifecycle.pending_replacement.is_some_and(|pending| {
+                        pending.generation_revision >= KEY_PACKAGE_GENERATION_REVISION
+                    })
             });
         if key_package_due && (!self.maintenance_paused || key_package_prepared) {
             let started = self.monotonic_clock.elapsed();
@@ -5722,6 +5779,49 @@ fn v5_failed_endpoint_result(
         failure_kind: Some(failure_kind),
         rejection_category,
     })
+}
+
+fn key_package_weekly_refresh_due(lifecycle: &KeyPackageLifecycleState, now: Timestamp) -> bool {
+    lifecycle
+        .authored_event_created_at
+        .is_some_and(|authored| authored.0.saturating_add(KEY_PACKAGE_REPUBLISH_INTERVAL) <= now.0)
+}
+
+fn key_package_pending_conflict_replacement_due(
+    lifecycle: &KeyPackageLifecycleState,
+    now: Timestamp,
+) -> bool {
+    key_package_slot_conflict_due(lifecycle, now)
+        && lifecycle
+            .pending_replacement
+            .as_ref()
+            .is_some_and(|pending| {
+                let observed = lifecycle.slot_conflict_created_at.expect("conflict is due");
+                observed > pending.authored_created_at
+                    || (observed == pending.authored_created_at
+                        && lifecycle.slot_conflict_event_id.as_ref().is_some_and(|id| {
+                            pending.signed_event.as_ref().is_some_and(|artifact| {
+                                cgka_traits::maintenance::publication_event_wins(
+                                    observed,
+                                    id.as_slice(),
+                                    artifact.created_at,
+                                    artifact.id.as_slice(),
+                                )
+                            })
+                        }))
+            })
+}
+
+fn key_package_slot_conflict_due(lifecycle: &KeyPackageLifecycleState, now: Timestamp) -> bool {
+    lifecycle.slot_conflict_created_at.is_some()
+        && lifecycle
+            .last_slot_conflict_republish_at
+            .is_none_or(|previous| {
+                previous
+                    .0
+                    .saturating_add(KEY_PACKAGE_SLOT_CONFLICT_REPUBLISH_INTERVAL)
+                    <= now.0
+            })
 }
 
 #[cfg(test)]

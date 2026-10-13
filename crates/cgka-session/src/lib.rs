@@ -529,6 +529,25 @@ impl AccountDeviceSession {
         )?)
     }
 
+    /// Stage without confirming relay replacement. The wall-time argument is
+    /// retained for compatibility; superseded retention starts at a newer ACK.
+    pub fn stage_key_package_replacement_at(
+        &mut self,
+        state: &mut KeyPackageLifecycleState,
+        authored_created_at: cgka_traits::Timestamp,
+        superseded_at: cgka_traits::Timestamp,
+        refresh_lead_secs: u64,
+        targets: Vec<TransportFanoutTarget>,
+    ) -> SessionResult<KeyPackage> {
+        Ok(self.engine.stage_key_package_replacement_at(
+            state,
+            authored_created_at,
+            superseded_at,
+            refresh_lead_secs,
+            targets,
+        )?)
+    }
+
     pub fn promote_key_package_lifecycle(
         &mut self,
         retired: &[KeyPackage],

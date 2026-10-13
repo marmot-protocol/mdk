@@ -23685,3 +23685,389 @@ fn group_create_relay_options_preserve_defaults_and_enforce_host_safety() {
         ));
     }
 }
+
+#[tokio::test]
+async fn directory_own_slot_observation_is_verified_coalesced_and_durable() {
+    use cgka_traits::storage::MaintenanceStorage;
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    let package = fresh_key_package_for_account(&app, &account, false).await;
+    let unsigned = member_resolution_key_package_event(&account, package);
+    let keys = home.load_signing_keys(&account.label).unwrap();
+    let timestamp = unix_now_seconds();
+    let signed = |created_at| {
+        let event = EventBuilder::new(
+            Kind::from(KIND_MARMOT_KEY_PACKAGE as u16),
+            unsigned.content.clone(),
+        )
+        .tags(
+            unsigned
+                .tags
+                .iter()
+                .map(|tag| Tag::parse(tag.clone()).unwrap()),
+        )
+        .custom_created_at(NostrTimestamp::from(created_at))
+        .finalize(&keys)
+        .unwrap();
+        NostrTransportEvent::from_nostr_event(&event).unwrap()
+    };
+    let lifecycle = cgka_traits::KeyPackageLifecycleState::slot_only(
+        unsigned.tag_value("d").unwrap().to_owned(),
+    );
+    app.account_storage(&account.label)
+        .unwrap()
+        .put_key_package_lifecycle(&lifecycle)
+        .unwrap();
+    let record = |event| crate::relay_plane::DirectoryRelayEventRecord {
+        endpoints: vec![TransportEndpoint("wss://relay.example".into())],
+        event,
+    };
+    let mut forged = signed(timestamp);
+    forged.sig = Some("00".repeat(64));
+    app.ingest_directory_relay_event(record(forged)).unwrap();
+    assert!(
+        app.own_key_package_slot_observation(&account.label)
+            .unwrap()
+            .is_none()
+    );
+    let mut other_slot = unsigned.clone();
+    other_slot
+        .tags
+        .retain(|tag| tag.first().is_none_or(|name| name != "d"));
+    other_slot
+        .tags
+        .push(vec!["d".into(), "another-installation".into()]);
+    let event = EventBuilder::new(
+        Kind::from(KIND_MARMOT_KEY_PACKAGE as u16),
+        other_slot.content,
+    )
+    .tags(
+        other_slot
+            .tags
+            .into_iter()
+            .map(|tag| Tag::parse(tag).unwrap()),
+    )
+    .custom_created_at(NostrTimestamp::from(timestamp))
+    .finalize(&keys)
+    .unwrap();
+    app.ingest_directory_relay_event(record(
+        NostrTransportEvent::from_nostr_event(&event).unwrap(),
+    ))
+    .unwrap();
+    assert!(
+        app.own_key_package_slot_observation(&account.label)
+            .unwrap()
+            .is_none()
+    );
+    let winner = signed(timestamp);
+    app.ingest_directory_relay_event(record(winner.clone()))
+        .unwrap();
+    // Neither a duplicate nor an older event can overwrite the persisted winner.
+    app.ingest_directory_relay_event(record(winner.clone()))
+        .unwrap();
+    app.ingest_directory_relay_event(record(signed(timestamp - 1)))
+        .unwrap();
+    let observed = app
+        .own_key_package_slot_observation(&account.label)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        observed.event_id.as_slice(),
+        hex::decode(&winner.id).unwrap()
+    );
+    assert_eq!(observed.created_at, Timestamp(timestamp));
+    assert_eq!(
+        app.account_storage(&account.label)
+            .unwrap()
+            .key_package_lifecycle()
+            .unwrap(),
+        Some(lifecycle.clone())
+    );
+    // Distinct signed events at the same second: the lowest ID wins.
+    let mut variants = (0..8)
+        .map(|nonce| {
+            let event = EventBuilder::new(
+                Kind::from(KIND_MARMOT_KEY_PACKAGE as u16),
+                unsigned.content.clone(),
+            )
+            .tags(
+                unsigned
+                    .tags
+                    .iter()
+                    .map(|tag| Tag::parse(tag.clone()).unwrap()),
+            )
+            .tag(Tag::parse(vec!["test-nonce".to_owned(), nonce.to_string()]).unwrap())
+            .custom_created_at(NostrTimestamp::from(timestamp))
+            .finalize(&keys)
+            .unwrap();
+            NostrTransportEvent::from_nostr_event(&event).unwrap()
+        })
+        .collect::<Vec<_>>();
+    variants.push(winner);
+    variants.sort_by(|left, right| left.id.cmp(&right.id));
+    let lowest = variants.first().unwrap();
+    for event in variants.iter().rev() {
+        app.ingest_directory_relay_event(record(event.clone()))
+            .unwrap();
+    }
+    let observed = app
+        .own_key_package_slot_observation(&account.label)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        observed.event_id.as_slice(),
+        hex::decode(&lowest.id).unwrap()
+    );
+    // The lifecycle floor also uses the tie-break, and genuine own echoes lose.
+    let own_event = &variants[4];
+    let mut floor = lifecycle.clone();
+    floor.authored_event_created_at = Some(Timestamp(timestamp));
+    floor.authored_event_id = Some(MessageId::new(hex::decode(&own_event.id).unwrap()));
+    app.account_storage(&account.label)
+        .unwrap()
+        .put_key_package_lifecycle(&floor)
+        .unwrap();
+    app.clear_own_key_package_slot_observation(&account.label, &observed)
+        .unwrap();
+    app.ingest_directory_relay_event(record(own_event.clone()))
+        .unwrap();
+    app.ingest_directory_relay_event(record(variants.last().unwrap().clone()))
+        .unwrap();
+    assert!(
+        app.own_key_package_slot_observation(&account.label)
+            .unwrap()
+            .is_none()
+    );
+    app.ingest_directory_relay_event(record(lowest.clone()))
+        .unwrap();
+    assert_eq!(
+        app.own_key_package_slot_observation(&account.label)
+            .unwrap()
+            .unwrap()
+            .event_id,
+        observed.event_id
+    );
+    drop(app);
+    let reopened = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    assert_eq!(
+        reopened
+            .own_key_package_slot_observation(&account.label)
+            .unwrap()
+            .unwrap()
+            .event_id,
+        observed.event_id
+    );
+}
+
+#[tokio::test]
+async fn directory_own_slot_observation_failure_still_caches_key_package() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    let package = fresh_key_package_for_account(&app, &account, false).await;
+    let package_hex = hex::encode(package.bytes());
+    let unsigned = member_resolution_key_package_event(&account, package);
+    let keys = home.load_signing_keys(&account.label).unwrap();
+    let signed = EventBuilder::new(Kind::from(KIND_MARMOT_KEY_PACKAGE as u16), unsigned.content)
+        .tags(
+            unsigned
+                .tags
+                .into_iter()
+                .map(|tag| Tag::parse(tag).unwrap()),
+        )
+        .finalize(&keys)
+        .unwrap();
+    let event = NostrTransportEvent::from_nostr_event(&signed).unwrap();
+    let event_id = event.id.clone();
+
+    // Close only the session database: the best-effort observation must fail,
+    // while the independent directory stores remain available for caching.
+    app.account_storage(&account.label)
+        .unwrap()
+        .close()
+        .unwrap();
+    assert!(matches!(
+        app.remember_own_key_package_slot_observation(&event),
+        Err(AppError::Storage(cgka_traits::StorageError::Closed(_)))
+    ));
+    assert!(
+        app.directory_entry_for_account_id(&account.account_id_hex)
+            .unwrap()
+            .is_none_or(|entry| entry.key_package.is_none())
+    );
+
+    app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+        endpoints: vec![TransportEndpoint("wss://relay.example".into())],
+        event,
+    })
+    .unwrap();
+    let cached = app
+        .directory_entry_for_account_id(&account.account_id_hex)
+        .unwrap()
+        .unwrap()
+        .key_package
+        .unwrap();
+    assert_eq!(cached.key_package_event_id, event_id);
+    assert_eq!(cached.key_package_hex, package_hex);
+}
+
+#[tokio::test]
+async fn directory_tracked_public_key_package_does_not_open_account_storage() {
+    let remote_directory = tempfile::tempdir().unwrap();
+    let remote_app = MarmotApp::with_relay(remote_directory.path(), "wss://relay.example");
+    let remote = remote_app.account_home().create_account("remote").unwrap();
+    let package = fresh_key_package_for_account(&remote_app, &remote, false).await;
+    let unsigned = member_resolution_key_package_event(&remote, package);
+    let keys = remote_app
+        .account_home()
+        .load_signing_keys(&remote.label)
+        .unwrap();
+    let signed = EventBuilder::new(Kind::from(KIND_MARMOT_KEY_PACKAGE as u16), unsigned.content)
+        .tags(
+            unsigned
+                .tags
+                .into_iter()
+                .map(|tag| Tag::parse(tag).unwrap()),
+        )
+        .finalize(&keys)
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    let tracked = app
+        .account_home()
+        .add_public_account(&remote.account_id_hex)
+        .unwrap();
+    assert!(!tracked.local_signing && !tracked.external_signing);
+    app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+        endpoints: vec![TransportEndpoint("wss://relay.example".into())],
+        event: NostrTransportEvent::from_nostr_event(&signed).unwrap(),
+    })
+    .unwrap();
+    assert!(!app.account_storage_cached_for_test(&tracked.label));
+    assert!(
+        !app.account_dir(&tracked.label)
+            .join(SESSION_DB_FILE)
+            .exists()
+    );
+    assert!(
+        app.directory_entry_for_account_id(&remote.account_id_hex)
+            .unwrap()
+            .unwrap()
+            .key_package
+            .is_some()
+    );
+}
+
+#[test]
+fn round_two_slot_observation_old_owner_cannot_read_after_close_reopen() {
+    use cgka_traits::storage::MaintenanceStorage;
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let account = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    app.account_storage(&account.label)
+        .unwrap()
+        .put_key_package_lifecycle(&cgka_traits::KeyPackageLifecycleState::slot_only(
+            "race-slot".into(),
+        ))
+        .unwrap();
+    let stale = app.clone();
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    let barrier = resume.clone();
+    let old_task = std::thread::spawn(move || {
+        barrier.wait();
+        stale.own_key_package_slot_observation("alice")
+    });
+    app.close_storage().unwrap();
+    let reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let keys = home.load_signing_keys("alice").unwrap();
+    let event = EventBuilder::new(Kind::from(KIND_MARMOT_KEY_PACKAGE as u16), "race")
+        .tag(Tag::parse(vec!["d".to_owned(), "race-slot".to_owned()]).unwrap())
+        .finalize(&keys)
+        .unwrap();
+    reopened
+        .remember_own_key_package_slot_observation(
+            &NostrTransportEvent::from_nostr_event(&event).unwrap(),
+        )
+        .unwrap();
+    let valid = reopened
+        .own_key_package_slot_observation("alice")
+        .unwrap()
+        .unwrap();
+    assert!(
+        app.clear_own_key_package_slot_observation("alice", &valid)
+            .is_err()
+    );
+    assert!(
+        app.remember_own_key_package_slot_observation(
+            &NostrTransportEvent::from_nostr_event(&event).unwrap()
+        )
+        .is_err()
+    );
+    resume.wait();
+    assert!(
+        old_task.join().unwrap().is_err(),
+        "terminal owner must reject a resumed read"
+    );
+    assert_eq!(
+        reopened
+            .own_key_package_slot_observation("alice")
+            .unwrap()
+            .unwrap()
+            .event_id
+            .as_slice(),
+        event.id.as_bytes()
+    );
+}
+
+#[tokio::test]
+async fn slot_observation_maintenance_adopts_then_clears_durable_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    client.pause_maintenance();
+    client
+        .runtime
+        .session()
+        .put_key_package_lifecycle(&cgka_traits::KeyPackageLifecycleState::slot_only(
+            "adopt-slot".into(),
+        ))
+        .unwrap();
+    let keys = home.load_signing_keys("alice").unwrap();
+    let event = EventBuilder::new(Kind::from(KIND_MARMOT_KEY_PACKAGE as u16), "observation")
+        .tag(Tag::parse(vec!["d".to_owned(), "adopt-slot".to_owned()]).unwrap())
+        .finalize(&keys)
+        .unwrap();
+    app.remember_own_key_package_slot_observation(
+        &NostrTransportEvent::from_nostr_event(&event).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        app.own_key_package_slot_observation("alice")
+            .unwrap()
+            .is_some()
+    );
+    client.run_due_maintenance().await.unwrap();
+    assert!(
+        app.own_key_package_slot_observation("alice")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        client
+            .runtime
+            .key_package_maintenance_status()
+            .unwrap()
+            .unwrap()
+            .slot_conflict_event_id
+            .unwrap()
+            .as_slice(),
+        event.id.as_bytes()
+    );
+}

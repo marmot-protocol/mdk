@@ -5174,7 +5174,7 @@ impl MarmotApp {
                     .find(|retained| retained.key_package_ref == key_package_ref)
                 {
                     key_package_id = lifecycle.stable_slot_id.clone();
-                    published_at = retained.replaced_at.0;
+                    published_at = retained.replaced_at.map(|ack| ack.0).unwrap_or_default();
                 }
             }
 

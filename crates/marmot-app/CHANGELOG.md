@@ -4,6 +4,17 @@
 
 - `MarmotAppRuntime::submit_prepared_media_snapshot` admits the captured ordinary-media payload with a stable token and consumes only its unchanged captured draft in the same transaction. Newer or cleared drafts cannot replace the payload or block admission.
 
+### Added
+
+- Running accounts refresh KeyPackages with fresh events weekly in the same installation slot, including startup
+  catch-up. Verified foreign winners in the own slot trigger durable, hourly-bounded conflict recovery; own echoes
+  are ignored. MLS lifetime policy is unchanged.
+
+### Changed
+
+- Superseded unconsumed KeyPackage bundles are swept after a 24-hour in-flight Welcome grace (or earlier MLS expiry),
+  including superseded pending bundles. Consumed current bundles still retire on replacement acknowledgement.
+
 ## 0.13.0 - 2026-10-12
 
 ### Breaking changes

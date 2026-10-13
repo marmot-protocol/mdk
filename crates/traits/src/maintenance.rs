@@ -258,7 +258,11 @@ pub struct RetainedKeyPackagePrivateMaterial {
     pub key_package: KeyPackage,
     pub key_package_ref: Vec<u8>,
     pub not_after: Timestamp,
-    pub replaced_at: Timestamp,
+    /// Actual wall-clock time of the first accepted newer same-slot publication.
+    /// Superseded pending material has no grace deadline until that ACK.
+    /// Legacy numeric timestamps deserialize as `Some`; missing values as `None`.
+    #[serde(default)]
+    pub replaced_at: Option<Timestamp>,
 }
 
 /// The one stable replaceable-event slot for an account-device's last-resort
@@ -294,14 +298,85 @@ pub struct KeyPackageLifecycleState {
     pub last_consumed_key_package_ref: Option<Vec<u8>>,
     #[serde(default)]
     pub last_consumed_at: Option<Timestamp>,
-    /// Prior, unconsumed packages remain decryptable until their MLS lifetime
-    /// expires so an invite already in flight can still be processed.
+    /// Coalesced winning foreign event in this installation's slot. Maintenance
+    /// authors strictly after this timestamp; only acknowledged promotion clears it.
+    #[serde(default)]
+    pub slot_conflict_created_at: Option<Timestamp>,
+    /// Identity supplies the lowest-ID tie-break for equal publication timestamps.
+    #[serde(default)]
+    pub slot_conflict_event_id: Option<MessageId>,
+    /// Persisted preparation time bounds conflict-forced generation across restarts.
+    #[serde(default)]
+    pub last_slot_conflict_republish_at: Option<Timestamp>,
+    /// Newest unacknowledged local identity. Older identities lose to its timestamp floor.
+    #[serde(default)]
+    pub historical_authored_event_ids: Vec<MessageId>,
+    /// Survives private-bundle expiry so old own echoes cannot become conflicts.
+    #[serde(default)]
+    pub historical_authored_event_created_at: Option<Timestamp>,
+    /// Prior, unconsumed packages remain decryptable for a short post-replacement
+    /// grace (or until MLS expiry, whichever comes first) for Welcomes in flight.
     #[serde(default)]
     pub retained_private_material: Vec<RetainedKeyPackagePrivateMaterial>,
     pub pending_replacement: Option<PendingKeyPackageReplacement>,
 }
 
+/// Whether a publication wins over another in the same replaceable slot:
+/// newest timestamp first, then the lexically lowest event identity.
+pub fn publication_event_wins(
+    candidate_time: Timestamp,
+    candidate_id: &[u8],
+    previous_time: Timestamp,
+    previous_id: &[u8],
+) -> bool {
+    candidate_time > previous_time
+        || (candidate_time == previous_time && candidate_id < previous_id)
+}
+
 impl KeyPackageLifecycleState {
+    /// Classify a verified own-author event against all durable local authority.
+    pub fn is_foreign_slot_winner(
+        &self,
+        slot_id: &str,
+        event_id: &MessageId,
+        created_at: Timestamp,
+    ) -> bool {
+        if self.stable_slot_id != slot_id
+            || self.authored_event_id.as_ref() == Some(event_id)
+            || self.historical_authored_event_ids.contains(event_id)
+            || self
+                .pending_replacement
+                .as_ref()
+                .and_then(|pending| pending.signed_event.as_ref())
+                .is_some_and(|artifact| &artifact.id == event_id)
+        {
+            return false;
+        }
+        self.authored_event_created_at
+            .map(|time| (time, self.authored_event_id.as_ref()))
+            .into_iter()
+            .chain(self.pending_replacement.as_ref().map(|pending| {
+                (
+                    pending.authored_created_at,
+                    pending.signed_event.as_ref().map(|artifact| &artifact.id),
+                )
+            }))
+            .chain(
+                self.historical_authored_event_created_at
+                    .map(|time| (time, self.historical_authored_event_ids.last())),
+            )
+            .chain(
+                self.slot_conflict_created_at
+                    .map(|time| (time, self.slot_conflict_event_id.as_ref())),
+            )
+            .all(|(time, id)| {
+                // Legacy observations have no ID: accept equality once to learn it.
+                id.map_or(created_at >= time, |id| {
+                    publication_event_wins(created_at, event_id.as_slice(), time, id.as_slice())
+                })
+            })
+    }
+
     /// Create lifecycle authority before a current package has been promoted.
     /// An empty slot is a fail-closed migration sentinel and must never be
     /// published.
@@ -322,6 +397,11 @@ impl KeyPackageLifecycleState {
             generation_revision: 0,
             last_consumed_key_package_ref: None,
             last_consumed_at: None,
+            slot_conflict_created_at: None,
+            slot_conflict_event_id: None,
+            last_slot_conflict_republish_at: None,
+            historical_authored_event_ids: Vec::new(),
+            historical_authored_event_created_at: None,
             retained_private_material: Vec::new(),
             pending_replacement: None,
         }
@@ -372,6 +452,48 @@ pub struct GroupMaintenanceStatus {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn old_key_package_lifecycle_defaults_slot_recovery_fields() {
+        let lifecycle = super::KeyPackageLifecycleState::slot_only("stable-slot".into());
+        let mut json = serde_json::to_value(&lifecycle).unwrap();
+        let fields = json.as_object_mut().unwrap();
+        fields.remove("slot_conflict_created_at");
+        fields.remove("slot_conflict_event_id");
+        fields.remove("last_slot_conflict_republish_at");
+        fields.remove("historical_authored_event_ids");
+        fields.remove("historical_authored_event_created_at");
+        let restored: super::KeyPackageLifecycleState = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, lifecycle);
+    }
+
+    #[test]
+    fn retained_key_package_replacement_ack_timestamp_is_backward_compatible() {
+        use super::RetainedKeyPackagePrivateMaterial;
+        use crate::{KeyPackage, Timestamp};
+        let material = RetainedKeyPackagePrivateMaterial {
+            key_package: KeyPackage::new(vec![1]),
+            key_package_ref: vec![2],
+            not_after: Timestamp(100),
+            replaced_at: Some(Timestamp(42)),
+        };
+        let mut json = serde_json::to_value(&material).unwrap();
+        assert_eq!(json["replaced_at"], serde_json::json!(42));
+        assert_eq!(
+            serde_json::from_value::<RetainedKeyPackagePrivateMaterial>(json.clone()).unwrap(),
+            material
+        );
+        json.as_object_mut().unwrap().remove("replaced_at");
+        let unstamped: RetainedKeyPackagePrivateMaterial = serde_json::from_value(json).unwrap();
+        assert_eq!(unstamped.replaced_at, None);
+        assert_eq!(
+            serde_json::from_value::<RetainedKeyPackagePrivateMaterial>(
+                serde_json::to_value(&unstamped).unwrap()
+            )
+            .unwrap(),
+            unstamped
+        );
+    }
+
     use super::MaintenancePhase;
 
     #[test]
