@@ -2440,6 +2440,8 @@ pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCateg
         | EngineError::MissingRequiredCapabilities { .. }
         | EngineError::DisbandingUnsupportedMembers { .. }
         | EngineError::DisbandingNotEnabled { .. }
+        | EngineError::AppComponentNotActivatable { .. }
+        | EngineError::AppComponentUnsupportedMembers { .. }
         | EngineError::InvalidCredentialIdentity(_)
         | EngineError::InvalidAccountIdentityProof(_)
         | EngineError::InvalidKeyPackageLifetime { .. }
@@ -2518,6 +2520,8 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::MissingRequiredCapabilities { .. } => "missing_required_capabilities",
         EngineError::DisbandingUnsupportedMembers { .. } => "disbanding_unsupported_members",
         EngineError::DisbandingNotEnabled { .. } => "disbanding_not_enabled",
+        EngineError::AppComponentNotActivatable { .. } => "app_component_not_activatable",
+        EngineError::AppComponentUnsupportedMembers { .. } => "app_component_unsupported_members",
         EngineError::InvalidCredentialIdentity(_) => "invalid_credential_identity",
         EngineError::InvalidAccountIdentityProof(_) => "invalid_account_identity_proof",
         EngineError::InvalidKeyPackageLifetime { .. } => "invalid_key_package_lifetime",

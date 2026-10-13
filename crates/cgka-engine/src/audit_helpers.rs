@@ -140,6 +140,7 @@ pub(crate) fn send_intent_kind_str(intent: &SendIntent) -> &'static str {
         SendIntent::UpdateAppComponents { .. } => "update_app_components",
         SendIntent::UpdateGroupData { .. } => "update_group_data",
         SendIntent::EnableDisbanding { .. } => "enable_disbanding",
+        SendIntent::ActivateAppComponents { .. } => "activate_app_components",
         SendIntent::Disband { .. } => "disband",
     }
 }
@@ -159,6 +160,7 @@ pub(crate) fn send_intent_group_id(intent: &SendIntent) -> cgka_traits::GroupId 
         | SendIntent::UpdateAppComponents { group_id, .. }
         | SendIntent::UpdateGroupData { group_id, .. }
         | SendIntent::EnableDisbanding { group_id }
+        | SendIntent::ActivateAppComponents { group_id, .. }
         | SendIntent::Disband { group_id } => group_id.clone(),
     }
 }

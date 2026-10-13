@@ -85,6 +85,23 @@ pub enum EngineError {
         members: Vec<MemberId>,
     },
 
+    /// The component is not configured as activatable on this engine, so no
+    /// activation Commit can be prepared for it.
+    #[error("app component is not activatable")]
+    AppComponentNotActivatable {
+        group_id: GroupId,
+        component_id: crate::app_components::AppComponentId,
+    },
+
+    /// One or more current member leaves do not advertise the component, so
+    /// the group cannot start requiring it yet.
+    #[error("app component activation is blocked by unsupported member leaves")]
+    AppComponentUnsupportedMembers {
+        group_id: GroupId,
+        component_id: crate::app_components::AppComponentId,
+        members: Vec<MemberId>,
+    },
+
     /// The group has not yet installed and required lifecycle-v1, so it cannot
     /// accept a terminal disband request.
     #[error("group disbanding is not enabled")]
@@ -264,6 +281,10 @@ impl EngineError {
             EngineError::MissingRequiredCapabilities { .. } => "missing_required_capabilities",
             EngineError::DisbandingUnsupportedMembers { .. } => "disbanding_unsupported_members",
             EngineError::DisbandingNotEnabled { .. } => "disbanding_not_enabled",
+            EngineError::AppComponentNotActivatable { .. } => "app_component_not_activatable",
+            EngineError::AppComponentUnsupportedMembers { .. } => {
+                "app_component_unsupported_members"
+            }
             EngineError::UnsupportedCiphersuite { .. } => "unsupported_ciphersuite",
             EngineError::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
             EngineError::InvalidAccountIdentityProof(_) => "invalid_account_identity_proof",

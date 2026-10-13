@@ -106,6 +106,17 @@ pub struct GroupMaintenanceState {
     pub periodic_enrolled: bool,
     pub last_own_leaf_rotation_at: Option<Timestamp>,
     pub next_periodic_rotation_at: Option<Timestamp>,
+    /// When to replace an own leaf that advertises fewer app components than
+    /// this device supports. Sampled once per stale period so a release does
+    /// not make every member of a group commit at once; cleared once the leaf
+    /// is current. Independent of periodic enrollment.
+    #[serde(default)]
+    pub leaf_refresh_due_at: Option<Timestamp>,
+    /// When this admin device commits the activation of eligible
+    /// automatic-mode components. Sampled once per eligible period; cleared
+    /// when nothing is eligible.
+    #[serde(default)]
+    pub component_activation_due_at: Option<Timestamp>,
 }
 
 /// Restart-safe semantic intent.  Wall-clock deadlines and sampled jitter are

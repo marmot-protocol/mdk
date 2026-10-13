@@ -68,6 +68,9 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
 
+        // Lifecycle-v1 enablement is the admin-initiated instance of the
+        // generic activation (spec app-components/README.md, "Enabling a
+        // Component in an Existing Group").
         required.insert(GROUP_LIFECYCLE_COMPONENT_ID);
         let mut updates = vec![AppComponentData {
             component_id: APP_COMPONENTS_COMPONENT_ID,

@@ -85,6 +85,7 @@ impl<S: StorageProvider> Engine<S> {
             | SendIntent::Leave { .. }
             | SendIntent::SelfUpdate { .. }
             | SendIntent::EnableDisbanding { .. }
+            | SendIntent::ActivateAppComponents { .. }
             | SendIntent::Disband { .. } => None,
         })
     }

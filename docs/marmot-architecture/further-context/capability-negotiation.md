@@ -204,6 +204,19 @@ Client runs self-update
   → UI reflects newly available upgrades
 ```
 
+**Implementation status.** App components follow this process today, as the spec's "Enabling a Component in an Existing
+Group" (`app-components/README.md`):
+
+- **Leaf refresh.** A self-update re-advertises every supported app component in the own leaf, keeping every other leaf
+  byte.
+- **Stale leaves.** Account maintenance gives a stale own leaf a self-update at a persisted random time within 72
+  hours.
+- **Activation.** Activation is one Commit (`SendIntent::ActivateAppComponents`). Components configured as
+  `ComponentActivationMode::Automatic` are activated by an admin device at a persisted random time within 12 hours,
+  once every leaf advertises them.
+
+MLS capabilities from the feature registry (extension and proposal types) are not yet re-advertised on self-update.
+
 ---
 
 ## Group upgrade: the admin action

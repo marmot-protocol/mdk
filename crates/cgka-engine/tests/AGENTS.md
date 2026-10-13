@@ -56,6 +56,10 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 - **File:** `capabilities.rs`
   - **Owns:** `feature_status`, capability cache, capability matrix
 
+- **File:** `component_activation.rs`
+  - **Owns:** Enabling a component in an existing group: self-update leaf re-advertisement, all-leaves eligibility,
+    admin-only automatic activation, `ActivateAppComponents` refusals and idempotence
+
 - **File:** `fork_detection.rs`
   - **Owns:** Same-epoch fork resolution through the unified distributed-convergence route (committer, observer,
     and restarted-committer shapes) plus the missing-anchor fail-closed halt

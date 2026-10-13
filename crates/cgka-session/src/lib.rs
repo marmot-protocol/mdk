@@ -73,6 +73,7 @@ pub struct SessionConfig {
     account_identity_proof_signer: Option<Arc<dyn AccountIdentityProofSigner>>,
     feature_registry: FeatureRegistry,
     supported_app_components: AppComponentSet,
+    activatable_app_components: Vec<cgka_traits::app_components::ActivatableAppComponent>,
     protocol_profile: ProtocolProfile,
     allow_legacy_compatibility_profile: bool,
     storage_options: SqliteStorageOptions,
@@ -97,6 +98,7 @@ impl SessionConfig {
             account_identity_proof_signer: None,
             feature_registry: FeatureRegistry::new(),
             supported_app_components: AppComponentSet::new(default_group_components()),
+            activatable_app_components: Vec::new(),
             protocol_profile: ProtocolProfile::Current,
             allow_legacy_compatibility_profile: false,
             storage_options: SqliteStorageOptions::default(),
@@ -144,6 +146,16 @@ impl SessionConfig {
         components: impl IntoIterator<Item = AppComponentId>,
     ) -> Self {
         self.supported_app_components = AppComponentSet::new(components);
+        self
+    }
+
+    /// Components an existing group may start requiring with one activation
+    /// Commit. See `EngineBuilder::activatable_app_components`.
+    pub fn activatable_app_components(
+        mut self,
+        components: impl IntoIterator<Item = cgka_traits::app_components::ActivatableAppComponent>,
+    ) -> Self {
+        self.activatable_app_components = components.into_iter().collect();
         self
     }
 
@@ -352,6 +364,7 @@ impl AccountDeviceSession {
             )?)
             .feature_registry(config.feature_registry)
             .supported_app_components(config.supported_app_components.ids)
+            .activatable_app_components(config.activatable_app_components)
             .protocol_profile(config.protocol_profile);
         #[cfg(debug_assertions)]
         let builder = if config.allow_legacy_compatibility_profile {
@@ -602,6 +615,24 @@ impl AccountDeviceSession {
 
     pub fn own_leaf_hash(&self, group_id: &GroupId) -> SessionResult<Vec<u8>> {
         Ok(self.engine.own_leaf_hash(group_id)?)
+    }
+
+    /// Supported component ids this device's own leaf in `group_id` does not
+    /// advertise yet; non-empty means a self-update would refresh the leaf.
+    pub fn own_leaf_missing_app_components(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<AppComponentSet> {
+        Ok(self.engine.own_leaf_missing_app_components(group_id)?)
+    }
+
+    /// Automatic-mode components this device, as an admin, may activate in
+    /// `group_id` now. Advisory; activation re-checks under the engine lock.
+    pub fn auto_activatable_app_components(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<Vec<AppComponentId>> {
+        Ok(self.engine.auto_activatable_app_components(group_id)?)
     }
 
     pub fn put_transport_fanout(&self, record: &DurableTransportFanout) -> SessionResult<()> {
@@ -1579,6 +1610,7 @@ fn send_intent_kind(intent: &SendIntent) -> &'static str {
         SendIntent::UpdateAppComponents { .. } => "update_app_components",
         SendIntent::UpdateGroupData { .. } => "update_group_data",
         SendIntent::EnableDisbanding { .. } => "enable_disbanding",
+        SendIntent::ActivateAppComponents { .. } => "activate_app_components",
         SendIntent::Disband { .. } => "disband",
     }
 }

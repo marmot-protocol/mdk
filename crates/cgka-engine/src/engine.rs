@@ -123,6 +123,10 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) identity: Identity,
     pub(crate) registry: FeatureRegistry,
     pub(crate) supported_app_components: AppComponentSet,
+    /// GroupContext components an existing group may start requiring with one
+    /// activation Commit, and how each one activates.
+    pub(crate) activatable_app_components:
+        Vec<cgka_traits::app_components::ActivatableAppComponent>,
     /// Profile emitted by newly created KeyPackages and groups. Existing
     /// groups retain their independently persisted/wire-classified profile.
     pub(crate) new_protocol_profile: ProtocolProfile,
@@ -352,6 +356,7 @@ pub struct EngineBuilder<S: StorageProvider> {
         Option<Arc<dyn crate::account_identity_proof::AccountIdentityProofSigner>>,
     registry: FeatureRegistry,
     supported_app_components: AppComponentSet,
+    activatable_app_components: Vec<cgka_traits::app_components::ActivatableAppComponent>,
     new_protocol_profile: ProtocolProfile,
     allow_legacy_compatibility_profile: bool,
     peeler: Option<Box<dyn TransportPeeler>>,
@@ -377,6 +382,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             account_identity_proof_signer: None,
             registry: FeatureRegistry::new(),
             supported_app_components: AppComponentSet::new(default_group_components()),
+            activatable_app_components: Vec::new(),
             new_protocol_profile: ProtocolProfile::Current,
             allow_legacy_compatibility_profile: false,
             peeler: None,
@@ -418,6 +424,18 @@ impl<S: StorageProvider> EngineBuilder<S> {
         components: impl IntoIterator<Item = AppComponentId>,
     ) -> Self {
         self.supported_app_components = AppComponentSet::new(components);
+        self
+    }
+
+    /// GroupContext components an existing group may start requiring through
+    /// [`cgka_traits::engine::SendIntent::ActivateAppComponents`]. Each one
+    /// must also be in [`Self::supported_app_components`]; `build` rejects an
+    /// entry that is not, because this device could not advertise it.
+    pub fn activatable_app_components(
+        mut self,
+        components: impl IntoIterator<Item = cgka_traits::app_components::ActivatableAppComponent>,
+    ) -> Self {
+        self.activatable_app_components = components.into_iter().collect();
         self
     }
 
@@ -541,6 +559,16 @@ impl<S: StorageProvider> EngineBuilder<S> {
                 "max_past_epochs must equal the pinned v1 app-message window".into(),
             ));
         }
+        if let Some(unsupported) = self.activatable_app_components.iter().find(|component| {
+            !self
+                .supported_app_components
+                .contains(component.component_id)
+        }) {
+            return Err(EngineError::Other(format!(
+                "activatable app component {:#06x} is not in the supported set",
+                unsupported.component_id
+            )));
+        }
         let identity_bytes = self
             .identity_bytes
             .ok_or_else(|| EngineError::Other("identity bytes are required".into()))?;
@@ -604,6 +632,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             identity,
             registry: self.registry,
             supported_app_components: self.supported_app_components,
+            activatable_app_components: self.activatable_app_components,
             new_protocol_profile: self.new_protocol_profile,
             peeler,
             ciphersuite: self.ciphersuite,

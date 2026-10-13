@@ -248,6 +248,30 @@ impl AppComponentSet {
     }
 }
 
+/// How a group that predates a component starts requiring it (spec
+/// `app-components/README.md`, "Enabling a Component in an Existing Group").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentActivationMode {
+    /// An active admin decides when to activate; nothing activates it on its
+    /// own. For components whose activation changes what members see or can do.
+    AdminInitiated,
+    /// Once every leaf advertises the component, an active admin's client
+    /// activates it without user action, after a randomized delay. For
+    /// components that change only how clients process protocol state.
+    Automatic,
+}
+
+/// A GroupContext component that an existing group may start requiring with
+/// one activation Commit. `initial_state` is installed when the group has no
+/// entry for the component yet.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivatableAppComponent {
+    pub component_id: AppComponentId,
+    pub initial_state: Vec<u8>,
+    pub mode: ComponentActivationMode,
+}
+
 impl From<BTreeSet<AppComponentId>> for AppComponentSet {
     fn from(ids: BTreeSet<AppComponentId>) -> Self {
         Self { ids }

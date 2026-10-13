@@ -185,6 +185,17 @@ pub enum SendIntent {
     /// Install `marmot.group.lifecycle.v1 = active` and require the component
     /// in one admin Commit for a compatible existing group.
     EnableDisbanding { group_id: GroupId },
+    /// Start requiring activatable app components in an existing group with
+    /// one admin Commit: install each component's initial state where absent
+    /// and add its id to the required `app_components` list. The required list
+    /// is computed when the Commit is prepared, never from the caller's view,
+    /// so a queued activation cannot drop a requirement added meanwhile. Ids
+    /// the group already requires are skipped; if none remain the result is
+    /// `NoChange`.
+    ActivateAppComponents {
+        group_id: GroupId,
+        component_ids: Vec<crate::app_components::AppComponentId>,
+    },
     /// Persist the irreversible local intent to terminate the group. Preparing
     /// and publishing the terminal Commit is driven asynchronously from this
     /// durable request.

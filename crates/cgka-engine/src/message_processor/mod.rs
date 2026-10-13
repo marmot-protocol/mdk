@@ -4024,6 +4024,7 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         | SendIntent::UpdateAppComponents { group_id, .. }
         | SendIntent::UpdateGroupData { group_id, .. }
         | SendIntent::EnableDisbanding { group_id }
+        | SendIntent::ActivateAppComponents { group_id, .. }
         | SendIntent::Disband { group_id } => group_id,
     }
 }
@@ -4040,6 +4041,7 @@ pub(crate) fn is_admin_group_state_intent(intent: &SendIntent) -> bool {
             | SendIntent::UpdateAppComponents { .. }
             | SendIntent::UpdateGroupData { .. }
             | SendIntent::EnableDisbanding { .. }
+            | SendIntent::ActivateAppComponents { .. }
             | SendIntent::Disband { .. }
     )
 }

@@ -131,6 +131,13 @@ impl<S: StorageProvider> Engine<S> {
             SendIntent::EnableDisbanding { group_id } => {
                 self.do_enable_group_disbanding(group_id).await
             }
+            SendIntent::ActivateAppComponents {
+                group_id,
+                component_ids,
+            } => {
+                self.do_activate_app_components(group_id, component_ids)
+                    .await
+            }
             SendIntent::Disband { group_id } => self.do_request_disband(group_id),
         };
         if let (

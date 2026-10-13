@@ -41,6 +41,17 @@ fn engine_error_display_does_not_expose_group_or_member_ids() {
             group_id: group_id.clone(),
         }
         .to_string(),
+        EngineError::AppComponentNotActivatable {
+            group_id: group_id.clone(),
+            component_id: 0x8010,
+        }
+        .to_string(),
+        EngineError::AppComponentUnsupportedMembers {
+            group_id: group_id.clone(),
+            component_id: 0x8010,
+            members: vec![member_id.clone()],
+        }
+        .to_string(),
         EngineError::QueuedOutboundAtCapacity {
             group_id: group_id.clone(),
         }
