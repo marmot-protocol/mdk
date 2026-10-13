@@ -269,7 +269,7 @@ pub use notifications::{
     NotificationWakeSource, PUSH_ENCRYPTED_TOKEN_LEN, PUSH_VERSION, PushPlatform, PushRegistration,
     PushRegistrationShareOutcome, PushRegistrationShareStatus, PushRegistrationSyncResult,
     build_notification_gift_wrap, build_notification_rumor_content, encrypted_push_token,
-    parse_provider_token, push_token_fingerprint,
+    message_text_mentions_account, parse_provider_token, push_token_fingerprint,
 };
 pub use profile_pseudonyms::{default_profile_pseudonym, random_profile_pseudonym};
 pub use relay_plane::{

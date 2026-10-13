@@ -2053,7 +2053,7 @@ fn message_mentions_account(message: &ReceivedMessage, account_id_hex: &str) -> 
 /// A kind-9 message mentions an account only through its received NIP-27 `p`
 /// tags. Content spelling and rendered names do not override the sender's
 /// recipient choice. Shared by notifications and the unread-mention projection.
-pub(crate) fn message_text_mentions_account(
+pub fn message_text_mentions_account(
     kind: u64,
     _plaintext: &str,
     tags: &[Vec<String>],

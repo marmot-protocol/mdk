@@ -165,7 +165,7 @@ including an empty list for informational references. Up to 64 hex/npub values
 are normalized, sorted and deduplicated before admission. The text and selection
 are retained together; a changed selection cannot reuse the token. Default text
 submission derives recipients from both bare and NIP-21 profile references.
-Received `p` tags determine attention; profile text alone does not. Recovery by
+Received `p` tags determine notification, unread and agent attention; profile text alone does not. Recovery by
 client token retains the original selection. This method submits ordinary text;
 reply, draft, edit and media methods retain their existing default tagging.
 

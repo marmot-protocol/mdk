@@ -5327,12 +5327,13 @@ fn inbound_message_event_from_record_extracts_mention_and_reply() {
     // A `p`-tag for the receiving account marks a mention; the first `e`-tag is
     // the reply target. Both let a channel gate/thread without re-parsing tags.
     let parent_msg_id = "bb".repeat(32);
+    let account = "aa".repeat(32);
     let tags = vec![
-        vec!["p".to_owned(), "acct".to_owned()],
+        vec!["p".to_owned(), account.clone()],
         vec!["e".to_owned(), parent_msg_id.clone()],
     ];
     assert!(
-        message_mentions_account(&tags, "hey there", "acct"),
+        message_mentions_account(&tags, "hey there", &account),
         "p-tag for the account should mark a mention"
     );
     assert_eq!(
@@ -5342,13 +5343,46 @@ fn inbound_message_event_from_record_extracts_mention_and_reply() {
 }
 
 #[test]
-fn inbound_message_event_detects_inline_nostr_mention() {
-    // Marmot clients address a member with an inline `nostr:<pubkey-hex>` token
-    // (no p-tag), and the account id IS the pubkey hex.
-    assert!(
-        message_mentions_account(&[], "hey nostr:acct can you help?", "acct"),
-        "inline nostr:<pubkey> should mark a mention"
-    );
+fn inbound_message_event_uses_received_tags_for_every_profile_spelling() {
+    let account = "aa".repeat(32);
+    let npub = marmot_app::npub_for_account_id(&account).unwrap();
+    let profile = marmot_app::nprofile_for_account_id(&account, &[]).unwrap();
+    for text in [
+        format!("nostr:{account}"),
+        format!("nostr:{npub}"),
+        format!("@{npub}"),
+        npub.clone(),
+        format!("nostr:{profile}"),
+    ] {
+        assert!(!message_mentions_account(&[], &text, &account));
+        for recipient in [
+            account.clone(),
+            account.to_ascii_uppercase(),
+            npub.clone(),
+            profile.clone(),
+        ] {
+            assert!(message_mentions_account(
+                &[vec!["p".into(), recipient]],
+                &text,
+                &account
+            ));
+        }
+        assert!(!message_mentions_account(
+            &[vec!["p".into(), "bb".repeat(32)]],
+            &text,
+            &account
+        ));
+        assert!(!message_mentions_account(
+            &[vec!["p".into()]],
+            &text,
+            &account
+        ));
+        assert!(!message_mentions_account(
+            &[vec!["p".into(), "invalid".into()]],
+            &text,
+            &account
+        ));
+    }
 }
 
 #[test]
@@ -5364,15 +5398,14 @@ fn inbound_message_event_does_not_scan_for_hex_mentions_past_the_cap() {
 }
 
 #[test]
-fn inbound_message_event_detects_npub_bech32_mention() {
-    // A p-tag-less mention whose inline text is the bech32 `nostr:npub1…` form
-    // (what marmot-markdown renders) must still be detected.
+fn inbound_message_event_keeps_untagged_npub_reference_silent() {
+    // Rendering a profile name does not override an explicit empty recipient set.
     let account = "aa".repeat(32);
     let npub = marmot_app::npub_for_account_id(&account).unwrap();
     let text = format!("hey nostr:{npub} can you help?");
     assert!(
-        message_mentions_account(&[], &text, &account),
-        "inline nostr:<npub> bech32 mention should be detected"
+        !message_mentions_account(&[], &text, &account),
+        "an untagged profile reference stays silent"
     );
 }
 
@@ -5381,15 +5414,14 @@ fn inbound_message_mentions_self_for_text(account: &str, text: &str) -> bool {
 }
 
 #[test]
-fn inbound_message_event_detects_bare_at_npub_mention() {
-    // Clients can emit the visible bare `@npub1…` handle without a p-tag or
-    // `nostr:` scheme; agent-control mention classification must still fire.
+fn inbound_message_event_keeps_untagged_bare_npub_reference_silent() {
+    // Bare spelling also requires a received p tag to trigger attention.
     let account = "aa".repeat(32);
     let npub = marmot_app::npub_for_account_id(&account).unwrap();
 
     assert!(
-        inbound_message_mentions_self_for_text(&account, &format!("hey @{npub} can you help?")),
-        "bare @npub bech32 mention should be detected"
+        !inbound_message_mentions_self_for_text(&account, &format!("hey @{npub} can you help?")),
+        "untagged bare profile references stay silent"
     );
 }
 
@@ -5480,10 +5512,7 @@ fn inbound_message_mention_check_is_fast_on_hostile_markdown_without_npub() {
 
 #[test]
 fn inbound_message_mention_check_is_fast_on_hostile_markdown_with_visible_npub() {
-    // A visible candidate npub must not send the remaining hostile plaintext
-    // through the Markdown parser. The parser path previously spent hundreds of
-    // milliseconds on this capped prefix; the bounded token scanner should be
-    // effectively linear and still detect the visible mention.
+    // Untagged references do not trigger attention or scan hostile plaintext.
     let account = "aa".repeat(32);
     let npub = marmot_app::npub_for_account_id(&account).unwrap();
     let hostile = format!("hey @{npub} {}", "![a](".repeat(16_000));
@@ -5492,7 +5521,7 @@ fn inbound_message_mention_check_is_fast_on_hostile_markdown_with_visible_npub()
     let mentions = inbound_message_mentions_self_for_text(&account, &hostile);
     let elapsed = start.elapsed();
 
-    assert!(mentions, "visible @npub mention should be detected");
+    assert!(!mentions, "untagged profile text must stay silent");
     assert!(
         elapsed < Duration::from_millis(500),
         "visible-npub classification must not parse hostile markdown \
