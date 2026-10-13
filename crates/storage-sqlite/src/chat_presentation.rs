@@ -106,6 +106,7 @@ pub struct ChatPresentationInput {
     pub source_version: ChatPresentationVersion,
     pub row_epoch: Vec<u8>,
     pub group_name: String,
+    /// Number of distinct member accounts, rather than MLS leaves.
     pub member_count: Option<u64>,
     pub self_membership: crate::SelfMembership,
     pub members: Vec<String>,
@@ -413,14 +414,10 @@ pub(crate) fn replace_members_tx(
     group: &str,
     members: &[String],
 ) -> StorageResult<()> {
-    let mut normalized: Vec<_> = if members.len() == 2 {
-        members
-            .iter()
-            .map(|s| s.trim().to_ascii_lowercase())
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let mut normalized: Vec<_> = members
+        .iter()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .collect();
     normalized.sort();
     normalized.dedup();
     if normalized.len() != 2 || normalized.iter().any(|s| !valid_member_identity(s)) {

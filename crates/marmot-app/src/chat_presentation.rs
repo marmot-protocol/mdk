@@ -11,7 +11,7 @@ use storage_sqlite::{
 /// Determine the eligible peer without selecting text, avatars, or cache keys.
 pub(crate) fn presentation_peer(input: &ChatPresentationInput, local_id: &str) -> Option<String> {
     let local_id = canonical_identity(local_id);
-    let members: Option<Vec<_>> = input
+    let members: Option<std::collections::BTreeSet<_>> = input
         .members
         .iter()
         .map(|s| canonical_identity(s))
@@ -21,7 +21,6 @@ pub(crate) fn presentation_peer(input: &ChatPresentationInput, local_id: &str) -
             if input.member_count == Some(2)
                 && input.self_membership == storage_sqlite::SelfMembership::Member
                 && members.len() == 2
-                && members[0] != members[1]
                 && members.contains(local) =>
         {
             members.iter().find(|id| *id != local).cloned()
@@ -39,7 +38,7 @@ pub(crate) fn select_chat_presentation(
     profile: Option<(&str, &UserProfileMetadata)>,
 ) -> ConversationPresentation {
     let local_id = canonical_identity(local_id);
-    let members: Option<Vec<_>> = input
+    let members: Option<std::collections::BTreeSet<_>> = input
         .members
         .iter()
         .map(|s| canonical_identity(s))
@@ -54,9 +53,7 @@ pub(crate) fn select_chat_presentation(
         .map(|(_, profile)| profile);
     let known_roster = input.member_count.is_some()
         && (input.member_count != Some(2)
-            || members
-                .as_ref()
-                .is_some_and(|members| members.len() == 2 && members[0] != members[1]));
+            || members.as_ref().is_some_and(|members| members.len() == 2));
     let group_name = safe_name(&input.group_name);
     let fallback_source = if peer.is_some() {
         PresentationSource::PeerFallback
@@ -295,6 +292,43 @@ mod tests {
             avatar: None,
         }
     }
+    #[test]
+    fn multi_device_pair_selects_peer_title_and_avatar() {
+        let mut input = input("");
+        input.members = [vec!["aa".repeat(32); 4], vec!["bb".repeat(32); 10]].concat();
+        let profile = UserProfileMetadata {
+            display_name: Some("Middle".into()),
+            picture: Some("https://example.com/middle.png".into()),
+            ..Default::default()
+        };
+        let selected =
+            select_chat_presentation(&input, &"aa".repeat(32), Some((&"bb".repeat(32), &profile)));
+        assert_eq!(selected.peer_id, Some("bb".repeat(32)));
+        assert!(selected.title == PresentationText::Literal("Middle".into()));
+        assert_eq!(selected.avatar_source, PresentationSource::PeerProfile);
+
+        input.members = vec!["aa".repeat(32), "bb".repeat(32), "cc".repeat(32)];
+        input.member_count = Some(3);
+        let selected = select_chat_presentation(&input, &"aa".repeat(32), None);
+        assert_eq!(selected.peer_id, None);
+        assert!(
+            selected.title
+                == PresentationText::UnnamedGroup {
+                    member_count: Some(3)
+                }
+        );
+        input.members = vec!["aa".repeat(32); 4];
+        input.member_count = Some(1);
+        let selected = select_chat_presentation(&input, &"aa".repeat(32), None);
+        assert_eq!(selected.peer_id, None);
+        assert!(
+            selected.title
+                == PresentationText::UnnamedGroup {
+                    member_count: Some(1)
+                }
+        );
+    }
+
     #[test]
     fn named_pair_uses_group_title_and_peer_avatar_independently() {
         let input = input("Our custom name");

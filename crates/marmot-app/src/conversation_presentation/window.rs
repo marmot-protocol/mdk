@@ -35,6 +35,7 @@ pub struct ConversationHeaderState {
 pub struct ConversationHeader {
     pub avatar_asset: Option<storage_sqlite::AvatarAssetPresentation>,
     pub selected: ConversationPresentation,
+    /// Number of distinct member accounts, including all their devices once.
     pub member_count: Option<u64>,
     pub archived: bool,
     /// None denotes local-only presentation; live action capabilities are suppressed.

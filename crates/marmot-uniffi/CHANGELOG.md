@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Conversation header and roster `member_count` values count distinct accounts across MLS devices. Roster entries are deduplicated by account; MLS diagnostic state retains its leaf count. No binding fields change.
+
 - `Marmot::send_prepared_media_with_client_token` exposes captured ordinary-media admission with transactional conditional draft consumption. Use the original token and revision for live retries, recover ownership by token after interruption, and pair regenerated Swift/Kotlin bindings with the matching library. See [local sends](LOCAL-SENDS.md).
 
 ## 0.13.0 - 2026-10-12

@@ -400,11 +400,11 @@ impl AgentConnector {
                 // This worker evaluates invites serially. Directness is an
                 // admission-time snapshot; later membership changes remain
                 // possible after the invite is accepted.
-                self.runtime
-                    .group_mls_state(&account.label, group_id)
-                    .await?
-                    .member_count
-                    == 2
+                let snapshot = self
+                    .runtime
+                    .group_conversation_snapshot(&account.label, group_id)
+                    .await?;
+                crate::messaging::group_info_member_count(&snapshot) == 2
             } else {
                 false
             };

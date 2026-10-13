@@ -21,6 +21,16 @@ use crate::{
     MAX_MEDIA_UPLOAD_BATCH_BYTES,
 };
 
+/// Membership used by the connector's existing two-person activation policy.
+pub(crate) fn group_info_member_count(snapshot: &marmot_app::AppGroupConversationSnapshot) -> u32 {
+    let accounts = snapshot
+        .members
+        .iter()
+        .map(|member| member.member_id_hex.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    u32::try_from(accounts.len()).unwrap_or(u32::MAX)
+}
+
 /// Map an account-scoped chat-list projection onto the optional `group_info`
 /// display subject. Missing rows, blank names, and projection errors yield
 /// `None` so display enrichment cannot fail a valid membership response.
@@ -359,7 +369,7 @@ impl AgentConnector {
     }
 
     /// Report group membership for an account's group so a channel can decide
-    /// activation policy: `is_direct` (exactly two members, i.e. an effective DM
+    /// activation policy: `is_direct` (exactly two distinct accounts, i.e. an effective DM
     /// where the agent always replies) vs a multi-party group that gates on
     /// being addressed.
     pub(crate) async fn group_info_response(
@@ -370,11 +380,11 @@ impl AgentConnector {
         let account = self.local_account_for_account_id(account_id_hex)?;
         let group_id_hex = normalize_hex(group_id_hex)?;
         let group_id = GroupId::new(hex::decode(&group_id_hex)?);
-        let state = self
+        let snapshot = self
             .runtime
-            .group_mls_state(&account.label, &group_id)
+            .group_conversation_snapshot(&account.label, &group_id)
             .await?;
-        let member_count = u32::try_from(state.member_count).unwrap_or(u32::MAX);
+        let member_count = group_info_member_count(&snapshot);
         let subject = group_info_subject_from_projection(
             self.runtime
                 .chat_list_row(&account.label, &group_id_hex)
@@ -399,7 +409,7 @@ impl AgentConnector {
             account_id_hex: account.account_id_hex,
             group_id_hex: hex::encode(group_id.as_slice()),
             member_count,
-            is_direct: state.member_count == 2,
+            is_direct: member_count == 2,
             subject,
             agent_created,
         })

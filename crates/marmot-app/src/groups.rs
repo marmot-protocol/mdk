@@ -169,15 +169,15 @@ pub struct AppGroupRecord {
     pub archived: bool,
     #[serde(default)]
     pub pending_confirmation: bool,
-    /// Current locally observed MLS roster size. `None` only for legacy
+    /// Current locally observed number of distinct member accounts. `None` only for legacy
     /// projections that have not yet been hydrated by an upgraded runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member_count: Option<u64>,
     /// Hex member ids when this group is currently a Direct conversation
-    /// (empty name, roster size 2). Persisted as the peer-keyed reuse index.
+    /// (empty name, two distinct accounts). Persisted as the peer-keyed reuse index.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct_member_ids_hex: Option<Vec<String>>,
-    /// Current authoritative two-member roster, including explicitly named groups.
+    /// Current authoritative two-account roster, including explicitly named groups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presentation_member_ids_hex: Option<Vec<String>>,
     /// Whether the local account is still a member of this group, and if not,
@@ -267,6 +267,7 @@ pub struct AppGroupMlsState {
     pub protocol_profile: AppProtocolProfile,
     pub lifecycle_state: AppGroupLifecycleState,
     pub epoch: u64,
+    /// Number of MLS leaves in this diagnostic state, including multiple devices per account.
     pub member_count: usize,
     #[serde(default)]
     pub unrecoverable: bool,
@@ -329,6 +330,7 @@ pub struct AppGroupRoster {
     /// display-name changes do not.
     pub roster_revision: u64,
     pub self_membership: SelfMembership,
+    /// Number of distinct member accounts.
     pub member_count: usize,
     pub lifecycle_state: AppGroupLifecycleState,
 }
@@ -346,8 +348,10 @@ pub(crate) fn app_group_roster_from_session(
         mls_state,
     } = session;
     let admin_ids: HashSet<String> = group_record.admin_policy.admins.iter().cloned().collect();
-    let members = members
+    let mut seen = HashSet::new();
+    let members: Vec<_> = members
         .into_iter()
+        .filter(|member| seen.insert(member.member_id_hex.clone()))
         .map(|member| {
             let member_id_hex = member.member_id_hex.clone();
             AppGroupRosterMember {
@@ -360,6 +364,7 @@ pub(crate) fn app_group_roster_from_session(
             }
         })
         .collect();
+    let member_count = members.len();
     let epoch = mls_state.epoch;
     let membership_revision = match group_record.self_membership {
         SelfMembership::Member => 0,
@@ -372,7 +377,7 @@ pub(crate) fn app_group_roster_from_session(
         epoch,
         roster_revision: epoch.saturating_mul(3).saturating_add(membership_revision),
         self_membership: group_record.self_membership,
-        member_count: mls_state.member_count,
+        member_count,
         lifecycle_state: mls_state.lifecycle_state,
     }
 }
@@ -757,7 +762,7 @@ impl AppGroupRecord {
         if let Some(group) = group {
             record.protocol_profile = group.protocol_profile.into();
             record.nostr_routing_last_epoch = group.epoch.0;
-            record.member_count = u64::try_from(group.members.len()).ok();
+            record.member_count = u64::try_from(distinct_account_count(&group.members)).ok();
             record.unrecoverable = group.unrecoverable;
             record.disbanded = group.disbanded.is_some();
             record.set_direct_member_ids_from_roster(&group.members);
@@ -798,7 +803,7 @@ impl AppGroupRecord {
         self.profile = projection.profile.clone();
         if let Some(group) = projection.group_metadata {
             self.protocol_profile = group.protocol_profile.into();
-            self.member_count = u64::try_from(group.members.len()).ok();
+            self.member_count = u64::try_from(distinct_account_count(&group.members)).ok();
             self.unrecoverable = group.unrecoverable;
             self.disbanded = group.disbanded.is_some();
             self.set_direct_member_ids_from_roster(&group.members);
@@ -809,19 +814,17 @@ impl AppGroupRecord {
         &mut self,
         members: &[cgka_traits::group::Member],
     ) {
-        self.presentation_member_ids_hex = (members.len() == 2
+        let mut ids: Vec<_> = members
+            .iter()
+            .map(|member| hex::encode(member.id.as_slice()))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        self.presentation_member_ids_hex = (ids.len() == 2
             && members
                 .iter()
-                .all(|member| member.id.as_slice().len() == 32)
-            && members[0].id != members[1].id)
-            .then(|| {
-                let mut ids: Vec<_> = members
-                    .iter()
-                    .map(|member| hex::encode(member.id.as_slice()))
-                    .collect();
-                ids.sort_unstable();
-                ids
-            });
+                .all(|member| member.id.as_slice().len() == 32))
+        .then_some(ids);
         self.direct_member_ids_hex = if self.profile.name.trim().is_empty() {
             self.presentation_member_ids_hex.clone()
         } else {
@@ -1039,6 +1042,15 @@ pub struct GroupRejoinInvitation {
     pub local_state_token: String,
 }
 
+/// The engine roster contains one entry per MLS leaf; app counts represent people.
+pub(crate) fn distinct_account_count(members: &[cgka_traits::group::Member]) -> usize {
+    members
+        .iter()
+        .map(|member| member.id.as_slice())
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
+
 #[cfg(test)]
 mod prior_nostr_route_tests {
     use super::*;
@@ -1090,6 +1102,72 @@ mod prior_nostr_route_tests {
             image: AppGroupImageInput::default(),
             observed_at_secs: OBSERVED_AT,
         }
+    }
+
+    #[test]
+    fn direct_projection_counts_accounts_across_device_leaves() {
+        let mut metadata = group(1);
+        metadata.name.clear();
+        metadata.members = [vec![0xaa; 4], vec![0xbb; 10]]
+            .concat()
+            .into_iter()
+            .map(|byte| cgka_traits::group::Member {
+                id: cgka_traits::types::MemberId::new(vec![byte; 32]),
+                credential: Vec::new(),
+            })
+            .collect();
+        let p = projection(routing(1, "wss://relay.example"), &metadata);
+        let mut record = AppGroupRecord::from_group(
+            &metadata.id,
+            p.nostr_routing.clone(),
+            Some(&metadata),
+            p.admin_policy.clone(),
+            p.message_retention.clone(),
+            p.agent_text_stream.clone(),
+            p.avatar_url.clone(),
+            p.encrypted_media.clone(),
+            p.image.clone(),
+        );
+        let pair = vec!["aa".repeat(32), "bb".repeat(32)];
+        assert_eq!(record.member_count, Some(2));
+        assert_eq!(
+            storage_sqlite::conversation_kind(&record.profile.name, record.member_count),
+            storage_sqlite::ChatConversationKind::Direct
+        );
+
+        assert_eq!(record.direct_member_ids_hex, Some(pair.clone()));
+        assert_eq!(record.presentation_member_ids_hex, Some(pair.clone()));
+        record.member_count = Some(14);
+        record.direct_member_ids_hex = None;
+        record.refresh_from_group(&p);
+        assert_eq!(record.member_count, Some(2));
+        assert_eq!(record.direct_member_ids_hex, Some(pair.clone()));
+
+        metadata.name = "Named pair".into();
+        record.refresh_from_group(&projection(routing(1, "wss://relay.example"), &metadata));
+        assert_eq!(record.direct_member_ids_hex, None);
+        assert_eq!(record.presentation_member_ids_hex, Some(pair));
+
+        metadata.name.clear();
+        metadata.members = [0xaa, 0xbb, 0xcc]
+            .into_iter()
+            .map(|byte| cgka_traits::group::Member {
+                id: cgka_traits::types::MemberId::new(vec![byte; 32]),
+                credential: Vec::new(),
+            })
+            .collect();
+        record.refresh_from_group(&projection(routing(1, "wss://relay.example"), &metadata));
+        assert_eq!(record.member_count, Some(3));
+        assert_eq!(record.direct_member_ids_hex, None);
+        assert_eq!(record.presentation_member_ids_hex, None);
+
+        metadata
+            .members
+            .retain(|member| member.id.as_slice() == [0xaa; 32]);
+        record.refresh_from_group(&projection(routing(1, "wss://relay.example"), &metadata));
+        assert_eq!(record.member_count, Some(1));
+        assert_eq!(record.direct_member_ids_hex, None);
+        assert_eq!(record.presentation_member_ids_hex, None);
     }
 
     #[test]
@@ -2979,12 +3057,13 @@ mod group_roster_api_tests {
             disbanding_blockers: Vec::new(),
             disband_request: None,
         };
+        let session = AppGroupRosterSession {
+            group_record: record,
+            members,
+            mls_state,
+        };
         let roster = app_group_roster_from_session(
-            AppGroupRosterSession {
-                group_record: record,
-                members,
-                mls_state,
-            },
+            session.clone(),
             self_id,
             HashMap::from([(self_id.to_owned(), "Alice".to_owned())]),
         );
@@ -2997,5 +3076,20 @@ mod group_roster_api_tests {
         assert!(roster.members[0].is_admin);
         assert!(roster.members[0].is_self);
         assert_eq!(roster.members[0].display_name.as_deref(), Some("Alice"));
+
+        let mut multi_device = session;
+        multi_device.members = vec![multi_device.members[0].clone(); 4];
+        multi_device.members.extend(vec![
+            AppGroupMemberRecord {
+                member_id_hex: "bb".repeat(32),
+                account: None,
+                local: false,
+            };
+            10
+        ]);
+        multi_device.mls_state.member_count = 14;
+        let roster = app_group_roster_from_session(multi_device, self_id, HashMap::new());
+        assert_eq!(roster.member_count, 2);
+        assert_eq!(roster.members.len(), 2);
     }
 }

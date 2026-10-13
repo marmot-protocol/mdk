@@ -126,6 +126,16 @@ classification without SQLite's database-controlled message. Fixture provenance 
 Account-database compatibility fixtures are described in [`fixtures/README.md`](fixtures/README.md). Old binaries
 refuse an upgraded schema; downgrading a binary requires a pre-upgrade backup.
 
+
+Projected `account_groups.member_count` counts distinct member accounts, not MLS
+leaves. Migration 0108 recomputes it from `cgka_groups.record` on first upgraded
+open, rebuilding the two-account direct/presentation indexes in the same
+transaction as count changes and the migration ledger. Existing triggers
+invalidate cached presentation when its count changes. Names, membership and
+creation timestamps are preserved. Rows without a readable stored engine roster remain
+unchanged until live hydration re-projects them; the runtime also reconciles
+counts and peer indexes at every hydrated open/update.
+
 ## Recovery semantics
 
 **Retained anchors** are engine/group policy, not hidden SQLite policy. `max_rewind_commits` defaults to `5` when no

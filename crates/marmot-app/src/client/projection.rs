@@ -528,7 +528,8 @@ impl AppClient {
             };
             let mut dirty = false;
             if let Ok(group) = self.runtime.group_record(&group_id) {
-                let live_count = u64::try_from(group.members.len()).ok();
+                let live_count =
+                    u64::try_from(crate::groups::distinct_account_count(&group.members)).ok();
                 if projected_group.member_count != live_count {
                     projected_group.member_count = live_count;
                     dirty = true;

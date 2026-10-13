@@ -250,6 +250,19 @@ mod tests {
     }
 
     #[test]
+    fn group_management_state_counts_distinct_admin_accounts() {
+        let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let details = GroupDetailsFfi {
+            group: group(vec![self_id]),
+            members: vec![member(self_id, true, true); 2],
+            mls_state: mls_state(),
+        };
+        let state = group_management_state_ffi(self_id, &details);
+        assert!(state.is_last_admin);
+        assert!(state.member_actions.iter().all(|action| !action.can_demote));
+    }
+
+    #[test]
     fn group_conversation_snapshot_derives_management_from_returned_details() {
         let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
         let bob_id = "bb4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";

@@ -406,8 +406,11 @@ pub(crate) fn group_details_ffi(
     display_names: HashMap<String, String>,
 ) -> Result<GroupDetailsFfi, MarmotKitError> {
     let admin_ids = group.admins.iter().cloned().collect::<HashSet<_>>();
+    // Session snapshots retain device leaves; detail rows represent accounts.
+    let mut seen = HashSet::new();
     let members = members
         .into_iter()
+        .filter(|member| seen.insert(member.member_id_hex.clone()))
         .map(|member| {
             let npub = npub_for_account_id(&member.member_id_hex).map_err(|err| {
                 MarmotKitError::InvalidIdentity {
@@ -498,7 +501,9 @@ pub(crate) fn group_management_state_ffi(
         .members
         .iter()
         .filter(|member| member.is_admin)
-        .count();
+        .map(|member| member.member_id_hex.as_str())
+        .collect::<HashSet<_>>()
+        .len();
     let self_member = details
         .members
         .iter()

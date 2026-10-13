@@ -237,6 +237,9 @@ mod migration_0087_attachment_automatic_history;
 #[path = "migrations/0088_draft_attachment_descriptors.rs"]
 mod migration_0088_draft_attachment_descriptors;
 
+#[path = "migrations/0108_distinct_account_counts.rs"]
+mod migration_0108_distinct_account_counts;
+
 pub(crate) struct Migration {
     pub(crate) version: i64,
     pub(crate) name: &'static str,
@@ -888,6 +891,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0107_moderation_report_outbox",
         suspend_foreign_keys: &[],
         apply: migration_0107_moderation_report_outbox::apply,
+    },
+    Migration {
+        version: 108,
+        name: "0108_distinct_account_counts",
+        suspend_foreign_keys: &[],
+        apply: migration_0108_distinct_account_counts::apply,
     },
 ];
 
@@ -4392,5 +4401,179 @@ mod poll_response_edge_tests {
             .unwrap(),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod distinct_account_count_tests {
+    use super::*;
+    use crate::storage::test_support::sample_group;
+    use cgka_traits::types::GroupId;
+
+    #[test]
+    fn upgrade_repairs_leaf_counts_and_pair_indexes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let old_versions = MIGRATIONS.iter().take_while(|m| m.version <= 107).count();
+        run(&mut conn, &MIGRATIONS[..old_versions]).unwrap();
+        for (byte, accounts) in [
+            (
+                1,
+                vec![0xaa; 4]
+                    .into_iter()
+                    .chain(vec![0xbb; 10])
+                    .collect::<Vec<_>>(),
+            ),
+            (2, vec![0xaa, 0xbb, 0xcc]),
+            (3, vec![0xaa; 4]),
+            (
+                4,
+                vec![0xaa; 4]
+                    .into_iter()
+                    .chain(vec![0xbb; 10])
+                    .collect::<Vec<_>>(),
+            ),
+        ] {
+            let mut group = sample_group(GroupId::new(vec![byte; 16]), 7, 0);
+            group.members = accounts
+                .iter()
+                .map(|byte| cgka_traits::group::Member {
+                    id: cgka_traits::types::MemberId::new(vec![*byte; 32]),
+                    credential: Vec::new(),
+                })
+                .collect();
+            let id = hex::encode(group.id.as_slice());
+            conn.execute(
+                "INSERT INTO cgka_groups(id, epoch, record) VALUES(?1, 7, ?2)",
+                params![
+                    group.id.as_slice(),
+                    crate::codec::serialize(&group).unwrap()
+                ],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO account_groups(group_id_hex, endpoint, profile_name, updated_at, member_count) VALUES(?1, 'fixture', ?2, 7, ?3)",
+                params![id, if byte == 4 { "Named pair" } else { "" }, accounts.len() as i64]).unwrap();
+            conn.execute("INSERT INTO chat_list_rows(group_id_hex, group_name, activity_sort_at, updated_at, presentation_json) VALUES(?1, '', 7, 7, X'01')", [&id]).unwrap();
+            conn.execute(
+                "INSERT INTO chat_list_unread_ready_groups(group_id_hex) VALUES(?1)",
+                [&id],
+            )
+            .unwrap();
+        }
+        // An unreadable engine group is independently quarantined by hydration.
+        conn.execute(
+            "INSERT INTO cgka_groups(id, epoch, record) VALUES(?1, 7, X'00')",
+            [vec![5; 16]],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO account_groups(group_id_hex, endpoint, profile_name, updated_at, member_count) VALUES(?1, 'fixture', '', 7, 14)", [hex::encode([5; 16])]).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_pair_backfill BEFORE INSERT ON direct_conversation_members BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+        assert!(run(&mut conn, MIGRATIONS).is_err());
+        let unchanged: i64 = conn
+            .query_row(
+                "SELECT member_count FROM account_groups WHERE group_id_hex=?1",
+                [hex::encode([1; 16])],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            unchanged, 14,
+            "a peer-index failure rolls back the count correction"
+        );
+        let ledger: i64 = conn
+            .query_row("SELECT max(version) FROM cgka_schema_migrations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(ledger, 107);
+        let cached: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT presentation_json FROM chat_list_rows WHERE group_id_hex=?1",
+                [hex::encode([1; 16])],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cached,
+            Some(vec![1]),
+            "presentation invalidation also rolls back"
+        );
+        let readiness: (bool, bool) = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM chat_list_unread_ready_groups WHERE group_id_hex=?1),
+                    EXISTS(SELECT 1 FROM chat_presentation_row_work WHERE group_id_hex=?1)",
+                [hex::encode([1; 16])],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            readiness,
+            (true, false),
+            "readiness invalidation also rolls back"
+        );
+        conn.execute_batch("DROP TRIGGER fail_pair_backfill;")
+            .unwrap();
+        run(&mut conn, MIGRATIONS).unwrap();
+        for (byte, expected) in [(1, 2), (2, 3), (3, 1), (4, 2)] {
+            let id = hex::encode([byte; 16]);
+            let count: i64 = conn
+                .query_row(
+                    "SELECT member_count FROM account_groups WHERE group_id_hex=?1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, expected);
+            let readiness: (bool, bool) = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM chat_list_unread_ready_groups WHERE group_id_hex=?1),
+                        EXISTS(SELECT 1 FROM chat_presentation_row_work WHERE group_id_hex=?1)",
+                [&id], |r| Ok((r.get(0)?, r.get(1)?)),
+            ).unwrap();
+            assert_eq!(
+                readiness,
+                if byte == 1 {
+                    (false, true)
+                } else {
+                    (true, false)
+                }
+            );
+            let peers: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM direct_conversation_members WHERE group_id_hex=?1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(peers, if expected == 2 && byte != 4 { 2 } else { 0 });
+            let presentation: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM chat_presentation_members WHERE group_id_hex=?1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(presentation, if expected == 2 { 2 } else { 0 });
+            if byte != 2 {
+                let cached: Option<Vec<u8>> = conn
+                    .query_row(
+                        "SELECT presentation_json FROM chat_list_rows WHERE group_id_hex=?1",
+                        [&id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert!(
+                    cached.is_none(),
+                    "changed counts invalidate old presentation"
+                );
+            }
+        }
+        let unreadable: i64 = conn
+            .query_row(
+                "SELECT member_count FROM account_groups WHERE group_id_hex=?1",
+                [hex::encode([5; 16])],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unreadable, 14);
+        run(&mut conn, MIGRATIONS).unwrap();
     }
 }

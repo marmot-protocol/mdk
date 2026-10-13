@@ -143,7 +143,7 @@ pub struct ExistingDirectConversation {
 /// Select the reusable direct conversation with `peer_account_id_hex`, if any.
 ///
 /// A row is a **direct** conversation when its group name is empty and the
-/// projected roster size is exactly two (`ChatConversationKind::Direct`).
+/// projected distinct-account count is exactly two (`ChatConversationKind::Direct`).
 /// It is **reusable** with that peer when all of the following hold:
 ///
 /// - `self_membership` is [`SelfMembership::Member`]

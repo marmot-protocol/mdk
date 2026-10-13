@@ -1521,6 +1521,13 @@ fn group_management_json(
     members: &[AppGroupMemberRecord],
     mls: &AppGroupMlsState,
 ) -> Value {
+    // Runtime members are device leaves; management actions and last-admin
+    // decisions apply to accounts. Preserve the first occurrence's order.
+    let mut seen = std::collections::HashSet::new();
+    let members = members
+        .iter()
+        .filter(|member| seen.insert(&member.member_id_hex))
+        .collect::<Vec<_>>();
     let admins = &group.admin_policy.admins;
     let is_admin = |member_id_hex: &str| admins.iter().any(|admin| admin == member_id_hex);
     let admin_count = members
@@ -1863,6 +1870,60 @@ mod tests {
         .expect("sample group");
         group.welcomer_account_id_hex = welcomer.map(str::to_owned);
         group
+    }
+
+    fn management_with_device_leaves(admins: &[&str]) -> Value {
+        let mut group = sample_group("Ops", None);
+        group.admin_policy.admins = admins.iter().map(|id| (*id).to_owned()).collect();
+        let members = ["alice", "bob", "alice", "bob"]
+            .into_iter()
+            .map(|id| AppGroupMemberRecord {
+                member_id_hex: id.to_owned(),
+                account: None,
+                local: id == "alice",
+            })
+            .collect::<Vec<_>>();
+        let mls = AppGroupMlsState {
+            group_id_hex: group.group_id_hex.clone(),
+            protocol_profile: marmot_app::AppProtocolProfile::Current,
+            lifecycle_state: AppGroupLifecycleState::Stable,
+            epoch: 0,
+            member_count: members.len(),
+            unrecoverable: false,
+            required_app_components: Vec::new(),
+            disbanding_enabled: false,
+            disbanding: false,
+            disbanding_blockers: Vec::new(),
+            disband_request: None,
+        };
+        group_management_json("alice", &group, &members, &mls)
+    }
+
+    #[test]
+    fn group_management_counts_admin_accounts_not_device_leaves() {
+        let management = management_with_device_leaves(&["alice"]);
+        assert_eq!(management["is_self_admin"], true);
+        assert_eq!(management["is_last_admin"], true);
+        assert_eq!(management["can_leave"], false);
+
+        let management = management_with_device_leaves(&["alice", "bob"]);
+        assert_eq!(management["is_last_admin"], false);
+        assert_eq!(management["member_actions"][1]["can_demote"], true);
+        assert_eq!(management["member_actions"][1]["can_remove"], true);
+    }
+
+    #[test]
+    fn group_management_deduplicates_account_actions() {
+        let management = management_with_device_leaves(&["alice"]);
+        let actions = management["member_actions"].as_array().unwrap();
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0]["member_id"], "alice");
+        assert_eq!(actions[0]["is_self"], true);
+        assert_eq!(actions[0]["can_remove"], false);
+        assert_eq!(actions[0]["can_demote"], false);
+        assert_eq!(actions[1]["member_id"], "bob");
+        assert_eq!(actions[1]["can_promote"], true);
+        assert_eq!(actions[1]["can_remove"], true);
     }
 
     #[test]

@@ -178,15 +178,15 @@ pub struct StoredAccountGroup {
     pub admin_keys_hex: String,
     pub archived: bool,
     pub pending_confirmation: bool,
-    /// Current locally observed MLS roster size. `None` for legacy rows until a
+    /// Current locally observed number of distinct member accounts. `None` for legacy rows until a
     /// live group hydration persists the projection.
     pub member_count: Option<u64>,
-    /// Hex member ids for a Direct conversation (empty name, roster size 2).
+    /// Hex member ids for a Direct conversation (empty name, two distinct accounts).
     /// Persisted in `direct_conversation_members` so reuse lookup can query by
     /// peer without scanning every unnamed two-member chat. `None` when the
     /// group is not currently classified as Direct.
     pub direct_member_ids_hex: Option<Vec<String>>,
-    /// Current authoritative two-member roster, including explicitly named groups.
+    /// Current authoritative two-account roster, including explicitly named groups.
     pub presentation_member_ids_hex: Option<Vec<String>>,
     pub welcomer_account_id_hex: Option<String>,
     pub via_welcome_message_id_hex: Option<String>,

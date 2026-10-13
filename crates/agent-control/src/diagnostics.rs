@@ -90,6 +90,7 @@ pub struct AgentControlDiagnosticHome {
     pub requested: bool,
     pub resolved: bool,
     pub worker_available: bool,
+    /// Projected distinct-account count; unavailable counts are omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member_count: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

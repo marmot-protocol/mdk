@@ -7098,6 +7098,25 @@ fn leave_group_decision_covers_sole_admin_co_admin_and_non_admin() {
 }
 
 #[test]
+fn build_group_detail_counts_duplicate_device_leaves_as_two_people() {
+    let members = [
+        vec![("aa".to_owned(), "npubself".to_owned()); 4],
+        vec![("bb".to_owned(), "npubbob".to_owned()); 10],
+    ]
+    .concat();
+    let view = build_group_detail("g1", "Ops", "desc", &members, &["aa".to_owned()], &[], "aa");
+    assert_eq!(view.members.len(), 2);
+    assert_eq!(view.members[0].member_id, "aa");
+    assert_eq!(view.members[0].npub, "npubself");
+    assert!(view.members[0].is_admin && view.members[0].is_self);
+    assert_eq!(view.members[1].member_id, "bb");
+    assert_eq!(view.members[1].npub, "npubbob");
+    assert!(!view.members[1].is_admin && !view.members[1].is_self);
+    assert_eq!(view.admin_count, 1);
+    assert!(view.account_is_admin);
+}
+
+#[test]
 fn build_group_detail_tags_admins_and_self() {
     let members = vec![
         ("aa".to_owned(), "npubself".to_owned()),

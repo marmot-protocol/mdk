@@ -1207,8 +1207,12 @@ pub(crate) fn build_group_detail(
     relays: &[String],
     self_account_id: &str,
 ) -> GroupDetailView {
+    // The runtime roster contains device leaves; display each account once,
+    // preserving the first occurrence's order and identity presentation.
+    let mut seen = std::collections::HashSet::new();
     let members = members
         .iter()
+        .filter(|(member_id, _)| seen.insert(member_id))
         .map(|(member_id, npub)| GroupMemberRow {
             member_id: member_id.clone(),
             npub: npub.clone(),

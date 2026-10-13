@@ -1004,3 +1004,16 @@ fn chat_list_draft_preview_reopens_from_encrypted_store_without_projection_write
         .unwrap();
     assert_eq!(before, after);
 }
+
+#[test]
+fn multi_device_presentation_members_deduplicate_leaves() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "11");
+    let leaves = [vec!["aa".repeat(32); 4], vec!["bb".repeat(32); 10]].concat();
+    store.set_chat_presentation_members("11", &leaves).unwrap();
+    let input = store.chat_presentation_input("11").unwrap().unwrap();
+    assert_eq!(input.members, vec!["aa".repeat(32), "bb".repeat(32)]);
+    store
+        .store_chat_presentation(&input, &value("bb", "Middle", 1))
+        .unwrap();
+}

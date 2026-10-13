@@ -679,8 +679,9 @@ pub enum AgentControlResponse {
         /// this grants no sender or approval authorization.
         #[serde(default)]
         agent_created: bool,
+        /// Number of distinct member accounts, rather than MLS device leaves.
         member_count: u32,
-        /// True when the group has exactly two members (the agent + one peer),
+        /// True when the group has exactly two accounts (the agent + one peer),
         /// i.e. an effective direct conversation where the agent always replies.
         is_direct: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]

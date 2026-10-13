@@ -4,6 +4,13 @@ C5 M5 exposes one prepared conversation through Swift/Kotlin and C. This is an
 additive API: existing timeline, group, message and draft queries remain available.
 Publishing a MarmotKit release, migrating apps and measuring devices remain C9.
 
+
+The conversation header's `member_count` counts distinct accounts, including all
+devices of each person once. An unnamed two-account conversation is Direct;
+explicit naming still makes it a Group. Roster screens likewise list accounts
+once. `AppGroupMlsStateFfi.member_count` is the separate developer diagnostic MLS
+leaf count and must not drive conversation classification or people counts.
+
 ## Open and render
 
 Call `open_conversation_window(account, group, mode, message_id, initial_rows,

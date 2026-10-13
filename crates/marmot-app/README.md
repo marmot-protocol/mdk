@@ -5,6 +5,12 @@ session storage, the Nostr MLS peeler, the Nostr transport adapter, and relay-ba
 result as `MarmotApp` / `MarmotAppRuntime`. It sits below presentation layers (`wn`, the UniFFI and C bindings) and above
 the generic account, session, and engine crates. Read this if you are building a host app or binding on top of MDK.
 
+
+Group/chat presentation `member_count` means distinct member accounts. An unnamed
+conversation with two accounts is Direct even when each account has several MLS
+device leaves. Roster screens list each account once; the developer diagnostic
+`AppGroupMlsState.member_count` retains the MLS leaf count.
+
 ## Contents
 
 - [Runtime overview](#runtime-overview)

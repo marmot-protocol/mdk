@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Count distinct member accounts for group/chat presentation and direct-peer selection. Multiple MLS device leaves per person no longer turn an unnamed two-person conversation into a group; roster screens show each account once. MLS diagnostic state retains its leaf count. WN Agent activation, direct-only invite admission, and home diagnostics also use account counts while preserving named-pair activation.
+
 - `MarmotAppRuntime::submit_prepared_media_snapshot` admits the captured ordinary-media payload with a stable token and consumes only its unchanged captured draft in the same transaction. Newer or cleared drafts cannot replace the payload or block admission.
 
 ## 0.13.0 - 2026-10-12

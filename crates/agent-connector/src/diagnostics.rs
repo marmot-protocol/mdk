@@ -11,6 +11,16 @@ use crate::AgentConnector;
 use crate::error::ConnectorError;
 use crate::validation::{normalize_hex, unix_now_seconds};
 
+pub(crate) fn diagnostic_home_membership(
+    group: Option<&marmot_app::AppGroupRecord>,
+) -> (Option<u32>, Option<bool>) {
+    let count = group.and_then(|group| group.member_count);
+    (
+        count.map(|count| u32::try_from(count).unwrap_or(u32::MAX)),
+        count.map(|count| count == 2),
+    )
+}
+
 impl AgentConnector {
     pub(crate) async fn diagnostic_status_response(
         &self,
@@ -178,14 +188,15 @@ impl AgentConnector {
             .diagnostic_group_mls_state(account_ref, &group_id)
             .await
         {
-            Ok(Some(state)) => {
-                let member_count = u32::try_from(state.member_count).unwrap_or(u32::MAX);
+            Ok(Some(_)) => {
+                let group = self.app.group(account_ref, &group_id_hex).ok().flatten();
+                let (member_count, is_direct) = diagnostic_home_membership(group.as_ref());
                 Ok(AgentControlDiagnosticHome {
                     requested: true,
                     resolved: true,
                     worker_available: true,
-                    member_count: Some(member_count),
-                    is_direct: Some(state.member_count == 2),
+                    member_count,
+                    is_direct,
                 })
             }
             Ok(None) => Ok(AgentControlDiagnosticHome {

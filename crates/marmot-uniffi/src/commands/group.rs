@@ -1546,6 +1546,27 @@ mod tests {
             .await
             .expect("create group");
 
+        // The worker snapshot retains MLS leaves. The binding's detail rows and
+        // management authority must represent accounts while diagnostics keep leaves.
+        let mut multi_device = kit
+            .runtime
+            .group_conversation_snapshot(
+                &account_ref,
+                &GroupId::new(hex::decode(&group_id_hex).unwrap()),
+            )
+            .await
+            .expect("worker snapshot");
+        multi_device.members.push(multi_device.members[0].clone());
+        multi_device.mls_state.member_count = 2;
+        let converted = group_conversation_snapshot_ffi(
+            &account_ref,
+            group_details_from_conversation_snapshot_ffi(multi_device).unwrap(),
+        );
+        assert_eq!(converted.details.members.len(), 1);
+        assert_eq!(converted.details.mls_state.member_count, 2);
+        assert!(converted.management_state.is_last_admin);
+        assert!(!converted.management_state.member_actions[0].can_demote);
+
         let details = kit
             .group_details(account_ref.clone(), group_id_hex.clone())
             .await

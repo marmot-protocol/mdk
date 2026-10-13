@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Migration 0108 atomically corrects projected `member_count` to distinct accounts from stored engine rosters, rebuilds direct/presentation pair indexes, and invalidates stale presentation. Chat-list direct filters and activity rules use the corrected count. Account schema advances to 108 on open; downgrade is unsupported.
+
 ## 0.13.0 - 2026-10-12
 
 Account storage advances from migration 101 through 107 on first open; downgrade
