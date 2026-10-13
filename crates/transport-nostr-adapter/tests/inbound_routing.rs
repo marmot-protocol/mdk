@@ -5412,13 +5412,22 @@ struct ReleasableSubscribeRelayClient {
     /// Held subscribes that have been released and returned.
     released: AtomicUsize,
     unsubscribed: Mutex<Vec<String>>,
+    /// Every successful subscribe (`+id`) and unsubscribe (`-id`), in order.
+    log: Mutex<Vec<String>>,
+    /// While set, unsubscribes wait for `release_unsubscribes`.
+    hold_unsubscribes: AtomicBool,
+    unsubscribes_held: AtomicUsize,
+    release_unsubscribes: Notify,
+    /// When set, `unsubscribe_account` releases every held subscribe and
+    /// waits until they have returned before it does.
+    release_during_sweep: AtomicBool,
 }
 
 #[async_trait]
 impl NostrRelayClient for ReleasableSubscribeRelayClient {
     async fn subscribe(
         &self,
-        _subscription: NostrSubscription,
+        subscription: NostrSubscription,
     ) -> Result<(), cgka_traits::TransportAdapterError> {
         if self.hold.load(Ordering::SeqCst) {
             let released = self.release.notified();
@@ -5428,6 +5437,10 @@ impl NostrRelayClient for ReleasableSubscribeRelayClient {
             released.await;
             self.released.fetch_add(1, Ordering::SeqCst);
         }
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("+{}", subscription.subscription_id()));
         Ok(())
     }
 
@@ -5435,10 +5448,16 @@ impl NostrRelayClient for ReleasableSubscribeRelayClient {
         &self,
         subscription: NostrSubscription,
     ) -> Result<(), cgka_traits::TransportAdapterError> {
-        self.unsubscribed
-            .lock()
-            .unwrap()
-            .push(subscription.subscription_id());
+        if self.hold_unsubscribes.load(Ordering::SeqCst) {
+            let released = self.release_unsubscribes.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            self.unsubscribes_held.fetch_add(1, Ordering::SeqCst);
+            released.await;
+        }
+        let id = subscription.subscription_id();
+        self.log.lock().unwrap().push(format!("-{id}"));
+        self.unsubscribed.lock().unwrap().push(id);
         Ok(())
     }
 
@@ -5446,6 +5465,13 @@ impl NostrRelayClient for ReleasableSubscribeRelayClient {
         &self,
         _account_id: &MemberId,
     ) -> Result<(), cgka_traits::TransportAdapterError> {
+        if self.release_during_sweep.swap(false, Ordering::SeqCst) {
+            let held = self.held.load(Ordering::SeqCst);
+            self.release.notify_waiters();
+            while self.released.load(Ordering::SeqCst) < held {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
         Ok(())
     }
 
@@ -5760,4 +5786,161 @@ async fn full_page_replay_stays_incomplete_when_paging_is_unsupported() {
         "a full page with no paging is not coverage"
     );
     assert!(!eose.settled(), "the relay stays in paging, not answered");
+}
+
+/// A straggler that registers while the next activation is still sweeping sees
+/// the outgoing activation's routes, which list its id. Its check must wait
+/// for that activation to install its new routes, then close the superseded
+/// REQ (#2262).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn straggler_registering_during_the_next_sweep_closes_its_req() {
+    let relay = Arc::new(ReleasableSubscribeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA3; 32]);
+    let group = sync_fixture_group(0xB6);
+    let activation = || TransportAccountActivation {
+        account_id: account_id.clone(),
+        inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+        group_subscriptions: vec![group.clone()],
+        since: None,
+    };
+    adapter
+        .activate_account(activation())
+        .await
+        .expect("activation succeeds");
+    let superseded = group_subscription_id(&adapter, &account_id, &group).await;
+    let held_before = relay.held.load(Ordering::SeqCst);
+
+    relay.hold.store(true, Ordering::SeqCst);
+    let dropped = tokio::spawn({
+        let adapter = adapter.clone();
+        let activation = activation();
+        async move { adapter.activate_account(activation).await }
+    });
+    wait_until("both subscribes are held", || {
+        relay.held.load(Ordering::SeqCst) >= held_before + 2
+    })
+    .await;
+    dropped.abort();
+    assert!(dropped.await.unwrap_err().is_cancelled());
+    let dropped_group = {
+        // The dropped activation issued under the next attempt.
+        let attempt = adapter
+            .account_subscription_attempt(&account_id)
+            .await
+            .expect("the account is active");
+        assert_ne!(
+            group_subscription_id(&adapter, &account_id, &group).await,
+            superseded
+        );
+        NostrSubscription::Group {
+            account_id: account_id.clone(),
+            group_id: group.group_id.clone(),
+            transport_group_id: group.transport_group_id.clone(),
+            endpoints: group.endpoints.clone(),
+            since: None,
+            attempt,
+        }
+        .subscription_id()
+    };
+
+    relay.hold.store(false, Ordering::SeqCst);
+    // The stragglers return inside the sweep, before the new routes exist.
+    relay.release_during_sweep.store(true, Ordering::SeqCst);
+    adapter
+        .activate_account(activation())
+        .await
+        .expect("the next activation proceeds after the straggler wait");
+    wait_until("the stragglers close their superseded REQs", || {
+        relay.unsubscribed.lock().unwrap().contains(&dropped_group)
+    })
+    .await;
+    let live = group_subscription_id(&adapter, &account_id, &group).await;
+    assert!(
+        !relay.unsubscribed.lock().unwrap().contains(&live),
+        "the new activation's REQ stays open"
+    );
+}
+
+/// A retired straggler's route check and CLOSE must not interleave with a
+/// retry re-registering the same id: the retry's registration has to land
+/// after the straggler's CLOSE, so the live route keeps its REQ.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retired_straggler_close_cannot_interleave_with_a_retry() {
+    let relay = Arc::new(ReleasableSubscribeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA4; 32]);
+    let (kept, added) = (sync_fixture_group(0xB7), sync_fixture_group(0xC9));
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![kept.clone()],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+    let added_id = group_subscription_id(&adapter, &account_id, &added).await;
+
+    cancel_held_group_sync(
+        &relay,
+        &adapter,
+        &account_id,
+        vec![kept.clone(), added.clone()],
+    )
+    .await;
+    // The cancelled sync's cleanup outlives the wait, retires the barrier and
+    // closes the not-yet-registered id.
+    wait_until("the cleanup closes the abandoned id", || {
+        relay.unsubscribed.lock().unwrap().contains(&added_id)
+    })
+    .await;
+
+    // The straggler registers, finds the id unwanted, and stalls in its CLOSE.
+    relay.hold_unsubscribes.store(true, Ordering::SeqCst);
+    relay.release.notify_waiters();
+    wait_until("the straggler's CLOSE is in flight", || {
+        relay.unsubscribes_held.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let retry = tokio::spawn({
+        let adapter = adapter.clone();
+        let sync = TransportGroupSync {
+            account_id: account_id.clone(),
+            group_subscriptions: vec![kept, added],
+            since: None,
+        };
+        async move { adapter.sync_account_groups(sync).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    relay.hold_unsubscribes.store(false, Ordering::SeqCst);
+    relay.release_unsubscribes.notify_waiters();
+    retry
+        .await
+        .unwrap()
+        .expect("the retry makes the group live");
+    // The straggler is detached: wait for its CLOSE to land as well.
+    wait_until("the straggler's CLOSE lands", || {
+        relay
+            .unsubscribed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|id| **id == added_id)
+            .count()
+            == 2
+    })
+    .await;
+
+    let log = relay.log.lock().unwrap().clone();
+    let last = log
+        .iter()
+        .rev()
+        .find(|entry| entry[1..] == added_id)
+        .expect("the added id was touched");
+    assert_eq!(
+        last,
+        &format!("+{added_id}"),
+        "the retry registered after the straggler's CLOSE: {log:?}"
+    );
 }

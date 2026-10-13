@@ -1180,11 +1180,11 @@ impl NostrTransportAdapter {
         for (sub_index, subscription) in subscriptions.iter().cloned().enumerate() {
             let relay_client = self.relay_client.clone();
             let state = self.state.clone();
+            let lifecycle = self.subscription_lock.clone();
             let barriers = self.subscribe_tasks.clone();
             let barrier = self.current_subscribe_tasks();
             let in_flight = barrier.clone().read_owned().await;
             tasks.0.spawn(async move {
-                let _in_flight = in_flight;
                 let result = relay_client.subscribe(subscription.clone()).await;
                 // A lifecycle operation that gave up waiting for this task
                 // retired its barrier and may already have swept the account,
@@ -1198,15 +1198,33 @@ impl NostrTransportAdapter {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()),
                 );
-                if retired
-                    && result.is_ok()
-                    && state
+                // Release the barrier before taking the lifecycle lock: its
+                // holder may be waiting on the current barrier. A retired task
+                // never has a caller waiting on it, because only the lock's
+                // holder retires barriers.
+                drop(in_flight);
+                if retired && result.is_ok() {
+                    // Check and close under the lifecycle lock, so neither can
+                    // interleave with an activation that has swept but not yet
+                    // installed its routes, or with a retry re-registering the
+                    // same id. A failed close is queued for the next drain.
+                    let _lifecycle = lifecycle.lock().await;
+                    let wanted = state
                         .read()
                         .await
                         .live_subscription_route(&subscription.subscription_id())
-                        .is_none()
-                {
-                    let _ = relay_client.unsubscribe(subscription).await;
+                        .is_some();
+                    if !wanted
+                        && relay_client
+                            .unsubscribe(subscription.clone())
+                            .await
+                            .is_err()
+                    {
+                        state
+                            .write()
+                            .await
+                            .queue_pending_unsubscribes(vec![subscription]);
+                    }
                 }
                 (sub_index, result)
             });

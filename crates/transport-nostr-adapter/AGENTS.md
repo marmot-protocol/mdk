@@ -61,7 +61,8 @@ for reconnect/backoff and relay status mechanics.
     sweep.
   - That wait is bounded so a hung relay client cannot wedge the adapter. When it gives up, it retires the barrier;
     a task that finishes after its barrier was retired closes the REQ it just registered, unless the current routes
-    want that id.
+    want that id. It releases its barrier guard, then holds the lifecycle lock across that check and the CLOSE, so
+    neither can interleave with an activation mid-sweep or a retry re-registering the id.
   - A failed or cancelled group sync closes the REQs its batch installed once its subscribe tasks settle, except ids
     the committed routes still want (`close_abandoned_sync_batch`). Its guard holds the lifecycle lock throughout.
 - Never count a replay a relay may have clamped as coverage (#2263):
