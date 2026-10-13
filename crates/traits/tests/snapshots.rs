@@ -634,6 +634,7 @@ fn snapshot_send_intents() {
 #[test]
 fn snapshot_send_results() {
     let mut app = SendResult::ApplicationMessage {
+        sender_device: Default::default(),
         authority: None,
         msg: TransportMessage {
             id: mid(),
@@ -736,6 +737,7 @@ fn snapshot_group_events() {
             message_id: mid(),
             epoch: EpochId(7),
             sender: mem_id(),
+            sender_device: Default::default(),
             payload: b"hi".to_vec(),
             retention: None,
             encrypted_media_secret: None,
@@ -752,6 +754,7 @@ fn snapshot_group_events() {
             message_id: mid(),
             epoch: EpochId(7),
             sender: mem_id(),
+            sender_device: Default::default(),
             payload: b"hi".to_vec(),
             retention: None,
             encrypted_media_secret: None,
@@ -763,6 +766,7 @@ fn snapshot_group_events() {
         message_id: mid(),
         epoch: EpochId(7),
         sender: mem_id(),
+        sender_device: Default::default(),
         payload: b"hi".to_vec(),
         retention: None,
         encrypted_media_secret: Some(cgka_traits::EncryptedMediaSecret::new(
@@ -1025,4 +1029,39 @@ fn disband_tombstone_announced_defaults_false_for_old_records() {
     }))
     .unwrap();
     assert!(!legacy.announced);
+}
+
+#[test]
+fn historical_message_event_defaults_sender_device_to_unknown() {
+    let legacy = serde_json::json!({"MessageReceived": {
+        "group_id": [1], "message_id": [2], "sender": [3], "epoch": 1,
+        "payload": []
+    }});
+    let event: GroupEvent = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(matches!(
+        &event,
+        GroupEvent::MessageReceived {
+            sender_device: cgka_traits::message::SenderDevice::Unknown,
+            ..
+        }
+    ));
+    assert_eq!(serde_json::to_value(event).unwrap(), legacy);
+    for device in [
+        cgka_traits::message::SenderDevice::Unknown,
+        cgka_traits::message::SenderDevice::OneOf { device_count: 2 },
+        cgka_traits::message::SenderDevice::Exact {
+            device_id: "42".repeat(32),
+            leaf_index: 7,
+            client_label: None,
+            is_this_installation: true,
+        },
+    ] {
+        assert_eq!(
+            serde_json::from_value::<cgka_traits::message::SenderDevice>(
+                serde_json::to_value(&device).unwrap()
+            )
+            .unwrap(),
+            device
+        );
+    }
 }

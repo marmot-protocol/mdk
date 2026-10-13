@@ -29,6 +29,7 @@ fn source(message: &str) -> StoredAppEvent {
         source_epoch: Some(3),
         direction: "received".into(),
         sender: "author".into(),
+        sender_device: Default::default(),
         plaintext: "caption".into(),
         kind: 9,
         tags: vec![vec![

@@ -620,17 +620,21 @@ impl MessageStorage for SqliteAccountStorage {
                     .storage()?;
                 return match existing {
                     Some(existing) if existing == record => Ok(()),
-                    Some(existing) if pending_authority_upgrade(&existing, event)? => {
-                        conn.execute_cached(
-                            "UPDATE pending_application_events SET record=?2 WHERE message_id=?1",
-                            params![message_id.as_slice(), record],
-                        )
-                        .storage()?;
-                        Ok(())
+                    Some(existing) => {
+                        if let Some(merged) = merge_pending_application_evidence(&existing, event)?
+                        {
+                            conn.execute_cached(
+                                "UPDATE pending_application_events SET record=?2 WHERE message_id=?1",
+                                params![message_id.as_slice(), merged],
+                            ).storage()?;
+                            Ok(())
+                        } else {
+                            Err(StorageError::Backend(
+                                "pending application event id reused with different content"
+                                    .to_owned(),
+                            ))
+                        }
                     }
-                    Some(_) => Err(StorageError::Backend(
-                        "pending application event id reused with different content".to_owned(),
-                    )),
                     None => Err(StorageError::NotFound),
                 };
             }
@@ -641,6 +645,19 @@ impl MessageStorage for SqliteAccountStorage {
         } else {
             retry_on_busy(|| self.connection.with_transaction(write))
         }
+    }
+
+    fn get_pending_application_event(&self, id: &MessageId) -> StorageResult<Option<GroupEvent>> {
+        let record = self
+            .lock()?
+            .query_row_cached(
+                "SELECT record FROM pending_application_events WHERE message_id=?1",
+                params![id.as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .storage()?;
+        record.as_deref().map(deserialize).transpose()
     }
 
     fn list_pending_application_events(&self) -> StorageResult<Vec<GroupEvent>> {
@@ -1133,29 +1150,49 @@ fn put_processed_transport_id_on_connection(
     Ok(())
 }
 
-fn pending_authority_upgrade(existing: &[u8], incoming: &GroupEvent) -> StorageResult<bool> {
+// Only missing evidence may change. All source identity and authenticated
+// content fields must still match; known provenance cannot be replaced.
+fn merge_pending_application_evidence(
+    existing: &[u8],
+    incoming: &GroupEvent,
+) -> StorageResult<Option<Vec<u8>>> {
     let mut existing: GroupEvent = deserialize(existing)?;
+    let mut incoming = incoming.clone();
     if let (
         GroupEvent::MessageReceived {
             authority: old,
             retention: old_retention,
+            sender_device: old_device,
             ..
         },
         GroupEvent::MessageReceived {
-            authority: Some(new),
+            authority: new,
             retention: new_retention,
+            sender_device: new_device,
             ..
         },
-    ) = (&mut existing, incoming)
-        && old.is_none()
+    ) = (&mut existing, &mut incoming)
     {
-        *old = Some(*new);
-        if old_retention.is_none() {
-            *old_retention = *new_retention;
+        if old_device.is_unknown() && !new_device.is_unknown() {
+            *old_device = new_device.clone();
+            if old_retention.is_none() {
+                *old_retention = *new_retention;
+            }
+        } else if new_device.is_unknown() {
+            *new_device = old_device.clone();
         }
-        return Ok(&existing == incoming);
+        if old.is_none() && new.is_some() {
+            *old = *new;
+            if old_retention.is_none() {
+                *old_retention = *new_retention;
+            }
+        }
     }
-    Ok(false)
+    if existing == incoming {
+        serialize(&existing).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -1637,11 +1674,53 @@ mod tests {
             group_id: gid(1),
             message_id,
             sender: MemberId::new(vec![7; 32]),
+            sender_device: Default::default(),
             epoch: EpochId(0),
             payload: b"authenticated chat".to_vec(),
             retention: None,
             encrypted_media_secret: None,
         }
+    }
+
+    #[test]
+    fn sender_device_outbox_upgrade_requires_identical_authenticated_content() {
+        use cgka_traits::message::SenderDevice;
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+        store
+            .put_message(&sample_message(mid(1), gid(1), 0))
+            .unwrap();
+        let legacy = application_event(mid(1));
+        store.put_pending_application_event(&legacy).unwrap();
+        let mut exact = legacy.clone();
+        if let GroupEvent::MessageReceived { sender_device, .. } = &mut exact {
+            *sender_device = SenderDevice::Exact {
+                device_id: "42".repeat(32),
+                leaf_index: 7,
+                client_label: None,
+                is_this_installation: false,
+            };
+        }
+        store.put_pending_application_event(&exact).unwrap();
+        assert_eq!(
+            store.list_pending_application_events().unwrap(),
+            vec![exact.clone()]
+        );
+        // A later replay lacking the source tree must keep captured evidence.
+        store.put_pending_application_event(&legacy).unwrap();
+        assert_eq!(
+            store.list_pending_application_events().unwrap(),
+            vec![exact.clone()]
+        );
+        let mut conflicting = exact.clone();
+        if let GroupEvent::MessageReceived { payload, .. } = &mut conflicting {
+            payload.push(0);
+        }
+        assert!(store.put_pending_application_event(&conflicting).is_err());
+        assert_eq!(
+            store.list_pending_application_events().unwrap(),
+            vec![exact]
+        );
     }
 
     #[test]

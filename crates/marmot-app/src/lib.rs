@@ -4,6 +4,8 @@
 //! early app surfaces: encrypted session storage, Nostr MLS peeling, Nostr
 //! transport publishing, and relay-backed app projections.
 
+pub use cgka_traits::message::SenderDevice;
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -237,7 +239,7 @@ pub use groups::{
     AppInitialGroupImage, AppPreparedGroupImageUpload, AppPreparedGroupImageUploadState,
     AppPriorNostrRoute, AppProtocolProfile, AppQuarantinedGroup, GroupRecoveryStatus,
     GroupRejoinInvitation, GroupSystemEventProvenance, MAX_GROUP_MEMBER_IDS_PAGE_SIZE,
-    PendingGroupInvite, group_system_event_from_message,
+    MemberDevice, PendingGroupInvite, group_system_event_from_message,
 };
 pub use ids::{
     account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
@@ -1037,6 +1039,7 @@ pub struct EpochStallEscalation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReceivedMessage {
+    pub sender_device: cgka_traits::message::SenderDevice,
     pub authority: Option<cgka_traits::app_event::AppMessageAuthority>,
     pub message_id_hex: String,
     pub source_message_id_hex: String,
@@ -1100,6 +1103,8 @@ pub(crate) fn prune_seen_events(seen_events: &mut Vec<String>) -> std::vec::Drai
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppMessageRecord {
+    #[serde(default)]
+    pub sender_device: cgka_traits::message::SenderDevice,
     /// Authenticated source-state evidence. Legacy and unresolved rows remain
     /// `None`; recovery must never infer this from current group policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1249,6 +1254,7 @@ pub struct GroupInviteDeclineResult {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FetchedKeyPackage {
+    pub client_label: Option<String>,
     pub account_id_hex: String,
     pub key_package: KeyPackage,
     pub key_package_id: String,
@@ -1318,6 +1324,7 @@ impl AccountKeyPackageLocalState {
 pub struct AccountKeyPackageInventoryEntry {
     pub record: AccountKeyPackageRecord,
     pub local_state: AccountKeyPackageLocalState,
+    pub is_this_installation: bool,
 }
 
 /// Observed relay history for an account's kind-30443 KeyPackage events.
@@ -1388,6 +1395,7 @@ pub(crate) struct AccountState {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AppMessageProjection {
+    pub sender_device: cgka_traits::message::SenderDevice,
     pub authority: Option<cgka_traits::app_event::AppMessageAuthority>,
     pub(crate) message_id_hex: String,
     pub(crate) source_message_id_hex: Option<String>,
@@ -1984,6 +1992,9 @@ impl MarmotApp {
         let recovery_loss_imports = open.recovery_loss_imports;
         let audit_v5_enabled = open.runtime.session().audit_v5_enabled();
         let mut client = AppClient {
+            member_device_package_validations: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            member_device_validation_count: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             test_recovery_selection_witness: None,
             audit_v5_probe: audit_v5_enabled.then(client::audit_v5_probe::WelcomeProbe::live),
@@ -5206,6 +5217,7 @@ impl MarmotApp {
                     local: true,
                     relay: false,
                 },
+                is_this_installation: local_state.is_local(),
                 local_state,
             });
         }
@@ -6557,6 +6569,7 @@ impl MarmotApp {
         source_epoch: u64,
         retention: AppMessageRetentionDecision,
         authority: Option<cgka_traits::app_event::AppMessageAuthority>,
+        sender_device: crate::SenderDevice,
     ) -> Result<Option<AppProjectionUpdate>, AppError> {
         let observation = self
             .product_analytics
@@ -6570,12 +6583,13 @@ impl MarmotApp {
         let update = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
             let authority_update =
                 storage.finalize_app_event_authority(group_id_hex, message_id_hex, authority)?;
-            let retention_update = storage.finalize_app_event_source_retention(
+            let retention_update = storage.finalize_app_event_source_retention_with_sender_device(
                 group_id_hex,
                 message_id_hex,
                 source_message_id_hex,
                 source_epoch,
                 retention,
+                &sender_device,
             )?;
             storage.retain_attachment_uploads_after_commit(
                 group_id_hex,
@@ -7714,6 +7728,7 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
                 .account_relay_list_status_for_account_id(&account_id_hex)
                 .unwrap_or_else(|_| AccountRelayListStatus::empty());
             let fetched = FetchedKeyPackage {
+                client_label: crate::key_package_records::key_package_client_label(&event),
                 account_id_hex,
                 key_package: publication.key_package.clone(),
                 key_package_id: publication.slot_id.clone(),

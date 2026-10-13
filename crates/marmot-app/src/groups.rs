@@ -241,11 +241,43 @@ impl From<ProtocolProfile> for AppProtocolProfile {
     }
 }
 
+/// One canonical MLS device. The group-scoped opaque ID is stable while the
+/// signature key is unchanged (including MDK SelfUpdate and reopen). A client
+/// rotating its signature key appears as a new device. Leaf indices can be
+/// reused after removal and are display/debug information only.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemberDevice {
+    pub device_id: String,
+    pub leaf_index: u32,
+    /// Bounded, sanitized advisory label from a cached validated KeyPackage.
+    pub client_label: Option<String>,
+    /// No reliable per-leaf admission time is available.
+    pub joined_at: Option<u64>,
+    pub is_this_installation: bool,
+}
+
+pub(crate) fn member_device(
+    group_id: &cgka_traits::GroupId,
+    leaf: cgka_engine::group_authority::CanonicalMemberDevice,
+    client_label: Option<String>,
+) -> MemberDevice {
+    MemberDevice {
+        device_id: cgka_traits::message::member_device_id(group_id, &leaf.signature_key),
+        leaf_index: leaf.leaf_index,
+        client_label,
+        joined_at: None,
+        is_this_installation: leaf.is_this_installation,
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppGroupMemberRecord {
     pub member_id_hex: String,
     pub account: Option<String>,
     pub local: bool,
+    #[serde(default)]
+    /// None means unknown; Some contains canonical admitted devices (always nonempty).
+    pub devices: Option<Vec<MemberDevice>>,
 }
 
 /// Lightweight local roster projection for one group.
@@ -312,6 +344,9 @@ pub struct AppGroupRosterMember {
     pub member_id_hex: String,
     pub account: Option<String>,
     pub local: bool,
+    #[serde(default)]
+    /// None means unknown; Some contains canonical admitted devices (always nonempty).
+    pub devices: Option<Vec<MemberDevice>>,
     pub is_admin: bool,
     pub is_self: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -354,6 +389,7 @@ pub(crate) fn app_group_roster_from_session(
                 member_id_hex,
                 account: member.account,
                 local: member.local,
+                devices: member.devices,
                 is_admin: admin_ids.contains(&member.member_id_hex),
                 is_self: member.member_id_hex == my_account_id_hex,
                 display_name: display_names.get(&member.member_id_hex).cloned(),
@@ -2154,6 +2190,7 @@ pub(crate) fn decode_received_event(
         message_id_hex: event.id,
         source_message_id_hex: source_message_id_hex.to_owned(),
         sender: sender_hex.to_owned(),
+        sender_device: Default::default(),
         sender_display_name,
         group_id: group_id.clone(),
         source_epoch,
@@ -2210,6 +2247,7 @@ pub(crate) fn observe_event(
         GroupEvent::MessageReceived {
             group_id,
             sender,
+            sender_device,
             epoch,
             payload,
             retention,
@@ -2250,6 +2288,7 @@ pub(crate) fn observe_event(
                 return None;
             };
             message.authority = *authority;
+            message.sender_device = sender_device.clone();
             // Gossip remains available to native ingestion, but must never enter
             // the host message summary, including a partially applied batch.
             if !crate::notifications::is_push_gossip_kind(message.kind) {
@@ -2965,6 +3004,7 @@ mod group_roster_api_tests {
             member_id_hex: self_id.to_owned(),
             account: Some("alice".to_owned()),
             local: true,
+            devices: None,
         }];
         let mls_state = AppGroupMlsState {
             group_id_hex: record.group_id_hex.clone(),
@@ -2997,5 +3037,44 @@ mod group_roster_api_tests {
         assert!(roster.members[0].is_admin);
         assert!(roster.members[0].is_self);
         assert_eq!(roster.members[0].display_name.as_deref(), Some("Alice"));
+    }
+}
+
+#[cfg(test)]
+mod member_device_tests {
+    use super::*;
+    #[test]
+    fn device_id_is_group_scoped_and_binds_signature_key_not_leaf_index() {
+        let device = |group: &[u8], key: &[u8], index| {
+            member_device(
+                &cgka_traits::GroupId::new(group.to_vec()),
+                cgka_engine::group_authority::CanonicalMemberDevice {
+                    member: cgka_traits::MemberId::new(vec![1; 32]),
+                    signature_key: key.to_vec(),
+                    leaf_index: index,
+                    is_this_installation: false,
+                },
+                None,
+            )
+        };
+        let original = device(b"group", b"signature", 2);
+        assert_eq!(
+            original.device_id,
+            device(b"group", b"signature", 9).device_id
+        );
+        assert_ne!(
+            original.device_id,
+            device(b"other", b"signature", 2).device_id
+        );
+        assert_ne!(
+            original.device_id,
+            device(b"group", b"new signature", 2).device_id
+        );
+        assert_ne!(
+            device(b"ab", b"c", 2).device_id,
+            device(b"a", b"bc", 2).device_id
+        );
+        assert!(original.client_label.is_none());
+        assert!(original.joined_at.is_none());
     }
 }

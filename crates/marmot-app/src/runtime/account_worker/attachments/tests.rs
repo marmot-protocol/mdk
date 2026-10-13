@@ -102,6 +102,7 @@ fn seed_direction(
             source_epoch: Some(3),
             direction: direction.into(),
             sender: "33".repeat(32),
+            sender_device: Default::default(),
             plaintext: String::new(),
             kind: 9,
             tags: vec![tag, vec!["imeta".into(), "v future".into()]],
@@ -301,6 +302,7 @@ async fn download_without_engine_and_retain(
                 source_epoch: None,
                 direction: "sent".into(),
                 sender: "33".repeat(32),
+                sender_device: Default::default(),
                 plaintext: String::new(),
                 kind: 9,
                 tags: vec![reference.imeta_tag()],
@@ -344,6 +346,7 @@ async fn download_without_engine_and_retain(
         let connection = retention_fault_connection(&app);
         let tag = reference.imeta_tag();
         storage.record_app_event(&StoredAppEvent {
+            sender_device: Default::default(),
             group_id_hex: GROUP.into(), message_id_hex: "55".repeat(32),
             source_message_id_hex: Some("66".repeat(32)), source_epoch: Some(3),
             direction: "sent".into(), sender: "33".repeat(32), plaintext: String::new(),
@@ -534,6 +537,7 @@ async fn attachment_missing_secret_does_not_claim_or_back_off_a_page_of_siblings
                 source_epoch: Some(3),
                 direction: "received".into(),
                 sender: "33".repeat(32),
+                sender_device: Default::default(),
                 plaintext: String::new(),
                 kind: 9,
                 tags: vec![serde_json::from_value(entry.slot.clone()).unwrap()],
@@ -722,6 +726,7 @@ fn attachment_explicit_retry_derives_an_uncached_source_epoch_key() {
                 source_epoch: Some(source_epoch.0),
                 direction: "received".into(),
                 sender: "33".repeat(32),
+                sender_device: Default::default(),
                 plaintext: String::new(),
                 kind: 9,
                 tags: vec![vec![
@@ -1347,6 +1352,7 @@ async fn outgoing_retention_failure_preserves_all_source_projection_paths() {
         direction: "sent".into(),
         group_id_hex: GROUP.into(),
         sender: "33".repeat(32),
+        sender_device: Default::default(),
         plaintext: "accepted".into(),
         kind: 9,
         tags: vec![reference.imeta_tag()],
@@ -1377,6 +1383,7 @@ async fn outgoing_retention_failure_preserves_all_source_projection_paths() {
             3,
             crate::AppMessageRetentionDecision::new(10, 0),
             None,
+            Default::default(),
         )
         .unwrap();
     let rows: i64 = connection.query_row("SELECT count(*) FROM app_events WHERE direction='sent' AND source_message_id_hex IS NOT NULL",[],|row|row.get(0)).unwrap();

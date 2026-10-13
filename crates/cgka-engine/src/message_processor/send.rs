@@ -876,6 +876,19 @@ impl<S: StorageProvider> Engine<S> {
         // epoch the caller saw can legitimately no longer be encrypted under
         // it. Nothing has been written yet; hand the untouched group back.
         let source_epoch = EpochId(mls_group.epoch().as_u64());
+        let sender_device = mls_group
+            .own_leaf_node()
+            .filter(|leaf| leaf.signature_key().as_slice() == self.identity.signer.public())
+            .map(|leaf| cgka_traits::message::SenderDevice::Exact {
+                device_id: cgka_traits::message::member_device_id(
+                    &group_id,
+                    leaf.signature_key().as_slice(),
+                ),
+                leaf_index: mls_group.own_leaf_index().u32(),
+                client_label: None,
+                is_this_installation: true,
+            })
+            .unwrap_or_default();
         if let Some(expected) = expected_epoch
             && expected != source_epoch
         {
@@ -956,6 +969,7 @@ impl<S: StorageProvider> Engine<S> {
         self.return_mls_group(&group_id, mls_group);
 
         Ok(SendResult::ApplicationMessage {
+            sender_device,
             msg: wrapped,
             group_id,
             app_event_id: app_event.id,

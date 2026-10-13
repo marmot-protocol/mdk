@@ -389,3 +389,21 @@ fn legacy_deleted_record_defaults_to_unknown_provenance() {
         super::super::timeline::DeletionSourceFfi::Unknown
     );
 }
+
+#[test]
+fn sender_device_change_invalidates_prepared_conversion_cache() {
+    let mut cache = ConversationConversionCache::default();
+    let mut row = record(0);
+    let unknown = wire(cache.row(&row, false));
+    row.sender_device = app::SenderDevice::Exact {
+        device_id: "42".repeat(32),
+        leaf_index: 2,
+        client_label: None,
+        is_this_installation: false,
+    };
+    let exact = wire(cache.row(&row, false));
+    assert_ne!(exact, unknown);
+    assert_eq!(exact, wire(presented_timeline(&row, false)));
+    assert_eq!(cache.conversions, 2);
+    assert_eq!(cache.parses, 1);
+}

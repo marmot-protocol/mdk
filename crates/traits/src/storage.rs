@@ -352,6 +352,19 @@ pub trait MessageStorage {
     /// upgrades an otherwise identical output and retires that request atomically.
     fn put_pending_application_event(&self, event: &GroupEvent) -> StorageResult<()>;
 
+    /// Read one durable output so replay can retain previously authenticated
+    /// sender evidence. Backends should use their source-id index when available.
+    fn get_pending_application_event(&self, id: &MessageId) -> StorageResult<Option<GroupEvent>> {
+        Ok(self
+            .list_pending_application_events()?
+            .into_iter()
+            .find(|event| match event {
+                GroupEvent::MessageReceived { message_id, .. } => message_id == id,
+                GroupEvent::GroupJoined { via_welcome, .. } => via_welcome == id,
+                _ => false,
+            }))
+    }
+
     /// Return pending app-visible outputs in deterministic ingress order.
     fn list_pending_application_events(&self) -> StorageResult<Vec<GroupEvent>>;
 

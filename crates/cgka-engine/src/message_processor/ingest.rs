@@ -1410,6 +1410,13 @@ impl<S: StorageProvider> Engine<S> {
 
         // Classify content.
         let sender_id = member_id_of_processed_message(&processed, &mls_group);
+        let sender_device = crate::identity::sender_device_of_processed_message(
+            &processed,
+            &mls_group,
+            self.identity.signer.public(),
+            self.storage.mls_storage(),
+        )
+        .map_err(|error| EngineError::Backend(format!("sender device evidence: {error:?}")))?;
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(bytes) => {
                 let Some(sender) = sender_id else {
@@ -1533,10 +1540,11 @@ impl<S: StorageProvider> Engine<S> {
                 } else {
                     None
                 };
-                let event = GroupEvent::MessageReceived {
+                let mut event = GroupEvent::MessageReceived {
                     group_id: group_id.clone(),
                     message_id: msg.id.clone(),
                     sender,
+                    sender_device,
                     epoch: msg_epoch,
                     payload,
                     authority,
@@ -1545,6 +1553,7 @@ impl<S: StorageProvider> Engine<S> {
                     }),
                     encrypted_media_secret,
                 };
+                crate::identity::retain_saved_sender_device(&self.storage, &mut event)?;
                 let previous = self.storage.get_message(&msg.id).ok();
                 self.storage.with_transaction(|storage| {
                     storage.update_message_state(&msg.id, MessageState::Processed)?;

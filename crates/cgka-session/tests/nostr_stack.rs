@@ -62,6 +62,7 @@ async fn nostr_adapter_peeler_and_session_deliver_welcome_and_group_message() {
     assert_eq!(
         received.effects.events,
         vec![GroupEvent::MessageReceived {
+            sender_device: support::received_sender_device(&sent.publish[0]),
             authority: None,
             group_id: created.group_id,
             message_id: message_id.clone(),
@@ -140,7 +141,22 @@ async fn group_delivery_requires_synced_group_subscription() {
     )
     .await;
 
-    let app_message = send_app_message(&mut alice, &created.group_id, b"sync gated").await;
+    let sent = alice
+        .session
+        .send(SendIntent::AppMessage {
+            group_id: created.group_id.clone(),
+            payload: app_payload_for(&alice, b"sync gated"),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap();
+    let PublishWork::ApplicationMessage {
+        msg: app_message, ..
+    } = &sent.publish[0]
+    else {
+        panic!("expected application publication");
+    };
+    let app_message = app_message.clone();
     let report = stack
         .publish_group(&alice, &created.group_id, app_message, 1)
         .await
@@ -177,6 +193,7 @@ async fn group_delivery_requires_synced_group_subscription() {
     assert_eq!(
         after_sync.effects.events,
         vec![GroupEvent::MessageReceived {
+            sender_device: support::received_sender_device(&sent.publish[0]),
             authority: None,
             group_id: created.group_id,
             message_id: message_id.clone(),

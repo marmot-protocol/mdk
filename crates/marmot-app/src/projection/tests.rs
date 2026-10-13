@@ -271,6 +271,7 @@ fn prune_group_messages_before_removes_only_expired_group_rows() {
             direction: "received".to_owned(),
             group_id_hex: group_id_hex.to_owned(),
             sender: "sender".to_owned(),
+            sender_device: Default::default(),
             plaintext: message_id_hex.to_owned(),
             kind: 9,
             tags: Vec::new(),

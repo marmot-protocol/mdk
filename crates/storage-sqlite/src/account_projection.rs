@@ -294,6 +294,7 @@ impl SecurePruneAppEventsMode {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredAppMessageRecord {
+    pub sender_device: cgka_traits::message::SenderDevice,
     /// Authenticated source-state evidence; absent for legacy/unresolved rows.
     pub authority: Option<cgka_traits::app_event::AppMessageAuthority>,
     pub message_id_hex: String,
@@ -336,7 +337,7 @@ impl StoredAppMessageRecord {
 const APP_EVENT_REPLAY_COLUMNS: &str = "message_id_hex, direction, group_id_hex, sender, plaintext, \
      kind, tags_json, source_epoch, retention_seconds, retention_expires_at, recorded_at, \
      received_at, insert_order, moderation_grant, invalidated, authority_state, \
-     authority_context";
+     authority_context, sender_device";
 
 /// The ONE ascending order for the raw-event replay surface (recovery / lag
 /// replay), shared by [`SqliteAccountStorage::app_messages`] and — via
@@ -3884,6 +3885,7 @@ fn app_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAppMe
         direction: row.get(1)?,
         group_id_hex: row.get(2)?,
         sender: row.get(3)?,
+        sender_device: crate::timeline::sender_device_from_row(row)?,
         plaintext: row.get(4)?,
         kind: row.get::<_, i64>(5)?.try_into().unwrap_or_default(),
         tags: tags_from_json(row.get::<_, String>(6)?).map_err(|err| {

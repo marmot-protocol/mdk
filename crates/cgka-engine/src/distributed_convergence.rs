@@ -1584,7 +1584,7 @@ impl<S: StorageProvider> Engine<S> {
                 };
                 storage.put_convergence_pass(&completed_pass)?;
                 let application_events =
-                    Self::application_replay_events(group_id, &output.observations)?;
+                    Self::application_replay_events(storage, group_id, &output.observations)?;
                 for event in &application_events {
                     storage
                         .put_pending_application_event(event)
@@ -1810,6 +1810,7 @@ impl<S: StorageProvider> Engine<S> {
     }
 
     pub(crate) fn application_replay_events(
+        storage: &S,
         group_id: &GroupId,
         observations: &[OpenMlsReplayObservation],
     ) -> Result<Vec<GroupEvent>, OpenMlsProjectionError> {
@@ -1819,6 +1820,7 @@ impl<S: StorageProvider> Engine<S> {
                 message_id,
                 source_epoch,
                 sender,
+                sender_device,
                 payload,
                 retention,
                 authority,
@@ -1840,16 +1842,20 @@ impl<S: StorageProvider> Engine<S> {
                 );
                 continue;
             }
-            events.push(GroupEvent::MessageReceived {
+            let mut event = GroupEvent::MessageReceived {
                 group_id: group_id.clone(),
                 message_id: message_id_from_hex(message_id)?,
                 epoch: cgka_traits::EpochId(*source_epoch),
                 sender: MemberId::new(sender.clone()),
+                sender_device: sender_device.clone(),
                 payload: payload.clone(),
                 retention: Some(*retention),
                 authority: *authority,
                 encrypted_media_secret: encrypted_media_secret.clone(),
-            });
+            };
+            crate::identity::retain_saved_sender_device(storage, &mut event)
+                .map_err(storage_projection_error)?;
+            events.push(event);
         }
         Ok(events)
     }

@@ -724,7 +724,21 @@ pub(crate) enum CursorSeal {
 #[cfg(test)]
 pub(crate) type CursorSealProbe = Box<dyn FnMut(CursorSeal) + Send>;
 
+type MemberDeviceLabels = HashMap<(String, Vec<u8>), String>;
+
+/// Two current sources per account: its selected directory slot and our publication.
+/// Replacing either source drops its old validation result, including rejections.
+#[derive(Clone)]
+pub(crate) struct MemberDevicePackageValidation {
+    bytes: Vec<u8>,
+    metadata: Option<cgka_engine::key_package::KeyPackageMetadata>,
+}
+
 pub struct AppClient {
+    pub(crate) member_device_package_validations:
+        std::sync::Mutex<HashMap<(String, bool), MemberDevicePackageValidation>>,
+    #[cfg(test)]
+    pub(crate) member_device_validation_count: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     pub(crate) test_recovery_selection_witness:
         Option<Arc<std::sync::Mutex<Vec<TestRecoverySelection>>>>,
@@ -2398,36 +2412,206 @@ impl AppClient {
     /// map for a single read;
     /// [`AppClient::group_read_snapshot_with_stage_telemetry`] loads it once
     /// and reuses it across every group so capturing the snapshot stays a
-    /// single profile read plus in-memory engine reads (it runs on the worker
-    /// readiness path).
+    /// single profile read with device-label cache reads shared across groups
+    /// (it runs on the worker readiness path).
     fn members_with_profiles(
         &self,
         group_id: &GroupId,
         profiles: &HashMap<String, String>,
     ) -> Result<Vec<AppGroupMemberRecord>, AppError> {
         self.ensure_group(group_id)?;
-        self.members_with_profiles_unchecked(group_id, profiles)
+        self.members_with_profiles_unchecked(group_id, profiles, None)
     }
 
     fn members_with_profiles_unchecked(
         &self,
         group_id: &GroupId,
         profiles: &HashMap<String, String>,
+        cached_labels: Option<&MemberDeviceLabels>,
     ) -> Result<Vec<AppGroupMemberRecord>, AppError> {
-        Ok(self
-            .runtime
-            .members(group_id)?
-            .into_iter()
-            .map(|member| {
-                let member_id_hex = hex::encode(member.id.as_slice());
-                let account = profiles.get(&member_id_hex).cloned();
-                AppGroupMemberRecord {
+        // Disband deletes live MLS state but keeps the historical roster.
+        let devices = if self.runtime.group_record(group_id)?.disbanded.is_some() {
+            Vec::new()
+        } else {
+            self.runtime
+                .session()
+                .canonical_group_membership(group_id)?
+                .devices
+        };
+        let mut members = std::collections::BTreeMap::new();
+        for member in self.runtime.members(group_id)? {
+            let member_id_hex = hex::encode(member.id.as_slice());
+            let account = profiles.get(&member_id_hex).cloned();
+            members
+                .entry(member_id_hex.clone())
+                .or_insert(AppGroupMemberRecord {
                     member_id_hex,
                     local: account.is_some(),
                     account,
+                    devices: None,
+                });
+        }
+        let owned_labels;
+        let labels = if let Some(labels) = cached_labels {
+            labels
+        } else {
+            owned_labels = self.member_device_labels(members.keys().cloned());
+            &owned_labels
+        };
+        for leaf in devices {
+            let account_id = hex::encode(leaf.member.as_slice());
+            if let Some(member) = members.get_mut(&account_id) {
+                let label = labels
+                    .get(&(account_id, leaf.signature_key.clone()))
+                    .cloned();
+                member
+                    .devices
+                    .get_or_insert_with(Vec::new)
+                    .push(crate::groups::member_device(group_id, leaf, label));
+            }
+        }
+        for member in members.values_mut() {
+            if let Some(devices) = &mut member.devices {
+                devices.sort_by_key(|device| (!device.is_this_installation, device.leaf_index));
+            }
+        }
+        Ok(members.into_values().collect())
+    }
+
+    pub(crate) fn enrich_sender_device(
+        &self,
+        group_id: &GroupId,
+        sender: &str,
+        mut device: crate::SenderDevice,
+    ) -> crate::SenderDevice {
+        if let crate::SenderDevice::Exact {
+            device_id,
+            client_label,
+            ..
+        } = &mut device
+        {
+            let labels = self.member_device_labels(std::iter::once(sender.to_owned()));
+            *client_label = labels.into_iter().find_map(|((_, key), label)| {
+                (cgka_traits::message::member_device_id(group_id, &key) == *device_id)
+                    .then_some(label)
+            });
+        }
+        device
+    }
+
+    fn member_device_package_metadata(
+        &self,
+        account_id: &str,
+        publication: bool,
+        package: &KeyPackage,
+    ) -> Result<cgka_engine::key_package::KeyPackageMetadata, AppError> {
+        let mut cache = self
+            .member_device_package_validations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (account_id.to_owned(), publication);
+        let same_package = [publication, !publication].into_iter().find_map(|source| {
+            cache
+                .get(&(account_id.to_owned(), source))
+                .filter(|cached| cached.bytes == package.bytes())
+        });
+        let validated = if let Some(cached) = same_package {
+            cached.clone()
+        } else {
+            #[cfg(test)]
+            self.member_device_validation_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            MemberDevicePackageValidation {
+                bytes: package.bytes().to_vec(),
+                metadata: cgka_engine::key_package::key_package_metadata(package).ok(),
+            }
+        };
+        let metadata = validated.metadata.clone();
+        cache.insert(key, validated);
+        metadata
+            .ok_or_else(|| AppError::InvalidKeyPackageEvent("invalid advisory KeyPackage".into()))
+    }
+
+    /// Read each requested account cache once; never discover devices here.
+    /// Optional enrichment cannot change the outcome of authoritative roster reads.
+    fn member_device_labels(
+        &self,
+        account_ids: impl IntoIterator<Item = String>,
+    ) -> MemberDeviceLabels {
+        let account_ids = account_ids.into_iter().collect::<Vec<_>>();
+        if account_ids.is_empty() {
+            return HashMap::new();
+        }
+        let mut labels = HashMap::new();
+        let mut failed_advisory_reads = 0usize;
+        match self.app.member_device_key_packages(&account_ids) {
+            Ok(packages) => {
+                for (account_id, package) in packages {
+                    let result = (|| -> Result<(), AppError> {
+                        let Some(package) = package? else {
+                            return Ok(());
+                        };
+                        let Some(label) = package
+                            .client_label
+                            .as_deref()
+                            .and_then(crate::key_package_records::sanitize_client_label)
+                        else {
+                            return Ok(());
+                        };
+                        let bytes = hex::decode(&package.key_package_hex)?;
+                        let metadata = self.member_device_package_metadata(
+                            &account_id,
+                            false,
+                            &KeyPackage::new(bytes).with_protocol_profile(
+                                cgka_traits::group::ProtocolProfile::Current,
+                            ),
+                        )?;
+                        if metadata.credential_identity_hex == account_id {
+                            labels.insert((account_id, metadata.signature_key), label);
+                        } else {
+                            return Err(AppError::InvalidKeyPackageEvent(
+                                "advisory identity mismatch".into(),
+                            ));
+                        }
+                        Ok(())
+                    })();
+                    failed_advisory_reads += usize::from(result.is_err());
                 }
-            })
-            .collect())
+            }
+            Err(_) => failed_advisory_reads += 1,
+        }
+        // The durable signed publication survives replacement by a sibling.
+        // Reuse its validated metadata, including when also present in the directory.
+        let publication = (|| -> Result<(), AppError> {
+            let Some(artifact) = self
+                .runtime
+                .key_package_maintenance_status()?
+                .and_then(|state| state.authored_signed_event)
+            else {
+                return Ok(());
+            };
+            let event: transport_nostr_peeler::NostrTransportEvent =
+                serde_json::from_slice(&artifact.bytes)?;
+            let account_id = event.pubkey.clone();
+            let (fetched, metadata) =
+                crate::key_package_records::key_package_from_record_with_metadata(
+                    &crate::RelayEventRecord {
+                        event,
+                        endpoints: Vec::new(),
+                    },
+                    |package| self.member_device_package_metadata(&account_id, true, package),
+                )?;
+            if let Some(label) = fetched.client_label {
+                labels.insert((fetched.account_id_hex, metadata.signature_key), label);
+            }
+            Ok(())
+        })();
+        failed_advisory_reads += usize::from(publication.is_err());
+        if failed_advisory_reads > 0 {
+            tracing::warn!(target: "marmot_app::client", method = "member_device_labels",
+                failed_advisory_reads, "advisory device label enrichment unavailable");
+        }
+        labels
     }
 
     pub fn group_mls_state(&self, group_id: &GroupId) -> Result<AppGroupMlsState, AppError> {
@@ -2454,7 +2638,7 @@ impl AppClient {
             .cloned()
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex))?;
         let profiles = self.app.profiles_by_id()?;
-        let members = self.members_with_profiles_unchecked(group_id, &profiles)?;
+        let members = self.members_with_profiles_unchecked(group_id, &profiles, None)?;
         if let Some(membership) = self
             .app
             .stored_group_self_membership(&self.state.label, &group_record.group_id_hex)?
@@ -2578,9 +2762,8 @@ impl AppClient {
             )
             .into());
         }
-        // Load account profiles once and reuse across every group: the rest of
-        // the capture is in-memory engine reads, so the snapshot adds a single
-        // storage read to the worker readiness path regardless of group count.
+        // Load profiles once and share label enrichment across roster accounts;
+        // canonical device evidence comes from the live engine, never discovery.
         let profile_load_started = Instant::now();
         let profiles = self.app.profiles_by_id();
         if let Some(telemetry) = telemetry {
@@ -2595,6 +2778,17 @@ impl AppClient {
         let mut groups = HashMap::new();
         let mut members = HashMap::new();
         let mut mls_state = HashMap::new();
+        // Device enrichment is shared across groups in this worker capture.
+        // Only roster accounts are read; no full directory or history scan.
+        let mut account_ids = std::collections::BTreeSet::new();
+        for group in &self.state.groups {
+            if let Ok(bytes) = hex::decode(&group.group_id_hex) {
+                for member in self.runtime.members(&GroupId::new(bytes))? {
+                    account_ids.insert(hex::encode(member.id.as_slice()));
+                }
+            }
+        }
+        let labels = self.member_device_labels(account_ids);
         let mut skipped_malformed_group_records = 0usize;
         for group in &self.state.groups {
             let Ok(bytes) = hex::decode(&group.group_id_hex) else {
@@ -2606,7 +2800,8 @@ impl AppClient {
             if let Some(membership) = stored_self_memberships.get(&group.group_id_hex) {
                 group_record.self_membership = *membership;
             }
-            let records = self.members_with_profiles_unchecked(&group_id, &profiles)?;
+            let records =
+                self.members_with_profiles_unchecked(&group_id, &profiles, Some(&labels))?;
             let state = self.group_mls_state_unchecked(&group_id)?;
             groups.insert(group_id.clone(), group_record);
             members.insert(group_id.clone(), records);
@@ -4596,6 +4791,7 @@ impl AppClient {
                 published.source_epoch.0,
                 published.retention,
                 published.authority,
+                published.sender_device.clone(),
             )
         });
         if should_project_locally {

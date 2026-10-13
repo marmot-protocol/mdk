@@ -20,7 +20,7 @@ const ROTATED_GROUP: &str = "5cd77cb71f1a861ace44d13e4dfdae3d";
 const RETAINED_ROUTE: &str = "17f6648f67003fec1ac26f7b1e027e5185beb61b22c131605ea80ec8aaf4810e";
 const PERSISTED_CURSOR: i64 = 1_790_635_089;
 
-/// Tables whose rows migrations 0090-0098 must carry over unchanged.
+/// Tables whose historical fields forward migrations must carry over unchanged.
 const PRESERVED_TABLES: &[&str] = &[
     "cgka_groups",
     "cgka_messages",
@@ -65,7 +65,19 @@ fn rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<Value>> {
 
 /// Every row of `table` in a canonical order (some tables have no rowid).
 fn table_rows(conn: &rusqlite::Connection, table: &str) -> Vec<Vec<Value>> {
-    let mut all = rows(conn, &format!("SELECT * FROM {table}"));
+    // Migration 0108 adds nullable evidence without attributing historical rows.
+    // Compare every pre-existing field while checking the new field separately.
+    let mut statement = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+    let columns = (0..statement.column_count())
+        .filter(|&index| statement.column_name(index).unwrap() != "sender_device")
+        .collect::<Vec<_>>();
+    let mut all = statement
+        .query_map([], |row| {
+            columns.iter().map(|&index| row.get(index)).collect()
+        })
+        .unwrap()
+        .collect::<Result<Vec<Vec<Value>>, _>>()
+        .unwrap();
     all.sort_by_cached_key(|row| format!("{row:?}"));
     all
 }
@@ -182,6 +194,13 @@ fn v0_10_4_account_upgrades_without_losing_state_or_raising_notices() {
 
         for (table, before) in PRESERVED_TABLES.iter().zip(&before_tables) {
             assert_eq!(&table_rows(&conn, table), before, "{table} changed");
+        }
+        for table in ["app_events", "message_timeline"] {
+            assert_eq!(
+                rows(&conn, &format!("SELECT sender_device FROM {table}")),
+                vec![vec![Value::Null]; count(&conn, table) as usize],
+                "{table} must not invent historical sender-device evidence"
+            );
         }
         assert_eq!(cursor(&conn), Some(PERSISTED_CURSOR));
         assert_eq!(retained_routes(&conn), before_routes);

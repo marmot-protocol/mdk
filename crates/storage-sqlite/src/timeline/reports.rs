@@ -632,6 +632,7 @@ mod tests {
             source_epoch: Some(1),
             direction: "received".into(),
             sender: id(sender),
+            sender_device: Default::default(),
             plaintext: text.into(),
             kind,
             tags,

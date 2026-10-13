@@ -67,6 +67,7 @@ fn chat_with_tags(
         source_epoch: None,
         direction: if sender == LOCAL { "sent" } else { "received" }.to_owned(),
         sender: sender.to_owned(),
+        sender_device: Default::default(),
         plaintext: plaintext.to_owned(),
         kind: MARMOT_APP_EVENT_KIND_CHAT,
         tags,
@@ -91,6 +92,7 @@ fn group_system(
         source_epoch: Some(at),
         direction: "system".to_owned(),
         sender: sender.to_owned(),
+        sender_device: Default::default(),
         plaintext: plaintext.to_owned(),
         kind: MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
         tags: vec![vec![
@@ -129,6 +131,7 @@ fn reaction(id: &str, sender: &str, target: &str, at: u64) -> StoredAppEvent {
         source_epoch: None,
         direction: "received".to_owned(),
         sender: sender.to_owned(),
+        sender_device: Default::default(),
         plaintext: "+".to_owned(),
         kind: MARMOT_APP_EVENT_KIND_REACTION,
         tags: vec![vec![EVENT_REF_TAG.to_owned(), target.to_owned()]],

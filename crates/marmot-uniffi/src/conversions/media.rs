@@ -589,6 +589,7 @@ mod tests {
             direction: "incoming".to_owned(),
             group_id_hex: "bb".repeat(32),
             sender: "alice".to_owned(),
+            sender_device: Default::default(),
             plaintext: "album caption".to_owned(),
             kind: 9,
             tags,

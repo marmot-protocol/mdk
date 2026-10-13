@@ -73,6 +73,7 @@ fn seed(store: &SqliteAccountStorage, bytes: &[u8]) {
             source_epoch: Some(3),
             direction: "received".into(),
             sender: "cc".repeat(32),
+            sender_device: Default::default(),
             plaintext: String::new(),
             kind: 9,
             tags: vec![vec![

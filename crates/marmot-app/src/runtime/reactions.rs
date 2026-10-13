@@ -128,6 +128,7 @@ mod tests {
             source_epoch: None,
             direction: "received".into(),
             sender: "ff".repeat(32),
+            sender_device: Default::default(),
             plaintext: "target".into(),
             kind: 9,
             tags: vec![],

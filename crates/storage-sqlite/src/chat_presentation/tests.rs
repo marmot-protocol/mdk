@@ -103,6 +103,7 @@ fn presented_chat_preview_retention_comes_from_selected_message() {
         source_epoch: Some(1),
         direction: "received".to_owned(),
         sender: "bb".repeat(32),
+        sender_device: Default::default(),
         plaintext: "hello".to_owned(),
         kind: 9,
         tags: Vec::new(),

@@ -462,6 +462,7 @@ impl MarmotApp {
                 source_message_id_hex: None,
                 group_id_hex: group_hex.clone(),
                 sender: event.pubkey,
+                sender_device: Default::default(),
                 plaintext: event.content,
                 kind: event.kind,
                 tags: event.tags,

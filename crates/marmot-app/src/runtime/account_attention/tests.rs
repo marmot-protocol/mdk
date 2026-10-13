@@ -503,6 +503,7 @@ async fn message_and_mention_totals_change_while_unread_membership_stays_true() 
                 source_epoch: None,
                 direction: "received".into(),
                 sender: f.bob.account_id_hex.clone(),
+                sender_device: Default::default(),
                 plaintext: "message".into(),
                 kind: 9,
                 tags: vec![],

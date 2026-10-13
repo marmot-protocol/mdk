@@ -11,6 +11,15 @@ use crate::Engine;
 pub struct CanonicalGroupMembership {
     pub local_leaf_active: bool,
     pub member_leaves: Vec<cgka_traits::engine::GroupMemberLeaf>,
+    pub devices: Vec<CanonicalMemberDevice>,
+}
+
+/// Authenticated leaf evidence for app device projection; never log these values.
+pub struct CanonicalMemberDevice {
+    pub member: MemberId,
+    pub signature_key: Vec<u8>,
+    pub leaf_index: u32,
+    pub is_this_installation: bool,
 }
 
 /// Compact membership/capability scalars. No roster, administrator list,
@@ -60,6 +69,12 @@ impl<S: StorageProvider> Engine<S> {
         self.storage.with_read_snapshot(|storage| {
             let terminal = storage.get_group(group_id)?.is_terminal();
             self.with_mls_group(group_id, |group| {
+                let local_leaf_active = !terminal
+                    && crate::identity::local_leaf_is_active(group, self.identity.self_id())
+                    && group.own_leaf_node().is_some_and(|leaf| {
+                        leaf.signature_key().as_slice() == self.identity.signer.public()
+                    });
+                let mut devices = Vec::new();
                 let member_leaves = group
                     .members()
                     .map(|member| {
@@ -68,17 +83,23 @@ impl<S: StorageProvider> Engine<S> {
                                 .map_err(|_| {
                                     EngineError::Backend("invalid member credential".into())
                                 })?;
+                        devices.push(CanonicalMemberDevice {
+                            member: MemberId::new(credential.identity().to_vec()),
+                            signature_key: member.signature_key.clone(),
+                            leaf_index: member.index.u32(),
+                            is_this_installation: local_leaf_active
+                                && member.index == group.own_leaf_index(),
+                        });
                         Ok(cgka_traits::engine::GroupMemberLeaf {
                             leaf_index: member.index.u32(),
                             member: MemberId::new(credential.identity().to_vec()),
                         })
                     })
                     .collect::<Result<Vec<_>, EngineError>>()?;
-                let local_leaf_active = !terminal
-                    && crate::identity::local_leaf_is_active(group, self.identity.self_id());
                 Ok(CanonicalGroupMembership {
                     local_leaf_active,
                     member_leaves,
+                    devices,
                 })
             })
         })
@@ -194,6 +215,13 @@ mod tests {
         let canonical = engine.canonical_group_membership(&group).unwrap();
         assert!(canonical.local_leaf_active);
         assert_eq!(canonical.member_leaves.len(), 1);
+        assert_eq!(canonical.devices.len(), 1);
+        assert!(canonical.devices[0].is_this_installation);
+        assert_eq!(canonical.devices[0].leaf_index, 0);
+        assert_eq!(
+            canonical.devices[0].signature_key,
+            engine.identity.signer.public()
+        );
         assert_eq!(canonical.member_leaves[0].member, engine.self_id());
         let mut record = engine.storage.get_group(&group).unwrap();
         record.members.clear();
@@ -207,11 +235,13 @@ mod tests {
         );
         record.removed = true;
         engine.storage.put_group(&record).unwrap();
+        let terminal = engine.canonical_group_membership(&group).unwrap();
+        assert!(!terminal.local_leaf_active);
         assert!(
-            !engine
-                .canonical_group_membership(&group)
-                .unwrap()
-                .local_leaf_active
+            terminal
+                .devices
+                .iter()
+                .all(|device| !device.is_this_installation)
         );
     }
 

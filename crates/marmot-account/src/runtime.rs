@@ -2826,6 +2826,7 @@ where
                     source_epoch,
                     retention,
                     authority,
+                    sender_device,
                 } => {
                     let status = Box::pin(self.publish_one(
                         msg,
@@ -2836,6 +2837,7 @@ where
                             source_epoch,
                             retention,
                             authority,
+                            sender_device,
                         }),
                         output,
                         queue,
@@ -5204,6 +5206,7 @@ fn record_published_application_fanout(fanout: &OutboundFanout, output: &mut Acc
             source_epoch: application.source_epoch,
             retention: application.retention,
             authority: application.authority,
+            sender_device: application.sender_device.clone(),
         });
 }
 
@@ -5528,6 +5531,7 @@ pub struct AccountDeviceEffects {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublishedApplicationMessage {
+    pub sender_device: cgka_traits::message::SenderDevice,
     pub group_id: GroupId,
     pub app_event_id: String,
     pub message_id: cgka_traits::MessageId,
@@ -5780,6 +5784,7 @@ mod tests {
 
     fn published_message(id: u8) -> PublishedApplicationMessage {
         PublishedApplicationMessage {
+            sender_device: Default::default(),
             authority: None,
             group_id: GroupId::new(vec![id]),
             app_event_id: format!("event-{id}"),

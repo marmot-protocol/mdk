@@ -298,6 +298,7 @@ mod tests {
                     group_id: g0.id.clone(),
                     message_id,
                     sender: MemberId::new(vec![7; 32]),
+                    sender_device: Default::default(),
                     epoch: EpochId(0),
                     payload: b"authenticated chat".to_vec(),
                     retention: None,

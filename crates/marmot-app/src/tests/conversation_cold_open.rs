@@ -46,6 +46,7 @@ impl History {
                     source_epoch: Some(epoch.0),
                     direction: "received".into(),
                     sender: "bb".repeat(32),
+                    sender_device: Default::default(),
                     plaintext: format!("retained message {i}"),
                     kind: 9,
                     tags: vec![],

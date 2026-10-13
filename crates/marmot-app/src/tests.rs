@@ -242,6 +242,7 @@ async fn send_history_timings() {
                     source_epoch: Some(epoch),
                     direction: "received".into(),
                     sender: "ee".repeat(32),
+                    sender_device: Default::default(),
                     plaintext: "historical message".into(),
                     kind: MARMOT_APP_EVENT_KIND_CHAT,
                     tags: Vec::new(),
@@ -2157,6 +2158,7 @@ fn recovery_warning_requires_qualified_local_observations_and_survives_local_com
                 group_id: group_id.clone(),
                 message_id: cgka_traits::MessageId::new(vec![0xa1; 32]),
                 sender: cgka_traits::MemberId::new(vec![0xb1; 32]),
+                sender_device: Default::default(),
                 epoch: current,
                 payload: Vec::new(),
                 retention: None,
@@ -8075,6 +8077,7 @@ async fn member_key_package_falls_back_to_current_directory_for_local_account() 
         follow_source_relays: Vec::new(),
         relay_lists: AccountRelayListStatus::empty(),
         key_package: Some(DirectoryKeyPackage {
+            client_label: None,
             key_package_id: "current-directory".into(),
             key_package_ref_hex: metadata.key_package_ref_hex.clone(),
             key_package_event_id: String::new(),
@@ -10520,6 +10523,7 @@ fn directory_entry_reconciles_nostr_components_independently() {
     cached.relay_lists.inbox.created_at = 30;
     cached.relay_lists.inbox.relays = vec!["wss://cached-inbox.example".into()];
     cached.key_package = Some(DirectoryKeyPackage {
+        client_label: None,
         key_package_id: "old-package".into(),
         key_package_ref_hex: String::new(),
         key_package_event_id: String::new(),
@@ -10537,6 +10541,7 @@ fn directory_entry_reconciles_nostr_components_independently() {
     shared.relay_lists.inbox.created_at = 20;
     shared.relay_lists.inbox.relays = vec!["wss://shared-inbox.example".into()];
     shared.key_package = Some(DirectoryKeyPackage {
+        client_label: None,
         key_package_id: "new-package".into(),
         key_package_ref_hex: String::new(),
         key_package_event_id: String::new(),
@@ -11193,6 +11198,7 @@ fn received_message_sender_is_admitted_to_directory_cache() {
         message_id_hex: "message-id".to_owned(),
         source_message_id_hex: "source-message-id".to_owned(),
         sender: sender.clone(),
+        sender_device: Default::default(),
         sender_display_name: None,
         group_id: GroupId::new(vec![0x01]),
         source_epoch: 0,
@@ -11897,6 +11903,7 @@ fn legacy_account_projection_imports_once_into_account_storage() {
             direction: "received".to_owned(),
             group_id_hex: "aa".to_owned(),
             sender: account.account_id_hex.clone(),
+            sender_device: Default::default(),
             plaintext: "from legacy".to_owned(),
             kind: 9,
             tags: Vec::new(),
@@ -11965,6 +11972,7 @@ fn legacy_account_projection_imports_once_into_account_storage() {
             direction: "received".to_owned(),
             group_id_hex: "aa".to_owned(),
             sender: account.account_id_hex,
+            sender_device: Default::default(),
             plaintext: "should stay legacy-only".to_owned(),
             kind: 9,
             tags: Vec::new(),
@@ -13270,6 +13278,7 @@ fn ingest_applies_owner_signed_transitive_448_and_drops_spoof() {
         message_id_hex: "11".repeat(32),
         source_message_id_hex: "22".repeat(32),
         sender: sender.to_owned(),
+        sender_device: Default::default(),
         sender_display_name: None,
         group_id: group_id.clone(),
         source_epoch: 1,
@@ -14705,6 +14714,7 @@ fn source_epoch_retention_is_app_visible_and_returns_media_hashes_when_expired()
             direction: "received".to_owned(),
             group_id_hex: "aa".to_owned(),
             sender: account.account_id_hex,
+            sender_device: Default::default(),
             plaintext: "expired plaintext".to_owned(),
             kind: MARMOT_APP_EVENT_KIND_CHAT,
             tags: vec![vec![
@@ -14794,6 +14804,7 @@ fn group_state_invalidated_event_tombstones_origin_commit_system_rows() {
             direction: "system".to_owned(),
             group_id_hex: "aa".to_owned(),
             sender: account.account_id_hex.clone(),
+            sender_device: Default::default(),
             plaintext: "renamed the group".to_owned(),
             kind: MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
             tags: Vec::new(),
@@ -14922,6 +14933,7 @@ fn group_state_revalidated_event_revives_the_readopted_commits_system_rows() {
         direction: "system".to_owned(),
         group_id_hex: "aa".to_owned(),
         sender: account.account_id_hex.clone(),
+        sender_device: Default::default(),
         plaintext: "renamed the group".to_owned(),
         kind: MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
         tags: Vec::new(),
@@ -15071,6 +15083,7 @@ fn sweeping_a_terminal_group_stops_a_held_send_from_claiming_pending() {
             direction: "sent".to_owned(),
             group_id_hex: "aa".to_owned(),
             sender: account.account_id_hex.clone(),
+            sender_device: Default::default(),
             plaintext: "hello".to_owned(),
             kind: MARMOT_APP_EVENT_KIND_CHAT,
             tags: Vec::new(),
@@ -15173,6 +15186,7 @@ async fn a_drained_disband_sweeps_the_held_send_its_first_pass_never_reached() {
             direction: "sent".to_owned(),
             group_id_hex: group_id_hex.clone(),
             sender: account.account_id_hex.clone(),
+            sender_device: Default::default(),
             plaintext: "hello".to_owned(),
             kind: MARMOT_APP_EVENT_KIND_CHAT,
             tags: Vec::new(),
@@ -15350,6 +15364,7 @@ async fn an_open_heals_a_held_send_from_an_already_announced_guard() {
             direction: "sent".to_owned(),
             group_id_hex: group_id_hex.clone(),
             sender: account.account_id_hex.clone(),
+            sender_device: Default::default(),
             plaintext: "hello".to_owned(),
             kind: MARMOT_APP_EVENT_KIND_CHAT,
             tags: Vec::new(),
@@ -15825,6 +15840,7 @@ async fn a_drained_invalidation_event_withdraws_the_timeline_record() {
             direction: "received".to_owned(),
             group_id_hex: group_id_hex.clone(),
             sender: account.account_id_hex.clone(),
+            sender_device: Default::default(),
             plaintext: "from the losing branch".to_owned(),
             kind: MARMOT_APP_EVENT_KIND_CHAT,
             tags: Vec::new(),
@@ -16153,6 +16169,7 @@ async fn a_retained_event_resend_revives_the_row_its_failed_send_retracted() {
                 7,
                 crate::AppMessageRetentionDecision::new(1_700_000_000, 300),
                 None,
+                Default::default(),
             )),
             true,
         )
@@ -17701,6 +17718,7 @@ async fn local_delete_restart_preserves_rotated_route_relay_pairs_for_resurrecti
             group_id: group_id.clone(),
             message_id: fresh.reports[0].message_id.clone(),
             sender: MemberId::new(hex::decode(&sender).unwrap()),
+            sender_device: Default::default(),
             epoch: reopened.runtime.group_record(&group_id).unwrap().epoch,
             payload: fresh_payload,
             retention: None,
@@ -17810,12 +17828,14 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
             group_id: group_id.clone(),
             message_id: historical.reports[0].message_id.clone(),
             sender: sender.clone(),
+            sender_device: Default::default(),
             epoch,
             payload: historical_payload,
             retention: None,
             encrypted_media_secret: None,
         };
         let fresh_event = cgka_traits::engine::GroupEvent::MessageReceived {
+            sender_device: Default::default(),
             authority: None,
             group_id: group_id.clone(),
             message_id: fresh.reports[0].message_id.clone(),
@@ -17893,6 +17913,7 @@ async fn account_open_recovers_first_fresh_chat_after_protocol_projection_crash(
     assert!(fresh.failures.is_empty());
     let message_id = fresh.reports[0].message_id.clone();
     let event = cgka_traits::engine::GroupEvent::MessageReceived {
+        sender_device: Default::default(),
         authority: None,
         group_id: group_id.clone(),
         message_id: message_id.clone(),
@@ -17977,6 +17998,7 @@ async fn account_open_keeps_first_fresh_chat_pending_when_group_projection_is_un
     assert!(fresh.failures.is_empty());
     let message_id = fresh.reports[0].message_id.clone();
     let event = cgka_traits::engine::GroupEvent::MessageReceived {
+        sender_device: Default::default(),
         authority: None,
         group_id: group_id.clone(),
         message_id,
@@ -18550,6 +18572,7 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
             direction: "sent".to_owned(),
             group_id_hex: group_id_hex.clone(),
             sender: local_account_id_hex.clone(),
+            sender_device: Default::default(),
             plaintext: "successful sibling publish".to_owned(),
             kind: MARMOT_APP_EVENT_KIND_CHAT,
             tags: Vec::new(),
@@ -18570,6 +18593,7 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
             direction: "sent".to_owned(),
             group_id_hex: group_id_hex.clone(),
             sender: local_account_id_hex,
+            sender_device: Default::default(),
             plaintext: "failed sibling publish".to_owned(),
             kind: MARMOT_APP_EVENT_KIND_CHAT,
             tags: Vec::new(),
@@ -18587,6 +18611,7 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
     let retention = AppMessageRetentionDecision::new(10, 0);
     let effects = marmot_account::AccountDeviceEffects {
         published_app_messages: vec![marmot_account::PublishedApplicationMessage {
+            sender_device: Default::default(),
             authority: None,
             group_id: group_id.clone(),
             app_event_id: app_event_id.to_owned(),
@@ -19186,6 +19211,7 @@ async fn a_relay_accepted_send_revives_its_local_publish_failure() {
         direction: "sent".to_owned(),
         group_id_hex: hex::encode(group_id.as_slice()),
         sender: account.account_id_hex.clone(),
+        sender_device: Default::default(),
         plaintext: "Lunch?".to_owned(),
         kind: cgka_traits::MARMOT_APP_EVENT_KIND_POLL,
         tags: cgka_traits::poll_tags(
@@ -19205,6 +19231,7 @@ async fn a_relay_accepted_send_revives_its_local_publish_failure() {
     let published = |app_event_id: &str, group_id: &cgka_traits::GroupId| {
         marmot_account::AccountDeviceEffects {
             published_app_messages: vec![marmot_account::PublishedApplicationMessage {
+                sender_device: Default::default(),
                 authority: None,
                 group_id: group_id.clone(),
                 app_event_id: app_event_id.to_owned(),
@@ -21785,6 +21812,7 @@ async fn check_received_media_source_epoch_secret(carried_secret: bool) {
             group_id: group_id.clone(),
             message_id: sent.reports[0].message_id.clone(),
             sender: MemberId::new(hex::decode(&sender_hex).unwrap()),
+            sender_device: Default::default(),
             epoch: source_epoch,
             payload,
             retention: None,
@@ -22045,6 +22073,7 @@ fn account_unread_summary_includes_badge_attention_without_session_load() {
         source_epoch: None,
         direction: "received".to_owned(),
         sender: "ee".repeat(32),
+        sender_device: Default::default(),
         plaintext: "hello".to_owned(),
         kind: MARMOT_APP_EVENT_KIND_CHAT,
         tags: Vec::new(),

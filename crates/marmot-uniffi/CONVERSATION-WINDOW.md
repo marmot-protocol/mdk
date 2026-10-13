@@ -49,6 +49,19 @@ outside the capture timeout and retries transient failures; closing the window n
 abandons worker teardown. A missing/dirty local read projection uses the existing
 keyed preparation/retry path.
 
+`AppMessageRecordFfi` and `TimelineMessageRecordFfi` expose the same durable
+`sender_device: SenderDevice` (Kotlin `senderDevice`). `Exact { device_id,
+leaf_index, client_label, is_this_installation }` identifies the authenticated
+source-epoch leaf; its ID equals `MemberDeviceFfi.device_id` for that signature
+key and group. `OneOf { device_count }` requires authenticated source-epoch
+membership evidence. `Unknown` is the default for historical rows and messages
+whose source-epoch signature key cannot be recovered. MDK never attributes a
+historical message using today's roster or a reused leaf index. Own sends flag
+this installation; sibling installations of the same account do not. Labels
+are advisory, sanitized and cache-only, with `None` on a miss. Provenance is
+persisted before projection and survives reopening without rewriting legacy
+history. A signature-key change produces a different ID, as in member projection.
+
 Timeline content uses the existing Markdown/media converters. For this screen,
 raw tags, full reactor lists and raw `media_json` are omitted from the compatibility timeline record;
 use the bounded `references.reactions` tallies/previews and truncation flags.

@@ -280,6 +280,7 @@ fn production_projection_rebuild_invalidation_expiry_and_encrypted_reopen() {
         source_epoch: Some(7),
         direction: "received".into(),
         sender: "alice".into(),
+        sender_device: Default::default(),
         plaintext: "body".into(),
         kind: 9,
         tags: vec![

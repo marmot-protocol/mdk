@@ -332,6 +332,33 @@ impl SqliteSharedStorage {
             .collect()
     }
 
+    /// Batched advisory KeyPackage bytes only; no profile, relay, or follow reads.
+    pub fn directory_key_packages_for_ids(
+        &self,
+        account_ids: &[String],
+    ) -> StorageResult<Vec<(String, Option<String>)>> {
+        let conn = self.lock()?;
+        let mut packages = Vec::new();
+        for ids in account_ids.chunks(crate::SQLITE_BIND_PARAMETER_CHUNK) {
+            let placeholders = std::iter::repeat_n("?", ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut statement = conn
+                .prepare_cached(&format!(
+                    "SELECT account_id_hex, key_package_json FROM directory_users
+                 WHERE account_id_hex IN ({placeholders})"
+                ))
+                .storage()?;
+            let rows = statement
+                .query_map(params_from_iter(ids), |row| Ok((row.get(0)?, row.get(1)?)))
+                .storage()?;
+            for row in rows {
+                packages.push(row.storage()?);
+            }
+        }
+        Ok(packages)
+    }
+
     /// Read only requested profiles, without follow, relay-list, or key-package rows.
     pub fn directory_profiles_for_ids(
         &self,
@@ -819,6 +846,21 @@ mod tests {
             .unwrap()
             .execute_batch("DROP TABLE directory_user_follows")
             .unwrap();
+        assert_eq!(
+            storage
+                .directory_key_packages_for_ids(&[record.account_id_hex.clone(), "missing".into()])
+                .unwrap(),
+            vec![(
+                record.account_id_hex.clone(),
+                record.key_package_json.clone()
+            )]
+        );
+        assert!(
+            storage
+                .directory_key_packages_for_ids(&[])
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             storage.public_directory_profiles().unwrap(),
             vec![PublicDirectoryProfileRecord {

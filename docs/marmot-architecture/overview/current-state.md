@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-10-09
+updated: 2026-10-13
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -18,6 +18,11 @@ status: overview
 > explicit group evolution.
 
 # Current State — Implementations & Spec
+
+App and timeline message records expose persisted sender-device provenance with
+the same group-scoped signature-key IDs as canonical member devices. Historical
+messages without source-epoch leaf evidence remain Unknown, including after
+migration or leaf-index reuse; account siblings are distinct from this installation.
 
 On master, one durable recovery owner (#1946) authorizes account-history acquisition for startup, receive,
 maintenance, convergence and explicit repair; its coalesced demand and retry pacing survive reopen, and EOSE alone never

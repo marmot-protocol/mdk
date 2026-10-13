@@ -188,6 +188,7 @@ fn add(store: &SqliteAccountStorage, i: usize) {
             source_epoch: Some(1),
             direction: "received".into(),
             sender: "cd".repeat(32),
+            sender_device: Default::default(),
             plaintext: String::new(),
             kind: 9,
             tags: if i.is_multiple_of(7) {
@@ -342,6 +343,7 @@ async fn attachment_discovery_fences_changes_isolates_accounts_and_closes() {
             source_epoch: Some(1),
             direction: "received".into(),
             sender: "cd".repeat(32),
+            sender_device: Default::default(),
             plaintext: String::new(),
             kind: 5,
             tags: vec![vec!["e".into(), format!("{:064x}", 7)]],
@@ -483,6 +485,7 @@ async fn attachment_discovery_roles_preserve_slots_and_refresh() {
         source_epoch: Some(1),
         direction: "received".into(),
         sender: "cd".repeat(32),
+        sender_device: Default::default(),
         plaintext: ":wave:".into(),
         kind: 9,
         tags: vec![

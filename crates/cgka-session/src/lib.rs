@@ -252,6 +252,7 @@ impl SessionEffects {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PublishWork {
     ApplicationMessage {
+        sender_device: cgka_traits::message::SenderDevice,
         msg: TransportMessage,
         queued_intent: Option<QueuedIntentRef>,
         group_id: GroupId,
@@ -1487,6 +1488,7 @@ impl AccountDeviceSession {
                     source_epoch,
                     retention,
                     authority,
+                    sender_device,
                 } => {
                     let queued_intent = self
                         .engine
@@ -1503,6 +1505,7 @@ impl AccountDeviceSession {
                         source_epoch,
                         retention,
                         authority,
+                        sender_device,
                     });
                 }
                 SendResult::Proposal { msg } => {

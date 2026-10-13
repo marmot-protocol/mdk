@@ -804,6 +804,41 @@ pub enum MessageState {
     EpochInvalidated,
 }
 
+/// Authenticated message sender device. Historical records carry Unknown unless
+/// source-epoch evidence was captured; never derive this from today's roster.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SenderDevice {
+    Exact {
+        device_id: String,
+        leaf_index: u32,
+        client_label: Option<String>,
+        is_this_installation: bool,
+    },
+    OneOf {
+        device_count: u32,
+    },
+    #[default]
+    Unknown,
+}
+
+/// Shared with member-device projection. Opaque MLS group IDs are length-prefixed.
+pub fn member_device_id(group_id: &crate::GroupId, signature_key: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"marmot-app/member-device-id/v1");
+    hash.update((group_id.as_slice().len() as u64).to_be_bytes());
+    hash.update(group_id.as_slice());
+    hash.update((signature_key.len() as u64).to_be_bytes());
+    hash.update(signature_key);
+    hex::encode(hash.finalize())
+}
+
+impl SenderDevice {
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+}
+
 #[cfg(test)]
 mod stored_payload_codec_tests {
     use super::*;

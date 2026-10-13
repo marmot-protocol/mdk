@@ -1,7 +1,7 @@
 ---
 title: "Chat and conversation projection inventory"
 created: 2026-09-07
-updated: 2026-09-19
+updated: 2026-10-13
 tags: [marmot, architecture, projections, chat]
 ---
 
@@ -28,6 +28,14 @@ other Marmot applications. Remove competing presentation ownership only after it
 For current remaining draft, delivery and lifecycle gaps and release evidence, see
 the [2026-09-19 chat-row contract audit](chat-row-contract-audit.md). The original
 complete-row contract is broader than the selected identity/navigation work.
+
+Raw app-message and timeline records also carry durable `sender_device` evidence:
+Exact source-epoch signature-key identity (the same ID as member-device
+projection), authenticated source-epoch OneOf counts, or Unknown. Delayed
+messages without recoverable source-tree evidence remain Unknown; current
+membership is never a historical attribution source. Migration 0108 adds nullable
+columns without rewriting existing messages. Labels use the member-device cache
+only; local-installation flags distinguish siblings of the same account.
 
 ## 1. Existing persistent data and projections
 

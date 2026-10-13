@@ -443,6 +443,7 @@ mod tests {
             source_epoch: Some(source_epoch),
             direction: "received".to_owned(),
             sender: "sender".to_owned(),
+            sender_device: Default::default(),
             plaintext: String::new(),
             kind: MARMOT_APP_EVENT_KIND_CHAT,
             tags: versions

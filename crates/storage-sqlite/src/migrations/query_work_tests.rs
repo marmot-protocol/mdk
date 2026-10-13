@@ -502,11 +502,13 @@ fn retention_indexes_upgrade() {
             let mut stmt = conn
                 .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
                 .unwrap();
+            // Compare historical fields across additive migrations. The new
+            // sender-device column is checked for NULL separately below.
             let columns = (0..stmt.column_count())
                 .filter(|&i| {
                     !matches!(
                         stmt.column_name(i).unwrap(),
-                        "edit_json" | "deletion_source"
+                        "edit_json" | "deletion_source" | "sender_device"
                     )
                 })
                 .collect::<Vec<_>>();
@@ -533,6 +535,15 @@ fn retention_indexes_upgrade() {
     super::migration_0069_chat_readiness_index::apply(&tx).unwrap();
     tx.commit().unwrap();
     assert_eq!(contents(&conn), before);
+    // Additive sender-device evidence stays unknown for historical rows.
+    let attributed: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM message_timeline WHERE sender_device IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attributed, 0);
     let integrity: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .unwrap();

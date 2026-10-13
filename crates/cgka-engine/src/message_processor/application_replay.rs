@@ -248,7 +248,7 @@ impl<S: StorageProvider> Engine<S> {
                     } else {
                         Vec::new()
                     };
-                    let events = Self::application_replay_events(group_id, &observations)?;
+                    let events = Self::application_replay_events(storage, group_id, &observations)?;
                     let invalidated =
                         if events.is_empty() {
                             Some(horizon_reason.unwrap_or(

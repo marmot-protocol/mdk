@@ -88,13 +88,42 @@ impl AppClient {
             u64,
             crate::AppMessageRetentionDecision,
             Option<cgka_traits::app_event::AppMessageAuthority>,
+            crate::SenderDevice,
         )>,
         advance_read_marker: bool,
     ) -> Result<crate::AppProjectionUpdate, AppError> {
         let group_id_hex = hex::encode(group_id.as_slice());
-        let (source_epoch, retention, authority) = source_state
-            .map(|(epoch, retention, authority)| (Some(epoch), Some(retention), authority))
-            .unwrap_or((None, None, None));
+        let (source_epoch, retention, authority, sender_device) = source_state
+            .map(|(epoch, retention, authority, device)| {
+                (Some(epoch), Some(retention), authority, device)
+            })
+            .unwrap_or((None, None, None, crate::SenderDevice::Unknown));
+        let sender_device = if source_epoch.is_none() {
+            // A prepared/queued local row may precede MLS readiness. Optional
+            // device display evidence must not make that admission fail.
+            self.runtime
+                .session()
+                .canonical_group_membership(group_id)
+                .ok()
+                .and_then(|membership| {
+                    membership
+                        .devices
+                        .into_iter()
+                        .find(|leaf| leaf.is_this_installation)
+                })
+                .map(|leaf| {
+                    let device = crate::groups::member_device(group_id, leaf, None);
+                    crate::SenderDevice::Exact {
+                        device_id: device.device_id,
+                        leaf_index: device.leaf_index,
+                        client_label: None,
+                        is_this_installation: true,
+                    }
+                })
+                .unwrap_or_default()
+        } else {
+            sender_device
+        };
         // Stamped on the sender's own store too, so a moderation delete of
         // another member's message survives local reprojection instead of
         // resurrecting the target.
@@ -106,6 +135,7 @@ impl AppClient {
             direction: "sent".to_owned(),
             group_id_hex: group_id_hex.clone(),
             sender: sender.to_owned(),
+            sender_device: self.enrich_sender_device(group_id, sender, sender_device),
             plaintext: event.content.clone(),
             kind: event.kind,
             tags: event.tags.clone(),
@@ -764,6 +794,11 @@ impl AppClient {
         }
         let mut updates = Vec::new();
         for published in &effects.published_app_messages {
+            let sender_device = self.enrich_sender_device(
+                &published.group_id,
+                &hex::encode(self.runtime.session().self_id().as_slice()),
+                published.sender_device.clone(),
+            );
             let group_id_hex = hex::encode(published.group_id.as_slice());
             let source_message_id_hex = hex::encode(published.message_id.as_slice());
             let finalized = self
@@ -779,6 +814,7 @@ impl AppClient {
                             published.source_epoch.0,
                             published.retention,
                             published.authority,
+                            sender_device.clone(),
                         )?;
                         // Revive after the source write, so the revival reprojects the
                         // finalized row and its update supersedes the finalize update.
@@ -1343,6 +1379,7 @@ fn build_group_system_projection(
         direction: "system".to_owned(),
         group_id_hex: material.group_id_hex,
         sender: material.sender,
+        sender_device: Default::default(),
         plaintext: material.content,
         kind: MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
         tags: material.tags,

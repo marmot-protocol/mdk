@@ -1522,6 +1522,7 @@ pub(crate) fn recover_notification_updates(
                         message_id_hex: record.message_id_hex,
                         source_message_id_hex: String::new(),
                         sender: record.sender,
+                        sender_device: record.sender_device,
                         sender_display_name,
                         group_id: GroupId::new(group_id),
                         source_epoch: record.source_epoch.unwrap_or(0),

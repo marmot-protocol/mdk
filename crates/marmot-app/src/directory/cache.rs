@@ -136,6 +136,30 @@ impl DirectoryCache {
         Ok(entries)
     }
 
+    /// Roster enrichment reads only the package slot, never follows or relays.
+    pub(crate) fn key_packages_for_ids(
+        &self,
+        account_ids: &[String],
+    ) -> Result<Vec<(String, Option<String>)>, AppError> {
+        let conn = self.lock()?;
+        let mut packages = Vec::new();
+        for ids in account_ids.chunks(PROFILE_QUERY_BATCH_SIZE) {
+            let placeholders = std::iter::repeat_n("?", ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut statement = conn.prepare_cached(&format!(
+                "SELECT account_id_hex, key_package_json FROM directory_users
+                 WHERE account_id_hex IN ({placeholders})"
+            ))?;
+            let rows =
+                statement.query_map(params_from_iter(ids), |row| Ok((row.get(0)?, row.get(1)?)))?;
+            for row in rows {
+                packages.push(row?);
+            }
+        }
+        Ok(packages)
+    }
+
     pub(crate) fn profiles_for_ids(
         &self,
         account_ids: &[String],

@@ -1928,6 +1928,15 @@ async fn send_app_message_round_trips_to_another_client() {
         .await
         .unwrap();
 
+    let own_device = alice
+        .canonical_group_membership(&group_id)
+        .unwrap()
+        .devices
+        .remove(0);
+    let expected_id = cgka_traits::message::member_device_id(&group_id, &own_device.signature_key);
+    assert!(
+        matches!(&send_res, SendResult::ApplicationMessage { sender_device: cgka_traits::message::SenderDevice::Exact { device_id, is_this_installation: true, .. }, .. } if device_id == &expected_id)
+    );
     let msg = match send_res {
         SendResult::ApplicationMessage { msg, .. } => msg,
         _ => panic!("expected ApplicationMessage"),
@@ -1953,6 +1962,18 @@ async fn send_app_message_round_trips_to_another_client() {
         )
     });
     assert!(got_it, "expected MessageReceived; got {events:?}");
+    let event = events
+        .iter()
+        .find(|e| matches!(e, GroupEvent::MessageReceived { .. }))
+        .unwrap();
+    assert!(
+        matches!(event, GroupEvent::MessageReceived { sender_device: cgka_traits::message::SenderDevice::Exact { device_id, is_this_installation: false, .. }, .. } if device_id == &expected_id)
+    );
+    let json = serde_json::to_value(event).unwrap();
+    assert!(
+        json["MessageReceived"].get("sender_device").is_some(),
+        "authenticated sender device must survive the durable event"
+    );
 }
 
 #[tokio::test]
@@ -2012,6 +2033,17 @@ async fn pending_application_delivery_replays_after_restart_until_acknowledged()
     ));
     let pending_events = bob_storage.list_pending_application_events().unwrap();
     assert_eq!(pending_events.len(), 1);
+    assert!(matches!(
+        &pending_events[0],
+        GroupEvent::MessageReceived {
+            sender_device: cgka_traits::message::SenderDevice::Exact {
+                is_this_installation: false,
+                ..
+            },
+            ..
+        }
+    ));
+
     let pending_message_id = match &pending_events[0] {
         GroupEvent::MessageReceived { message_id, .. } => message_id.clone(),
         event => panic!("unexpected pending event: {event:?}"),
@@ -2022,6 +2054,10 @@ async fn pending_application_delivery_replays_after_restart_until_acknowledged()
     drop(bob);
     let mut reopened = build_client_with_storage(bob_storage.clone(), b"bob-outbox");
     let recovered = reopened.drain_events();
+    assert!(
+        recovered.contains(&pending_events[0]),
+        "restart must replay identical provenance"
+    );
     assert!(recovered.iter().any(
         |event| matches!(event, GroupEvent::MessageReceived { payload, .. }
             if app_content(payload) == b"survive the projection crash")

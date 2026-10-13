@@ -152,6 +152,7 @@ impl Fixture {
                 source_epoch: Some(1),
                 direction: "received".into(),
                 sender: sender.to_owned(),
+                sender_device: Default::default(),
                 plaintext: format!("message {i}"),
                 kind: 9,
                 tags: vec![],
@@ -973,6 +974,7 @@ async fn provenance_only_change_is_not_suppressed_as_unchanged_content() {
         source_epoch: row.source_epoch,
         direction: row.direction.clone(),
         sender: row.sender.clone(),
+        sender_device: Default::default(),
         plaintext: row.plaintext.clone(),
         kind: row.kind,
         tags: vec![],
@@ -1153,6 +1155,7 @@ async fn conversation_viewer_reaction_updates_after_add_and_remove() {
                 source_epoch: Some(1),
                 direction: "received".into(),
                 sender: sender.into(),
+                sender_device: Default::default(),
                 plaintext: if kind == MARMOT_APP_EVENT_KIND_REACTION {
                     "👍".into()
                 } else {

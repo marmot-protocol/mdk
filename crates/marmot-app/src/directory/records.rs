@@ -174,6 +174,8 @@ impl UserDirectorySearch {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DirectoryKeyPackage {
+    #[serde(default)]
+    pub client_label: Option<String>,
     pub key_package_id: String,
     #[serde(default)]
     pub key_package_ref_hex: String,
@@ -182,6 +184,18 @@ pub struct DirectoryKeyPackage {
     pub key_package_hex: String,
     pub created_at: u64,
     pub source_relays: Vec<String>,
+}
+
+pub(crate) type MemberDeviceKeyPackages =
+    std::collections::HashMap<String, Result<Option<MemberDeviceKeyPackage>, AppError>>;
+
+/// Only the fields roster enrichment needs; ignored JSON fields are not hydrated.
+#[derive(serde::Deserialize)]
+pub(crate) struct MemberDeviceKeyPackage {
+    #[serde(default)]
+    pub(crate) client_label: Option<String>,
+    pub(crate) key_package_hex: String,
+    pub(crate) created_at: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

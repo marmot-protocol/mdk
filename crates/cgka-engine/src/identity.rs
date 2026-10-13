@@ -256,6 +256,269 @@ pub(crate) fn local_leaf_is_active(group: &MlsGroup, identity: &MemberId) -> boo
         })
 }
 
+/// Read-only view of the pinned OpenMLS MessageSecretsStore encoding. The
+/// ProcessedMessage API discards the verified signature key, but OpenMLS's
+/// public_group::parse_message authenticates historical senders against these
+/// exact retained epoch leaves. Preserve field order for positional MessagePack
+/// storage, skipping secrets and unused keys without retaining their contents.
+#[derive(serde::Deserialize)]
+struct RetainedSenderTrees {
+    #[serde(rename = "max_epochs")]
+    _max_epochs: serde::de::IgnoredAny,
+    past_epoch_trees: Vec<RetainedSenderTree>,
+    #[serde(rename = "message_secrets")]
+    _message_secrets: serde::de::IgnoredAny,
+}
+
+#[derive(serde::Deserialize)]
+struct RetainedSenderTree {
+    epoch: u64,
+    #[serde(rename = "message_secrets")]
+    _message_secrets: serde::de::IgnoredAny,
+    leaves: Vec<RetainedSenderLeaf>,
+}
+
+#[derive(serde::Deserialize)]
+struct RetainedSenderLeaf {
+    index: LeafNodeIndex,
+    credential: Credential,
+    #[serde(rename = "encryption_key")]
+    _encryption_key: serde::de::IgnoredAny,
+    signature_key: Vec<u8>,
+}
+
+// The storage Entity trait requires Serialize, but this view must never overwrite
+// the complete OpenMLS record (which includes secrets we intentionally skipped).
+impl serde::Serialize for RetainedSenderTrees {
+    fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+        Err(serde::ser::Error::custom(
+            "retained sender trees are read-only",
+        ))
+    }
+}
+
+impl openmls_traits::storage::Entity<{ openmls_traits::storage::CURRENT_VERSION }>
+    for RetainedSenderTrees
+{
+}
+impl openmls_traits::storage::traits::MessageSecrets<{ openmls_traits::storage::CURRENT_VERSION }>
+    for RetainedSenderTrees
+{
+}
+
+/// Capture authenticated source-epoch evidence before consuming ProcessedMessage.
+pub(crate) fn sender_device_of_processed_message<M>(
+    processed: &ProcessedMessage,
+    group: &MlsGroup,
+    local_signature_key: &[u8],
+    storage: &M,
+) -> Result<cgka_traits::message::SenderDevice, M::Error>
+where
+    M: openmls_traits::storage::StorageProvider<{ openmls_traits::storage::CURRENT_VERSION }>,
+{
+    use cgka_traits::message::{SenderDevice, member_device_id};
+    if !matches!(
+        processed.content(),
+        ProcessedMessageContent::ApplicationMessage(_)
+    ) {
+        return Ok(SenderDevice::Unknown);
+    }
+    let Sender::Member(index) = processed.sender() else {
+        return Ok(SenderDevice::Unknown);
+    };
+    let member = if processed.epoch() == group.epoch() {
+        group.member_at(*index).map(|member| RetainedSenderLeaf {
+            index: member.index,
+            credential: member.credential,
+            _encryption_key: serde::de::IgnoredAny,
+            signature_key: member.signature_key,
+        })
+    } else {
+        storage
+            .message_secrets::<_, RetainedSenderTrees>(group.group_id())?
+            .and_then(|trees| {
+                trees
+                    .past_epoch_trees
+                    .into_iter()
+                    .find(|tree| tree.epoch == processed.epoch().as_u64())
+            })
+            .and_then(|tree| tree.leaves.into_iter().find(|leaf| leaf.index == *index))
+    };
+    // Missing retained evidence is unprovable; never fall back to the live leaf
+    // at this index, which may now belong to another device (even of this account).
+    let Some(member) = member else {
+        return Ok(SenderDevice::Unknown);
+    };
+    let Some(sender) = validated_member_id(processed.credential()).ok() else {
+        return Ok(SenderDevice::Unknown);
+    };
+    if validated_member_id(&member.credential).ok().as_ref() != Some(&sender) {
+        return Ok(SenderDevice::Unknown);
+    }
+    Ok(SenderDevice::Exact {
+        device_id: member_device_id(
+            &cgka_traits::GroupId::new(group.group_id().as_slice().to_vec()),
+            &member.signature_key,
+        ),
+        leaf_index: index.u32(),
+        client_label: None,
+        is_this_installation: member.index == group.own_leaf_index()
+            && member.signature_key == local_signature_key,
+    })
+}
+
+/// A replay without a source tree retains proof already captured for the exact
+/// same authenticated envelope. Never consult today's member projection here.
+pub(crate) fn retain_saved_sender_device(
+    storage: &impl cgka_traits::storage::MessageStorage,
+    incoming: &mut cgka_traits::GroupEvent,
+) -> Result<(), cgka_traits::StorageError> {
+    use cgka_traits::GroupEvent;
+    let GroupEvent::MessageReceived {
+        group_id,
+        message_id,
+        epoch,
+        sender,
+        payload,
+        sender_device,
+        ..
+    } = incoming
+    else {
+        return Ok(());
+    };
+    if !sender_device.is_unknown() {
+        return Ok(());
+    }
+    if let Some(GroupEvent::MessageReceived {
+        group_id: old_group,
+        epoch: old_epoch,
+        sender: old_sender,
+        payload: old_payload,
+        sender_device: old_device,
+        ..
+    }) = storage.get_pending_application_event(message_id)?
+        && *group_id == old_group
+        && *epoch == old_epoch
+        && *sender == old_sender
+        && *payload == old_payload
+    {
+        *sender_device = old_device;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod sender_device_tests {
+    use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, GroupEvent, SendIntent, SendResult};
+    use cgka_traits::message::SenderDevice;
+    use cgka_traits::storage::MessageStorage;
+
+    #[test]
+    fn sender_device_lookup_is_application_only_and_does_not_scan_live_roster() {
+        // Pin the cost boundary: member_at indexes the tree directly, whereas
+        // members() clones every preceding leaf. Non-applications need no device.
+        let source = include_str!("identity.rs");
+        let helper = source
+            .split("pub(crate) fn sender_device_of_processed_message")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn retain_saved_sender_device")
+            .next()
+            .unwrap();
+        assert!(!helper.contains("group.members()"));
+        assert!(helper.contains("group.member_at(*index)"));
+        assert!(
+            helper.find("processed.content()").unwrap()
+                < helper.find("processed.sender()").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn sender_device_saved_evidence_requires_the_same_authenticated_message() {
+        let mut engine = crate::distributed_convergence::tests::test_engine();
+        let (group, created) = engine
+            .create_group(CreateGroupRequest {
+                name: "sender evidence".into(),
+                description: String::new(),
+                members: vec![],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        if let SendResult::GroupCreated { pending, .. } = created {
+            engine.confirm_published(pending).await.unwrap();
+        }
+        let payload = cgka_traits::MarmotAppEvent::new(
+            hex::encode(engine.self_id().as_slice()),
+            1,
+            9,
+            vec![],
+            "saved",
+        )
+        .encode()
+        .unwrap();
+        let sent = engine
+            .send(SendIntent::AppMessage {
+                group_id: group.clone(),
+                payload: payload.clone(),
+                expected_epoch: None,
+            })
+            .await
+            .unwrap();
+        let SendResult::ApplicationMessage {
+            msg,
+            source_epoch,
+            sender_device,
+            retention,
+            authority,
+            ..
+        } = sent
+        else {
+            panic!("expected application");
+        };
+        let exact = GroupEvent::MessageReceived {
+            group_id: group,
+            message_id: msg.id,
+            epoch: source_epoch,
+            sender: engine.self_id(),
+            payload,
+            sender_device,
+            retention: Some(retention),
+            authority,
+            encrypted_media_secret: None,
+        };
+        engine
+            .storage
+            .put_pending_application_event(&exact)
+            .unwrap();
+        let mut replay = exact.clone();
+        if let GroupEvent::MessageReceived { sender_device, .. } = &mut replay {
+            *sender_device = SenderDevice::Unknown;
+        }
+        super::retain_saved_sender_device(&engine.storage, &mut replay).unwrap();
+        assert_eq!(replay, exact);
+        if let GroupEvent::MessageReceived {
+            sender_device,
+            payload,
+            ..
+        } = &mut replay
+        {
+            *sender_device = SenderDevice::Unknown;
+            payload.push(0);
+        }
+        super::retain_saved_sender_device(&engine.storage, &mut replay).unwrap();
+        assert!(matches!(
+            replay,
+            GroupEvent::MessageReceived {
+                sender_device: SenderDevice::Unknown,
+                ..
+            }
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::validate_credential_identity;

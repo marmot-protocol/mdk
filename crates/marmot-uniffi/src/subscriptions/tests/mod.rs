@@ -27,6 +27,7 @@ fn record(id: &str, plaintext: &str) -> TimelineMessageRecord {
         direction: "received".to_string(),
         group_id_hex: "aa".to_string(),
         sender: "bb".to_string(),
+        sender_device: Default::default(),
         plaintext: plaintext.to_string(),
         kind: cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
         tags: Vec::new(),

@@ -4475,7 +4475,16 @@ async fn published_app_messages_carry_exact_source_state_and_adapter_identity() 
         adapter_handle.publishes()[0].message.id,
         "test adapter must exercise transport id replacement"
     );
+    let sender_device = effects.published_app_messages[0].sender_device.clone();
+    assert!(matches!(
+        &sender_device,
+        cgka_traits::message::SenderDevice::Exact {
+            is_this_installation: true,
+            ..
+        }
+    ));
     let expected_publication = PublishedApplicationMessage {
+        sender_device,
         authority: None,
         group_id: group_id.clone(),
         app_event_id: app_event_id.clone(),

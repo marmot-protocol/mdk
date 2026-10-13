@@ -414,6 +414,12 @@ mod tests {
         let mut expected = sample_fanout(8);
         expected
             .set_application_message(OutboundApplicationMessage {
+                sender_device: cgka_traits::message::SenderDevice::Exact {
+                    device_id: "42".repeat(32),
+                    leaf_index: 7,
+                    client_label: None,
+                    is_this_installation: true,
+                },
                 authority: None,
                 group_id: gid(1),
                 app_event_id: "durable-app-event".into(),

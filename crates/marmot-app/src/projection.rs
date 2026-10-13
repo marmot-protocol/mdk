@@ -571,6 +571,7 @@ impl LegacyAccountProjectionDb {
                 direction: row.get(1)?,
                 group_id_hex: row.get(2)?,
                 sender: row.get(3)?,
+                sender_device: Default::default(),
                 plaintext: row.get(4)?,
                 kind: row.get::<_, i64>(5)?.try_into().unwrap_or_default(),
                 tags: deserialize_tags_row(row.get::<_, Option<String>>(6)?, 6)?,

@@ -278,6 +278,11 @@ pub enum SendResult {
     },
     /// Pure application message — publish once, no state advance.
     ApplicationMessage {
+        #[serde(
+            default,
+            skip_serializing_if = "crate::message::SenderDevice::is_unknown"
+        )]
+        sender_device: crate::message::SenderDevice,
         msg: TransportMessage,
         group_id: GroupId,
         /// Inner [`MarmotAppEvent::id`](crate::app_event::MarmotAppEvent)
@@ -619,6 +624,11 @@ pub enum GroupEvent {
         /// sender-controlled wall clock.
         message_id: MessageId,
         sender: MemberId,
+        #[serde(
+            default,
+            skip_serializing_if = "crate::message::SenderDevice::is_unknown"
+        )]
+        sender_device: crate::message::SenderDevice,
         epoch: EpochId,
         payload: Vec<u8>,
         /// Retention policy resolved from the authenticated MLS source epoch.

@@ -237,6 +237,9 @@ mod migration_0087_attachment_automatic_history;
 #[path = "migrations/0088_draft_attachment_descriptors.rs"]
 mod migration_0088_draft_attachment_descriptors;
 
+#[path = "migrations/0108_sender_device.rs"]
+mod migration_0108_sender_device;
+
 pub(crate) struct Migration {
     pub(crate) version: i64,
     pub(crate) name: &'static str,
@@ -889,6 +892,12 @@ const MIGRATIONS: &[Migration] = &[
         suspend_foreign_keys: &[],
         apply: migration_0107_moderation_report_outbox::apply,
     },
+    Migration {
+        version: 108,
+        name: "0108_sender_device",
+        suspend_foreign_keys: &[],
+        apply: migration_0108_sender_device::apply,
+    },
 ];
 
 /// Test fixtures use the same default-registry entry point as production with observation disabled.
@@ -1228,6 +1237,29 @@ mod tests {
     const TEST_DATABASE_KEY: &str = "storage format migration crash key";
     const V0_9_12_FIXTURE_KEY: &str = "mdk storage v1 fixture key";
     const V0_9_12_FIXTURE: &[u8] = include_bytes!("../fixtures/storage-v1-v0.9.12.bin");
+
+    #[test]
+    fn sender_device_upgrade_preserves_populated_legacy_rows() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&mut conn, &MIGRATIONS[..MIGRATIONS.len() - 1]).unwrap();
+        conn.execute_batch("INSERT INTO app_events (group_id_hex,message_id_hex,direction,sender,plaintext,kind,tags_json,recorded_at,received_at) VALUES ('group','legacy','received','alice','old',9,'[]',1,1);
+            INSERT INTO message_timeline (group_id_hex,message_id_hex,direction,sender,plaintext,kind,tags_json,timeline_at,received_at,reactions_json) VALUES ('group','legacy','received','alice','old',9,'[]',1,1,'[]');").unwrap();
+        run(&mut conn, MIGRATIONS).unwrap();
+        for table in ["app_events", "message_timeline"] {
+            let (plaintext, device): (String, cgka_traits::message::SenderDevice) = conn
+                .query_row(
+                    &format!(
+                        "SELECT plaintext,sender_device FROM {table} WHERE message_id_hex='legacy'"
+                    ),
+                    [],
+                    |row| Ok((row.get(0)?, crate::timeline::sender_device_from_row(row)?)),
+                )
+                .unwrap();
+            assert_eq!(plaintext, "old");
+            assert_eq!(device, cgka_traits::message::SenderDevice::Unknown);
+        }
+        run(&mut conn, MIGRATIONS).unwrap();
+    }
 
     #[test]
     fn presentation_upgrade_adds_durable_storage_without_rewriting_group_names() {

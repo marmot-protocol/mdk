@@ -75,6 +75,15 @@ async fn check_historical_sender(
         .unwrap();
     let source_epoch = bob.epoch(&group).unwrap();
     let old_leaf = bob.own_leaf_index(&group).unwrap();
+    let original_device = bob
+        .canonical_group_membership(&group)
+        .unwrap()
+        .devices
+        .into_iter()
+        .find(|d| d.is_this_installation)
+        .unwrap();
+    let original_device_id =
+        cgka_traits::message::member_device_id(&group, &original_device.signature_key);
     let content = b"sent before removal";
     let message = if forge_replacement_author {
         // Bob authenticates the MLS message, but lies about its inner author.
@@ -174,6 +183,7 @@ async fn check_historical_sender(
         assert_eq!(received.len(), 1, "{delivery:?}, {change:?}");
         let GroupEvent::MessageReceived {
             sender,
+            sender_device,
             epoch,
             payload,
             ..
@@ -181,6 +191,19 @@ async fn check_historical_sender(
         else {
             unreachable!()
         };
+        match sender_device {
+            cgka_traits::message::SenderDevice::Exact {
+                device_id,
+                leaf_index,
+                is_this_installation,
+                ..
+            } => {
+                assert_eq!(*device_id, original_device_id);
+                assert_eq!(*leaf_index, old_leaf);
+                assert!(!is_this_installation);
+            }
+            other => panic!("unexpected historical provenance: {other:?}"),
+        }
         assert_eq!(sender, &bob.self_id());
         assert_eq!(epoch, &source_epoch);
         assert_eq!(app_content(payload), content);

@@ -1991,6 +1991,7 @@ pub(crate) fn received_message_update_from_record(
         // canonical app-message id above is what subscribers dedupe on.
         source_message_id_hex: String::new(),
         sender: record.sender,
+        sender_device: record.sender_device,
         sender_display_name,
         group_id,
         source_epoch: record.source_epoch.unwrap_or(0),

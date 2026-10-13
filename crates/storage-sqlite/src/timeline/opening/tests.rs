@@ -29,6 +29,7 @@ fn event(id: &str, epoch: u64, at: u64) -> StoredAppEvent {
         source_epoch: Some(epoch),
         direction: "received".into(),
         sender: "bb".into(),
+        sender_device: Default::default(),
         plaintext: id.into(),
         kind: MARMOT_APP_EVENT_KIND_CHAT,
         tags: vec![],

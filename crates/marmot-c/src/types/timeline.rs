@@ -232,6 +232,7 @@ c_mirror! {
         str direction,
         str group_id_hex,
         str sender,
+        rec sender_device: super::message::MarmotSenderDevice,
         str plaintext,
         rec content_tokens: MarmotMarkdownDocument,
         copy kind: u64,

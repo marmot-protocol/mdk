@@ -141,6 +141,7 @@ const CLEARABLE_LOCAL_PUBLISH_FAILURE_PREDICATE: &str = "group_id_hex = ?1
        AND invalidation_reason = ?3";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredAppEvent {
+    pub sender_device: cgka_traits::message::SenderDevice,
     pub group_id_hex: String,
     pub message_id_hex: String,
     pub source_message_id_hex: Option<String>,
@@ -226,6 +227,8 @@ impl DeletionSource {
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TimelineMessageRecord {
+    #[serde(default)]
+    pub sender_device: cgka_traits::message::SenderDevice,
     /// Opaque device-local submission identity. Never reconstructed from tags.
     #[serde(default)]
     pub client_token: Option<String>,
@@ -567,6 +570,25 @@ impl SqliteAccountStorage {
         source_epoch: u64,
         retention: AppMessageRetentionDecision,
     ) -> StorageResult<Option<TimelineProjectionUpdate>> {
+        self.finalize_app_event_source_retention_with_sender_device(
+            group_id_hex,
+            message_id_hex,
+            source_message_id_hex,
+            source_epoch,
+            retention,
+            &cgka_traits::message::SenderDevice::Unknown,
+        )
+    }
+
+    pub fn finalize_app_event_source_retention_with_sender_device(
+        &self,
+        group_id_hex: &str,
+        message_id_hex: &str,
+        source_message_id_hex: Option<&str>,
+        source_epoch: u64,
+        retention: AppMessageRetentionDecision,
+        sender_device: &cgka_traits::message::SenderDevice,
+    ) -> StorageResult<Option<TimelineProjectionUpdate>> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let existing_source: Option<Option<String>> = conn
@@ -596,7 +618,11 @@ impl SqliteAccountStorage {
                      SET source_message_id_hex = COALESCE(source_message_id_hex, ?3),
                          source_epoch = COALESCE(source_epoch, ?4),
                          retention_seconds = ?5,
-                         retention_expires_at = ?6
+                         retention_expires_at = ?6,
+                         sender_device = CASE
+                             WHEN source_message_id_hex IS NULL OR source_message_id_hex = ?3
+                                 THEN COALESCE(?7, sender_device)
+                             ELSE sender_device END
                      WHERE group_id_hex = ?1
                        AND message_id_hex = ?2
                        AND retention_seconds IS NULL
@@ -608,6 +634,7 @@ impl SqliteAccountStorage {
                         u64_to_i64(source_epoch)?,
                         u64_to_i64(retention.retention_seconds)?,
                         retention.expires_at.map(u64_to_i64).transpose()?,
+                        sender_device_json(sender_device)?,
                     ],
                 )
                 .storage()?;
@@ -724,14 +751,27 @@ impl SqliteAccountStorage {
                 "INSERT INTO app_events (
                     group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
                     plaintext, kind, tags_json, recorded_at, received_at, origin_commit_id,
-                    moderation_grant, retention_seconds, retention_expires_at
+                    moderation_grant, retention_seconds, retention_expires_at, sender_device
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?17)
                  ON CONFLICT(group_id_hex, message_id_hex) DO UPDATE SET
-                    source_message_id_hex = COALESCE(app_events.source_message_id_hex, excluded.source_message_id_hex),
+                    -- Preserve a known legacy epoch unless the new envelope agrees.
+                    source_message_id_hex = CASE
+                        WHEN app_events.source_epoch IS NULL OR app_events.source_epoch = excluded.source_epoch
+                            THEN COALESCE(app_events.source_message_id_hex, excluded.source_message_id_hex)
+                        ELSE app_events.source_message_id_hex END,
                     source_epoch = COALESCE(app_events.source_epoch, excluded.source_epoch),
                     direction = excluded.direction,
                     sender = excluded.sender,
+                    sender_device = CASE
+                        WHEN app_events.source_epoch IS NOT NULL
+                            AND (excluded.source_epoch IS NULL OR app_events.source_epoch != excluded.source_epoch)
+                            THEN app_events.sender_device
+                        WHEN app_events.source_message_id_hex IS NULL
+                            THEN COALESCE(excluded.sender_device, app_events.sender_device)
+                        WHEN app_events.source_message_id_hex = excluded.source_message_id_hex
+                            THEN COALESCE(app_events.sender_device, excluded.sender_device)
+                        ELSE app_events.sender_device END,
                     plaintext = CASE WHEN EXISTS (
                         SELECT 1 FROM content_pruned_controls p
                         WHERE p.group_id_hex = app_events.group_id_hex
@@ -790,6 +830,7 @@ impl SqliteAccountStorage {
                         .map(u64_to_i64)
                         .transpose()?,
                     refresh_moderation_grant,
+                    sender_device_json(&event.sender_device)?,
                 ],
             )
             .storage()?;
@@ -2468,9 +2509,9 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
             group_id_hex, message_id_hex, source_message_id_hex, source_epoch, direction, sender,
             plaintext, kind, tags_json, timeline_at, received_at,
             reply_to_message_id_hex, media_json, agent_stream_json, reactions_json,
-            deleted, deleted_by_message_id_hex, invalidation_status, edit_json, deletion_source
+            deleted, deleted_by_message_id_hex, invalidation_status, edit_json, deletion_source, sender_device
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, (SELECT sender_device FROM app_events WHERE group_id_hex=?1 AND message_id_hex=?2))
          ON CONFLICT(group_id_hex, message_id_hex) DO UPDATE SET
             source_message_id_hex = excluded.source_message_id_hex,
             source_epoch = excluded.source_epoch,
@@ -2489,7 +2530,8 @@ fn upsert_message_timeline_row_tx(tx: &Connection, row: &TimelineRow) -> Storage
             deleted_by_message_id_hex = excluded.deleted_by_message_id_hex,
             invalidation_status = excluded.invalidation_status,
             edit_json = excluded.edit_json,
-            deletion_source = excluded.deletion_source",
+            deletion_source = excluded.deletion_source,
+            sender_device = excluded.sender_device",
         params![
             &row.group_id_hex,
             &row.message_id_hex,
@@ -2693,6 +2735,7 @@ fn scrub_app_event_rows_by_ids_tx(
                      source_epoch = NULL,
                      direction = '',
                      sender = '',
+                     sender_device = NULL,
                      plaintext = zeroblob(length(plaintext)),
                      tags_json = zeroblob(length(tags_json)),
                      invalidation_reason = NULL,
@@ -2794,6 +2837,7 @@ fn scrub_timeline_projection_rows_by_ids_tx(
                      source_epoch = NULL,
                      direction = '',
                      sender = '',
+                     sender_device = NULL,
                      plaintext = zeroblob(length(plaintext)),
                      tags_json = zeroblob(length(tags_json)),
                      reply_to_message_id_hex = NULL,
@@ -3364,7 +3408,7 @@ fn timeline_records_by_ids_tx(
                     timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                     timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
-                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
+                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source, timeline.sender_device,
                     {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
                     (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token
              FROM message_timeline AS timeline
@@ -3626,7 +3670,7 @@ fn timeline_query_sql(
                     timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                     timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
-                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
+                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source, timeline.sender_device,
                     {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
                     (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token
              FROM {source} AS timeline
@@ -4056,7 +4100,7 @@ fn visible_timeline_record(
                     timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
                     timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
                     timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
-                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
+                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source, timeline.sender_device,
                 {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
                 (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token
              FROM visible_message_timeline AS timeline
@@ -4099,6 +4143,7 @@ fn timeline_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Timelin
         direction: row.get(5)?,
         group_id_hex: row.get(6)?,
         sender: row.get(7)?,
+        sender_device: sender_device_from_row(row)?,
         plaintext: row.get(8)?,
         kind: row.get::<_, i64>(9)?.try_into().unwrap_or_default(),
         // Mask at the read boundary, including pre-upgrade materialized rows.
@@ -4558,6 +4603,34 @@ fn reaction_summary_json(summary: &TimelineReactionSummary) -> StorageResult<Str
 
 fn reaction_summary_from_json(json: String) -> Result<TimelineReactionSummary, serde_json::Error> {
     serde_json::from_str(&json)
+}
+
+pub(crate) fn sender_device_json(
+    device: &cgka_traits::message::SenderDevice,
+) -> StorageResult<Option<String>> {
+    if matches!(device, cgka_traits::message::SenderDevice::Unknown) {
+        return Ok(None);
+    }
+    serde_json::to_string(device)
+        .map(Some)
+        .map_err(|e| StorageError::Serialization(e.to_string()))
+}
+
+pub(crate) fn sender_device_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<cgka_traits::message::SenderDevice> {
+    row.get::<_, Option<String>>("sender_device")?
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    row.as_ref().column_index("sender_device").unwrap_or(0),
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })
+        })
+        .transpose()
+        .map(|device| device.unwrap_or_default())
 }
 
 #[cfg(test)]

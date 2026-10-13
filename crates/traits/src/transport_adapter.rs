@@ -284,6 +284,11 @@ pub struct OutboundFanout {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboundApplicationMessage {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::message::SenderDevice::is_unknown"
+    )]
+    pub sender_device: crate::message::SenderDevice,
     pub group_id: GroupId,
     pub app_event_id: String,
     pub source_epoch: EpochId,
@@ -1482,6 +1487,12 @@ mod tests {
     fn frozen_fanout_round_trip_preserves_application_message_context() {
         let mut fanout = OutboundFanout::stage(fanout_request(), None, None, 55).unwrap();
         let application = OutboundApplicationMessage {
+            sender_device: crate::message::SenderDevice::Exact {
+                device_id: "42".repeat(32),
+                leaf_index: 7,
+                client_label: None,
+                is_this_installation: true,
+            },
             authority: None,
             group_id: GroupId::new(vec![0xD4; 16]),
             app_event_id: "app-event-1".into(),
@@ -1490,6 +1501,17 @@ mod tests {
         };
         fanout.set_application_message(application.clone()).unwrap();
 
+        let mut legacy_application = serde_json::to_value(&application).unwrap();
+        legacy_application
+            .as_object_mut()
+            .unwrap()
+            .remove("sender_device");
+        let legacy_application: OutboundApplicationMessage =
+            serde_json::from_value(legacy_application).unwrap();
+        assert_eq!(
+            legacy_application.sender_device,
+            crate::message::SenderDevice::Unknown
+        );
         let encoded = serde_json::to_vec(&fanout).unwrap();
         let restored: OutboundFanout = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(restored.application_message(), Some(&application));

@@ -8,12 +8,48 @@ use marmot_app::{
 use super::common::{MessageTagFfi, markdown_content_tokens, message_tags_ffi};
 use crate::markdown::MarkdownDocumentFfi;
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Enum)]
+pub enum SenderDevice {
+    Exact {
+        device_id: String,
+        leaf_index: u32,
+        client_label: Option<String>,
+        is_this_installation: bool,
+    },
+    OneOf {
+        device_count: u32,
+    },
+    #[default]
+    Unknown,
+}
+
+impl From<marmot_app::SenderDevice> for SenderDevice {
+    fn from(value: marmot_app::SenderDevice) -> Self {
+        match value {
+            marmot_app::SenderDevice::Exact {
+                device_id,
+                leaf_index,
+                client_label,
+                is_this_installation,
+            } => Self::Exact {
+                device_id,
+                leaf_index,
+                client_label,
+                is_this_installation,
+            },
+            marmot_app::SenderDevice::OneOf { device_count } => Self::OneOf { device_count },
+            marmot_app::SenderDevice::Unknown => Self::Unknown,
+        }
+    }
+}
+
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct AppMessageRecordFfi {
     pub message_id_hex: String,
     pub direction: String,
     pub group_id_hex: String,
     pub sender: String,
+    pub sender_device: SenderDevice,
     pub plaintext: String,
     pub content_tokens: MarkdownDocumentFfi,
     /// Nostr `kind` of the inner Marmot app event (9 chat, 7 reaction, …).
@@ -39,6 +75,7 @@ impl From<AppMessageRecord> for AppMessageRecordFfi {
             direction: value.direction,
             group_id_hex: value.group_id_hex,
             sender: value.sender,
+            sender_device: value.sender_device.into(),
             plaintext: value.plaintext,
             content_tokens,
             kind: value.kind,
@@ -135,6 +172,7 @@ pub struct ReceivedMessageFfi {
     pub message_id_hex: String,
     pub group_id_hex: String,
     pub sender: String,
+    pub sender_device: SenderDevice,
     pub sender_display_name: Option<String>,
     pub plaintext: String,
     pub content_tokens: MarkdownDocumentFfi,
@@ -158,6 +196,7 @@ impl From<&ReceivedMessage> for ReceivedMessageFfi {
             message_id_hex: value.message_id_hex.clone(),
             group_id_hex: hex::encode(value.group_id.as_slice()),
             sender: value.sender.clone(),
+            sender_device: value.sender_device.clone().into(),
             sender_display_name: value.sender_display_name.clone(),
             plaintext: value.plaintext.clone(),
             content_tokens: markdown_content_tokens(value.kind, &value.plaintext),
@@ -215,6 +254,79 @@ impl From<RuntimeMessageUpdate> for MessageUpdateFfi {
                     message: ReceivedMessageFfi::from(&m.message),
                 },
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod sender_device_tests {
+    use super::*;
+    #[test]
+    fn sender_device_raw_and_timeline_record_round_trip() {
+        use marmot_app::SenderDevice as AppSenderDevice;
+        let device = AppSenderDevice::Exact {
+            device_id: "42".repeat(32),
+            leaf_index: 7,
+            client_label: Some("Test Client".into()),
+            is_this_installation: true,
+        };
+        let raw: marmot_app::AppMessageRecord = serde_json::from_value(serde_json::json!({
+            "message_id_hex":"message", "direction":"sent", "group_id_hex":"group",
+            "sender":"account", "sender_device":device, "plaintext":"hello", "kind":9,
+            "recorded_at":1,"received_at":2
+        }))
+        .unwrap();
+        let timeline: marmot_app::TimelineMessageRecord =
+            serde_json::from_value(serde_json::json!({
+                "message_id_hex":"message", "direction":"sent", "group_id_hex":"group",
+                "sender":"account", "sender_device":device, "plaintext":"hello", "kind":9,
+                "tags":[], "timeline_at":1,"received_at":2,
+                "reactions":{"by_emoji":{},"user_reactions":[]}, "deleted":false
+            }))
+            .unwrap();
+        let raw: AppMessageRecordFfi = raw.into();
+        let timeline: super::super::timeline::TimelineMessageRecordFfi = timeline.into();
+        assert_eq!(raw.sender_device, timeline.sender_device);
+        let mut bytes = Vec::new();
+        <AppMessageRecordFfi as uniffi::Lower<crate::UniFfiTag>>::write(raw, &mut bytes);
+        let decoded = <AppMessageRecordFfi as uniffi::Lift<crate::UniFfiTag>>::try_read(
+            &mut bytes.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(decoded.sender_device, SenderDevice::from(device.clone()));
+        let mut bytes = Vec::new();
+        <super::super::timeline::TimelineMessageRecordFfi as uniffi::Lower<crate::UniFfiTag>>::write(timeline, &mut bytes);
+        let decoded = <super::super::timeline::TimelineMessageRecordFfi as uniffi::Lift<
+            crate::UniFfiTag,
+        >>::try_read(&mut bytes.as_slice())
+        .unwrap();
+        assert_eq!(decoded.sender_device, SenderDevice::from(device));
+    }
+    #[test]
+    fn sender_device_uniffi_round_trip() {
+        for value in [
+            SenderDevice::Unknown,
+            SenderDevice::OneOf { device_count: 2 },
+            SenderDevice::Exact {
+                device_id: "42".repeat(32),
+                leaf_index: 5,
+                client_label: Some("Test Client".into()),
+                is_this_installation: true,
+            },
+            SenderDevice::Exact {
+                device_id: "43".repeat(32),
+                leaf_index: 6,
+                client_label: None,
+                is_this_installation: false,
+            },
+        ] {
+            let mut bytes = Vec::new();
+            <SenderDevice as uniffi::Lower<crate::UniFfiTag>>::write(value.clone(), &mut bytes);
+            let mut slice = bytes.as_slice();
+            let actual =
+                <SenderDevice as uniffi::Lift<crate::UniFfiTag>>::try_read(&mut slice).unwrap();
+            assert_eq!(actual, value);
+            assert!(slice.is_empty());
         }
     }
 }

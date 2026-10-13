@@ -247,6 +247,7 @@ impl<S: cgka_traits::StorageProvider> crate::engine::Engine<S> {
                     message_id: request.message_id.clone(),
                     epoch: request.epoch,
                     sender: request.sender,
+                    sender_device: Default::default(),
                     payload: source.payload,
                     authority: Some(source.authority),
                     retention: request.retention.or_else(|| {
