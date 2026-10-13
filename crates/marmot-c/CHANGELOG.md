@@ -10,6 +10,7 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 ### Added
 
 - Append invitation diagnostic statuses `MARMOT_STATUS_OBSOLETE_KEY_PACKAGE` (101) and `MARMOT_STATUS_MEMBER_DISCOVERY_INCOMPLETE` (102). Existing status values remain unchanged; detail strings omit recipient identity. Member discovery failures previously mapped to the relay-directory status use 102; hosts should offer retry for this outcome.
+- Account attachment pages, bounded borrowed query inputs and opaque cursor/version handles with deep-free and version-clone functions. New records/symbols require matching headers and libraries; existing group history remains supported.
 - Add `marmot_send_prepared_media_with_client_token` for captured ordinary-media admission and conditional draft consumption. Inputs are borrowed; the nullable captured revision remains owned by its selected-draft root. The owned result uses the existing `marmot_local_send_acceptance_free`; layouts and status values are unchanged. Use matching regenerated headers and libraries.
 
 ## [0.13.0] - 2026-10-12
