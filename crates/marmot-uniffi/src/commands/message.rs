@@ -266,6 +266,28 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// Read one locally stored raw message, applying the account's visibility rules.
+    /// Missing or hidden messages return `None`. No network request is made;
+    /// run this synchronous read off the UI thread.
+    pub fn message(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        message_id_hex: String,
+    ) -> Result<Option<AppMessageRecordFfi>, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let message_id =
+            crate::optional_message_id_hex(Some(message_id_hex))?.ok_or_else(|| {
+                MarmotKitError::InvalidHex {
+                    details: "message id must not be empty".into(),
+                }
+            })?;
+        Ok(self
+            .runtime
+            .message_by_id(&account_ref, &hex::encode(group_id.as_slice()), &message_id)?
+            .map(Into::into))
+    }
+
     /// Initial history fetch for a group (or, when `group_id_hex` is None,
     /// the account-wide tail). Used to populate the conversation view before
     /// the subscription stream takes over.

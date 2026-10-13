@@ -14,6 +14,8 @@
 
 ### Added
 
+- `Marmot::message` reads one locally stored raw message by account/group/message id, returning `None` when missing or hidden by account visibility rules; no network request.
+
 - Account-wide attachment candidate pages, group/sender/date queries and opaque account/query-bound cursor/version handles. Filtered empty pages can continue; source changes require restart. Existing group history and acquisition primitives are unchanged.
 
 - `Marmot::send_prepared_media_with_client_token` exposes captured ordinary-media admission with transactional conditional draft consumption. Use the original token and revision for live retries, recover ownership by token after interruption, and pair regenerated Swift/Kotlin bindings with the matching library. See [local sends](LOCAL-SENDS.md).

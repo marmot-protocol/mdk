@@ -9,6 +9,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `marmot_message` mirrors the single-message local read: OK with NULL for missing or hidden records, otherwise an owned `MarmotAppMessageRecord` released with `marmot_app_message_record_free`. Use the matching header and library.
+
 - Account attachment pages, bounded borrowed query inputs and opaque cursor/version handles with deep-free and version-clone functions. New records/symbols require matching headers and libraries; existing group history remains supported.
 
 - Add `marmot_send_prepared_media_with_client_token` for captured ordinary-media admission and conditional draft consumption. Inputs are borrowed; the nullable captured revision remains owned by its selected-draft root. The owned result uses the existing `marmot_local_send_acceptance_free`; layouts and status values are unchanged. Use matching regenerated headers and libraries.

@@ -81,6 +81,12 @@ for each release.
 - Free every subscription handle before the client that created it, and never free an object while another call uses
   it.
 
+`marmot_message` reads one raw stored message by account/group/message id without
+network access. It blocks: call off the UI thread. Missing or hidden records return
+`MARMOT_STATUS_OK` with NULL; free a non-NULL result with
+`marmot_app_message_record_free`. Inputs are borrowed. See the
+[shared API selection guide](../marmot-uniffi/README.md#integration-guide-and-api-reference).
+
 ## Using the ABI
 
 ```c

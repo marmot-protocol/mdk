@@ -2441,6 +2441,16 @@ reprojected, and run this synchronous query off the UI thread. See [Polls](POLLS
 
 [Source](src/commands/timeline.rs#L83)
 
+### `Marmot::message`
+
+```rust
+pub fn message( &self, account_ref: String, group_id_hex: String, message_id_hex: String, ) -> Result<Option<AppMessageRecordFfi>, MarmotKitError>
+```
+
+Read one raw locally stored message for Message Details refreshes without loading a kind or timeline window. Account references use the same resolution as `messages`; group ids are non-empty variable-length MLS ids (up to 1024 bytes), and message ids are 32 bytes. Hex is trimmed and canonicalized; malformed ids return `InvalidHex`. Missing records and authors hidden by the account's block policy return `None`. This synchronous read performs no network request; call off the UI thread. The returned record is owned by the caller.
+
+[Source](src/commands/message.rs#L272)
+
 ### `Marmot::messages`
 
 **Lower-level.** Raw stored messages; complete conversation screens use open_conversation_window.
@@ -2451,7 +2461,7 @@ pub fn messages( &self, account_ref: String, group_id_hex: Option<String>, limit
 
 Initial history fetch for a group (or, when `group_id_hex` is None, the account-wide tail). Used to populate the conversation view before the subscription stream takes over.
 
-[Source](src/commands/message.rs#L275)
+[Source](src/commands/message.rs#L297)
 
 </details>
 

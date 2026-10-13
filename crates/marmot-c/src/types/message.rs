@@ -166,3 +166,76 @@ c_mirror! {
         vec groups/groups_len: MarmotRetentionSweepGroupOutcome,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CStr;
+
+    #[test]
+    fn message_by_id_nullable_conversion_and_free() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let before = crate::memory::audit::live_allocations();
+        let ffi = AppMessageRecordFfi {
+            message_id_hex: "ab".repeat(32),
+            direction: "received".into(),
+            group_id_hex: "cd".repeat(16),
+            sender: "ef".repeat(32),
+            plaintext: "hello **details**".into(),
+            content_tokens: marmot_uniffi::MarkdownDocumentFfi {
+                blocks: vec![marmot_uniffi::MarkdownBlockFfi::Paragraph {
+                    inlines: vec![marmot_uniffi::MarkdownInlineFfi::Text {
+                        content: "details".into(),
+                    }],
+                }],
+                truncated: false,
+                blank_lines_before: vec![0],
+            },
+            kind: 9,
+            tags: vec![marmot_uniffi::MessageTagFfi {
+                values: vec!["subject".into(), "details".into()],
+            }],
+            source_epoch: Some(3),
+            retention_seconds: Some(0),
+            retention_expires_at: None,
+            recorded_at: 10,
+            received_at: 11,
+        };
+        let mut out = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(
+                crate::commands::deliver_opt::<_, MarmotAppMessageRecord>(Ok(Some(ffi)), &mut out),
+                crate::MarmotStatus::Ok
+            );
+            assert!(!out.is_null());
+            let record = &*out;
+            assert_eq!(
+                CStr::from_ptr(record.message_id_hex).to_str().unwrap(),
+                "ab".repeat(32)
+            );
+            assert_eq!(
+                CStr::from_ptr(record.plaintext).to_str().unwrap(),
+                "hello **details**"
+            );
+            assert_eq!(record.tags_len, 1);
+            assert_eq!(record.tags.as_ref().unwrap().values_len, 2);
+            assert_eq!(record.source_epoch, 3);
+            assert!(record.has_source_epoch);
+            assert!(record.has_retention_seconds);
+            assert!(!record.has_retention_expires_at);
+            marmot_app_message_record_free(out);
+            assert_eq!(
+                crate::commands::deliver_opt::<AppMessageRecordFfi, MarmotAppMessageRecord>(
+                    Ok(None),
+                    &mut out
+                ),
+                crate::MarmotStatus::Ok
+            );
+            assert!(out.is_null());
+            marmot_app_message_record_free(out);
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), before);
+    }
+}

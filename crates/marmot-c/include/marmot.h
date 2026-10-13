@@ -7741,6 +7741,22 @@ MarmotStatus marmot_clear_chat_muted(const struct MarmotClient *client,
                                      struct MarmotChatNotificationSettings **out);
 
 /**
+ * One locally stored raw message. No network; missing or hidden returns
+ * OK with NULL. Free a non-NULL result with `marmot_app_message_record_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_message(const struct MarmotClient *client,
+                            const char *account_ref,
+                            const char *group_id_hex,
+                            const char *message_id_hex,
+                            struct MarmotAppMessageRecord **out);
+
+/**
  * Stored raw app messages for a group (`group_id_hex` non-NULL) or
  * the whole account (NULL), newest-last, capped by `limit` when
  * `has_limit`. `kinds` restricts the result to those Nostr event

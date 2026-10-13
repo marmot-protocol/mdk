@@ -1263,3 +1263,133 @@ async fn retention_sweep_binding_is_public_and_requires_a_known_account() {
         .expect_err("missing account should fail at the runtime boundary");
     assert!(format!("{missing_account}").contains("missing"));
 }
+
+#[tokio::test]
+async fn message_by_id_reads_visible_record_and_validates_ids() {
+    use sha2::{Digest, Sha256};
+    use storage_sqlite::{SqlCipherKey, SqliteAccountStorage, StoredAppEvent, StoredBlockList};
+
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = AccountHome::open_with_default_keychain(tmp.path()).unwrap();
+    let account = home.create_nostr_account().unwrap();
+    let keys = home.load_signing_keys(&account.label).unwrap();
+    // Seed an encrypted legacy session fixture; the runtime migrates it on open.
+    // This avoids sending messages or starting any relay worker in a read test.
+    let mut hash = Sha256::new();
+    hash.update(b"marmot-app-sqlcipher-key-v1");
+    hash.update(account.label.as_bytes());
+    hash.update(keys.public_key().to_bytes());
+    hash.update(keys.secret_key().to_secret_bytes());
+    let key = SqlCipherKey::new(hex::encode(hash.finalize())).unwrap();
+    let storage = SqliteAccountStorage::open_encrypted(
+        home.account_dir(&account.label).join("session.sqlite"),
+        &key,
+    )
+    .unwrap();
+    let group_id = "ab".repeat(16);
+    let message_id = "cd".repeat(32);
+    let sender = nostr::prelude::Keys::generate().public_key().to_hex();
+    storage
+        .record_app_event(&StoredAppEvent {
+            group_id_hex: group_id.clone(),
+            message_id_hex: message_id.clone(),
+            source_message_id_hex: None,
+            source_epoch: Some(3),
+            direction: "received".into(),
+            sender: sender.clone(),
+            plaintext: "hello **details**".into(),
+            kind: 9,
+            tags: vec![vec!["subject".into(), "details".into()]],
+            recorded_at: 10,
+            received_at: 11,
+            origin_commit_id: None,
+            moderation_grant: false,
+        })
+        .unwrap();
+    let hidden_id = "12".repeat(32);
+    let hidden_sender = nostr::prelude::Keys::generate().public_key().to_hex();
+    storage
+        .record_app_event(&StoredAppEvent {
+            group_id_hex: group_id.clone(),
+            message_id_hex: hidden_id.clone(),
+            source_message_id_hex: None,
+            source_epoch: None,
+            direction: "received".into(),
+            sender: hidden_sender.clone(),
+            plaintext: "hidden".into(),
+            kind: 9,
+            tags: vec![],
+            recorded_at: 10,
+            received_at: 11,
+            origin_commit_id: None,
+            moderation_grant: false,
+        })
+        .unwrap();
+    storage
+        .adopt_block_list(
+            &StoredBlockList {
+                event_id: "34".repeat(32),
+                event_created_at: 1,
+                ..Default::default()
+            },
+            &[(hidden_sender, false)],
+            100,
+            &account.account_id_hex,
+            &|_, _| false,
+        )
+        .unwrap();
+    storage.close().unwrap();
+    drop(storage);
+    let kit = Marmot::new(tmp.path().to_string_lossy().into_owned(), vec![]).unwrap();
+    let record = kit
+        .message(
+            account.account_id_hex.clone(),
+            format!(" {} ", group_id.to_uppercase()),
+            format!(" {} ", message_id.to_uppercase()),
+        )
+        .unwrap()
+        .expect("visible record");
+    assert_eq!(record.message_id_hex, message_id);
+    assert_eq!(record.group_id_hex, group_id);
+    assert_eq!(record.sender, sender);
+    assert_eq!(record.plaintext, "hello **details**");
+    assert!(!record.content_tokens.blocks.is_empty());
+    assert_eq!(record.kind, 9);
+    assert_eq!(record.tags[0].values, vec!["subject", "details"]);
+    assert_eq!(record.source_epoch, Some(3));
+    assert_eq!((record.recorded_at, record.received_at), (10, 11));
+    assert!(
+        kit.message(account.label.clone(), group_id.clone(), "ef".repeat(32))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        kit.message(account.label.clone(), "ab".repeat(17), message_id.clone())
+            .unwrap()
+            .is_none()
+    );
+    for invalid in ["", " ", "not-hex", "abc", "ab", &"ab".repeat(33)] {
+        assert!(matches!(
+            kit.message(account.label.clone(), group_id.clone(), invalid.into()),
+            Err(MarmotKitError::InvalidHex { .. })
+        ));
+    }
+    for invalid in ["", " ", "not-hex", "abc", &"ab".repeat(1025)] {
+        assert!(matches!(
+            kit.message(account.label.clone(), invalid.into(), message_id.clone()),
+            Err(MarmotKitError::InvalidHex { .. })
+        ));
+    }
+    assert!(matches!(
+        kit.message("missing".into(), group_id.clone(), message_id.clone()),
+        Err(MarmotKitError::UnknownAccount { .. })
+    ));
+
+    assert!(
+        kit.message(account.label, group_id, hidden_id)
+            .unwrap()
+            .is_none()
+    );
+    kit.shutdown_and_close().await.unwrap();
+}

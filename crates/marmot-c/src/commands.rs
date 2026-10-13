@@ -70,7 +70,8 @@ use crate::types::media::{
     MarmotMediaUploadRequest, MarmotMediaUploadResult,
 };
 use crate::types::message::{
-    MarmotAppMessageRecordList, MarmotRetentionSweepReport, MarmotSecureDeleteExpiredResult,
+    MarmotAppMessageRecord, MarmotAppMessageRecordList, MarmotRetentionSweepReport,
+    MarmotSecureDeleteExpiredResult,
 };
 use crate::types::notification::{
     MarmotBackgroundNotificationCollection, MarmotNotificationSettings,
@@ -979,6 +980,10 @@ c_cmd! {
     /// Unmute a conversation. Free with
     /// `marmot_chat_notification_settings_free`.
     sync fn marmot_clear_chat_muted(account_ref: str, group_id_hex: str) -> rec(MarmotChatNotificationSettings) = clear_chat_muted;
+
+    /// One locally stored raw message. No network; missing or hidden returns
+    /// OK with NULL. Free a non-NULL result with `marmot_app_message_record_free`.
+    sync fn marmot_message(account_ref: str, group_id_hex: str, message_id_hex: str) -> opt_rec(MarmotAppMessageRecord) = message;
 
     /// Stored raw app messages for a group (`group_id_hex` non-NULL) or
     /// the whole account (NULL), newest-last, capped by `limit` when

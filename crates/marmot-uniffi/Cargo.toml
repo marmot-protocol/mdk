@@ -33,6 +33,8 @@ uniffi = { version = "0.29.4", features = ["tokio"] }
 zeroize.workspace = true
 
 [dev-dependencies]
+sha2.workspace = true
+storage-sqlite.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "test-util"] }
 keyring-core.workspace = true
