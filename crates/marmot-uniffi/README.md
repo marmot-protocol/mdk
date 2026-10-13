@@ -869,13 +869,15 @@ full-history repair remains available and can still complete parked history that
 comparison of the retained window certifies. Notices carry no relay, message or key identities; keep them out of
 analytics. C callers: see the [C guide](../marmot-c/README.md#history-may-be-incomplete-notices).
 
-While a group's epoch-gap recovery is pending or parked, the group has moved past this
-device. Group changes (invite, remove, admin changes, profile, image, retention, disbanding
-and app components) fail with `MarmotKitError::GroupCatchingUp` instead of committing from
-the stale epoch, which would fork the group. Scheduled self-updates wait too. Messages and
-leaving still work. Show it as "This chat is still catching up; try again once it has
-synced". The hold lifts once recovery catches the group up, or once the user dismisses the
-group's history notice.
+While unresolved epoch-gap recovery covers a group's current local epoch, the group has
+moved past this device. Group changes (invite, remove, admin changes, profile, image,
+retention, disbanding and app components) fail with `MarmotKitError::GroupCatchingUp`
+instead of committing from the stale epoch, which would fork the group. Scheduled
+self-updates, queued group changes and automatic removals of departing members wait too.
+Messages and leaving still work; a message already queued behind a group change waits with
+it. Show it as "This chat is still catching up; try again once it has synced". The hold
+lifts once recovery catches the group up or the device moves past that epoch. Dismissing
+the group's history notice does not lift it: the device is still behind.
 
 ## File-backed media upload
 

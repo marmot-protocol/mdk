@@ -3245,6 +3245,105 @@ async fn multiple_leavers_stage_one_selfremove_only_commit_excluding_unrelated_p
     );
 }
 
+/// mdk#2258: a host that knows the group moved past this device's epoch
+/// holds commits. A due SelfRemove is neither scheduled, drained nor staged
+/// by a foreground send while held, and commits normally once released.
+#[tokio::test]
+async fn commit_hold_defers_a_due_selfremove_auto_commit_until_released() {
+    let clock = cgka_engine::ManualConvergenceClock::new(1_000, 10_000);
+    let mut alice = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .legacy_compatibility_profile()
+        .identity(pad32(b"alice"))
+        .account_identity_proof_signer(proof_signer(b"alice"))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .convergence_clock(std::sync::Arc::new(clock.clone()))
+        .build()
+        .unwrap();
+    let mut bob = build_client(b"bob");
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "held leave".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated {
+        pending,
+        mut welcomes,
+    } = created
+    else {
+        panic!("expected group creation");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcomes.remove(0)).await.unwrap();
+    let SendResult::Proposal { mut msg } = bob
+        .send(SendIntent::Leave {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected SelfRemove proposal");
+    };
+    msg.envelope = TransportEnvelope::GroupMessage {
+        transport_group_id: group_id.as_slice().to_vec(),
+    };
+    alice.ingest(msg).await.unwrap();
+    let delay = alice
+        .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+        .unwrap()
+        .expect("a processed SelfRemove arms the timer");
+    clock.advance_ms(delay);
+    let epoch = alice.epoch(&group_id).unwrap();
+
+    let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let hold = held.clone();
+    alice.set_commit_hold(Some(std::sync::Arc::new(move |_, _| {
+        hold.load(std::sync::atomic::Ordering::SeqCst)
+    })));
+    assert_eq!(
+        alice
+            .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+            .unwrap(),
+        None,
+        "held work must not wake the scheduler"
+    );
+    alice.advance_convergence(&group_id).await.unwrap();
+    assert!(alice.drain_auto_publish().is_empty());
+    let payload = app_payload_for(&alice, b"chat while held");
+    assert!(matches!(
+        alice
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload,
+                expected_epoch: None,
+            })
+            .await
+            .unwrap(),
+        SendResult::ApplicationMessage { .. }
+    ));
+    assert!(
+        alice.drain_auto_publish().is_empty(),
+        "a foreground send must not stage the held auto-commit"
+    );
+    assert_eq!(alice.epoch(&group_id).unwrap(), epoch);
+
+    held.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        alice
+            .scheduled_self_remove_auto_commit_delay_ms(&group_id)
+            .unwrap(),
+        Some(0)
+    );
+    alice.advance_convergence(&group_id).await.unwrap();
+    assert_eq!(alice.drain_auto_publish().len(), 1);
+}
+
 #[tokio::test]
 async fn selfremove_runtime_deadline_survives_encrypted_reopen_and_clears_after_publish() {
     for reopen in [false, true] {

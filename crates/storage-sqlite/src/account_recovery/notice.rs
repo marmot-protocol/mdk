@@ -703,11 +703,12 @@ mod tests {
         );
     }
 
-    /// mdk#2258: an unresolved epoch gap, pending or parked, says the group
-    /// moved past the epoch it stalled at. Only the user's retirement, a
-    /// cleared intent, or the device leaving that epoch ends the hold.
+    /// mdk#2258: an unresolved epoch gap says the group moved past the epoch
+    /// it stalled at. Pending, parked and user-retired gaps all hold it:
+    /// dismissing the notice changes no MLS state. Only a cleared intent or
+    /// the device leaving that epoch ends the hold.
     #[test]
-    fn epoch_gap_holds_its_stalled_epoch_until_retired_or_left_behind() {
+    fn epoch_gap_holds_its_stalled_epoch_until_cleared_or_left_behind() {
         let store = fixture();
         store.put_group(&sample_group(gid(1), 7, 2)).unwrap();
         let group = gid(1);
@@ -758,6 +759,23 @@ mod tests {
                 .retire_parked_recovery_obligation(id, ticket.revision, 2_000)
                 .unwrap()
         );
+        assert!(
+            store
+                .epoch_gap_recovery_open_at(group.as_slice(), 7)
+                .unwrap(),
+            "dismissing the notice leaves the device on the stalled epoch"
+        );
+        assert!(
+            !store
+                .epoch_gap_recovery_open_at(group.as_slice(), 8)
+                .unwrap()
+        );
+        store
+            .clear_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
+                group_id_hex: hex::encode(group.as_slice()),
+                stalled_epoch: 7,
+            }])
+            .unwrap();
         assert!(
             !store
                 .epoch_gap_recovery_open_at(group.as_slice(), 7)

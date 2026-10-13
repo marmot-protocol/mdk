@@ -377,6 +377,15 @@ impl AccountDeviceSession {
             builder = builder.recorder(recorder);
         }
         let mut engine = builder.build()?;
+        // mdk#2258: while unresolved epoch-gap recovery covers a group's local
+        // epoch, the group has moved on without this device. Automatic commits
+        // wait. A storage failure holds rather than risk a fork.
+        let hold_storage = maintenance_storage.clone();
+        engine.set_commit_hold(Some(std::sync::Arc::new(move |group_id, epoch| {
+            hold_storage
+                .epoch_gap_recovery_open_at(group_id.as_slice(), epoch.0)
+                .unwrap_or(true)
+        })));
         if config.protocol_profile == ProtocolProfile::Current {
             let retirement = engine.retire_non_current_key_packages()?;
             tracing::info!(

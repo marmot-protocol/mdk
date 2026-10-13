@@ -555,10 +555,11 @@ impl SqliteAccountStorage {
     }
 
     /// Whether unresolved epoch-gap recovery says this group moved past
-    /// `local_epoch` without this device (mdk#2258). Pending and parked
-    /// obligations both count: neither has proven the device caught up.
-    /// Retirement, a cleared intent, or a local epoch above the stalled one
-    /// ends the hold.
+    /// `local_epoch` without this device (mdk#2258). Pending, parked and
+    /// user-retired obligations all count: none of them has caught the device
+    /// up, and retiring a "history may be incomplete" notice changes no MLS
+    /// state. Only recovery that clears the gap, or a local epoch above the
+    /// stalled one, ends the hold.
     pub fn epoch_gap_recovery_open_at(
         &self,
         group_id: &[u8],
@@ -567,7 +568,7 @@ impl SqliteAccountStorage {
         self.lock()?
             .query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM account_recovery_obligations
-                 WHERE cause = 1 AND state = 0 AND group_id = ?1 AND stalled_epoch >= ?2)",
+                 WHERE cause = 1 AND state IN (0, 2) AND group_id = ?1 AND stalled_epoch >= ?2)",
                 params![group_id, u64_to_i64(local_epoch)?],
                 |row| row.get(0),
             )

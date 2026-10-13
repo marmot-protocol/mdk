@@ -5922,18 +5922,15 @@ impl AppClient {
     /// authored from that epoch forks the group, and fork choice can then
     /// rewind everyone else's history onto it. The pre-send sync only
     /// re-registers subscriptions, so it cannot prove the device caught up.
-    /// The hold lifts when recovery ends the gap, when the device leaves the
-    /// stalled epoch, or when the user dismisses the group's history notice.
+    /// The hold lifts when recovery clears the gap or the device leaves the
+    /// stalled epoch. Dismissing the group's history notice does not lift it:
+    /// that accepts missing history but leaves the device on the stale epoch.
     ///
     /// Application messages and leave are not held: neither commits from the
-    /// stale epoch.
+    /// stale epoch. The engine applies the same hold to automatic commits
+    /// (queued intents, pending disband, SelfRemove auto-commits).
     fn ensure_group_caught_up(&self, group_id: &GroupId) -> Result<(), AppError> {
-        let epoch = self.runtime.group_record(group_id)?.epoch;
-        if self
-            .app
-            .account_storage(&self.state.label)?
-            .epoch_gap_recovery_open_at(group_id.as_slice(), epoch.0)?
-        {
+        if self.group_commits_held(group_id)? {
             tracing::info!(
                 target: "marmot_app::client",
                 method = "ensure_group_caught_up",
@@ -5944,17 +5941,22 @@ impl AppClient {
         Ok(())
     }
 
+    /// Whether new commits for this group wait for epoch-gap recovery; the
+    /// same predicate the session installs as the engine's commit hold.
+    pub(crate) fn group_commits_held(&self, group_id: &GroupId) -> Result<bool, AppError> {
+        let epoch = self.runtime.group_record(group_id)?.epoch;
+        Ok(self
+            .app
+            .account_storage(&self.state.label)?
+            .epoch_gap_recovery_open_at(group_id.as_slice(), epoch.0)?)
+    }
+
     /// Groups whose new maintenance commits [`Self::ensure_group_caught_up`]
     /// would refuse.
     fn epoch_gap_held_groups(&self) -> Result<Vec<GroupId>, AppError> {
-        let storage = self.app.account_storage(&self.state.label)?;
         let mut held = Vec::new();
-        for intent in storage.pending_epoch_backfill_intents()? {
-            let group_id = GroupId::new(hex::decode(&intent.group_id_hex)?);
-            let Ok(group) = self.runtime.group_record(&group_id) else {
-                continue;
-            };
-            if intent.stalled_epoch >= group.epoch.0 && !held.contains(&group_id) {
+        for group_id in self.runtime.live_group_ids()? {
+            if self.group_commits_held(&group_id)? {
                 held.push(group_id);
             }
         }

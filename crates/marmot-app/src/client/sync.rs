@@ -81,6 +81,10 @@ pub(super) const TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS: usize = 4;
 // ponytail: EOSE crosses a separate router task; retain a short quiet window
 // until delivery and EOSE can share an ordered receive lane.
 const EOSE_QUIET_WAIT: Duration = Duration::from_millis(100);
+/// How often held queued group work re-checks its epoch-gap commit hold. The
+/// hold usually lifts with an inbound commit, which wakes the group itself;
+/// this bounds the wait when it lifts through recovery bookkeeping alone.
+const EPOCH_GAP_COMMIT_HOLD_RETRY_MS: u64 = 60_000;
 
 type OwnedComparisonResult = Result<
     Option<(
@@ -795,7 +799,7 @@ impl AppClient {
                     // when secondary replication retains a longer retry cutoff.
                     // The drain uses the same durable publication safety gate.
                     Ok(ConvergenceScheduleState::PendingOutbound {
-                        retry_after_ms: None,
+                        retry_after_ms: self.commit_hold_retry_ms(group_id)?,
                     })
                 } else if self.runtime.has_pending_outbound_fanouts(group_id)? {
                     // Required publication and pending MLS still gate queued
@@ -820,7 +824,7 @@ impl AppClient {
                     // convergence and frozen publications retain their precedence;
                     // an unrecoverable group stays paused.
                     Ok(ConvergenceScheduleState::PendingOutbound {
-                        retry_after_ms: None,
+                        retry_after_ms: self.commit_hold_retry_ms(group_id)?,
                     })
                 } else {
                     // Only an otherwise idle group may use the lifecycle timer.
@@ -840,6 +844,18 @@ impl AppClient {
                 }
             }
         }
+    }
+
+    /// A drain authors nothing for a group whose commits are held
+    /// (mdk#2258), so held queued work is re-checked on a timer rather than
+    /// woken immediately into a drain that stages nothing.
+    fn commit_hold_retry_ms(
+        &self,
+        group_id: &cgka_traits::GroupId,
+    ) -> Result<Option<u64>, AppError> {
+        Ok(self
+            .group_commits_held(group_id)?
+            .then_some(EPOCH_GAP_COMMIT_HOLD_RETRY_MS))
     }
 
     fn remember_buffered_convergence_outcome(&mut self, outcome: &IngestOutcome) {

@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Group changes refuse with the new `AppError::GroupCatchingUp` while the group's epoch-gap recovery is pending or parked at or above the local epoch, and due maintenance self-updates wait. Before, a device that knew the group had moved on could still commit from its stale epoch and fork the group (mdk#2258). Messages and leave are not held. Update exhaustive `AppError` matches.
+- Group changes refuse with the new `AppError::GroupCatchingUp` while unresolved epoch-gap recovery (pending, parked or with its notice dismissed) covers the group's current local epoch. Due maintenance self-updates, queued group changes, pending disbands and SelfRemove auto-commits wait too. Before, a device that knew the group had moved on could still commit from its stale epoch and fork the group (mdk#2258). Messages and leave are not held. Update exhaustive `AppError` matches.
 - `MarmotAppRuntime::submit_prepared_media_snapshot` admits the captured ordinary-media payload with a stable token and consumes only its unchanged captured draft in the same transaction. Newer or cleared drafts cannot replace the payload or block admission.
 
 ## 0.13.0 - 2026-10-12

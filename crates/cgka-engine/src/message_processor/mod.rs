@@ -1074,7 +1074,9 @@ impl<S: StorageProvider> Engine<S> {
         let settled = self
             .advance_convergence_inputs_with_deadline(group_id, now_ms, deadline)
             .await?;
-        if !settled {
+        // Inbound input settled above. A held group authors nothing new: its
+        // queued intents, pending disband and SelfRemove wait for the release.
+        if !settled || self.commits_held(group_id) {
             return Ok(Vec::new());
         }
         if let Some(result) = self.prepare_pending_disband(group_id).await? {
@@ -1340,6 +1342,9 @@ impl<S: StorageProvider> Engine<S> {
             AdvanceConvergenceStatus::ForegroundBudgetExhausted => {
                 return Ok(Some(OutboundQueueReason::ForegroundBudgetExhausted));
             }
+        }
+        if self.commits_held(group_id) {
+            return Ok(None);
         }
         self.stage_due_self_remove_auto_commit(group_id, now_ms)
             .await
@@ -1952,7 +1957,7 @@ impl<S: StorageProvider> Engine<S> {
         {
             return Ok(None);
         }
-        if self.load_leave_request_state(group_id)?.is_some() {
+        if self.load_leave_request_state(group_id)?.is_some() || self.commits_held(group_id) {
             return Ok(None);
         }
         let now_ms = self.convergence_now_ms();
