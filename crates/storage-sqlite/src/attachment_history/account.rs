@@ -45,15 +45,19 @@ impl AccountAttachmentQuery {
         Ok(result)
     }
     fn accepts(&self, group: &str, sender: &str) -> bool {
+        // Query IDs are canonical hex; imported historical rows can retain casing.
+        // Keep the stored ordering key and returned identity intact for continuation.
+        let group = group.to_ascii_lowercase();
+        let sender = sender.to_ascii_lowercase();
         (self.groups.is_empty()
             || self
                 .groups
-                .binary_search_by(|v| v.as_str().cmp(group))
+                .binary_search_by(|v| v.as_str().cmp(group.as_str()))
                 .is_ok())
             && (self.senders.is_empty()
                 || self
                     .senders
-                    .binary_search_by(|v| v.as_str().cmp(sender))
+                    .binary_search_by(|v| v.as_str().cmp(sender.as_str()))
                     .is_ok())
     }
 }
@@ -242,7 +246,8 @@ impl SqliteAccountStorage {
                 ]);
             }
             let mut stmt = conn.prepare_cached(&sql(cursor.is_some())).storage()?;
-            // No metadata read for the extra look-ahead row; it proves continuation only.
+            // Skip Rust decoding for the look-ahead row. SQLite still evaluates
+            // the bounded metadata expressions selected by this candidate query.
             let mut rows = stmt.query(params_from_iter(values)).storage()?;
             let mut entries = Vec::new();
             let mut key = None;

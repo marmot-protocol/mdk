@@ -510,3 +510,36 @@ fn record_time_retention_copies_expiry_before_any_maintenance_or_update() {
         2
     );
 }
+
+#[test]
+fn canonical_filters_match_historical_row_casing_without_changing_cursor_order() {
+    let s = SqliteAccountStorage::in_memory().unwrap();
+    seed(&s, "AA", 1, 3, 10);
+    s.lock()
+        .unwrap()
+        .execute(
+            "UPDATE message_timeline SET sender=?1 WHERE group_id_hex='AA'",
+            ["AB".repeat(32)],
+        )
+        .unwrap();
+    let query = AccountAttachmentQuery {
+        groups: vec!["aa".into()],
+        senders: vec!["ab".repeat(32)],
+        ..Default::default()
+    };
+    let first = s.account_attachment_history_page(&query, 1, None).unwrap();
+    assert_eq!(first.entries.len(), 1);
+    assert_eq!(first.entries[0].group_id_hex, "AA");
+    assert_eq!(first.entries[0].attachment.sender, "AB".repeat(32));
+    let mut cursor = first.next_cursor;
+    let mut slots = vec![first.entries[0].attachment.attachment_index];
+    while let Some(next) = cursor {
+        let page = s
+            .account_attachment_history_page(&query, 1, Some(&next))
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        slots.push(page.entries[0].attachment.attachment_index);
+        cursor = page.next_cursor;
+    }
+    assert_eq!(slots, vec![0, 1, 2]);
+}
