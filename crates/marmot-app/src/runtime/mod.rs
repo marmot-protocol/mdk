@@ -2436,6 +2436,42 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Record that the user accepts changing a group whose last change has not
+    /// reached every group relay yet, after a group change failed with
+    /// [`AppError::GroupCommitUndelivered`] (mdk#2255). Members who read only
+    /// the owed relays cannot follow the group, and the new change builds on
+    /// a change they lack. Retry the change afterwards. The acknowledgement
+    /// admits one group change attempt, consumed even if that attempt fails,
+    /// and is not persisted. Returns false, recording nothing, when no relay
+    /// is owed the group's last change.
+    pub async fn acknowledge_group_commit_undelivered(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        self.accounts
+            .acknowledge_group_commit_undelivered(account_ref, group_id)
+            .await
+    }
+
+    /// The group's oldest change that some group relays have not accepted yet,
+    /// or `None` once every relay has accepted or definitively rejected it
+    /// (mdk#2255). MDK keeps retrying the owed relays. Owed relays are reported
+    /// immediately, while group changes fail with
+    /// [`AppError::GroupCommitUndelivered`] only once `since` is two minutes old:
+    /// a healthy relay cut off at the first acknowledgement is retried after 30
+    /// seconds. A local read; no event announces delivery completing, so poll
+    /// while showing it.
+    pub async fn group_commit_delivery(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<Option<crate::GroupCommitDelivery>, AppError> {
+        self.accounts
+            .group_commit_delivery(account_ref, group_id)
+            .await
+    }
+
     /// Dismiss one notice after the user accepts that this history may be
     /// incomplete. The dismissal is durable and is recorded as its own
     /// outcome, never as recovered history. Returns false, changing nothing,

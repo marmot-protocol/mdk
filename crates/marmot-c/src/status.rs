@@ -147,6 +147,9 @@ pub enum MarmotStatus {
     /// The group moved past this device and recovery has not caught it up;
     /// group changes would fork it. Retry once it has synced (mdk#2258).
     GroupCatchingUp = 101,
+    /// The group's last change has not reached every group relay yet; group
+    /// changes wait while MDK retries them (mdk#2255).
+    GroupCommitUndelivered = 102,
 }
 
 thread_local! {
@@ -276,6 +279,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::GroupDisbanding { .. } => MarmotStatus::GroupDisbanding,
         MarmotKitError::GroupRemoved { .. } => MarmotStatus::GroupRemoved,
         MarmotKitError::GroupCatchingUp { .. } => MarmotStatus::GroupCatchingUp,
+        MarmotKitError::GroupCommitUndelivered { .. } => MarmotStatus::GroupCommitUndelivered,
         MarmotKitError::StorageClosed { .. } => MarmotStatus::StorageClosed,
         MarmotKitError::GroupSendQueueFull { .. } => MarmotStatus::GroupSendQueueFull,
         MarmotKitError::CreatedGroupProjectionUnavailable { .. } => {
@@ -466,6 +470,9 @@ mod tests {
             MarmotKitError::GroupCatchingUp {
                 group_id_hex: "aa".into(),
             },
+            MarmotKitError::GroupCommitUndelivered {
+                group_id_hex: "aa".into(),
+            },
             MarmotKitError::MemberNotInGroup {
                 group_id_hex: "aa".into(),
                 member_id_hex: "bb".into(),
@@ -516,7 +523,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            92,
+            93,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
