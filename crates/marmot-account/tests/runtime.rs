@@ -3426,6 +3426,7 @@ async fn adapter_publish_failure_records_per_relay_causes() {
     let audit_path = dir.path().join("audit.jsonl");
     let mut initial = current_session(database.clone(), &key, b"alice");
     let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let bob_id = bob.self_id();
     let bob_key_package = bob.fresh_key_package().await.unwrap();
     drop(bob);
     let created = initial
@@ -3471,7 +3472,12 @@ async fn adapter_publish_failure_records_per_relay_causes() {
             (refused.clone(), "connect relay failed"),
         ],
     );
-    let routing = StaticTransportRouting::new(vec![timed_out.clone(), refused.clone()]);
+    let routing = StaticTransportRouting::new(vec![])
+        .with_inbox_route(bob_id, vec![timed_out.clone(), refused.clone()]);
+    assert_eq!(
+        routing.publish_target(&welcome).unwrap().endpoints(),
+        &[timed_out.clone(), refused.clone()]
+    );
     let wall = Arc::new(TestWallClock::new(120_000));
     let monotonic = Arc::new(TestMonotonicClock::default());
     let mut runtime = AccountDeviceRuntime::new(
