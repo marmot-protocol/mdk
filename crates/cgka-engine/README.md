@@ -36,6 +36,53 @@ MIP-03 admin rules, and returns typed outcomes for every ingest path.
 It does **not** do transport (plug in a `TransportPeeler`), persistence beyond `StorageProvider` (pair with
 [`storage-sqlite`](../storage-sqlite/README.md); tests use its in-memory mode), CLI, FFI, or application logic.
 
+`SendIntent::Leave` removes only this installation's MLS leaf. Admin rights belong to the account:
+an admin device may leave while another canonical leaf of that account remains, preserving the admin set.
+The account's last leaf must first leave the admin set or the engine returns `AdminCannotSelfRemove`.
+Concurrent sibling SelfRemove proposals are batched in leaf order, keeping at least one leaf per active admin
+account. The resulting admin/leaf coupling is checked before auto-publication and again before publish confirmation.
+
+### Compatibility of admin sibling departures
+
+This permission changes receiver validation; enabling the `SelfRemove` MLS proposal capability alone does not
+negotiate it. All group members must support admin sibling SelfRemove before it is used. No additional capability
+gate is implemented yet.
+
+The older receiver policy examined at `origin/master` commit
+[`c27300be`](https://github.com/marmot-protocol/mdk/tree/c27300bef4f47cf3bb03d214d2fdd5290b6f44f9)
+rejects a SelfRemove from any account in the source epoch's admin set, even if another leaf remains:
+
+- [`authorize_proposal` lines 449–455](https://github.com/marmot-protocol/mdk/blob/c27300bef4f47cf3bb03d214d2fdd5290b6f44f9/crates/cgka-engine/src/app_components.rs#L449-L455)
+  returns `InvalidSelfRemove`. Direct ingest terminalizes the proposal as `Failed` and returns `Rejected`
+  ([`ingest.rs` lines 1587–1595](https://github.com/marmot-protocol/mdk/blob/c27300bef4f47cf3bb03d214d2fdd5290b6f44f9/crates/cgka-engine/src/message_processor/ingest.rs#L1587-L1595));
+  replay also rejects it before storing its proposal reference
+  ([`openmls_projection.rs` lines 4071–4084](https://github.com/marmot-protocol/mdk/blob/c27300bef4f47cf3bb03d214d2fdd5290b6f44f9/crates/cgka-engine/src/openmls_projection.rs#L4071-L4084)).
+- A commit consuming that SelfRemove cannot advance an older receiver: normal by-reference commits lack an admitted
+  proposal dependency. Even if the reference resolves, `authorize_staged_commit_proposals` re-runs the same
+  source-epoch authorization
+  ([lines 520–525](https://github.com/marmot-protocol/mdk/blob/c27300bef4f47cf3bb03d214d2fdd5290b6f44f9/crates/cgka-engine/src/app_components.rs#L520-L525)),
+  and `require_admin_for_staged_commit` independently invokes `reject_admin_self_remove_proposals`, which returns
+  `AdminCannotSelfRemove` for every active-admin sender
+  ([lines 268–274](https://github.com/marmot-protocol/mdk/blob/c27300bef4f47cf3bb03d214d2fdd5290b6f44f9/crates/cgka-engine/src/app_components.rs#L268-L274),
+  [1395–1398](https://github.com/marmot-protocol/mdk/blob/c27300bef4f47cf3bb03d214d2fdd5290b6f44f9/crates/cgka-engine/src/app_components.rs#L1395-L1398)).
+  Commit replay applies these checks before merge
+  ([lines 4119–4145](https://github.com/marmot-protocol/mdk/blob/c27300bef4f47cf3bb03d214d2fdd5290b6f44f9/crates/cgka-engine/src/openmls_projection.rs#L4119-L4145)).
+
+A mixed-version group therefore can split when a new admin device proposes SelfRemove and a new remaining member
+publishes/confirms its sibling departure: new receivers accept the valid commit, while old receivers cannot adopt
+that epoch. A proposal alone does not advance the epoch, and an old-only set of eligible committers will not publish
+that departure. Demoting the account in a **prior committed epoch**, then issuing a fresh SelfRemove in the non-admin
+epoch, avoids this validation mismatch (the group must still retain an admin). Combining demotion with the SelfRemove
+in one commit does not avoid the older source-epoch guard. An ordinary admin-authorized `Remove` of a sibling leaf
+is a different path: the older coupling validator already allows it when another account leaf survives
+([lines 635–681](https://github.com/marmot-protocol/mdk/blob/c27300bef4f47cf3bb03d214d2fdd5290b6f44f9/crates/cgka-engine/src/app_components.rs#L635-L681)).
+
+A future gate could use a dedicated advertised capability or versioned app component required by the GroupContext.
+Every leaf would have to advertise support before the group enables the new validation semantics; creation, joins,
+invites, send, auto-commit, and inbound/replay validation would all enforce that requirement. Older members would
+need upgrading or removal before enabling it. Maintainers must choose that negotiation contract before deploying
+admin sibling SelfRemove in mixed-version groups.
+
 ## KeyPackage validation before membership changes
 
 Create and Invite validate transported KeyPackages through OpenMLS and the Marmot identity/profile checks before

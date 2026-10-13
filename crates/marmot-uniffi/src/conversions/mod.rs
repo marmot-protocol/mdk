@@ -216,6 +216,26 @@ mod tests {
     }
 
     #[test]
+    fn group_management_state_allows_admin_sibling_leave() {
+        let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let bob_id = "bb4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let details = GroupDetailsFfi {
+            group: group(vec![self_id]),
+            members: vec![
+                member(self_id, true, true),
+                member(self_id, true, true),
+                member(self_id, true, true),
+                member(bob_id, false, false),
+            ],
+            mls_state: mls_state(),
+        };
+        let state = group_management_state_ffi(self_id, &details);
+        assert!(state.is_self_admin);
+        assert!(state.can_leave);
+        assert!(!state.requires_self_demote_before_leave);
+    }
+
+    #[test]
     fn group_management_state_marks_last_admin_self_demote_requirement() {
         let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
         let bob_id = "bb4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";

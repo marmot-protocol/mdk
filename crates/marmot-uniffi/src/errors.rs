@@ -164,6 +164,7 @@ pub enum MarmotKitError {
     AccountCatchUp { details: String },
     #[error("local account is not an admin of group {group_id_hex}")]
     NotGroupAdmin { group_id_hex: String },
+    /// The last leaf of an admin account must self-demote before leaving.
     #[error("admin must self-demote before leaving group {group_id_hex}")]
     AdminCannotSelfRemove { group_id_hex: String },
     /// A leave is already in flight for this group. The durable request survives
@@ -559,10 +560,9 @@ impl MarmotKitError {
             EngineError::AdminCannotSelfRemove { group_id } => Self::AdminCannotSelfRemove {
                 group_id_hex: hex::encode(group_id.as_slice()),
             },
-            // The authoritative already-leaving signal. `Marmot::leave_group`
-            // prechecks the pending flag for fast UX, but that check is a
-            // check-then-act race, so the engine's verdict must map to the same
-            // named error rather than falling through to `Runtime`.
+            // Pending leave retries reach the worker so the engine can either
+            // classify a duplicate or cancel a newly forbidden intent. Preserve
+            // its typed duplicate verdict for hosts.
             EngineError::LeaveAlreadyRequested { group_id } => Self::LeaveAlreadyRequested {
                 group_id_hex: hex::encode(group_id.as_slice()),
             },
@@ -754,12 +754,8 @@ mod tests {
         );
     }
 
-    // The `leave_group` precheck on `leave_request_pending` is not atomic with
-    // the send it guards, so two concurrent leaves can both pass it. The engine
-    // settles the race under its own lock, and the loser's verdict has to reach
-    // the host as the same named error the precheck would have produced — never
-    // the untyped `Runtime` bucket, which is exactly the opaque failure this
-    // field was added to eliminate.
+    // Pending retries are classified by the engine; preserve its duplicate
+    // verdict as a typed error rather than the untyped `Runtime` bucket.
     // Asserted against `from_engine_error` directly rather than through an
     // `AppError`: a leave failure arrives wrapped as
     // `AppError::Session(SessionError::Engine(..))`, and `cgka-session` is not a

@@ -9,6 +9,8 @@ pub struct ConversationAuthority {
     pub self_membership: SelfMembership,
     pub is_admin: bool,
     pub admin_count: usize,
+    /// Another device of this account remains in the canonical group.
+    pub self_has_sibling_leaf: bool,
     pub pending_confirmation: bool,
     pub leave_request_pending: bool,
     pub lifecycle: AppGroupLifecycleState,
@@ -86,8 +88,8 @@ impl ConversationAuthority {
             can_send: ordinary,
             can_invite: manage,
             can_edit_group: manage,
-            can_leave: ordinary && !admin,
-            requires_self_demote_before_leave: manage,
+            can_leave: ordinary && (!admin || self.self_has_sibling_leaf),
+            requires_self_demote_before_leave: manage && !self.self_has_sibling_leaf,
             can_enable_disbanding: manage
                 && self.lifecycle == AppGroupLifecycleState::Stable
                 && !self.disbanding_enabled

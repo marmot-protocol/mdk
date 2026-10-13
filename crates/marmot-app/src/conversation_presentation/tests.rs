@@ -12,6 +12,7 @@ fn authority() -> ConversationAuthority {
         self_membership: SelfMembership::Member,
         is_admin: false,
         admin_count: 1,
+        self_has_sibling_leaf: false,
         pending_confirmation: false,
         leave_request_pending: false,
         lifecycle: AppGroupLifecycleState::Stable,
@@ -197,6 +198,20 @@ fn conversation_capabilities_follow_membership_and_lifecycle_without_profiles() 
     input.unrecoverable = false;
     input.disbanding = true;
     assert!(!input.capabilities().can_send);
+}
+
+#[test]
+fn conversation_capabilities_allow_admin_sibling_leave() {
+    let mut input = authority();
+    input.is_admin = true;
+    input.self_has_sibling_leaf = true;
+    let capabilities = input.capabilities();
+    assert!(capabilities.is_self_admin && capabilities.is_last_admin);
+    assert!(capabilities.can_leave && capabilities.can_invite);
+    assert!(!capabilities.requires_self_demote_before_leave);
+    input.self_has_sibling_leaf = false;
+    assert!(!input.capabilities().can_leave);
+    assert!(input.capabilities().requires_self_demote_before_leave);
 }
 
 #[test]

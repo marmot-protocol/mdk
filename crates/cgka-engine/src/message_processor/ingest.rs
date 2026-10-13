@@ -1855,7 +1855,10 @@ impl<S: StorageProvider> Engine<S> {
             .iter()
             .map(|candidate| (candidate.leaf, candidate.digest))
             .collect();
-        let selected = crate::auto_committer::select_lowest_digest_per_leaf(&selection_inputs);
+        let selected = crate::auto_committer::select_admin_safe_self_remove_batch(
+            mls_group,
+            &selection_inputs,
+        )?;
         Ok(selected
             .into_iter()
             .map(|index| candidates[index].queued.clone())
@@ -1946,6 +1949,11 @@ impl<S: StorageProvider> Engine<S> {
         let staged_commit = mls_group
             .pending_commit()
             .ok_or_else(|| EngineError::Backend("auto-commit produced no pending commit".into()))?;
+        crate::app_components::validate_admin_leaf_coupling_for_staged_commit(
+            mls_group,
+            group_id,
+            staged_commit,
+        )?;
         crate::app_components::validate_current_profile_invariants_for_staged_commit(
             mls_group,
             staged_commit,

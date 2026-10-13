@@ -569,6 +569,7 @@ mod budget_tests {
             self_membership: crate::SelfMembership::Member,
             is_admin: true,
             admin_count: 1,
+            self_has_sibling_leaf: false,
             pending_confirmation: true,
             leave_request_pending: false,
             lifecycle: AppGroupLifecycleState::Stable,

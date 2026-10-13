@@ -12,7 +12,7 @@ use cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID;
 use cgka_traits::engine::{SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::EngineError;
-use cgka_traits::message::OwnApplicationConvergenceStamp;
+use cgka_traits::message::{MessageState, OwnApplicationConvergenceStamp, StoredMessagePayload};
 use cgka_traits::peeler::GroupMessageMetadata;
 use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportMessage};
@@ -675,34 +675,14 @@ impl<S: StorageProvider> Engine<S> {
             || self.convergence_now_ms(),
             |request| request.requested_at_ms,
         );
-        let current_epoch = self
-            .storage
-            .get_group(&group_id)
-            .map_err(|e| match e {
-                StorageError::NotFound => EngineError::UnknownGroup(group_id.clone()),
-                other => EngineError::Storage(other),
-            })?
-            .epoch;
-        if existing
-            .as_ref()
-            .and_then(|request| request.last_proposed_epoch)
-            == Some(current_epoch)
-        {
-            self.leaving_groups.insert(group_id.clone());
-            // Authoritative classification for "already leaving". Decided here
-            // rather than by a caller-side precheck because this read and the
-            // durable write below happen under the same lock: two concurrent
-            // leaves can both observe "not pending" above this layer, and the
-            // loser has to learn the real reason from here. Typed rather than
-            // `InvalidTransition` (an engine-bug signal) so it can cross the FFI
-            // boundary as a named error instead of an opaque runtime failure.
-            return Err(EngineError::LeaveAlreadyRequested {
-                group_id: group_id.clone(),
-            });
-        }
-
         let (msg, proposal_bytes, proposed_epoch) =
-            self.prepare_self_remove_proposal(&group_id).await?;
+            match self.prepare_self_remove_proposal(&group_id).await {
+                Err(err @ EngineError::AdminCannotSelfRemove { .. }) if existing.is_some() => {
+                    self.cancel_forbidden_leave_request(&group_id)?;
+                    return Err(err);
+                }
+                result => result?,
+            };
         let request = existing.get_or_insert_with(|| LeaveRequest {
             group_id: group_id.clone(),
             requested_at_ms,
@@ -718,6 +698,37 @@ impl<S: StorageProvider> Engine<S> {
         )?;
 
         Ok(SendResult::Proposal { msg })
+    }
+
+    /// Cancel the local intent without retracting already-published MLS bytes.
+    /// Retire its Sent markers atomically with the request, so legacy hydration
+    /// cannot resurrect the gate even if an older branch becomes canonical.
+    fn cancel_forbidden_leave_request(&mut self, group_id: &GroupId) -> Result<(), StorageError> {
+        let sent_proposals: Vec<_> = self
+            .storage
+            .list_messages_in_states(group_id, &[MessageState::Sent], EpochId(0))?
+            .into_iter()
+            .filter_map(|record| {
+                let payload = StoredMessagePayload::decode(&record.payload).ok()?;
+                let message = payload.as_openmls_wire()?;
+                let projection =
+                    crate::openmls_projection::project_mls_message(&message.payload).ok()?;
+                (projection.kind == crate::openmls_projection::OpenMlsContentKind::Proposal)
+                    .then_some(record.id)
+            })
+            .collect();
+        self.storage.with_transaction(|storage| {
+            // SelfRemove is the engine's only outbound proposal. Processed
+            // proposals still participate in convergence replay, but do not
+            // restore a leave request at hydration.
+            for id in &sent_proposals {
+                storage.update_message_state(id, MessageState::Processed)?;
+            }
+            storage.clear_leave_request(group_id)
+        })?;
+        self.leave_requests.remove(group_id);
+        self.leaving_groups.remove(group_id);
+        Ok(())
     }
 
     pub(crate) async fn prepare_self_remove_proposal(
@@ -747,16 +758,33 @@ impl<S: StorageProvider> Engine<S> {
             ));
         }
 
-        // member-departure.md:23-26 — an admin must leave the admin set before
-        // using SelfRemove. This is stricter than merely preserving a non-empty
-        // admin set: it prevents an admin identity from departing while still
-        // present in the prior epoch's admin policy.
+        // Admin rights belong to the account. Only its last canonical leaf
+        // must leave the admin set before using SelfRemove.
         let self_pubkey =
             crate::app_components::admin_pubkey_from_member_id(self.identity.self_id())?;
         let admins = crate::app_components::admins_of_group(&mls_group)?;
         let i_am_admin = admins.iter().any(|k| k == &self_pubkey);
-        if i_am_admin {
+        if i_am_admin
+            && !crate::app_components::account_has_other_leaf(
+                &mls_group,
+                mls_group.own_leaf_index(),
+                &self_pubkey,
+            )
+        {
             return Err(EngineError::AdminCannotSelfRemove {
+                group_id: group_id.clone(),
+            });
+        }
+
+        // Validate authority before classifying a duplicate: branch selection
+        // can forbid a durable leave even at the last proposed epoch.
+        if self
+            .storage
+            .leave_request(group_id)?
+            .and_then(|request| request.last_proposed_epoch)
+            == Some(EpochId(mls_group.epoch().as_u64()))
+        {
+            return Err(EngineError::LeaveAlreadyRequested {
                 group_id: group_id.clone(),
             });
         }

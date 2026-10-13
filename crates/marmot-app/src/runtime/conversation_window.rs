@@ -783,6 +783,7 @@ impl Reader {
                             self_membership: account.presentation_input.self_membership,
                             is_admin: facts.is_admin,
                             admin_count: facts.admin_count,
+                            self_has_sibling_leaf: facts.self_has_sibling_leaf,
                             pending_confirmation: account.pending_confirmation,
                             leave_request_pending: account.leave_request_pending,
                             lifecycle: authority.lifecycle.into(),
@@ -805,6 +806,7 @@ impl Reader {
                             self_membership: account.presentation_input.self_membership,
                             is_admin: false,
                             admin_count: 0,
+                            self_has_sibling_leaf: false,
                             pending_confirmation: account.pending_confirmation,
                             leave_request_pending: account.leave_request_pending,
                             lifecycle: if account.disbanded {

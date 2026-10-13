@@ -448,7 +448,8 @@ fn authorize_proposal(
 
     match proposal.proposal() {
         Proposal::SelfRemove => {
-            if sender_is_admin {
+            if sender_is_admin && !account_has_other_leaf(mls_group, *sender_index, &sender_pubkey)
+            {
                 return Err(StandaloneProposalRejection::invalid_self_remove(
                     "self_remove_sender_is_active_admin",
                 ));
@@ -1294,6 +1295,20 @@ pub(crate) fn reject_admins_without_member_leaf(
     reject_admins_without_member_accounts(admins, &member_account_pubkeys(mls_group), group_id)
 }
 
+/// Whether the account has another leaf in the current canonical MLS tree.
+/// Compare credentials on the same length-based basis as the admin policy;
+/// staged/projected membership must not authorize a last-leaf departure.
+pub(crate) fn account_has_other_leaf(
+    group: &MlsGroup,
+    leaving_index: LeafNodeIndex,
+    account: &[u8; 32],
+) -> bool {
+    group.members().any(|member| {
+        member.index != leaving_index
+            && credential_account_pubkey(member.credential).as_ref() == Some(account)
+    })
+}
+
 /// Member account pubkeys currently in the group's ratchet tree.
 pub(crate) fn member_account_pubkeys(mls_group: &MlsGroup) -> BTreeSet<[u8; 32]> {
     let mut accounts: BTreeSet<[u8; 32]> = BTreeSet::new();
@@ -1377,22 +1392,26 @@ fn reject_admin_self_remove_proposals(
         // curve-validated, so a leaf whose 32-byte identity equals a listed
         // admin key but fails secp256k1 validation would resolve to `None` under
         // the validating chokepoint and SKIP this guard — letting that admin
-        // self-remove in violation of MIP-03. Matching the admin-set basis keeps
-        // both sides of the comparison comparable. Fail CLOSED: a `SelfRemove`
+        // remove its last leaf in violation of MIP-03. Matching the admin-set
+        // basis keeps both sides of the comparison comparable. Fail CLOSED: a `SelfRemove`
         // whose sender cannot be resolved to a member account is rejected, never
         // waved through (mirrors the Sm7 auto-committer / fork-recovery posture).
-        let sender_pubkey = match queued.sender() {
-            Sender::Member(leaf_idx) => mls_group
-                .member_at(*leaf_idx)
-                .and_then(|member| credential_account_pubkey(member.credential)),
-            _ => None,
+        let Sender::Member(sender_index) = queued.sender() else {
+            return Err(EngineError::AdminCannotSelfRemove {
+                group_id: group_id.clone(),
+            });
         };
+        let sender_pubkey = mls_group
+            .member_at(*sender_index)
+            .and_then(|member| credential_account_pubkey(member.credential));
         let Some(sender_pubkey) = sender_pubkey else {
             return Err(EngineError::AdminCannotSelfRemove {
                 group_id: group_id.clone(),
             });
         };
-        if admins.iter().any(|admin| admin == &sender_pubkey) {
+        if admins.iter().any(|admin| admin == &sender_pubkey)
+            && !account_has_other_leaf(mls_group, *sender_index, &sender_pubkey)
+        {
             return Err(EngineError::AdminCannotSelfRemove {
                 group_id: group_id.clone(),
             });

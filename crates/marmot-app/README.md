@@ -279,6 +279,10 @@ notifications and invitation recovery. Quiet observations return repaired deltas
 MLS commit. Cancellation preserves the owning client's pending work; these queues are session-local, not a crash-durable
 event journal.
 
+An installation's leave removes its own MLS leaf. An admin device can leave while another device of the same account
+remains in canonical membership; the admin set stays unchanged. The last leaf of an admin account must self-demote
+before leaving.
+
 ## Conversations
 
 - **Drafts.** Rust app/runtime draft commands expose selected metadata, conditional save/clear, keyed attachment bytes,

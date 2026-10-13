@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Allow admin devices with surviving sibling leaves to leave without self-demotion. Leave capabilities preserve
+  the last-leaf restriction and account-level admin rights. Rust callers constructing `ConversationAuthority` must
+  supply `self_has_sibling_leaf`; live conversation capture derives it from canonical engine membership.
+
 - `MarmotAppRuntime::submit_prepared_media_snapshot` admits the captured ordinary-media payload with a stable token and consumes only its unchanged captured draft in the same transaction. Newer or cleared drafts cannot replace the payload or block admission.
 
 ## 0.13.0 - 2026-10-12

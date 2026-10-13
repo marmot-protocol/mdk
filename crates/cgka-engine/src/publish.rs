@@ -96,6 +96,13 @@ impl<S: StorageProvider> Engine<S> {
         let mut mls_group = MlsGroup::load(provider.storage(), &mls_gid)
             .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
             .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        // Validate before snapshots, cache writes, or the canonical merge.
+        // Confirmation must not adopt an invalid batch staged by any producer.
+        if let Some(staged) = mls_group.pending_commit() {
+            crate::app_components::validate_admin_leaf_coupling_for_staged_commit(
+                &mls_group, &group_id, staged,
+            )?;
+        }
         let has_pending_commit = mls_group.pending_commit().is_some();
         let previous_membership = self.canonical_membership_snapshot(&group_id)?;
         let activity_before =

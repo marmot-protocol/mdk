@@ -196,10 +196,15 @@ pub(crate) async fn group_management_state_for(
     kit: &Marmot,
     account_ref: &str,
     group_id: &GroupId,
-    _group_id_hex: &str,
+    group_id_hex: &str,
 ) -> Result<GroupManagementStateFfi, MarmotKitError> {
     let account = kit.runtime.accounts().resolve(account_ref)?;
-    let details = group_details_for(kit, account_ref, group_id).await?;
+    let mut details = group_details_for(kit, account_ref, group_id).await?;
+    // Leave intent can change without a roster projection write (including
+    // across reopen). Use its durable source for admission and display hints.
+    let pending = kit.app.pending_leave_requests(&account.label)?;
+    details.group.leave_requested_at_ms = pending.get(group_id_hex).copied();
+    details.group.leave_request_pending = details.group.leave_requested_at_ms.is_some();
     Ok(group_management_state_ffi(
         &account.account_id_hex,
         &details,
@@ -334,18 +339,11 @@ fn ensure_can_request_leave(
     state: &GroupManagementStateFfi,
     group_id_hex: &str,
 ) -> Result<(), MarmotKitError> {
-    // A fast-path reject only, not the source of correctness: this read and
-    // the worker command that acts on it are not atomic, so two concurrent
-    // leaves can both pass here. The engine settles it under its own lock and
-    // returns `EngineError::LeaveAlreadyRequested`, which maps to this same
-    // variant — see `MarmotKitError::from_engine_error`.
-    //
-    // Keep pending intent ahead of the roster/admin preflight: a durable
-    // leave can coexist with a locally classified departure.
+    // The engine must reclassify pending retries against the current roster.
+    // A surviving admin leaf may now be forbidden to leave; only the worker
+    // can cancel that durable intent and restore the device's usability.
     if state.leave_request_pending {
-        return Err(MarmotKitError::LeaveAlreadyRequested {
-            group_id_hex: group_id_hex.to_owned(),
-        });
+        return Ok(());
     }
     if state.requires_self_demote_before_leave {
         return Err(MarmotKitError::AdminCannotSelfRemove {
@@ -1500,6 +1498,187 @@ mod tests {
         kit.runtime.shutdown_and_close().await.unwrap();
     }
 
+    /// Exercise the exported command against a real surviving admin device.
+    #[test]
+    fn forbidden_admin_sibling_leave_retry_crosses_exported_api() {
+        std::thread::Builder::new()
+            .name("ffi-forbidden-leave-retry".into())
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        for disband_before_restart in [false, true] {
+                            forbidden_admin_sibling_leave_retry_body(disband_before_restart).await;
+                        }
+                    });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn sync_until_member_count(
+        client: &mut marmot_app::AppClient,
+        group: &cgka_traits::GroupId,
+        count: usize,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                client.sync().await.unwrap();
+                if client.group_mls_state(group).is_ok() {
+                    client.retry_group_convergence(group).await.unwrap();
+                    if client.group_mls_state(group).unwrap().member_count == count {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("membership must settle");
+    }
+
+    async fn forbidden_admin_sibling_leave_retry_body(disband_before_restart: bool) {
+        let relay = MockRelay::run().await.unwrap();
+        let url = relay.url().await.to_string();
+        let root = tempfile::tempdir().unwrap();
+        let sibling_root = tempfile::tempdir().unwrap();
+        let home = marmot_account::AccountHome::open(root.path());
+        let alice_account = home.create_account("alice").unwrap();
+        let bob_account = home.create_account("bob").unwrap();
+        let secret = home
+            .load_signing_keys("alice")
+            .unwrap()
+            .secret_key()
+            .to_secret_hex();
+        marmot_account::AccountHome::open(sibling_root.path())
+            .import_account("alice", &secret)
+            .unwrap();
+        let open_app = |path: &std::path::Path| {
+            MarmotApp::with_relay_and_config(
+                path,
+                url.clone(),
+                marmot_app::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+            )
+        };
+        let app = open_app(root.path());
+        let sibling_app = open_app(sibling_root.path());
+        for label in ["alice", "bob"] {
+            app.publish_account_relay_lists(
+                label,
+                marmot_app::AccountRelayListBootstrap::new(
+                    vec![TransportEndpoint(url.clone())],
+                    vec![TransportEndpoint(url.clone())],
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        let mut bob = app.client("bob").await.unwrap();
+        bob.publish_key_package().await.unwrap();
+        let mut alice = app.client("alice").await.unwrap();
+        let group = alice
+            .create_group("exported leave retry", &[&bob_account.account_id_hex])
+            .await
+            .unwrap();
+        let group_hex = hex::encode(group.as_slice());
+        sync_until_member_count(&mut bob, &group, 2).await;
+        bob.accept_group_invite(&group).unwrap();
+        let mut sibling = sibling_app.client("alice").await.unwrap();
+        sibling.publish_key_package().await.unwrap();
+        alice
+            .invite_members(&group, &[&alice_account.account_id_hex])
+            .await
+            .unwrap();
+        sync_until_member_count(&mut sibling, &group, 3).await;
+        sibling.accept_group_invite(&group).unwrap();
+        sync_until_member_count(&mut bob, &group, 3).await;
+        alice.leave_group(&group).await.unwrap();
+        sibling.leave_group(&group).await.unwrap();
+        sync_until_member_count(&mut bob, &group, 2).await;
+        sync_until_member_count(&mut sibling, &group, 2).await;
+        assert!(
+            sibling_app
+                .pending_leave_requests("alice")
+                .unwrap()
+                .contains_key(&group_hex)
+        );
+        drop(sibling);
+        let kit = Marmot {
+            runtime: sibling_app.runtime(),
+            app: sibling_app,
+        };
+        let state = kit
+            .group_management_state("alice".into(), group_hex.clone())
+            .await
+            .unwrap();
+        assert!(state.leave_request_pending);
+        let err = kit
+            .leave_group("alice".into(), group_hex.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, MarmotKitError::AdminCannotSelfRemove { .. }),
+            "{err:?}"
+        );
+        assert!(kit.app.pending_leave_requests("alice").unwrap().is_empty());
+        kit.runtime
+            .send_message("alice", &group, b"before restart".to_vec())
+            .await
+            .unwrap();
+        kit.promote_admin(
+            "alice".into(),
+            group_hex.clone(),
+            bob_account.account_id_hex.clone(),
+        )
+        .await
+        .unwrap();
+        kit.demote_admin(
+            "alice".into(),
+            group_hex.clone(),
+            bob_account.account_id_hex.clone(),
+        )
+        .await
+        .unwrap();
+        if disband_before_restart {
+            kit.disband_group("alice".into(), group_hex.clone())
+                .await
+                .unwrap();
+        }
+        kit.runtime.shutdown_and_close().await.unwrap();
+        drop(kit);
+        let app = open_app(sibling_root.path());
+        let kit = Marmot {
+            runtime: app.runtime(),
+            app,
+        };
+        assert!(
+            !kit.group_management_state("alice".into(), group_hex.clone())
+                .await
+                .unwrap()
+                .leave_request_pending
+        );
+        assert!(kit.app.pending_leave_requests("alice").unwrap().is_empty());
+        if !disband_before_restart {
+            kit.runtime
+                .send_message("alice", &group, b"after restart".to_vec())
+                .await
+                .unwrap();
+            kit.promote_admin(
+                "alice".into(),
+                group_hex.clone(),
+                bob_account.account_id_hex,
+            )
+            .await
+            .unwrap();
+            kit.disband_group("alice".into(), group_hex).await.unwrap();
+        }
+        kit.runtime.shutdown_and_close().await.unwrap();
+    }
+
     #[test]
     fn group_conversation_snapshot_round_trips_shape_and_errors() {
         let test_thread = std::thread::Builder::new()
@@ -1709,10 +1888,10 @@ mod tests {
             Err(MarmotKitError::MemberNotInGroup { .. })
         ));
         state.leave_request_pending = true;
-        assert!(matches!(
-            ensure_can_request_leave(&state, "group"),
-            Err(MarmotKitError::LeaveAlreadyRequested { .. })
-        ));
+        state.requires_self_demote_before_leave = true;
+        // Neither stale membership nor forbidden authority may intercept the
+        // engine's cancellation of a pending retry.
+        assert!(ensure_can_request_leave(&state, "group").is_ok());
     }
 
     #[test]

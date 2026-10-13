@@ -30,6 +30,8 @@ pub struct GroupAuthorityFacts {
     pub is_admin: bool,
     /// Canonical policy count, or zero when terminal; not gated by self membership.
     pub admin_count: usize,
+    /// Another leaf of this account exists in canonical membership; false when terminal.
+    pub self_has_sibling_leaf: bool,
     pub removed: bool,
     pub unrecoverable: bool,
     pub disbanded: bool,
@@ -126,6 +128,7 @@ impl<S: StorageProvider> Engine<S> {
                     .any(|m| &m.id == self.identity.self_id()),
             is_admin: false,
             admin_count: 0,
+            self_has_sibling_leaf: false,
             removed: group.removed,
             unrecoverable: group.unrecoverable,
             disbanded: group.disbanded.is_some(),
@@ -146,6 +149,11 @@ impl<S: StorageProvider> Engine<S> {
             admins.sort();
             admins.dedup();
             facts.admin_count = admins.len();
+            facts.self_has_sibling_leaf = crate::app_components::account_has_other_leaf(
+                mls_group,
+                mls_group.own_leaf_index(),
+                &crate::app_components::admin_pubkey_from_member_id(self.identity.self_id())?,
+            );
             facts.is_admin = facts.is_member
                 && admins
                     .iter()

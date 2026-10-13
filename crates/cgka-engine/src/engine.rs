@@ -2391,7 +2391,8 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Whether outbound group work is gated while this account's leave awaits
     /// the Commit that removes it. The request stays durable until the removal
-    /// lands or a reorg restores the membership.
+    /// lands, a reorg restores membership, or an explicit Leave retry is
+    /// refused by the last-admin-leaf rule and cancels the intent.
     pub fn leave_in_progress(&self, group_id: &GroupId) -> Result<bool, EngineError> {
         Ok(self.leaving_groups.contains(group_id)
             || self.leave_requests.contains_key(group_id)

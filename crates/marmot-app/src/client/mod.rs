@@ -3398,9 +3398,21 @@ impl AppClient {
         // Once the MLS leave commits we can no longer author an in-group token
         // removal. Drain that durable intent first; if the leave later fails,
         // queue the current registration update as compensation.
-        let removed_registration = self
-            .drain_push_registration_removal_before_departure(group_id)
-            .await?;
+        // A pending leave already drained notification cleanup. Its retry must
+        // reach the engine first: the current roster may now forbid departure,
+        // in which case the engine cancels the durable intent. Application
+        // messages (including token removal) are gated while that intent exists.
+        let removed_registration = if self
+            .runtime
+            .session()
+            .leave_in_progress(group_id)
+            .map_err(cgka_session::SessionError::from)?
+        {
+            None
+        } else {
+            self.drain_push_registration_removal_before_departure(group_id)
+                .await?
+        };
         let effects = match async {
             self.sync_runtime_groups().await?;
             let effects = self
@@ -3420,6 +3432,15 @@ impl AppClient {
         {
             Ok(effects) => effects,
             Err(err) => {
+                if matches!(
+                    err.as_engine_error(),
+                    Some(cgka_traits::EngineError::AdminCannotSelfRemove { .. })
+                ) && self.reconcile_canonical_self_membership(group_id)?
+                {
+                    // Cancellation restores an active copy's projection too;
+                    // the successful proposal had classified it as Left.
+                    self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+                }
                 self.compensate_group_push_registration_removal(
                     group_id,
                     removed_registration.as_ref(),
