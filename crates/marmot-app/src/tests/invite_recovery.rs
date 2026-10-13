@@ -1153,7 +1153,7 @@ async fn invite_recovery_direct_lookup_keeps_checked_candidate_across_clock_boun
     assert_recovery_keeps_checked_candidate_across_clock_boundary(false).await;
 }
 
-fn package_expiring_at(
+pub(super) fn package_expiring_at(
     app: &MarmotApp,
     account: &AccountSummary,
     expires: u64,

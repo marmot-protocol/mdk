@@ -2,6 +2,52 @@ use super::*;
 use crate::key_package_records::preferred_member_key_package_from_records;
 
 #[tokio::test]
+async fn expired_current_slot_does_not_become_obsolete_only() {
+    let (_dir, app, accounts, _) = member_resolution_fixture(1, false).await;
+    let account = &accounts[0];
+    let now = unix_now_seconds();
+    let expired = super::invite_recovery::package_expiring_at(&app, account, now - 60);
+    let mut current = member_resolution_key_package_event(
+        account,
+        fresh_key_package_for_account(&app, account, false).await,
+    );
+    // Build transport tags from a live package, since that helper validates
+    // metadata. Lifetime rejection precedes reference/tag validation for the
+    // substituted expired bytes; assert that exact reason below.
+    current.content = BASE64_STANDARD.encode(expired.bytes());
+    current.tags.iter_mut().find(|tag| tag[0] == "d").unwrap()[1] = "expired-current".into();
+    let mut legacy = member_resolution_key_package_event(
+        account,
+        fresh_key_package_for_account(&app, account, true).await,
+    );
+    legacy.tags.iter_mut().find(|tag| tag[0] == "d").unwrap()[1] = "valid-legacy".into();
+    for legacy_is_newer in [false, true] {
+        current.created_at = now - if legacy_is_newer { 2 } else { 1 };
+        legacy.created_at = now - if legacy_is_newer { 1 } else { 2 };
+        let records = [current.clone(), legacy.clone()]
+            .into_iter()
+            .map(|event| RelayEventRecord {
+                event,
+                endpoints: vec![],
+            })
+            .collect::<Vec<_>>();
+        let error = preferred_member_key_package_from_records(
+            &account.account_id_hex,
+            &records,
+            app.directory_freshness(),
+            None,
+        )
+        .err()
+        .expect("expired Current must retain its rejection beside valid Legacy");
+        assert!(
+            matches!(error, AppError::InvalidKeyPackageEvent(ref detail)
+            if detail.contains("invalid KeyPackage lifetime")),
+            "unexpected diagnosis: {error:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn legacy_primary_diagnosis_preserves_current_discovery_recovery() {
     let (_dir, app, accounts, fetcher) = super::invite_recovery::discovery_fixture(1).await;
     let account = &accounts[0];

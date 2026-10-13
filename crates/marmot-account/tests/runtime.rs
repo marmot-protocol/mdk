@@ -3490,13 +3490,18 @@ async fn adapter_publish_failure_records_per_relay_causes() {
     monotonic.set_millis(60_000);
     wall.set(120_060);
     runtime.run_due_maintenance().await.unwrap();
-    let jittered = runtime
-        .session()
-        .maintenance_obligation(&obligation_id)
-        .unwrap()
-        .unwrap();
-    wall.set(jittered.not_before.unwrap().0);
-    runtime.run_due_maintenance().await.unwrap();
+    // This assertion covers the first publication. A frozen self-update can
+    // already publish at the second tick; advancing again would exercise its
+    // legitimate retry and increment every target's attempt count.
+    if adapter.publishes().is_empty() {
+        let jittered = runtime
+            .session()
+            .maintenance_obligation(&obligation_id)
+            .unwrap()
+            .unwrap();
+        wall.set(jittered.not_before.unwrap().0);
+        runtime.run_due_maintenance().await.unwrap();
+    }
     assert_eq!(adapter.publishes().len(), 1);
 
     let fanout = runtime.session().transport_fanouts().unwrap().remove(0);
