@@ -557,7 +557,9 @@ Metadata notes:
 
 ### `publish_outcome`
 
-Emitted after the transport adapter returns endpoint-level results.
+Emitted after the transport adapter returns endpoint-level results. A legacy publish whose adapter error carries
+per-endpoint failures also emits this row, with empty `accepted_relay_urls`, before its `adapter`-stage
+`publish_failure`.
 
 | Field | Meaning |
 | --- | --- |
@@ -578,7 +580,10 @@ Emitted when publish cannot complete or does not satisfy the required acknowledg
 | `stage` | `routing`, `adapter`, or `required_acks`. |
 | `target_kind` | `unknown`, `group`, or `inbox`. |
 | `relay_urls` | Routed endpoint strings when known. |
-| `reason` | Human-readable failure reason. |
+| `reason` | Failure category. `adapter`-stage rows use `TransportAdapterError::privacy_safe_kind`, never its `Display`. |
+
+Nostr per-relay `reason` phrases separate `connect relay timed out` (the 5 s connect budget elapsed) from
+`connect relay failed` (an immediate dial error such as refused, DNS, TLS, or proxy).
 
 ### `epoch_confirmed`
 

@@ -219,6 +219,17 @@ fn safe_failure_category(input: &str) -> String {
         | "insufficient_publish_acknowledgements"
         | "publish_acknowledgement_unknown"
         | "publish_attempt_failed_before_exposure"
+        // `TransportAdapterError::privacy_safe_kind` categories
+        // (`transport_closed` and `insufficient_publish_acknowledgements`
+        // are listed elsewhere).
+        | "transport_account_not_active"
+        | "transport_invalid_inbound_encoding"
+        | "transport_invalid_inbound_signature"
+        | "transport_publish_target_mismatch"
+        | "transport_subscription_failed"
+        | "transport_publish_failed"
+        | "transport_backend"
+        | "transport_other"
         // Closed categories emitted by the typed app, recovery, storage,
         // and engine outcome producers. Keep them explicit: generic adapter
         // and Display text must still fall through to `unclassified`.
@@ -430,6 +441,7 @@ fn safe_failure_category(input: &str) -> String {
         // suffix is never preserved; only typed protocol-prefix outcomes and
         // these locally authored phrases have an audit category.
         "connect relay failed" => "connect_relay_failed".to_owned(),
+        "connect relay timed out" => "connect_relay_timed_out".to_owned(),
         "send event failed" => "send_event_failed".to_owned(),
         "relay did not acknowledge event" => "relay_did_not_acknowledge_event".to_owned(),
         "send event timed out" => "send_event_timed_out".to_owned(),
@@ -907,6 +919,7 @@ mod tests {
     fn fixed_adapter_phrases_keep_categories_without_remote_suffixes() {
         for (source, expected) in [
             ("connect relay failed", "connect_relay_failed"),
+            ("connect relay timed out", "connect_relay_timed_out"),
             ("send event failed", "send_event_failed"),
             (
                 "relay did not acknowledge event",
@@ -938,6 +951,23 @@ mod tests {
             });
             protect(&mut event).unwrap();
             assert_eq!(event["failed_relays"][0]["reason"], expected);
+        }
+        // `TransportAdapterError::privacy_safe_kind` categories (mdk#2264).
+        for category in [
+            "transport_account_not_active",
+            "transport_closed",
+            "transport_invalid_inbound_encoding",
+            "transport_invalid_inbound_signature",
+            "transport_publish_target_mismatch",
+            "transport_subscription_failed",
+            "transport_publish_failed",
+            "insufficient_publish_acknowledgements",
+            "transport_backend",
+            "transport_other",
+        ] {
+            let mut event = json!({"type": "publish_failure", "reason": category});
+            protect(&mut event).unwrap();
+            assert_eq!(event["reason"], category);
         }
         let mut arbitrary =
             json!({"type": "publish_failure", "reason": "relay rejected event (Secret42)"});

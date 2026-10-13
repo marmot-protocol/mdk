@@ -390,6 +390,7 @@ struct RecordingAdapterInner {
     accept_policy: Mutex<Option<Vec<TransportEndpoint>>>,
     error_endpoints: Mutex<Vec<TransportEndpoint>>,
     error_kind: Mutex<Option<TransportEndpointFailureKind>>,
+    error_reason: Mutex<Option<String>>,
     publish_errors: Mutex<VecDeque<bool>>,
     reported_message_ids: Mutex<VecDeque<MessageId>>,
     welcome_gate: Mutex<Option<Arc<WelcomePublishGate>>>,
@@ -452,6 +453,18 @@ impl RecordingAdapter {
     ) {
         *self.inner.error_endpoints.lock().unwrap() = endpoints;
         *self.inner.error_kind.lock().unwrap() = Some(kind);
+        *self.inner.error_reason.lock().unwrap() = None;
+    }
+
+    /// Like [`Self::fail_endpoints_as`], with a fixed adapter reason phrase.
+    fn fail_endpoints_with_reason(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        kind: TransportEndpointFailureKind,
+        reason: &str,
+    ) {
+        self.fail_endpoints_as(endpoints, kind);
+        *self.inner.error_reason.lock().unwrap() = Some(reason.to_owned());
     }
 
     fn report_message_id_next(&self, message_id: MessageId) {
@@ -546,6 +559,13 @@ impl TransportAdapter for RecordingAdapter {
                     .all(|endpoint| error_endpoints.contains(endpoint))
             {
                 if let Some(kind) = *self.inner.error_kind.lock().unwrap() {
+                    let reason = self
+                        .inner
+                        .error_reason
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_else(|| "injected typed endpoint failure".into());
                     let failures = request
                         .target
                         .endpoints()
@@ -553,7 +573,7 @@ impl TransportAdapter for RecordingAdapter {
                         .cloned()
                         .map(|endpoint| TransportEndpointFailure {
                             endpoint,
-                            reason: "injected typed endpoint failure".into(),
+                            reason: reason.clone(),
                             kind,
                             rejection_category: None,
                         })
@@ -3144,6 +3164,137 @@ async fn manual_self_update_confirms_on_first_ack_and_finishes_exact_event_fanou
             .targets
             .iter()
             .all(|target| { target.state == cgka_traits::TransportFanoutAttemptState::Accepted })
+    );
+}
+
+/// mdk#2264: a legacy publish that fails on every relay must keep each relay's
+/// cause in the audit log and on the durable fanout, instead of one
+/// `unclassified` adapter row with no relay detail.
+#[tokio::test]
+async fn adapter_publish_failure_records_per_relay_causes() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot adapter failure cause key").unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let audit_path = dir.path().join("audit.jsonl");
+    let mut initial = current_session(database.clone(), &key, b"alice");
+    let created = initial
+        .create_group(CreateGroupRequest {
+            name: "adapter failure causes".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id;
+    drop(initial);
+
+    let mut session = current_session(database, &key, b"alice");
+    session.set_audit_recorder(Box::new(
+        marmot_forensics::JsonlRecorder::open_v5_with_account_ref(
+            &audit_path,
+            "11".repeat(16),
+            Some("22".repeat(16)),
+            marmot_forensics::v5::Producer {
+                mdk_revision: None,
+                build_profile: marmot_forensics::v5::BuildProfile::Debug,
+                platform: marmot_forensics::v5::Platform::Other,
+                host_build: None,
+            },
+        )
+        .unwrap(),
+    ));
+    let timed_out = TransportEndpoint("wss://group-timed-out.example".into());
+    let refused = TransportEndpoint("wss://group-refused.example".into());
+    let adapter = RecordingAdapter::default();
+    adapter.fail_endpoints_with_reason(
+        vec![timed_out.clone(), refused.clone()],
+        TransportEndpointFailureKind::RetryableUnavailable,
+        "connect relay failed",
+    );
+    let routing =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())])
+            .with_group_route(
+                group_id.clone(),
+                group_id.as_slice().to_vec(),
+                vec![timed_out.clone(), refused.clone()],
+            );
+    let wall = Arc::new(TestWallClock::new(120_000));
+    let monotonic = Arc::new(TestMonotonicClock::default());
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        adapter.clone(),
+        routing,
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        monotonic.clone(),
+        Arc::new(TestRandom::new(0)),
+    );
+
+    let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    monotonic.set_millis(60_000);
+    wall.set(120_060);
+    runtime.run_due_maintenance().await.unwrap();
+    let jittered = runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+    wall.set(jittered.not_before.unwrap().0);
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(adapter.publishes().len(), 1);
+
+    let fanout = runtime.session().transport_fanouts().unwrap().remove(0);
+    assert_eq!(fanout.targets.len(), 2);
+    for target in &fanout.targets {
+        assert_eq!(
+            target.state,
+            cgka_traits::TransportFanoutAttemptState::AttemptedFailed
+        );
+        assert_eq!(target.attempt_count, 1);
+        assert_eq!(
+            target.failure_code.as_deref(),
+            Some("transport_rejected"),
+            "each relay's reported failure must reach its fanout target"
+        );
+    }
+    drop(runtime);
+
+    let audit = std::fs::read_to_string(&audit_path).unwrap();
+    assert!(!audit.contains("wss://"));
+    let rows = audit
+        .lines()
+        .map(|line| {
+            marmot_forensics::v5::Record::from_json(line.as_bytes()).expect("strict v5 row");
+            serde_json::from_str::<serde_json::Value>(line).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let failure = rows
+        .iter()
+        .find(|row| row["event"]["type"] == "publish_failure")
+        .expect("adapter publish failure row");
+    assert_eq!(failure["event"]["stage"], "adapter");
+    assert_eq!(
+        failure["event"]["reason"], "insufficient_publish_acknowledgements",
+        "the adapter failure reason must survive the v5 allowlist"
+    );
+    let outcome = rows
+        .iter()
+        .find(|row| row["event"]["type"] == "publish_outcome")
+        .expect("per-relay publish outcome row");
+    assert_eq!(outcome["event"]["met_required_acks"], false);
+    let failed_relays = outcome["event"]["failed_relays"].as_array().unwrap();
+    assert_eq!(failed_relays.len(), 2);
+    assert!(
+        failed_relays
+            .iter()
+            .all(|relay| relay["reason"] == "connect_relay_failed"),
+        "{failed_relays:?}"
     );
 }
 

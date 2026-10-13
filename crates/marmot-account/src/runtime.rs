@@ -4815,24 +4815,70 @@ where
             Ok(report) => report,
             Err(error) => {
                 fanout.possible_exposure = true;
-                for target in &mut fanout.targets {
-                    if retry_endpoints.contains(&target.endpoint)
-                        && target.state != TransportFanoutAttemptState::Accepted
-                    {
-                        target.attempt_count = target.attempt_count.saturating_add(1);
-                        target.last_attempt_at = Some(self.wall_clock.now());
-                        target.state = TransportFanoutAttemptState::AttemptedFailed;
-                        target.failure_code = Some("adapter_error".into());
+                // Keep each endpoint's typed cause when the adapter reported
+                // one (mdk#2264); only whole-call errors stay coarse.
+                let endpoint_report = (!error.publish_endpoint_failures().is_empty()).then(|| {
+                    TransportPublishReport {
+                        message_id: error
+                            .publish_message_id()
+                            .cloned()
+                            .unwrap_or_else(|| message_id.clone()),
+                        accepted: Vec::new(),
+                        failed: error.publish_endpoint_failures().to_vec(),
+                        required_acks,
+                    }
+                });
+                if let Some(report) = &endpoint_report {
+                    apply_report_to_fanout(
+                        &mut fanout,
+                        &retry_endpoints,
+                        report,
+                        self.wall_clock.now(),
+                    );
+                } else {
+                    for target in &mut fanout.targets {
+                        if retry_endpoints.contains(&target.endpoint)
+                            && target.state != TransportFanoutAttemptState::Accepted
+                        {
+                            target.attempt_count = target.attempt_count.saturating_add(1);
+                            target.last_attempt_at = Some(self.wall_clock.now());
+                            target.state = TransportFanoutAttemptState::AttemptedFailed;
+                            target.failure_code = Some("adapter_error".into());
+                        }
                     }
                 }
                 self.session.put_transport_fanout(&fanout)?;
                 self.record_v5_welcome_publish_finished(
                     &v5_welcome,
-                    None,
+                    endpoint_report.as_ref(),
                     &retry_endpoints,
                     accepted_before,
                     required_acks,
                 );
+                if let Some(report) = &endpoint_report {
+                    self.session.record_audit_event(
+                        target_group_id.as_ref(),
+                        Some(publish_context.clone()),
+                        AuditEventKind::PublishOutcome {
+                            msg_id: msg_id_hex.clone(),
+                            artifact_kind,
+                            target_kind: target_kind.clone(),
+                            relay_url: None,
+                            accepted_relay_urls: Vec::new(),
+                            failed_relays: report
+                                .failed
+                                .iter()
+                                .map(|failure| PublishRelayFailure {
+                                    relay_url: failure.endpoint.0.clone(),
+                                    reason: failure.reason.clone(),
+                                })
+                                .collect(),
+                            required_acks: required_acks as u64,
+                            met_required_acks: accepted_before >= required_acks.max(1),
+                            transport: Some(wire.clone()),
+                        },
+                    );
+                }
                 self.session.record_audit_event(
                     target_group_id.as_ref(),
                     Some(publish_context),
@@ -4844,7 +4890,9 @@ where
                         relay_url: None,
                         relay_urls,
                         required_acks: Some(required_acks as u64),
-                        reason: error.to_string(),
+                        // `Display` always reads "publish failed: ..." and
+                        // never passes the audit category allowlist.
+                        reason: error.privacy_safe_kind().into(),
                         detail: None,
                         transport: Some(wire),
                     },
