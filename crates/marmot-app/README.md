@@ -236,8 +236,8 @@ membership, provider response, profile hydration, and network completion, withou
 ## Groups and invitations
 
 **Creating and inviting.** Group creation and invites take pubkeys at the action boundary. The app canonicalizes and
-deduplicates the requested roster and fetches current KeyPackages in bounded multi-author relay batches before building
-the MLS add.
+deduplicates the requested roster and fetches current KeyPackages in bounded batches of author-scoped relay filters
+before building the MLS add. Normal invites exclude existing leaf signing keys before selection and the device cap.
 
 - Cached packages are useful for discovery, but cannot authorize an invitation or substitute for a failed relay lookup.
   This also applies to another account on the same installation: its local package record is not an invitation
@@ -251,19 +251,31 @@ the MLS add.
 - Directory diagnostics (such as `wn keys check` / `keys fetch`) may still describe cached public packages. Their availability
   result is advisory and does not guarantee a fresh relay lookup or acceptance by the create/invite admission policy.
 
-When advertised outboxes have no usable invitation package, lookup makes one supplementary pass over up to eight
-safe configured discovery endpoints that were not already searched. Explicit bootstrap endpoints supply this set for
-direct directory lookups. Successful advertised lookups skip the supplementary pass. Recovery keeps observed
-replacement barriers and requires complete package coverage and completed deletion queries for each usable candidate
-across the searched routes. Separate exact-event and timestamp-scoped coordinate filters ask for one signed deletion;
-unrelated deleted posts cannot fill their limits. Any verified matching deletion rejects the candidate, even when
-another route is incomplete. Accepting a candidate requires complete empty queries on every required route; unknown
-coverage and the twelve-candidate budget remain retryable. Signed deletions cannot revive an older slot version.
-For direct diagnostics, the existing future-record cache fallback also requires this proof for its cached public
-metadata. Incomplete recovery refuses that fallback; a revoked or superseded cache entry is never returned.
-Cached entries without a usable public event identifier are ineligible for this fallback.
-Member resolution and direct lookup each have a 50-second overall deadline. Relay visibility still cannot prove that
-the recipient retains the private package, or that every relay disclosed all replacements and deletions.
+Create, invite and direct chats select every valid, compatible current slot republished within
+30 days, ordered newest first (equal timestamps favour the lexically higher event id), deduplicated by
+KeyPackageRef and capped at ten packages per account. Newer slot publications suppress older ones even if
+invalid or revoked. MLS lifetime checks still apply. If no eligible package is fresh, a compatibility fallback
+selects only the single newest valid compatible package; internal account-level resolution statistics count this
+fallback. The cap applies only to outbound selection, never to received group leaves. Prewarm counts accounts,
+not packages.
+
+Member discovery requests at most 32 events per author, keeps the existing author/concurrency bounds and
+50-second deadline, and supplements advertised outboxes with up to eight safe configured discovery endpoints
+that were not already searched. Successful White Noise results still allow discovery of other device slots.
+Normal create, invite and prewarm use deletion evidence from responding relays: separate exact-event
+and timestamp-scoped coordinate filters ask for verified same-author kind-5 deletions. Unrelated post deletions
+cannot fill their limits. A matching deletion rejects its candidate even when another route is incomplete;
+unavailable routes do not veto observed packages. Retired and unsafe routes are skipped before fetching.
+Superseded-invite recovery requires complete transport and deletion coverage, but may select from a deliberately
+bounded 32-publication prefix. It matches missing leaves before the ten-package cap, prioritizing exact signing
+keys, and retains unmatched obligations plus consumed refs and assigned signing keys across partial retries.
+Signed deletions never revive an older slot version; the 32-candidate proof budget remains bounded.
+
+Direct directory diagnostics retain their single-package client preference and existing cache fallback for
+future-record results; supplementary recovery checks its cached public event metadata. Incomplete recovery
+refuses that fallback, and revoked or superseded cache entries are never returned. Member resolution never
+uses cached package bytes. Directory lookup also has a 50-second overall deadline. Relay visibility cannot
+prove that a recipient retains private material or that every relay disclosed every replacement and deletion.
 
 **Routing.** New Nostr-routed groups generate `marmot.transport.nostr.routing.v1` at creation, store the component bytes
 in signed MLS app data, and project the decoded `nostr_group_id` plus relay list into group subscriptions and publish

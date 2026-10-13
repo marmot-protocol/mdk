@@ -45,3 +45,22 @@ checks the migration ledger, schema parity with a fresh database, preserved
 rows and cursor, empty recovery and notice state, the one-time retained-route
 stamp, and that the v0.10.4 migration set refuses the upgraded file. Never
 regenerate this file with a later writer; add a new version-named fixture.
+
+## `account-c27300be.sql`
+
+Frozen account store written by master commit
+`c27300bef4f47cf3bb03d214d2fdd5290b6f44f9` (migration 107).
+The [writer](write-c27300be-fixture.rs.txt) was compiled as a `storage-sqlite`
+example from a `git archive` of that exact commit. It uses the historical
+production storage APIs, then dumps schema and rows as SQL for review.
+
+It contains two synthetic groups, two distinct members per group, four
+account-only capability rows (proposal 10 and extension 42), two full v2
+snapshots and two v2 group-state checkpoints. It contains no production data.
+
+- SHA-256: `57c02c510f5d86bfcea5be92a5081cf1badd62ccb0f9d5b6d617c97c256e1288`
+- Test: `migrations/upgrade_c27300be_tests.rs`, which opens the populated store
+  through the encrypted production path, checks migration 0108, preserves
+  retained blobs, restores both historical formats and adds a sibling device.
+
+Never regenerate this fixture with a later writer.

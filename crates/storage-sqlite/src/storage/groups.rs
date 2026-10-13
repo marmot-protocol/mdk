@@ -59,21 +59,38 @@ impl GroupStorage for SqliteAccountStorage {
     }
 
     fn put_group(&self, group: &Group) -> StorageResult<()> {
-        self.lock()?
-            .execute_cached(
-                "INSERT INTO cgka_groups (id, epoch, record)
+        self.connection.with_transaction(|| {
+            let connection = self.lock()?;
+            let previous: Option<Vec<u8>> = connection
+                .query_row(
+                    "SELECT record FROM cgka_groups WHERE id = ?1",
+                    params![group.id.as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .storage()?;
+            if let Some(previous) = previous {
+                let previous: Group = deserialize(&previous)?;
+                if previous.members != group.members {
+                    super::capabilities::promote_legacy_capabilities(&connection, &previous)?;
+                }
+            }
+            connection
+                .execute_cached(
+                    "INSERT INTO cgka_groups (id, epoch, record)
                  VALUES (?1, ?2, ?3)
                  ON CONFLICT(id) DO UPDATE SET
                     epoch = excluded.epoch,
                     record = excluded.record",
-                params![
-                    group.id.as_slice(),
-                    epoch_to_i64(group.epoch)?,
-                    serialize(group)?
-                ],
-            )
-            .storage()?;
-        Ok(())
+                    params![
+                        group.id.as_slice(),
+                        epoch_to_i64(group.epoch)?,
+                        serialize(group)?
+                    ],
+                )
+                .storage()?;
+            Ok(())
+        })
     }
 
     fn get_group(&self, id: &GroupId) -> StorageResult<Group> {

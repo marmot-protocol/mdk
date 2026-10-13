@@ -1809,7 +1809,10 @@ pub(crate) fn projected_members_with_pending(
     let mut out = marmot_members(group);
     for kp in invitees {
         let id = crate::identity::validated_member_id_of_leaf(kp.leaf_node())?;
-        if !out.iter().any(|m| m.id == id) {
+        if !out
+            .iter()
+            .any(|m| m.id == id && m.credential == kp.leaf_node().signature_key().as_slice())
+        {
             out.push(Member {
                 id,
                 credential: kp.leaf_node().signature_key().as_slice().to_vec(),

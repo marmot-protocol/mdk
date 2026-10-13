@@ -427,8 +427,9 @@ The `SingleDevice` step always pauses before initial KeyPackage publication.
 Display a general notice that White Noise does not yet support synchronized
 multi-device use and recommends one device. The snapshot's `single_device_notice`
 adds evidence with `OtherInstallationPossible`, `NoneFound`, or `Unknown` discovery.
-When another installation is possible, explain that invitations may reach only
-one installation and conversations will not automatically appear on both.
+When another installation is possible, explain that invitations from up-to-date
+inviters reach every recently active installation (fresh within 30 days, up to
+10). Existing conversations and history still do not sync between installations.
 Reinstallation or cleared local state can produce the same evidence; do not
 claim to have identified a physical device or a particular app.
 

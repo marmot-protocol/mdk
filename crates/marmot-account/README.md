@@ -18,7 +18,8 @@ owns the local account home, account records, signing-key storage, and the coord
 - Activates the transport account for one local `AccountDeviceSession`.
 - Publishes fresh KeyPackages through an injected boundary, and drives KeyPackage generator upgrades.
 - Turns `SessionEffects.publish` work into `TransportPublishRequest`s, then confirms or rolls back pending session state
-  from the adapter's publish reports.
+  from the adapter's publish reports. Welcome preparation and publication failures are recorded per device;
+  a failed recipient does not prevent the remaining Welcomes from being prepared and sent.
 - Keeps transport routing policy generic, so the first implementation can be Nostr without baking Nostr into the
   session or engine crates.
 

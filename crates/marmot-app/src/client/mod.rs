@@ -2735,15 +2735,26 @@ impl AppClient {
             .session()
             .invite_key_package_requirements(group_id)
             .map_err(cgka_session::SessionError::from)?;
+        let exclusions = crate::key_package_records::MemberKeyPackageExclusions {
+            signing_keys: self
+                .runtime
+                .group_record(group_id)?
+                .members
+                .iter()
+                .map(|member| hex::encode(&member.credential))
+                .collect(),
+            ..Default::default()
+        };
         let key_packages = self
             .app
-            .resolve_compatible_member_key_packages(
+            .resolve_member_key_packages_with_exclusions(
                 member_refs
                     .iter()
                     .map(|member| (*member).to_owned())
                     .collect(),
-                &requirements,
                 crate::directory::MemberResolutionPurpose::Commit,
+                Some(&requirements),
+                &exclusions,
             )
             .await
             .map(|resolved| resolved.key_packages);

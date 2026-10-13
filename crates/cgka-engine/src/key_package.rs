@@ -48,6 +48,8 @@ mod validation_crypto {
 pub struct KeyPackageMetadata {
     pub key_package_ref_hex: String,
     pub credential_identity_hex: String,
+    /// Device leaf signing key, distinct from the account credential identity.
+    pub signature_key_hex: String,
     pub protocol_profile: ProtocolProfile,
     pub not_before: u64,
     pub not_after: u64,
@@ -153,6 +155,7 @@ pub fn key_package_metadata(kp: &KeyPackage) -> Result<KeyPackageMetadata, Engin
     Ok(KeyPackageMetadata {
         key_package_ref_hex: hex::encode(key_package_ref.as_slice()),
         credential_identity_hex: hex::encode(member_id.as_slice()),
+        signature_key_hex: hex::encode(key_package.leaf_node().signature_key().as_slice()),
         protocol_profile,
         not_before: key_package.life_time().not_before(),
         not_after: key_package.life_time().not_after(),

@@ -261,10 +261,9 @@ pub(crate) fn relay_list_queries(account_id_hex: String) -> Vec<DirectoryEventQu
         .collect()
 }
 
-/// Temporary interoperability policy. Retire this ranking when device-aware
-/// delivery in https://github.com/marmot-protocol/mdk/issues/1696 replaces
-/// single-package selection. Keep separate from cryptographic admission so
-/// multi-device selection can replace this preference without changing validity.
+/// Interoperability ranking for single-package directory diagnostics only.
+/// Invitation selection collects every eligible device slot instead of using
+/// this preference. Keep separate from cryptographic admission.
 /// Labels are self-asserted and do not authenticate an application; they only
 /// rank candidates after admission checks and never relax cryptographic gates.
 pub(crate) fn key_package_client_priority(event: &NostrTransportEvent) -> u8 {
@@ -288,8 +287,8 @@ pub(crate) fn key_package_client_priority(event: &NostrTransportEvent) -> u8 {
     }
 }
 
-/// Directory reads deliberately share the client ranking and slot-supersession
-/// policy used by invitation discovery, but have no target-group requirements.
+/// Single-package directory diagnostics retain client ranking and have no
+/// target-group requirements. Invitation discovery only shares slot supersession.
 /// A malformed current slot never revives an older publication; if no usable
 /// slot remains, the lookup returns the validation error.
 pub(crate) fn latest_fresh_key_package_from_records(
@@ -305,9 +304,198 @@ pub(crate) fn latest_fresh_key_package_from_records(
     })
 }
 
+/// The Marmot multi-device direction invites packages republished within 30 days.
+pub(crate) const MEMBER_KEY_PACKAGE_FRESHNESS_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(30 * 24 * 60 * 60);
+/// The multi-device direction caps outbound selection at ten devices per account.
+/// This is never a limit on received MLS leaves.
+pub(crate) const MAX_KEY_PACKAGES_PER_MEMBER: usize = 10;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static MEMBER_CANDIDATE_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Immutable slot winners are validated once during deletion-proof recovery.
+/// Eligibility, deduplication and the outbound cap are cheap subsequent passes.
+pub(crate) struct ValidatedMemberKeyPackages {
+    candidates: Vec<(FetchedKeyPackage, String)>,
+    newest_error: Option<AppError>,
+    rejected_future: bool,
+}
+
+/// Recovery narrows discovery to outstanding leaves before the outbound cap.
+#[derive(Default)]
+pub(crate) struct MemberKeyPackageExclusions {
+    pub(crate) refs: BTreeSet<String>,
+    pub(crate) signing_keys: BTreeSet<String>,
+    pub(crate) obligations: Option<std::collections::BTreeMap<String, Vec<String>>>,
+}
+
+impl ValidatedMemberKeyPackages {
+    pub(crate) fn select(
+        &mut self,
+        allows: impl Fn(&FetchedKeyPackage) -> bool,
+        exclusions: &MemberKeyPackageExclusions,
+    ) -> Result<DirectorySelection<Vec<FetchedKeyPackage>>, AppError> {
+        self.select_at(crate::unix_now_seconds(), allows, exclusions)
+    }
+
+    pub(crate) fn select_at(
+        &mut self,
+        now: u64,
+        allows: impl Fn(&FetchedKeyPackage) -> bool,
+        exclusions: &MemberKeyPackageExclusions,
+    ) -> Result<DirectorySelection<Vec<FetchedKeyPackage>>, AppError> {
+        let mut refs = BTreeSet::new();
+        let mut keys = BTreeSet::new();
+        let mut eligible = self
+            .candidates
+            .iter()
+            .filter(|(fetched, key)| {
+                allows(fetched)
+                    && !exclusions.refs.contains(&fetched.key_package_ref_hex)
+                    && !exclusions.signing_keys.contains(key)
+            })
+            .filter(|(fetched, key)| {
+                if refs.contains(&fetched.key_package_ref_hex) || keys.contains(key) {
+                    return false;
+                }
+                refs.insert(fetched.key_package_ref_hex.clone());
+                keys.insert(key.clone());
+                true
+            })
+            .collect::<Vec<_>>();
+        if let Some(obligations) = &exclusions.obligations {
+            let mut remaining = obligations.clone();
+            let mut selected = BTreeSet::new();
+            // Stable signing keys win regardless of publication order. Only
+            // then may rotated keys consume unmatched account obligations.
+            for exact in [true, false] {
+                for (fetched, key) in &eligible {
+                    if selected.contains(&fetched.key_package_ref_hex) {
+                        continue;
+                    }
+                    let Some(keys) = remaining.get_mut(&fetched.account_id_hex) else {
+                        continue;
+                    };
+                    let index = if exact {
+                        keys.iter().position(|old| old == key)
+                    } else {
+                        (!keys.is_empty()).then_some(0)
+                    };
+                    if let Some(index) = index {
+                        keys.remove(index);
+                        selected.insert(fetched.key_package_ref_hex.clone());
+                    }
+                }
+            }
+            eligible.retain(|(fetched, _)| selected.contains(&fetched.key_package_ref_hex));
+        }
+        let mut eligible = eligible
+            .into_iter()
+            .map(|(fetched, _)| fetched.clone())
+            .collect::<Vec<_>>();
+        let newest = eligible.first().cloned();
+        eligible.retain(|fetched| {
+            now.saturating_sub(fetched.created_at) <= MEMBER_KEY_PACKAGE_FRESHNESS_WINDOW.as_secs()
+        });
+        if eligible.is_empty()
+            && let Some(newest) = newest
+        {
+            eligible.push(newest);
+        }
+        eligible.truncate(MAX_KEY_PACKAGES_PER_MEMBER);
+        if eligible.is_empty()
+            && let Some(error) = self.newest_error.take()
+        {
+            return Err(error);
+        }
+        Ok(DirectorySelection {
+            value: eligible,
+            rejected_future: self.rejected_future,
+        })
+    }
+}
+
+/// Collect current eligible slots for a chat, including a direct chat: every
+/// device needs its own Add and Welcome regardless of the chat's presentation.
+pub(crate) fn eligible_member_key_packages_from_records(
+    account: &str,
+    records: &[RelayEventRecord],
+    freshness: DirectoryFreshness,
+    requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+    exclusions: &MemberKeyPackageExclusions,
+) -> Result<DirectorySelection<Vec<FetchedKeyPackage>>, AppError> {
+    validate_member_key_package_candidates(account, records, freshness, requirements)
+        .select(|_| true, exclusions)
+}
+
+pub(crate) fn validate_member_key_package_candidates(
+    account: &str,
+    records: &[RelayEventRecord],
+    freshness: DirectoryFreshness,
+    requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+) -> ValidatedMemberKeyPackages {
+    let now = crate::unix_now_seconds();
+    let mut records = records.iter().collect::<Vec<_>>();
+    records
+        .sort_by(|a, b| (b.event.created_at, &b.event.id).cmp(&(a.event.created_at, &a.event.id)));
+    let mut slots = BTreeSet::new();
+    let mut candidates = Vec::new();
+    let mut newest_error = None;
+    let mut rejected_future = false;
+    for record in records {
+        if record.event.kind != KIND_MARMOT_KEY_PACKAGE || record.event.pubkey != account {
+            continue;
+        }
+        if !freshness.accepts(record) {
+            rejected_future = true;
+            continue;
+        }
+        // Invalid or revoked replacements are barriers too; never revive an
+        // older package whose device may already have retired its private key.
+        if let Some(slot) = record.event.tag_value("d").filter(|slot| !slot.is_empty())
+            && !slots.insert(slot.to_owned())
+        {
+            continue;
+        }
+        #[cfg(test)]
+        MEMBER_CANDIDATE_VALIDATIONS.with(|count| count.set(count.get() + 1));
+        let result = (|| {
+            let fetched = key_package_from_borrowed_record(record)?;
+            if fetched.key_package.protocol_profile != ProtocolProfile::Current {
+                return Ok(None);
+            }
+            let metadata = key_package_metadata(&fetched.key_package)
+                .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))?;
+            if now < metadata.not_before || now > metadata.not_after {
+                return Ok(None);
+            }
+            if let Some(requirements) = requirements {
+                requirements
+                    .validate(&fetched.key_package)
+                    .map_err(|error| AppError::from(cgka_session::SessionError::from(error)))?;
+            }
+            Ok(Some((fetched, metadata.signature_key_hex)))
+        })();
+        match result {
+            Ok(Some(candidate)) => candidates.push(candidate),
+            Ok(_) => {}
+            Err(error) => {
+                newest_error.get_or_insert(error);
+            }
+        }
+    }
+    ValidatedMemberKeyPackages {
+        candidates,
+        newest_error,
+        rejected_future,
+    }
+}
+
 pub(crate) struct PreferredKeyPackage {
     pub(crate) fetched: FetchedKeyPackage,
-    pub(crate) priority: u8,
 }
 
 pub(crate) fn preferred_fresh_key_package_from_records(
@@ -362,7 +550,7 @@ pub(crate) fn preferred_fresh_key_package_from_records(
             continue;
         }
         if selected.is_none() || priority > selected_priority {
-            selected = Some(PreferredKeyPackage { fetched, priority });
+            selected = Some(PreferredKeyPackage { fetched });
             selected_priority = priority;
             // Newest-first order already breaks ties; nothing can outrank this.
             if selected_priority == 2 {

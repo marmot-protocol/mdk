@@ -73,6 +73,27 @@ fn signed_deletion(
     NostrTransportEvent::from_nostr_event(&event).unwrap()
 }
 
+async fn strict_superseded_member_lookup(
+    app: &MarmotApp,
+    account: &AccountSummary,
+) -> Result<(), AppError> {
+    let exclusions = crate::key_package_records::MemberKeyPackageExclusions {
+        obligations: Some(std::collections::BTreeMap::from([(
+            account.account_id_hex.clone(),
+            vec!["missing-leaf".into()],
+        )])),
+        ..Default::default()
+    };
+    app.resolve_member_key_packages_with_exclusions(
+        vec![account.account_id_hex.clone()],
+        crate::directory::MemberResolutionPurpose::CommitFresh,
+        None,
+        &exclusions,
+    )
+    .await
+    .map(|_| ())
+}
+
 #[tokio::test]
 async fn invite_recovery_supports_prewarm_and_multi_member_lookup() {
     let (_directory, app, accounts, fetcher) = discovery_fixture(2).await;
@@ -105,7 +126,7 @@ async fn invite_recovery_supports_prewarm_and_multi_member_lookup() {
 }
 
 #[tokio::test]
-async fn invite_recovery_keeps_advertised_success_free_of_supplementary_reads() {
+async fn invite_recovery_membership_proves_deletions_while_diagnostics_keep_advertised_fast_path() {
     let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
     let published = package(&fetcher, &accounts[0]);
     fetcher
@@ -121,11 +142,11 @@ async fn invite_recovery_keeps_advertised_success_free_of_supplementary_reads() 
     {
         let requests = fetcher.requests.lock().unwrap();
         assert!(
-            !requests
+            requests
                 .iter()
                 .any(|r| r.queries.iter().any(|q| q.kind == 5))
         );
-        assert!(!requests.iter().any(
+        assert!(requests.iter().any(
             |r| r.endpoints.contains(&TransportEndpoint(DISCOVERY.into()))
                 && r.queries.iter().any(|q| q.kind == KIND_MARMOT_KEY_PACKAGE)
         ));
@@ -266,9 +287,11 @@ async fn invite_recovery_unknown_coverage_is_retryable_and_can_recover_after_rou
     let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
     *fetcher.incomplete_endpoint.lock().unwrap() = Some(OUTBOX.into());
     *fetcher.incomplete_query_kind.lock().unwrap() = Some(5);
+    app.resolve_member_key_packages(&[&accounts[0].account_id_hex])
+        .await
+        .unwrap();
     assert!(matches!(
-        app.resolve_member_key_packages(&[&accounts[0].account_id_hex])
-            .await,
+        strict_superseded_member_lookup(&app, &accounts[0]).await,
         Err(AppError::RelayDirectory(_))
     ));
     *fetcher.incomplete_endpoint.lock().unwrap() = None;
@@ -731,9 +754,11 @@ async fn invite_recovery_incomplete_supplement_cannot_authorize_a_usable_copy() 
     let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
     *fetcher.incomplete_endpoint.lock().unwrap() = Some(DISCOVERY.into());
     *fetcher.incomplete_query_kind.lock().unwrap() = Some(KIND_MARMOT_KEY_PACKAGE);
+    app.resolve_member_key_packages(&[&accounts[0].account_id_hex])
+        .await
+        .unwrap();
     assert!(matches!(
-        app.resolve_member_key_packages(&[&accounts[0].account_id_hex])
-            .await,
+        strict_superseded_member_lookup(&app, &accounts[0]).await,
         Err(AppError::RelayDirectory(_))
     ));
 }
@@ -871,7 +896,9 @@ async fn invite_recovery_candidate_budget_does_not_accept_an_unchecked_survivor(
     let published = package(&fetcher, account);
     let mut copies = Vec::new();
     let mut deletions = Vec::new();
-    for index in 0..14 {
+    // Exceed the 32-proof budget, keeping each discovery route below its
+    // 32-event query limit so coverage is complete until the final survivor.
+    for index in 0..33 {
         let mut event = published.clone();
         event.id = format!("{:064x}", 1000 + index);
         event.created_at -= index;
@@ -880,7 +907,7 @@ async fn invite_recovery_candidate_budget_does_not_accept_an_unchecked_survivor(
             .iter_mut()
             .find(|t| t.first().is_some_and(|name| name == "d"))
             .unwrap()[1] = format!("slot-{index}");
-        if index < 13 {
+        if index < 32 {
             deletions.push(signed_deletion(
                 &app,
                 account,
@@ -900,10 +927,10 @@ async fn invite_recovery_candidate_budget_does_not_accept_an_unchecked_survivor(
         routes
             .get_mut(DISCOVERY)
             .unwrap()
-            .extend(copies[..7].iter().cloned());
+            .extend(copies[..17].iter().cloned());
         routes.insert(
             "wss://second-discovery.example".into(),
-            copies[7..].to_vec(),
+            copies[17..].to_vec(),
         );
         routes.get_mut(OUTBOX).unwrap().extend(deletions);
     }
@@ -1350,18 +1377,19 @@ async fn assert_recovery_does_not_switch_after_mls_expiry(membership: bool) {
         "expiry must fail closed rather than return an unchecked, revoked slot"
     );
     let requests = fetcher.requests.lock().unwrap();
-    assert!(
-        !requests
-            .iter()
-            .flat_map(|request| &request.queries)
-            .any(|query| {
-                query.kind == 5
-                    && query
-                        .reference
-                        .as_ref()
-                        .is_some_and(|(name, value)| *name == 'e' && value == &alternative.id)
-            })
-    );
+    let checked_alternative = requests
+        .iter()
+        .flat_map(|request| &request.queries)
+        .any(|query| {
+            query.kind == 5
+                && query
+                    .reference
+                    .as_ref()
+                    .is_some_and(|(name, value)| *name == 'e' && value == &alternative.id)
+        });
+    // Membership checks every eligible device, including the alternative;
+    // diagnostics retain the original single-slot admission boundary.
+    assert_eq!(checked_alternative, membership);
 }
 
 #[tokio::test]
@@ -1372,4 +1400,171 @@ async fn invite_recovery_direct_lookup_does_not_switch_after_mls_expiry() {
 #[tokio::test]
 async fn invite_recovery_membership_does_not_switch_after_mls_expiry() {
     assert_recovery_does_not_switch_after_mls_expiry(true).await;
+}
+
+#[tokio::test]
+async fn invite_all_fresh_devices_checks_deletion_and_compatibility_for_every_slot() {
+    for deletion_tag in ["e", "a"] {
+        let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
+        let peer = &accounts[0];
+        app.account_home().create_account("alice").unwrap();
+        let mut alice = client_on_app_relay_plane(&app, "alice").await;
+        let group = alice.create_group("requirements", &[]).await.unwrap();
+        let requirements = alice
+            .runtime
+            .session()
+            .invite_key_package_requirements(&group)
+            .unwrap();
+        let now = unix_now_seconds();
+        let mut events = Vec::new();
+        for slot in 0..3 {
+            events.push(super::invite_all_fresh_devices::device_event(
+                peer,
+                fresh_key_package_for_account(&app, peer, false).await,
+                slot,
+                now - slot as u64,
+            ));
+        }
+        // The newest slot is revoked; two other compatible devices remain.
+        let value = if deletion_tag == "e" {
+            events[0].id.clone()
+        } else {
+            format!("30443:{}:device-0", peer.account_id_hex)
+        };
+        let deletion = signed_deletion(&app, peer, deletion_tag, value, now);
+        let incompatible = fresh_key_package_with_components(
+            &app,
+            peer,
+            false,
+            app.supported_app_component_ids()
+                .into_iter()
+                .filter(|id| *id != GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID)
+                .collect(),
+        )
+        .await;
+        events.push(super::invite_all_fresh_devices::device_event(
+            peer,
+            incompatible,
+            3,
+            now,
+        ));
+        // A normal outbox positive must still discover another device on the supplement.
+        {
+            let mut routes = fetcher.events_by_endpoint.lock().unwrap();
+            for route in routes.values_mut() {
+                route.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+            }
+            routes.get_mut(OUTBOX).unwrap().extend([
+                events[0].clone(),
+                events[1].clone(),
+                events[3].clone(),
+                deletion,
+            ]);
+            routes.get_mut(DISCOVERY).unwrap().push(events[2].clone());
+        }
+        let resolved = app
+            .resolve_compatible_member_key_packages(
+                vec![peer.account_id_hex.clone()],
+                &requirements,
+                crate::directory::MemberResolutionPurpose::Commit,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved.key_packages.len(), 2);
+        assert_eq!(
+            resolved
+                .key_packages
+                .iter()
+                .map(|kp| hex::encode(kp.source.as_ref().unwrap().event_id.as_slice()))
+                .collect::<Vec<_>>(),
+            vec![events[1].id.clone(), events[2].id.clone()]
+        );
+    }
+}
+
+#[tokio::test]
+async fn invite_all_fresh_devices_normal_create_tolerates_unreachable_and_retired_routes() {
+    let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
+    let peer = &accounts[0];
+    let dead = "wss://unreachable.example";
+    let retired = format!("wss://{}", crate::retired_relay_hosts()[0]);
+    let now = unix_now_seconds();
+    let mut publications = Vec::new();
+    for slot in 0..3 {
+        publications.push(super::invite_all_fresh_devices::device_event(
+            peer,
+            fresh_key_package_for_account(&app, peer, false).await,
+            slot,
+            now,
+        ));
+    }
+    let deletion = signed_deletion(&app, peer, "e", publications[0].id.clone(), now);
+    {
+        let mut routes = fetcher.events_by_endpoint.lock().unwrap();
+        for events in routes.values_mut() {
+            events.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+            for event in events.iter_mut().filter(|event| {
+                event.pubkey == peer.account_id_hex
+                    && (event.kind == KIND_NIP65_RELAY_LIST
+                        || event.kind == KIND_MARMOT_INBOX_RELAY_LIST)
+            }) {
+                let tag = if event.kind == KIND_NIP65_RELAY_LIST {
+                    "r"
+                } else {
+                    "relay"
+                };
+                event.tags = [DISCOVERY, dead, &retired]
+                    .into_iter()
+                    .map(|url| vec![tag.into(), url.into()])
+                    .collect();
+            }
+        }
+        routes
+            .get_mut(DISCOVERY)
+            .unwrap()
+            .extend(publications.clone());
+        routes.get_mut(DISCOVERY).unwrap().push(deletion);
+    }
+    *fetcher.incomplete_endpoint.lock().unwrap() = Some(dead.into());
+    app.account_home().create_account("alice").unwrap();
+    let mut alice = client_on_app_relay_plane(&app, "alice").await;
+    app.prewarm_group_member_key_packages(&[&peer.account_id_hex])
+        .await
+        .unwrap();
+    let packages = app
+        .resolve_member_key_packages(&[&peer.account_id_hex])
+        .await
+        .unwrap();
+    assert_eq!(packages.len(), 2);
+    assert!(packages.iter().all(
+        |p| hex::encode(p.source.as_ref().unwrap().event_id.as_slice()) != publications[0].id
+    ));
+    let group = alice
+        .create_group("healthy devices", &[&peer.account_id_hex])
+        .await
+        .unwrap();
+    assert_eq!(
+        alice
+            .runtime
+            .session()
+            .group_record(&group)
+            .unwrap()
+            .members
+            .len(),
+        3
+    );
+    assert!(
+        fetcher
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|r| r.endpoints.iter().all(|e| e.0 != retired))
+    );
+    fetcher.fail_all_fetches();
+    assert!(matches!(
+        app.resolve_member_key_packages(&[&peer.account_id_hex])
+            .await,
+        Err(AppError::RelayDirectory(_))
+    ));
 }

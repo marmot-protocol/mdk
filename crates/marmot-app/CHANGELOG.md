@@ -4,6 +4,15 @@
 
 - `MarmotAppRuntime::submit_prepared_media_snapshot` admits the captured ordinary-media payload with a stable token and consumes only its unchanged captured draft in the same transaction. Newer or cleared drafts cannot replace the payload or block admission.
 
+### Changed
+
+- Normal invites exclude existing leaf signing keys before device selection and the cap. KeyPackage batches use author-scoped filters capped at 32 events each.
+
+- Device selection deduplicates signing keys as well as package refs. Recovery excludes consumed and already queued refs before the device cap; deletion-proof rounds reuse validated candidates while final acceptance rechecks lifetimes.
+
+- Create, invite, prewarm and superseded-invite recovery resolve all fresh compatible device slots per account (30-day publication window, at most ten outbound packages), with a counted single-newest fallback when every eligible package is stale. Discovery checks each selected package for deletion. Direct-chat classification for multi-device members is handled separately in `fix/count-people-not-leaves`.
+
+
 ## 0.13.0 - 2026-10-12
 
 ### Breaking changes

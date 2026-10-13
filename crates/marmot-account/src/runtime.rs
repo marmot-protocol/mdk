@@ -3624,16 +3624,22 @@ where
             let recipient = welcome_recipient(&welcome);
             let welcome_id = welcome.id.clone();
             let mut effects = AccountDeviceEffects::default();
-            match self.prepare_legacy_publish(
-                welcome,
-                &mut effects,
-                context.clone(),
-                force_retry,
-            )? {
-                PreparedLegacyPublish::Complete(status) => {
+            match self.prepare_legacy_publish(welcome, &mut effects, context.clone(), force_retry) {
+                Ok(PreparedLegacyPublish::Complete(status)) => {
                     completions[index] = Some(LegacyPublishCompletion::Complete(status));
                 }
-                PreparedLegacyPublish::Network(attempt) => pending.push_back((index, attempt)),
+                Ok(PreparedLegacyPublish::Network(attempt)) => pending.push_back((index, attempt)),
+                Err(error) => {
+                    // Preparation records durable intent before external effects.
+                    // Retain any existing journal for retry; this recipient's
+                    // failure must not suppress other devices' Welcomes.
+                    effects.failures.push(PublishFailure {
+                        message_id: welcome_id.clone(),
+                        reason: error.to_string(),
+                    });
+                    completions[index] =
+                        Some(LegacyPublishCompletion::Complete(PublishStatus::default()));
+                }
             }
             metadata.push(WelcomePublishMetadata {
                 recipient,

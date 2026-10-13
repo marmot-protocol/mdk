@@ -206,6 +206,9 @@ impl TransportPeeler for MockPeeler {
     ) -> Result<TransportMessage, PeelerError> {
         let mut id_material = payload.ciphertext.clone();
         id_material.extend_from_slice(recipient.as_slice());
+        // Distinct device deliveries have distinct outer wrapper ids.
+        static NEXT_WRAP: AtomicU64 = AtomicU64::new(0);
+        id_material.extend_from_slice(&NEXT_WRAP.fetch_add(1, Ordering::Relaxed).to_be_bytes());
         Ok(TransportMessage {
             id: hash_id(&id_material),
             payload: payload.ciphertext.clone(),
@@ -6061,4 +6064,97 @@ async fn periodic_fault_keeps_effects() {
             vec![complete]
         );
     }
+}
+
+#[tokio::test]
+async fn invite_all_fresh_devices_preparation_failure_does_not_skip_sibling_welcome() {
+    use cgka_traits::maintenance::DurableTransportFanout;
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("device preparation failure").unwrap();
+    let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let mut sibling = current_session(dir.path().join("sibling.sqlite"), &key, b"bob");
+    let members = vec![
+        bob.fresh_key_package().await.unwrap(),
+        sibling.fresh_key_package().await.unwrap(),
+    ];
+    let peer = bob.self_id();
+    let adapter = RecordingAdapter::default();
+    let policy = StaticTransportRouting::new(vec![TransportEndpoint("wss://alice.example".into())])
+        .with_inbox_route(
+            peer.clone(),
+            vec![TransportEndpoint("wss://bob.example".into())],
+        );
+    let mut runtime = AccountDeviceRuntime::new(
+        current_session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        adapter.clone(),
+        policy,
+        RecordingKeyPackages::default(),
+    );
+    let prepared = runtime
+        .session_mut()
+        .create_group(CreateGroupRequest {
+            name: "siblings".into(),
+            description: String::new(),
+            members,
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let [PublishWork::FoundingGroupCreated { welcomes }] = &prepared.effects.publish[..] else {
+        panic!("founding Welcomes");
+    };
+    assert_eq!(welcomes.len(), 2);
+    let first = welcomes[0].clone();
+    let second_id = welcomes[1].id.clone();
+    let mut mismatched = first.clone();
+    mismatched.payload.push(0xff);
+    // A conflicting exact-artifact journal causes a real fallible preparation
+    // step to fail before transport; the sibling's unrelated journal stays usable.
+    runtime
+        .session()
+        .put_transport_fanout(&DurableTransportFanout {
+            id: first.id.clone(),
+            group_id: Some(prepared.group_id.clone()),
+            evolution_id: None,
+            exact_message: mismatched,
+            target: TransportPublishTarget::Inbox {
+                recipient: peer.clone(),
+                endpoints: vec![TransportEndpoint("wss://bob.example".into())],
+            },
+            targets: vec![],
+            required_acks: 1,
+            evolution_confirmed: true,
+            possible_exposure: false,
+            created_at: Timestamp(0),
+            bounded_until: None,
+        })
+        .unwrap();
+    let effects = runtime
+        .publish_session_effects(prepared.effects)
+        .await
+        .unwrap();
+    assert_eq!(effects.welcome_failures.len(), 1);
+    assert_eq!(effects.welcome_failures[0].message_id, first.id);
+    assert_eq!(effects.welcome_failures[0].recipient, peer);
+    assert_eq!(
+        effects.welcome_failures[0].group_id.as_ref(),
+        Some(&prepared.group_id)
+    );
+    assert!(
+        effects.welcome_failures[0]
+            .reason
+            .contains("persisted exact transport event")
+    );
+    assert_eq!(adapter.publishes().len(), 1);
+    assert_eq!(adapter.publishes()[0].message.id, second_id);
+    assert!(
+        runtime
+            .session()
+            .transport_fanout(&first.id)
+            .unwrap()
+            .is_some(),
+        "retain the existing journal"
+    );
 }

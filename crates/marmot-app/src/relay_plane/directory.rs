@@ -46,6 +46,9 @@ pub(crate) struct DirectoryEventQuery {
     pub(crate) limit: usize,
     pub(crate) reference: Option<(char, String)>,
     pub(crate) since: Option<u64>,
+    /// Package discovery may select from an intentionally bounded prefix.
+    /// This never relaxes transport completion or deletion absence proofs.
+    pub(crate) bounded_package_prefix: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +143,8 @@ pub(crate) struct DirectorySubscriptionSyncSummary {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DirectoryFetchOutcome {
     pub(crate) records: Vec<DirectoryRelayEventRecord>,
+    /// EOSE with every frame admitted for each requested filter. Saturated
+    /// filters fail coverage unless explicitly requesting a package prefix.
     pub(crate) complete: bool,
 }
 
@@ -203,7 +208,19 @@ impl DirectoryEventQuery {
             limit,
             reference: None,
             since: None,
+            bounded_package_prefix: false,
         }
+    }
+
+    pub(crate) fn bounded_key_package_prefix(mut self) -> Self {
+        self.bounded_package_prefix = true;
+        self
+    }
+
+    pub(crate) fn accepts_limit(&self) -> bool {
+        self.bounded_package_prefix
+            && self.kind == transport_nostr_adapter::KIND_MARMOT_KEY_PACKAGE
+            && self.reference.is_none()
     }
 
     pub(crate) fn deletion_reference(
@@ -1043,14 +1060,14 @@ async fn strict_fetch_endpoint(
                         RelayMessage::EndOfStoredEvents(received_id)
                             if received_id.as_ref() == &subscription_id =>
                         {
-                            // A filter that reaches its limit cannot establish absence.
+                            // Only deliberate package prefixes accept saturation;
+                            // existence/absence filters keep strict limit coverage.
                             // A frame discarded before notifications cannot
                             // establish negative coverage, even after EOSE.
                             break wire.event_count() == admitted_messages
-                                && queries
-                                    .iter()
-                                    .zip(&query_counts)
-                                    .all(|(query, count)| *count < query.limit);
+                                && queries.iter().zip(&query_counts).all(|(query, count)| {
+                                    query.accepts_limit() || *count < query.limit
+                                });
                         }
                         RelayMessage::Closed {
                             subscription_id: received_id,
@@ -1351,6 +1368,50 @@ mod tests {
         assert!(
             !result.complete,
             "one saturated filter must not be hidden by the combined limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_directory_bounded_package_prefix_accepts_limit_after_eose() {
+        use nostr_sdk::local_relay::MockRelay;
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Tag};
+
+        let relay = MockRelay::run().await.unwrap();
+        let url = relay.url().await;
+        let keys = Keys::generate();
+        let client = NostrSdkClient::default();
+        client.add_relay(url.clone()).await.unwrap();
+        client.connect_relay(url.clone()).await.unwrap();
+        for slot in 0..32 {
+            let event = EventBuilder::new(Kind::Custom(30443), "package")
+                .tags([Tag::identifier(format!("device-{slot}"))])
+                .finalize(&keys)
+                .unwrap();
+            client.send_event(&event).await.unwrap();
+        }
+        let query = DirectoryEventQuery::new(30443, vec![keys.public_key().to_hex()], 32);
+        let fetcher = NostrSdkDirectoryRelayFetcher::standalone();
+        for bounded in [false, true] {
+            let query = if bounded {
+                query.clone().bounded_key_package_prefix()
+            } else {
+                query.clone()
+            };
+            let request =
+                DirectoryFetchRequest::new(vec![TransportEndpoint(url.to_string())], vec![query])
+                    .unwrap();
+            let outcome = fetcher
+                .fetch_directory_events_with_completion(request)
+                .await
+                .unwrap();
+            assert_eq!(outcome.records.len(), 32);
+            assert_eq!(outcome.complete, bounded);
+        }
+        client.shutdown().await;
+        assert!(
+            !DirectoryEventQuery::deletion_reference("account", 'e', "event".into(), None)
+                .bounded_key_package_prefix()
+                .accepts_limit()
         );
     }
 

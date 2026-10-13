@@ -24,5 +24,5 @@ Map for SQLite group snapshots.
   secret-derived, memory-only validation values: never log or persist them. Keep `mls_write_generation` semantics
   unchanged for loaded MLS objects. Fingerprint regression tests live in the parent `snapshots.rs` test module.
 - Snapshot release is idempotent only where the caller explicitly handles `SnapshotMissing`.
-- New rollback snapshots and group-state checkpoints use the `MDKS` v2 envelope; untagged legacy JSON remains
+- New rollback snapshots and group-state checkpoints use the `MDKS` v3 envelope; untagged legacy JSON and v2 remain
   readable, while tagged unknown versions fail closed.

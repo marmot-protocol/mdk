@@ -1,0 +1,73 @@
+use cgka_traits::capabilities::{Capability, GroupCapabilities};
+use cgka_traits::group::{Group, Member, ProtocolProfile};
+use cgka_traits::types::{EpochId, GroupId, MemberId};
+use cgka_traits::storage::{CapabilityStorage, GroupStorage, MessageStorage, GroupStateCheckpointRef};
+use storage_sqlite::{SqliteAccountStorage, SqlCipherKey, SqlCipherHardening, open_hardened_sqlcipher};
+fn member_id(n: u8) -> MemberId { MemberId::new(vec![n; 4]) }
+fn sample_group(id: GroupId, epoch: u64, members: usize) -> Group {
+    Group {
+        id,
+        name: "sample".into(),
+        description: "desc".into(),
+        epoch: EpochId(epoch),
+        members: (0..members as u8)
+            .map(|i| Member {
+                id: member_id(i),
+                credential: vec![i; 8],
+            })
+            .collect(),
+        required_capabilities: GroupCapabilities::default(),
+        protocol_profile: ProtocolProfile::Legacy,
+        removed: false,
+        unrecoverable: false,
+        disbanded: None,
+        join_epoch: EpochId(0),
+        local_copy_install_epoch: EpochId(0),
+        local_copy_welcome_created_at: None,
+    }
+}
+
+
+fn main() {
+    let path = "/tmp/mdk-round4-master-fixture.db";
+    let key = SqlCipherKey::new("round4 synthetic fixture key").unwrap();
+    let store = SqliteAccountStorage::open_encrypted(path, &key).unwrap();
+    for n in [1, 2] {
+        let group = sample_group(GroupId::new(vec![n; 4]), 7, 2);
+        store.put_group(&group).unwrap();
+        for member in &group.members {
+            let mut caps = GroupCapabilities::default();
+            caps.insert(Capability::Proposal(10));
+            caps.insert(Capability::Extension(42));
+            store.save_member_capabilities(&group.id, member, caps).unwrap();
+        }
+        store.create_group_snapshot(&group.id, "master-snapshot").unwrap();
+        store.create_group_state_checkpoint(&group.id, &GroupStateCheckpointRef {
+            id: "master-checkpoint".into(), resulting_epoch: EpochId(7),
+        }).unwrap();
+    }
+    drop(store);
+    let conn = rusqlite::Connection::open(path).unwrap();
+    open_hardened_sqlcipher(&conn, &key, SqlCipherHardening::cipher_only()).unwrap();
+    println!("-- Synthetic fixture written by c27300be. Do not regenerate with HEAD.\nBEGIN TRANSACTION;");
+    let mut stmt = conn.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap();
+    let tables: Vec<(String,String)> = stmt.query_map([], |r| Ok((r.get(0)?,r.get(1)?))).unwrap().map(Result::unwrap).collect();
+    for (name, sql) in tables {
+        println!("{sql};");
+        let mut rows = conn.prepare(&format!("SELECT * FROM \"{name}\"")).unwrap();
+        let width = rows.column_count();
+        let records = rows.query_map([], |r| {
+            (0..width).map(|i| Ok(match r.get_ref(i)? {
+                rusqlite::types::ValueRef::Null => "NULL".into(),
+                rusqlite::types::ValueRef::Integer(v) => v.to_string(),
+                rusqlite::types::ValueRef::Real(v) => v.to_string(),
+                rusqlite::types::ValueRef::Text(v) => format!("'{}'", String::from_utf8_lossy(v).replace('\'', "''")),
+                rusqlite::types::ValueRef::Blob(v) => format!("X'{}'", hex::encode(v)),
+            })).collect::<rusqlite::Result<Vec<String>>>()
+        }).unwrap();
+        for record in records { println!("INSERT INTO \"{name}\" VALUES({});", record.unwrap().join(",")); }
+    }
+    let mut stmt = conn.prepare("SELECT sql FROM sqlite_master WHERE type IN ('index', 'trigger', 'view') AND sql IS NOT NULL ORDER BY name").unwrap();
+    for sql in stmt.query_map([], |r| r.get::<_,String>(0)).unwrap() { println!("{};", sql.unwrap()); }
+    println!("COMMIT;");
+}

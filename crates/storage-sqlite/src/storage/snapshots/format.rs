@@ -10,7 +10,7 @@ use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use serde::de::DeserializeOwned;
 
 const SNAPSHOT_MAGIC: &[u8; 4] = b"MDKS";
-const SNAPSHOT_VERSION: u16 = 2;
+const SNAPSHOT_VERSION: u16 = 3;
 const MAX_FIELD_LEN: usize = 1 << 30;
 const MAX_LIST_ITEMS: usize = 1 << 20;
 
@@ -58,7 +58,7 @@ pub(super) fn decode(bytes: &[u8]) -> StorageResult<Snapshot> {
     let mut decoder = Decoder::new(bytes);
     decoder.expect(SNAPSHOT_MAGIC, "snapshot magic")?;
     let version = decoder.u16("snapshot version")?;
-    if version != SNAPSHOT_VERSION {
+    if version != 2 && version != SNAPSHOT_VERSION {
         return Err(serialization(format!(
             "unsupported group snapshot version {version}"
         )));
@@ -533,7 +533,7 @@ mod tests {
     use crate::storage::test_support::{gid, sample_group};
 
     #[test]
-    fn state_scoped_v2_has_stable_golden_bytes() {
+    fn state_scoped_v3_has_stable_golden_bytes() {
         let snapshot = Snapshot {
             group: sample_group(gid(1), 0, 0),
             messages: None,
@@ -546,7 +546,32 @@ mod tests {
         let encoded = encode(&snapshot).unwrap();
         assert_eq!(
             hex::encode(encoded.as_slice()),
-            "4d444b530002410f7b226964223a5b312c312c312c315d2c226e616d65223a2273616d706c65222c226465736372697074696f6e223a2264657363222c2265706f6368223a302c226d656d62657273223a5b5d2c2272657175697265645f6361706162696c6974696573223a7b2270726f706f73616c73223a5b5d2c22657874656e73696f6e73223a5b5d2c226170705f636f6d706f6e656e7473223a7b22696473223a5b5d7d7d2c2270726f746f636f6c5f70726f66696c65223a226c6567616379222c2272656d6f766564223a66616c73652c22756e7265636f76657261626c65223a66616c73652c226a6f696e5f65706f6368223a302c226c6f63616c5f636f70795f696e7374616c6c5f65706f6368223a307d000000000000"
+            "4d444b530003410f7b226964223a5b312c312c312c315d2c226e616d65223a2273616d706c65222c226465736372697074696f6e223a2264657363222c2265706f6368223a302c226d656d62657273223a5b5d2c2272657175697265645f6361706162696c6974696573223a7b2270726f706f73616c73223a5b5d2c22657874656e73696f6e73223a5b5d2c226170705f636f6d706f6e656e7473223a7b22696473223a5b5d7d7d2c2270726f746f636f6c5f70726f66696c65223a226c6567616379222c2272656d6f766564223a66616c73652c22756e7265636f76657261626c65223a66616c73652c226a6f696e5f65706f6368223a302c226c6f63616c5f636f70795f696e7374616c6c5f65706f6368223a307d000000000000"
         );
+    }
+    #[test]
+    fn capability_snapshot_v3_reads_historical_v1_v2_and_versions_new_writes() {
+        let checkpoint = GroupStateCheckpoint {
+            group: sample_group(gid(1), 0, 1),
+            member_caps: vec![MemberCapabilitiesSnapshot {
+                member_id: cgka_traits::MemberId::new(vec![1; 32]),
+                capabilities: crate::storage::capabilities::StoredMemberCapabilities::Legacy(
+                    Default::default(),
+                ),
+            }],
+            validated_tree_marker: None,
+            openmls_values: vec![],
+        };
+        let json = serialize(&checkpoint).unwrap();
+        assert_eq!(decode_checkpoint(&json).unwrap().member_caps.len(), 1);
+        let encoded = encode_checkpoint(&checkpoint).unwrap();
+        assert_eq!(&encoded.as_slice()[..6], b"MDKS\x00\x03");
+        // v2 used this same framing with account-only capability JSON.
+        let mut historical = encoded.as_slice().to_vec();
+        historical[5] = 2;
+        assert_eq!(decode_checkpoint(&historical).unwrap().member_caps.len(), 1);
+        assert_eq!(decode(&historical).unwrap().member_caps.len(), 1);
+        historical[5] = 4;
+        assert!(decode_checkpoint(&historical).is_err());
     }
 }

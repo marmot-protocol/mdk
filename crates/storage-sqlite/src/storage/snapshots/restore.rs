@@ -106,7 +106,7 @@ pub(super) fn import(
 ) -> StorageResult<()> {
     store.connection.note_openmls_write();
     let snapshot: ReplaySnapshot = deserialize(snapshot_blob)?;
-    if snapshot.version != REPLAY_SNAPSHOT_VERSION {
+    if snapshot.version != 1 && snapshot.version != REPLAY_SNAPSHOT_VERSION {
         return Err(StorageError::Serialization(format!(
             "unsupported conformance replay snapshot version {}",
             snapshot.version

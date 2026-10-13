@@ -38,6 +38,10 @@ It does **not** do transport (plug in a `TransportPeeler`), persistence beyond `
 
 ## KeyPackage validation before membership changes
 
+`KeyPackageMetadata::signature_key_hex` identifies the device leaf signing key separately from
+`credential_identity_hex`, which identifies its account. Invite recovery compares leaves, accepts multiple fresh
+packages for one account, and refuses consumed KeyPackage refs. Pending rosters retain every device Add.
+
 Create and Invite validate transported KeyPackages through OpenMLS and the Marmot identity/profile checks before
 adding members. They also reject LeafNode capabilities that explicitly advertise RFC 9420 section 7.2 default
 extension or proposal types. Unknown capability values remain accepted for protocol extensibility.

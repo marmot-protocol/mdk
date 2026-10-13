@@ -6,7 +6,7 @@ use cgka_traits::engine::{
     SendIntent, SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport,
 };
 
-use cgka_traits::storage::WelcomeStorage;
+use cgka_traits::storage::{OutboundIntentStorage, WelcomeStorage};
 use cgka_traits::{GroupId, MessageId};
 use std::collections::{HashMap, HashSet};
 
@@ -79,7 +79,7 @@ impl AppClient {
                         .key_package_metadata(package)
                         .map_err(cgka_session::SessionError::from)?;
                     missing |= !group.members.iter().any(|member| {
-                        hex::encode(member.id.as_slice()) == metadata.credential_identity_hex
+                        hex::encode(&member.credential) == metadata.signature_key_hex
                     });
                 }
                 if !missing || group.is_terminal() {
@@ -261,18 +261,60 @@ impl AppClient {
                 Err(error) => return Err(error.into()),
             };
             let mut members = Vec::new();
+            let retry = record.reinvite.as_ref().expect("pending recovery");
+            let mut exclusions = crate::key_package_records::MemberKeyPackageExclusions {
+                refs: retry.consumed_key_package_refs.iter().cloned().collect(),
+                signing_keys: retry.assigned_signing_keys.iter().cloned().collect(),
+                obligations: Some(Default::default()),
+            };
+            if let Some(group) = &group {
+                exclusions.signing_keys.extend(
+                    group
+                        .members
+                        .iter()
+                        .map(|member| hex::encode(&member.credential)),
+                );
+            }
             for package in key_packages {
                 let metadata = self
                     .runtime
                     .session()
                     .key_package_metadata(package)
                     .map_err(cgka_session::SessionError::from)?;
+                exclusions.refs.insert(metadata.key_package_ref_hex.clone());
                 if !group.as_ref().is_some_and(|group| {
-                    group.members.iter().any(|member| {
-                        hex::encode(member.id.as_slice()) == metadata.credential_identity_hex
-                    })
+                    group
+                        .members
+                        .iter()
+                        .any(|member| hex::encode(&member.credential) == metadata.signature_key_hex)
                 }) {
+                    exclusions
+                        .obligations
+                        .as_mut()
+                        .expect("recovery obligations")
+                        .entry(metadata.credential_identity_hex.clone())
+                        .or_default()
+                        .push(metadata.signature_key_hex);
                     members.push(metadata.credential_identity_hex);
+                }
+            }
+            // A partial recovery already queued another device's replacement.
+            // Its relay publication is no longer available for this remainder.
+            for queued in self
+                .app
+                .account_storage(&self.state.label)?
+                .list_queued_outbound_intents(&record.group_id)?
+            {
+                if let SendIntent::Invite { key_packages, .. } = queued.intent {
+                    for package in key_packages {
+                        let metadata = self
+                            .runtime
+                            .session()
+                            .key_package_metadata(&package)
+                            .map_err(cgka_session::SessionError::from)?;
+                        exclusions.refs.insert(metadata.key_package_ref_hex);
+                        exclusions.signing_keys.insert(metadata.signature_key_hex);
+                    }
                 }
             }
             let packages =
@@ -292,10 +334,11 @@ impl AppClient {
                     };
                     match self
                         .app
-                        .resolve_compatible_member_key_packages(
+                        .resolve_member_key_packages_with_exclusions(
                             members,
-                            &requirements,
                             crate::directory::MemberResolutionPurpose::CommitFresh,
+                            Some(&requirements),
+                            &exclusions,
                         )
                         .await
                     {

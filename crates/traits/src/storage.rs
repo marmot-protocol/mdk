@@ -513,6 +513,14 @@ pub struct ReinviteRetry {
     pub next_attempt_at_ms: u64,
     pub lookup_attempts: u32,
     pub abandoned: bool,
+    /// All original and replacement refs consumed by this recovery, independent
+    /// of the remaining missing-leaf obligations in `OwnCommitIntent::intent`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consumed_key_package_refs: Vec<String>,
+    /// Original and replacement signing keys of discharged obligations. A
+    /// replacement for one leaf must never discharge a sibling's obligation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assigned_signing_keys: Vec<String>,
 }
 
 /// The intent behind a commit this device staged. A confirmed commit can still

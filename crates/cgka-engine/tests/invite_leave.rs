@@ -207,8 +207,17 @@ impl TransportPeeler for MockPeeler {
         payload: &EncryptedPayload,
         recipient: &MemberId,
     ) -> Result<TransportMessage, PeelerError> {
+        // Real transport wrappers use fresh randomness even when two devices
+        // share an account and receive the same MLS Welcome plaintext.
+        static NEXT_WRAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut id_material = payload.ciphertext.clone();
+        id_material.extend_from_slice(
+            &NEXT_WRAP
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .to_be_bytes(),
+        );
         Ok(TransportMessage {
-            id: hash_id(&payload.ciphertext),
+            id: hash_id(&id_material),
             payload: payload.ciphertext.clone(),
             timestamp: Timestamp(0),
             causal_deps: vec![],
@@ -6191,4 +6200,159 @@ async fn an_app_message_from_below_this_copys_install_epoch_is_not_a_retention_e
         ),
         "got {outcome:?}"
     );
+}
+
+#[tokio::test]
+async fn invite_all_fresh_devices_preserves_pending_leaves_and_recovery_packages() {
+    multi_device_invite_recovery(false).await;
+}
+
+#[tokio::test]
+async fn own_commit_intent_partial_device_recovery_retains_missing_sibling() {
+    multi_device_invite_recovery(true).await;
+}
+
+async fn multi_device_invite_recovery(partial: bool) {
+    use cgka_traits::engine::SupersededIntentOutcome;
+    use cgka_traits::storage::{OwnCommitBaseline, OwnCommitIntent, ReinviteRetry};
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let current_device = |label: &[u8], store: SqliteAccountStorage| {
+        EngineBuilder::new(store)
+            .identity(pad32(label))
+            .account_identity_proof_signer(proof_signer(label))
+            .feature_registry(selfremove_registry())
+            .peeler(Box::new(MockPeeler))
+            .build()
+            .unwrap()
+    };
+    let mut alice = current_device(b"alice", storage.clone());
+    let mut bob = current_device(b"bob", SqliteAccountStorage::in_memory().unwrap());
+    let mut sibling = current_device(b"bob", SqliteAccountStorage::in_memory().unwrap());
+    let first = bob.fresh_key_package().await.unwrap();
+    let second = sibling.fresh_key_package().await.unwrap();
+    let (group, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "devices".into(),
+            description: String::new(),
+            members: vec![first.clone(), second.clone()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { welcomes } = created else {
+        panic!("founding create");
+    };
+    assert_eq!(welcomes.len(), 2);
+    assert_eq!(alice.members(&group).unwrap().len(), 3);
+    let mut third = current_device(b"bob", SqliteAccountStorage::in_memory().unwrap());
+    let mut fourth = current_device(b"bob", SqliteAccountStorage::in_memory().unwrap());
+    let third_old = third.fresh_key_package().await.unwrap();
+    let fourth_old = fourth.fresh_key_package().await.unwrap();
+    let SendResult::GroupEvolution {
+        pending, welcomes, ..
+    } = alice
+        .send(SendIntent::Invite {
+            group_id: group.clone(),
+            key_packages: vec![third_old.clone(), fourth_old.clone()],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("invite");
+    };
+    assert_eq!(welcomes.len(), 2);
+    assert_eq!(
+        alice.members(&group).unwrap().len(),
+        5,
+        "pending projection retains every device Add"
+    );
+    alice.publish_failed(pending).await.unwrap();
+    assert_eq!(alice.members(&group).unwrap().len(), 3);
+    let commit_id = MessageId::new(vec![0xef; 32]);
+    storage
+        .put_own_commit_intent(&OwnCommitIntent {
+            commit_id: commit_id.clone(),
+            group_id: group.clone(),
+            source_epoch: alice.epoch(&group).unwrap(),
+            intent: SendIntent::Invite {
+                group_id: group.clone(),
+                key_packages: vec![first, third_old.clone(), fourth_old.clone()],
+                initial_admins: vec![],
+            },
+            baseline: OwnCommitBaseline::None,
+            reinvite: Some(ReinviteRetry::default()),
+            reissue_attempts: 0,
+            created_at_ms: 0,
+        })
+        .unwrap();
+    let mut fresh = vec![third.fresh_key_package().await.unwrap()];
+    if !partial {
+        fresh.push(fourth.fresh_key_package().await.unwrap());
+    }
+    let report = alice
+        .reissue_invite_with_key_packages(&commit_id, fresh)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        report.outcome,
+        SupersededIntentOutcome::Reissued,
+        "existing sibling leaves cannot satisfy missing devices"
+    );
+    let queued = storage.list_queued_outbound_intents(&group).unwrap();
+    let SendIntent::Invite { key_packages, .. } = &queued[0].intent else {
+        panic!("queued invitation");
+    };
+    assert_eq!(key_packages.len(), if partial { 1 } else { 2 });
+    if partial {
+        let remaining = storage
+            .own_commit_intent(&commit_id)
+            .unwrap()
+            .expect("missing sibling obligation survives");
+        let SendIntent::Invite { key_packages, .. } = remaining.intent else {
+            panic!("remaining invitation");
+        };
+        assert_eq!(key_packages, vec![fourth_old]);
+        // Persistence retains A's consumed ref independently of B's remaining leaf.
+        let retry = remaining.reinvite.as_ref().unwrap();
+        let original = cgka_engine::key_package::key_package_metadata(&third_old).unwrap();
+        assert!(
+            retry
+                .consumed_key_package_refs
+                .contains(&original.key_package_ref_hex)
+        );
+        assert!(
+            retry
+                .assigned_signing_keys
+                .contains(&original.signature_key_hex)
+        );
+        // Partial recovery must remember the original ref after removing A's
+        // obligation, and reject a new ref with A's already assigned leaf key.
+        for unavailable in [third_old, third.fresh_key_package().await.unwrap()] {
+            assert!(matches!(
+                alice.reissue_invite_with_key_packages(&commit_id, vec![unavailable]),
+                Err(cgka_traits::EngineError::InvalidWelcome)
+            ));
+            assert!(storage.own_commit_intent(&commit_id).unwrap().is_some());
+            assert_eq!(
+                storage.list_queued_outbound_intents(&group).unwrap().len(),
+                1
+            );
+        }
+        alice
+            .reissue_invite_with_key_packages(
+                &commit_id,
+                vec![fourth.fresh_key_package().await.unwrap()],
+            )
+            .unwrap();
+        assert!(storage.own_commit_intent(&commit_id).unwrap().is_none());
+        assert_eq!(
+            storage.list_queued_outbound_intents(&group).unwrap().len(),
+            2
+        );
+    } else {
+        assert!(storage.own_commit_intent(&commit_id).unwrap().is_none());
+    }
 }

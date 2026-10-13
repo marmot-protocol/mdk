@@ -346,42 +346,42 @@ mod tests {
         let mut message = sample_message(mid(1), group.id.clone(), 0);
         message.payload = vec![0xA5; 16_727];
         store.put_message(&message).unwrap();
-        store.create_group_snapshot(&group.id, "v2").unwrap();
+        store.create_group_snapshot(&group.id, "v3").unwrap();
 
         let mut blob: Vec<u8> = store
             .lock()
             .unwrap()
             .query_row(
                 "SELECT snapshot FROM cgka_group_snapshots
-                 WHERE group_id = ?1 AND name = 'v2'",
+                 WHERE group_id = ?1 AND name = 'v3'",
                 rusqlite::params![group.id.as_slice()],
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(blob.starts_with(b"MDKS\0\x02"));
+        assert!(blob.starts_with(b"MDKS\0\x03"));
         assert!(
             blob.len() < 20_000,
             "raw message bytes must not expand back into a JSON number array: {}",
             blob.len()
         );
 
-        blob[4..6].copy_from_slice(&3_u16.to_be_bytes());
+        blob[4..6].copy_from_slice(&4_u16.to_be_bytes());
         store
             .lock()
             .unwrap()
             .execute(
                 "UPDATE cgka_group_snapshots SET snapshot = ?1
-                 WHERE group_id = ?2 AND name = 'v2'",
+                 WHERE group_id = ?2 AND name = 'v3'",
                 rusqlite::params![blob, group.id.as_slice()],
             )
             .unwrap();
         let error = store
-            .rollback_group_to_snapshot(&group.id, "v2")
+            .rollback_group_to_snapshot(&group.id, "v3")
             .unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("unsupported group snapshot version 3")
+                .contains("unsupported group snapshot version 4")
         );
         assert_eq!(store.get_group(&group.id).unwrap(), group);
         assert_eq!(store.get_message(&message.id).unwrap(), message);
@@ -581,7 +581,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(checkpoint_blob.starts_with(b"MDKS\0\x02"));
+        assert!(checkpoint_blob.starts_with(b"MDKS\0\x03"));
         // Exact retry is idempotent.
         store
             .create_group_state_checkpoint(&g1.id, &checkpoint)
@@ -964,6 +964,22 @@ mod tests {
         let snapshot = source
             .export_conformance_replay_snapshot(&group.id)
             .unwrap();
+        let mut json: serde_json::Value = serde_json::from_slice(&snapshot).unwrap();
+        assert_eq!(json["version"], 2);
+        // Historical replay exports use the same outer shape and legacy rows.
+        json["version"] = 1.into();
+        let historical = serde_json::to_vec(&json).unwrap();
+        let historical_store = SqliteAccountStorage::in_memory().unwrap();
+        historical_store
+            .import_conformance_replay_snapshot(&group.id, &historical)
+            .unwrap();
+        assert_eq!(historical_store.get_group(&group.id).unwrap(), group);
+        json["version"] = 3.into();
+        assert!(
+            historical_store
+                .import_conformance_replay_snapshot(&group.id, &serde_json::to_vec(&json).unwrap())
+                .is_err()
+        );
         let restored = SqliteAccountStorage::in_memory().unwrap();
         restored
             .import_conformance_replay_snapshot(&group.id, &snapshot)

@@ -72,7 +72,7 @@ pub(crate) fn cache_self_capabilities<S: StorageProvider>(
         }
         let member = MarmotMember {
             id: leaf_id,
-            credential: vec![],
+            credential: leaf.signature_key().as_slice().to_vec(),
         };
         storage.save_member_capabilities(group_id, &member, caps)?;
     }
@@ -129,7 +129,7 @@ pub(crate) fn cache_from_key_packages<S: StorageProvider>(
             .map_err(|e| EngineError::Backend(format!("credential: {e:?}")))?;
         let member = MarmotMember {
             id: MemberId::new(bc.identity().to_vec()),
-            credential: vec![],
+            credential: kp.leaf_node().signature_key().as_slice().to_vec(),
         };
         storage.save_member_capabilities(group_id, &member, caps)?;
     }
@@ -161,7 +161,7 @@ pub(crate) fn cache_from_staged_commit<S: StorageProvider>(
             .map_err(|e| EngineError::Backend(format!("credential: {e:?}")))?;
         let member = MarmotMember {
             id: MemberId::new(bc.identity().to_vec()),
-            credential: vec![],
+            credential: kp.leaf_node().signature_key().as_slice().to_vec(),
         };
         storage.save_member_capabilities(group_id, &member, caps)?;
     }

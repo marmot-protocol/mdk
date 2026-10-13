@@ -9,6 +9,7 @@ use crate::connection::CachedSql;
 use crate::openmls_storage::mls_group_key;
 #[cfg(feature = "test-conformance-replay")]
 use crate::serialize;
+use crate::storage::capabilities::decode_cached_member_capabilities;
 use crate::storage::messages::ordered_messages_on_connection;
 use crate::{
     SqliteAccountStorage, SqliteResultExt, codec::SensitiveBytes, connection::retry_on_busy,
@@ -271,14 +272,17 @@ fn member_capabilities(
         .storage()?
         .collect::<Result<Vec<_>, _>>()
         .storage()?;
-    rows.into_iter()
-        .map(|(member_id, capabilities)| {
-            Ok(MemberCapabilitiesSnapshot {
-                member_id: MemberId::new(member_id),
-                capabilities: deserialize(&capabilities)?,
+    Ok(rows
+        .into_iter()
+        .filter_map(|(member_id, capabilities)| {
+            decode_cached_member_capabilities(&capabilities).map(|capabilities| {
+                MemberCapabilitiesSnapshot {
+                    member_id: MemberId::new(member_id),
+                    capabilities,
+                }
             })
         })
-        .collect()
+        .collect())
 }
 
 fn convergence_policy(

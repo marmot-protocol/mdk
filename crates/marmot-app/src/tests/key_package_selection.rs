@@ -191,7 +191,7 @@ async fn malformed_replacement_suppresses_older_package_in_the_same_slot() {
 }
 
 #[tokio::test]
-async fn client_preference_is_used_in_batch_and_single_author_fallback() {
+async fn member_selection_deduplicates_packages_in_batch_and_single_author_fallback() {
     for (reject_batch, truncate_batch) in [(false, false), (true, false), (false, true)] {
         let (_dir, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
         fetcher
@@ -219,7 +219,7 @@ async fn client_preference_is_used_in_batch_and_single_author_fallback() {
                 Some("amethyst"),
                 unix_now_seconds(),
             );
-            expected.push(white.id.clone());
+            expected.push(amethyst.id.clone());
             if truncate_batch {
                 fetcher
                     .key_packages_only_in_single_author
@@ -242,10 +242,7 @@ async fn client_preference_is_used_in_batch_and_single_author_fallback() {
             .flat_map(|request| &request.queries)
             .filter(|query| query.kind == KIND_MARMOT_KEY_PACKAGE && query.authors.len() == 1)
             .count();
-        assert_eq!(
-            single_author_lookups,
-            if reject_batch || truncate_batch { 2 } else { 0 }
-        );
+        assert_eq!(single_author_lookups, 6);
         assert_eq!(
             actual
                 .iter()
@@ -257,7 +254,7 @@ async fn client_preference_is_used_in_batch_and_single_author_fallback() {
 }
 
 #[tokio::test]
-async fn failed_preference_refetch_preserves_only_usable_current_batch_packages() {
+async fn failed_member_refetch_preserves_validation_errors_and_observed_packages() {
     for batch_case in ["valid", "absent", "malformed", "incompatible"] {
         let (_dir, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
         app.account_home().create_account("inviter").unwrap();
@@ -272,27 +269,15 @@ async fn failed_preference_refetch_preserves_only_usable_current_batch_packages(
             .iter()
             .map(|account| account.account_id_hex.as_str())
             .collect::<Vec<_>>();
-        // Ready prewarm reuses the batched existence answer, even for untagged
-        // packages; it must not trigger per-author preference queries.
+        // Prewarm checks every candidate through per-author discovery and deletion evidence.
         app.prewarm_group_member_key_packages(&refs).await.unwrap();
-        assert!(!fetcher.requests.lock().unwrap().iter().any(|request| {
+        assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
             request
                 .queries
                 .iter()
                 .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE && query.authors.len() == 1)
         }));
         let account = &accounts[0];
-        let expected = fetcher
-            .events
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|event| {
-                event.kind == KIND_MARMOT_KEY_PACKAGE && event.pubkey == account.account_id_hex
-            })
-            .unwrap()
-            .id
-            .clone();
         if batch_case == "incompatible" {
             let package = fresh_key_package_with_components(
                 &app,
@@ -343,34 +328,20 @@ async fn failed_preference_refetch_preserves_only_usable_current_batch_packages(
             })
         }));
         if batch_case == "valid" {
-            let resolved = result.unwrap();
-            assert_eq!(resolved.key_packages.len(), 2);
-            assert_eq!(
-                hex::encode(
-                    resolved.key_packages[0]
-                        .source
-                        .as_ref()
-                        .unwrap()
-                        .event_id
-                        .as_slice()
-                ),
-                expected
-            );
-        } else {
-            let error = result
-                .err()
-                .expect("unusable batch material must not become a fallback");
-            match batch_case {
-                "absent" => assert!(matches!(error, AppError::RelayDirectory(_))),
-                "malformed" => assert!(matches!(error, AppError::InvalidKeyPackageEvent(_))),
-                "incompatible" => assert!(matches!(
-                    error,
-                    AppError::Session(cgka_session::SessionError::Engine(
-                        cgka_traits::EngineError::MissingRequiredCapabilities { .. }
-                    ))
-                )),
-                _ => unreachable!(),
-            }
+            assert_eq!(result.unwrap().key_packages.len(), accounts.len());
+            continue;
+        }
+        let error = result.err().expect("unusable packages must fail selection");
+        match batch_case {
+            "absent" => assert!(matches!(error, AppError::RelayDirectory(_))),
+            "malformed" => assert!(matches!(error, AppError::InvalidKeyPackageEvent(_))),
+            "incompatible" => assert!(matches!(
+                error,
+                AppError::Session(cgka_session::SessionError::Engine(
+                    cgka_traits::EngineError::MissingRequiredCapabilities { .. }
+                ))
+            )),
+            _ => unreachable!(),
         }
     }
 }

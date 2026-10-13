@@ -658,6 +658,8 @@ impl MarmotApp {
                 discovery: &discovery_relays,
                 requirements: None,
                 cached_target,
+                all_devices: false,
+                exclusions: &crate::key_package_records::MemberKeyPackageExclusions::default(),
             })
             .await?;
         let cached_entry = cached_entry.filter(|entry| {

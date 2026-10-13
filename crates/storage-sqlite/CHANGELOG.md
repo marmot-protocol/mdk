@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Changed
+
+- Migration 0108 refuses account-only readers before leaf-aware writes. Capability blobs are versioned; snapshot/checkpoint v3 and conformance replay v2 retain historical readability. Single-leaf legacy capability rows promote before sibling additions, including after rollback.
+
+- Member capabilities retain per-leaf data and intersect current account leaves instead of overwriting sibling capabilities. Rollback snapshots/checkpoints preserve leaf data and historical account-only blobs remain readable.
+
+
 ## 0.13.0 - 2026-10-12
 
 Account storage advances from migration 101 through 107 on first open; downgrade

@@ -20,13 +20,12 @@ const ROTATED_GROUP: &str = "5cd77cb71f1a861ace44d13e4dfdae3d";
 const RETAINED_ROUTE: &str = "17f6648f67003fec1ac26f7b1e027e5185beb61b22c131605ea80ec8aaf4810e";
 const PERSISTED_CURSOR: i64 = 1_790_635_089;
 
-/// Tables whose rows migrations 0090-0098 must carry over unchanged.
+/// Tables whose rows subsequent migrations must carry over unchanged.
 const PRESERVED_TABLES: &[&str] = &[
     "cgka_groups",
     "cgka_messages",
     "openmls_values",
     "cgka_group_snapshots",
-    "cgka_member_capabilities",
     "cgka_transport_group_routes",
     "cgka_group_maintenance",
     "account_groups",
@@ -116,7 +115,7 @@ fn v0_10_4_account_upgrades_without_losing_state_or_raising_notices() {
     write_fixture(&database);
 
     // What v0.10.4 left behind.
-    let (before_tables, before_cursor, before_routes) = {
+    let (before_tables, before_capabilities, before_cursor, before_routes) = {
         let conn = raw(&database);
         assert_eq!(
             count(&conn, "cgka_schema_migrations"),
@@ -128,7 +127,12 @@ fn v0_10_4_account_upgrades_without_losing_state_or_raising_notices() {
             .collect();
         assert_eq!(count(&conn, "cgka_groups"), 3);
         assert!(count(&conn, "message_timeline") >= 18);
-        (tables, cursor(&conn), retained_routes(&conn))
+        (
+            tables,
+            table_rows(&conn, "cgka_member_capabilities"),
+            cursor(&conn),
+            retained_routes(&conn),
+        )
     };
     assert_eq!(before_cursor, Some(PERSISTED_CURSOR));
     assert_eq!(before_routes.len(), 1);
@@ -182,6 +186,58 @@ fn v0_10_4_account_upgrades_without_losing_state_or_raising_notices() {
 
         for (table, before) in PRESERVED_TABLES.iter().zip(&before_tables) {
             assert_eq!(&table_rows(&conn, table), before, "{table} changed");
+        }
+        // Migration 0108 changes capability bytes, preserving every known
+        // capability and binding it to the fixture's unambiguous roster leaf.
+        assert_eq!(
+            count(&conn, "cgka_member_capabilities"),
+            before_capabilities.len() as i64
+        );
+        for before in &before_capabilities {
+            let [
+                Value::Blob(group_id),
+                Value::Blob(member_id),
+                Value::Blob(caps),
+            ] = before.as_slice()
+            else {
+                panic!("historical capability row");
+            };
+            let historical: cgka_traits::capabilities::GroupCapabilities =
+                crate::deserialize(caps).unwrap();
+            let group_record: Vec<u8> = conn
+                .query_row(
+                    "SELECT record FROM cgka_groups WHERE id = ?1",
+                    [group_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let group: cgka_traits::group::Group = crate::deserialize(&group_record).unwrap();
+            let leaves = group
+                .members
+                .iter()
+                .filter(|member| member.id.as_slice() == member_id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                leaves.len(),
+                1,
+                "fixture capability knowledge is unambiguous"
+            );
+            let record: Vec<u8> = conn.query_row("SELECT capabilities FROM cgka_member_capabilities WHERE group_id = ?1 AND member_id = ?2", rusqlite::params![group_id, member_id], |row| row.get(0)).unwrap();
+            let crate::storage::capabilities::StoredMemberCapabilities::Leaves {
+                version,
+                leaves: cached,
+            } = crate::deserialize(&record).unwrap()
+            else {
+                panic!("promoted leaf row");
+            };
+            assert_eq!(version, 2);
+            assert_eq!(
+                cached,
+                std::collections::BTreeMap::from([(
+                    hex::encode(&leaves[0].credential),
+                    historical
+                )])
+            );
         }
         assert_eq!(cursor(&conn), Some(PERSISTED_CURSOR));
         assert_eq!(retained_routes(&conn), before_routes);

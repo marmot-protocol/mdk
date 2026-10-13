@@ -151,6 +151,14 @@ fetches full records only for selected attempts, retirement, or bounded lifecycl
 still need their record blob until bounded promotion converts them. The default trait implementation remains
 compatible with other backends.
 
+Member capability rows retain capabilities by leaf signing key in the encrypted account database.
+Account capability queries intersect the currently projected leaves, so a capable sibling cannot hide a
+less capable device. Migration 0108 gates older readers and binds unambiguous single-leaf legacy rows
+before sibling additions. New capability blobs carry version 2; snapshots/checkpoints use `MDKS` version 3
+(historical JSON and version 2 remain readable), and conformance replay exports use version 2.
+Snapshots and checkpoints preserve these leaf maps; historical account-only cache blobs remain readable.
+Removed leaves no longer contribute to the intersection.
+
 ## Conversation reads
 
 `conversation_open` composes a bounded canonical timeline page with retained read state in one read-only snapshot,

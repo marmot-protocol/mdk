@@ -1,7 +1,9 @@
 #[cfg(feature = "test-policy-overrides")]
 mod canonical_membership;
+mod capability_cache_bootstrap;
 mod draft_lifecycle;
 mod group_lookup;
+mod invite_all_fresh_devices;
 pub(crate) mod invite_recovery;
 mod key_package_inventory;
 mod key_package_selection;
@@ -600,6 +602,12 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
         request: crate::relay_plane::DirectoryFetchRequest,
     ) -> Result<Vec<crate::relay_plane::DirectoryRelayEventRecord>, String> {
         self.requests.lock().unwrap().push(request.clone());
+        // Model batch/refetch differences for author-scoped filter batches too.
+        let package_batch = request.queries.len() > 1
+            && request
+                .queries
+                .iter()
+                .all(|query| query.kind == KIND_MARMOT_KEY_PACKAGE);
         let gate = {
             let mut fetch_gate = self.fetch_gate.lock().unwrap();
             if request
@@ -627,6 +635,7 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
             return Err("multi-author queries unsupported".to_owned());
         }
         if let Some(failing_author) = self.failing_single_author.lock().unwrap().as_ref()
+            && !package_batch
             && request.queries.iter().any(|query| {
                 query.authors.len() == 1 && query.authors.first() == Some(failing_author)
             })
@@ -663,13 +672,14 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
             }
             if event.kind == KIND_MARMOT_KEY_PACKAGE
                 && multi_author_only.contains(&event.id)
+                && !package_batch
                 && request.queries.iter().all(|query| query.authors.len() == 1)
             {
                 return false;
             }
             if event.kind == KIND_MARMOT_KEY_PACKAGE
                 && single_author_only.contains(&event.id)
-                && request.queries.iter().any(|query| query.authors.len() > 1)
+                && (package_batch || request.queries.iter().any(|query| query.authors.len() > 1))
             {
                 return false;
             }
@@ -756,7 +766,7 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
                     .filter(|r| seen.insert(r.event.id.clone()))
                     .take(query.limit)
                     .collect::<Vec<_>>();
-                complete &= matching.len() < query.limit;
+                complete &= query.accepts_limit() || matching.len() < query.limit;
                 for record in matching {
                     if let Some(existing) =
                         retained.iter_mut().find(|r| r.event.id == record.event.id)
@@ -9065,10 +9075,16 @@ async fn member_key_package_resolution_refreshes_shared_directory_and_prewarm() 
     let requests = fetcher.requests.lock().unwrap();
     assert_eq!(
         requests.len(),
-        1,
+        4,
+        "prewarmed routes still require package refetches and deletion proofs"
+    );
+    assert!(
+        requests
+            .iter()
+            .flat_map(|request| &request.queries)
+            .all(|query| matches!(query.kind, KIND_MARMOT_KEY_PACKAGE | 5)),
         "prewarmed routes should avoid repeating discovery"
     );
-    assert_eq!(requests[0].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
 }
 
 #[tokio::test]
@@ -9206,8 +9222,8 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
     let requests = fetcher.requests.lock().unwrap().clone();
     assert_eq!(
         requests.len(),
-        3,
-        "prewarm needs discovery, outbox and package batches, without preference refetches"
+        27,
+        "prewarm batches routes/packages and checks every author's supplementary routes and deletions"
     );
     assert_eq!(requests[0].queries.len(), 2);
     assert!(
@@ -9227,10 +9243,12 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
             .iter()
             .all(|query| query.authors.len() == 8)
     );
-    assert_eq!(requests[2].queries.len(), 1);
-    assert_eq!(requests[2].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
-    assert_eq!(requests[2].queries[0].authors.len(), 8);
-    assert_eq!(requests[2].queries[0].limit, 8 * 12);
+    assert_eq!(requests[2].queries.len(), 8);
+    for query in &requests[2].queries {
+        assert_eq!(query.kind, KIND_MARMOT_KEY_PACKAGE);
+        assert_eq!(query.authors.len(), 1);
+        assert_eq!(query.limit, 32);
+    }
     drop(requests);
 
     for account in &accounts {
@@ -9247,8 +9265,8 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
     assert_eq!(resolved.len(), 8);
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
-        12,
-        "create reuses discovery routes but adds a package batch and eight preference refetches"
+        52,
+        "create reuses routes but refetches each author's packages and deletion proofs"
     );
 }
 
@@ -9266,6 +9284,7 @@ async fn member_key_package_prewarm_does_not_renew_routes_after_incomplete_disco
             .unwrap()
             .retain(|event| event.kind != KIND_MARMOT_INBOX_RELAY_LIST);
         *fetcher.incomplete_endpoint.lock().unwrap() = Some(incomplete.to_owned());
+        *fetcher.incomplete_query_kind.lock().unwrap() = Some(KIND_MARMOT_INBOX_RELAY_LIST);
         app.prewarm_group_member_key_packages(&members)
             .await
             .unwrap();
@@ -9306,8 +9325,8 @@ async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox
     let requests = fetcher.requests.lock().unwrap().clone();
     assert_eq!(
         requests.len(),
-        2,
-        "discovery covers the outbox; prewarm adds only the package batch"
+        6,
+        "discovery covers the outbox; prewarm adds batch, per-author fetches and deletion proofs"
     );
     assert_eq!(requests[0].queries.len(), 2);
     assert_eq!(requests[1].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
@@ -9320,8 +9339,8 @@ async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox
     );
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
-        5,
-        "create adds the package batch and two preference refetches, without relay discovery"
+        11,
+        "create adds batch, per-author fetches and deletion proofs, without route discovery"
     );
 }
 
@@ -9353,8 +9372,8 @@ async fn member_key_package_set_falls_back_when_multi_author_queries_are_rejecte
             .iter()
             .filter(|request| request.queries.iter().all(|query| query.authors.len() == 1))
             .count(),
-        6,
-        "discovery, outbox, and KeyPackage batches must each fall back per member"
+        11,
+        "relay-list fallbacks, per-author packages, supplementary packages and deletion proofs stay bounded"
     );
 }
 
@@ -9386,8 +9405,8 @@ async fn member_key_package_set_falls_back_when_multi_author_queries_are_incompl
             .iter()
             .filter(|request| request.queries.iter().all(|query| query.authors.len() == 1))
             .count(),
-        4,
-        "both relay-list hops retry each member; successful prewarm needs no preference refetch"
+        11,
+        "incomplete relay-list batches retry per author, followed by bounded package/deletion discovery"
     );
 }
 
@@ -23684,4 +23703,56 @@ fn group_create_relay_options_preserve_defaults_and_enforce_host_safety() {
             Err(AppError::InvalidNostrRouting(_))
         ));
     }
+}
+
+#[tokio::test]
+async fn member_resolution_invites_all_fresh_slots_in_publication_order() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let account = &accounts[0];
+    let now = unix_now_seconds();
+    let mut events = Vec::new();
+    let mut expected = Vec::new();
+    for index in 0..3 {
+        let kp = fresh_key_package_for_account(&app, account, false).await;
+        expected.push(
+            cgka_engine::key_package::key_package_metadata(&kp)
+                .unwrap()
+                .key_package_ref_hex,
+        );
+        let mut event = member_resolution_key_package_event(account, kp);
+        event.created_at = now - 3 + index;
+        event.id = format!("{index:064x}");
+        event.tags.iter_mut().find(|tag| tag[0] == "d").unwrap()[1] = format!("device-{index}");
+        events.push(event);
+    }
+    let mut superseded = events[0].clone();
+    superseded.created_at -= 1;
+    superseded.id = "f".repeat(64);
+    events.push(superseded);
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    fetcher.events.lock().unwrap().extend(events);
+    let selected = app
+        .resolve_member_key_packages(&[&account.account_id_hex])
+        .await
+        .unwrap();
+    let refs = selected
+        .iter()
+        .map(|kp| {
+            cgka_engine::key_package::key_package_metadata(kp)
+                .unwrap()
+                .key_package_ref_hex
+        })
+        .collect::<Vec<_>>();
+    expected.reverse();
+    assert_eq!(refs, expected);
+    assert!(
+        selected.iter().all(|package| hex::encode(
+            package.source.as_ref().unwrap().event_id.as_slice()
+        ) != "f".repeat(64)),
+        "the superseded event is not selected"
+    );
 }

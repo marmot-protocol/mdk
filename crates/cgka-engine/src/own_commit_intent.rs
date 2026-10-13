@@ -448,17 +448,43 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(None);
         };
         let group = self.stored_group_record(&record.group_id)?;
-        let mut expected = std::collections::BTreeSet::new();
-        let mut consumed = std::collections::BTreeSet::new();
+        let mut expected = Vec::new();
+        let retry = record.reinvite.as_ref().expect("active recovery");
+        let mut consumed = retry
+            .consumed_key_package_refs
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut assigned = retry
+            .assigned_signing_keys
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        for queued in self
+            .storage
+            .list_queued_outbound_intents(&record.group_id)?
+        {
+            if let SendIntent::Invite { key_packages, .. } = queued.intent {
+                for package in key_packages {
+                    let metadata = crate::key_package::key_package_metadata(&package)?;
+                    consumed.insert(metadata.key_package_ref_hex);
+                    assigned.insert(metadata.signature_key_hex);
+                }
+            }
+        }
         for package in old {
             let metadata = crate::key_package::key_package_metadata(package)?;
-            consumed.insert(metadata.key_package_ref_hex);
+            consumed.insert(metadata.key_package_ref_hex.clone());
             if !group.as_ref().is_some_and(|group| {
-                group.members.iter().any(|member| {
-                    hex::encode(member.id.as_slice()) == metadata.credential_identity_hex
-                })
+                group
+                    .members
+                    .iter()
+                    .any(|member| hex::encode(&member.credential) == metadata.signature_key_hex)
             }) {
-                expected.insert(metadata.credential_identity_hex);
+                expected.push((package.clone(), metadata));
+            } else {
+                // A canonical leaf already discharged this obligation too.
+                assigned.insert(metadata.signature_key_hex);
             }
         }
         let report = |outcome, reason| SupersededIntentReport {
@@ -478,7 +504,9 @@ impl<S: StorageProvider> Engine<S> {
         let mls_group = self.load_mls_group(&record.group_id)?;
         let admins = crate::app_components::admins_of_group(&mls_group)?;
         let unapplied_existing_admin_grant = initial_admins.iter().any(|id| {
-            !expected.contains(&hex::encode(id.as_slice()))
+            !expected
+                .iter()
+                .any(|(_, metadata)| metadata.credential_identity_hex == hex::encode(id.as_slice()))
                 && !admins.iter().any(|admin| admin.as_slice() == id.as_slice())
         });
         if expected.is_empty() {
@@ -512,16 +540,55 @@ impl<S: StorageProvider> Engine<S> {
             self.storage.put_own_commit_intent(&record)?;
             return Ok(Some(report));
         }
-        let mut actual = std::collections::BTreeSet::new();
+        let mut actual = Vec::new();
+        let mut refs = std::collections::BTreeSet::new();
+        let mut leaf_keys = std::collections::BTreeSet::new();
         for package in &key_packages {
             let metadata = crate::key_package::key_package_metadata(package)?;
             if consumed.contains(&metadata.key_package_ref_hex)
-                || !actual.insert(metadata.credential_identity_hex)
+                || assigned.contains(&metadata.signature_key_hex)
+                || !refs.insert(metadata.key_package_ref_hex.clone())
+                || !leaf_keys.insert(metadata.signature_key_hex.clone())
             {
                 return Err(EngineError::InvalidWelcome);
             }
+            if !group.as_ref().is_some_and(|group| {
+                group
+                    .members
+                    .iter()
+                    .any(|member| hex::encode(&member.credential) == metadata.signature_key_hex)
+            }) {
+                actual.push(metadata);
+            } else {
+                return Err(EngineError::InvalidWelcome);
+            }
         }
-        if actual != expected {
+        // Each replacement discharges exactly one missing leaf, even when
+        // several leaves share an account. Prefer matching stable signing keys;
+        // rotated keys may satisfy only an otherwise unmatched account obligation.
+        let mut remaining = expected.clone();
+        for metadata in &actual {
+            let matched = remaining
+                .iter()
+                .position(|(_, old)| {
+                    old.credential_identity_hex == metadata.credential_identity_hex
+                        && old.signature_key_hex == metadata.signature_key_hex
+                })
+                .or_else(|| {
+                    remaining.iter().position(|(_, old)| {
+                        old.credential_identity_hex == metadata.credential_identity_hex
+                            && !leaf_keys.contains(&old.signature_key_hex)
+                    })
+                });
+            let Some(index) = matched else {
+                return Err(EngineError::InvalidWelcome);
+            };
+            let (_, obligation) = remaining.remove(index);
+            assigned.insert(obligation.signature_key_hex);
+            assigned.insert(metadata.signature_key_hex.clone());
+            consumed.insert(metadata.key_package_ref_hex.clone());
+        }
+        if actual.is_empty() {
             return Err(EngineError::InvalidWelcome);
         }
         let intent = SendIntent::Invite {
@@ -529,7 +596,11 @@ impl<S: StorageProvider> Engine<S> {
             key_packages,
             initial_admins: initial_admins
                 .iter()
-                .filter(|id| expected.contains(&hex::encode(id.as_slice())))
+                .filter(|id| {
+                    actual.iter().any(|metadata| {
+                        metadata.credential_identity_hex == hex::encode(id.as_slice())
+                    })
+                })
                 .cloned()
                 .collect(),
         };
@@ -538,10 +609,26 @@ impl<S: StorageProvider> Engine<S> {
             intent,
             record.reissue_attempts.saturating_add(1),
         )?;
+        if let Some(retry) = &mut record.reinvite {
+            retry.consumed_key_package_refs = consumed.into_iter().collect();
+            retry.assigned_signing_keys = assigned.into_iter().collect();
+        }
+        if !remaining.is_empty() {
+            record.intent = SendIntent::Invite {
+                group_id: record.group_id.clone(),
+                key_packages: remaining.into_iter().map(|(package, _)| package).collect(),
+                initial_admins: initial_admins.clone(),
+            };
+        }
+        let completed = expected.len() == actual.len();
         self.storage
             .with_transaction(|storage| -> Result<(), EngineError> {
                 storage.put_queued_outbound_intent(&queued)?;
-                storage.delete_own_commit_intent(commit_id)?;
+                if completed {
+                    storage.delete_own_commit_intent(commit_id)?;
+                } else {
+                    storage.put_own_commit_intent(&record)?;
+                }
                 Ok(())
             })?;
         self.schedule_pending_convergence_group(&record.group_id);

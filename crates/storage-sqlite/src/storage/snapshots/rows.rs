@@ -1,5 +1,5 @@
 use crate::codec::SensitiveBytes;
-use cgka_traits::capabilities::GroupCapabilities;
+use crate::storage::capabilities::StoredMemberCapabilities;
 #[cfg(feature = "test-conformance-replay")]
 use cgka_traits::convergence_pass::DurableConvergencePass;
 use cgka_traits::group::Group;
@@ -44,7 +44,7 @@ pub(super) struct GroupStateCheckpoint {
 /// has different semantics and must reconstruct the scheduler state as well as
 /// the group/OpenMLS state that it governs.
 #[cfg(feature = "test-conformance-replay")]
-pub(super) const REPLAY_SNAPSHOT_VERSION: u32 = 1;
+pub(super) const REPLAY_SNAPSHOT_VERSION: u32 = 2;
 
 #[cfg(feature = "test-conformance-replay")]
 #[derive(Serialize, Deserialize)]
@@ -69,7 +69,7 @@ pub(super) struct OrderedQueuedOutbound {
 #[derive(Serialize, Deserialize)]
 pub(super) struct MemberCapabilitiesSnapshot {
     pub(super) member_id: MemberId,
-    pub(super) capabilities: GroupCapabilities,
+    pub(super) capabilities: StoredMemberCapabilities,
 }
 
 #[derive(Serialize, Deserialize)]

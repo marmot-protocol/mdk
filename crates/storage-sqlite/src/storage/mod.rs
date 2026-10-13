@@ -1,5 +1,5 @@
 mod account_device_signer;
-mod capabilities;
+pub(crate) mod capabilities;
 mod convergence_passes;
 mod convergence_policy;
 mod deferred_peel_generations;
