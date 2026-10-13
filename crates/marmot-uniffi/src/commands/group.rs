@@ -913,6 +913,24 @@ impl Marmot {
         Ok(summary.into())
     }
 
+    /// After a group change fails with `GroupCatchingUp`, record that the user
+    /// accepts the risk: this device may be behind its group, so the change can
+    /// split the group for everyone. Retry the change afterwards. Admits one
+    /// change attempt at the device's current epoch, consumed even if it
+    /// fails, and is not persisted. Returns false when the group is not
+    /// catching up.
+    pub async fn acknowledge_group_catching_up(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<bool, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .acknowledge_group_catching_up(&account_ref, &group_id)
+            .await?)
+    }
+
     /// Re-read on GroupStateUpdated; display uncertainty separately from whether
     /// the user accepted the original invitation. `history_notice_ids` are this
     /// group's "history may be incomplete" occurrences.

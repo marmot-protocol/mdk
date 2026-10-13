@@ -390,6 +390,7 @@ struct RecordingAdapterInner {
     accept_policy: Mutex<Option<Vec<TransportEndpoint>>>,
     error_endpoints: Mutex<Vec<TransportEndpoint>>,
     error_kind: Mutex<Option<TransportEndpointFailureKind>>,
+    error_reasons: Mutex<Vec<(TransportEndpoint, String)>>,
     publish_errors: Mutex<VecDeque<bool>>,
     reported_message_ids: Mutex<VecDeque<MessageId>>,
     welcome_gate: Mutex<Option<Arc<WelcomePublishGate>>>,
@@ -452,6 +453,27 @@ impl RecordingAdapter {
     ) {
         *self.inner.error_endpoints.lock().unwrap() = endpoints;
         *self.inner.error_kind.lock().unwrap() = Some(kind);
+        self.inner.error_reasons.lock().unwrap().clear();
+    }
+
+    /// Like [`Self::fail_endpoints_as`], with a fixed adapter reason phrase
+    /// per endpoint.
+    fn fail_endpoints_with_reasons(
+        &self,
+        kind: TransportEndpointFailureKind,
+        reasons: Vec<(TransportEndpoint, &str)>,
+    ) {
+        self.fail_endpoints_as(
+            reasons
+                .iter()
+                .map(|(endpoint, _)| endpoint.clone())
+                .collect(),
+            kind,
+        );
+        *self.inner.error_reasons.lock().unwrap() = reasons
+            .into_iter()
+            .map(|(endpoint, reason)| (endpoint, reason.to_owned()))
+            .collect();
     }
 
     fn report_message_id_next(&self, message_id: MessageId) {
@@ -546,14 +568,21 @@ impl TransportAdapter for RecordingAdapter {
                     .all(|endpoint| error_endpoints.contains(endpoint))
             {
                 if let Some(kind) = *self.inner.error_kind.lock().unwrap() {
+                    let reasons = self.inner.error_reasons.lock().unwrap().clone();
                     let failures = request
                         .target
                         .endpoints()
                         .iter()
                         .cloned()
                         .map(|endpoint| TransportEndpointFailure {
+                            reason: reasons
+                                .iter()
+                                .find(|(reasoned, _)| reasoned == &endpoint)
+                                .map_or_else(
+                                    || "injected typed endpoint failure".into(),
+                                    |(_, reason)| reason.clone(),
+                                ),
                             endpoint,
-                            reason: "injected typed endpoint failure".into(),
                             kind,
                             rejection_category: None,
                         })
@@ -2992,10 +3021,42 @@ async fn maintenance_waits_on_an_obligation_while_a_disband_is_in_progress() {
     );
 }
 
+fn v5_audit_recorder(path: &std::path::Path) -> Box<marmot_forensics::JsonlRecorder> {
+    Box::new(
+        marmot_forensics::JsonlRecorder::open_v5_with_account_ref(
+            path,
+            "11".repeat(16),
+            Some("22".repeat(16)),
+            marmot_forensics::v5::Producer {
+                mdk_revision: None,
+                build_profile: marmot_forensics::v5::BuildProfile::Debug,
+                platform: marmot_forensics::v5::Platform::Other,
+                host_build: None,
+            },
+        )
+        .unwrap(),
+    )
+}
+
+fn v5_audit_rows(path: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            marmot_forensics::v5::Record::from_json(line.as_bytes()).expect("strict v5 row");
+            serde_json::from_str::<serde_json::Value>(line).unwrap()
+        })
+        .collect()
+}
+
+/// mdk#2255: a self-update commit confirms on its first relay acknowledgement,
+/// then keeps retrying every group relay that missed it through the same
+/// durable frozen fanout as every other commit, auditing each retry pass.
 #[tokio::test]
-async fn manual_self_update_confirms_on_first_ack_and_finishes_exact_event_fanout() {
+async fn manual_self_update_confirms_on_first_ack_and_retries_unacked_relays_audibly() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("alice.sqlite");
+    let audit_path = dir.path().join("alice-audit.jsonl");
     let key = SqlCipherKey::new("marmot manual maintenance key").unwrap();
     let initial_runtime = AccountDeviceRuntime::new(
         current_session(database.clone(), &key, b"alice"),
@@ -3030,23 +3091,24 @@ async fn manual_self_update_confirms_on_first_ack_and_finishes_exact_event_fanou
     let source_epoch = initial_runtime.session().epoch(&group_id).unwrap();
     drop(initial_runtime);
 
+    let relay_a = TransportEndpoint("wss://group-a.example".into());
+    let relay_b = TransportEndpoint("wss://group-b.example".into());
     let adapter = RecordingAdapter::default();
-    adapter.accept_only_next(1);
+    // Relay B is unreachable for the first pass: the adapter cannot say
+    // whether it saw the event, as in the mdk#2254 incident.
+    adapter.error_for_endpoints(vec![relay_b.clone()]);
     let wall = Arc::new(TestWallClock::new(100_000));
     let monotonic = Arc::new(TestMonotonicClock::default());
+    let mut session = current_session(database, &key, b"alice");
+    session.set_audit_recorder(v5_audit_recorder(&audit_path));
     let mut runtime = AccountDeviceRuntime::new(
-        current_session(database, &key, b"alice"),
+        session,
         adapter.clone(),
-        StaticTransportRouting::new(vec![])
-            .required_acks(2)
-            .with_group_route(
-                group_id.clone(),
-                group_id.as_slice().to_vec(),
-                vec![
-                    TransportEndpoint("wss://group-a.example".into()),
-                    TransportEndpoint("wss://group-b.example".into()),
-                ],
-            ),
+        StaticTransportRouting::new(vec![]).with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![relay_a.clone(), relay_b.clone()],
+        ),
         RecordingKeyPackages::default(),
     )
     .with_maintenance_sources(
@@ -3099,7 +3161,8 @@ async fn manual_self_update_confirms_on_first_ack_and_finishes_exact_event_fanou
         effects
             .pending
             .iter()
-            .any(|resolution| matches!(resolution, PendingResolution::Confirmed { .. }))
+            .any(|resolution| matches!(resolution, PendingResolution::Confirmed { .. })),
+        "the first relay acknowledgement confirms the self-update"
     );
     assert_eq!(
         runtime.session().epoch(&group_id).unwrap().0,
@@ -3123,28 +3186,372 @@ async fn manual_self_update_confirms_on_first_ack_and_finishes_exact_event_fanou
             .periodic_enrolled,
         "manual success must not enroll an existing/manual-only group"
     );
-
-    wall.set(wall.now().0.saturating_add(30));
-    runtime.run_due_maintenance().await.unwrap();
     let publishes = adapter.publishes();
-    assert_eq!(publishes.len(), 2);
-    assert_eq!(publishes[0].message, publishes[1].message);
-    assert_eq!(publishes[0].target.endpoints().len(), 2);
-    assert_eq!(publishes[1].target.endpoints().len(), 1);
+    assert_eq!(publishes.len(), 2, "one single-endpoint publish per relay");
+    let commit = publishes[0].message.clone();
+    assert!(
+        runtime.session().transport_fanouts().unwrap().is_empty(),
+        "self-update commits no longer use the legacy transport fanout"
+    );
     let fanout = runtime
         .session()
-        .transport_fanouts()
+        .outbound_fanouts_for_group(&group_id)
         .unwrap()
         .into_iter()
-        .find(|fanout| fanout.id == publishes[0].message.id)
+        .find(|fanout| fanout.message_id() == &commit.id)
+        .expect("self-update commit is a durable frozen fanout");
+    assert!(matches!(
+        fanout.mls_state(),
+        cgka_traits::FanoutMlsState::Confirmed
+    ));
+    assert_eq!(fanout.outcome().accepted_targets, 1);
+    assert_eq!(
+        fanout.outcome().outstanding_targets,
+        1,
+        "relay B stays owed after confirmation"
+    );
+
+    // Relay B recovers. The exact commit is retried once its backoff expires.
+    adapter.error_for_endpoints(Vec::new());
+    runtime.drain().await.unwrap();
+    assert_eq!(
+        adapter.publishes().len(),
+        2,
+        "the ambiguous relay waits out its backoff"
+    );
+    wall.set(wall.now().0.saturating_add(30));
+    runtime.drain().await.unwrap();
+    let publishes = adapter.publishes();
+    assert_eq!(publishes.len(), 3);
+    assert_eq!(publishes[2].message, commit);
+    assert_eq!(
+        publishes[2].target.endpoints(),
+        std::slice::from_ref(&relay_b)
+    );
+    assert!(
+        runtime
+            .session()
+            .outbound_fanouts_for_group(&group_id)
+            .unwrap()
+            .into_iter()
+            .all(|fanout| fanout.message_id() != &commit.id),
+        "a fully delivered confirmed commit retires its fanout"
+    );
+
+    drop(runtime);
+    let rows = v5_audit_rows(&audit_path);
+    let attempts = rows
+        .iter()
+        .filter(|row| row["event"]["type"] == "publish_attempt")
+        .collect::<Vec<_>>();
+    let outcomes = rows
+        .iter()
+        .filter(|row| row["event"]["type"] == "publish_outcome")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        attempts.len(),
+        2,
+        "first pass and secondary retry: {rows:#?}"
+    );
+    assert_eq!(
+        outcomes.len(),
+        2,
+        "first pass and secondary retry: {rows:#?}"
+    );
+    let endpoint_refs = |row: &serde_json::Value, field: &str| {
+        row["event"][field]
+            .as_array()
+            .map(|refs| refs.len())
+            .unwrap_or(0)
+    };
+    assert_eq!(endpoint_refs(attempts[0], "endpoint_refs"), 2);
+    assert_eq!(endpoint_refs(attempts[1], "endpoint_refs"), 1);
+    assert_eq!(endpoint_refs(outcomes[0], "accepted_endpoint_refs"), 1);
+    assert_eq!(endpoint_refs(outcomes[0], "failed_relays"), 1);
+    assert_eq!(endpoint_refs(outcomes[1], "accepted_endpoint_refs"), 1);
+    assert_eq!(endpoint_refs(outcomes[1], "failed_relays"), 0);
+}
+
+/// mdk#2255: a self-update staged before the frozen-fanout migration keeps
+/// its legacy record. If the best-effort `evolution_confirmed` write failed
+/// after confirmation, the remaining relays must still be retried (and
+/// audited) instead of waiting out the 24 h retention window.
+#[tokio::test]
+async fn legacy_self_update_fanout_retries_after_lost_confirmation_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let audit_path = dir.path().join("alice-audit.jsonl");
+    let key = SqlCipherKey::new("marmot legacy marker key").unwrap();
+    let mut initial = current_session(database.clone(), &key, b"alice");
+    let group_id = initial
+        .create_group(CreateGroupRequest {
+            name: "legacy marker".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .group_id;
+    drop(initial);
+
+    let relay_a = TransportEndpoint("wss://group-a.example".into());
+    let relay_b = TransportEndpoint("wss://group-b.example".into());
+    let adapter = RecordingAdapter::default();
+    let mut session = current_session(database, &key, b"alice");
+    session.set_audit_recorder(v5_audit_recorder(&audit_path));
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        adapter.clone(),
+        StaticTransportRouting::new(vec![]).with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![relay_a.clone(), relay_b.clone()],
+        ),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        Arc::new(TestWallClock::new(100_000)),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    )
+    .with_maintenance_timing(MaintenanceTiming::immediate());
+    runtime.schedule_manual_self_update(&group_id).unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    let evolution = runtime
+        .session()
+        .group_evolutions_for_group(&group_id)
+        .unwrap()
+        .into_iter()
+        .find(|evolution| evolution.phase == cgka_traits::GroupEvolutionPhase::Confirmed)
+        .expect("confirmed self-update evolution");
+    let commit = adapter.publishes()[0].message.clone();
+    assert_eq!(evolution.signed_message_id.as_ref(), Some(&commit.id));
+
+    // The pre-migration shape: relay A acknowledged, relay B failed, and the
+    // post-confirmation marker write was lost.
+    let target = |endpoint: TransportEndpoint, state| cgka_traits::TransportFanoutTarget {
+        endpoint,
+        state,
+        attempt_count: 1,
+        last_attempt_at: Some(cgka_traits::Timestamp(1)),
+        failure_code: None,
+    };
+    runtime
+        .session()
+        .put_transport_fanout(&cgka_traits::DurableTransportFanout {
+            id: commit.id.clone(),
+            group_id: Some(group_id.clone()),
+            evolution_id: Some(evolution.id.clone()),
+            exact_message: commit.clone(),
+            target: TransportPublishTarget::Group {
+                group_id: group_id.clone(),
+                transport_group_id: group_id.as_slice().to_vec(),
+                endpoints: vec![relay_a.clone(), relay_b.clone()],
+            },
+            targets: vec![
+                target(relay_a, cgka_traits::TransportFanoutAttemptState::Accepted),
+                target(
+                    relay_b.clone(),
+                    cgka_traits::TransportFanoutAttemptState::AttemptedFailed,
+                ),
+            ],
+            required_acks: 1,
+            evolution_confirmed: false,
+            possible_exposure: true,
+            created_at: cgka_traits::Timestamp(1),
+            bounded_until: Some(cgka_traits::Timestamp(200_000)),
+        })
         .unwrap();
-    assert!(fanout.evolution_confirmed);
+    let before = adapter.publishes().len();
+
+    runtime.run_due_maintenance().await.unwrap();
+    let publishes = adapter.publishes();
+    assert_eq!(publishes.len(), before + 1, "relay B is retried");
+    let retry = publishes.last().unwrap();
+    assert_eq!(retry.message, commit);
+    assert_eq!(retry.target.endpoints(), std::slice::from_ref(&relay_b));
+    let fanout = runtime
+        .session()
+        .transport_fanout(&commit.id)
+        .unwrap()
+        .unwrap();
+    assert!(fanout.evolution_confirmed, "the marker is repaired");
     assert!(
         fanout
             .targets
             .iter()
-            .all(|target| { target.state == cgka_traits::TransportFanoutAttemptState::Accepted })
+            .all(|target| target.state == cgka_traits::TransportFanoutAttemptState::Accepted)
     );
+
+    drop(runtime);
+    let rows = v5_audit_rows(&audit_path);
+    let last_attempt = rows
+        .iter()
+        .rfind(|row| row["event"]["type"] == "publish_attempt")
+        .expect("secondary retry attempt is audited");
+    let last_outcome = rows
+        .iter()
+        .rfind(|row| row["event"]["type"] == "publish_outcome")
+        .expect("secondary retry outcome is audited");
+    assert_eq!(last_attempt["event"]["target_kind"], "group");
+    assert_eq!(
+        last_attempt["event"]["endpoint_refs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(last_outcome["event"]["target_kind"], "group");
+    assert_eq!(
+        last_outcome["event"]["accepted_endpoint_refs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// mdk#2264: a legacy publish that fails on every relay must keep each relay's
+/// cause in the audit log and on the durable fanout, instead of one
+/// `unclassified` adapter row with no relay detail.
+#[tokio::test]
+async fn adapter_publish_failure_records_per_relay_causes() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot adapter failure cause key").unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let audit_path = dir.path().join("audit.jsonl");
+    let mut initial = current_session(database.clone(), &key, b"alice");
+    let created = initial
+        .create_group(CreateGroupRequest {
+            name: "adapter failure causes".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id;
+    drop(initial);
+
+    let mut session = current_session(database, &key, b"alice");
+    session.set_audit_recorder(Box::new(
+        marmot_forensics::JsonlRecorder::open_v5_with_account_ref(
+            &audit_path,
+            "11".repeat(16),
+            Some("22".repeat(16)),
+            marmot_forensics::v5::Producer {
+                mdk_revision: None,
+                build_profile: marmot_forensics::v5::BuildProfile::Debug,
+                platform: marmot_forensics::v5::Platform::Other,
+                host_build: None,
+            },
+        )
+        .unwrap(),
+    ));
+    let timed_out = TransportEndpoint("wss://group-timed-out.example".into());
+    let refused = TransportEndpoint("wss://group-refused.example".into());
+    let adapter = RecordingAdapter::default();
+    adapter.fail_endpoints_with_reasons(
+        TransportEndpointFailureKind::RetryableUnavailable,
+        vec![
+            (timed_out.clone(), "connect relay timed out"),
+            (refused.clone(), "connect relay failed"),
+        ],
+    );
+    let routing =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())])
+            .with_group_route(
+                group_id.clone(),
+                group_id.as_slice().to_vec(),
+                vec![timed_out.clone(), refused.clone()],
+            );
+    let wall = Arc::new(TestWallClock::new(120_000));
+    let monotonic = Arc::new(TestMonotonicClock::default());
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        adapter.clone(),
+        routing,
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        monotonic.clone(),
+        Arc::new(TestRandom::new(0)),
+    );
+
+    let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    monotonic.set_millis(60_000);
+    wall.set(120_060);
+    runtime.run_due_maintenance().await.unwrap();
+    let jittered = runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+    wall.set(jittered.not_before.unwrap().0);
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(adapter.publishes().len(), 1);
+
+    let fanout = runtime.session().transport_fanouts().unwrap().remove(0);
+    assert_eq!(fanout.targets.len(), 2);
+    for target in &fanout.targets {
+        assert_eq!(
+            target.state,
+            cgka_traits::TransportFanoutAttemptState::AttemptedFailed
+        );
+        assert_eq!(target.attempt_count, 1);
+        assert_ne!(
+            target.failure_code.as_deref(),
+            Some("adapter_error"),
+            "each relay's reported failure must reach its fanout target"
+        );
+    }
+    drop(runtime);
+
+    let audit = std::fs::read_to_string(&audit_path).unwrap();
+    assert!(!audit.contains("wss://"));
+    let rows = audit
+        .lines()
+        .map(|line| {
+            marmot_forensics::v5::Record::from_json(line.as_bytes()).expect("strict v5 row");
+            serde_json::from_str::<serde_json::Value>(line).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let failure = rows
+        .iter()
+        .find(|row| row["event"]["type"] == "publish_failure")
+        .expect("adapter publish failure row");
+    assert_eq!(failure["event"]["stage"], "adapter");
+    assert_eq!(
+        failure["event"]["reason"], "insufficient_publish_acknowledgements",
+        "the adapter failure reason must survive the v5 allowlist"
+    );
+    let outcome = rows
+        .iter()
+        .find(|row| row["event"]["type"] == "publish_outcome")
+        .expect("per-relay publish outcome row");
+    assert_eq!(outcome["event"]["met_required_acks"], false);
+    let failed_relays = outcome["event"]["failed_relays"].as_array().unwrap();
+    assert_eq!(failed_relays.len(), 2);
+    for (endpoint, reason) in [
+        (&timed_out, "connect_relay_timed_out"),
+        (&refused, "connect_relay_failed"),
+    ] {
+        let endpoint_ref =
+            marmot_forensics::v5::EndpointRef::from_normalized_url(&endpoint.0).unwrap();
+        let relay = failed_relays
+            .iter()
+            .find(|relay| relay["endpoint_ref"] == endpoint_ref.as_str())
+            .unwrap_or_else(|| panic!("missing relay row: {failed_relays:?}"));
+        assert_eq!(relay["reason"], reason, "{failed_relays:?}");
+    }
 }
 
 #[tokio::test]
@@ -3205,12 +3612,20 @@ async fn ambiguous_self_update_exposure_survives_restart_and_respects_retry_back
     let effects = runtime.run_due_maintenance().await.unwrap();
 
     assert_eq!(adapter.publishes().len(), 1);
-    let fanout = runtime.session().transport_fanouts().unwrap().remove(0);
-    assert!(fanout.possible_exposure);
-    assert!(!fanout.evolution_confirmed);
+    assert!(runtime.session().transport_fanouts().unwrap().is_empty());
+    let fanout = runtime
+        .session()
+        .outbound_fanouts_for_group(&group_id)
+        .unwrap()
+        .remove(0);
+    assert!(fanout.possible_exposure());
+    assert!(matches!(
+        fanout.mls_state(),
+        cgka_traits::FanoutMlsState::Pending(_)
+    ));
     assert_eq!(
-        fanout.targets[0].state,
-        cgka_traits::TransportFanoutAttemptState::AttemptedFailed
+        fanout.target_status(0),
+        Some(cgka_traits::FanoutTargetStatus::PossiblyExposed)
     );
     assert_eq!(
         runtime
@@ -3253,11 +3668,19 @@ async fn ambiguous_self_update_exposure_survives_restart_and_respects_retry_back
     assert_eq!(
         adapter.publishes().len(),
         1,
-        "persisted backoff must prevent an immediate restart retry"
+        "persisted backoff must prevent an immediate restart retry, and the \
+         pending exact commit must not be replaced by a fresh rotation"
     );
-    let fanout = restarted.session().transport_fanouts().unwrap().remove(0);
-    assert!(fanout.possible_exposure);
-    assert!(!fanout.evolution_confirmed);
+    let fanout = restarted
+        .session()
+        .outbound_fanouts_for_group(&group_id)
+        .unwrap()
+        .remove(0);
+    assert!(fanout.possible_exposure());
+    assert!(matches!(
+        fanout.mls_state(),
+        cgka_traits::FanoutMlsState::Pending(_)
+    ));
 
     wall.set(wall.now().0.saturating_add(30));
     restarted.run_due_maintenance().await.unwrap();
@@ -4679,9 +5102,10 @@ async fn rejected_self_update_publication_rolls_back_instead_of_holding_pending_
     drop(initial);
 
     let adapter = RecordingAdapter::default();
-    // Every endpoint rejects: an `Ok` report with zero acknowledgements, which
-    // is precisely what a relay refusal looks like to the account runtime.
-    adapter.accept_next(0);
+    // Every endpoint rejects: an `Ok` report whose only endpoint answered with
+    // an explicit terminal `OK false`. An endpoint missing from both lists is
+    // an unknown acknowledgement, not a rejection.
+    adapter.accept_only_endpoints(Vec::new());
     let routing =
         StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())])
             .with_group_route(
@@ -4717,10 +5141,14 @@ async fn rejected_self_update_publication_rolls_back_instead_of_holding_pending_
     let effects = runtime.run_due_maintenance().await.unwrap();
 
     assert_eq!(adapter.publishes().len(), 1);
-    let fanout = runtime.session().transport_fanouts().unwrap().remove(0);
+    assert!(runtime.session().transport_fanouts().unwrap().is_empty());
     assert!(
-        !fanout.possible_exposure,
-        "a rejection is a definite non-delivery, not an ambiguous exposure"
+        runtime
+            .session()
+            .outbound_fanouts_for_group(&group_id)
+            .unwrap()
+            .is_empty(),
+        "a rejection is a definite non-delivery, so the rolled-back fanout retires"
     );
     assert!(
         effects
@@ -4750,7 +5178,7 @@ async fn rejected_self_update_publication_rolls_back_instead_of_holding_pending_
     // to measure from. Pinning the immediate re-stage means any future backoff
     // introduced here fails loudly instead of hiding behind a clock the test
     // advanced for it.
-    adapter.accept_next(1);
+    adapter.accept_only_endpoints(vec![TransportEndpoint("wss://group.example".into())]);
     runtime.run_due_maintenance().await.unwrap();
     assert_eq!(
         runtime.session().epoch(&group_id).unwrap().0,
@@ -5372,6 +5800,44 @@ async fn immediate_maintenance_timing_publishes_a_manual_self_update_without_wai
 
     // Sweep two: the jitter deadline is already due, so the rotation publishes
     // and confirms without either clock having moved.
+    let effects = runtime.run_due_maintenance().await.unwrap();
+    assert!(
+        effects
+            .pending
+            .iter()
+            .any(|resolution| matches!(resolution, PendingResolution::Confirmed { .. })),
+        "{effects:?}"
+    );
+    assert_eq!(
+        runtime.session().epoch(&group_id).unwrap().0,
+        source_epoch.0 + 1
+    );
+}
+
+/// mdk#2258: a self-update authored from an epoch the group already left forks
+/// the group. A caller that knows the group is behind holds it; the rotation
+/// stays owed and publishes once the hold lifts.
+#[tokio::test]
+async fn held_group_defers_a_due_self_update_until_the_hold_lifts() {
+    let (_dir, mut runtime, group_id, source_epoch) =
+        manual_only_group_runtime(MaintenanceTiming::immediate()).await;
+    let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
+    let held = [group_id.clone()];
+    for _ in 0..3 {
+        runtime.run_due_maintenance_holding(&held).await.unwrap();
+    }
+    let obligation = runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(obligation.phase, cgka_traits::MaintenancePhase::Retry);
+    assert_eq!(
+        obligation.last_failure_code.as_deref(),
+        Some("epoch_gap_hold")
+    );
+    assert_eq!(runtime.session().epoch(&group_id).unwrap(), source_epoch);
+
     let effects = runtime.run_due_maintenance().await.unwrap();
     assert!(
         effects

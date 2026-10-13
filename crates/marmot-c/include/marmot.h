@@ -192,6 +192,11 @@ enum MarmotStatus
    * Local per-account moderation-report cap; retry later.
    */
   MARMOT_STATUS_MODERATION_REPORT_RATE_LIMITED = 100,
+  /**
+   * The group moved past this device and recovery has not caught it up;
+   * group changes would fork it. Retry once it has synced (mdk#2258).
+   */
+  MARMOT_STATUS_GROUP_CATCHING_UP = 101,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -944,6 +949,7 @@ typedef enum MarmotAttachmentTransferState {
   MARMOT_ATTACHMENT_TRANSFER_STATE_PREVIOUSLY_ACQUIRED_UNAVAILABLE,
   MARMOT_ATTACHMENT_TRANSFER_STATE_COMPLETED_UNRETAINED,
   MARMOT_ATTACHMENT_TRANSFER_STATE_RETRY_EXHAUSTED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_STORAGE_BLOCKED,
 } MarmotAttachmentTransferState;
 
 typedef enum MarmotChatListView {
@@ -6836,6 +6842,23 @@ MarmotStatus marmot_group_app_component(const struct MarmotClient *client,
                                         const char *group_id_hex,
                                         uint16_t component_id,
                                         struct MarmotGroupAppComponent **out);
+
+/**
+ * After a group change returns `MARMOT_STATUS_GROUP_CATCHING_UP`, record
+ * that the user accepts the risk of splitting the group, then retry the
+ * change. Admits one attempt at the current epoch, consumed even if it
+ * fails; not persisted. Writes false when the group is not catching up.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_acknowledge_group_catching_up(const struct MarmotClient *client,
+                                                  const char *account_ref,
+                                                  const char *group_id_hex,
+                                                  bool *out);
 
 /**
  * Query advisory membership health and pending rejoin offers.

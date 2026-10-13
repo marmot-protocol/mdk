@@ -1003,6 +1003,23 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    pub async fn acknowledge_group_catching_up(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::AcknowledgeGroupCatchingUp {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn dismiss_history_notice(
         &self,
         account_ref: &str,

@@ -23,9 +23,9 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn populated_v108_upgrade_indexes_work_without_global_intent_state() {
+    fn populated_v109_upgrade_indexes_work_without_global_intent_state() {
         let mut c = rusqlite::Connection::open_in_memory().unwrap();
-        crate::migrations::run(&mut c, &crate::migrations::MIGRATIONS[..108]).unwrap();
+        crate::migrations::run(&mut c, &crate::migrations::MIGRATIONS[..109]).unwrap();
         c.execute_batch("PRAGMA foreign_keys=OFF; INSERT INTO attachment_acquisition(token,group_id_hex,message_id_hex,attachment_index,source_message_id_hex,source_epoch,slot_json,plaintext_digest,state,attempts,due,expires_at) VALUES(randomblob(16),'aa','one',0,'one',0,'[]',randomblob(32),0,0,0,NULL);").unwrap();
         assert_eq!(crate::migrations::run_all(&mut c).unwrap(), 1);
         assert_eq!(crate::migrations::run_all(&mut c).unwrap(), 0);

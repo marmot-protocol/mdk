@@ -2374,16 +2374,29 @@ impl NostrSdkRelayClient {
                                 subscription_id,
                                 event,
                             } => {
-                                // Every relay copy is telemetry only; delivery uses
-                                // the SDK's deduplicated Event notification above.
-                                if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
-                                    adapter
-                                        .observe_relay_event(NostrRelayEvent {
-                                            endpoint: TransportEndpoint(relay_url.to_string()),
-                                            subscription_id: Some(subscription_id.to_string()),
-                                            event,
-                                        })
-                                        .await;
+                                // Every relay copy feeds telemetry and replay-page
+                                // accounting, in order with that relay's EOSE;
+                                // delivery uses the SDK's deduplicated Event
+                                // notification above.
+                                match NostrTransportEvent::from_nostr_event(&event) {
+                                    Ok(event) => {
+                                        adapter
+                                            .observe_relay_event(NostrRelayEvent {
+                                                endpoint: TransportEndpoint(relay_url.to_string()),
+                                                subscription_id: Some(subscription_id.to_string()),
+                                                event,
+                                            })
+                                            .await;
+                                    }
+                                    Err(_) => {
+                                        adapter
+                                            .observe_unconvertible_relay_event(
+                                                TransportEndpoint(relay_url.to_string()),
+                                                subscription_id.to_string(),
+                                                event.created_at.as_secs(),
+                                            )
+                                            .await;
+                                    }
                                 }
                             }
                             RelayMessage::EndOfStoredEvents(subscription_id) => {
@@ -2645,7 +2658,20 @@ impl NostrSdkRelayClient {
         // connection attempt.
         self.client.connect().await;
 
-        let output = self
+        // Track the id before nostr-sdk can register it. The SDK registers the
+        // REQ and queues it before this task resumes, and the caller may abort
+        // the task at any await after that (a sibling's failure, or a dropped
+        // activation). An id tracked only after the SDK call would then be a
+        // live REQ that `unsubscribe_account` never closes and every reconnect
+        // re-sends. A tracked id the SDK never registered costs one CLOSE.
+        self.account_subscriptions
+            .write()
+            .await
+            .entry(plan.account_id.clone())
+            .or_default()
+            .push_unique(plan.subscription_id.clone());
+
+        let output = match self
             .client
             .subscribe(ReqTarget::manual(
                 plan.endpoints
@@ -2655,14 +2681,24 @@ impl NostrSdkRelayClient {
             ))
             .with_id(plan.subscription_id.clone())
             .await
-            .map_err(|_| TransportAdapterError::Subscription("subscribe failed".to_owned()))?;
-
-        if output.success.is_empty() {
-            return Err(TransportAdapterError::Subscription(format!(
-                "subscribe registered on 0 of {} relays",
-                plan.endpoints.len()
-            )));
-        }
+        {
+            Ok(output) if !output.success.is_empty() => output,
+            // A failed call registered nothing of its own: nostr-sdk reports
+            // each relay's failure, including an id another live REQ already
+            // holds, without registering it there. So it closes nothing. A
+            // group sync reuses its activation's ids, and closing one here
+            // would end the REQ that holds it. The early-tracked id stays
+            // tracked; a sweep's CLOSE for it is harmless.
+            result => {
+                return Err(TransportAdapterError::Subscription(match result {
+                    Ok(_) => format!(
+                        "subscribe registered on 0 of {} relays",
+                        plan.endpoints.len()
+                    ),
+                    Err(_) => "subscribe failed".to_owned(),
+                }));
+            }
+        };
 
         if !output.failed.is_empty() {
             tracing::warn!(
@@ -2698,13 +2734,6 @@ impl NostrSdkRelayClient {
                 .or_default(),
             outcomes,
         );
-
-        self.account_subscriptions
-            .write()
-            .await
-            .entry(plan.account_id)
-            .or_default()
-            .push_unique(plan.subscription_id);
         Ok(())
     }
 
@@ -2739,13 +2768,15 @@ impl NostrSdkRelayClient {
         // immediately.
         // Own the relay before awaiting its handshake. The pool helper keeps
         // a read lock that blocks registering other concurrent publish targets.
+        // `Err(true)` is a handshake that outlived the connect budget, kept
+        // apart from immediate dial errors so audit can tell them apart.
         let connected = match self.client.relay(endpoint.clone()).await {
             Ok(Some(relay)) => relay
                 .try_connect()
                 .timeout(SDK_RELAY_CONNECT_WAIT)
                 .await
-                .map_err(|_| ()),
-            Ok(None) | Err(_) => Err(()),
+                .map_err(|error| error.kind() == SdkErrorKind::Timeout),
+            Ok(None) | Err(_) => Err(false),
         };
         match connected {
             Ok(()) => Ok(endpoint),
@@ -2754,9 +2785,14 @@ impl NostrSdkRelayClient {
             // `TransportAdapterError::Publish` Display (see
             // `finish_publish_outcome`), which upper layers may log. The
             // endpoint stays available on the structured failure record.
-            Err(_) => Err(TransportEndpointFailure {
+            Err(timed_out) => Err(TransportEndpointFailure {
                 endpoint: transport_endpoint,
-                reason: "connect relay failed".to_owned(),
+                reason: if timed_out {
+                    "connect relay timed out"
+                } else {
+                    "connect relay failed"
+                }
+                .to_owned(),
                 kind: TransportEndpointFailureKind::RetryableUnavailable,
                 rejection_category: None,
             }),
@@ -3835,9 +3871,10 @@ impl NostrRelayClient for NostrSdkRelayClient {
         self.registration_log.lock().await.remove(account_id);
         let ids = self
             .account_subscriptions
-            .write()
+            .read()
             .await
-            .remove(account_id)
+            .get(account_id)
+            .cloned()
             .unwrap_or_default();
         tracing::debug!(
             target: "transport_nostr_adapter::sdk_client",
@@ -3845,27 +3882,36 @@ impl NostrRelayClient for NostrSdkRelayClient {
             subscription_count = ids.len(),
             "unsubscribing SDK account subscriptions"
         );
+        // Untrack each REQ only once its CLOSE went out. Removing every id up
+        // front would orphan the not-yet-closed REQs if the caller is dropped
+        // mid-sweep (a cancelled activation): still live on the relay, and
+        // re-sent on every reconnect, with nothing left to close them.
         let mut failed = Vec::new();
         for id in ids {
             if self.client.unsubscribe(&id).await.is_err() {
                 failed.push(id);
+                continue;
+            }
+            if let Some(tracked) = self.account_subscriptions.write().await.get_mut(account_id) {
+                tracked.retain(|tracked| tracked != &id);
+            }
+            if let Some(mut floors) = self.account_subscription_floors() {
+                floors.close(&id);
             }
         }
         if let Some(mut floors) = self.account_subscription_floors() {
             floors.close_all_except(&failed);
         }
-        if !failed.is_empty() {
-            self.account_subscriptions
-                .write()
-                .await
-                .entry(account_id.clone())
-                .or_default()
-                .extend(failed);
-            return Err(TransportAdapterError::Subscription(
-                "unsubscribe account failed".to_owned(),
-            ));
+        if failed.is_empty() {
+            let mut tracked = self.account_subscriptions.write().await;
+            if tracked.get(account_id).is_some_and(Vec::is_empty) {
+                tracked.remove(account_id);
+            }
+            return Ok(());
         }
-        Ok(())
+        Err(TransportAdapterError::Subscription(
+            "unsubscribe account failed".to_owned(),
+        ))
     }
 
     async fn publish_event(
@@ -7410,7 +7456,35 @@ mod tests {
             TransportEndpointFailureKind::RetryableUnavailable,
             "a failed connection proves the event was never exposed to the relay",
         );
+        assert_eq!(failures[0].reason, "connect relay failed");
         assert_eq!(sdk.relay_health().await.total_relays, 0);
+    }
+
+    /// mdk#2264: a handshake that outlives `SDK_RELAY_CONNECT_WAIT` must be
+    /// distinguishable from an immediate dial error in the per-relay reason.
+    #[tokio::test(start_paused = true)]
+    async fn publish_connect_timeout_is_reported_separately_from_dial_errors() {
+        // Bound and listening, but never accepted: the kernel completes TCP
+        // while the WebSocket handshake waits forever.
+        let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", silent.local_addr().unwrap()));
+        let sdk = signed_sdk(Keys::generate());
+        let dto = signed_group_event_dto();
+
+        let error = sdk
+            .publish_event(std::slice::from_ref(&endpoint), &dto, 1)
+            .await
+            .expect_err("an event cannot be published without a relay connection");
+
+        let failures = error.publish_endpoint_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].reason, "connect relay timed out");
+        assert_eq!(
+            failures[0].kind,
+            TransportEndpointFailureKind::RetryableUnavailable,
+            "a connect timeout proves the event was never sent",
+        );
+        drop(silent);
     }
 
     #[tokio::test(start_paused = true)]

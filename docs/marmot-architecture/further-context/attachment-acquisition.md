@@ -135,9 +135,9 @@ Bytes have no LRU. Publication enforces a caller-supplied account payload-byte
 budget and a 512 MiB storage ceiling per object; the existing stricter transport
 ciphertext cap remains in force (also 512 MiB, including AEAD overhead). Capacity refusal preserves existing objects and
 requires the caller to pause/retry. Filesystem free-space and WAL overhead admission
-belong to worker integration. Publication still binds the complete verified
-plaintext and SQLite can copy it; worker admission must account for that peak
-memory cost. Local storage reads return at most 1 MiB and recheck
+belong to worker integration. Publication copies the verified plaintext into
+chunk rows of at most 64 KiB, so SQLite keeps no whole-body copy beside the
+caller's buffer. Local storage reads return at most 1 MiB and recheck
 source visibility/expiry. Stored job status alone is not authorization to read.
 Due/expiry maintenance pages contain at most 64 entries and use dedicated indexes.
 
@@ -350,8 +350,10 @@ stalled server retaining that slot indefinitely. Raising the automatic cap readm
 failures, while integrity failures still require explicit retry. Invalid zero/over-ceiling policy
 values, including a quota smaller than the admission reservation, are rejected before mutation,
 and invalid Rust policy is rejected at runtime start. Disk reserves may intentionally exceed
-current free space; resource pressure is exposed as RetryScheduled with a retry time, without
-spending a transfer attempt or evicting existing bytes.
+current free space; retained-quota pressure is exposed as RetryScheduled with a retry time,
+without spending a transfer attempt or evicting existing bytes, while a body the device cannot
+publish parks as StorageBlocked with its checkpoint until free space covers its recorded
+target or the user retries (see the native attachment access contract).
 
 Release/binding publication, app cache adoption and device benchmarks remain C9. Local tests do
 not establish mobile throughput or background execution entitlement. See the native usage guide.

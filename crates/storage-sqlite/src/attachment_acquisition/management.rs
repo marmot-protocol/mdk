@@ -87,6 +87,7 @@ fn attention(s: AttachmentTransferState) -> bool {
     matches!(
         s,
         AttachmentTransferState::Failed
+            | AttachmentTransferState::StorageBlocked
             | AttachmentTransferState::RetryExhausted
             | AttachmentTransferState::PreviouslyAcquiredUnavailable
             | AttachmentTransferState::CompletedUnretained

@@ -554,6 +554,35 @@ impl SqliteAccountStorage {
             .collect()
     }
 
+    /// When unresolved epoch-gap recovery first said this group moved past
+    /// `local_epoch` without this device (mdk#2258), in wall-clock
+    /// milliseconds, or `None` when no such gap is open. Pending, parked and
+    /// user-retired obligations all count: none of them has caught the device
+    /// up, and retiring a "history may be incomplete" notice changes no MLS
+    /// state. Only recovery that clears the gap, or a local epoch above the
+    /// stalled one, closes it.
+    ///
+    /// The time is when the group's obligation row was first armed. Re-arming
+    /// it at a higher stalled epoch does not restart it, and nor does any
+    /// later revision (several of which, such as capacity deferral, flooding
+    /// can drive). A bound measured from it can end early, never be extended.
+    pub fn epoch_gap_recovery_open_since(
+        &self,
+        group_id: &[u8],
+        local_epoch: u64,
+    ) -> StorageResult<Option<u64>> {
+        let since: Option<i64> = self
+            .lock()?
+            .query_row_cached(
+                "SELECT MIN(created_at_ms) FROM account_recovery_obligations
+                 WHERE cause = 1 AND state IN (0, 2) AND group_id = ?1 AND stalled_epoch >= ?2",
+                params![group_id, u64_to_i64(local_epoch)?],
+                |row| row.get(0),
+            )
+            .storage()?;
+        since.map(i64_to_u64).transpose()
+    }
+
     /// Consume only the exact epochs one completed replay served. A newer arm
     /// written concurrently remains pending.
     pub fn clear_epoch_backfill_intents(

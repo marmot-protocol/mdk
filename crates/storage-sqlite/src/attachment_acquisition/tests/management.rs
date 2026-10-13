@@ -14,6 +14,60 @@ fn permitted(automatic: bool) -> AttachmentManagementPermission {
 }
 
 #[test]
+fn storage_blocked_jobs_need_attention_without_becoming_active_or_scheduled() {
+    let s = SqliteAccountStorage::in_memory().unwrap();
+    seed(&s, "parked");
+    let reference = request(&s, "parked");
+    let job = s
+        .claim_attachment_acquisition(&reference, 12, 100)
+        .unwrap()
+        .unwrap();
+    assert!(s.block_attachment_storage(&job, 8192, 12).unwrap());
+
+    for permission in [permitted(true), permitted(false)] {
+        let counts = s.attachment_job_counts(GROUP, 13, permission).unwrap();
+        assert!(counts.complete);
+        assert_eq!(counts.needs_attention, 1);
+        assert_eq!(counts.active, 0);
+        assert_eq!(counts.paused, 0);
+        assert_eq!(counts.other, 0);
+        let page = s
+            .attachment_jobs_page(
+                &AttachmentJobQuery {
+                    view: AttachmentJobView::NeedsAttention,
+                    ..chat_query()
+                },
+                50,
+                None,
+                13,
+                permission,
+            )
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert!(page.next_cursor.is_none());
+        let status = &page.entries[0].status;
+        assert_eq!(status.state, AttachmentTransferState::StorageBlocked);
+        assert_eq!(status.retry_at, None);
+        assert_eq!(status.reference.as_ref(), Some(&reference));
+        assert!(
+            s.attachment_jobs_page(
+                &AttachmentJobQuery {
+                    view: AttachmentJobView::Active,
+                    ..chat_query()
+                },
+                50,
+                None,
+                13,
+                permission,
+            )
+            .unwrap()
+            .entries
+            .is_empty()
+        );
+    }
+}
+
+#[test]
 fn managed_download_paging_counts_and_filters_are_local_bounded_and_source_bound() {
     let s = SqliteAccountStorage::in_memory().unwrap();
     for n in 0..73 {

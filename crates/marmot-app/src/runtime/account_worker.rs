@@ -479,6 +479,10 @@ pub(crate) enum AccountWorkerCommand {
         notice_id: String,
         respond: oneshot::Sender<Result<bool, AppError>>,
     },
+    AcknowledgeGroupCatchingUp {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<bool, AppError>>,
+    },
     ConfirmGroupRejoin {
         welcome_id: cgka_traits::MessageId,
         token: Vec<u8>,
@@ -4061,6 +4065,7 @@ async fn complete_media_http(
             if let Ok(crate::client::AcquiredMediaBody::File(file)) = result {
                 let storage = client.app.account_storage(&client.state.label);
                 let fallback = super::attachment_controls::default_policy(&client.app.config);
+                let directory = client.app.account_dir(&client.state.label);
                 let tx = media_http.tx.clone();
                 let lifetime = media_http.worker_lifetime.subscribe();
                 let lifecycle = shared.lifecycle();
@@ -4071,6 +4076,7 @@ async fn complete_media_http(
                         attachments::complete_acquired_stored(
                             &storage,
                             &fallback,
+                            &directory,
                             &job,
                             Ok(crate::client::AcquiredMediaBody::File(file)),
                             byte_budget,
@@ -5302,6 +5308,17 @@ fn account_worker_command_future<'a>(
             );
             true
         }),
+        AccountWorkerCommand::AcknowledgeGroupCatchingUp { group_id, respond } => {
+            Box::pin(async move {
+                let _ = respond_diagnosed(
+                    shared,
+                    storage_permit.as_ref(),
+                    respond,
+                    client.acknowledge_group_catching_up(&group_id),
+                );
+                true
+            })
+        }
         AccountWorkerCommand::DismissHistoryNotice { notice_id, respond } => {
             Box::pin(async move {
                 let result = client.dismiss_history_notice(&notice_id);

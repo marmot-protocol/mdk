@@ -14,6 +14,8 @@ The existing `attempt`, `received`, optional `total`, `retry_at` and transfer-st
 
 ## Existing per-item actions
 
+`StorageBlocked` jobs appear in the attention page and count. They are parked for insufficient disk space, not active transfers or scheduled network retries, and have no retry timer. Show a storage prompt and the existing per-item Retry action; readmission remains owned by the acquisition worker.
+
 Each observed transfer status carries its existing opaque attachment reference. Use `control_attachment` to retry or cancel an eligible item. The established account/store/source checks and retry budgets continue to apply; the health projection adds no actuation API or bulk cancellation. A read with unavailable evidence offers no reference. Cancellation is separate from removal and cache cleanup, and preserves Ready bytes. History notice dismissal uses the existing revision-fenced `dismiss_history_notice` operation and does not mean that history was recovered.
 
 ## Observation and privacy

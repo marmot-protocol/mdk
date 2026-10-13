@@ -610,26 +610,33 @@ fn attachment_admission_rejects_source_changed_since_shared_parser_validation() 
 fn attachment_small_reads_do_not_materialize_the_whole_blob() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     seed(&store, "one");
+    seed(&store, "legacy");
     let bytes = vec![7u8; 2 * 1024 * 1024];
-    let hash: [u8; 32] = Sha256::digest(&bytes).into();
-    let mut event = source("one");
-    event.tags[0][2] = format!("x {}", hex::encode(hash));
-    store.record_app_event(&event).unwrap();
-    let mut selection = selected("one");
-    selection.slot = serde_json::to_value(&event.tags[0]).unwrap();
-    let AttachmentDemand::Requested(reference) = store
-        .request_attachment_acquisition(GROUP, &selection, hash, 11)
-        .unwrap()
-    else {
-        panic!("missing demand")
-    };
-    let job = store
-        .claim_attachment_acquisition(&reference, 11, 100)
-        .unwrap()
-        .unwrap();
+    let job = claim_body(&store, "one", &bytes);
     store
-        .complete_attachment_acquisition(&job, &bytes, 12, bytes.len() as u64)
+        .complete_attachment_acquisition(&job, &bytes, 12, 2 * bytes.len() as u64)
         .unwrap();
+    // A large array row as upgraded databases still hold one: bound whole and
+    // left at the migration's `byte_len=-1` sentinel, so sizing reads `bytes`.
+    let legacy = claim_body(&store, "legacy", &bytes);
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "INSERT INTO retained_attachment_bytes(token,bytes) VALUES(?1,?2)",
+            params![legacy.reference.token, bytes],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE retained_attachment_bytes SET byte_len=-1 WHERE token=?1",
+            [&legacy.reference.token],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL WHERE token=?1",
+            [&legacy.reference.token],
+        )
+        .unwrap();
+    }
     {
         let conn = store.lock().unwrap();
         // SAFETY: the guard exclusively owns this live connection. Lowering its
@@ -642,21 +649,171 @@ fn attachment_small_reads_do_not_materialize_the_whole_blob() {
             );
         }
     }
+    // Sizing and a small read of the chunked body and of the legacy array row
+    // (through `blob_open`) never build a whole-body value.
+    for (message, job) in [("one", &job), ("legacy", &legacy)] {
+        assert_eq!(
+            store
+                .retained_attachment_asset(GROUP, message, &format!("source-{message}"), 0, 12)
+                .unwrap()
+                .unwrap()
+                .byte_count,
+            bytes.len() as u64,
+        );
+        assert_eq!(
+            store
+                .read_retained_attachment(&job.reference, 12, 1024 * 1024, 17)
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            &[7; 17]
+        );
+    }
+}
+
+/// Request and claim one slot whose source declares `bytes` as its plaintext.
+fn claim_body(store: &SqliteAccountStorage, message: &str, bytes: &[u8]) -> AttachmentAcquisition {
+    let hash: [u8; 32] = Sha256::digest(bytes).into();
+    let mut event = source(message);
+    event.tags[0][2] = format!("x {}", hex::encode(hash));
+    store.record_app_event(&event).unwrap();
+    let mut selection = selected(message);
+    selection.slot = serde_json::to_value(&event.tags[0]).unwrap();
+    let AttachmentDemand::Requested(reference) = store
+        .request_attachment_acquisition(GROUP, &selection, hash, 11)
+        .unwrap()
+    else {
+        panic!("missing demand")
+    };
+    store
+        .claim_attachment_acquisition(&reference, 11, 100)
+        .unwrap()
+        .unwrap()
+}
+
+#[test]
+fn attachment_publication_never_holds_more_than_one_chunk_in_a_sqlite_value() {
+    const CHUNK: usize = ATTACHMENT_STAGING_CHUNK_BYTES;
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "array");
+    seed(&store, "chunked");
+    let array: Vec<u8> = (0..CHUNK).map(|i| (i % 251) as u8).collect();
+    let chunked: Vec<u8> = (0..3 * CHUNK + 5).map(|i| (i % 241) as u8).collect();
+    let array_job = claim_body(&store, "array", &array);
+    let chunked_job = claim_body(&store, "chunked", &chunked);
+    {
+        let conn = store.lock().unwrap();
+        // SAFETY: the guard exclusively owns this live connection. Any value
+        // longer than one staging chunk, such as a whole-body zeroblob or
+        // record, now fails deterministically instead of being allocated.
+        unsafe {
+            rusqlite::ffi::sqlite3_limit(
+                conn.handle(),
+                rusqlite::ffi::SQLITE_LIMIT_LENGTH,
+                CHUNK as i32 + 1024,
+            );
+        }
+    }
+    for (job, body) in [(&array_job, &array), (&chunked_job, &chunked)] {
+        assert_eq!(
+            store
+                .complete_attachment_acquisition(job, body, 12, 1 << 30)
+                .unwrap(),
+            AttachmentPublishResult::Published
+        );
+    }
+    let (files, chunks): (i64, i64) = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM retained_attachment_files WHERE completed=1),
+                    (SELECT count(*) FROM retained_attachment_chunks)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    // One staging chunk stays an array row; a larger body is one sealed file.
+    assert_eq!((files, chunks), (1, 4));
+    assert_eq!(
+        store.retained_attachment_byte_count().unwrap(),
+        (array.len() + chunked.len()) as u64
+    );
+    for (message, body) in [("array", &array), ("chunked", &chunked)] {
+        let asset = store
+            .retained_attachment_asset(GROUP, message, &format!("source-{message}"), 0, 12)
+            .unwrap()
+            .unwrap();
+        assert_eq!(asset.byte_count, body.len() as u64);
+        for (offset, len) in [(0, 17), (CHUNK - 6, 20), (body.len() - 3, 3)] {
+            assert_eq!(
+                store
+                    .read_retained_attachment(&asset.reference, 12, offset as u64, len)
+                    .unwrap()
+                    .unwrap()
+                    .as_slice(),
+                &body[offset..(offset + len).min(body.len())]
+            );
+        }
+    }
+    assert!(store.remove_local_attachment(GROUP, "chunked", 0).unwrap());
+    assert_eq!(
+        store.retained_attachment_byte_count().unwrap(),
+        array.len() as u64
+    );
+    let bodies: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM attachment_chunk_bodies)+(SELECT count(*) FROM retained_attachment_chunks)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(bodies, 0);
+}
+
+#[test]
+fn chunk_publication_failing_mid_body_commits_nothing() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "one");
+    let body: Vec<u8> = (0..3 * ATTACHMENT_STAGING_CHUNK_BYTES + 5)
+        .map(|i| (i % 239) as u8)
+        .collect();
+    let job = claim_body(&store, "one", &body);
+    sql(
+        &store,
+        "CREATE TEMP TRIGGER fail_second_chunk BEFORE INSERT ON main.retained_attachment_chunks
+         WHEN NEW.offset>0 BEGIN SELECT RAISE(ABORT,'injected chunk failure'); END;",
+    );
+    assert!(
+        store
+            .complete_attachment_acquisition(&job, &body, 12, 1 << 30)
+            .is_err()
+    );
+    let rows: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM retained_attachment_bytes)+(SELECT count(*) FROM retained_attachment_files)
+                   +(SELECT count(*) FROM attachment_chunk_bodies)+(SELECT count(*) FROM retained_attachment_chunks)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0);
+    assert_eq!(store.retained_attachment_byte_count().unwrap(), 0);
+    // The rolled-back attempt still owns its lease and publishes once the
+    // fault is gone.
+    sql(&store, "DROP TRIGGER temp.fail_second_chunk");
     assert_eq!(
         store
-            .retained_attachment_asset(GROUP, "one", "source-one", 0, 12)
-            .unwrap()
-            .unwrap()
-            .byte_count,
-        bytes.len() as u64,
+            .complete_attachment_acquisition(&job, &body, 12, 1 << 30)
+            .unwrap(),
+        AttachmentPublishResult::Published
     );
     assert_eq!(
-        store
-            .read_retained_attachment(&reference, 12, 1024 * 1024, 17)
-            .unwrap()
-            .unwrap()
-            .as_slice(),
-        &[7; 17]
+        store.retained_attachment_byte_count().unwrap(),
+        body.len() as u64
     );
 }
 
@@ -2863,6 +3020,952 @@ fn attachment_idle_permission_resume_is_read_only() {
         store.resume_permitted_attachments(12, [true; 4]).unwrap(),
         0
     );
+}
+
+/// Free space beyond the reserve that readmits a job parked with `headroom`.
+fn fits(headroom: u64) -> u64 {
+    headroom + STORAGE_READMIT_MARGIN_BYTES
+}
+fn parked_headroom(store: &SqliteAccountStorage, asset: &AttachmentAssetRef) -> Option<i64> {
+    column(store, asset, "storage_blocked_headroom")
+}
+fn column(store: &SqliteAccountStorage, asset: &AttachmentAssetRef, name: &str) -> Option<i64> {
+    store
+        .lock()
+        .unwrap()
+        .query_row(
+            &format!("SELECT {name} FROM attachment_acquisition WHERE token=?1"),
+            [&asset.token],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+fn park(store: &SqliteAccountStorage, job: &AttachmentAcquisition, headroom: u64, now: u64) {
+    assert!(store.block_attachment_storage(job, headroom, now).unwrap());
+}
+fn due(store: &SqliteAccountStorage, asset: &AttachmentAssetRef) -> Option<u64> {
+    store
+        .attachment_acquisition_status(asset)
+        .unwrap()
+        .unwrap()
+        .due
+}
+/// Readmit with a transfer limit small enough that admission never interferes.
+fn readmit(
+    store: &SqliteAccountStorage,
+    now: u64,
+    reserve: u64,
+    free: u64,
+    automatic: bool,
+) -> usize {
+    store
+        .readmit_storage_blocked_attachments(now, reserve, free, 1, automatic)
+        .unwrap()
+}
+
+/// mdk#2239: a storage-parked job keeps its checkpoint, never rejoins the due
+/// page on its own, readmits exactly when its recorded headroom plus the margin
+/// fits below the free space, and clears on either retry path.
+#[test]
+fn storage_block_parks_until_space_or_retry_and_keeps_checkpoints() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    for m in ["disk", "cancel", "size"] {
+        seed(&store, m);
+    }
+    let asset = request(&store, "disk");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    store
+        .checkpoint_attachment_partial(&job, &partial_identity(10), 0, b"abc", 12, 100)
+        .unwrap();
+    park(&store, &job, 8192, 12);
+    assert!(
+        !store.block_attachment_storage(&job, 8192, 12).unwrap(),
+        "only the live attempt parks"
+    );
+    assert_eq!(
+        transfer(&store, "disk", true).state,
+        AttachmentTransferState::StorageBlocked
+    );
+    assert_eq!(transfer(&store, "disk", true).retry_at, None);
+    assert_eq!(partial_usage(&store), 3, "checkpoints survive parking");
+    assert!(
+        store
+            .attachment_transfer_candidates(20, 64, true)
+            .unwrap()
+            .is_empty()
+    );
+    // Cancelled and size-blocked work stays parked whatever the free space.
+    let cancelled = request(&store, "cancel");
+    let cancelled_job = store
+        .claim_attachment_acquisition(&cancelled, 12, 100)
+        .unwrap()
+        .unwrap();
+    store.cancel_attachment_acquisition(&cancelled).unwrap();
+    assert!(
+        !store
+            .block_attachment_storage(&cancelled_job, 1, 12)
+            .unwrap()
+    );
+    let sized = request(&store, "size");
+    let sized_job = store
+        .claim_attachment_acquisition(&sized, 12, 100)
+        .unwrap()
+        .unwrap();
+    store
+        .block_attachment_size_policy(&sized_job, 64, 13)
+        .unwrap();
+    assert_eq!(
+        readmit(&store, 21, 1000, 1000 + fits(8192) - 1, true),
+        0,
+        "one byte short of the target plus margin keeps the job parked"
+    );
+    assert_eq!(readmit(&store, 21, 1000, 999, true), 0);
+    assert_eq!(
+        readmit(&store, 21, 1000, 1000 + fits(8192), false),
+        0,
+        "an automatic row waits for automatic acquisition to be enabled"
+    );
+    assert_eq!(readmit(&store, 21, 1000, 1000 + fits(8192), true), 1);
+    assert_eq!(
+        transfer(&store, "disk", true).state,
+        AttachmentTransferState::Queued
+    );
+    assert_eq!(parked_headroom(&store, &asset), None);
+    assert_eq!(
+        store.attachment_transfer_candidates(21, 64, true).unwrap(),
+        vec![asset.clone()],
+        "a first park readmits without delay"
+    );
+    assert_eq!(partial_usage(&store), 3, "readmission keeps the prefix");
+    assert_eq!(
+        transfer(&store, "cancel", true).state,
+        AttachmentTransferState::Cancelled
+    );
+    assert_eq!(
+        transfer(&store, "size", true).state,
+        AttachmentTransferState::PolicyBlocked
+    );
+    assert_eq!(
+        readmit(&store, 23, 0, u64::MAX, true),
+        0,
+        "nothing else is storage-parked"
+    );
+    // A second and third park wait out the park streak before they are due
+    // again, so a target that free space keeps crossing cannot drive a hot loop.
+    let job = store
+        .claim_attachment_acquisition(&asset, 24, 100)
+        .unwrap()
+        .unwrap();
+    park(&store, &job, 8192, 24);
+    assert_eq!(readmit(&store, 30, 0, fits(8192), true), 1);
+    assert_eq!(due(&store, &asset), Some(45), "second park: 15 s");
+    assert!(
+        store
+            .attachment_transfer_candidates(44, 64, true)
+            .unwrap()
+            .is_empty()
+    );
+    let job = store
+        .claim_attachment_acquisition(&asset, 45, 100)
+        .unwrap()
+        .unwrap();
+    park(&store, &job, 8192, 45);
+    assert_eq!(readmit(&store, 50, 0, fits(8192), true), 1);
+    assert_eq!(due(&store, &asset), Some(80), "third park: 30 s");
+    // Checkpoint progress ends the park streak: the next park is immediate.
+    let job = store
+        .claim_attachment_acquisition(&asset, 80, 100)
+        .unwrap()
+        .unwrap();
+    store
+        .checkpoint_attachment_partial(&job, &partial_identity(10), 3, b"de", 80, 100)
+        .unwrap();
+    assert_eq!(column(&store, &asset, "storage_park_count"), Some(0));
+    park(&store, &job, 8192, 80);
+    assert_eq!(readmit(&store, 81, 0, fits(8192), true), 1);
+    assert_eq!(due(&store, &asset), Some(81), "progress reset the streak");
+    // Explicit retry readmits at once, clears the parked marker on both paths
+    // and forgets earlier parks, so a user who freed space is not made to wait.
+    let job = store
+        .claim_attachment_acquisition(&asset, 81, 100)
+        .unwrap()
+        .unwrap();
+    park(&store, &job, 8192, 81);
+    let job = {
+        assert_eq!(readmit(&store, 82, 0, fits(8192), true), 1);
+        store
+            .claim_attachment_acquisition(&asset, 97, 200)
+            .unwrap()
+            .unwrap()
+    };
+    park(&store, &job, 8192, 97);
+    assert_eq!(column(&store, &asset, "storage_park_count"), Some(3));
+    assert!(store.retry_attachment_acquisition(&asset, 98).unwrap());
+    assert_eq!(
+        transfer(&store, "disk", true).state,
+        AttachmentTransferState::Queued
+    );
+    assert_eq!(parked_headroom(&store, &asset), None);
+    assert_eq!(column(&store, &asset, "storage_park_count"), Some(0));
+    let job = store
+        .claim_attachment_acquisition(&asset, 98, 200)
+        .unwrap()
+        .unwrap();
+    park(&store, &job, 8192, 98);
+    assert_eq!(readmit(&store, 99, 0, fits(8192), true), 1);
+    assert_eq!(
+        due(&store, &asset),
+        Some(99),
+        "no inherited backoff after retry"
+    );
+    let job = store
+        .claim_attachment_acquisition(&asset, 99, 200)
+        .unwrap()
+        .unwrap();
+    park(&store, &job, 8192, 99);
+    assert!(store.explicitly_retry_attachment(&asset, 100).unwrap());
+    assert_eq!(
+        transfer(&store, "disk", false).state,
+        AttachmentTransferState::Queued
+    );
+    assert_eq!(parked_headroom(&store, &asset), None);
+    assert_eq!(column(&store, &asset, "storage_park_count"), Some(0));
+    assert_eq!(
+        readmit(&store, 101, 0, u64::MAX, true),
+        0,
+        "retry cleared the parked marker"
+    );
+    // Retry racing readmission in either order leaves one queued row.
+    let job = store
+        .claim_attachment_acquisition(&asset, 101, 200)
+        .unwrap()
+        .unwrap();
+    park(&store, &job, 8192, 101);
+    assert_eq!(
+        readmit(&store, 102, 0, fits(8192), false),
+        1,
+        "an explicitly retried row readmits while automatic work is disabled"
+    );
+    assert!(store.explicitly_retry_attachment(&asset, 102).unwrap());
+    assert_eq!(
+        store
+            .attachment_acquisition_status(&asset)
+            .unwrap()
+            .unwrap()
+            .state,
+        AttachmentAcquisitionState::Queued
+    );
+    assert_eq!(parked_headroom(&store, &asset), None);
+}
+
+/// Readmission never outruns admission: a parked row whose target fits is left
+/// parked while free space is still below the reserve plus four transfer
+/// limits, instead of being bounced back to a retry timer.
+#[test]
+fn storage_readmission_waits_for_admission_capacity() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "small");
+    let asset = request(&store, "small");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    park(&store, &job, 1024, 12);
+    let limit = 2 * 1024 * 1024;
+    assert!(
+        fits(1024) < 4 * limit,
+        "the target fits before admission would"
+    );
+    assert_eq!(
+        store
+            .readmit_storage_blocked_attachments(13, 1000, 1000 + 4 * limit - 1, limit, true)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        transfer(&store, "small", true).state,
+        AttachmentTransferState::StorageBlocked
+    );
+    assert_eq!(
+        store
+            .readmit_storage_blocked_attachments(13, 1000, 1000 + 4 * limit, limit, true)
+            .unwrap(),
+        1
+    );
+}
+
+/// Cancelling a storage-parked job clears its marker, so the kept prefix
+/// expires and is pruned like any other cancelled checkpoint instead of
+/// pinning quota forever.
+#[test]
+fn cancelled_storage_park_releases_its_prefix_on_expiry() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "parked");
+    let asset = request(&store, "parked");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    store
+        .checkpoint_attachment_partial(&job, &partial_identity(10), 0, b"abc", 12, 100)
+        .unwrap();
+    park(&store, &job, 8192, 12);
+    store.cancel_attachment_acquisition(&asset).unwrap();
+    assert_eq!(parked_headroom(&store, &asset), None);
+    assert_eq!(
+        transfer(&store, "parked", true).state,
+        AttachmentTransferState::Cancelled
+    );
+    assert_eq!(readmit(&store, 13, 0, u64::MAX, true), 0);
+    assert_eq!(
+        partial_usage(&store),
+        3,
+        "cancellation keeps the prefix until expiry"
+    );
+    let later = 12 + 48 * 60 * 60;
+    assert_eq!(store.prune_attachment_partials(later, 64).unwrap(), 1);
+    assert_eq!(
+        partial_usage(&store),
+        0,
+        "an expired cancelled prefix is reclaimed"
+    );
+}
+
+/// Leaving the parked state through permission paths never leaves a stale
+/// storage marker behind, so a later ordinary failure renders as `Failed`.
+#[test]
+fn permission_transitions_clear_the_storage_marker() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "paused");
+    let asset = request(&store, "paused");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    store.pause_automatic_attachments(13).unwrap();
+    park(&store, &job, 8192, 13);
+    assert_eq!(
+        parked_headroom(&store, &asset),
+        None,
+        "a permission-owned park carries no storage target"
+    );
+    assert_eq!(
+        store.resume_permitted_attachments(40, [true; 4]).unwrap(),
+        1
+    );
+    assert_eq!(parked_headroom(&store, &asset), None);
+    let job = store
+        .claim_attachment_acquisition(&asset, 41, 100)
+        .unwrap()
+        .unwrap();
+    park(&store, &job, 8192, 41);
+    assert_eq!(parked_headroom(&store, &asset), Some(8192));
+    assert_eq!(readmit(&store, 42, 0, u64::MAX, true), 1);
+    store.park_attachment_permission(&asset).unwrap();
+    assert_eq!(parked_headroom(&store, &asset), None);
+    assert_eq!(
+        store.resume_permitted_attachments(43, [true; 4]).unwrap(),
+        1
+    );
+    let now = due(&store, &asset).unwrap();
+    assert_eq!(
+        now, 43,
+        "a permission-owned park does not count toward the park streak"
+    );
+    let job = store
+        .claim_attachment_acquisition(&asset, now, now + 100)
+        .unwrap()
+        .unwrap();
+    store.fail_attachment_acquisition(&job, None).unwrap();
+    assert_eq!(
+        transfer(&store, "paused", true).state,
+        AttachmentTransferState::Failed,
+        "a plain failure after a park is not a storage park"
+    );
+}
+
+/// A storage park refunds the automatic-history claim it consumed: a row that
+/// parks four times is still attempted, and its prefix is not discarded as
+/// exhausted work.
+#[test]
+fn storage_parks_do_not_spend_the_automatic_history_budget() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "auto");
+    let asset = request(&store, "auto");
+    store.enable_attachment_automatic_history(&asset).unwrap();
+    let mut now = 12;
+    for _ in 0..4 {
+        let job = store
+            .claim_attachment_acquisition(&asset, now, now + 100)
+            .unwrap()
+            .expect("claim");
+        park(&store, &job, 8192, now);
+        assert_eq!(column(&store, &asset, "acquisition_attempts"), Some(0));
+        now += 5000;
+        assert_eq!(readmit(&store, now, 0, u64::MAX, true), 1);
+        now = due(&store, &asset).unwrap();
+    }
+    assert_eq!(
+        transfer(&store, "auto", true).state,
+        AttachmentTransferState::Queued
+    );
+    assert!(
+        store
+            .claim_attachment_acquisition(&asset, now, now + 100)
+            .unwrap()
+            .is_some(),
+        "readmitted work must be attempted"
+    );
+}
+
+/// Each park records the need its own check proved, even below an earlier
+/// park's, and readmissions are spaced by the park streak, 15 s doubling to an
+/// hour, so a body that keeps starting over cannot refetch faster than that.
+/// Explicit retry forgets the streak.
+#[test]
+fn repeated_parks_record_their_own_need_and_back_off() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "chunked");
+    let asset = request(&store, "chunked");
+    let mib = 1024 * 1024;
+    let mut now = 12;
+    let mut delays = vec![];
+    for target in [445, 470, 460, 480, 485, 486, 487, 488, 489, 490, 491, 492] {
+        let job = store
+            .claim_attachment_acquisition(&asset, now, now + 100)
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .block_attachment_storage(&job, target * mib, now)
+                .unwrap()
+        );
+        assert_eq!(parked_headroom(&store, &asset), Some((target * mib) as i64));
+        assert_eq!(readmit(&store, now, 0, fits(target * mib) - 1, true), 0);
+        assert_eq!(readmit(&store, now, 0, fits(target * mib), true), 1);
+        let next = due(&store, &asset).unwrap();
+        delays.push(next - now);
+        now = next;
+    }
+    assert_eq!(
+        delays,
+        [0, 15, 30, 60, 120, 240, 480, 960, 1920, 3600, 3600, 3600],
+        "readmissions are spaced by the park streak, at most one an hour once it saturates"
+    );
+    let job = store
+        .claim_attachment_acquisition(&asset, now, now + 100)
+        .unwrap()
+        .unwrap();
+    assert!(store.block_attachment_storage(&job, 7 * mib, now).unwrap());
+    assert!(store.retry_attachment_acquisition(&asset, now + 1).unwrap());
+    assert_eq!(column(&store, &asset, "storage_park_count"), Some(0));
+}
+
+/// An explicit Retry of a job parked for longer than the idle expiry resumes
+/// from its kept prefix through either retry API, instead of pruning it and
+/// refetching the body from zero.
+#[test]
+fn retry_after_a_park_longer_than_a_day_keeps_the_prefix() {
+    for explicit in [false, true] {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        seed(&store, "parked");
+        let asset = request(&store, "parked");
+        let job = store
+            .claim_attachment_acquisition(&asset, 12, 100)
+            .unwrap()
+            .unwrap();
+        store
+            .checkpoint_attachment_partial(&job, &partial_identity(10), 0, b"abc", 12, 100)
+            .unwrap();
+        park(&store, &job, 8192, 12);
+        let later = 12 + 72 * 60 * 60;
+        assert_eq!(
+            store.prune_attachment_partials(later, 64).unwrap(),
+            0,
+            "parked prefixes are exempt"
+        );
+        if explicit {
+            assert!(store.explicitly_retry_attachment(&asset, later).unwrap());
+        } else {
+            assert!(store.retry_attachment_acquisition(&asset, later).unwrap());
+        }
+        assert_eq!(
+            store.prune_attachment_partials(later, 64).unwrap(),
+            0,
+            "the next tick prunes nothing once the row is queued"
+        );
+        let job = store
+            .claim_attachment_acquisition(&asset, later, later + 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .attachment_partial_extent(&job, later, (&[1; 32], &[2; 32]))
+                .unwrap(),
+            Some((10, 3)),
+            "explicit={explicit}"
+        );
+        assert_eq!(
+            store
+                .load_attachment_partial(&job, later, 100, Some((&[1; 32], &[2; 32])))
+                .unwrap()
+                .unwrap()
+                .bytes,
+            b"abc"
+        );
+    }
+}
+
+/// A storage-parked prefix is kept for at most a week after its latest park:
+/// past that it is pruned and releases its quota reservation, while the row
+/// stays parked and simply starts the body over when it is readmitted.
+#[test]
+fn storage_parked_prefixes_expire_after_the_maximum_parked_age() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "stale");
+    let asset = request(&store, "stale");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    store
+        .checkpoint_attachment_partial(&job, &partial_identity(10), 0, b"abc", 12, 100)
+        .unwrap();
+    park(&store, &job, 8192, 12);
+    let reserved = |store: &SqliteAccountStorage| -> u64 {
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT reserved_bytes FROM attachment_partial_usage WHERE id=1",
+                [],
+                |r| nonnegative(r, 0),
+            )
+            .unwrap()
+    };
+    assert_eq!(reserved(&store), 10);
+    let limit = 12 + STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS;
+    assert_eq!(store.prune_attachment_partials(limit - 1, 64).unwrap(), 0);
+    assert_eq!(partial_usage(&store), 3);
+    assert_eq!(store.prune_attachment_partials(limit, 64).unwrap(), 1);
+    assert_eq!(partial_usage(&store), 0);
+    assert_eq!(reserved(&store), 0, "the quota reservation is released");
+    assert_eq!(
+        parked_headroom(&store, &asset),
+        Some(8192),
+        "the target is unchanged; a next attempt that needs more parks again"
+    );
+    assert_eq!(
+        transfer(&store, "stale", true).state,
+        AttachmentTransferState::StorageBlocked,
+        "the row stays parked without its prefix"
+    );
+    assert_eq!(readmit(&store, limit, 0, u64::MAX, true), 1);
+}
+
+/// A permission-owned park does not advance the storage park streak,
+/// cancellation clears it, and every park refunds the claim streak
+/// so a later network failure backs off as if the parks never happened.
+#[test]
+fn storage_park_streak_counts_only_storage_owned_parks() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "streak");
+    let asset = request(&store, "streak");
+    for now in [12, 13] {
+        let job = store
+            .claim_attachment_acquisition(&asset, now, now + 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(column(&store, &asset, "attempts"), Some(1));
+        assert!(store.block_attachment_storage(&job, 8192, now).unwrap());
+        assert_eq!(
+            column(&store, &asset, "attempts"),
+            Some(0),
+            "the park refunds its claim"
+        );
+        assert_eq!(readmit(&store, now, 0, u64::MAX, true), 1);
+        sql(&store, "UPDATE attachment_acquisition SET due=0");
+    }
+    assert_eq!(column(&store, &asset, "storage_park_count"), Some(2));
+    let job = store
+        .claim_attachment_acquisition(&asset, 14, 100)
+        .unwrap()
+        .unwrap();
+    store.pause_automatic_attachments(14).unwrap();
+    assert!(store.block_attachment_storage(&job, 1 << 20, 14).unwrap());
+    assert_eq!(column(&store, &asset, "storage_park_count"), Some(2));
+    assert_eq!(column(&store, &asset, "attempts"), Some(0));
+    assert_eq!(
+        store.resume_permitted_attachments(15, [true; 4]).unwrap(),
+        1
+    );
+    sql(&store, "UPDATE attachment_acquisition SET due=0");
+    // A network failure after the parks backs off from one claim, not four.
+    let job = store
+        .claim_attachment_acquisition(&asset, 15, 100)
+        .unwrap()
+        .unwrap();
+    assert_eq!(column(&store, &asset, "attempts"), Some(1));
+    store.fail_attachment_acquisition(&job, Some(30)).unwrap();
+    store.cancel_attachment_acquisition(&asset).unwrap();
+    assert_eq!(column(&store, &asset, "storage_park_count"), Some(0));
+}
+
+/// A verified-body shortage under a revoked automatic permission parks under
+/// the permission owner: the row waits as `Paused`, keeps its prefix, and the
+/// permission readmission path requeues it for a fresh capacity check.
+#[test]
+fn storage_block_under_permission_pause_stays_permission_owned() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "paused");
+    let asset = request(&store, "paused");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    store
+        .checkpoint_attachment_partial(&job, &partial_identity(10), 0, b"abc", 12, 100)
+        .unwrap();
+    store.pause_automatic_attachments(13).unwrap();
+    park(&store, &job, 8192, 13);
+    assert_eq!(
+        transfer(&store, "paused", true).state,
+        AttachmentTransferState::Paused
+    );
+    assert_eq!(partial_usage(&store), 3);
+    assert_eq!(
+        readmit(&store, 14, 0, u64::MAX, true),
+        0,
+        "permission, not space, owns the row"
+    );
+    assert_eq!(
+        store.resume_permitted_attachments(40, [true; 4]).unwrap(),
+        1
+    );
+    assert_eq!(
+        transfer(&store, "paused", true).state,
+        AttachmentTransferState::Queued
+    );
+    assert_eq!(partial_usage(&store), 3);
+    let job = store
+        .claim_attachment_acquisition(&asset, 41, 100)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        parked_headroom(&store, &asset),
+        None,
+        "a claim starts clean"
+    );
+    park(&store, &job, 8192, 41);
+    assert_eq!(
+        transfer(&store, "paused", true).state,
+        AttachmentTransferState::StorageBlocked
+    );
+}
+
+/// The 24-hour checkpoint expiry skips storage-parked jobs, and parking and
+/// readmission refresh it, so a prefix kept through a park longer than a day
+/// still loads for the readmitted attempt.
+#[test]
+fn storage_parked_checkpoints_are_exempt_from_idle_expiry() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    for m in ["parked", "idle"] {
+        seed(&store, m);
+    }
+    let parked = request(&store, "parked");
+    let job = store
+        .claim_attachment_acquisition(&parked, 12, 100)
+        .unwrap()
+        .unwrap();
+    store
+        .checkpoint_attachment_partial(&job, &partial_identity(10), 0, b"abc", 12, 100)
+        .unwrap();
+    park(&store, &job, 8192, 12);
+    let idle = request(&store, "idle");
+    let idle_job = store
+        .claim_attachment_acquisition(&idle, 12, 100)
+        .unwrap()
+        .unwrap();
+    store
+        .checkpoint_attachment_partial(&idle_job, &partial_identity(10), 0, b"abcd", 12, 100)
+        .unwrap();
+    assert_eq!(partial_usage(&store), 7);
+    let far_future = 12 + 48 * 60 * 60;
+    assert_eq!(store.prune_attachment_partials(far_future, 64).unwrap(), 1);
+    assert_eq!(partial_usage(&store), 3, "only the idle prefix expired");
+    assert_eq!(readmit(&store, far_future, 0, u64::MAX, true), 1);
+    let job = store
+        .claim_attachment_acquisition(&parked, far_future, far_future + 100)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .attachment_partial_extent(&job, far_future + 1, (&[1; 32], &[2; 32]))
+            .unwrap(),
+        Some((10, 3)),
+        "the kept checkpoint is usable by the readmitted attempt"
+    );
+    let restored = store
+        .load_attachment_partial(&job, far_future + 1, 100, Some((&[1; 32], &[2; 32])))
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.bytes, b"abc");
+    store
+        .fail_attachment_acquisition(&job, Some(far_future + 2))
+        .unwrap();
+    assert!(
+        store
+            .retry_attachment_acquisition(&parked, far_future + 2)
+            .unwrap()
+    );
+    let much_later = far_future + 48 * 60 * 60;
+    assert_eq!(store.prune_attachment_partials(much_later, 64).unwrap(), 1);
+    assert_eq!(
+        partial_usage(&store),
+        0,
+        "a retried job's prefix expires normally"
+    );
+}
+
+/// A full database during publication is a capacity error that commits
+/// nothing and leaves the attempt live, so the worker can park the job; once
+/// room exists the same attempt publishes.
+#[test]
+fn publication_into_a_full_database_commits_nothing_and_reports_capacity() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "full");
+    let asset = request(&store, "full");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    let body: Vec<u8> = (0..2 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let digest: [u8; 32] = Sha256::digest(&body).into();
+    sql(
+        &store,
+        &format!(
+            "UPDATE attachment_acquisition SET plaintext_digest=x'{}'",
+            hex::encode(digest)
+        ),
+    );
+    let job = {
+        // Reclaim the attempt under the corrected digest.
+        store.fail_attachment_acquisition(&job, Some(13)).unwrap();
+        store
+            .claim_attachment_acquisition(&asset, 13, 100)
+            .unwrap()
+            .unwrap()
+    };
+    store.limit_database_pages_for_test(0).unwrap();
+    assert!(matches!(
+        store.complete_attachment_acquisition(&job, &body, 13, 1 << 40),
+        Err(StorageError::Capacity(_))
+    ));
+    assert_eq!(store.retained_attachment_byte_count().unwrap(), 0);
+    assert!(
+        store
+            .read_retained_attachment(&asset, 13, 0, 10)
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.attachment_transfer_is_active(&job, 13).unwrap());
+    store.limit_database_pages_for_test(1 << 30).unwrap();
+    assert_eq!(
+        store
+            .complete_attachment_acquisition(&job, &body, 14, 1 << 40)
+            .unwrap(),
+        AttachmentPublishResult::Published
+    );
+    assert_eq!(
+        store.retained_attachment_byte_count().unwrap(),
+        body.len() as u64
+    );
+}
+
+/// On a database that cannot grow by a single page, a refused publication
+/// still parks: the park rewrites fixed-size columns of an existing row and
+/// the checkpoint's expiry, and needs no new page.
+#[test]
+fn storage_park_needs_no_new_page_after_a_full_publication() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "full");
+    let asset = request(&store, "full");
+    let body: Vec<u8> = (0..2 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let digest: [u8; 32] = Sha256::digest(&body).into();
+    sql(
+        &store,
+        &format!(
+            "UPDATE attachment_acquisition SET plaintext_digest=x'{}'",
+            hex::encode(digest)
+        ),
+    );
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    store
+        .checkpoint_attachment_partial(&job, &partial_identity(10), 0, b"abc", 12, 100)
+        .unwrap();
+    store.limit_database_pages_for_test(0).unwrap();
+    assert!(matches!(
+        store.complete_attachment_acquisition(&job, &body, 13, 1 << 40),
+        Err(StorageError::Capacity(_))
+    ));
+    assert!(
+        store
+            .block_attachment_storage(&job, 4 * body.len() as u64, 13)
+            .unwrap(),
+        "the park write fits without a new page"
+    );
+    assert_eq!(
+        transfer(&store, "full", true).state,
+        AttachmentTransferState::StorageBlocked
+    );
+    assert_eq!(partial_usage(&store), 3);
+    store.limit_database_pages_for_test(1 << 30).unwrap();
+}
+
+/// The per-tick readmission probe is read-only while no parked row fits: no
+/// write statement runs, so the common tick never takes the write lock. A
+/// query-only connection proves it, since any write statement fails there.
+#[test]
+fn storage_readmission_probe_is_read_only_while_nothing_fits() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "probe");
+    let asset = request(&store, "probe");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    park(&store, &job, 8192, 12);
+    sql(&store, "PRAGMA query_only=1");
+    assert_eq!(
+        readmit(&store, 13, 0, fits(8192) - 1, true),
+        0,
+        "a target that does not fit is never written"
+    );
+    assert_eq!(
+        readmit(&store, 13, 0, u64::MAX, false),
+        0,
+        "an automatic row is never written while automatic work is disabled"
+    );
+    assert!(
+        store
+            .readmit_storage_blocked_attachments(13, 0, u64::MAX, 1, true)
+            .is_err(),
+        "a row that fits does write, so the guard is effective"
+    );
+    sql(&store, "PRAGMA query_only=0");
+    assert_eq!(readmit(&store, 13, 0, u64::MAX, true), 1);
+}
+
+/// A full database can refuse publication after the completed-body receipt.
+/// Parking withdraws that receipt, so an automatic-history job readmits and is
+/// attempted again instead of ending as an unretained completed body, and its
+/// eventual completion ends the park streak.
+#[test]
+fn storage_park_after_a_receipt_keeps_automatic_history_attemptable() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "receipt");
+    let asset = request(&store, "receipt");
+    store.enable_attachment_automatic_history(&asset).unwrap();
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    assert!(store.mark_attachment_body_completed(&job, 12).unwrap());
+    park(&store, &job, 8192, 12);
+    assert_eq!(column(&store, &asset, "body_completed"), Some(0));
+    assert_eq!(
+        transfer(&store, "receipt", true).state,
+        AttachmentTransferState::StorageBlocked
+    );
+    assert_eq!(readmit(&store, 13, 0, u64::MAX, true), 1);
+    assert_eq!(
+        transfer(&store, "receipt", true).state,
+        AttachmentTransferState::Queued,
+        "a withdrawn receipt is not an unretained completed body"
+    );
+    let job = store
+        .claim_attachment_acquisition(&asset, 13, 100)
+        .unwrap()
+        .expect("readmitted work is attempted");
+    park(&store, &job, 8192, 13);
+    assert_eq!(column(&store, &asset, "storage_park_count"), Some(2));
+    assert_eq!(readmit(&store, 14, 0, u64::MAX, true), 1);
+    let due = due(&store, &asset).unwrap();
+    let job = store
+        .claim_attachment_acquisition(&asset, due, due + 100)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .complete_attachment_acquisition(&job, BODY, due, 10000)
+            .unwrap(),
+        AttachmentPublishResult::Published
+    );
+    assert_eq!(column(&store, &asset, "storage_park_count"), Some(0));
+    assert_eq!(read(&store, &asset), BODY);
+}
+
+/// mdk#2241: a body of at most one staging chunk publishes as an array row that
+/// declares `byte_len` on insert, so the insert trigger charges the quota
+/// without rewriting the row.
+#[test]
+fn array_publication_declares_length_and_skips_the_trigger_rewrite() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "array");
+    let asset = request(&store, "array");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    let before = store.lock().unwrap().total_changes();
+    assert_eq!(
+        store
+            .complete_attachment_acquisition(&job, BODY, 12, 10000)
+            .unwrap(),
+        AttachmentPublishResult::Published
+    );
+    // Exactly the row insert, the usage charge and the job state change: the
+    // `byte_len<0` normalizing UPDATE in the insert trigger matched no row.
+    assert_eq!(store.lock().unwrap().total_changes() - before, 3);
+    let (byte_len, stored_len): (i64, i64) = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT byte_len,length(bytes) FROM retained_attachment_bytes WHERE token=?1",
+            [&asset.token],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (byte_len, stored_len),
+        (BODY.len() as i64, BODY.len() as i64)
+    );
+    assert_eq!(
+        store.retained_attachment_byte_count().unwrap(),
+        BODY.len() as u64
+    );
+    assert_eq!(read(&store, &asset), BODY);
+    // The retired bind-the-whole-body form pays the trigger rewrite inside one
+    // statement: insert, row rewrite and usage charge also count three, which
+    // is the copy the publication path no longer makes.
+    seed(&store, "legacy");
+    let legacy = request(&store, "legacy");
+    let before = store.lock().unwrap().total_changes();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO retained_attachment_bytes(token,bytes) VALUES(?1,?2)",
+            params![legacy.token, BODY],
+        )
+        .unwrap();
+    assert_eq!(store.lock().unwrap().total_changes() - before, 3);
 }
 
 mod outgoing;
