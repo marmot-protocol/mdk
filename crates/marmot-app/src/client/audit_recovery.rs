@@ -74,7 +74,7 @@ impl RouteAcquisition {
                     .map(|named| named.failure);
                 let (failure, refusal_category) = match failure {
                     Some(failure) => relay_failure(failure),
-                    None if incomplete => (RecoveryRelayFailure::Withheld, None),
+                    None if incomplete => (RecoveryRelayFailure::PassLimit, None),
                     None => (RecoveryRelayFailure::LocalError, None),
                 };
                 FailedRelay {
@@ -119,6 +119,7 @@ fn relay_failure(
         Failure::IdFetchRefused => RecoveryRelayFailure::IdFetchRefused,
         Failure::UnrequestedEvent => RecoveryRelayFailure::UnrequestedEvent,
         Failure::Withheld => RecoveryRelayFailure::Withheld,
+        Failure::PassLimit => RecoveryRelayFailure::PassLimit,
         Failure::LocalError => RecoveryRelayFailure::LocalError,
     };
     (failure, None)

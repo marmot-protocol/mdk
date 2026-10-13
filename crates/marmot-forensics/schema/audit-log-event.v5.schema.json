@@ -3214,6 +3214,7 @@
         "id_fetch_refused",
         "unrequested_event",
         "withheld",
+        "pass_limit",
         "local_error"
       ]
     },

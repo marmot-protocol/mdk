@@ -139,7 +139,10 @@ answered: they finished the comparison and served their exact-ID requests, but t
 not return every ID they claimed. The rest timed out, errored or truncated.
 `endpoint_failures` gives each failed endpoint one `NostrReconciliationFailure`: the first stage that
 failed it, such as a NEG-ERR (with its reason's machine-readable prefix, never the text), no first
-reply, the pass deadline, an endpoint outside the account's pool, or `Withheld` for an incomplete one.
+reply, the pass deadline, or an endpoint outside the account's pool. A failure in a later window or
+boundary probe is classified the same way. An incomplete endpoint is `Withheld` only when it reached
+EOSE on an exact-ID fetch without an ID it claimed; one this pass's own budget or ordering left
+unasked or cut short is `PassLimit`.
 strfry answers a NEG-OPEN past its per-connection session cap with a session-less NOTICE (`ERROR: too
 many concurrent NEG requests`) that nostr-sdk ignores, so the comparison waits out its first-reply
 timeout. The client watches the relay while the NEG-OPEN is pending and reports that timeout as

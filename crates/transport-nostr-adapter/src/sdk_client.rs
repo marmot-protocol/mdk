@@ -430,7 +430,8 @@ pub enum NostrReconciliationFailure {
     NegentropyUnsupported,
     /// The relay sent no first negentropy reply in time.
     FirstReplyTimeout,
-    /// The pass's deadline ended this endpoint's comparison or fetches.
+    /// The pass's deadline ended this endpoint's comparison, a window
+    /// probe, or its fetches.
     RouteTimeout,
     /// The account's relay pool does not hold this endpoint.
     NotInPool,
@@ -443,8 +444,13 @@ pub enum NostrReconciliationFailure {
     IdFetchRefused,
     /// The relay returned an event this pass did not ask for.
     UnrequestedEvent,
-    /// The relay answered, but this pass did not return every event it claimed.
+    /// The relay reached EOSE on an exact-ID fetch without an event it
+    /// claimed.
     Withheld,
+    /// This pass's own item, byte, request or ordering limits left some of
+    /// the events the relay claimed for a later pass, without asking for them
+    /// or after cutting their fetch short. Not the relay's fault.
+    PassLimit,
     /// A local fault, not attributable to the relay.
     LocalError,
 }
@@ -464,6 +470,7 @@ impl NostrReconciliationFailure {
             Self::IdFetchRefused => "id_fetch_refused",
             Self::UnrequestedEvent => "unrequested_event",
             Self::Withheld => "withheld",
+            Self::PassLimit => "pass_limit",
             Self::LocalError => "local_error",
         }
     }
@@ -1333,8 +1340,13 @@ impl NostrSdkRelayClient {
         let mut remote_by_endpoint = HashMap::new();
         let mut failed_endpoints = HashSet::new();
         let mut incomplete_endpoints = HashSet::new();
-        // The first stage that failed each endpoint.
+        // The first stage that failed each endpoint outright.
         let mut failure_of = HashMap::new();
+        // Endpoints that reached EOSE on an exact-ID fetch without an ID they
+        // claimed.
+        let mut withheld_by = HashSet::new();
+        // The first failure of each endpoint in a window or boundary probe.
+        let probe_failures = StdMutex::new(HashMap::new());
         for (endpoint, result) in outcomes {
             match result {
                 Ok(summary) => {
@@ -1436,6 +1448,7 @@ impl NostrSdkRelayClient {
                         target,
                         window_seed,
                         narrowing_deadline,
+                        &probe_failures,
                     )
                     .await
                 {
@@ -1757,6 +1770,13 @@ impl NostrSdkRelayClient {
                 } else if claimed_id_missing
                     || outcome.end != NostrAcquisitionEnd::RequestPolicySatisfied
                 {
+                    // Only a relay that reached EOSE without an ID it
+                    // claimed withheld it; our own limits prove nothing.
+                    if claimed_id_missing
+                        && outcome.end == NostrAcquisitionEnd::RequestPolicySatisfied
+                    {
+                        withheld_by.insert(endpoint.clone());
+                    }
                     incomplete_endpoints.insert(endpoint.clone());
                 }
                 for event in outcome.events {
@@ -1876,6 +1896,7 @@ impl NostrSdkRelayClient {
                         sdk_events.iter().map(|(_, event)| event.created_at),
                         &left_behind,
                         deadline,
+                        &probe_failures,
                     )
                     .await;
                 // An unknown boundary is not permission. A route that cannot
@@ -1985,19 +2006,30 @@ impl NostrSdkRelayClient {
                 "group reconciliation pass held back without a proven order"
             );
         }
+        let probe_failures = probe_failures
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
         let mut endpoint_failures = failed_endpoints
             .iter()
             .map(|endpoint| NostrReconciliationEndpointFailure {
                 endpoint: TransportEndpoint(endpoint.to_string()),
-                // An endpoint left incomplete answered; one failed outright
-                // had its stage recorded where it failed.
-                failure: if incomplete_endpoints.contains(endpoint) {
-                    NostrReconciliationFailure::Withheld
-                } else {
+                // One failed outright had its stage recorded where it failed.
+                // One left incomplete answered: it withheld an ID only if it
+                // reached EOSE without it. Otherwise a failed probe, or this
+                // pass's own budget or order, left its IDs for a later pass.
+                failure: if !incomplete_endpoints.contains(endpoint) {
                     failure_of
                         .get(endpoint)
+                        .or_else(|| probe_failures.get(endpoint))
                         .copied()
                         .unwrap_or(NostrReconciliationFailure::LocalError)
+                } else if withheld_by.contains(endpoint) {
+                    NostrReconciliationFailure::Withheld
+                } else {
+                    probe_failures
+                        .get(endpoint)
+                        .copied()
+                        .unwrap_or(NostrReconciliationFailure::PassLimit)
                 },
             })
             .collect::<Vec<_>>();
@@ -2135,6 +2167,7 @@ impl NostrSdkRelayClient {
         returned_at: impl Iterator<Item = u64>,
         left_behind: &HashSet<EventId>,
         deadline: tokio::time::Instant,
+        probe_failures: &ProbeFailures,
     ) -> Option<u64> {
         let mut times = returned_at.collect::<Vec<_>>();
         times.sort_unstable();
@@ -2152,8 +2185,16 @@ impl NostrSdkRelayClient {
             }
             // Whole seconds: a left-behind event sharing a second with
             // returned ones holds that second back too.
-            self.window_remote_ids(filter, endpoints, items, options, (since, *at), deadline)
-                .await
+            self.window_remote_ids(
+                filter,
+                endpoints,
+                items,
+                options,
+                (since, *at),
+                deadline,
+                probe_failures,
+            )
+            .await
         }))
         .await;
         let mut answered = false;
@@ -2191,6 +2232,7 @@ impl NostrSdkRelayClient {
         target: usize,
         seed: Option<WindowSeed>,
         deadline: tokio::time::Instant,
+        probe_failures: &ProbeFailures,
     ) -> Option<WindowSearch> {
         let skip = set_aside.iter().copied().collect::<HashSet<_>>();
         // The largest probed bound whose window fits a pass, and the smallest
@@ -2234,7 +2276,15 @@ impl NostrSdkRelayClient {
                 break;
             }
             let rounds = futures::future::join_all(probes.iter().map(|probe| {
-                self.window_remote_ids(filter, endpoints, items, options, (since, *probe), deadline)
+                self.window_remote_ids(
+                    filter,
+                    endpoints,
+                    items,
+                    options,
+                    (since, *probe),
+                    deadline,
+                    probe_failures,
+                )
             }))
             .await;
             let mut answered = false;
@@ -2300,7 +2350,9 @@ impl NostrSdkRelayClient {
 
     /// Remote-only IDs within `[since, until]` across the endpoints that
     /// answer a dry-run comparison by `deadline`, and whether every endpoint
-    /// answered, or `None` if none does.
+    /// answered, or `None` if none does. Each endpoint's first probe failure
+    /// is kept in `probe_failures`.
+    #[allow(clippy::too_many_arguments)]
     async fn window_remote_ids(
         &self,
         filter: &Filter,
@@ -2309,6 +2361,7 @@ impl NostrSdkRelayClient {
         options: &SyncOptions,
         (since, until): (u64, u64),
         deadline: tokio::time::Instant,
+        probe_failures: &ProbeFailures,
     ) -> Option<(HashSet<EventId>, bool)> {
         if tokio::time::Instant::now() >= deadline {
             return None;
@@ -2328,15 +2381,25 @@ impl NostrSdkRelayClient {
             let items = items.clone();
             let options = options.clone();
             async move {
-                timeout_at(deadline, async {
-                    match client.relay(&endpoint).await {
-                        Ok(Some(relay)) => relay.sync(filter).items(items).opts(options).await.ok(),
-                        Ok(None) | Err(_) => None,
-                    }
+                let result = timeout_at(deadline, async {
+                    let relay = match client.relay(&endpoint).await {
+                        Ok(Some(relay)) => relay,
+                        Ok(None) => return Err(NostrReconciliationFailure::NotInPool),
+                        Err(_) => return Err(NostrReconciliationFailure::LocalError),
+                    };
+                    sync_watching_neg_cap(&relay, filter, items, options).await
                 })
                 .await
-                .ok()
-                .flatten()
+                .unwrap_or(Err(NostrReconciliationFailure::RouteTimeout));
+                result
+                    .map_err(|failure| {
+                        probe_failures
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .entry(endpoint)
+                            .or_insert(failure);
+                    })
+                    .ok()
             }
         });
         let mut answered = 0usize;
@@ -4370,6 +4433,9 @@ fn append_missing_publish_failures(
     }
 }
 
+/// Each endpoint's first failure in a pass's window or boundary probes.
+type ProbeFailures = StdMutex<HashMap<RelayUrl, NostrReconciliationFailure>>;
+
 /// strfry's answer to a NEG-OPEN past its per-connection session cap. It is a
 /// NOTICE, not NEG-ERR, and names no session.
 const NEG_CAP_NOTICE: &str = "too many concurrent neg requests";
@@ -4398,6 +4464,15 @@ async fn sync_watching_neg_cap(
             }
         }
     };
+    // The timeout and a NOTICE already queued can be ready in the same wake.
+    if result.is_err() {
+        while !cap_notice {
+            match futures::FutureExt::now_or_never(notifications.next()) {
+                Some(Some(notification)) => cap_notice = is_neg_cap_notice(&notification),
+                _ => break,
+            }
+        }
+    }
     result.map_err(|error| sync_failure(&error, cap_notice))
 }
 
@@ -4427,9 +4502,7 @@ fn sync_failure(error: &nostr_sdk::prelude::Error, cap_notice: bool) -> NostrRec
         SdkErrorKind::Unsupported | SdkErrorKind::Protocol => {
             NostrReconciliationFailure::NegentropyUnsupported
         }
-        SdkErrorKind::State | SdkErrorKind::LimitExceeded => {
-            NostrReconciliationFailure::NotOperational
-        }
+        SdkErrorKind::State => NostrReconciliationFailure::NotOperational,
         _ => NostrReconciliationFailure::LocalError,
     }
 }

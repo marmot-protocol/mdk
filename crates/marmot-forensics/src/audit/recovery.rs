@@ -221,8 +221,11 @@ pub enum RecoveryRelayFailure {
     IdFetchRefused,
     /// The relay returned an event the pass did not ask for.
     UnrequestedEvent,
-    /// The relay answered but withheld a claimed event.
+    /// The relay reached EOSE on an exact-ID fetch without a claimed event.
     Withheld,
+    /// The pass's own budget or ordering left some of the relay's claimed
+    /// events for a later pass. Not the relay's fault.
+    PassLimit,
     /// A local fault, not attributable to the relay.
     LocalError,
 }
@@ -701,6 +704,7 @@ mod tests {
                 F::IdFetchRefused,
                 F::UnrequestedEvent,
                 F::Withheld,
+                F::PassLimit,
                 F::LocalError
             ]),
             defined("Operational_recoveryRelayFailure")

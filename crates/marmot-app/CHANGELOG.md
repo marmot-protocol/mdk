@@ -67,9 +67,9 @@
   endpoint reference, with a failure class: NEG-ERR and its reason's category,
   strfry's negentropy-cap NOTICE, a first-reply or pass timeout, a relay outside
   the pool or not usable, the comparison limit, a refused or unexpected fetch,
-  withheld events, or a local error. `relays_failed` and `relays_incomplete`
-  now count distinct relays; before, they were summed per compared route and
-  could exceed `relays_required` (#2265).
+  withheld events, the pass's own budget, or a local error. `relays_failed`
+  and `relays_incomplete` now count distinct relays; before, they were summed
+  per compared route and could exceed `relays_required` (#2265).
 
 ## 0.13.0 - 2026-10-12
 

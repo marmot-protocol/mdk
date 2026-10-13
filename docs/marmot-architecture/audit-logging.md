@@ -1066,13 +1066,14 @@ Relay failure classes (`failure`), each naming the stage that failed the relay:
 | `neg_cap_notice` | The relay sent its concurrent-negentropy cap NOTICE (strfry: `too many concurrent NEG requests`) while the NEG-OPEN waited for its first reply, which never came. The NOTICE names no session, so it is attributed to the comparison it left unanswered. |
 | `negentropy_unsupported` | The relay does not support negentropy, or broke its protocol. |
 | `first_reply_timeout` | No first negentropy reply in time. |
-| `route_timeout` | The pass deadline ended the comparison or its exact-ID fetches. |
+| `route_timeout` | The pass deadline ended the comparison, a window probe, or its exact-ID fetches. |
 | `not_in_pool` | The account's relay pool does not hold the relay. |
 | `not_operational` | The relay was not connected or not usable. |
 | `limit_reached` | The relay's matching set filled the comparison limit, so it cannot vouch for the whole window. |
 | `id_fetch_refused` | The relay rejected or closed an exact-ID fetch for events it claimed. |
 | `unrequested_event` | The relay returned an event the pass did not ask for. |
-| `withheld` | The relay answered but did not return every event it claimed. |
+| `withheld` | The relay reached end-of-stored-events on an exact-ID fetch without an event it claimed. |
+| `pass_limit` | The pass's own item, byte, request or ordering limits left some of the relay's claimed events for a later pass, unasked or cut short. Ordinary bounded catch-up; not the relay's fault. |
 | `local_error` | A local fault, not attributable to the relay. |
 
 Outcomes:
