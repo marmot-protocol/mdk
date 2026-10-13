@@ -1035,3 +1035,43 @@ fn chat_list_draft_preview_reopens_from_encrypted_store_without_projection_write
         .unwrap();
     assert_eq!(before, after);
 }
+
+#[test]
+fn present_null_description_is_known_empty_and_allows_keyword_folder_capture() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    // This ordinary source row omits profile_description, so it stores SQL NULL.
+    seed(&store, "11");
+    let input = store.chat_presentation_input("11").unwrap().unwrap();
+    store
+        .store_chat_presentation(&input, &value("bb", "Peer", 1))
+        .unwrap();
+    let description: Option<String> = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT folder_description_fold FROM chat_list_rows WHERE group_id_hex='11'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(description.as_deref(), Some(""));
+    // Finish the source batch, as the projection worker does after this write.
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "DELETE FROM chat_presentation_row_work WHERE group_id_hex='11'",
+            [],
+        )
+        .unwrap();
+    let selection = store
+        .chat_folder_selection_snapshot(crate::ChatFolderSelectionRule {
+            keyword: Some("peer".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        store.chat_list_selection_page(&selection, 0, 100).unwrap(),
+        ["11"]
+    );
+}

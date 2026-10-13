@@ -121,7 +121,6 @@ mod folder_input_tests {
             r#"{"version":1,"root":{"kind":"group","all":true,"not":false,"children":[]}}"#,
         )
         .unwrap();
-        input.smart_filter_json = smart.as_ptr();
         let value = unsafe { input.to_ffi() }.unwrap();
         assert!(
             value.include_muted
@@ -130,6 +129,14 @@ mod folder_input_tests {
                 && value.pinned_only
                 && value.include_all
         );
+        input.smart_filter_json = smart.as_ptr();
+        assert!(matches!(
+            unsafe { input.to_ffi() },
+            Err(crate::MarmotStatus::ChatSelectionInvalidFilter)
+        ));
+        input = rule();
+        input.smart_filter_json = smart.as_ptr();
+        let value = unsafe { input.to_ffi() }.unwrap();
         assert_eq!(value.smart_filter_json.as_deref(), smart.to_str().ok());
         let invalid = std::ffi::CString::new(
             r#"{"version":2,"root":{"kind":"group","all":true,"not":false,"children":[]}}"#,

@@ -313,11 +313,11 @@ for revisions, cancellation and account lifecycle. `marmot_capture_chat_folder_s
 accepts a borrowed version-1 rule, copying strings and arrays before returning.
 The version-1 record layout is frozen; a future layout requires a new record type
 and entry point. The version field does not authorize appending fields to this struct.
-Its nullable `smart_filter_json` accepts the bounded private smart-rule envelope;
+Its nullable `smart_filter_json` accepts the bounded version-1 public smart-rule input contract;
 NULL uses flat criteria. Rebuild this new record with matching generated headers
 and native libraries; never mix its previous draft layout with the updated ABI.
 Byte-valued input booleans accept nonzero as true. Array lengths and version are
-checked before pointer traversal; invalid rules return status99. Free the returned
+checked before pointer traversal; invalid rules return `MARMOT_STATUS_CHAT_SELECTION_INVALID_FILTER` (104). Free the returned
 handle using the existing selection free function, never free borrowed inputs.
 
 Live Chats/Unread/Archived/Left windows and independent account attention follow the

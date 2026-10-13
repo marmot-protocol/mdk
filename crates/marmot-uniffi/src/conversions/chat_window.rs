@@ -65,10 +65,7 @@ mod folder_rule_tests {
             include_all: true,
             archived_only: true,
             include_muted: true,
-            smart_filter_json: Some(
-                r#"{"version":1,"root":{"kind":"group","all":true,"not":false,"children":[]}}"#
-                    .into(),
-            ),
+            smart_filter_json: None,
             manual_include_ids: vec!["aa".into()],
             manual_exclude_ids: vec!["bb".into()],
         };
@@ -88,10 +85,17 @@ mod folder_rule_tests {
         assert_eq!(native.include_member_ids, ["AB".repeat(32)]);
         assert_eq!(native.manual_include_ids, ["aa"]);
         assert_eq!(native.manual_exclude_ids, ["bb"]);
-        assert_eq!(
-            native.smart_filter_json.as_deref(),
-            Some(r#"{"version":1,"root":{"kind":"group","all":true,"not":false,"children":[]}}"#)
-        );
+        assert!(native.smart_filter_json.is_none());
+        let mut smart = app::ChatFolderSelectionRule {
+            smart_filter_json: Some(
+                r#"{"version":1,"root":{"kind":"group","all":true,"not":false,"children":[]}}"#
+                    .into(),
+            ),
+            ..Default::default()
+        };
+        smart.validate().unwrap();
+        smart.include_all = true;
+        assert!(smart.validate().is_err());
     }
 }
 

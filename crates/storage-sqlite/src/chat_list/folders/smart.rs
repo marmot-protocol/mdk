@@ -1,4 +1,4 @@
-//! Strict private version-1 smart-folder envelope. Compile bounded validated
+//! Strict version-1 public smart-folder input contract. Compile bounded validated
 //! nodes into parameterized SQL; user text never becomes SQL syntax.
 use super::{ChatListSelectionError, fold_literal};
 use rusqlite::types::Value;
@@ -81,7 +81,7 @@ pub(super) fn compile(raw: &str) -> Result<Compiled, ChatListSelectionError> {
 impl Compiled {
     fn bind(&mut self, text: String) -> String {
         self.values.push(Value::Text(text));
-        format!("?{}", 16 + self.values.len())
+        format!(":smart_{}", self.values.len())
     }
     fn node(&mut self, node: Node, depth: usize) -> Result<String, ChatListSelectionError> {
         self.nodes += 1;
@@ -157,7 +157,7 @@ impl Compiled {
                             return Err(ChatListSelectionError::InvalidFilter);
                         }
                         self.kind = true;
-                        let direct = "trim(group_name,?13)='' AND EXISTS(SELECT 1 FROM account_groups a WHERE a.group_id_hex=r.group_id_hex AND a.member_count=2)";
+                        let direct = "trim(group_name,:ws)='' AND EXISTS(SELECT 1 FROM account_groups a WHERE a.group_id_hex=r.group_id_hex AND a.member_count=2)";
                         if matches!(mode, Mode::Direct) {
                             direct.into()
                         } else {
@@ -174,8 +174,8 @@ impl Compiled {
                             Field::Pinned=>"list_pin_ordinal>=0".into(),
                             Field::Archived=>"list_scope=1".into(),
                             Field::Accepted=>"list_scope IN (0,1) AND NOT COALESCE((SELECT pending_confirmation FROM account_groups a WHERE a.group_id_hex=r.group_id_hex),pending_confirmation)".into(),
-                            Field::Muted=>"EXISTS(SELECT 1 FROM chat_notification_settings mute WHERE mute.group_id_hex=r.group_id_hex AND (mute.muted_until_ms IS NULL OR mute.muted_until_ms>?8))".into(),
-                            Field::Draft=>"EXISTS(SELECT 1 FROM message_drafts draft WHERE draft.group_id_hex=r.group_id_hex AND (length(CAST(trim(draft.content,?13) AS BLOB))>0 OR EXISTS(SELECT 1 FROM message_draft_attachments attachment WHERE attachment.group_id_hex=draft.group_id_hex)))".into(),
+                            Field::Muted=>"EXISTS(SELECT 1 FROM chat_notification_settings mute WHERE mute.group_id_hex=r.group_id_hex AND (mute.muted_until_ms IS NULL OR mute.muted_until_ms>:now_ms))".into(),
+                            Field::Draft=>"EXISTS(SELECT 1 FROM message_drafts draft WHERE draft.group_id_hex=r.group_id_hex AND (length(CAST(trim(draft.content,:ws) AS BLOB))>0 OR EXISTS(SELECT 1 FROM message_draft_attachments attachment WHERE attachment.group_id_hex=draft.group_id_hex)))".into(),
                             // Complete local pending intent, not just the latest preview.
                             Field::PendingSend=>"EXISTS(SELECT 1 FROM local_message_submissions submission WHERE submission.group_id_hex=r.group_id_hex AND submission.state=0) OR EXISTS(SELECT 1 FROM message_timeline pending INDEXED BY idx_chat_folder_pending_send WHERE pending.group_id_hex=r.group_id_hex AND pending.direction='sent' AND pending.source_message_id_hex IS NULL AND pending.invalidation_status IS NULL AND pending.deleted=0)".into(),
                             _=>unreachable!("handled structured conditions"),

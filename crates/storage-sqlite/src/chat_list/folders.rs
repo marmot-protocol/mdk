@@ -15,7 +15,7 @@ const WHITE_SPACE: &str = "\u{0009}\u{000a}\u{000b}\u{000c}\u{000d}\u{0020}\u{00
 
 /// Version 1 mirrors the existing Android folder rule. Members and keyword are
 /// ORed, then category/archive/mute constraints are ANDed. A smart envelope, if
-/// present, replaces flat automatic criteria. An empty automatic
+/// present, is mutually exclusive with flat automatic criteria. An empty automatic
 /// rule matches nothing. Manual includes bypass automatic rules; exclusions win.
 /// Missing/blocked/departed conversations are never resurrected by manual IDs.
 /// Rules and names remain private client preferences. Edits require recapture.
@@ -74,6 +74,10 @@ pub(crate) fn fold_literal(value: &str) -> String {
 
 impl ChatFolderSelectionRule {
     pub fn validate(&self) -> Result<(), ChatListSelectionError> {
+        self.validated_smart().map(|_| ())
+    }
+
+    fn validated_smart(&self) -> Result<Option<smart::Compiled>, ChatListSelectionError> {
         let valid_ids = |ids: &[String], members: bool| {
             ids.len() <= (if members { 256 } else { 1024 })
                 && ids.iter().all(|id| {
@@ -96,16 +100,28 @@ impl ChatFolderSelectionRule {
             return Err(ChatListSelectionError::InvalidFilter);
         }
         if let Some(raw) = &self.smart_filter_json {
-            smart::compile(raw)?;
+            if !self.include_member_ids.is_empty()
+                || self.keyword.is_some()
+                || self.unread_only
+                || self.unread_mentions_only
+                || self.groups_only
+                || self.direct_chats_only
+                || self.pinned_only
+                || self.include_all
+                || self.archived_only
+                || self.include_muted
+            {
+                return Err(ChatListSelectionError::InvalidFilter);
+            }
+            return smart::compile(raw).map(Some);
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Literal selected-title inputs need the shared-directory catch-up fence.
     pub fn requires_text(&self) -> Result<bool, ChatListSelectionError> {
-        self.validate()?;
-        Ok(match &self.smart_filter_json {
-            Some(raw) => smart::compile(raw)?.title,
+        Ok(match self.validated_smart()? {
+            Some(compiled) => compiled.title,
             None => self
                 .keyword
                 .as_deref()
@@ -117,12 +133,7 @@ impl ChatFolderSelectionRule {
         &self,
         conn: &Connection,
     ) -> Result<Vec<String>, ChatListSelectionError> {
-        self.validate()?;
-        let smart = self
-            .smart_filter_json
-            .as_deref()
-            .map(smart::compile)
-            .transpose()?;
+        let smart = self.validated_smart()?;
         let ids_json = |ids: &[String]| {
             // Bound JSON arrays keep the SQL variable count independent of ID count.
             serde_json::to_string(
@@ -153,23 +164,25 @@ impl ChatFolderSelectionRule {
         // destructive selection. Manual-only candidates need neither input.
         let candidates = "list_scope IN (0,1)
             AND group_id_hex NOT IN (SELECT group_id_hex FROM blocked_pending_invites)
-            AND group_id_hex NOT IN (SELECT value FROM json_each(?1))";
+            AND group_id_hex NOT IN (SELECT value FROM json_each(:excludes))";
         let needs_inputs = format!(
             "{candidates}
-            AND group_id_hex NOT IN (SELECT value FROM json_each(?2))
-            AND (?8 OR archived=?3)"
+            AND group_id_hex NOT IN (SELECT value FROM json_each(:includes))
+            AND (:is_smart OR archived=:archived)"
         );
         let missing: bool = conn.query_row_cached(
             &format!("SELECT EXISTS(SELECT 1 FROM chat_list_rows r WHERE {needs_inputs} AND (
-                (?4 AND NOT EXISTS(SELECT 1 FROM chat_folder_rosters roster
+                (:needs_roster AND NOT EXISTS(SELECT 1 FROM chat_folder_rosters roster
                     WHERE roster.group_id_hex=r.group_id_hex AND roster.complete=1
                     AND NOT EXISTS(SELECT 1 FROM chat_folder_roster_work work WHERE work.group_id=roster.group_id)))
-                OR (?5 AND (folder_title_fold IS NULL OR folder_description_fold IS NULL
+                OR (:needs_text AND (folder_title_fold IS NULL OR (:needs_description AND folder_description_fold IS NULL)
                     OR presentation_json IS NULL
                     OR presentation_applied_source_revision!=presentation_source_revision))
-                OR (?6 AND trim(group_name,?7)='' AND (SELECT member_count FROM account_groups a
+                OR (:needs_kind AND trim(group_name,:ws)='' AND (SELECT member_count FROM account_groups a
                     WHERE a.group_id_hex=r.group_id_hex) IS NULL)))"),
-            params![excludes, includes, self.archived_only, needs_roster, needs_text, needs_kind, WHITE_SPACE, smart.is_some()],
+            rusqlite::named_params! {":excludes": &excludes, ":includes": &includes, ":archived": self.archived_only,
+                ":needs_roster": needs_roster, ":needs_text": needs_text, ":needs_description": has_keyword && smart.is_none(),
+                ":needs_kind": needs_kind, ":ws": WHITE_SPACE, ":is_smart": smart.is_some()},
             |row| row.get(0),
         ).storage()?;
         if missing {
@@ -185,59 +198,99 @@ impl ChatFolderSelectionRule {
             || self.include_all
             || self.archived_only;
         let automatic_sql = smart.as_ref().map(|s| s.sql.clone()).unwrap_or_else(||
-            "?4 AND archived=?3 AND (NOT ?5 OR list_unread=1)
-                    AND (NOT ?14 OR (list_unread=1 AND unread_mention_count>0))
-                    AND (NOT ?15 OR (trim(group_name,?13)='' AND EXISTS(SELECT 1 FROM account_groups a
+            ":automatic AND archived=:archived AND (NOT :unread_only OR list_unread=1)
+                    AND (NOT :mentions_only OR (list_unread=1 AND unread_mention_count>0))
+                    AND (NOT :direct_only OR (trim(group_name,:ws)='' AND EXISTS(SELECT 1 FROM account_groups a
                         WHERE a.group_id_hex=r.group_id_hex AND a.member_count=2)))
-                    AND (NOT ?16 OR list_pin_ordinal>=0)
-                    AND (NOT ?6 OR trim(group_name,?13)!='' OR EXISTS(SELECT 1 FROM account_groups a
+                    AND (NOT :pinned_only OR list_pin_ordinal>=0)
+                    AND (NOT :groups_only OR trim(group_name,:ws)!='' OR EXISTS(SELECT 1 FROM account_groups a
                         WHERE a.group_id_hex=r.group_id_hex AND a.member_count!=2))
-                    AND (?7 OR NOT EXISTS(SELECT 1 FROM chat_notification_settings mute
+                    AND (:include_muted OR NOT EXISTS(SELECT 1 FROM chat_notification_settings mute
                         WHERE mute.group_id_hex=r.group_id_hex
-                        AND (mute.muted_until_ms IS NULL OR mute.muted_until_ms>?8)))
-                    AND ((NOT ?9 AND NOT ?10)
-                        OR (?9 AND EXISTS(SELECT 1 FROM chat_folder_rosters roster
+                        AND (mute.muted_until_ms IS NULL OR mute.muted_until_ms>:now_ms)))
+                    AND ((NOT :has_members AND NOT :has_keyword)
+                        OR (:has_members AND EXISTS(SELECT 1 FROM chat_folder_rosters roster
                             JOIN chat_folder_members member ON member.group_id=roster.group_id
                             WHERE roster.group_id_hex=r.group_id_hex AND roster.complete=1
-                            AND member.member_id_hex IN (SELECT value FROM json_each(?11))))
-                        OR (?10 AND (instr(folder_title_fold,?12)>0 OR instr(folder_description_fold,?12)>0)))".into());
+                            AND member.member_id_hex IN (SELECT value FROM json_each(:members))))
+                        OR (:has_keyword AND (instr(folder_title_fold,:keyword)>0 OR instr(folder_description_fold,:keyword)>0)))".into());
         let sql = format!(
             "SELECT group_id_hex FROM chat_list_rows r INDEXED BY idx_chat_list_page
-            WHERE {candidates} AND (?16 IS NULL OR ?16 IS NOT NULL) AND (
-                group_id_hex IN (SELECT value FROM json_each(?2)) OR ({automatic_sql}))
+            WHERE {candidates} AND (
+                group_id_hex IN (SELECT value FROM json_each(:includes)) OR ({automatic_sql}))
                 ORDER BY {}",
             super::pages::KEY_COLUMNS
         );
         use rusqlite::types::Value;
         let mut values = vec![
-            Value::Text(excludes),
-            Value::Text(includes),
-            Value::Integer(self.archived_only.into()),
-            Value::Integer(automatic.into()),
-            Value::Integer(self.unread_only.into()),
-            Value::Integer(self.groups_only.into()),
-            Value::Integer(self.include_muted.into()),
-            Value::Integer(crate::unix_now_ms()),
-            Value::Integer(has_members.into()),
-            Value::Integer(has_keyword.into()),
-            Value::Text(members),
-            keyword.map_or(Value::Null, Value::Text),
-            Value::Text(WHITE_SPACE.into()),
-            Value::Integer(self.unread_mentions_only.into()),
-            Value::Integer(self.direct_chats_only.into()),
-            Value::Integer(self.pinned_only.into()),
+            (":excludes".to_owned(), Value::Text(excludes)),
+            (":includes".to_owned(), Value::Text(includes)),
+            (
+                ":archived".to_owned(),
+                Value::Integer(self.archived_only.into()),
+            ),
+            (":automatic".to_owned(), Value::Integer(automatic.into())),
+            (
+                ":unread_only".to_owned(),
+                Value::Integer(self.unread_only.into()),
+            ),
+            (
+                ":groups_only".to_owned(),
+                Value::Integer(self.groups_only.into()),
+            ),
+            (
+                ":include_muted".to_owned(),
+                Value::Integer(self.include_muted.into()),
+            ),
+            (":now_ms".to_owned(), Value::Integer(crate::unix_now_ms())),
+            (
+                ":has_members".to_owned(),
+                Value::Integer(has_members.into()),
+            ),
+            (
+                ":has_keyword".to_owned(),
+                Value::Integer(has_keyword.into()),
+            ),
+            (":members".to_owned(), Value::Text(members)),
+            (
+                ":keyword".to_owned(),
+                keyword.map_or(Value::Null, Value::Text),
+            ),
+            (":ws".to_owned(), Value::Text(WHITE_SPACE.into())),
+            (
+                ":mentions_only".to_owned(),
+                Value::Integer(self.unread_mentions_only.into()),
+            ),
+            (
+                ":direct_only".to_owned(),
+                Value::Integer(self.direct_chats_only.into()),
+            ),
+            (
+                ":pinned_only".to_owned(),
+                Value::Integer(self.pinned_only.into()),
+            ),
         ];
         if let Some(smart) = smart {
-            values.extend(smart.values);
+            values.extend(
+                smart
+                    .values
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, value)| (format!(":smart_{}", index + 1), value)),
+            );
         }
         let mut statement = conn.prepare_cached(&sql).storage()?;
-        // rusqlite requires only referenced parameters. Smart compilation reserves
-        // slots1..16 via a harmless true expression before using slots17+.
-        Ok(statement
-            .query_map(rusqlite::params_from_iter(values), |row| row.get(0))
-            .storage()?
-            .collect::<Result<_, _>>()
-            .storage()?)
+        for (name, value) in values {
+            if let Some(index) = statement.parameter_index(&name).storage()? {
+                statement.raw_bind_parameter(index, value).storage()?;
+            }
+        }
+        let mut rows = statement.raw_query();
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().storage()? {
+            ids.push(row.get(0).storage()?);
+        }
+        Ok(ids)
     }
 }
 
@@ -248,7 +301,10 @@ pub(crate) fn replace_roster(conn: &Connection, group: &Group) -> StorageResult<
         .filter(|member| member.id.as_slice().len() == 32)
         .map(|member| hex::encode(member.id.as_slice()))
         .collect();
-    let complete = members.len() == group.members.len();
+    let complete = group
+        .members
+        .iter()
+        .all(|member| member.id.as_slice().len() == 32);
     let mut digest = Sha256::new();
     digest.update(b"marmot.chat-folder-roster.v1");
     for member in &members {

@@ -343,7 +343,8 @@ impl SqliteAccountStorage {
                 )
                 .optional()
                 .storage()?
-                .flatten();
+                // Missing source rows stay unknown; NULL on a present row is a known empty description.
+                .map(Option::unwrap_or_default);
             conn.execute_cached(
                 "UPDATE chat_list_rows SET presentation_json = ?2,
                     presentation_applied_source_revision = presentation_source_revision,

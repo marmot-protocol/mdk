@@ -162,7 +162,6 @@ impl MarmotAppRuntime {
         account_ref: &str,
         rule: ChatFolderSelectionRule,
     ) -> Result<ChatListSelectionHandle, ChatSelectionError> {
-        rule.validate()?;
         self.capture_selection(account_ref, ChatListView::Chats, Some(rule))
             .await
     }
@@ -174,6 +173,12 @@ impl MarmotAppRuntime {
         rule: Option<ChatFolderSelectionRule>,
     ) -> Result<ChatListSelectionHandle, ChatSelectionError> {
         self.shared.lifecycle().ensure_running()?;
+        // Validate once before any preparation writes; keep only this immutable flag for retries.
+        let requires_text = rule
+            .as_ref()
+            .map(ChatFolderSelectionRule::requires_text)
+            .transpose()?
+            .unwrap_or(false);
         let account = self.accounts.resolve(account_ref)?;
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
         let mut resets = self
@@ -199,12 +204,7 @@ impl MarmotAppRuntime {
                         return Err(ChatSelectionError::Closed);
                     }
                     let store = app.account_storage(&account.label)?;
-                    let text_source = if attempt_rule
-                        .as_ref()
-                        .map(ChatFolderSelectionRule::requires_text)
-                        .transpose()?
-                        .unwrap_or(false)
-                    {
+                    let text_source = if requires_text {
                         Some(app.shared_storage()?)
                     } else {
                         None

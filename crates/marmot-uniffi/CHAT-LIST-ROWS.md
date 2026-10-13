@@ -177,8 +177,7 @@ Migration108 also creates partial pending-send indexes, which requires a one-tim
 scan of existing timeline/submission rows during the transactional upgrade. Later
 pending-send matching uses those indexes, not a message-history traversal.
 
-If present, `smart_filter_json` replaces flat automatic criteria, preserving
-manual inclusion/exclusion. This public version-1 JSON input contract has `version:1` and a
+If present, `smart_filter_json` is mutually exclusive with non-default flat automatic criteria; mixed rules return `InvalidFilter`. Manual inclusion/exclusion applies to either form. The rule and its JSON envelope both require version 1; neither version changes the meaning of the other. This public version-1 JSON input contract has `version:1` and a
 `root` group with `kind:"group"`, `all` (AND when true, OR otherwise), `not`,
 and `children`. Conditions have `kind:"condition"`, uppercase `field` and `mode`,
 `values` and `not`. Nested groups and conditions support negation. An empty root

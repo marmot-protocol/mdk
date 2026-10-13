@@ -21,7 +21,7 @@ const RETAINED_ROUTE: &str = "17f6648f67003fec1ac26f7b1e027e5185beb61b22c131605e
 const PERSISTED_CURSOR: i64 = 1_790_635_089;
 
 /// Tables whose original values forward migrations must carry over, except
-/// the explicit presentation-refresh revision in migration 0107 below.
+/// the explicit presentation-refresh revision in migration 0108 below.
 const PRESERVED_TABLES: &[&str] = &[
     "cgka_groups",
     "cgka_messages",
@@ -196,7 +196,7 @@ fn v0_10_4_account_upgrades_without_losing_state_or_raising_notices() {
         for (table, before) in PRESERVED_TABLES.iter().zip(&before_tables) {
             let mut expected = before.clone();
             if *table == "chat_list_rows" {
-                // Migration 0107 dirties metadata for bounded re-preparation,
+                // Migration 0108 dirties metadata for bounded re-preparation,
                 // retaining every original value (especially selected display
                 // and avatar bytes). The two appended filter inputs start NULL.
                 for row in &mut expected {

@@ -764,3 +764,138 @@ fn smart_invalid_subtrees_versions_depth_nodes_and_values_fail_whole_rule() {
         Err(ChatListSelectionError::InvalidFilter)
     ));
 }
+
+#[test]
+fn duplicate_account_leaves_are_complete_without_duplicate_member_index_rows() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let id = seed(&store, 1, false, false, "Group", 1);
+    let group_id = GroupId::new(hex::decode(&id).unwrap());
+    let mut group = store.get_group(&group_id).unwrap();
+    group.members.push(Member {
+        id: group.members[0].id.clone(),
+        credential: vec![1],
+    });
+    store.put_group(&group).unwrap();
+    let conn = store.lock().unwrap();
+    assert!(
+        conn.query_row(
+            "SELECT complete FROM chat_folder_rosters WHERE group_id_hex=?1",
+            [&id],
+            |r| r.get::<_, bool>(0)
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM chat_folder_members WHERE group_id=?1",
+            [group_id.as_slice()],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    drop(conn);
+    assert_eq!(
+        ids(
+            &store,
+            ChatFolderSelectionRule {
+                include_member_ids: vec!["01".repeat(32)],
+                ..Default::default()
+            }
+        ),
+        [id]
+    );
+}
+
+#[test]
+fn smart_rules_reject_every_non_default_flat_automatic_field_but_allow_manual_overrides() {
+    let base = smart_rule(
+        vec![condition("UNREAD", "PRESENT", vec![], false)],
+        true,
+        false,
+    );
+    let mut mixed = Vec::new();
+    let setters: [fn(&mut ChatFolderSelectionRule); 10] = [
+        |r: &mut ChatFolderSelectionRule| r.include_member_ids = vec!["11".repeat(32)],
+        |r: &mut ChatFolderSelectionRule| r.keyword = Some("".into()),
+        |r: &mut ChatFolderSelectionRule| r.unread_only = true,
+        |r: &mut ChatFolderSelectionRule| r.unread_mentions_only = true,
+        |r: &mut ChatFolderSelectionRule| r.groups_only = true,
+        |r: &mut ChatFolderSelectionRule| r.direct_chats_only = true,
+        |r: &mut ChatFolderSelectionRule| r.pinned_only = true,
+        |r: &mut ChatFolderSelectionRule| r.include_all = true,
+        |r: &mut ChatFolderSelectionRule| r.archived_only = true,
+        |r: &mut ChatFolderSelectionRule| r.include_muted = true,
+    ];
+    for set in setters {
+        let mut rule = base.clone();
+        set(&mut rule);
+        mixed.push(rule);
+    }
+    for rule in mixed {
+        assert!(matches!(
+            rule.validate(),
+            Err(ChatListSelectionError::InvalidFilter)
+        ));
+    }
+    let allowed = ChatFolderSelectionRule {
+        manual_include_ids: vec!["aa".into()],
+        manual_exclude_ids: vec!["bb".into()],
+        ..base
+    };
+    allowed.validate().unwrap();
+}
+
+#[test]
+fn named_smart_clock_and_whitespace_parameters_are_independent_of_flat_query_fields() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let id = seed(&store, 1, false, true, "Project", 1);
+    store.lock().unwrap().execute("INSERT INTO chat_notification_settings(group_id_hex,muted_until_ms,updated_at_ms) VALUES(?1,?2,0)", params![id, i64::MAX]).unwrap();
+    // Smart-only SQL does not reference most flat fields. Both shared names and bound literals still work.
+    assert_eq!(
+        ids(
+            &store,
+            smart_rule(
+                vec![condition("MUTED", "PRESENT", vec![], false)],
+                true,
+                false
+            )
+        ),
+        [id.clone()]
+    );
+    store.save_message_draft(&id, "  ", None, &[]).unwrap();
+    assert!(
+        ids(
+            &store,
+            smart_rule(
+                vec![condition("DRAFT", "PRESENT", vec![], false)],
+                true,
+                false
+            )
+        )
+        .is_empty()
+    );
+    store.save_message_draft(&id, "draft", None, &[]).unwrap();
+    assert_eq!(
+        ids(
+            &store,
+            smart_rule(
+                vec![condition("DRAFT", "PRESENT", vec![], false)],
+                true,
+                false
+            )
+        ),
+        [id.clone()]
+    );
+    assert_eq!(
+        ids(
+            &store,
+            ChatFolderSelectionRule {
+                unread_only: true,
+                include_muted: true,
+                ..Default::default()
+            }
+        ),
+        [id]
+    );
+}

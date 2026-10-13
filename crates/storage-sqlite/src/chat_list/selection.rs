@@ -81,8 +81,8 @@ impl SqliteAccountStorage {
         &self,
         rule: ChatFolderSelectionRule,
     ) -> Result<ChatListSelectionSnapshot, ChatListSelectionError> {
-        rule.validate()?;
         self.connection.with_deferred_read(|conn| {
+            // Folder eligibility validates the immutable rule before reading any IDs.
             let scope = SelectionScope::Folder(rule);
             Ok(ChatListSelectionSnapshot {
                 lifetime: self.connection.lifetime(),
