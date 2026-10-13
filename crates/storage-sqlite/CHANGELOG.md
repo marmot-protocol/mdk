@@ -33,6 +33,7 @@
   checkpoint's total and saved bytes. The new `test-support` feature exposes
   `limit_database_pages_for_test` and `attachment_partial_bytes_for_test` to
   dependents' tests (mdk#2239).
+- `SqliteAccountStorage::epoch_gap_recovery_open_since` reports when an unresolved epoch-gap obligation (pending, parked or retired by the user) covering a group's local epoch was first armed.
 
 ### Fixed
 
@@ -46,8 +47,6 @@
 - `load_attachment_partial` sizes the restored prefix for the complete
   representation with a fallible reservation: a refused allocation is a
   storage error that keeps the checkpoint, not a process abort (mdk#2241).
-
-- `SqliteAccountStorage::epoch_gap_recovery_open_since` reports when an unresolved epoch-gap obligation (pending, parked or retired by the user) covering a group's local epoch was first armed.
 
 ## 0.13.0 - 2026-10-12
 
