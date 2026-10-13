@@ -2047,7 +2047,12 @@ impl NostrTransportAdapter {
                     .await
                 {
                     Ok(count) => delivered += count,
-                    Err(_) => return,
+                    // Only a closed delivery channel ends paging. An event that
+                    // does not map (bad encoding, signature or tag shape) is
+                    // skipped, as the live replay skips it; returning would
+                    // leave the relay in paging and wedge the cursor.
+                    Err(TransportAdapterError::Closed) => return,
+                    Err(_) => {}
                 }
             }
             if page.end != NostrAcquisitionEnd::RequestPolicySatisfied {

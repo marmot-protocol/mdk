@@ -1324,6 +1324,56 @@ async fn saturated_boundary_second_keeps_replay_incomplete() {
     assert!(!complete, "a saturated boundary must not count as coverage");
 }
 
+/// A stored event that does not map to a transport message (here a kind-445
+/// with an extra tag) is skipped by the live replay. A backward page holding
+/// one must skip it too and keep paging, or the relay would stay in paging and
+/// the cursor would never promote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unmappable_event_on_a_backward_page_does_not_wedge_paging() {
+    const VALID: usize = 600;
+    let fx = Fixture::new(
+        LimitConfig {
+            req_limit_clamp: Some(limit_relay::REQ_LIMIT_CLAMP),
+            ..LimitConfig::default()
+        },
+        false,
+    )
+    .await;
+    store_events_at(
+        &fx.database,
+        (0..VALID as u64).map(|index| 1_700_000_000 + index),
+    )
+    .await;
+    // Older than the live replay's newest 500, so it lands on the first page.
+    let keys = Keys::generate();
+    let unmappable = EventBuilder::new(Kind::MlsGroupMessage, "extra-tagged")
+        .tags([
+            Tag::custom("h", [hex::encode(route(0))]),
+            Tag::custom("x", ["unexpected"]),
+        ])
+        .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(1_700_000_010))
+        .finalize(&keys)
+        .unwrap();
+    fx.database
+        .save_event(&serde_json::from_str(unmappable.as_json().as_str()).unwrap())
+        .await
+        .unwrap();
+    let url = fx.limit.url();
+    fx.adapter
+        .activate_account(fx.activation(std::slice::from_ref(&url), groups(1, &url)))
+        .await
+        .unwrap();
+    let delivered = distinct_deliveries(&fx.adapter, Duration::from_secs(15)).await;
+    let complete = fx
+        .adapter
+        .account_subscription_eose(&fx.account)
+        .await
+        .complete();
+    fx.shutdown().await;
+    assert_eq!(delivered, VALID, "every valid event arrives");
+    assert!(complete, "the unmappable event does not wedge paging");
+}
+
 /// A replay that stays under a full page is complete as delivered and opens
 /// no backward page.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
