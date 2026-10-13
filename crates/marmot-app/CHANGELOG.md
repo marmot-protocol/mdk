@@ -62,6 +62,14 @@
 - Self-update maintenance commits now publish through the same durable frozen fanout as every other commit. They still confirm on the first relay acknowledgement, and the app's fanout retry schedule keeps retrying every group relay that missed them. Self-updates staged before upgrading finish on their legacy record, which no longer stops retrying when its post-confirmation marker write fails.
 - Every publish pass, including secondary retries after a commit confirmed, writes `publish_attempt` and `publish_outcome` audit rows with the endpoints attempted, accepted and failed in that pass.
 - A relay still pending when a multi-relay signed publish meets quorum is now reported as `publish acknowledgement unknown` instead of being dropped from the outcome.
+- History recovery now records why each relay failed. The v5
+  `recovery_attempt_finished` row lists each failed relay once, as a hashed
+  endpoint reference, with a failure class: NEG-ERR and its reason's category,
+  strfry's negentropy-cap NOTICE, a first-reply or pass timeout, a relay outside
+  the pool or not usable, the comparison limit, a refused or unexpected fetch,
+  withheld events, or a local error. `relays_failed` and `relays_incomplete`
+  now count distinct relays; before, they were summed per compared route and
+  could exceed `relays_required` (#2265).
 
 ## 0.13.0 - 2026-10-12
 

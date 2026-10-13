@@ -1022,8 +1022,22 @@ fn sample_v5_only_kinds() -> Vec<AuditEventKind> {
             events_refused: 0,
             relays_required: 2,
             relays_admitted: 2,
-            relays_failed: 1,
-            relays_incomplete: 0,
+            relays_failed: 2,
+            relays_incomplete: 1,
+            relay_outcomes: vec![
+                RecoveryRelayOutcome {
+                    relay_url: "wss://a.relay.example".into(),
+                    failure: RecoveryRelayFailure::NegErr,
+                    refusal_category: Some(SubscriptionRefusalCategory::Blocked),
+                    routes: 2,
+                },
+                RecoveryRelayOutcome {
+                    relay_url: "wss://b.relay.example".into(),
+                    failure: RecoveryRelayFailure::Withheld,
+                    refusal_category: None,
+                    routes: 1,
+                },
+            ],
         },
         AuditEventKind::RecoveryObligationReassessed {
             attempt_serial: 9,

@@ -788,7 +788,7 @@ impl AppClient {
     }
 }
 
-fn refusal_category(
+pub(super) fn refusal_category(
     category: cgka_traits::TransportEndpointRejectionCategory,
 ) -> SubscriptionRefusalCategory {
     use cgka_traits::TransportEndpointRejectionCategory as Category;
