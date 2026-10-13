@@ -330,12 +330,14 @@ class MarmotAgentControlClient:
         target_message_id_hex: str,
         text: str,
     ) -> Dict[str, Any]:
+        if not isinstance(text, str):
+            raise AgentControlError("edit text must be a string")
         return await self.request({
             "type": "edit_message",
             "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
             "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
             "target_message_id_hex": _normalize_hex(target_message_id_hex, "target_message_id_hex"),
-            "text": str(text or ""),
+            "text": text,
         })
 
     async def delete_message(

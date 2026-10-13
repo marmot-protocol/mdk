@@ -341,6 +341,9 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
             writer.close()
         await self.start_server(handler)
         client = self.adapter.MarmotAgentControlClient(self.socket_path)
+        with self.assertRaisesRegex(self.adapter.AgentControlError, "edit text must be a string"):
+            await client.edit_message("11" * 32, "22" * 16, "33" * 32, None)
+        self.assertEqual(requests, [], "null must not clear the target through a socket write")
         response = await client.edit_message("11" * 32, "22" * 16, "33" * 32, "updated")
         self.assertEqual(response["type"], "final_sent")
         self.assertEqual({key: requests[0][key] for key in (

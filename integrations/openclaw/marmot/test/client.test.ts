@@ -317,6 +317,9 @@ describe("MarmotAgentControlClient", () => {
       type: string; message_ids_hex: string[]; echoed_target: string; echoed_text: string;
     };
     expect(result).toMatchObject({ type: "final_sent", message_ids_hex: [HEX32("ed")], echoed_target: HEX32("dd"), echoed_text: "updated" });
+    await expect(client.editMessage(HEX32("aa"), HEX32("cc"), HEX32("dd"), null as unknown as string)).rejects.toThrow("edit text must be a string");
+    const cleared = await client.editMessage(HEX32("aa"), HEX32("cc"), HEX32("dd"), "") as unknown as { echoed_text: string };
+    expect(cleared.echoed_text).toBe("");
     await expect(client.editMessage(HEX32("aa"), HEX32("cc"), HEX32("dd"), "__wrong_type")).rejects.toThrow("unexpected response");
     await expect(client.editMessage(HEX32("aa"), HEX32("cc"), HEX32("dd"), "__rejected")).rejects.toMatchObject({ code: "invalid_edit_target", retryable: false });
   });

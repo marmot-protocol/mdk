@@ -623,12 +623,15 @@ export class MarmotAgentControlClient {
     targetMessageIdHex: string,
     text: string,
   ): Promise<FinalSentResponse> {
+    if (typeof text !== "string") {
+      throw new AgentControlError("edit text must be a string");
+    }
     const response = await this.request({
       type: "edit_message",
       account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
       group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
       target_message_id_hex: normalizeHex(targetMessageIdHex, "target_message_id_hex"),
-      text: String(text ?? ""),
+      text,
     });
     if (response.type !== "final_sent") {
       throw new AgentControlError("unexpected response to edit_message");
