@@ -316,6 +316,108 @@ mod tests {
                 None,
             ))
             .unwrap();
+        // Exercise the account-level ABI on populated data, including borrowed continuation
+        // and a cloned baseline that outlives both root page results.
+        {
+            use crate::account_attachment_history::*;
+            let account_ref = CString::new(account.clone()).unwrap();
+            let query = MarmotAccountAttachmentQuery {
+                groups: ptr::null(),
+                groups_len: 0,
+                senders: ptr::null(),
+                senders_len: 0,
+                has_min_timeline_at: 0,
+                min_timeline_at: 0,
+                has_max_timeline_at: 0,
+                max_timeline_at: 0,
+            };
+            unsafe {
+                let mut first = ptr::null_mut();
+                assert_eq!(
+                    marmot_account_attachment_history_page(
+                        &client,
+                        account_ref.as_ptr(),
+                        &query,
+                        1,
+                        ptr::null(),
+                        &mut first
+                    ),
+                    MarmotStatus::Ok
+                );
+                let MarmotAccountAttachmentPageRead::Page { page } = &*first else {
+                    panic!("account page");
+                };
+                assert_eq!(page.entries_len, 1);
+                assert!(!page.next_cursor.is_null());
+                assert_eq!(
+                    std::ffi::CStr::from_ptr((*page.entries).group_id_hex)
+                        .to_str()
+                        .unwrap(),
+                    group
+                );
+                let mut baseline = ptr::null_mut();
+                assert_eq!(
+                    marmot_account_attachment_version_clone(page.version, &mut baseline),
+                    MarmotStatus::Ok
+                );
+                let mut second = ptr::null_mut();
+                assert_eq!(
+                    marmot_account_attachment_history_page(
+                        &client,
+                        account_ref.as_ptr(),
+                        &query,
+                        1,
+                        page.next_cursor,
+                        &mut second
+                    ),
+                    MarmotStatus::Ok
+                );
+                marmot_account_attachment_page_read_free(first);
+                let MarmotAccountAttachmentPageRead::Page { page } = &*second else {
+                    panic!("account continuation");
+                };
+                assert_eq!(page.entries_len, 1);
+                assert!(page.next_cursor.is_null());
+                let mut change = u32::MAX;
+                assert_eq!(
+                    marmot_account_attachment_version_change_since(
+                        page.version,
+                        baseline,
+                        &mut change
+                    ),
+                    MarmotStatus::Ok
+                );
+                assert_eq!(change, MarmotAttachmentHistoryChange::Unchanged as u32);
+                marmot_account_attachment_page_read_free(second);
+                let mut current = ptr::null_mut();
+                assert_eq!(
+                    marmot_account_attachment_history_version(
+                        &client,
+                        account_ref.as_ptr(),
+                        &mut current
+                    ),
+                    MarmotStatus::Ok
+                );
+                assert_eq!(
+                    marmot_account_attachment_version_change_since(current, baseline, &mut change),
+                    MarmotStatus::Ok
+                );
+                assert_eq!(change, MarmotAttachmentHistoryChange::Unchanged as u32);
+                marmot_account_attachment_version_free(current);
+                marmot_account_attachment_version_free(baseline);
+                // Typed non-page results own no page allocations; freeing each is harmless.
+                for result in [
+                    AccountAttachmentPageReadFfi::RestartRequired,
+                    AccountAttachmentPageReadFfi::CursorMismatch,
+                    AccountAttachmentPageReadFfi::InvalidQuery,
+                    AccountAttachmentPageReadFfi::InvalidLimit,
+                ] {
+                    marmot_account_attachment_page_read_free(boxed(
+                        MarmotAccountAttachmentPageRead::from(result),
+                    ));
+                }
+            }
+        }
         let account = CString::new(account).unwrap();
         let group = CString::new(group).unwrap();
         unsafe {
