@@ -9,6 +9,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Security
+
+- Upgrade `quinn-proto` to 0.11.19 for RUSTSEC-2026-0338, -0339, -0340, -0341 and -0342
+  (QUIC agent text stream previews and the preview broker). `rustls-platform-verifier`
+  moves to 0.7 to match it, keeping a single copy in the dependency graph.
+
 ### Fixed
 
 - Group changes on a group that has moved past this device now fail with the JSON error code
