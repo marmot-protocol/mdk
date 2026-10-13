@@ -920,6 +920,7 @@ async fn attachment_publication_digest_bug_is_terminal_and_native_default_is_on(
 }
 
 mod resume;
+mod storage_block;
 
 #[tokio::test]
 async fn attachment_worker_disk_pause_does_not_consume_attempts() {

@@ -5,10 +5,48 @@
 ### Breaking changes
 
 - Migration 0108 advances account storage to schema 108 with account-wide attachment seek/expiry indexes and invalidation counters. Older binaries reject the upgraded database; downgrade is unsupported.
+- Migration 0109 advances account storage to schema 109 on first open. Older
+  binaries reject the upgraded database; downgrade is unsupported. It adds
+  `attachment_acquisition.storage_blocked_headroom` and `storage_park_count`,
+  a partial index for parked rows, and keeps ciphertext checkpoints for jobs
+  parked on disk space.
+- `AttachmentTransferState` adds `StorageBlocked`; update exhaustive matches.
 
 ### Added
 
 - Bounded account-wide attachment pages with group/sender selections, inclusive date bounds and account/query-bound continuation cursors.
+- `SqliteAccountStorage::block_attachment_storage` parks a live attempt whose
+  publication disk reserve the device cannot cover. It records the free space
+  the next attempt needs beyond the reserve, refreshes the checkpoint's idle
+  expiry, refunds the automatic-history claim and the claim streak, withdraws
+  a completed-body receipt that publication could not use, and advances a park
+  streak (a permission-owned park does not). `readmit_storage_blocked_attachments`
+  requeues up to 64 parked jobs whose target fits the supplied free space less
+  `STORAGE_READMIT_MARGIN_BYTES` once admission (`disk_reserve + 4 *
+  transfer_limit`) would pass, delays a repeated park by its streak, and skips
+  automatic rows while automatic acquisition is disabled; its probe is
+  read-only until a row fits. Explicit retry, readmission, completion and
+  cancellation clear the parked marker; both explicit retry APIs refresh a
+  parked prefix's idle expiry. `prune_attachment_partials` keeps a parked
+  prefix for at most `STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS` (seven days) after
+  the latest park, then prunes it. `attachment_partial_extent` reports a
+  checkpoint's total and saved bytes. The new `test-support` feature exposes
+  `limit_database_pages_for_test` and `attachment_partial_bytes_for_test` to
+  dependents' tests (mdk#2239).
+- `SqliteAccountStorage::epoch_gap_recovery_open_since` reports when an unresolved epoch-gap obligation (pending, parked or retired by the user) covering a group's local epoch was first armed.
+
+### Fixed
+
+- `complete_attachment_acquisition` publishes a body larger than one 64 KiB
+  staging chunk as a completed chunked file, the layout the file sink's import
+  already produces, so no SQLite value holds more than one chunk of it and the
+  insert trigger never rewrites a body-sized row. Migration 0104 appends `byte_len`
+  after `bytes`, and SQLite expands a `zeroblob` that is not the record's last
+  field, so a pre-sized array row would still materialize the body. A body of
+  at most one chunk stays one array row (mdk#2241).
+- `load_attachment_partial` sizes the restored prefix for the complete
+  representation with a fallible reservation: a refused allocation is a
+  storage error that keeps the checkpoint, not a process abort (mdk#2241).
 
 ## 0.13.0 - 2026-10-12
 

@@ -848,7 +848,6 @@ pub(crate) async fn fetch_blossom_file_with_transport(
                 total.unwrap_or(limit + 1),
             ));
         }
-        observation.file_capacity(total.unwrap_or(0)).await?;
         let identity =
             etag.zip(total)
                 .map(|(etag, total)| storage_sqlite::AttachmentPartialIdentity {
@@ -857,6 +856,18 @@ pub(crate) async fn fetch_blossom_file_with_transport(
                     etag,
                     total,
                 });
+        // The staging file grows from the restored prefix to the total and,
+        // with a validator, so does the checkpoint; the prefix is staged now.
+        observation
+            .publication_capacity(
+                total.unwrap_or(0),
+                total.map_or(0, |total| {
+                    let growth = total.saturating_sub(prefix_length);
+                    growth.saturating_add(if identity.is_some() { growth } else { 0 })
+                }),
+                prefix_length,
+            )
+            .await?;
         let mut response = response;
         let mut output = if partial_response {
             prefix.expect("validated file prefix").0
@@ -948,9 +959,24 @@ pub(crate) async fn fetch_blossom_file_with_transport(
                 )));
             }
             // Bodies without validators cannot checkpoint, but still consume
-            // private disk space and must preserve the same reserve.
+            // private disk space and must preserve the same reserve. An unknown
+            // total projects the body received so far; the staged bytes are
+            // held now, and the checkpoint still grows past the saved prefix.
             if output.len - capacity_checked >= storage_sqlite::ATTACHMENT_CHECKPOINT_BYTES as u64 {
-                observation.file_capacity(output.len).await?;
+                let projected = total.unwrap_or(output.len);
+                observation
+                    .publication_capacity(
+                        projected,
+                        projected.saturating_sub(output.len).saturating_add(
+                            if identity.is_some() {
+                                projected.saturating_sub(saved as u64)
+                            } else {
+                                0
+                            },
+                        ),
+                        output.len,
+                    )
+                    .await?;
                 capacity_checked = output.len;
             }
             for part in chunk.chunks(super::file_transfer::FILE_TRANSFER_BUFFER_BYTES) {
@@ -1305,7 +1331,7 @@ where
                     && resume
                         .checkpoint_total(&current)
                         .await?
-                        .is_some_and(|total| total > max_body_bytes)
+                        .is_some_and(|total| total > resume.memory_sink_limit())
                 {
                     return Err(AttachmentDownloadFailure::FileRequired);
                 }
@@ -1508,7 +1534,7 @@ where
                     && prefix.is_none()
                     && response
                         .content_length()
-                        .is_none_or(|length| length > MAX_ENCRYPTED_MEDIA_BLOB_BYTES)
+                        .is_none_or(|length| length > context.memory_sink_limit())
                 {
                     return Err(AttachmentDownloadFailure::FileRequired);
                 }

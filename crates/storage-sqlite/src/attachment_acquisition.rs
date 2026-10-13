@@ -632,8 +632,10 @@ impl SqliteAccountStorage {
     /// verifies the parser-supplied plaintext hash, but cannot authenticate AEAD.
     /// Quota counts retained plaintext bytes, not SQLite/WAL filesystem overhead;
     /// runtime disk-pressure admission must reserve that overhead separately.
-    /// Publication binds the complete plaintext and SQLite may copy it; the
-    /// runtime must budget full-object memory, unlike incremental local reads.
+    /// A body larger than one `ATTACHMENT_STAGING_CHUNK_BYTES` chunk publishes
+    /// as a completed chunked file, the layout the file sink's import produces,
+    /// so no SQLite value holds more than one chunk of it; a body of at most one
+    /// chunk stays one array row. Either way publication is one transaction.
     pub fn complete_attachment_acquisition(
         &self,
         job: &AttachmentAcquisition,
@@ -650,13 +652,25 @@ impl SqliteAccountStorage {
             {
                 return Ok(refused);
             }
+            if plaintext.len() > ATTACHMENT_STAGING_CHUNK_BYTES {
+                let len = plaintext.len() as u64;
+                let nonce = file_import::reserve_chunked_file(&conn, job, len)?;
+                file_import::insert_chunks(&conn, &nonce, 0, plaintext)?;
+                file_import::seal_chunked_file(&conn, &job.reference.token, &nonce)?;
+            } else {
+                // Declaring `byte_len` keeps the insert trigger from rewriting the row.
+                conn.execute(
+                    "INSERT INTO retained_attachment_bytes(token,byte_len,bytes) VALUES(?1,?2,?3)",
+                    params![
+                        job.reference.token,
+                        u64_to_i64(plaintext.len() as u64)?,
+                        plaintext
+                    ],
+                )
+                .storage()?;
+            }
             conn.execute(
-                "INSERT INTO retained_attachment_bytes(token,bytes) VALUES(?1,?2)",
-                params![job.reference.token, plaintext],
-            )
-            .storage()?;
-            conn.execute(
-                "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL WHERE token=?1",
+                "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL,storage_blocked_headroom=NULL,storage_park_count=0 WHERE token=?1",
                 [&job.reference.token],
             )
             .storage()?;
@@ -732,23 +746,32 @@ impl SqliteAccountStorage {
     }
     /// Explicit retry of an existing failed/parked/delayed job. Ready bytes and active
     /// attempts are not changed; this never clears explicit-removal suppression.
+    /// Retrying a storage-parked job refreshes its prefix's idle expiry, so a
+    /// park longer than a day still resumes from the kept checkpoint.
     pub fn retry_attachment_acquisition(
         &self,
         reference: &AttachmentAssetRef,
         now: u64,
     ) -> StorageResult<bool> {
-        let conn = self.lock()?;
-        if !matches_store(&conn, reference)? {
-            return Ok(false);
-        }
-        Ok(conn
-            .execute(
-                "UPDATE attachment_acquisition SET state=0,due=?2,attempt=NULL,cancelled=0,size_blocked_max=NULL,permission_paused=0,retry_not_before=0,network_attempts=0,acquisition_attempts=0,body_completed=0,preparation_deferrals=0
-             WHERE token=?1 AND state IN (2,4,5)",
-                params![reference.token, u64_to_i64(now)?],
-            )
-            .storage()?
-            == 1)
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if !matches_store(&conn, reference)? {
+                return Ok(false);
+            }
+            let parked = partial::storage_parked(&conn, &reference.token)?;
+            let retried = conn
+                .execute(
+                    "UPDATE attachment_acquisition SET state=0,due=?2,attempt=NULL,cancelled=0,size_blocked_max=NULL,storage_blocked_headroom=NULL,storage_park_count=0,permission_paused=0,retry_not_before=0,network_attempts=0,acquisition_attempts=0,body_completed=0,preparation_deferrals=0
+                 WHERE token=?1 AND state IN (2,4,5)",
+                    params![reference.token, u64_to_i64(now)?],
+                )
+                .storage()?
+                == 1;
+            if retried && parked {
+                partial::refresh_partial_expiry(&conn, &reference.token, now)?;
+            }
+            Ok(retried)
+        })
     }
 
     /// Suppress this original message slot durably even when it has no bytes yet.
@@ -942,6 +965,23 @@ impl SqliteAccountStorage {
             )
             .storage()
     }
+    /// Cap the account database at its current size plus `slack_pages`, so a
+    /// publication that needs more fails with the backend's capacity error
+    /// while small bookkeeping updates still fit. Test support only; a large
+    /// slack lifts the cap again.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn limit_database_pages_for_test(&self, slack_pages: u64) -> StorageResult<()> {
+        let conn = self.lock()?;
+        let pages: u64 = conn
+            .query_row("PRAGMA page_count", [], |row| nonnegative(row, 0))
+            .storage()?;
+        conn.execute_batch(&format!(
+            "PRAGMA max_page_count={}",
+            pages.saturating_add(slack_pages)
+        ))
+        .storage()
+    }
+
     pub fn retained_attachment_byte_count(&self) -> StorageResult<u64> {
         self.lock()?
             .query_row(
@@ -1016,7 +1056,10 @@ fn publication_refusal(
 mod tests;
 
 mod partial;
-pub use partial::{ATTACHMENT_CHECKPOINT_BYTES, AttachmentPartial, AttachmentPartialIdentity};
+pub use partial::{
+    ATTACHMENT_CHECKPOINT_BYTES, AttachmentPartial, AttachmentPartialIdentity,
+    STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS,
+};
 
 mod file_import;
 mod file_staging;
@@ -1027,7 +1070,7 @@ pub use access::RetainedAttachmentAsset;
 mod controls;
 pub use controls::{
     AttachmentDownloadPolicy, AttachmentTransferFrame, AttachmentTransferState,
-    AttachmentTransferStatus,
+    AttachmentTransferStatus, STORAGE_READMIT_MARGIN_BYTES,
 };
 
 mod outgoing;

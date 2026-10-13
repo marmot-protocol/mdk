@@ -1388,6 +1388,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::InvalidChatPin(_) => "read_marker_failed:invalid_chat_pin",
         AppError::GroupDisbanding(_) => "read_marker_failed:group_disbanding",
         AppError::GroupRemoved(_) => "read_marker_failed:group_removed",
+        AppError::GroupCatchingUp(_) => "read_marker_failed:group_catching_up",
         AppError::MessageDraftRevisionConflict => {
             "read_marker_failed:message_draft_revision_conflict"
         }

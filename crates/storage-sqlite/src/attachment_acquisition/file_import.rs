@@ -55,20 +55,17 @@ pub(super) fn complete(
         if let Some(refused) = publication_refusal(&conn, job, now, len, budget)? {
             return Ok(Err(refused));
         }
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM retained_attachment_bytes WHERE token=?1)",
-            [&job.reference.token], |row| row.get(0),
-        ).storage()?;
-        if exists { return Ok(Err(AttachmentPublishResult::Superseded)); }
-        let nonce: Vec<u8> = conn.query_row("SELECT randomblob(16)", [], |row| row.get(0)).storage()?;
-        conn.execute("INSERT INTO attachment_chunk_bodies(nonce) VALUES(?1)", [&nonce]).storage()?;
-        // Empty blob keeps existing source/deletion ownership. File metadata,
-        // not this placeholder, charges the complete reservation exactly once.
-        conn.execute("INSERT INTO retained_attachment_bytes(token,byte_len,bytes) VALUES(?1,0,x'')",
-            [&job.reference.token]).storage()?;
-        conn.execute("INSERT INTO retained_attachment_files(token,nonce,attempt,byte_len) VALUES(?1,?2,?3,?4)",
-            params![job.reference.token, nonce, job.attempt, u64_to_i64(len)?]).storage()?;
-        Ok(Ok(nonce))
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM retained_attachment_bytes WHERE token=?1)",
+                [&job.reference.token],
+                |row| row.get(0),
+            )
+            .storage()?;
+        if exists {
+            return Ok(Err(AttachmentPublishResult::Superseded));
+        }
+        Ok(Ok(reserve_chunked_file(&conn, job, len)?))
     })?;
     let nonce = match reservation {
         Ok(nonce) => nonce,
@@ -116,20 +113,7 @@ pub(super) fn complete(
             {
                 return Ok(Some(refused));
             }
-            for (index, chunk) in buffer[..count]
-                .chunks(ATTACHMENT_STAGING_CHUNK_BYTES)
-                .enumerate()
-            {
-                conn.execute(
-                    "INSERT INTO retained_attachment_chunks(token,offset,bytes) VALUES(?1,?2,?3)",
-                    params![
-                        reservation.nonce,
-                        u64_to_i64(offset + (index * ATTACHMENT_STAGING_CHUNK_BYTES) as u64)?,
-                        chunk
-                    ],
-                )
-                .storage()?;
-            }
+            insert_chunks(&conn, &reservation.nonce, offset, &buffer[..count])?;
             Ok(None)
         })?;
         if let Some(refused) = refusal {
@@ -159,13 +143,9 @@ pub(super) fn complete(
         if let Some(refused) = publication_refusal(&conn, job, u64_to_i64(clock())?, 0, budget)? {
             return Ok(refused);
         }
+        seal_chunked_file(&conn, &job.reference.token, &reservation.nonce)?;
         conn.execute(
-            "UPDATE retained_attachment_files SET completed=1 WHERE token=?1 AND nonce=?2",
-            params![job.reference.token, reservation.nonce],
-        )
-        .storage()?;
-        conn.execute(
-            "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL WHERE token=?1",
+            "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL,storage_blocked_headroom=NULL,storage_park_count=0 WHERE token=?1",
             [&job.reference.token],
         )
         .storage()?;
@@ -173,6 +153,73 @@ pub(super) fn complete(
     })?;
     reservation.published = result == AttachmentPublishResult::Published;
     Ok(result)
+}
+
+/// Reserve a chunked retained file for `job`: a fresh chunk-body nonce, an
+/// empty placeholder that keeps source and deletion ownership, and the
+/// unfinished file row, whose metadata (not the placeholder) charges the
+/// complete length to the quota exactly once. Returns the chunks' nonce.
+pub(super) fn reserve_chunked_file(
+    conn: &Connection,
+    job: &AttachmentAcquisition,
+    len: u64,
+) -> StorageResult<Vec<u8>> {
+    let nonce: Vec<u8> = conn
+        .query_row("SELECT randomblob(16)", [], |row| row.get(0))
+        .storage()?;
+    conn.execute(
+        "INSERT INTO attachment_chunk_bodies(nonce) VALUES(?1)",
+        [&nonce],
+    )
+    .storage()?;
+    conn.execute(
+        "INSERT INTO retained_attachment_bytes(token,byte_len,bytes) VALUES(?1,0,x'')",
+        [&job.reference.token],
+    )
+    .storage()?;
+    conn.execute(
+        "INSERT INTO retained_attachment_files(token,nonce,attempt,byte_len) VALUES(?1,?2,?3,?4)",
+        params![job.reference.token, nonce, job.attempt, u64_to_i64(len)?],
+    )
+    .storage()?;
+    Ok(nonce)
+}
+
+/// Write `bytes` at `offset` of a reserved file, one staging chunk per row.
+pub(super) fn insert_chunks(
+    conn: &Connection,
+    nonce: &[u8],
+    offset: u64,
+    bytes: &[u8],
+) -> StorageResult<()> {
+    for (index, chunk) in bytes.chunks(ATTACHMENT_STAGING_CHUNK_BYTES).enumerate() {
+        conn.execute_cached(
+            "INSERT INTO retained_attachment_chunks(token,offset,bytes) VALUES(?1,?2,?3)",
+            params![
+                nonce,
+                u64_to_i64(offset + (index * ATTACHMENT_STAGING_CHUNK_BYTES) as u64)?,
+                chunk
+            ],
+        )
+        .storage()?;
+    }
+    Ok(())
+}
+
+/// Seal a reserved file after its last chunk, since completed chunks are
+/// immutable, and before the job leaves its attempt, which discards an
+/// unfinished file.
+pub(super) fn seal_chunked_file(
+    conn: &Connection,
+    token: &[u8],
+    nonce: &[u8],
+) -> StorageResult<()> {
+    conn.execute(
+        "UPDATE retained_attachment_files SET completed=1 WHERE token=?1 AND nonce=?2",
+        params![token, nonce],
+    )
+    .storage()?;
+    Ok(())
 }
 
 fn owns(conn: &Connection, job: &AttachmentAcquisition, nonce: &[u8]) -> StorageResult<bool> {

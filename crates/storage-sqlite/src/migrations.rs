@@ -230,6 +230,8 @@ mod migration_0106_retained_attachment_chunks;
 mod migration_0107_moderation_report_outbox;
 #[path = "migrations/0108_account_attachment_history.rs"]
 mod migration_0108_account_attachment_history;
+#[path = "migrations/0109_attachment_storage_block.rs"]
+mod migration_0109_attachment_storage_block;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -896,6 +898,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0108_account_attachment_history",
         suspend_foreign_keys: &[],
         apply: migration_0108_account_attachment_history::apply,
+    },
+    Migration {
+        version: 109,
+        name: "0109_attachment_storage_block",
+        suspend_foreign_keys: &[],
+        apply: migration_0109_attachment_storage_block::apply,
     },
 ];
 

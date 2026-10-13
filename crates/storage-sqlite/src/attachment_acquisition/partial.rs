@@ -2,7 +2,45 @@
 use super::*;
 
 pub const ATTACHMENT_CHECKPOINT_BYTES: usize = 1024 * 1024;
-const PARTIAL_TTL_SECONDS: u64 = 24 * 60 * 60;
+/// Idle expiry of a checkpoint, measured from its last progress. Parking a job
+/// for disk space, readmitting it and explicitly retrying it all refresh this
+/// deadline, so a prefix kept through a long park is still loadable when the
+/// job resumes by any of those paths.
+pub(super) const PARTIAL_TTL_SECONDS: u64 = 24 * 60 * 60;
+/// Longest a storage-parked job keeps its prefix, measured from its latest
+/// park. A parked prefix is exempt from the idle expiry until then, so it
+/// survives while the user frees space, but it cannot hold its disk and its
+/// quota reservation forever, for instance while automatic acquisition stays
+/// disabled. Past it, the prefix is pruned and the row stays parked without
+/// one; its next attempt starts the body over.
+pub const STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+/// Whether the row is storage-parked: the state an explicit retry or a
+/// readmission resumes from with the parked prefix.
+pub(super) fn storage_parked(conn: &Connection, token: &[u8]) -> StorageResult<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM attachment_acquisition WHERE token=?1
+         AND state=4 AND cancelled=0 AND storage_blocked_headroom IS NOT NULL)",
+        [token],
+        |row| row.get(0),
+    )
+    .storage()
+}
+
+/// Give a prefix that is about to be resumed a fresh idle expiry, never a
+/// shorter one.
+pub(super) fn refresh_partial_expiry(
+    conn: &Connection,
+    token: &[u8],
+    now: u64,
+) -> StorageResult<()> {
+    conn.execute(
+        "UPDATE attachment_partial SET expires_at=max(expires_at,?2) WHERE token=?1",
+        params![token, u64_to_i64(now.saturating_add(PARTIAL_TTL_SECONDS))?],
+    )
+    .storage()?;
+    Ok(())
+}
 
 /// HTTP validator is opaque and protected; do not log this identity.
 #[derive(Clone, PartialEq, Eq)]
@@ -64,27 +102,38 @@ impl SqliteAccountStorage {
         now: u64,
         expected: (&[u8; 32], &[u8; 32]),
     ) -> StorageResult<Option<u64>> {
+        Ok(self
+            .attachment_partial_extent(job, now, expected)?
+            .map(|(total, _)| total))
+    }
+
+    /// The checkpoint's declared total and the bytes saved so far, without
+    /// reading its body. Capacity checks size a restore from both.
+    pub fn attachment_partial_extent(
+        &self,
+        job: &AttachmentAcquisition,
+        now: u64,
+        expected: (&[u8; 32], &[u8; 32]),
+    ) -> StorageResult<Option<(u64, u64)>> {
         let conn = self.lock()?;
         if !valid_attempt(&conn, job, now)? {
             return Ok(None);
         }
-        let total = conn
-            .query_row(
-                "SELECT total FROM attachment_partial WHERE token=?1
+        conn.query_row(
+            "SELECT total,received FROM attachment_partial WHERE token=?1
              AND ciphertext_digest=?2 AND locator_digest=?3 AND expires_at>?4
              AND received<=total AND total<=?5",
-                params![
-                    job.reference.token,
-                    &expected.0[..],
-                    &expected.1[..],
-                    u64_to_i64(now)?,
-                    u64_to_i64(MAX_RETAINED_FILE_ATTACHMENT_BYTES)?
-                ],
-                |row| nonnegative(row, 0),
-            )
-            .optional()
-            .storage()?;
-        Ok(total)
+            params![
+                job.reference.token,
+                &expected.0[..],
+                &expected.1[..],
+                u64_to_i64(now)?,
+                u64_to_i64(MAX_RETAINED_FILE_ATTACHMENT_BYTES)?
+            ],
+            |row| Ok((nonnegative(row, 0)?, nonnegative(row, 1)?)),
+        )
+        .optional()
+        .storage()
     }
 
     /// Restore a verified ciphertext prefix into a bounded writer rather than
@@ -341,11 +390,12 @@ impl SqliteAccountStorage {
                 ],
             )
             .storage()?;
-            // Only newly retained resumable bytes break the failure streak.
-            // Re-reading/replacing the same prefix must not suppress backoff.
+            // Only newly retained resumable bytes break the failure streak and
+            // the storage-park streak. Re-reading/replacing the same prefix
+            // must not suppress backoff.
             if end > old.as_ref().map_or(0, |old| old.4) {
                 conn.execute(
-                    "UPDATE attachment_acquisition SET attempts=1 WHERE token=?1",
+                    "UPDATE attachment_acquisition SET attempts=1,storage_park_count=0 WHERE token=?1",
                     [&job.reference.token],
                 )
                 .storage()?;
@@ -459,7 +509,13 @@ impl SqliteAccountStorage {
                 )
                 .storage()?;
             let mut rows = stmt.query([&job.reference.token]).storage()?;
+            // Size the prefix for the complete representation once, so neither
+            // this reassembly nor the resumed body grows it by doubling. A
+            // failed reservation is a backend error the runtime retries later.
             let mut bytes = Vec::new();
+            bytes.try_reserve_exact(total as usize).map_err(|_| {
+                StorageError::Backend("partial checkpoint buffer unavailable".into())
+            })?;
             let mut corrupt = false;
             while let Some(row) = rows.next().storage()? {
                 let offset = nonnegative(row, 0).storage()?;
@@ -533,16 +589,43 @@ impl SqliteAccountStorage {
         })
     }
 
+    /// Storage-parked jobs are exempt until
+    /// [`STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS`] after their latest park: the
+    /// prefix is what makes readmission local work. A park sets the prefix's
+    /// idle expiry to one TTL past the park, so the exemption ends once that
+    /// expiry is more than the remaining age in the past. Cancellation clears
+    /// the parked marker, so a cancelled prefix expires as before. A job whose
+    /// aged prefix is pruned stays parked; its next attempt parks again at its
+    /// first capacity check if the recorded target no longer covers it.
     pub fn prune_attachment_partials(&self, now: u64, limit: usize) -> StorageResult<usize> {
         if limit == 0 || limit > ATTACHMENT_ACQUISITION_BATCH_LIMIT {
             return Err(invalid("invalid partial prune limit"));
         }
+        let exempt_after = now
+            .saturating_add(PARTIAL_TTL_SECONDS)
+            .saturating_sub(STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS);
         self.lock()?
             .execute(
                 "DELETE FROM attachment_partial WHERE token IN (
-                 SELECT token FROM attachment_partial WHERE expires_at<=?1
-                 ORDER BY expires_at,token LIMIT ?2)",
-                params![u64_to_i64(now)?, limit as i64],
+                 SELECT p.token FROM attachment_partial p WHERE p.expires_at<=?1
+                 AND NOT (p.expires_at>?3 AND EXISTS(SELECT 1 FROM attachment_acquisition q
+                     WHERE q.token=p.token AND q.state=4 AND q.cancelled=0
+                     AND q.storage_blocked_headroom IS NOT NULL))
+                 ORDER BY p.expires_at,p.token LIMIT ?2)",
+                params![u64_to_i64(now)?, limit as i64, u64_to_i64(exempt_after)?],
+            )
+            .storage()
+    }
+
+    /// Bytes currently held in ciphertext checkpoints. Test support for
+    /// free-space models that charge checkpoint growth to the volume.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn attachment_partial_bytes_for_test(&self) -> StorageResult<u64> {
+        self.lock()?
+            .query_row(
+                "SELECT coalesce(sum(length(bytes)),0) FROM attachment_partial_chunk",
+                [],
+                |row| nonnegative(row, 0),
             )
             .storage()
     }

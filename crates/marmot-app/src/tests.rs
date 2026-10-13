@@ -3072,8 +3072,13 @@ fn local_epoch_progress_does_not_clear_history_or_suppress_independent_gaps() {
             )
             .unwrap()
             .unwrap();
+        // The app refuses group changes while this gap is armed (mdk#2258),
+        // so advance the epoch at the engine instead.
         client
-            .update_group_profile(&group, Some("local progress during acquisition"), None)
+            .runtime
+            .send(cgka_traits::engine::SendIntent::SelfUpdate {
+                group_id: group.clone(),
+            })
             .await
             .unwrap();
         assert!(client.group_mls_state(&group).unwrap().epoch > epoch);
@@ -23055,6 +23060,228 @@ fn presentation_quarantine_preserves_existing_chat_kind_and_direct_reuse() {
     });
 }
 
+fn assert_group_catching_up<T: std::fmt::Debug>(
+    result: Result<T, AppError>,
+    group_hex: &str,
+    operation: &str,
+) {
+    match result {
+        Err(AppError::GroupCatchingUp(held)) => assert_eq!(held, group_hex, "{operation}"),
+        other => panic!("{operation} must refuse while the group is behind, got {other:?}"),
+    }
+}
+
+/// mdk#2258: a device with unresolved epoch-gap recovery knows the group moved
+/// past its local epoch. Any commit it authors from there forks the group, so
+/// every group change is refused and the maintenance self-update waits, unless
+/// the user accepts the fork risk for that epoch.
+#[tokio::test]
+async fn group_changes_refuse_while_epoch_gap_recovery_holds_the_group() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("behind", &[]).await.unwrap();
+    let group_hex = hex::encode(group_id.as_slice());
+    let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
+    let storage = app.account_storage("alice").unwrap();
+    let intent = storage_sqlite::StoredEpochBackfillIntent {
+        group_id_hex: group_hex.clone(),
+        stalled_epoch: epoch.0,
+    };
+    storage
+        .arm_epoch_backfill_intents(std::slice::from_ref(&intent))
+        .unwrap();
+    let publishes = relay.published_event_ids().len();
+    let member = Keys::generate().public_key().to_hex();
+
+    assert_group_catching_up(
+        client
+            .update_group_profile(&group_id, Some("renamed"), None)
+            .await,
+        &group_hex,
+        "update_group_profile",
+    );
+    assert_group_catching_up(
+        client.invite_members(&group_id, &[member.as_str()]).await,
+        &group_hex,
+        "invite_members",
+    );
+    assert_group_catching_up(
+        client.remove_members(&group_id, &[member.as_str()]).await,
+        &group_hex,
+        "remove_members",
+    );
+    assert_group_catching_up(
+        client.promote_admin(&group_id, &member).await,
+        &group_hex,
+        "promote_admin",
+    );
+    assert_group_catching_up(
+        client.self_demote_admin(&group_id).await,
+        &group_hex,
+        "self_demote_admin",
+    );
+    assert_group_catching_up(
+        client.enable_group_disbanding(&group_id).await,
+        &group_hex,
+        "enable_group_disbanding",
+    );
+    assert_group_catching_up(
+        client.disband_group(&group_id).await,
+        &group_hex,
+        "disband_group",
+    );
+    assert_group_catching_up(
+        client.update_message_retention(&group_id, 3_600).await,
+        &group_hex,
+        "update_message_retention",
+    );
+    assert_group_catching_up(
+        client
+            .update_group_avatar_url(&group_id, None, None, None)
+            .await,
+        &group_hex,
+        "update_group_avatar_url",
+    );
+    assert_group_catching_up(
+        client
+            .replace_encrypted_media_blob_endpoints(&group_id, Vec::new())
+            .await,
+        &group_hex,
+        "replace_encrypted_media_blob_endpoints",
+    );
+    assert_group_catching_up(
+        client
+            .update_group_image(&group_id, vec![0; 4], "image/png")
+            .await,
+        &group_hex,
+        "update_group_image",
+    );
+
+    // A due self-update is held the same way rather than authored.
+    client
+        .runtime
+        .schedule_manual_self_update(&group_id)
+        .unwrap();
+    let mut obligation = client
+        .runtime
+        .session()
+        .maintenance_obligations()
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("scheduled maintenance obligation");
+    obligation.phase = cgka_traits::MaintenancePhase::Retry;
+    client
+        .runtime
+        .session()
+        .put_maintenance_obligation(&obligation)
+        .unwrap();
+    client.run_due_maintenance().await.unwrap();
+    let held = client
+        .runtime
+        .session()
+        .maintenance_obligation(&obligation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.last_failure_code.as_deref(), Some("epoch_gap_hold"));
+
+    assert_eq!(client.runtime.group_record(&group_id).unwrap().epoch, epoch);
+    assert_eq!(relay.published_event_ids().len(), publishes);
+
+    // An acknowledgement admits one attempt: a change that fails after the
+    // gate does not leave a different change authorized.
+    assert!(client.acknowledge_group_catching_up(&group_id).unwrap());
+    assert!(matches!(
+        client
+            .update_group_avatar_url(
+                &group_id,
+                Some("http://insecure.example/a.png".into()),
+                None,
+                None
+            )
+            .await,
+        Err(AppError::InvalidGroupAvatarUrl(_))
+    ));
+    assert_group_catching_up(
+        client
+            .update_group_profile(&group_id, Some("renamed"), None)
+            .await,
+        &group_hex,
+        "update_group_profile after a failed acknowledged attempt",
+    );
+
+    // The gate is advisory: the user can accept the fork risk for this epoch.
+    assert!(client.acknowledge_group_catching_up(&group_id).unwrap());
+    client
+        .update_group_profile(&group_id, Some("renamed"), None)
+        .await
+        .unwrap();
+    let moved = client.runtime.group_record(&group_id).unwrap().epoch;
+    assert!(moved.0 > epoch.0);
+
+    // The acknowledgement covered that epoch only; a gap at the next asks again.
+    let next = storage_sqlite::StoredEpochBackfillIntent {
+        group_id_hex: group_hex.clone(),
+        stalled_epoch: moved.0,
+    };
+    storage
+        .arm_epoch_backfill_intents(std::slice::from_ref(&next))
+        .unwrap();
+    assert_group_catching_up(
+        client
+            .update_group_profile(&group_id, Some("again"), None)
+            .await,
+        &group_hex,
+        "update_group_profile after the acknowledged epoch",
+    );
+
+    // Recovery that ends the gap lifts the gate without any acknowledgement.
+    storage
+        .clear_epoch_backfill_intents(&[intent, next])
+        .unwrap();
+    assert!(!client.acknowledge_group_catching_up(&group_id).unwrap());
+    client
+        .update_group_profile(&group_id, Some("caught up"), None)
+        .await
+        .unwrap();
+}
+
+/// mdk#2258: gap evidence armed at an epoch the device has since left does not
+/// hold the group; only an unresolved gap at or above the local epoch does.
+#[tokio::test]
+async fn epoch_gap_below_the_local_epoch_does_not_hold_group_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("moved on", &[]).await.unwrap();
+    let stalled = client.runtime.group_record(&group_id).unwrap().epoch;
+    client
+        .update_group_profile(&group_id, Some("first"), None)
+        .await
+        .unwrap();
+    app.account_storage("alice")
+        .unwrap()
+        .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+            group_id_hex: hex::encode(group_id.as_slice()),
+            stalled_epoch: stalled.0,
+        }])
+        .unwrap();
+    client
+        .update_group_profile(&group_id, Some("second"), None)
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn forget_group_local_stops_work_and_survives_reopen() {
     use cgka_traits::storage::GroupStorage;
@@ -23700,5 +23927,93 @@ fn group_create_relay_options_preserve_defaults_and_enforce_host_safety() {
             app.new_nostr_routing(Some(relays)),
             Err(AppError::InvalidNostrRouting(_))
         ));
+    }
+}
+
+/// Allocation audit for the crate's own test binary (mdk#2241).
+///
+/// Only threads that opt in are counted: a measuring test drives its fixture on
+/// a dedicated current-thread runtime whose worker and blocking threads all
+/// opt in (see [`alloc_audit::measure`]), so tests that run alongside in the
+/// same process cannot inflate the figure. Memory a measured thread frees but
+/// an unmeasured one allocated lowers the live count, so measuring tests also
+/// check that the body they receive is itself visible in the peak. SQLite
+/// allocates through libc and is measured separately by the storage-sqlite
+/// publication test.
+pub(crate) mod alloc_audit {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicIsize, Ordering};
+
+    static LIVE: AtomicIsize = AtomicIsize::new(0);
+    static PEAK: AtomicIsize = AtomicIsize::new(0);
+
+    thread_local! {
+        static MEASURED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Whether this thread's allocations count, without allocating.
+    fn measured() -> bool {
+        MEASURED.try_with(Cell::get).unwrap_or(false)
+    }
+
+    struct Counting;
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc(layout) };
+            if !pointer.is_null() && measured() {
+                let size = layout.size() as isize;
+                let now = LIVE.fetch_add(size, Ordering::Relaxed) + size;
+                PEAK.fetch_max(now, Ordering::Relaxed);
+            }
+            pointer
+        }
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            if measured() {
+                LIVE.fetch_sub(layout.size() as isize, Ordering::Relaxed);
+            }
+            unsafe { System.dealloc(pointer, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: Counting = Counting;
+
+    /// Count this thread's allocations from now on.
+    fn measure_current_thread() {
+        MEASURED.with(|measured| measured.set(true));
+    }
+
+    /// Run `future` on a fresh current-thread runtime whose threads, and the
+    /// calling thread, are measured. Measuring tests are serialized so their
+    /// fixtures never share the counters.
+    pub(crate) fn measure<F: std::future::Future>(future: F) -> F::Output {
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _serial = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .on_thread_start(measure_current_thread)
+            .build()
+            .unwrap();
+        measure_current_thread();
+        let output = runtime.block_on(future);
+        drop(runtime);
+        MEASURED.with(|measured| measured.set(false));
+        output
+    }
+
+    /// Live measured heap bytes.
+    pub(crate) fn live() -> isize {
+        LIVE.load(Ordering::Relaxed)
+    }
+    /// Start a peak measurement from the current live count.
+    pub(crate) fn reset_peak() {
+        PEAK.store(live(), Ordering::Relaxed);
+    }
+    /// Highest live count since the last reset.
+    pub(crate) fn peak() -> isize {
+        PEAK.load(Ordering::Relaxed)
     }
 }

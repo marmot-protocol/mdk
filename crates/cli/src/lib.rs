@@ -402,7 +402,7 @@ pub(crate) fn resolve_relative_paths(cli: &mut Cli, base: &Path) {
     }
     let base_dir = || base.to_string_lossy().into_owned();
     match &mut cli.command {
-        Command::Groups { command } => match command {
+        Command::Groups { command, .. } => match command {
             GroupsCommand::Create {
                 image: Some(image), ..
             } => resolve(base, image),
@@ -474,6 +474,7 @@ fn is_group_state_subscribe(cli: &Cli) -> bool {
         &cli.command,
         Command::Groups {
             command: GroupsCommand::SubscribeState { .. },
+            ..
         }
     )
 }
@@ -666,11 +667,31 @@ async fn execute_inner(
         Command::Media { command } => {
             commands::media::media_command(&account_home, &app, command, account_flag).await
         }
-        Command::Group { command } => {
-            commands::groups::group_command(&account_home, &app, command, account_flag).await
+        Command::Group {
+            command,
+            accept_stale,
+        } => {
+            commands::groups::group_command(
+                &account_home,
+                &app,
+                command,
+                account_flag,
+                accept_stale,
+            )
+            .await
         }
-        Command::Groups { command } => {
-            commands::groups::groups_command(&account_home, &app, command, account_flag).await
+        Command::Groups {
+            command,
+            accept_stale,
+        } => {
+            commands::groups::groups_command(
+                &account_home,
+                &app,
+                command,
+                account_flag,
+                accept_stale,
+            )
+            .await
         }
         Command::Message { command } => {
             commands::messages::message_command(&account_home, &app, command, account_flag).await
@@ -2439,6 +2460,7 @@ mod tests {
         match &cli.command {
             Command::Groups {
                 command: crate::GroupsCommand::SetImage { file_path, .. },
+                ..
             } => assert_eq!(file_path, "/callers/cwd/avatar.png"),
             other => panic!("expected groups set-image, got {other:?}"),
         }
@@ -2450,6 +2472,7 @@ mod tests {
         match &cli.command {
             Command::Groups {
                 command: crate::GroupsCommand::Create { image, .. },
+                ..
             } => assert_eq!(image.as_deref(), Some("/callers/cwd/founding.png")),
             other => panic!("expected groups create, got {other:?}"),
         }
@@ -2462,6 +2485,7 @@ mod tests {
         match &cli.command {
             Command::Groups {
                 command: crate::GroupsCommand::DownloadImage { output, .. },
+                ..
             } => assert_eq!(output.as_deref(), Some("/callers/cwd")),
             other => panic!("expected groups download-image, got {other:?}"),
         }
@@ -2533,6 +2557,26 @@ mod tests {
         }
     }
 
+    /// mdk#2258: `--accept-stale` is opt-in and parses on either side of the
+    /// group subcommand.
+    #[test]
+    fn groups_accept_stale_flag_parses() {
+        for args in [
+            &["wn", "groups", "rename", "GROUP", "NAME"][..],
+            &["wn", "groups", "rename", "GROUP", "NAME", "--accept-stale"][..],
+            &["wn", "groups", "--accept-stale", "rename", "GROUP", "NAME"][..],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("rename parses");
+            match cli.command {
+                Command::Groups {
+                    command: crate::GroupsCommand::Rename { .. },
+                    accept_stale,
+                } => assert_eq!(accept_stale, args.contains(&"--accept-stale")),
+                other => panic!("expected a groups rename command, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn groups_retention_disband_and_admin_flags_parse() {
         let cli = Cli::try_parse_from(["wn", "groups", "retention", "GROUP", "--set", "1h"])
@@ -2540,6 +2584,7 @@ mod tests {
         match cli.command {
             Command::Groups {
                 command: crate::GroupsCommand::Retention { group_id, set },
+                ..
             } => {
                 assert_eq!(group_id, "GROUP");
                 assert_eq!(set.as_deref(), Some("1h"));
@@ -2551,6 +2596,7 @@ mod tests {
         match cli.command {
             Command::Groups {
                 command: crate::GroupsCommand::Disband { confirm, .. },
+                ..
             } => assert!(
                 !confirm,
                 "confirmation is an explicit flag, never a default"
@@ -2574,6 +2620,7 @@ mod tests {
                     crate::GroupsCommand::AddMembers {
                         members, admins, ..
                     },
+                ..
             } => {
                 assert_eq!(members, vec!["carol".to_owned(), "dave".to_owned()]);
                 assert_eq!(admins, vec!["carol".to_owned()]);
@@ -2597,6 +2644,7 @@ mod tests {
                     crate::GroupsCommand::Create {
                         retention, image, ..
                     },
+                ..
             } => {
                 assert_eq!(retention.as_deref(), Some("1d"));
                 assert_eq!(image.as_deref(), Some("avatar.png"));

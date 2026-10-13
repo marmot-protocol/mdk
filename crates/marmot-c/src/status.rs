@@ -144,10 +144,13 @@ pub enum MarmotStatus {
     CannotReportSelf = 99,
     /// Local per-account moderation-report cap; retry later.
     ModerationReportRateLimited = 100,
+    /// The group moved past this device and recovery has not caught it up;
+    /// group changes would fork it. Retry once it has synced (mdk#2258).
+    GroupCatchingUp = 101,
     /// Completed discovery found only validated obsolete KeyPackages.
-    ObsoleteKeyPackage = 101,
+    ObsoleteKeyPackage = 102,
     /// Bounded member discovery could not establish missing or obsolete-only packages.
-    MemberDiscoveryIncomplete = 102,
+    MemberDiscoveryIncomplete = 103,
 }
 
 thread_local! {
@@ -278,6 +281,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::DisbandingNotEnabled { .. } => MarmotStatus::DisbandingNotEnabled,
         MarmotKitError::GroupDisbanding { .. } => MarmotStatus::GroupDisbanding,
         MarmotKitError::GroupRemoved { .. } => MarmotStatus::GroupRemoved,
+        MarmotKitError::GroupCatchingUp { .. } => MarmotStatus::GroupCatchingUp,
         MarmotKitError::StorageClosed { .. } => MarmotStatus::StorageClosed,
         MarmotKitError::GroupSendQueueFull { .. } => MarmotStatus::GroupSendQueueFull,
         MarmotKitError::CreatedGroupProjectionUnavailable { .. } => {
@@ -471,6 +475,9 @@ mod tests {
             MarmotKitError::GroupRemoved {
                 group_id_hex: "aa".into(),
             },
+            MarmotKitError::GroupCatchingUp {
+                group_id_hex: "aa".into(),
+            },
             MarmotKitError::MemberNotInGroup {
                 group_id_hex: "aa".into(),
                 member_id_hex: "bb".into(),
@@ -521,7 +528,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            93,
+            94,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
@@ -532,6 +539,12 @@ mod tests {
         assert_eq!(
             status_from_error(&MarmotKitError::ModerationReportRateLimited) as i32,
             100
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::GroupCatchingUp {
+                group_id_hex: "aa".into()
+            }) as i32,
+            101
         );
         assert_eq!(
             status_from_error(&MarmotKitError::BlockListUnavailable) as i32,
@@ -545,14 +558,14 @@ mod tests {
             status_from_error(&MarmotKitError::ObsoleteKeyPackage {
                 account: "private".into()
             }) as i32,
-            101
+            102
         );
         assert!(!take_last_error().unwrap().contains("private"));
         assert_eq!(
             status_from_error(&MarmotKitError::MemberDiscoveryIncomplete {
                 account: "private".into()
             }) as i32,
-            102
+            103
         );
         assert!(!take_last_error().unwrap().contains("private"));
         let mut seen = std::collections::BTreeSet::new();
