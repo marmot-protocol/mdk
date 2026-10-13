@@ -1079,8 +1079,8 @@ impl<S: StorageProvider> Engine<S> {
         }
         // Inbound input settled above. A held group authors no new commit: its
         // pending disband, queued commit intents (and anything queued behind
-        // them) and SelfRemove wait for the release. A queued leave is a
-        // proposal, not a commit, so it still drains.
+        // them) and SelfRemove wait for the release. Queued application
+        // messages and leave proposals ahead of them still drain.
         let held = self.commits_held(group_id);
         if !held && let Some(result) = self.prepare_pending_disband(group_id).await? {
             return Ok(vec![result]);
@@ -1102,7 +1102,12 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(Vec::new());
         }
         for record in queued {
-            if held && !matches!(record.intent, SendIntent::Leave { .. }) {
+            if held
+                && !matches!(
+                    record.intent,
+                    SendIntent::Leave { .. } | SendIntent::AppMessage { .. }
+                )
+            {
                 break;
             }
             // A regenerated intent the host has not yet confirmed or retired
@@ -1960,7 +1965,7 @@ impl<S: StorageProvider> Engine<S> {
         {
             return Ok(None);
         }
-        if self.load_leave_request_state(group_id)?.is_some() || self.commits_held(group_id) {
+        if self.load_leave_request_state(group_id)?.is_some() {
             return Ok(None);
         }
         let now_ms = self.convergence_now_ms();

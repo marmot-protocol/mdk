@@ -81,9 +81,10 @@ pub(super) const TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS: usize = 4;
 // ponytail: EOSE crosses a separate router task; retain a short quiet window
 // until delivery and EOSE can share an ordered receive lane.
 const EOSE_QUIET_WAIT: Duration = Duration::from_millis(100);
-/// How often held queued group work re-checks its epoch-gap commit hold. The
-/// hold usually lifts with an inbound commit, which wakes the group itself;
-/// this bounds the wait when it lifts through recovery bookkeeping alone.
+/// How often held group work (queued intents, a pending disband or a due
+/// SelfRemove) re-checks its epoch-gap commit hold. The hold usually lifts
+/// with an inbound commit, which wakes the group itself; this bounds the wait
+/// when it lifts through recovery bookkeeping alone.
 const EPOCH_GAP_COMMIT_HOLD_RETRY_MS: u64 = 60_000;
 
 type OwnedComparisonResult = Result<
@@ -830,9 +831,19 @@ impl AppClient {
                     // Only an otherwise idle group may use the lifecycle timer.
                     // It cannot shorten a collecting pass or a fanout retry:
                     // advance_convergence cannot stage the removal behind either.
-                    let lifecycle_delay = self
+                    // A held SelfRemove stays scheduled but cannot stage, so it
+                    // re-checks on the hold timer instead of waking straight
+                    // into a drain that stages nothing.
+                    let lifecycle_delay = match self
                         .runtime
-                        .scheduled_self_remove_auto_commit_delay_ms(group_id)?;
+                        .scheduled_self_remove_auto_commit_delay_ms(group_id)?
+                    {
+                        Some(delay) => Some(
+                            self.commit_hold_retry_ms(group_id)?
+                                .map_or(delay, |hold| delay.max(hold)),
+                        ),
+                        None => None,
+                    };
                     let deferred_delay = self.runtime.deferred_peel_cutoff_delay_ms(group_id)?;
                     match lifecycle_delay.into_iter().chain(deferred_delay).min() {
                         Some(0) => Ok(ConvergenceScheduleState::Ready),

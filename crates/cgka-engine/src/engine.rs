@@ -688,10 +688,10 @@ impl<S: StorageProvider> Engine<S> {
     /// While the hold answers `true`, a convergence drain still settles inbound
     /// input but prepares no pending disband, queued commit intent or
     /// SelfRemove auto-commit, and a foreground send stages no SelfRemove
-    /// auto-commit. The drain stops at the first queued intent that is not a
-    /// leave: a leave is a proposal and still drains, while anything queued
-    /// behind a held intent keeps its order and waits. Foreground application
-    /// messages are unaffected.
+    /// auto-commit. The drain stops at the first queued commit intent:
+    /// application messages and leave proposals ahead of it still drain, and
+    /// anything behind it keeps its order and waits. A due SelfRemove keeps
+    /// its schedule, so the host must not wake straight into a held drain.
     /// Held work stays durable and runs on a later drain once the hold
     /// releases. Republishing an already-staged commit is not held. Foreground
     /// commit intents are the host's to refuse before they reach the engine.

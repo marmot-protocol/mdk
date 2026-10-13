@@ -3246,8 +3246,8 @@ async fn multiple_leavers_stage_one_selfremove_only_commit_excluding_unrelated_p
 }
 
 /// mdk#2258: a host that knows the group moved past this device's epoch
-/// holds commits. A due SelfRemove is neither scheduled, drained nor staged
-/// by a foreground send while held, and commits normally once released.
+/// holds commits. A due SelfRemove keeps its schedule but is neither drained
+/// nor staged by a foreground send while held, and commits once released.
 #[tokio::test]
 async fn commit_hold_defers_a_due_selfremove_auto_commit_until_released() {
     let clock = cgka_engine::ManualConvergenceClock::new(1_000, 10_000);
@@ -3310,8 +3310,8 @@ async fn commit_hold_defers_a_due_selfremove_auto_commit_until_released() {
         alice
             .scheduled_self_remove_auto_commit_delay_ms(&group_id)
             .unwrap(),
-        None,
-        "held work must not wake the scheduler"
+        Some(0),
+        "the schedule stays armed so the host can re-check the hold"
     );
     alice.advance_convergence(&group_id).await.unwrap();
     assert!(alice.drain_auto_publish().is_empty());
