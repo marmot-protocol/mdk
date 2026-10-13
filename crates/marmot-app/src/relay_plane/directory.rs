@@ -226,6 +226,20 @@ impl DirectoryEventQuery {
                 Err("invalid directory since constraint".into())
             };
         };
+        if self.kind == 30443 && self.authors.len() == 1 && self.since.is_none() {
+            PublicKey::parse(&self.authors[0]).map_err(|_| "invalid query author")?;
+            return match name {
+                'd' if !value.is_empty() => Ok(()),
+                'i' if value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) =>
+                {
+                    Ok(())
+                }
+                _ => Err("invalid key package query reference".into()),
+            };
+        }
         if self.kind != 5 || self.authors.len() != 1 {
             return Err("invalid deletion query scope".into());
         }

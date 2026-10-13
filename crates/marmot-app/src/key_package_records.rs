@@ -778,6 +778,22 @@ fn sort_inventory_records(records: &mut [AccountKeyPackageRecord]) {
     });
 }
 
+/// Keep all observed versions of our slot, plus legacy events with owned bundles.
+/// Missing ownership evidence never authorizes account-wide deletion.
+pub(crate) fn installation_key_package_relay_events(
+    events: Vec<AccountKeyPackageRelayEvent>,
+    stable_slot_id: Option<&str>,
+    owned_refs: &BTreeSet<String>,
+) -> Vec<AccountKeyPackageRelayEvent> {
+    events
+        .into_iter()
+        .filter(|event| {
+            stable_slot_id.is_some_and(|slot| !slot.is_empty() && event.key_package_id == slot)
+                || owned_refs.contains(&event.key_package_ref_hex)
+        })
+        .collect()
+}
+
 pub(crate) fn owned_key_package_local_state(
     key_package_ref: &[u8],
     lifecycle: Option<&cgka_traits::KeyPackageLifecycleState>,

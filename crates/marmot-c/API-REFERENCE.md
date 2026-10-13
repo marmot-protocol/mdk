@@ -3938,7 +3938,7 @@ Free a string returned by this library (`marmot_last_error_message`, string out-
 MarmotStatus marmot_sign_out_and_wipe(const struct MarmotClient *client, const char *account_ref, struct MarmotWipeOutcome **out);
 ```
 
-Destructive sign-out: leave groups, delete relay KeyPackages, wipe local state. Every stage is reported in the outcome. Free with `marmot_wipe_outcome_free`.
+Destructive sign-out: leave groups, delete this installation's relay KeyPackages, wipe local state. Every stage is reported in the outcome. Free with `marmot_wipe_outcome_free`.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsign_out_and_wipe) · [Header contract](include/marmot.h#L6045)
 
@@ -3948,7 +3948,7 @@ Destructive sign-out: leave groups, delete relay KeyPackages, wipe local state. 
 MarmotStatus marmot_sign_out(const struct MarmotClient *client, const char *account_ref, uint8_t delete_key_packages, struct MarmotSignOutOutcome **out);
 ```
 
-Non-destructive sign-out: deactivate the account on this device, keeping local state so it can sign back in later. When `delete_key_packages` is true, relay-published KeyPackages get NIP-09 deletions. Free with `marmot_sign_out_outcome_free`.
+Non-destructive sign-out: deactivate the account on this device, keeping local state so it can sign back in later. When `delete_key_packages` is true, this installation's relay-published KeyPackages get NIP-09 deletions. Free with `marmot_sign_out_outcome_free`.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotsign_out) · [Header contract](include/marmot.h#L6061)
 

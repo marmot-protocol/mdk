@@ -4031,6 +4031,58 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Discover only events owned by this installation, without minting a slot.
+    async fn installation_key_package_relay_events(
+        &self,
+        account_label: &str,
+    ) -> Result<Vec<AccountKeyPackageRelayEvent>, AppError> {
+        let app = &self.accounts.app;
+        let (owned, lifecycle) =
+            app.capture_local_key_package_ownership_and_lifecycle(account_label)?;
+        let slot = lifecycle.as_ref().map(|state| state.stable_slot_id.clone());
+        let owned_refs: std::collections::BTreeSet<String> = app
+            .project_local_account_key_package_inventory(account_label, owned, lifecycle)?
+            .into_iter()
+            .filter(|entry| entry.local_state.is_local())
+            .map(|entry| entry.record.key_package_ref_hex)
+            .collect();
+        // Bound discovery to one slot plus at most 64 durable bundle refs,
+        // with 12 events per tag query. Never silently truncate ownership.
+        if owned_refs.len() > 64 {
+            return Err(AppError::RelayDirectory(
+                "installation key package discovery exceeds owned-ref budget".into(),
+            ));
+        }
+        let mut references = Vec::new();
+        if let Some(slot) = slot.as_ref().filter(|slot| !slot.is_empty()) {
+            references.push(('d', slot.clone()));
+        }
+        // Publication carries KeyPackageRef in the indexable Nostr `i` tag.
+        // Filter at the relay before its limit so sibling slots cannot crowd
+        // out either our stable slot or an owned legacy package.
+        references.extend(owned_refs.iter().cloned().map(|reference| ('i', reference)));
+        if references.is_empty() {
+            return Ok(Vec::new());
+        }
+        let records = app
+            .fetch_validated_account_key_package_records_with_tags(
+                account_label,
+                Vec::new(),
+                "installation_key_package_relay_events",
+                Some(references),
+            )
+            .await?;
+        let events =
+            crate::key_package_records::account_key_package_relay_events_from_records(records);
+        Ok(
+            crate::key_package_records::installation_key_package_relay_events(
+                events,
+                slot.as_deref(),
+                &owned_refs,
+            ),
+        )
+    }
+
     async fn delete_relay_key_packages(
         &self,
         account_label: &str,
@@ -4041,6 +4093,7 @@ impl MarmotAppRuntime {
             .into_iter()
             .filter(|event| seen.insert(event.key_package_event_id.clone()))
             .map(|event| KeyPackageDeletionTarget {
+                slot_id: Some(event.key_package_id),
                 event_id_hex: event.key_package_event_id,
                 source_relays: event
                     .source_relays
@@ -4099,9 +4152,11 @@ impl MarmotAppRuntime {
     ///    the SQL account record, and the secret-store nsec all stay on disk.
     ///    The account remains a live record in the picker and can be
     ///    re-activated with its groups, message history, and drafts intact.
-    /// 2. **KeyPackage hygiene (when `delete_key_packages`).** Enumerate every
-    ///    relay-published KeyPackage for this account and publish a kind:5
-    ///    deletion to each one's source relays, mirroring the
+    /// 2. **KeyPackage hygiene (when `delete_key_packages`).** Enumerate
+    ///    relay-published KeyPackages in this installation's slot (and locally
+    ///    owned legacy packages) and publish a kind:5 deletion to each one's
+    ///    source relays, preserving sibling installations' invitation keys.
+    ///    This mirrors the
     ///    [`delete_key_package`](Self::delete_key_package) path. This stops
     ///    strangers from pulling a stale KeyPackage and gift-wrapping a Welcome
     ///    into a new group while the account is signed out.
@@ -4159,14 +4214,14 @@ impl MarmotAppRuntime {
 
         let mut outcome = SignOutOutcome::default();
 
-        // Step 1 (KeyPackage hygiene): delete every relay-published KeyPackage
+        // Step 1 (KeyPackage hygiene): delete this installation's KeyPackages
         // before tearing the worker down, while the account is still fully
         // live. Discovery itself is network-bound; a discovery failure is
         // recorded as a single failure (no event id) and must not abort the
         // sign-out. This mirrors stage 2 of `sign_out_and_wipe`.
         if options.delete_key_packages {
             match self
-                .account_key_package_relay_events(account_ref, Vec::new())
+                .installation_key_package_relay_events(&account.label)
                 .await
             {
                 Ok(events) => {
@@ -4221,8 +4276,8 @@ impl MarmotAppRuntime {
     ///    pending invite is a real committed membership this device must leave
     ///    (the decline path leaves such groups too). Group-enumeration failures
     ///    are surfaced as a recorded failure rather than silently dropped.
-    /// 2. Best-effort delete of every relay-published KeyPackage event, always
-    ///    (no toggle), mirroring the `delete_key_package` path.
+    /// 2. Best-effort delete of this installation's slot and owned legacy
+    ///    KeyPackage events, always (no toggle), preserving sibling installations.
     /// 3. Local cleanup (stages 3-5 of the spec): tear down the managed worker
     ///    and in-memory caches, then remove the account directory. In mdk
     ///    `remove_account` first **atomically renames** the live account
@@ -4314,11 +4369,12 @@ impl MarmotAppRuntime {
             }
         }
 
-        // Stage 2: delete every relay-published KeyPackage. Discovery itself is
+        // Stage 2: delete only this installation's slot and owned legacy packages,
+        // preserving sibling installations' invitation keys. Discovery itself is
         // network-bound; a discovery failure is recorded as a single failure
         // (no event id) and must not abort the wipe.
         match self
-            .account_key_package_relay_events(account_ref, Vec::new())
+            .installation_key_package_relay_events(&account.label)
             .await
         {
             Ok(events) => {

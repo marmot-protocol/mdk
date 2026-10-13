@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use cgka_engine::key_package::key_package_metadata;
 use cgka_traits::engine::KeyPackage;
-use cgka_traits::{MemberId, TransportEndpoint};
+use cgka_traits::{MaintenanceStorage, MemberId, TransportEndpoint};
 use marmot_account::{AccountHome, AccountSummary};
 use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
@@ -395,11 +395,20 @@ async fn bulk_key_package_cleanup_includes_superseded_events() {
         .await
         .unwrap();
     let account = created.account;
-    let (older, newer, _other) = same_slot_events(&app, &account).await;
+    let (older, newer, sibling) = same_slot_events(&app, &account).await;
+    // These packages were generated in separate temporary sessions; ownership
+    // here comes solely from this installation's durable slot.
+    let storage = app.account_storage(&account.label).unwrap();
+    let mut lifecycle = storage
+        .key_package_lifecycle()
+        .unwrap()
+        .unwrap_or_else(|| cgka_traits::KeyPackageLifecycleState::slot_only(SLOT.to_owned()));
+    lifecycle.stable_slot_id = SLOT.to_owned();
+    storage.put_key_package_lifecycle(&lifecycle).unwrap();
     seed_fetcher(
         &fetcher,
         &account,
-        vec![older.clone(), newer.clone()],
+        vec![older.clone(), newer.clone(), sibling.clone()],
         &[DIRECTORY],
     );
     write_key_package_cache(&app, &account, SLOT, "local-only-ref", "");
@@ -408,7 +417,7 @@ async fn bulk_key_package_cleanup_includes_superseded_events() {
         .account_key_package_relay_events(&account.account_id_hex, vec![endpoint(DIRECTORY)])
         .await
         .unwrap();
-    assert_eq!(history.len(), 2);
+    assert_eq!(history.len(), 3);
 
     let outcome = runtime
         .sign_out(
@@ -425,7 +434,8 @@ async fn bulk_key_package_cleanup_includes_superseded_events() {
         BTreeSet::from([older.id.clone(), newer.id.clone()])
     );
     assert_eq!(deleted.len(), 2);
-    assert!(outcome.key_packages_deleted >= 2);
+    assert_eq!(outcome.key_packages_deleted, 2);
+    assert!(!deleted.contains(&sibling.id));
     assert!(!deleted.iter().any(|id| id.is_empty()));
 }
 
@@ -454,11 +464,20 @@ async fn wipe_bulk_cleanup_includes_superseded_events() {
         .await
         .unwrap();
     let account = created.account;
-    let (older, newer, _other) = same_slot_events(&app, &account).await;
+    let (older, newer, sibling) = same_slot_events(&app, &account).await;
+    // These packages were generated in separate temporary sessions; ownership
+    // here comes solely from this installation's durable slot.
+    let storage = app.account_storage(&account.label).unwrap();
+    let mut lifecycle = storage
+        .key_package_lifecycle()
+        .unwrap()
+        .unwrap_or_else(|| cgka_traits::KeyPackageLifecycleState::slot_only(SLOT.to_owned()));
+    lifecycle.stable_slot_id = SLOT.to_owned();
+    storage.put_key_package_lifecycle(&lifecycle).unwrap();
     seed_fetcher(
         &fetcher,
         &account,
-        vec![older.clone(), newer.clone()],
+        vec![older.clone(), newer.clone(), sibling.clone()],
         &[DIRECTORY],
     );
 
@@ -471,7 +490,120 @@ async fn wipe_bulk_cleanup_includes_superseded_events() {
         deleted.iter().cloned().collect::<BTreeSet<_>>(),
         BTreeSet::from([older.id.clone(), newer.id.clone()])
     );
-    assert!(outcome.key_packages_deleted >= 2);
+    assert_eq!(outcome.key_packages_deleted, 2);
+    assert!(!deleted.contains(&sibling.id));
+}
+
+#[tokio::test]
+async fn sign_out_deletes_owned_legacy_slot_but_preserves_unowned_events() {
+    let (_dir, runtime, account, fetcher, relay) = runtime_inventory_fixture().await;
+    let app = runtime.app_for_test();
+    let (owned, _) = app
+        .capture_local_key_package_ownership_and_lifecycle(&account.label)
+        .unwrap();
+    let legacy = key_package_event(
+        &account,
+        owned.into_iter().next().expect("owned local key package"),
+        "legacy-slot",
+        10,
+    );
+    let sibling = key_package_event(
+        &account,
+        fresh_key_package_for_account(app, &account, false).await,
+        OTHER_SLOT,
+        20,
+    );
+    let local = runtime.local_account_key_packages(&account.label).unwrap();
+    assert!(local.iter().any(|entry| entry.local_state.is_local()));
+    assert!(
+        local
+            .iter()
+            .all(|entry| entry.record.key_package_id != "legacy-slot")
+    );
+    seed_fetcher(
+        &fetcher,
+        &account,
+        vec![legacy.clone(), sibling.clone()],
+        &[DIRECTORY],
+    );
+    let outcome = runtime
+        .sign_out(
+            &account.label,
+            SignOutOptions {
+                delete_key_packages: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(kind5_targets(&relay), vec![legacy.id]);
+    assert!(
+        relay
+            .published_events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == 5)
+            .all(|event| event
+                .tags
+                .iter()
+                .all(|tag| tag.first().is_none_or(|name| name != "a")))
+    );
+    assert_eq!(outcome.key_packages_deleted, 1);
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn sign_out_without_slot_or_owned_refs_deletes_nothing() {
+    // An account created directly in AccountHome has no published local package.
+    for wipe in [false, true] {
+        let (_dir, app, account, fetcher, relay) = inventory_fixture().await;
+        let sibling = key_package_event(
+            &account,
+            fresh_key_package_for_account(&app, &account, false).await,
+            OTHER_SLOT,
+            20,
+        );
+        // A cache record alone must never establish bundle or slot ownership.
+        write_key_package_cache(&app, &account, OTHER_SLOT, "cache-only-ref", "");
+        let (owned, lifecycle) = app
+            .capture_local_key_package_ownership_and_lifecycle(&account.label)
+            .unwrap();
+        assert!(owned.is_empty());
+        assert!(
+            lifecycle
+                .as_ref()
+                .is_none_or(|state| state.stable_slot_id.is_empty())
+        );
+        seed_fetcher(&fetcher, &account, vec![sibling], &[DIRECTORY]);
+        let runtime = MarmotAppRuntime::new(app);
+        runtime.start().await.unwrap();
+        if wipe {
+            assert_eq!(
+                runtime
+                    .sign_out_and_wipe(&account.label)
+                    .await
+                    .unwrap()
+                    .key_packages_deleted,
+                0
+            );
+        } else {
+            assert_eq!(
+                runtime
+                    .sign_out(
+                        &account.label,
+                        SignOutOptions {
+                            delete_key_packages: true
+                        }
+                    )
+                    .await
+                    .unwrap()
+                    .key_packages_deleted,
+                0
+            );
+        }
+        assert!(kind5_targets(&relay).is_empty());
+        runtime.shutdown().await;
+    }
 }
 
 #[tokio::test]
@@ -503,10 +635,12 @@ async fn listing_does_not_publish_and_partial_deletion_still_uses_explicit_targe
             &account.label,
             vec![
                 KeyPackageDeletionTarget {
+                    slot_id: None,
                     event_id_hex: older.id.clone(),
                     source_relays: vec![endpoint(DIRECTORY)],
                 },
                 KeyPackageDeletionTarget {
+                    slot_id: None,
                     event_id_hex: newer.id.clone(),
                     source_relays: vec![endpoint(DIRECTORY)],
                 },
@@ -1138,4 +1272,133 @@ async fn local_read_rejects_terminal_close_without_reopening() {
         matches!(error, crate::AppError::Storage(_)),
         "unexpected close error: {error:?}"
     );
+}
+
+#[tokio::test]
+async fn sign_out_discovers_older_installation_events_beyond_sibling_limit() {
+    assert_sign_out_discovers_older_installation_events(false).await;
+}
+
+#[tokio::test]
+async fn sign_out_and_wipe_discovers_older_installation_events_beyond_sibling_limit() {
+    assert_sign_out_discovers_older_installation_events(true).await;
+}
+
+async fn assert_sign_out_discovers_older_installation_events(wipe: bool) {
+    let (_dir, runtime, account, fetcher, relay) = runtime_inventory_fixture().await;
+    let app = runtime.app_for_test();
+    let (owned, lifecycle) = app
+        .capture_local_key_package_ownership_and_lifecycle(&account.label)
+        .unwrap();
+    let package = owned.into_iter().next().expect("owned package");
+    let slot = lifecycle.unwrap().stable_slot_id;
+    let installation = key_package_event(&account, package.clone(), &slot, 10);
+    let legacy = key_package_event(&account, package, "legacy-slot", 11);
+    let sibling_package = fresh_key_package_for_account(app, &account, false).await;
+    let siblings = (0..13)
+        .map(|index| {
+            key_package_event(
+                &account,
+                sibling_package.clone(),
+                &format!("sibling-{index}"),
+                20 + index,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut events = siblings.clone();
+    events.extend([installation.clone(), legacy.clone()]);
+    seed_fetcher(&fetcher, &account, events, &[DIRECTORY]);
+    let deleted = if wipe {
+        runtime
+            .sign_out_and_wipe(&account.label)
+            .await
+            .unwrap()
+            .key_packages_deleted
+    } else {
+        runtime
+            .sign_out(
+                &account.label,
+                SignOutOptions {
+                    delete_key_packages: true,
+                },
+            )
+            .await
+            .unwrap()
+            .key_packages_deleted
+    };
+    assert_eq!(deleted, 2, "wipe={wipe}");
+    let targets = kind5_targets(&relay).into_iter().collect::<BTreeSet<_>>();
+    assert_eq!(targets, BTreeSet::from([installation.id, legacy.id]));
+    assert!(siblings.iter().all(|event| !targets.contains(&event.id)));
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn sign_out_coordinate_covers_superseded_events_beyond_fetch_limit() {
+    let (_dir, runtime, account, fetcher, relay) = runtime_inventory_fixture().await;
+    let app = runtime.app_for_test();
+    let (_, lifecycle) = app
+        .capture_local_key_package_ownership_and_lifecycle(&account.label)
+        .unwrap();
+    let slot = lifecycle.unwrap().stable_slot_id;
+    // An unowned package keeps these versions out of the owned-ref queries:
+    // discovery must use the installation's d query, capped at 12 events.
+    let package = fresh_key_package_for_account(app, &account, false).await;
+    let versions = (0..15)
+        .map(|index| key_package_event(&account, package.clone(), &slot, 10 + index))
+        .collect::<Vec<_>>();
+    let sibling = key_package_event(&account, package.clone(), OTHER_SLOT, 30);
+    let mut events = versions.clone();
+    events.push(sibling.clone());
+    seed_fetcher(&fetcher, &account, events, &[DIRECTORY]);
+    let before = nostr_sdk::prelude::Timestamp::now().as_secs();
+    let outcome = runtime
+        .sign_out(
+            &account.label,
+            SignOutOptions {
+                delete_key_packages: true,
+            },
+        )
+        .await
+        .unwrap();
+    let after = nostr_sdk::prelude::Timestamp::now().as_secs();
+    assert_key_package_queries_use_limit_12(&fetcher);
+    assert_eq!(outcome.key_packages_deleted, 12);
+    let targets = kind5_targets(&relay).into_iter().collect::<BTreeSet<_>>();
+    assert_eq!(targets.len(), 12);
+    assert!(
+        !targets.contains(&versions[0].id),
+        "oldest version was not fetched"
+    );
+    assert!(!targets.contains(&sibling.id));
+    let coordinate = format!("30443:{}:{slot}", account.account_id_hex);
+    let deletions = relay.published_events.lock().unwrap().clone();
+    let deletions = deletions
+        .iter()
+        .filter(|event| event.kind == 5)
+        .collect::<Vec<_>>();
+    assert_eq!(deletions.len(), 12);
+    for deletion in &deletions {
+        assert!(
+            deletion
+                .tags
+                .contains(&vec!["a".into(), coordinate.clone()])
+        );
+        assert!((before..=after).contains(&deletion.created_at));
+        assert_eq!(deletion.pubkey, account.account_id_hex);
+    }
+    // NIP-09's coordinate and timestamp predicate covers even unfetched versions.
+    assert!(
+        versions
+            .iter()
+            .all(|version| deletions.iter().any(|deletion| {
+                deletion.pubkey == version.pubkey
+                    && version.created_at <= deletion.created_at
+                    && deletion
+                        .tags
+                        .contains(&vec!["a".into(), coordinate.clone()])
+            }))
+    );
+    drop(deletions);
+    runtime.shutdown().await;
 }

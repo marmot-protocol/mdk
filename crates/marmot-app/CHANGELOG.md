@@ -4,6 +4,10 @@
 
 - `MarmotAppRuntime::submit_prepared_media_snapshot` admits the captured ordinary-media payload with a stable token and consumes only its unchanged captured draft in the same transaction. Newer or cleared drafts cannot replace the payload or block admission.
 
+### Fixed
+
+- Sign-out and wipe delete only this installation's KeyPackage slot and locally owned legacy events, preserving sibling installations' invitation keys.
+
 ## 0.13.0 - 2026-10-12
 
 ### Breaking changes

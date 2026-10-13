@@ -1343,6 +1343,9 @@ pub struct AccountKeyPackageRelayEvent {
 
 #[derive(Clone, Debug)]
 pub(crate) struct KeyPackageDeletionTarget {
+    /// Observed slot for installation cleanup only. Explicit event deletion
+    /// leaves this unset; the builder checks it against durable slot ownership.
+    pub slot_id: Option<String>,
     pub event_id_hex: String,
     pub source_relays: Vec<TransportEndpoint>,
 }
@@ -5218,6 +5221,22 @@ impl MarmotApp {
         bootstrap_relays: Vec<TransportEndpoint>,
         method: &'static str,
     ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
+        self.fetch_validated_account_key_package_records_with_tags(
+            label,
+            bootstrap_relays,
+            method,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn fetch_validated_account_key_package_records_with_tags(
+        &self,
+        label: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        method: &'static str,
+        references: Option<Vec<(char, String)>>,
+    ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
         let account = self.account_home().account(label)?;
         let account_id_hex = account.account_id_hex;
 
@@ -5264,9 +5283,21 @@ impl MarmotApp {
             ]));
         }
 
-        let mut relay_records = self
-            .fetch_key_package_events_for_account_id(&account_id_hex, &source_relays)
-            .await?;
+        let mut relay_records = match references {
+            None => {
+                self.fetch_key_package_events_for_account_id(&account_id_hex, &source_relays)
+                    .await?
+            }
+            Some(references) => {
+                self.fetch_key_package_events_for_account_id_with_tags(
+                    &account_id_hex,
+                    &source_relays,
+                    12,
+                    Some(references),
+                )
+                .await?
+            }
+        };
         sort_directory_records(&mut relay_records);
         let mut packages = Vec::new();
         for record in relay_records {
@@ -5330,6 +5361,7 @@ impl MarmotApp {
             .delete_key_package_events(
                 label,
                 vec![KeyPackageDeletionTarget {
+                    slot_id: None,
                     event_id_hex: event_id_hex.to_owned(),
                     source_relays,
                 }],
@@ -5359,6 +5391,14 @@ impl MarmotApp {
             .collect::<Vec<_>>();
         let mut requests = Vec::new();
         let mut request_indices = Vec::new();
+        let owned_slot = if targets.iter().any(|target| target.slot_id.is_some()) {
+            self.account_storage(label)?
+                .key_package_lifecycle()?
+                .map(|state| state.stable_slot_id)
+                .filter(|slot| !slot.is_empty())
+        } else {
+            None
+        };
 
         for (index, target) in targets.into_iter().enumerate() {
             let event_id_hex = match parse_key_package_event_id_hex(&target.event_id_hex) {
@@ -5397,15 +5437,29 @@ impl MarmotApp {
                     continue;
                 }
             };
+            let mut tags = vec![
+                vec!["e".into(), event_id_hex],
+                vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()],
+            ];
+            if let Some(slot) = target
+                .slot_id
+                .as_ref()
+                .filter(|slot| Some(slot.as_str()) == owned_slot.as_deref())
+            {
+                // NIP-09 covers all versions through the deletion's current
+                // timestamp, including those outside bounded discovery. A
+                // locally owned ref in a legacy slot does not own that slot.
+                tags.push(vec![
+                    "a".into(),
+                    format!("{KIND_MARMOT_KEY_PACKAGE}:{account_id_hex}:{slot}"),
+                ]);
+            }
             requests.push(NostrEventPublishRequest {
                 endpoints,
                 event: NostrTransportEvent::new_unsigned(
                     account_id_hex.clone(),
                     5,
-                    vec![
-                        vec!["e".into(), event_id_hex],
-                        vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()],
-                    ],
+                    tags,
                     String::new(),
                 ),
                 required_acks: 1,

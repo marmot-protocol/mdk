@@ -1117,18 +1117,41 @@ impl MarmotApp {
         source_relays: &[TransportEndpoint],
         limit: usize,
     ) -> Result<Vec<RelayEventRecord>, AppError> {
+        self.fetch_key_package_events_for_account_id_with_tags(
+            account_id_hex,
+            source_relays,
+            limit,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn fetch_key_package_events_for_account_id_with_tags(
+        &self,
+        account_id_hex: &str,
+        source_relays: &[TransportEndpoint],
+        limit: usize,
+        references: Option<Vec<(char, String)>>,
+    ) -> Result<Vec<RelayEventRecord>, AppError> {
         let public_key =
             PublicKey::parse(account_id_hex).map_err(|_| AppError::InvalidPublicKey)?;
         let source_relays = self.directory_source_relays(source_relays);
+        let query =
+            DirectoryEventQuery::new(KIND_MARMOT_KEY_PACKAGE, vec![public_key.to_hex()], limit);
+        let queries = match references {
+            None => vec![query],
+            Some(references) if references.is_empty() => return Ok(Vec::new()),
+            Some(references) => references
+                .into_iter()
+                .map(|reference| {
+                    let mut query = query.clone();
+                    query.reference = Some(reference);
+                    query
+                })
+                .collect(),
+        };
         self.relay_plane
-            .fetch_directory_events(
-                source_relays,
-                vec![DirectoryEventQuery::new(
-                    KIND_MARMOT_KEY_PACKAGE,
-                    vec![public_key.to_hex()],
-                    limit,
-                )],
-            )
+            .fetch_directory_events(source_relays, queries)
             .await
             .map_err(|e| AppError::RelayDirectory(format!("fetch key packages: {e}")))
     }
