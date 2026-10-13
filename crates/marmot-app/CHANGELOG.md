@@ -17,6 +17,14 @@
 ### Fixed
 
 - Group changes fail with `AppError::GroupCatchingUp` while unresolved epoch-gap recovery (pending, parked or with its notice dismissed) covers the group's current local epoch. Before, a device that knew the group had moved on could still commit from its stale epoch and fork the group (mdk#2258). The check is advisory: after the user accepts the risk, `acknowledge_group_catching_up` lets the change through. Due self-updates wait up to 24 hours for the gap to close. Messages and leave are not affected.
+- A failed or cancelled transport activation no longer leaves untracked REQs
+  live on the relay. They used to stay open until disconnect, be re-sent on
+  every reconnect, and use up the relay's per-connection subscription limit
+  until the account's own subscriptions were refused (#2262).
+- A live replay that a relay cut short at its default page (500 events on
+  strfry) no longer counts as complete coverage. The relay's stored history is
+  paged backwards before its end-of-stored-events counts, so older events in
+  the replay window are no longer skipped (#2263).
 
 ## 0.13.0 - 2026-10-12
 

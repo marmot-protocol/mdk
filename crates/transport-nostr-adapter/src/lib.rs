@@ -26,7 +26,7 @@ use cgka_traits::{
 };
 use nostr::prelude::RelayUrl;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, mpsc, oneshot};
 use tokio::task::JoinSet;
 use transport_nostr_peeler::{
     KIND_NIP59_GIFT_WRAP, NOSTR_SOURCE, NostrPeelerError, NostrTransportEvent,
@@ -107,6 +107,35 @@ pub use telemetry::{
 };
 
 const DELIVERY_BUFFER: usize = 1024;
+
+/// How long a subscription-lifecycle operation waits for subscribe tasks a
+/// dropped caller left running (see `NostrTransportAdapter::subscribe_tasks`).
+/// Subscribe calls only queue REQs, so a healthy client finishes in far less.
+const SUBSCRIBE_STRAGGLER_WAIT: Duration = Duration::from_secs(2);
+
+/// The most stored events a relay may return for one live REQ before EOSE.
+/// strfry (and NIP-01 relays generally) silently clamp a REQ that carries no
+/// `limit` to a default page, 500 on strfry, and then send EOSE as if the
+/// stored history were exhausted. A replay that delivers this many events
+/// before EOSE may therefore have been cut short, and is paged backwards
+/// before its EOSE counts as coverage.
+pub const RELAY_REPLAY_PAGE_LIMIT: usize = 500;
+
+/// Upper bound on backward pages for one relay's replay of one REQ. A replay
+/// still truncated after this many pages stays incomplete rather than paging
+/// without end; recovery owns history that deep.
+const REPLAY_PAGE_MAX_PAGES: usize = 64;
+
+/// Budget for one backward replay page. The item cap sits well above
+/// [`RELAY_REPLAY_PAGE_LIMIT`] so a relay that does not clamp still answers a
+/// page with EOSE instead of hitting the cap.
+const REPLAY_PAGE_LIMITS: NostrAcquisitionLimits = NostrAcquisitionLimits {
+    max_endpoints: 1,
+    max_requested_event_ids: 1,
+    max_received_items_per_endpoint: 8 * RELAY_REPLAY_PAGE_LIMIT,
+    max_serialized_event_bytes_per_endpoint: 32 * 1024 * 1024,
+    max_duration: Duration::from_secs(30),
+};
 
 /// A REQ a lag repair claimed, with each relay it claimed and what the repair
 /// may do there.
@@ -872,6 +901,17 @@ pub trait NostrRelayClient: Send + Sync {
     }
 }
 
+/// A `JoinSet` that detaches its tasks when dropped instead of aborting them.
+/// See `NostrTransportAdapter::subscribe_tasks` for why subscribe tasks must
+/// run to completion.
+struct DetachOnDrop<T: 'static>(JoinSet<T>);
+
+impl<T: 'static> Drop for DetachOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.detach_all();
+    }
+}
+
 /// Nostr implementation of the shared transport adapter boundary.
 #[derive(Clone)]
 pub struct NostrTransportAdapter {
@@ -887,6 +927,17 @@ pub struct NostrTransportAdapter {
     /// and its stale `unsubscribe`, tearing the fresh subscription back down.
     /// The `RwLock` still guards the fast delivery/routing path independently.
     subscription_lock: Arc<Mutex<()>>,
+    /// Held shared by every relay subscribe task `subscribe_all` spawns, for
+    /// the task's whole life. A caller dropped mid-activation detaches those
+    /// tasks rather than aborting them: an abort lands only at the task's next
+    /// await, so a task already running could still register its REQ after the
+    /// next activation's `unsubscribe_account` swept the account, leaving a live
+    /// REQ nothing tracks. `lock_subscriptions` takes the current lock
+    /// exclusively, so every lifecycle operation starts only after the
+    /// stragglers have registered and can be swept. A straggler still running
+    /// after [`SUBSCRIBE_STRAGGLER_WAIT`] is abandoned to a retired lock, so a
+    /// relay client whose subscribe never returns cannot wedge the adapter.
+    subscribe_tasks: Arc<std::sync::Mutex<Arc<RwLock<()>>>>,
     /// Local monotonic origin for delivery telemetry. Never `created_at`.
     monotonic_start: std::time::Instant,
     /// Shared by [`Clone`] and by every account adapter on this relay plane.
@@ -907,6 +958,7 @@ impl NostrTransportAdapter {
             delivery_tx,
             delivery_rx: Arc::new(Mutex::new(delivery_rx)),
             subscription_lock: Arc::new(Mutex::new(())),
+            subscribe_tasks: Arc::new(std::sync::Mutex::new(Arc::new(RwLock::new(())))),
             monotonic_start: std::time::Instant::now(),
             publish_accounting: publish_accounting::PublishAccounting::new(),
             subscription_refusals: Arc::default(),
@@ -1040,22 +1092,63 @@ impl NostrTransportAdapter {
         state.metrics.reconciliation_order_unproven_passes += usize::from(summary.order_unproven);
     }
 
+    /// Take the subscription-lifecycle lock (see `subscription_lock`), then
+    /// wait for any subscribe task a dropped caller left running (see
+    /// `subscribe_tasks`). No new task can start meanwhile: only holders of this
+    /// lock spawn them.
+    async fn lock_subscriptions(&self) -> OwnedMutexGuard<()> {
+        let guard = self.subscription_lock.clone().lock_owned().await;
+        let in_flight = self.current_subscribe_tasks();
+        if tokio::time::timeout(SUBSCRIBE_STRAGGLER_WAIT, in_flight.write())
+            .await
+            .is_err()
+        {
+            *self
+                .subscribe_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(RwLock::new(()));
+            tracing::warn!(
+                target: "transport_nostr_adapter::adapter",
+                method = "lock_subscriptions",
+                "abandoned relay subscribe tasks still running after the straggler wait"
+            );
+        }
+        guard
+    }
+
+    fn current_subscribe_tasks(&self) -> Arc<RwLock<()>> {
+        self.subscribe_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     async fn subscribe_all(
         &self,
         caller: &'static str,
         subscriptions: &[NostrSubscription],
     ) -> Result<(), TransportAdapterError> {
-        let mut tasks = JoinSet::new();
+        let mut tasks = DetachOnDrop(JoinSet::new());
         for (sub_index, subscription) in subscriptions.iter().cloned().enumerate() {
             let relay_client = self.relay_client.clone();
-            tasks.spawn(async move { (sub_index, relay_client.subscribe(subscription).await) });
+            let in_flight = self.current_subscribe_tasks().read_owned().await;
+            tasks.0.spawn(async move {
+                let _in_flight = in_flight;
+                (sub_index, relay_client.subscribe(subscription).await)
+            });
         }
+        let tasks = &mut tasks.0;
 
+        // Let every sibling finish after a failure instead of aborting it. An
+        // aborted task can stop between handing its REQ to the relay client and
+        // returning, and the caller's rollback `unsubscribe_account` would then
+        // race that REQ. Subscribe calls queue REQs without waiting for relay
+        // replies, so draining the rest is short.
+        let mut first_error = None;
         while let Some(result) = tasks.join_next().await {
             match result {
                 Ok((_sub_index, Ok(()))) => {}
                 Ok((sub_index, Err(err))) => {
-                    tasks.abort_all();
                     tracing::warn!(
                         target: "transport_nostr_adapter::adapter",
                         method = caller,
@@ -1063,18 +1156,19 @@ impl NostrTransportAdapter {
                         issued_count = subscriptions.len(),
                         "transport subscription failed"
                     );
-                    return Err(err);
+                    first_error.get_or_insert(err);
                 }
                 Err(err) => {
-                    tasks.abort_all();
-                    return Err(TransportAdapterError::Subscription(format!(
-                        "subscription task failed: {err}"
-                    )));
+                    first_error.get_or_insert_with(|| {
+                        TransportAdapterError::Subscription(format!(
+                            "subscription task failed: {err}"
+                        ))
+                    });
                 }
             }
         }
 
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Drain relay unsubscribes queued in `pending_unsubscribes`. A local
@@ -1255,7 +1349,7 @@ impl NostrTransportAdapter {
         account_id: Option<&MemberId>,
         lag: NotificationLagMark,
     ) -> EoseReissueSummary {
-        let _subscription_guard = self.subscription_lock.lock().await;
+        let _subscription_guard = self.lock_subscriptions().await;
         let awaiting = self
             .state
             .write()
@@ -1327,7 +1421,11 @@ impl NostrTransportAdapter {
             let now_ms = self.now_ms();
             let mut state = self.state.write().await;
             for (subscription_id, endpoint) in &complete {
-                state.record_subscription_eose(subscription_id, endpoint, now_ms);
+                if let Some(paging) =
+                    state.record_subscription_eose(subscription_id, endpoint, now_ms)
+                {
+                    self.spawn_replay_paging(paging);
+                }
             }
             for (subscription_id, endpoint) in &unsent {
                 state.release_reissue_claim(subscription_id, endpoint);
@@ -1391,7 +1489,7 @@ impl NostrTransportAdapter {
                 "scoped subscription unsupported".into(),
             ));
         }
-        let subscription_guard = self.subscription_lock.clone().lock_owned().await;
+        let subscription_guard = self.lock_subscriptions().await;
         let subscription = NostrSubscription::GroupMaintenance {
             account_id: account_id.clone(),
             group_id: group.group_id.clone(),
@@ -1488,7 +1586,7 @@ impl NostrTransportAdapter {
         &self,
         subscription: NostrSubscription,
     ) -> Result<(), TransportAdapterError> {
-        let _subscription_guard = self.subscription_lock.lock().await;
+        let _subscription_guard = self.lock_subscriptions().await;
         let subscription_id = subscription.subscription_id();
         {
             let mut state = self.state.write().await;
@@ -1513,7 +1611,7 @@ impl NostrTransportAdapter {
         account_id: &MemberId,
         subscription_id: &str,
     ) -> Result<(), TransportAdapterError> {
-        let _guard = self.subscription_lock.lock().await;
+        let _guard = self.lock_subscriptions().await;
         let subscription = {
             let mut state = self.state.write().await;
             let subscription = state
@@ -1679,6 +1777,11 @@ impl NostrTransportAdapter {
     /// first-event timing can be measured. Timing uses the adapter's monotonic
     /// clock, never the publisher-controlled `created_at`. Events that fail to
     /// map to a transport message are ignored.
+    ///
+    /// It also counts each relay's stored events for an activation REQ before
+    /// that relay's EOSE, so [`Self::handle_relay_eose`] can tell a replay the
+    /// relay may have clamped (see [`RELAY_REPLAY_PAGE_LIMIT`]). Callers must
+    /// pass a relay's copies in order with its EOSE.
     pub async fn observe_relay_event(&self, relay_event: NostrRelayEvent) {
         let Ok(message) = relay_event.event.to_transport_message() else {
             return;
@@ -1688,6 +1791,11 @@ impl NostrTransportAdapter {
         state.record_delivery_timing(&message.id, &relay_event.endpoint, now_ms);
         if let Some(subscription_id) = &relay_event.subscription_id {
             state.record_subscription_first_event(subscription_id, &relay_event.endpoint, now_ms);
+            state.record_stored_replay_event(
+                subscription_id,
+                &relay_event.endpoint,
+                relay_event.event.created_at,
+            );
         }
     }
 
@@ -1749,16 +1857,107 @@ impl NostrTransportAdapter {
 
     /// Record an end-of-stored-events signal for a subscription on one relay
     /// endpoint. This advances the initial-sync gate; it produces no delivery.
+    ///
+    /// When the relay sent a full page of stored events for an activation REQ
+    /// first, it may have clamped the replay (see [`RELAY_REPLAY_PAGE_LIMIT`]).
+    /// That relay's coverage then waits while older pages are fetched in the
+    /// background and delivered like reconciled events.
     pub async fn handle_relay_eose(&self, endpoint: TransportEndpoint, subscription_id: String) {
         let now_ms = self.now_ms();
-        self.state
-            .write()
-            .await
-            .record_subscription_eose(&subscription_id, &endpoint, now_ms);
+        let paging =
+            self.state
+                .write()
+                .await
+                .record_subscription_eose(&subscription_id, &endpoint, now_ms);
+        if let Some(paging) = paging {
+            self.spawn_replay_paging(paging);
+        }
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
             method = "handle_relay_eose",
             "handled relay eose"
+        );
+    }
+
+    /// Page a clamped replay in the background: the caller is a notification
+    /// consumer that must not wait on relay round trips.
+    fn spawn_replay_paging(&self, paging: ReplayPaging) {
+        let adapter = self.clone();
+        tokio::spawn(async move { adapter.page_replay(paging).await });
+    }
+
+    /// Fetch one relay's stored history for one activation REQ backwards from
+    /// the oldest event its live replay delivered, a page at a time, until a
+    /// page comes back short. Events are delivered to the REQ's account like
+    /// reconciled events. Only then does the relay's EOSE count as coverage;
+    /// a failed or over-long paging leaves it incomplete.
+    async fn page_replay(&self, paging: ReplayPaging) {
+        let mut until = paging.until;
+        let mut pages = 0;
+        let mut delivered = 0;
+        let complete = loop {
+            if pages == REPLAY_PAGE_MAX_PAGES {
+                break false;
+            }
+            pages += 1;
+            let request = NostrAcquisitionRequest {
+                account_id: paging.account_id.clone(),
+                scope: paging.window.acquisition_scope(until),
+                endpoints: vec![paging.endpoint.clone()],
+                limits: REPLAY_PAGE_LIMITS,
+            };
+            let page = match self
+                .relay_client
+                .acquire_history(request, NostrAcquisitionCancellation::new())
+                .await
+            {
+                Ok(mut result) => match result.endpoints.pop() {
+                    Some(page) => page,
+                    None => break false,
+                },
+                // A backend that cannot page keeps the unpaged behaviour.
+                Err(NostrAcquisitionError::Unsupported) => break true,
+                Err(NostrAcquisitionError::InvalidRequest) => break false,
+            };
+            let received = page.events.len();
+            let oldest = page.events.iter().map(|event| event.created_at).min();
+            for event in page.events {
+                let relay_event = NostrRelayEvent {
+                    endpoint: paging.endpoint.clone(),
+                    subscription_id: None,
+                    event,
+                };
+                match self
+                    .handle_reconciled_event(&paging.account_id, relay_event)
+                    .await
+                {
+                    Ok(count) => delivered += count,
+                    Err(_) => return,
+                }
+            }
+            if page.end != NostrAcquisitionEnd::RequestPolicySatisfied {
+                break false;
+            }
+            // `until` is inclusive, so the next page repeats the boundary
+            // second; duplicates are harmless. A full page that cannot move
+            // past that second has nothing older left to reach.
+            match oldest {
+                Some(oldest) if received >= RELAY_REPLAY_PAGE_LIMIT && oldest < until => {
+                    until = oldest;
+                }
+                _ => break true,
+            }
+        };
+        if complete {
+            self.state.write().await.finish_replay_paging(&paging);
+        }
+        tracing::debug!(
+            target: "transport_nostr_adapter::adapter",
+            method = "page_replay",
+            pages,
+            delivered,
+            complete,
+            "paged a clamped relay replay"
         );
     }
 }
@@ -1772,7 +1971,7 @@ impl TransportAdapter for NostrTransportAdapter {
     ) -> Result<(), TransportAdapterError> {
         // Serialize with sync/deactivate so this account's re-subscribe cannot
         // interleave a concurrent sync's unsubscribe drain (see the field doc).
-        let _subscription_guard = self.subscription_lock.lock().await;
+        let _subscription_guard = self.lock_subscriptions().await;
         let account_id = activation.account_id.clone();
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
@@ -1881,7 +2080,7 @@ impl TransportAdapter for NostrTransportAdapter {
         // Serialize against other subscription-lifecycle operations so the
         // drain's live-route filter and its relay unsubscribes cannot race a
         // concurrent re-add of the same deterministic subscription id.
-        let subscription_guard = self.subscription_lock.clone().lock_owned().await;
+        let subscription_guard = self.lock_subscriptions().await;
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
             method = "sync_account_groups",
@@ -2002,7 +2201,7 @@ impl TransportAdapter for NostrTransportAdapter {
     async fn deactivate_account(&self, account_id: &MemberId) -> Result<(), TransportAdapterError> {
         // Serialize with sync/activate so the blanket unsubscribe cannot
         // interleave a concurrent sync's unsubscribe drain (see the field doc).
-        let _subscription_guard = self.subscription_lock.lock().await;
+        let _subscription_guard = self.lock_subscriptions().await;
         let removed_count = {
             let state = self.state.read().await;
             state
@@ -2157,6 +2356,79 @@ struct AccountRoutes {
 #[derive(Clone, Default)]
 struct AccountReplayCoverage {
     subscriptions: HashMap<String, HashMap<RelayIndex, RelayReplay>>,
+    /// The stored-history window each issued REQ asked for, so a replay a relay
+    /// cut short can be paged within it.
+    windows: HashMap<String, ReplayWindow>,
+    /// Stored events each relay sent for each REQ before its EOSE.
+    stored: HashMap<(String, RelayIndex), StoredReplay>,
+}
+
+/// The stored-history window of one activation REQ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReplayWindow {
+    scope: ReplayScope,
+    /// The REQ's `since`, or 0 when it asked for full history.
+    since: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplayScope {
+    Inbox,
+    Group([u8; 32]),
+}
+
+impl ReplayWindow {
+    fn for_subscription(subscription: &NostrSubscription) -> Option<Self> {
+        let (scope, since) = match subscription {
+            NostrSubscription::AccountInbox { since, .. } => (ReplayScope::Inbox, since),
+            NostrSubscription::Group {
+                transport_group_id,
+                since,
+                ..
+            } => (
+                ReplayScope::Group(transport_group_id.as_slice().try_into().ok()?),
+                since,
+            ),
+            NostrSubscription::GroupMaintenance { .. } => return None,
+        };
+        Some(Self {
+            scope,
+            since: since.map_or(0, |since| since.0),
+        })
+    }
+
+    fn acquisition_scope(self, until: u64) -> NostrAcquisitionScope {
+        let since = self.since.min(until);
+        match self.scope {
+            ReplayScope::Inbox => NostrAcquisitionScope::AccountInboxWindow { since, until },
+            ReplayScope::Group(transport_group_id) => NostrAcquisitionScope::GroupWindow {
+                transport_group_id,
+                since,
+                until,
+            },
+        }
+    }
+}
+
+/// How many stored events one relay sent for one REQ before EOSE, and the
+/// oldest `created_at` among them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StoredReplay {
+    events: usize,
+    oldest: Option<u64>,
+}
+
+/// One relay's replay of one activation REQ that must be paged backwards
+/// before its EOSE counts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReplayPaging {
+    account_id: MemberId,
+    subscription_id: String,
+    endpoint: TransportEndpoint,
+    window: ReplayWindow,
+    /// Inclusive upper bound of the first page: the oldest event the live
+    /// replay delivered.
+    until: u64,
 }
 
 /// One relay's answer to one REQ of an activation's replay.
@@ -2171,6 +2443,11 @@ enum RelayReplay {
     Eose,
     /// The relay ended the REQ with a dropped refusal before EOSE.
     Refused,
+    /// The relay sent EOSE after a full page of stored events, so it may have
+    /// clamped the replay; older pages are being fetched. Neither complete nor
+    /// settled. A paging that fails or runs out of pages stays here until the
+    /// next activation replays the REQ.
+    Paging,
 }
 
 impl AccountReplayCoverage {
@@ -2195,8 +2472,65 @@ impl AccountReplayCoverage {
         progress
     }
 
-    fn record_eose(&mut self, subscription_id: &str, relay: RelayIndex) {
-        if let Some(replay) = self.replay_mut(subscription_id, relay) {
+    /// Count one stored event a relay sent for a REQ still awaiting its EOSE.
+    fn record_stored_event(&mut self, subscription_id: &str, relay: RelayIndex, created_at: u64) {
+        if self
+            .replay_mut(subscription_id, relay)
+            .map(|replay| *replay)
+            != Some(RelayReplay::Awaiting)
+        {
+            return;
+        }
+        let stored = self
+            .stored
+            .entry((subscription_id.to_owned(), relay))
+            .or_default();
+        stored.events += 1;
+        stored.oldest = Some(
+            stored
+                .oldest
+                .map_or(created_at, |oldest| oldest.min(created_at)),
+        );
+    }
+
+    /// Record a relay's EOSE for a REQ. A replay that delivered a full page
+    /// may have been clamped: it moves to [`RelayReplay::Paging`] and returns
+    /// the window and first `until` to page instead of counting as coverage.
+    fn record_eose(
+        &mut self,
+        subscription_id: &str,
+        relay: RelayIndex,
+    ) -> Option<(ReplayWindow, u64)> {
+        let stored = self.stored.remove(&(subscription_id.to_owned(), relay));
+        let window = self.windows.get(subscription_id).copied();
+        let replay = self.replay_mut(subscription_id, relay)?;
+        if *replay != RelayReplay::Awaiting {
+            if *replay != RelayReplay::Paging {
+                *replay = RelayReplay::Eose;
+            }
+            return None;
+        }
+        if let (
+            Some(window),
+            Some(StoredReplay {
+                events,
+                oldest: Some(until),
+            }),
+        ) = (window, stored)
+            && events >= RELAY_REPLAY_PAGE_LIMIT
+        {
+            *replay = RelayReplay::Paging;
+            return Some((window, until));
+        }
+        *replay = RelayReplay::Eose;
+        None
+    }
+
+    /// A paged replay reached the start of its window: its EOSE now counts.
+    fn finish_paging(&mut self, subscription_id: &str, relay: RelayIndex) {
+        if let Some(replay) = self.replay_mut(subscription_id, relay)
+            && *replay == RelayReplay::Paging
+        {
             *replay = RelayReplay::Eose;
         }
     }
@@ -2208,7 +2542,7 @@ impl AccountReplayCoverage {
         disposition: SubscriptionRefusalDisposition,
     ) {
         if let Some(replay) = self.replay_mut(subscription_id, relay)
-            && *replay != RelayReplay::Eose
+            && !matches!(*replay, RelayReplay::Eose | RelayReplay::Paging)
         {
             *replay = match disposition {
                 SubscriptionRefusalDisposition::Pending => RelayReplay::Awaiting,
@@ -2640,6 +2974,13 @@ impl AdapterState {
         account_id: &MemberId,
         subscriptions: &[NostrSubscription],
     ) {
+        let windows = subscriptions
+            .iter()
+            .filter_map(|subscription| {
+                ReplayWindow::for_subscription(subscription)
+                    .map(|window| (subscription.subscription_id(), window))
+            })
+            .collect();
         let subscriptions = subscriptions
             .iter()
             .map(|subscription| {
@@ -2651,8 +2992,14 @@ impl AdapterState {
                 (subscription.subscription_id(), relays)
             })
             .collect();
-        self.account_replay_coverage
-            .insert(account_id.clone(), AccountReplayCoverage { subscriptions });
+        self.account_replay_coverage.insert(
+            account_id.clone(),
+            AccountReplayCoverage {
+                subscriptions,
+                windows,
+                stored: HashMap::new(),
+            },
+        );
     }
 
     fn stage_subscription_starts(&mut self, subscriptions: &[NostrSubscription], now_ms: u64) {
@@ -2831,16 +3178,56 @@ impl AdapterState {
         self.sync.record_first_event(subscription_id, relay, now_ms);
     }
 
+    /// Record a relay's EOSE. Returns the paging to run when the relay sent a
+    /// full page of an activation REQ's stored history first (see
+    /// [`RELAY_REPLAY_PAGE_LIMIT`]); that relay's coverage waits for it.
     fn record_subscription_eose(
         &mut self,
         subscription_id: &str,
         endpoint: &TransportEndpoint,
         now_ms: u64,
-    ) {
+    ) -> Option<ReplayPaging> {
         let relay = self.relay_index.index_for(endpoint);
         self.sync.record_eose(subscription_id, relay, now_ms);
+        let mut paging = None;
+        for (account_id, coverage) in &mut self.account_replay_coverage {
+            if let Some((window, until)) = coverage.record_eose(subscription_id, relay) {
+                paging = Some(ReplayPaging {
+                    account_id: account_id.clone(),
+                    subscription_id: subscription_id.to_owned(),
+                    endpoint: endpoint.clone(),
+                    window,
+                    until,
+                });
+            }
+        }
+        paging
+    }
+
+    /// Count one relay's copy of a stored event for an activation REQ that has
+    /// not reported EOSE on that relay yet.
+    fn record_stored_replay_event(
+        &mut self,
+        subscription_id: &str,
+        endpoint: &TransportEndpoint,
+        created_at: u64,
+    ) {
+        let Some(relay) = self.relay_index.existing_index_for(endpoint) else {
+            return;
+        };
         for coverage in self.account_replay_coverage.values_mut() {
-            coverage.record_eose(subscription_id, relay);
+            coverage.record_stored_event(subscription_id, relay, created_at);
+        }
+    }
+
+    /// A paged replay reached the start of its window. Applies only while the
+    /// activation that issued the REQ is still current.
+    fn finish_replay_paging(&mut self, paging: &ReplayPaging) {
+        let Some(relay) = self.relay_index.existing_index_for(&paging.endpoint) else {
+            return;
+        };
+        if let Some(coverage) = self.account_replay_coverage.get_mut(&paging.account_id) {
+            coverage.finish_paging(&paging.subscription_id, relay);
         }
     }
 

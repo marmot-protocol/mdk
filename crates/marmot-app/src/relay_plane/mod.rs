@@ -2956,8 +2956,9 @@ async fn handle_relay_notification(
                     subscription_id,
                     event,
                 } => {
-                    // Raw per-relay copy is telemetry only. Delivery uses the
-                    // deduplicated Event notification above.
+                    // Raw per-relay copy feeds telemetry and replay-page
+                    // accounting, in order with this relay's EOSE. Delivery
+                    // uses the deduplicated Event notification above.
                     if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
                         adapter
                             .observe_relay_event(transport_nostr_adapter::NostrRelayEvent {

@@ -50,6 +50,20 @@ for reconnect/backoff and relay status mechanics.
 - Keep `activate_account`'s opening `unsubscribe_account` unconditional. Attempt-scoped ids removed the relay-side
   REQ-replace backstop, and a rolled-back activation can leave `accounts` empty while the relay client still holds this
   account's subscriptions; an orphaned REQ double-delivers because routing is content-keyed.
+- Never leave a REQ live that `account_subscriptions` does not track (#2262):
+  - Track a REQ's id before handing it to nostr-sdk, and untrack it only once its CLOSE went out. A failed subscribe
+    closes before untracking; a failed close stays tracked for the next sweep. `unsubscribe_account` untracks per id
+    as it closes, so a caller dropped mid-sweep leaves the rest tracked.
+  - Never abort subscribe tasks. `subscribe_all` drains its siblings after an error and detaches them when dropped.
+    Every lifecycle operation takes `lock_subscriptions`, which waits for those stragglers to register before any
+    sweep.
+- Never count a replay a relay may have clamped as coverage (#2263):
+  - `observe_relay_event` counts each relay's stored events per activation REQ until that relay's EOSE, so consumers
+    must pass a relay's copies in order with its EOSE.
+  - A relay that sent `RELAY_REPLAY_PAGE_LIMIT` or more moves to `RelayReplay::Paging`, which is neither complete nor
+    settled. `page_replay` then fetches the window backwards with `acquire_history` until a page comes back short;
+    only then does that relay's EOSE count.
+  - A failed or over-long paging stays incomplete for the next activation and recovery.
 - Record each REQ's filter `since` in its SDK account context before the REQ goes out, find it by subscription id
   when the REQ closes, and keep a closed REQ's floor for the rest of the context's life: routing is content-keyed,
   and a closed REQ's buffered or in-flight notifications have no deadline, so they can still be lost in a lag. Do
