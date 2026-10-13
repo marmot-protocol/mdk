@@ -5409,6 +5409,8 @@ struct ReleasableSubscribeRelayClient {
     hold: AtomicBool,
     held: AtomicUsize,
     release: Notify,
+    /// Held subscribes that have been released and returned.
+    released: AtomicUsize,
     unsubscribed: Mutex<Vec<String>>,
 }
 
@@ -5424,6 +5426,7 @@ impl NostrRelayClient for ReleasableSubscribeRelayClient {
             released.as_mut().enable();
             self.held.fetch_add(1, Ordering::SeqCst);
             released.await;
+            self.released.fetch_add(1, Ordering::SeqCst);
         }
         Ok(())
     }
@@ -5539,4 +5542,170 @@ async fn subscribe_tasks_outliving_the_straggler_wait_close_their_reqs() {
         unsubscribed.iter().all(|id| !live.contains(id)),
         "only the superseded attempt's REQs are closed"
     );
+}
+
+async fn wait_until(what: &str, condition: impl Fn() -> bool) {
+    tokio::time::timeout(concurrent_subscribe_timeout(), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
+}
+
+fn sync_fixture_group(byte: u8) -> TransportGroupSubscription {
+    TransportGroupSubscription {
+        group_id: cgka_traits::GroupId::new(vec![byte; 32]),
+        transport_group_id: vec![byte.wrapping_add(1); 32],
+        endpoints: vec![TransportEndpoint("wss://group.example".into())],
+        retained_since: None,
+    }
+}
+
+async fn group_subscription_id(
+    adapter: &NostrTransportAdapter,
+    account_id: &MemberId,
+    group: &TransportGroupSubscription,
+) -> String {
+    NostrSubscription::Group {
+        account_id: account_id.clone(),
+        group_id: group.group_id.clone(),
+        transport_group_id: group.transport_group_id.clone(),
+        endpoints: group.endpoints.clone(),
+        since: None,
+        attempt: adapter
+            .account_subscription_attempt(account_id)
+            .await
+            .expect("the account is active"),
+    }
+    .subscription_id()
+}
+
+/// Start a group sync adding `added` while its subscribe is held, then cancel
+/// it. Its subscribe task keeps running detached.
+async fn cancel_held_group_sync(
+    relay: &ReleasableSubscribeRelayClient,
+    adapter: &NostrTransportAdapter,
+    account_id: &MemberId,
+    groups: Vec<TransportGroupSubscription>,
+) {
+    relay.hold.store(true, Ordering::SeqCst);
+    let held_before = relay.held.load(Ordering::SeqCst);
+    let sync = tokio::spawn({
+        let adapter = adapter.clone();
+        let sync = TransportGroupSync {
+            account_id: account_id.clone(),
+            group_subscriptions: groups,
+            since: None,
+        };
+        async move { adapter.sync_account_groups(sync).await }
+    });
+    wait_until("the added group's subscribe is held", || {
+        relay.held.load(Ordering::SeqCst) > held_before
+    })
+    .await;
+    sync.abort();
+    assert!(sync.await.unwrap_err().is_cancelled());
+    relay.hold.store(false, Ordering::SeqCst);
+}
+
+/// A cancelled group sync's subscribe task keeps running and can register its
+/// group after the sync rolled back. The rolled-back group is in no committed
+/// route, so no later sync would close it: the sync's cleanup must (#2262).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_group_sync_closes_the_reqs_it_installed() {
+    let relay = Arc::new(ReleasableSubscribeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let (kept, added) = (sync_fixture_group(0xB2), sync_fixture_group(0xC3));
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![kept.clone()],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+    let added_id = group_subscription_id(&adapter, &account_id, &added).await;
+
+    cancel_held_group_sync(&relay, &adapter, &account_id, vec![kept.clone(), added]).await;
+    // Released within the straggler wait: the task registers under the
+    // current barrier, so only the sync's own cleanup can close it.
+    relay.release.notify_waiters();
+    wait_until("the cancelled sync closes its REQ", || {
+        relay.unsubscribed.lock().unwrap().contains(&added_id)
+    })
+    .await;
+
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id: account_id.clone(),
+            group_subscriptions: vec![kept],
+            since: None,
+        })
+        .await
+        .expect("the next sync proceeds");
+    assert_eq!(*relay.unsubscribed.lock().unwrap(), vec![added_id]);
+}
+
+/// Group syncs reuse their activation's subscription ids. A cancelled sync's
+/// straggler that outlives the wait must not close an id the retried sync
+/// has since made live, or the live route would stop receiving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retired_subscribe_task_keeps_an_id_the_live_routes_want() {
+    let relay = Arc::new(ReleasableSubscribeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA2; 32]);
+    let (kept, added) = (sync_fixture_group(0xB4), sync_fixture_group(0xC5));
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![kept.clone()],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+    let added_id = group_subscription_id(&adapter, &account_id, &added).await;
+    let closes_of_added = || {
+        relay
+            .unsubscribed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|id| **id == added_id)
+            .count()
+    };
+
+    cancel_held_group_sync(
+        &relay,
+        &adapter,
+        &account_id,
+        vec![kept.clone(), added.clone()],
+    )
+    .await;
+    // The held task outlives the cancelled sync's cleanup wait, which retires
+    // the barrier and closes the not-yet-registered id.
+    wait_until("the cleanup closes the abandoned id", || {
+        closes_of_added() == 1
+    })
+    .await;
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id: account_id.clone(),
+            group_subscriptions: vec![kept, added],
+            since: None,
+        })
+        .await
+        .expect("the retried sync makes the group live");
+
+    relay.release.notify_waiters();
+    wait_until("the straggler returns", || {
+        relay.released.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(closes_of_added(), 1, "the live route's REQ stays open");
 }

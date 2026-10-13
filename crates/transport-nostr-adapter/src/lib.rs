@@ -901,6 +901,68 @@ pub trait NostrRelayClient: Send + Sync {
     }
 }
 
+/// Wait, bounded by [`SUBSCRIBE_STRAGGLER_WAIT`], for every subscribe task
+/// holding the current barrier (see `NostrTransportAdapter::subscribe_tasks`).
+/// On timeout, retire that barrier so stragglers fence themselves, rather than
+/// letting a hung relay client wedge the adapter.
+async fn settle_subscribe_tasks(barriers: &std::sync::Mutex<Arc<RwLock<()>>>) {
+    let in_flight = barriers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if tokio::time::timeout(SUBSCRIBE_STRAGGLER_WAIT, in_flight.write())
+        .await
+        .is_err()
+    {
+        *barriers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(RwLock::new(()));
+        tracing::warn!(
+            target: "transport_nostr_adapter::adapter",
+            method = "settle_subscribe_tasks",
+            "abandoned relay subscribe tasks still running after the straggler wait"
+        );
+    }
+}
+
+/// Close the REQs a failed or cancelled group sync installed, once its
+/// subscribe tasks have settled. Only ids the committed routes no longer want
+/// are closed: a group sync reuses its activation's ids, so an id that is
+/// still live belongs to a route that needs that REQ. A failed close is queued
+/// for the next group sync's drain.
+async fn close_abandoned_sync_batch(
+    relay_client: &Arc<dyn NostrRelayClient>,
+    state: &RwLock<AdapterState>,
+    barriers: &std::sync::Mutex<Arc<RwLock<()>>>,
+    batch: Vec<NostrSubscription>,
+) {
+    settle_subscribe_tasks(barriers).await;
+    let abandoned = {
+        let state = state.read().await;
+        batch
+            .into_iter()
+            .filter(|subscription| {
+                state
+                    .live_subscription_route(&subscription.subscription_id())
+                    .is_none()
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut failed = Vec::new();
+    for subscription in abandoned {
+        if relay_client
+            .unsubscribe(subscription.clone())
+            .await
+            .is_err()
+        {
+            failed.push(subscription);
+        }
+    }
+    if !failed.is_empty() {
+        state.write().await.queue_pending_unsubscribes(failed);
+    }
+}
+
 /// A `JoinSet` that detaches its tasks when dropped instead of aborting them.
 /// See `NostrTransportAdapter::subscribe_tasks` for why subscribe tasks must
 /// run to completion.
@@ -1098,21 +1160,7 @@ impl NostrTransportAdapter {
     /// lock spawn them.
     async fn lock_subscriptions(&self) -> OwnedMutexGuard<()> {
         let guard = self.subscription_lock.clone().lock_owned().await;
-        let in_flight = self.current_subscribe_tasks();
-        if tokio::time::timeout(SUBSCRIBE_STRAGGLER_WAIT, in_flight.write())
-            .await
-            .is_err()
-        {
-            *self
-                .subscribe_tasks
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(RwLock::new(()));
-            tracing::warn!(
-                target: "transport_nostr_adapter::adapter",
-                method = "lock_subscriptions",
-                "abandoned relay subscribe tasks still running after the straggler wait"
-            );
-        }
+        settle_subscribe_tasks(&self.subscribe_tasks).await;
         guard
     }
 
@@ -1131,6 +1179,7 @@ impl NostrTransportAdapter {
         let mut tasks = DetachOnDrop(JoinSet::new());
         for (sub_index, subscription) in subscriptions.iter().cloned().enumerate() {
             let relay_client = self.relay_client.clone();
+            let state = self.state.clone();
             let barriers = self.subscribe_tasks.clone();
             let barrier = self.current_subscribe_tasks();
             let in_flight = barrier.clone().read_owned().await;
@@ -1139,15 +1188,24 @@ impl NostrTransportAdapter {
                 let result = relay_client.subscribe(subscription.clone()).await;
                 // A lifecycle operation that gave up waiting for this task
                 // retired its barrier and may already have swept the account,
-                // so a REQ registered now would be live with nothing tracking
-                // it. Close it here instead.
+                // so a REQ registered now could be live with nothing tracking
+                // it. Close it, unless the current routes want that id: a
+                // group sync reuses its activation's ids, and then this REQ is
+                // the one the live route needs.
                 let retired = !Arc::ptr_eq(
                     &barrier,
                     &barriers
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()),
                 );
-                if retired && result.is_ok() {
+                if retired
+                    && result.is_ok()
+                    && state
+                        .read()
+                        .await
+                        .live_subscription_route(&subscription.subscription_id())
+                        .is_none()
+                {
                     let _ = relay_client.unsubscribe(subscription).await;
                 }
                 (sub_index, result)
@@ -2179,25 +2237,48 @@ impl TransportAdapter for NostrTransportAdapter {
         // Keep the lifecycle lock in a detached cleanup guard. If this future
         // is cancelled at any later await, dropping the sender wakes the guard,
         // which rolls back staged state before another lifecycle call can run.
+        // A cancelled batch's subscribe tasks keep running detached, so the
+        // guard also closes whatever REQs they installed once they settle.
         let (staging_complete, staging_abandoned) = oneshot::channel();
         let cleanup_state = Arc::clone(&self.state);
+        let cleanup_client = Arc::clone(&self.relay_client);
+        let cleanup_barriers = Arc::clone(&self.subscribe_tasks);
+        let cleanup_batch = to_add.clone();
         tokio::spawn(async move {
             let _subscription_guard = subscription_guard;
             if staging_abandoned.await.is_err() {
-                let mut state = cleanup_state.write().await;
-                state.rollback_staged_subscription_starts();
-                state.rebuild_transport_group_index();
+                {
+                    let mut state = cleanup_state.write().await;
+                    state.rollback_staged_subscription_starts();
+                    state.rebuild_transport_group_index();
+                }
+                close_abandoned_sync_batch(
+                    &cleanup_client,
+                    &cleanup_state,
+                    &cleanup_barriers,
+                    cleanup_batch,
+                )
+                .await;
             }
         });
 
         if let Err(error) = self.subscribe_all("sync_account_groups", &to_add).await {
             // The authoritative routes and committed telemetry were never
             // replaced. Discard only this batch's staged callbacks and rebuild
-            // the derived route index to remove its temporary coverage.
-            let mut state = self.state.write().await;
-            state.rollback_staged_subscription_starts();
-            state.rebuild_transport_group_index();
-            drop(state);
+            // the derived route index to remove its temporary coverage, then
+            // close the REQs the batch's successful siblings installed.
+            {
+                let mut state = self.state.write().await;
+                state.rollback_staged_subscription_starts();
+                state.rebuild_transport_group_index();
+            }
+            close_abandoned_sync_batch(
+                &self.relay_client,
+                &self.state,
+                &self.subscribe_tasks,
+                to_add,
+            )
+            .await;
             let _ = staging_complete.send(());
             return Err(error);
         }

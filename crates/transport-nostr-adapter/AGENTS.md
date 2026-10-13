@@ -53,13 +53,17 @@ for reconnect/backoff and relay status mechanics.
   account's subscriptions; an orphaned REQ double-delivers because routing is content-keyed.
 - Never leave a REQ live that `account_subscriptions` does not track (#2262):
   - Track a REQ's id before handing it to nostr-sdk, and untrack it only once its CLOSE went out. A failed subscribe
-    closes before untracking; a failed close stays tracked for the next sweep. `unsubscribe_account` untracks per id
-    as it closes, so a caller dropped mid-sweep leaves the rest tracked.
+    registered nothing of its own and closes nothing: group syncs reuse their activation's ids, so the id may belong
+    to another live REQ. `unsubscribe_account` untracks per id as it closes, so a caller dropped mid-sweep leaves the
+    rest tracked.
   - Never abort subscribe tasks. `subscribe_all` drains its siblings after an error and detaches them when dropped.
     Every lifecycle operation takes `lock_subscriptions`, which waits for those stragglers to register before any
     sweep.
   - That wait is bounded so a hung relay client cannot wedge the adapter. When it gives up, it retires the barrier;
-    a task that finishes after its barrier was retired must close the REQ it just registered.
+    a task that finishes after its barrier was retired closes the REQ it just registered, unless the current routes
+    want that id.
+  - A failed or cancelled group sync closes the REQs its batch installed once its subscribe tasks settle, except ids
+    the committed routes still want (`close_abandoned_sync_batch`). Its guard holds the lifecycle lock throughout.
 - Never count a replay a relay may have clamped as coverage (#2263):
   - `observe_relay_event` counts each relay's stored events per activation REQ until that relay's EOSE, before
     mapping them. Consumers must pass a relay's copies in order with its EOSE, and report events that fail

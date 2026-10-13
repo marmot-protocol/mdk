@@ -2683,9 +2683,13 @@ impl NostrSdkRelayClient {
             .await
         {
             Ok(output) if !output.success.is_empty() => output,
+            // A failed call registered nothing of its own: nostr-sdk reports
+            // each relay's failure, including an id another live REQ already
+            // holds, without registering it there. So it closes nothing. A
+            // group sync reuses its activation's ids, and closing one here
+            // would end the REQ that holds it. The early-tracked id stays
+            // tracked; a sweep's CLOSE for it is harmless.
             result => {
-                self.abandon_subscription(&plan.account_id, &plan.subscription_id)
-                    .await;
                 return Err(TransportAdapterError::Subscription(match result {
                     Ok(_) => format!(
                         "subscribe registered on 0 of {} relays",
@@ -2731,19 +2735,6 @@ impl NostrSdkRelayClient {
             outcomes,
         );
         Ok(())
-    }
-
-    /// Undo `subscribe_planned`'s early tracking after a failed SDK call. The
-    /// call may have registered the REQ on some relays before failing, so close
-    /// it there first, and keep the id tracked when that close fails so the
-    /// next `unsubscribe_account` retries it.
-    async fn abandon_subscription(&self, account_id: &MemberId, id: &SubscriptionId) {
-        if self.client.unsubscribe(id).await.is_err() {
-            return;
-        }
-        if let Some(ids) = self.account_subscriptions.write().await.get_mut(account_id) {
-            ids.retain(|tracked| tracked != id);
-        }
     }
 
     async fn event_for_publish(

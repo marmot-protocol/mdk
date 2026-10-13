@@ -26,8 +26,8 @@ use nostr_relay_builder::{LocalRelay, RelayBuilder};
 use nostr_sdk::prelude::{Client, EventBuilder, FinalizeEvent, Keys, Kind, RelayOptions, Tag};
 use tokio::task::JoinHandle;
 use transport_nostr_adapter::{
-    NostrReconciliationProgress, NostrSdkRelayClient, NostrSubscription, NostrTransportAdapter,
-    SubscriptionAttempt, SubscriptionRouteKind,
+    NostrReconciliationProgress, NostrRelayClient, NostrSdkRelayClient, NostrSubscription,
+    NostrTransportAdapter, SubscriptionAttempt, SubscriptionRouteKind,
 };
 
 const QUIET: Duration = Duration::from_millis(600);
@@ -777,6 +777,38 @@ async fn dropped_activation_futures_leave_no_untracked_reqs() {
     assert_eq!(check.active_after_activation, G + 1, "{check:?}");
     assert_eq!(check.active_after_reconnect, G + 1, "{check:?}");
     assert_eq!(check.stale_on_reconnect, 0, "{check:?}");
+    fx.shutdown().await;
+}
+
+/// A group sync reuses its activation's ids, so a late or repeated subscribe
+/// can name an id another live REQ already holds. nostr-sdk refuses it without
+/// registering anything; the failed call must not close the live REQ (#2262).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn duplicate_subscribe_leaves_the_live_req_open() {
+    let fx = Fixture::new(LimitConfig::default(), false).await;
+    let url = fx.limit.url();
+    fx.adapter
+        .activate_account(fx.activation(std::slice::from_ref(&url), groups(1, &url)))
+        .await
+        .unwrap();
+    let settled = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    let group = groups(1, &url).remove(0);
+    let duplicate = NostrSubscription::Group {
+        account_id: fx.account.clone(),
+        group_id: group.group_id,
+        transport_group_id: group.transport_group_id,
+        endpoints: group.endpoints,
+        since: None,
+        attempt: fx
+            .adapter
+            .account_subscription_attempt(&fx.account)
+            .await
+            .expect("the account is active"),
+    };
+    assert!(fx.sdk.subscribe(duplicate).await.is_err());
+    let after = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    assert_eq!(after.closes, settled.closes, "no CLOSE for the live id");
+    assert_eq!(after.active_now(), 2, "inbox and group REQs stay live");
     fx.shutdown().await;
 }
 
