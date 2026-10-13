@@ -5502,7 +5502,7 @@ C binding for [captured ordinary-media admission](../marmot-uniffi/LOCAL-SENDS.m
 MarmotStatus marmot_attachment_job_cursor_clone(const struct MarmotAttachmentJobCursor *value, struct MarmotAttachmentJobCursor **out);
 ```
 
-Clone a live borrowed attachment job cursor into independently owned storage. Validate output before cloning; free only this clone with its matching handle free. Embedded handles remain borrowed from their root result. Preserve the original account/query/intent scope and never serialize the object.
+Clone a live borrowed attachment job cursor into independently owned storage. Validate output before cloning; free only this clone with its matching handle free. Embedded handles remain borrowed from their root result. Preserve the original account/query scope and never serialize the object.
 
 [Header contract](include/marmot.h#L12505)
 
@@ -5542,7 +5542,7 @@ Deep-free the independently owned attachment management snapshot. NULL is a no-o
 MarmotStatus marmot_attachment_management_subscription_cancel(const struct MarmotAttachmentManagementSubscription *sub);
 ```
 
-Close observation and wake its receiver without cancelling jobs, deleting bytes or dismissing notices. Keep the handle live for the call, and free it separately when no call is active. Use scoped cancellation commands to stop transfer intent.
+Close observation and wake its receiver without cancelling jobs, deleting bytes or dismissing notices. Keep the handle live for the call, and free it separately when no call is active. Use existing per-item attachment controls to stop an eligible transfer.
 
 [Header contract](include/marmot.h#L11210)
 
@@ -5572,7 +5572,7 @@ Block for a revalidated initial or coalesced replacement head. Zero timeout wait
 MarmotStatus marmot_attachment_management_version_clone(const struct MarmotAttachmentManagementVersion *value, struct MarmotAttachmentManagementVersion **out);
 ```
 
-Clone a live borrowed attachment management version into independently owned storage. Validate output before cloning; free only this clone with its matching handle free. Embedded handles remain borrowed from their root result. Preserve the original account/query/intent scope and never serialize the object.
+Clone a live borrowed attachment management version into independently owned storage. Validate output before cloning; free only this clone with its matching handle free. Embedded handles remain borrowed from their root result. Preserve the original account/query scope and never serialize the object.
 
 [Header contract](include/marmot.h#L12513)
 
@@ -5622,7 +5622,7 @@ Deep-free the independently owned managed attachment page. NULL is a no-op. Do n
 MarmotStatus marmot_subscribe_attachment_management(const struct MarmotClient *client, const char *account_ref, const struct MarmotAttachmentJobQuery *query, struct MarmotAttachmentManagementSubscription **out);
 ```
 
-Observe revalidated initial and coalesced replacement heads, at most4Hz. Existing native events and one-shot expiry invalidate the view without an idle polling loop. Continued pages remain explicit reads. Close observation when leaving/backgrounding the screen; closure does not cancel downloads or dismiss history notices. C inputs are borrowed and outputs are preflighted before work; call blocking methods off the UI thread. Deep-free each returned root and clone embedded handles before retaining them beyond that root.
+Observe revalidated initial and coalesced replacement heads, at most 4 Hz. Existing native events and one-shot expiry invalidate the view without an idle polling loop. Continued pages remain explicit reads. Close observation when leaving/backgrounding the screen; closure does not cancel downloads or dismiss history notices. C inputs are borrowed and outputs are preflighted before work; call blocking methods off the UI thread. Deep-free each returned root and clone embedded handles before retaining them beyond that root.
 
 [Header contract](include/marmot.h#L11190)
 
