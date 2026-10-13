@@ -3469,6 +3469,39 @@ async fn undelivered_commit_is_measured_from_its_first_acknowledgement() {
     );
 }
 
+/// mdk#2255 review: the delivery query answers for a stored group the engine
+/// has not hydrated yet instead of failing with `GroupNotHydrated`.
+#[tokio::test]
+async fn undelivered_commit_answers_for_an_unhydrated_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("marmot unhydrated delivery key").unwrap();
+    let mut initial = current_session(database.clone(), &key, b"alice-unhydrated-delivery");
+    initial
+        .create_group(CreateGroupRequest {
+            name: "unhydrated delivery".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    drop(initial);
+
+    let reopened = deferred_current_session(&database, &key, b"alice-unhydrated-delivery");
+    let group_id = reopened.live_group_ids().unwrap().remove(0);
+    assert_eq!(reopened.unhydrated_group_ids(), vec![group_id.clone()]);
+    let runtime = AccountDeviceRuntime::new(
+        reopened,
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![]),
+        RecordingKeyPackages::default(),
+    );
+    assert_eq!(runtime.undelivered_commit(&group_id).unwrap(), None);
+}
+
 /// mdk#2255 review: a commit convergence withdrew no longer gates the group,
 /// even while a relay still owes it, including after a restart.
 #[tokio::test]

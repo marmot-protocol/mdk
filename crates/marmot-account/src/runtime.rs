@@ -2771,11 +2771,15 @@ where
         }
         // Self-updates staged before the frozen-fanout migration.
         let now = self.wall_clock.now();
+        // The ungated list: the group-scoped lookup fails for a stored group
+        // the engine has not hydrated yet, which has nothing owed to report.
         let confirmed_evolutions = self
             .session
-            .group_evolutions_for_group(group_id)?
+            .group_evolutions()?
             .into_iter()
-            .filter(|evolution| evolution.phase == GroupEvolutionPhase::Confirmed)
+            .filter(|evolution| {
+                &evolution.group_id == group_id && evolution.phase == GroupEvolutionPhase::Confirmed
+            })
             .map(|evolution| evolution.id)
             .collect::<HashSet<_>>();
         for fanout in self.session.transport_fanouts()? {
