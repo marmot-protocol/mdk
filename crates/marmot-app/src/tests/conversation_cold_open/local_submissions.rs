@@ -358,10 +358,7 @@ async fn rapid_edit_limit_reports_a_stable_retryable_error() {
         if revision < 31 {
             result.unwrap();
         } else {
-            assert!(
-                matches!(result, Err(AppError::InvalidAppMessagePayload(detail))
-                if detail == "pending edit rate limit: retry shortly")
-            );
+            assert!(matches!(result, Err(AppError::EditRateLimited)));
         }
     }
     h.app.close_storage().unwrap();

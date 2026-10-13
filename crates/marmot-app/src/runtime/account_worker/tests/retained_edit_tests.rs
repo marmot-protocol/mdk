@@ -287,7 +287,7 @@ impl RetainedEditFixture {
 }
 
 #[tokio::test]
-async fn retained_edit_dependency_lookup_error_does_not_stall_another_group() {
+async fn missing_group_rejects_retained_edit_and_does_not_stall_another_group() {
     use cgka_traits::storage::GroupStorage;
     let mut fixture = RetainedEditFixture::new().await;
     fixture
@@ -312,8 +312,13 @@ async fn retained_edit_dependency_lookup_error_does_not_stall_another_group() {
         fixture
             .client
             .retained_edit_waits_for_original(&edit)
-            .is_err()
+            .is_ok_and(|waits| !waits)
     );
+    assert_eq!(fixture.drain().await, Some(Duration::ZERO));
+    let retained = fixture.submission(&fixture.group, "edit");
+    assert_eq!(retained.state, 3);
+    assert!(retained.request_json.is_none() && retained.payload.is_none());
+    assert!(retained.outcome_json.is_none());
     assert_eq!(fixture.drain().await, Some(Duration::ZERO));
     assert!(
         fixture
@@ -321,10 +326,6 @@ async fn retained_edit_dependency_lookup_error_does_not_stall_another_group() {
             .outcome_json
             .is_some()
     );
-    let retained = fixture.submission(&fixture.group, "edit");
-    assert_eq!(retained.state, 0);
-    assert!(retained.request_json.is_some() && retained.payload.is_some());
-    assert!(retained.outcome_json.is_none());
 }
 
 #[tokio::test]
@@ -398,5 +399,62 @@ async fn abandoned_original_rejects_retained_edit_and_unblocks_later_sends() {
             .submission(&fixture.group, "later")
             .outcome_json
             .is_some()
+    );
+}
+
+#[tokio::test]
+async fn retained_edit_lookup_backoff_skips_repeated_probes_and_keeps_sibling_progress() {
+    use cgka_traits::storage::GroupStorage;
+    let mut fixture = RetainedEditFixture::new().await;
+    fixture
+        .app
+        .admit_local_message(
+            "alice",
+            &fixture.sibling,
+            "sibling".into(),
+            RetainedEditFixture::request("sibling"),
+            None,
+        )
+        .unwrap();
+    fixture
+        .app
+        .account_storage("alice")
+        .unwrap()
+        .delete_group(&fixture.group)
+        .unwrap();
+    let group = hex::encode(fixture.group.as_slice());
+    // Model a previous uncertain backend failure without a timing-sensitive sleep.
+    fixture.client.local_edit_lookup_retries.insert(
+        group.clone(),
+        (
+            Instant::now() + Duration::from_secs(30),
+            Duration::from_secs(30),
+        ),
+    );
+    assert_eq!(fixture.drain().await, Some(Duration::ZERO));
+    assert!(
+        fixture
+            .submission(&fixture.sibling, "sibling")
+            .outcome_json
+            .is_some()
+    );
+    assert_eq!(fixture.submission(&fixture.group, "edit").state, 0);
+    let delay = fixture.drain().await.unwrap();
+    assert!(delay > Duration::ZERO && delay <= Duration::from_secs(30));
+    assert_eq!(fixture.submission(&fixture.group, "edit").state, 0);
+    // Once eligible, the missing group is classified as permanent and retired.
+    fixture
+        .client
+        .local_edit_lookup_retries
+        .get_mut(&group)
+        .unwrap()
+        .0 = Instant::now();
+    assert_eq!(fixture.drain().await, Some(Duration::ZERO));
+    assert_eq!(fixture.submission(&fixture.group, "edit").state, 3);
+    assert!(
+        !fixture
+            .client
+            .local_edit_lookup_retries
+            .contains_key(&group)
     );
 }

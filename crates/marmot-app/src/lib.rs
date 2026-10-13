@@ -2008,6 +2008,7 @@ impl MarmotApp {
             conversation_captures: Vec::new(),
             runtime_telemetry: None,
             send_telemetry: None,
+            local_edit_lookup_retries: HashMap::new(),
             app: self.clone(),
             maintenance_observation_generation: self.product_analytics.permit(),
             runtime: open.runtime,

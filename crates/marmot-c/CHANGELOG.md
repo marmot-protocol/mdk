@@ -7,6 +7,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+- Edit failures preserve distinct invalid-target and retryable rate-limit outcomes across the runtime, native bindings and connector. Retained edits in permanently missing groups reject instead of deferring forever; uncertain lookup failures use bounded group retry backoff.
+
 - Add `marmot_send_prepared_media_with_client_token` for captured ordinary-media admission and conditional draft consumption. Inputs are borrowed; the nullable captured revision remains owned by its selected-draft root. The owned result uses the existing `marmot_local_send_acceptance_free`; layouts and status values are unchanged. Use matching regenerated headers and libraries.
 
 ## [0.13.0] - 2026-10-12

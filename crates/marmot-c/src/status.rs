@@ -144,6 +144,9 @@ pub enum MarmotStatus {
     CannotReportSelf = 99,
     /// Local per-account moderation-report cap; retry later.
     ModerationReportRateLimited = 100,
+    InvalidEditTarget = 101,
+    /// No edit was published; retry after the local timestamp budget recovers.
+    EditRateLimited = 102,
 }
 
 thread_local! {
@@ -200,6 +203,8 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::InvalidReportedPublicKey => MarmotStatus::InvalidReportedPublicKey,
         MarmotKitError::CannotReportSelf => MarmotStatus::CannotReportSelf,
         MarmotKitError::ModerationReportRateLimited => MarmotStatus::ModerationReportRateLimited,
+        MarmotKitError::InvalidEditTarget => MarmotStatus::InvalidEditTarget,
+        MarmotKitError::EditRateLimited => MarmotStatus::EditRateLimited,
         MarmotKitError::ChatWindowInvalidLimit => MarmotStatus::ChatWindowInvalidLimit,
         MarmotKitError::ChatWindowStale => MarmotStatus::ChatWindowStale,
         MarmotKitError::ChatWindowAnchorOutside => MarmotStatus::ChatWindowAnchorOutside,
@@ -353,6 +358,8 @@ mod tests {
             MarmotKitError::InvalidReportedPublicKey,
             MarmotKitError::CannotReportSelf,
             MarmotKitError::ModerationReportRateLimited,
+            MarmotKitError::InvalidEditTarget,
+            MarmotKitError::EditRateLimited,
             MarmotKitError::ChatWindowInvalidLimit,
             MarmotKitError::ChatWindowStale,
             MarmotKitError::ChatWindowAnchorOutside,
@@ -509,7 +516,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            91,
+            93,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);

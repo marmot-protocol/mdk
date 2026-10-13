@@ -5632,6 +5632,17 @@ fn delivered_inbound_cursor_dedups_and_evicts_oldest() {
 }
 
 #[test]
+fn edit_rate_limit_has_a_stable_retryable_contract() {
+    let error = crate::ConnectorError::App(marmot_app::AppError::EditRateLimited);
+    assert_eq!(error.code(), "edit_rate_limited");
+    assert_eq!(
+        error.client_message(),
+        "edits are arriving too quickly; retry shortly"
+    );
+    assert!(error.retryable());
+}
+
+#[test]
 fn invalid_edit_target_has_a_distinct_non_retryable_contract() {
     let error = crate::ConnectorError::App(marmot_app::AppError::InvalidEditTarget);
     assert_eq!(error.code(), "invalid_edit_target");

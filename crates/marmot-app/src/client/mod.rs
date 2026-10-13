@@ -752,6 +752,8 @@ pub struct AppClient {
     pub(crate) conversation_captures: Vec<std::sync::Weak<crate::runtime::SendCapture>>,
     pub(crate) runtime_telemetry: Option<AppPerformanceTelemetry>,
     pub(crate) send_telemetry: Option<AppPerformanceTelemetry>,
+    /// Per-group retry floor for uncertain retained-edit backend lookups; pruned to live pending groups.
+    pub(crate) local_edit_lookup_retries: HashMap<String, (Instant, Duration)>,
     pub(crate) app: MarmotApp,
     pub(crate) runtime: AppRuntime,
     pub(crate) maintenance_observation_generation: Option<crate::DiagnosticsPermit>,
@@ -4268,10 +4270,32 @@ impl AppClient {
         if !recoverable {
             return Ok(false);
         }
-        let group = GroupId::new(hex::decode(&submission.group_id_hex).map_err(|_| {
-            AppError::InvalidAppMessagePayload("invalid local submission group".into())
-        })?);
-        if self.runtime.group_record(&group)?.is_terminal() {
+        let Ok(group) = hex::decode(&submission.group_id_hex) else {
+            // Corrupt retained routing is permanent, not a recoverable lookup.
+            return Ok(false);
+        };
+        let group = GroupId::new(group);
+        let record = match self.runtime.group_record(&group) {
+            Ok(record) => record,
+            // An absent authoritative group has no recoverable publication work.
+            // Let the normal send path reject and retire this retained edit.
+            Err(error) => {
+                let error = AppError::from(error);
+                if matches!(
+                    error.as_engine_error(),
+                    Some(
+                        cgka_traits::error::EngineError::UnknownGroup(_)
+                            | cgka_traits::error::EngineError::Storage(
+                                cgka_traits::storage::StorageError::NotFound
+                            )
+                    )
+                ) {
+                    return Ok(false);
+                }
+                return Err(error);
+            }
+        };
+        if record.is_terminal() {
             return Ok(false);
         }
         // Engine acceptance survives completion and abandonment. Defer only while the
@@ -4466,9 +4490,7 @@ impl AppClient {
                         now,
                         target.edit.map(|previous| previous.edited_at),
                     )
-                    .ok_or_else(|| {
-                        AppError::InvalidAppMessagePayload("edit rate limit: retry shortly".into())
-                    })?;
+                    .ok_or(AppError::EditRateLimited)?;
                 }
                 intent
             }

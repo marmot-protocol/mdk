@@ -169,3 +169,9 @@ Revisioned draft saves no longer hydrate an unused return copy of attachment
 plaintext. Selected-draft descriptors use a blob-free covering index. Attachment
 comparison still reads existing bytes; these changes do not promise constant-time
 attachment saves.
+
+## Edit eligibility and throttling
+
+All edit callers share the available, self-authored chat-target preflight. `InvalidEditTarget` is terminal for that request. Rapid sequential edits advance event timestamps within a 30-second local skew budget so recipients deterministically display the latest submitted text. When that budget is exhausted, `EditRateLimited` publishes nothing; retry the same intended edit shortly. C exposes `MARMOT_STATUS_INVALID_EDIT_TARGET` (101) and `MARMOT_STATUS_EDIT_RATE_LIMITED` (102), and the connector reports `edit_rate_limited` with `retryable=true`.
+
+A retained edit waits while its original has recoverable durable publication work. A permanently absent or terminal group follows normal rejected-submission cleanup. Uncertain backend lookup failures retain the payload and use per-group exponential retry delays from one to 30 seconds; independent groups keep progressing. Retry state is local to the worker, bounded by pending groups, and discarded when no submission remains.

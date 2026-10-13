@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Edit failures preserve distinct invalid-target and retryable rate-limit outcomes across the runtime, native bindings and connector. Retained edits in permanently missing groups reject instead of deferring forever; uncertain lookup failures use bounded group retry backoff.
+
 - `MarmotAppRuntime::submit_prepared_media_snapshot` admits the captured ordinary-media payload with a stable token and consumes only its unchanged captured draft in the same transaction. Newer or cleared drafts cannot replace the payload or block admission.
 
 ## 0.13.0 - 2026-10-12

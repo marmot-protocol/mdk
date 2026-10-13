@@ -2799,6 +2799,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::AccountSetupKeyPackageRecoveryAvailable
         | AppError::ReactionNotFound
         | AppError::InvalidEditTarget
+        | AppError::EditRateLimited
         | AppError::InvalidReportedPublicKey
         | AppError::CannotReportSelf
         | AppError::ModerationReportRateLimited => SubjectFailureCategory::ExpectedRefusal,

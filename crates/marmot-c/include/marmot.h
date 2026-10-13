@@ -192,6 +192,11 @@ enum MarmotStatus
    * Local per-account moderation-report cap; retry later.
    */
   MARMOT_STATUS_MODERATION_REPORT_RATE_LIMITED = 100,
+  MARMOT_STATUS_INVALID_EDIT_TARGET = 101,
+  /**
+   * No edit was published; retry after the local timestamp budget recovers.
+   */
+  MARMOT_STATUS_EDIT_RATE_LIMITED = 102,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L

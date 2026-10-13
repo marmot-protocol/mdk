@@ -66,6 +66,7 @@ impl ConnectorError {
         match self {
             Self::AccountHome(_) => "account_home_error",
             Self::App(AppError::InvalidEditTarget) => "invalid_edit_target",
+            Self::App(AppError::EditRateLimited) => "edit_rate_limited",
             Self::App(AppError::ReactionNotFound) => "reaction_not_found",
             Self::App(AppError::MediaUploadTimedOut) => "media_upload_timeout",
             Self::App(AppError::AgentStreamPublisher(_)) => "stream_error",
@@ -118,6 +119,7 @@ impl ConnectorError {
             Self::App(AppError::InvalidEditTarget) => {
                 "target must be an available self-authored chat message"
             }
+            Self::App(AppError::EditRateLimited) => "edits are arriving too quickly; retry shortly",
             Self::UnsafeControlPlaneConfig(_) => "unsafe agent control plane configuration",
             Self::Hex(_) => "invalid hex value",
             Self::Json(_) | Self::Control(_) => "invalid control request",
@@ -174,7 +176,11 @@ impl ConnectorError {
             self,
             Self::SendInProgress
                 | Self::RelayListInconclusive(_)
-                | Self::App(AppError::MediaUploadTimedOut | AppError::AgentStreamSendFailed(_))
+                | Self::App(
+                    AppError::MediaUploadTimedOut
+                        | AppError::AgentStreamSendFailed(_)
+                        | AppError::EditRateLimited
+                )
         )
     }
 

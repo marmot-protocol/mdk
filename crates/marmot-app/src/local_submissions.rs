@@ -416,11 +416,7 @@ impl MarmotApp {
                     created_at,
                     original_row.edit.map(|previous| previous.edited_at),
                 )
-                .ok_or_else(|| {
-                    AppError::InvalidAppMessagePayload(
-                        "pending edit rate limit: retry shortly".into(),
-                    )
-                })?;
+                .ok_or(AppError::EditRateLimited)?;
                 AppMessageIntent::Edit {
                     target_message_id: original.message_id_hex,
                     content: request.content.clone(),

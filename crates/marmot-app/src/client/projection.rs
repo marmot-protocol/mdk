@@ -1480,6 +1480,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::RuntimeStopping => "read_marker_failed:runtime_stopping",
         AppError::ReactionNotFound => "read_marker_failed:reaction_not_found",
         AppError::InvalidEditTarget => "read_marker_failed:invalid_edit_target",
+        AppError::EditRateLimited => "read_marker_failed:edit_rate_limited",
         AppError::TransportClosed => "read_marker_failed:transport_closed",
         AppError::UserBlocked => "read_marker_failed:user_blocked",
         AppError::BlockListUnavailable => "read_marker_failed:block_list_unavailable",

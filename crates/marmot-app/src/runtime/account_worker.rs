@@ -6120,17 +6120,54 @@ async fn publish_next_local_submission(
             return Some(Duration::from_millis(100));
         };
         let storage = app.account_storage(account_label).ok()?;
+        let pending = storage.pending_local_submissions().ok()?;
+        let pending_groups = pending
+            .iter()
+            .map(|row| row.group_id_hex.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        client
+            .local_edit_lookup_retries
+            .retain(|group, _| pending_groups.contains(group.as_str()));
+        let now = Instant::now();
         let mut deferred_groups = std::collections::HashSet::new();
+        let mut retry_after = None::<Duration>;
         let mut selected = None;
-        for candidate in storage.pending_local_submissions().ok()? {
+        for candidate in pending {
             if deferred_groups.contains(&candidate.group_id_hex) {
                 continue;
             }
+            if let Some((deadline, _)) = client
+                .local_edit_lookup_retries
+                .get(&candidate.group_id_hex)
+            {
+                if *deadline > now {
+                    let delay = deadline.duration_since(now);
+                    retry_after = Some(retry_after.map_or(delay, |current| current.min(delay)));
+                    deferred_groups.insert(candidate.group_id_hex.clone());
+                    continue;
+                }
+            }
             match client.retained_edit_waits_for_original(&candidate) {
                 Ok(true) => {
+                    client
+                        .local_edit_lookup_retries
+                        .remove(&candidate.group_id_hex);
+                    let delay = Duration::from_secs(1);
+                    retry_after = Some(retry_after.map_or(delay, |current| current.min(delay)));
                     deferred_groups.insert(candidate.group_id_hex.clone());
                 }
                 Err(_) => {
+                    let delay = client
+                        .local_edit_lookup_retries
+                        .get(&candidate.group_id_hex)
+                        .map_or(Duration::from_secs(1), |(_, previous)| {
+                            (*previous * 2).min(Duration::from_secs(30))
+                        });
+                    client.local_edit_lookup_retries.insert(
+                        candidate.group_id_hex.clone(),
+                        (Instant::now() + delay, delay),
+                    );
+                    retry_after = Some(retry_after.map_or(delay, |current| current.min(delay)));
                     // Preserve the failing group's order and retained payload, while
                     // allowing independent groups to make progress on this same tick.
                     deferred_groups.insert(candidate.group_id_hex.clone());
@@ -6141,13 +6178,16 @@ async fn publish_next_local_submission(
                     );
                 }
                 Ok(false) => {
+                    client
+                        .local_edit_lookup_retries
+                        .remove(&candidate.group_id_hex);
                     selected = Some(candidate);
                     break;
                 }
             }
         }
         let Some(submission) = selected else {
-            return (!deferred_groups.is_empty()).then_some(Duration::from_secs(1));
+            return retry_after;
         };
         let queued = shared
             .local_submission_queue

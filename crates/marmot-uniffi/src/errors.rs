@@ -4,6 +4,11 @@ use marmot_app::AppError;
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MarmotKitError {
+    #[error("edit target must be an available self-authored chat message")]
+    InvalidEditTarget,
+    /// No event was published; retry the edit after the local timestamp budget recovers.
+    #[error("edits are arriving too quickly; retry shortly")]
+    EditRateLimited,
     #[error("user is blocked")]
     UserBlocked,
     #[error("block list synchronization unavailable")]
@@ -364,6 +369,8 @@ impl From<&AppError> for MarmotKitError {
             AppError::InvalidReportedPublicKey => Self::InvalidReportedPublicKey,
             AppError::CannotReportSelf => Self::CannotReportSelf,
             AppError::ModerationReportRateLimited => Self::ModerationReportRateLimited,
+            AppError::InvalidEditTarget => Self::InvalidEditTarget,
+            AppError::EditRateLimited => Self::EditRateLimited,
             AppError::ProductAnalytics(marmot_app::ProductAnalyticsError::ConsentRequired) => {
                 Self::ConsentRequired
             }
@@ -1212,5 +1219,21 @@ impl From<marmot_app::ConversationWindowError> for MarmotKitError {
                 details: e.to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod edit_error_tests {
+    use super::*;
+    #[test]
+    fn edits_preserve_typed_eligibility_and_retry_outcomes() {
+        assert!(matches!(
+            MarmotKitError::from(AppError::InvalidEditTarget),
+            MarmotKitError::InvalidEditTarget
+        ));
+        assert!(matches!(
+            MarmotKitError::from(AppError::EditRateLimited),
+            MarmotKitError::EditRateLimited
+        ));
     }
 }
