@@ -280,10 +280,10 @@ impl SqliteAccountStorage {
             let sql = format!("WITH candidates AS MATERIALIZED (
                 SELECT * FROM attachment_acquisition INDEXED BY attachment_management_group_work
                 WHERE management_ready=0 AND group_id_hex=?3 ORDER BY rowid DESC LIMIT ?1)
-                SELECT {},CASE WHEN length(CAST(h.slot_json AS BLOB))<=16384 THEN h.slot_json ELSE '[]' END,
+                SELECT {},CASE WHEN length(CAST(h.slot_json AS BLOB))<=16384 THEN h.slot_json ELSE '[]' END AS management_slot,
                 h.visible=1 AND length(CAST(h.slot_json AS BLOB))<=16384 AND h.source_message_id_hex=q.source_message_id_hex
                 AND h.source_epoch=q.source_epoch AND h.slot_json=q.slot_json
-                AND g.pending_confirmation=0 AND a.message_id_hex IS NOT NULL AND (a.retention_expires_at IS NULL OR a.retention_expires_at>?2)
+                AND g.pending_confirmation=0 AND a.message_id_hex IS NOT NULL AND (a.retention_expires_at IS NULL OR a.retention_expires_at>?2) AS source_visible
                 FROM candidates q
                 LEFT JOIN attachment_history h ON h.group_id_hex=q.group_id_hex AND h.message_id_hex=q.message_id_hex AND h.attachment_index=q.attachment_index
                 LEFT JOIN app_events a ON a.group_id_hex=q.group_id_hex AND a.message_id_hex=q.message_id_hex
@@ -297,8 +297,8 @@ impl SqliteAccountStorage {
             while let Some(row) = rows.next().storage()? {
                 visited += 1;
                 if visited > ATTACHMENT_MANAGEMENT_COUNT_LIMIT { counts.complete=false; break; }
-                if !row.get::<_,Option<bool>>(17).storage()?.unwrap_or(false) { continue; }
-                let slot: String = row.get(16).storage()?;
+                if !row.get::<_,Option<bool>>("source_visible").storage()?.unwrap_or(false) { continue; }
+                let slot: String = row.get("management_slot").storage()?;
                 let mut status = super::controls::transfer_status_row(row, &identity, permission.automatic, &slot).storage()?;
                 apply_permission(&mut status, permission);
                 if active(status.state) { counts.active+=1; }

@@ -266,10 +266,15 @@ mod tests {
             .unwrap();
         let relay = rt.block_on(nostr_relay_builder::MockRelay::run()).unwrap();
         let url = rt.block_on(relay.url()).to_string();
+        // Keep test blob connections on loopback and unable to complete a body.
+        let blob_listener = rt
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let blob_url = format!("http://{}", blob_listener.local_addr().unwrap());
         let kit = Marmot::new_with_options(
             dir.path().to_str().unwrap().into(),
             vec![url.clone()],
-            marmot_uniffi::RelayPolicyFfi::AllowLoopback,
+            marmot_uniffi::RelayPolicyFfi::AllowLoopbackRelaysAndBlobs,
             Some(Arc::new(Store::default())),
         )
         .unwrap();
@@ -296,7 +301,7 @@ mod tests {
         let reference = MediaAttachmentReferenceFfi {
             locators: vec![MediaLocatorFfi {
                 kind: "blossom-v1".into(),
-                value: format!("https://media.example/{}.bin", "11".repeat(32)),
+                value: format!("{blob_url}/{}.bin", "11".repeat(32)),
             }],
             ciphertext_sha256: "11".repeat(32),
             plaintext_sha256: "22".repeat(32),
@@ -609,7 +614,7 @@ mod tests {
                         vec![MediaAttachmentReferenceFfi {
                             locators: vec![MediaLocatorFfi {
                                 kind: "blossom-v1".into(),
-                                value: format!("https://media.example/{}.bin", "44".repeat(32)),
+                                value: format!("{blob_url}/{}.bin", "44".repeat(32)),
                             }],
                             ciphertext_sha256: "44".repeat(32),
                             plaintext_sha256: "55".repeat(32),
@@ -654,6 +659,136 @@ mod tests {
                 assert!((*initial).available && (*next).available);
                 marmot_attachment_management_snapshot_free(initial);
                 marmot_attachment_management_snapshot_free(next);
+            }
+        }
+        // Standalone paging and cloned handles must survive their original roots.
+        {
+            use crate::attachment_management::*;
+            let AttachmentPageReadFfi::Page { page } = client
+                .block_on(client.marmot.attachment_history_page(
+                    health_account.clone(),
+                    health_group.clone(),
+                    2,
+                    None,
+                ))
+                .unwrap()
+            else {
+                panic!("populated history")
+            };
+            assert_eq!(page.entries.len(), 2);
+            for entry in page.entries {
+                let MediaAttachmentOutcomeFfi::Accepted {
+                    attachment_index, ..
+                } = entry.attachment
+                else {
+                    panic!("test attachment must be accepted")
+                };
+                let reference = client
+                    .block_on(client.marmot.request_explicit_attachment(
+                        health_account.clone(),
+                        health_group.clone(),
+                        AttachmentLocalTargetFfi {
+                            message_id_hex: entry.message_id_hex,
+                            source_message_id_hex: entry.source_message_id_hex,
+                            attachment_index,
+                        },
+                    ))
+                    .unwrap()
+                    .expect("current source registers a job");
+                // Cancellation keeps a real non-ready job and avoids network completion.
+                let _ = client
+                    .block_on(client.marmot.control_attachment(
+                        health_account.clone(),
+                        reference,
+                        AttachmentControlFfi::Cancel,
+                    ))
+                    .unwrap();
+            }
+            let query = MarmotAttachmentJobQuery {
+                group_id_hex: group.as_ptr(),
+                view: MarmotAttachmentJobView::All as u32,
+                origin: MarmotAttachmentJobOrigin::Any as u32,
+            };
+            unsafe {
+                let mut snapshot = ptr::null_mut();
+                assert_eq!(
+                    marmot_attachment_management_snapshot(
+                        &client,
+                        account.as_ptr(),
+                        &query,
+                        &mut snapshot
+                    ),
+                    MarmotStatus::Ok
+                );
+                assert!((*snapshot).available && (*snapshot).page.entries_len >= 2);
+                let mut version = ptr::null_mut();
+                assert_eq!(
+                    marmot_attachment_management_version_clone((*snapshot).version, &mut version),
+                    MarmotStatus::Ok
+                );
+                let mut same = false;
+                assert_eq!(
+                    marmot_attachment_management_version_same_as(
+                        version,
+                        (*snapshot).version,
+                        &mut same
+                    ),
+                    MarmotStatus::Ok
+                );
+                assert!(same);
+                marmot_attachment_management_snapshot_free(snapshot);
+                // The clone retains an independent immutable generation after root free.
+                assert_eq!(
+                    marmot_attachment_management_version_same_as(version, version, &mut same),
+                    MarmotStatus::Ok
+                );
+                assert!(same);
+                marmot_attachment_management_version_free(version);
+
+                let mut first = ptr::null_mut();
+                assert_eq!(
+                    marmot_managed_attachment_page(
+                        &client,
+                        account.as_ptr(),
+                        &query,
+                        1,
+                        ptr::null(),
+                        &mut first
+                    ),
+                    MarmotStatus::Ok
+                );
+                assert_eq!((*first).entries_len, 1);
+                assert!(!(*first).next_cursor.is_null());
+                assert!(!(*(*first).entries).status.reference.is_null());
+                let first_reference =
+                    std::ffi::CStr::from_ptr((*(*first).entries).status.reference).to_owned();
+                let mut cursor = ptr::null_mut();
+                assert_eq!(
+                    marmot_attachment_job_cursor_clone((*first).next_cursor, &mut cursor),
+                    MarmotStatus::Ok
+                );
+                marmot_managed_attachment_page_free(first);
+                let mut second = ptr::null_mut();
+                assert_eq!(
+                    marmot_managed_attachment_page(
+                        &client,
+                        account.as_ptr(),
+                        &query,
+                        1,
+                        cursor,
+                        &mut second
+                    ),
+                    MarmotStatus::Ok
+                );
+                assert_eq!((*second).entries_len, 1);
+                assert!(!(*(*second).entries).status.reference.is_null());
+                assert_ne!(
+                    std::ffi::CStr::from_ptr((*(*second).entries).status.reference),
+                    first_reference.as_c_str(),
+                    "a cloned continuation must advance to another source slot"
+                );
+                marmot_attachment_job_cursor_free(cursor);
+                marmot_managed_attachment_page_free(second);
             }
         }
         client.block_on(client.marmot.shutdown_and_close()).unwrap();
