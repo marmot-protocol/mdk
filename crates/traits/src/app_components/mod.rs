@@ -111,10 +111,16 @@ pub const ACCOUNT_IDENTITY_PROOF_COMPONENT_ID: AppComponentId = 0x8009;
 pub const MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID: AppComponentId = 0x800a;
 pub const GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID: AppComponentId = 0x800b;
 pub const GROUP_LIFECYCLE_COMPONENT_ID: AppComponentId = 0x800c;
+/// Data-less marker selecting convergence policy v2 (spec
+/// `app-components/convergence-policy-v2.md`). Its state bytes are empty; a
+/// pass uses policy v2 when the policy-epoch GroupContext requires it. Once
+/// required it can never be removed or un-required. `0x800d`-`0x800f` are
+/// claimed by open spec drafts, hence the gap.
+pub const CONVERGENCE_POLICY_V2_COMPONENT_ID: AppComponentId = 0x8010;
 
 /// First component id applications may allocate for themselves.
 ///
-/// The protocol registry allocates upward from `0x8001` and is at `0x800c`
+/// The protocol registry allocates upward from `0x8001` and is at `0x8010`
 /// today, so "any private-use id the registry has not taken yet" is not a
 /// safe rule for applications: an id chosen that way can be assigned by a
 /// later registry entry, stranding state already committed in live groups.
@@ -155,6 +161,7 @@ pub const PROTOCOL_OWNED_APP_COMPONENT_IDS: &[AppComponentId] = &[
     MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID,
     GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
     GROUP_LIFECYCLE_COMPONENT_ID,
+    CONVERGENCE_POLICY_V2_COMPONENT_ID,
 ];
 
 /// Lookup key for the encrypted-media secret in the
@@ -178,6 +185,7 @@ pub const GROUP_ENCRYPTED_MEDIA_COMPONENT: &str = GROUP_ENCRYPTED_MEDIA_V1_COMPO
 pub const ACCOUNT_IDENTITY_PROOF_COMPONENT: &str = "marmot.member.account-identity-proof.v2";
 pub const GROUP_ENCRYPTED_MEDIA_V2_COMPONENT: &str = "marmot.group.encrypted-media.v2";
 pub const GROUP_LIFECYCLE_COMPONENT: &str = "marmot.group.lifecycle.v1";
+pub const CONVERGENCE_POLICY_V2_COMPONENT: &str = "marmot.group.convergence-policy.v2";
 pub const ENCRYPTED_MEDIA_FORMAT_V1: &str = "encrypted-media-v1";
 pub const ENCRYPTED_MEDIA_FORMAT_V2: &str = "encrypted-media-v2";
 pub const BLOSSOM_LOCATOR_KIND_V1: &str = "blossom-v1";

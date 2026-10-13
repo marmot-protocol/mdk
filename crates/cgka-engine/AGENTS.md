@@ -133,6 +133,16 @@ coordinator issues the durable `Unrecoverable` + `GroupEvent::GroupUnrecoverable
 branch selection, where valid branch depth outranks it. Tests: `tests/fork_detection.rs` and the simulator's
 route-equivalence family.
 
+**Convergence policy v2.** A pass uses `SelectionPolicy::V2` when the policy-epoch GroupContext requires
+`CONVERGENCE_POLICY_V2_COMPONENT_ID` (`0x8010`). It compares `protected_senders` first, counting only pass members'
+witnesses after the policy epoch. Derive the policy epoch only from shared replayed state
+(`openmls_projection::selection_policy_for_candidates`: highest epoch where every eligible candidate's
+`epoch_authenticators` agree). Never derive it from a candidate's `fork_epoch`, which is this device's replay start. v1
+callers keep `select_canonical_branch[_traced]`, and `protected_senders` is always 0 under v1, so v1 traces keep their
+six rules. `validate_convergence_policy_v2_transition` (staged-commit chokepoint) keeps the component non-removable,
+never un-required, empty, and present exactly when required. Tests: `tests/convergence_policy_v2.rs` (the mdk#2254
+incident shape, v1 vs v2) and `convergence::tests`.
+
 **Branch-relative peel.** Selection ranks on valid commit depth and app witnesses over *stored* inputs, and a group
 message is sealed under the sender's current-epoch exporter secret with no epoch hint. Without help, each branch's
 later traffic stays `PeelDeferred` on devices that adopted the other branch, contributes nothing, and the fork never

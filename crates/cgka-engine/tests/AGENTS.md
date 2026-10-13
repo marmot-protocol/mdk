@@ -56,6 +56,10 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 - **File:** `capabilities.rs`
   - **Owns:** `feature_status`, capability cache, capability matrix
 
+- **File:** `convergence_policy_v2.rs`
+  - **Owns:** Convergence policy v2 over real OpenMLS state: the mdk#2254 incident shape resolved by an observer under
+    v1 (rewinds) and v2 (keeps the witnessed branch), and the `0x8010` component guards
+
 - **File:** `component_activation.rs`
   - **Owns:** Enabling a component in an existing group: self-update leaf re-advertisement, all-leaves eligibility,
     admin-only automatic activation, `ActivateAppComponents` refusals and idempotence

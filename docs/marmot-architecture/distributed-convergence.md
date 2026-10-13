@@ -202,6 +202,28 @@ Branches are compared in this order:
 `valid_commit_depth` remains a score diagnostic and an input to effective depth. It has no separate comparison step:
 when effective depth and quorum status tie, raw depth is necessarily tied as well.
 
+### Policy v2
+
+A pass uses convergence policy v2 when the GroupContext at its policy epoch requires
+`marmot.group.convergence-policy.v2` (`0x8010`). The policy epoch is the latest state every eligible candidate shares.
+The engine finds it as the highest epoch at which every candidate's replay recorded the same state authenticator,
+because a candidate's `fork_epoch` here is the pass's replay start, which depends on what the device holds unresolved.
+The replay records the required-component list and member set at every epoch it materializes
+(`OpenMlsMaterializedCandidate::epoch_policy_facts`).
+
+Under v2:
+
+- **Witness counting.** Only witnesses from pass members count: account identities with a leaf in the policy-epoch
+  state. They must also be at epochs after the policy epoch. A member added on a branch cannot vote for it.
+- **`protected_senders`.** This is the number of distinct counted senders across the whole branch when it meets
+  quorum, and 0 otherwise. It is compared before rule 1 above. A witness-protected branch beats every branch that
+  isn't protected, and only a branch with more counted senders can replace it.
+- **Everything else is unchanged.** Rules 1–6 and every constant stay as in v1. Under v1, `protected_senders` is
+  always 0, so v1 ordering is unaffected.
+
+New groups require `0x8010` when every founding member supports it. Existing groups get it through automatic
+activation once every leaf advertises it (see `component_activation.rs`). It can never be removed or un-required.
+
 The conformance scenario
 `app_witness_score_beats_priority_after_depth_and_quorum_ties` pins the adjacency between rules 3 and 4.
 

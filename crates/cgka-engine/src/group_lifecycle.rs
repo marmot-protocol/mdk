@@ -251,6 +251,27 @@ impl<S: StorageProvider> Engine<S> {
         for component_id in &required_caps.app_components.ids {
             desired_components.insert(*component_id);
         }
+        // Automatic-mode components are required from creation when every
+        // founding member supports them, and are otherwise left to later
+        // activation (spec app-components/README.md, "Enabling a Component in
+        // an Existing Group"). They are negotiated, never mandatory, so an
+        // invitee on an older build still joins a group without them.
+        let mut initial_app_components = req.app_components.clone();
+        for component in &self.activatable_app_components {
+            if component.mode != cgka_traits::app_components::ComponentActivationMode::Automatic {
+                continue;
+            }
+            desired_components.insert(component.component_id);
+            if !initial_app_components
+                .iter()
+                .any(|initial| initial.component_id == component.component_id)
+            {
+                initial_app_components.push(cgka_traits::app_components::AppComponentData {
+                    component_id: component.component_id,
+                    data: component.initial_state.clone(),
+                });
+            }
+        }
         let mut self_supported_components = self.supported_app_components.clone();
         if self.new_protocol_profile == ProtocolProfile::Current {
             self_supported_components.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID);
@@ -394,7 +415,7 @@ impl<S: StorageProvider> Engine<S> {
                 name: req.name.clone(),
                 description: req.description.clone(),
                 admins: admin_set,
-                app_components: req.app_components.clone(),
+                app_components: initial_app_components,
                 optional_app_components,
             },
         )?;

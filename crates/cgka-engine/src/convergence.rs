@@ -71,6 +71,69 @@ impl ConvergencePolicy {
     }
 }
 
+/// Which convergence policy a pass uses (spec protocol-core/convergence.md,
+/// "Active policy"). Both policies share every [`ConvergencePolicy`] value;
+/// they differ in which witnesses count and in the comparison order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SelectionPolicy {
+    /// Commit depth first; every authenticated witness sender counts.
+    #[default]
+    V1,
+    /// Selected when the policy-epoch GroupContext requires
+    /// `marmot.group.convergence-policy.v2`. Only `pass_members` (account
+    /// identities with a leaf in the policy-epoch state) count, only at
+    /// epochs after `policy_epoch`, and `protected_senders` is compared first.
+    V2 {
+        policy_epoch: u64,
+        pass_members: BTreeSet<Vec<u8>>,
+    },
+}
+
+impl SelectionPolicy {
+    pub fn is_v2(&self) -> bool {
+        matches!(self, Self::V2 { .. })
+    }
+
+    /// The witnesses this policy counts for a candidate.
+    fn counted_witnesses<'a>(&self, witnesses: &'a [AppWitness]) -> Vec<&'a AppWitness> {
+        match self {
+            Self::V1 => witnesses.iter().collect(),
+            Self::V2 {
+                policy_epoch,
+                pass_members,
+            } => witnesses
+                .iter()
+                .filter(|witness| {
+                    witness.epoch > *policy_epoch && pass_members.contains(&witness.sender)
+                })
+                .collect(),
+        }
+    }
+}
+
+/// What the active-policy rule reads from one replayed epoch's state: whether
+/// its GroupContext requires `marmot.group.convergence-policy.v2`, and the
+/// account identities with a leaf in it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EpochPolicyFacts {
+    pub convergence_v2_required: bool,
+    pub members: BTreeSet<Vec<u8>>,
+}
+
+impl EpochPolicyFacts {
+    /// The policy a pass uses when this is its policy-epoch state.
+    pub fn selection_policy(&self, policy_epoch: u64) -> SelectionPolicy {
+        if self.convergence_v2_required {
+            SelectionPolicy::V2 {
+                policy_epoch,
+                pass_members: self.members.clone(),
+            }
+        } else {
+            SelectionPolicy::V1
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BranchCandidate {
     pub id: String,
@@ -83,15 +146,38 @@ pub struct BranchCandidate {
 }
 
 impl BranchCandidate {
+    /// Score under convergence policy v1.
     pub fn score(&self, policy: &ConvergencePolicy) -> BranchScore {
+        self.score_with(policy, &SelectionPolicy::V1)
+    }
+
+    pub fn score_with(
+        &self,
+        policy: &ConvergencePolicy,
+        selection: &SelectionPolicy,
+    ) -> BranchScore {
+        let witnesses = selection.counted_witnesses(&self.app_witnesses);
+        let quorum = witness_quorum_met(&witnesses, policy);
+        let valid_commit_depth = self.tip_epoch.saturating_sub(self.fork_epoch);
+        let protected_senders = if selection.is_v2() && quorum {
+            witnesses
+                .iter()
+                .map(|witness| witness.sender.as_slice())
+                .collect::<BTreeSet<_>>()
+                .len()
+        } else {
+            0
+        };
         BranchScore {
-            valid_commit_depth: self.tip_epoch.saturating_sub(self.fork_epoch),
-            effective_commit_depth: self
-                .tip_epoch
-                .saturating_sub(self.fork_epoch)
-                .saturating_add(witness_depth_boost(self, policy)),
-            witness_quorum_met: witness_quorum_met(&self.app_witnesses, policy),
-            app_witness_score: app_witness_score(&self.app_witnesses, policy),
+            protected_senders,
+            valid_commit_depth,
+            effective_commit_depth: valid_commit_depth.saturating_add(if quorum {
+                policy.max_witness_override_depth
+            } else {
+                0
+            }),
+            witness_quorum_met: quorum,
+            app_witness_score: app_witness_score(&witnesses, policy),
             tip_priority: self.tip_priority,
             tip_committer: self.tip_committer.clone(),
             tip_digest: self.tip_digest,
@@ -107,6 +193,10 @@ pub struct AppWitness {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BranchScore {
+    /// Policy v2 only: distinct counted senders over the whole branch when it
+    /// meets witness quorum, else 0. Always 0 under policy v1, so comparing
+    /// it first leaves v1 ordering unchanged.
+    pub protected_senders: usize,
     pub valid_commit_depth: u64,
     pub effective_commit_depth: u64,
     pub witness_quorum_met: bool,
@@ -124,20 +214,36 @@ pub fn is_branch_eligible(
     current_tip_epoch.saturating_sub(branch.fork_epoch) <= policy.max_rewind_commits
 }
 
+/// Select under convergence policy v1.
 pub fn select_canonical_branch<'a>(
     current_tip_epoch: u64,
     candidates: &'a [BranchCandidate],
     policy: &ConvergencePolicy,
 ) -> Option<&'a BranchCandidate> {
+    select_canonical_branch_with(current_tip_epoch, candidates, policy, &SelectionPolicy::V1)
+}
+
+pub fn select_canonical_branch_with<'a>(
+    current_tip_epoch: u64,
+    candidates: &'a [BranchCandidate],
+    policy: &ConvergencePolicy,
+    selection: &SelectionPolicy,
+) -> Option<&'a BranchCandidate> {
     candidates
         .iter()
         .filter(|candidate| is_branch_eligible(current_tip_epoch, candidate, policy))
-        .max_by(|a, b| compare_scores(&a.score(policy), &b.score(policy)))
+        .max_by(|a, b| {
+            compare_scores(
+                &a.score_with(policy, selection),
+                &b.score_with(policy, selection),
+            )
+        })
 }
 
 fn compare_scores(a: &BranchScore, b: &BranchScore) -> Ordering {
-    a.effective_commit_depth
-        .cmp(&b.effective_commit_depth)
+    a.protected_senders
+        .cmp(&b.protected_senders)
+        .then_with(|| a.effective_commit_depth.cmp(&b.effective_commit_depth))
         .then_with(|| a.witness_quorum_met.cmp(&b.witness_quorum_met))
         .then_with(|| a.app_witness_score.cmp(&b.app_witness_score))
         .then_with(|| b.tip_priority.cmp(&a.tip_priority))
@@ -192,10 +298,20 @@ pub struct BranchSelectionTrace {
 /// and eligibility, the ordered rule-by-rule comparison between the winner and
 /// the runner-up (marking the decisive rule), and the losing branches. The
 /// selection itself is identical to [`select_canonical_branch`].
+/// [`select_canonical_branch_traced_with`] under convergence policy v1.
 pub fn select_canonical_branch_traced(
     current_tip_epoch: u64,
     candidates: &[BranchCandidate],
     policy: &ConvergencePolicy,
+) -> BranchSelectionTrace {
+    select_canonical_branch_traced_with(current_tip_epoch, candidates, policy, &SelectionPolicy::V1)
+}
+
+pub fn select_canonical_branch_traced_with(
+    current_tip_epoch: u64,
+    candidates: &[BranchCandidate],
+    policy: &ConvergencePolicy,
+    selection: &SelectionPolicy,
 ) -> BranchSelectionTrace {
     // Order the trace by branch id so it is a pure function of the candidate
     // *set*: distributed convergence must be input-order independent, and the
@@ -227,12 +343,12 @@ pub fn select_canonical_branch_traced(
                 app_witnesses,
                 eligible,
                 rejection_reasons,
-                score: candidate.score(policy),
+                score: candidate.score_with(policy, selection),
             }
         })
         .collect();
 
-    let selected = select_canonical_branch(current_tip_epoch, candidates, policy);
+    let selected = select_canonical_branch_with(current_tip_epoch, candidates, policy, selection);
     let selected_branch_id = selected.map(|branch| branch.id.clone());
 
     let mut rule_trace = Vec::new();
@@ -245,13 +361,19 @@ pub fn select_canonical_branch_traced(
             .copied()
             .filter(|candidate| is_branch_eligible(current_tip_epoch, candidate, policy))
             .filter(|candidate| candidate.id != winner.id)
-            .max_by(|a, b| compare_scores(&a.score(policy), &b.score(policy)));
+            .max_by(|a, b| {
+                compare_scores(
+                    &a.score_with(policy, selection),
+                    &b.score_with(policy, selection),
+                )
+            });
         if let Some(other) = runner_up {
             rule_trace = build_rule_trace(
-                &winner.score(policy),
-                &other.score(policy),
+                &winner.score_with(policy, selection),
+                &other.score_with(policy, selection),
                 &winner.id,
                 &other.id,
+                selection,
             );
         }
     }
@@ -273,13 +395,23 @@ pub fn select_canonical_branch_traced(
 /// Walk the `compare_scores` rules in order between the winner and runner-up,
 /// recording each rule's values and marking the first differentiator decisive.
 /// The orderings mirror `compare_scores` exactly (the last three rules favour
-/// the lexicographically smaller value, hence `other.cmp(winner)`).
+/// the lexicographically smaller value, hence `other.cmp(winner)`). A policy v1
+/// trace omits `protected_senders`, which is always 0 there.
 fn build_rule_trace(
     winner: &BranchScore,
     other: &BranchScore,
     winner_id: &str,
     other_id: &str,
+    selection: &SelectionPolicy,
 ) -> Vec<RuleEvaluation> {
+    let protected = selection.is_v2().then(|| {
+        (
+            "protected_senders",
+            winner.protected_senders.cmp(&other.protected_senders),
+            winner.protected_senders.to_string(),
+            other.protected_senders.to_string(),
+        )
+    });
     let entries: [(&'static str, Ordering, String, String); 6] = [
         (
             "effective_commit_depth",
@@ -321,8 +453,9 @@ fn build_rule_trace(
         ),
     ];
     let mut decided = false;
-    entries
+    protected
         .into_iter()
+        .chain(entries)
         .map(|(rule_name, ordering, winner_value, other_value)| {
             let decisive = !decided && ordering != Ordering::Equal;
             if decisive {
@@ -340,15 +473,7 @@ fn build_rule_trace(
         .collect()
 }
 
-fn witness_depth_boost(branch: &BranchCandidate, policy: &ConvergencePolicy) -> u64 {
-    if witness_quorum_met(&branch.app_witnesses, policy) {
-        policy.max_witness_override_depth
-    } else {
-        0
-    }
-}
-
-fn witness_quorum_met(witnesses: &[AppWitness], policy: &ConvergencePolicy) -> bool {
+fn witness_quorum_met(witnesses: &[&AppWitness], policy: &ConvergencePolicy) -> bool {
     if policy.witness_quorum_senders_per_epoch == 0 || policy.witness_quorum_epochs == 0 {
         return false;
     }
@@ -359,14 +484,14 @@ fn witness_quorum_met(witnesses: &[AppWitness], policy: &ConvergencePolicy) -> b
         >= policy.witness_quorum_epochs
 }
 
-fn app_witness_score(witnesses: &[AppWitness], policy: &ConvergencePolicy) -> usize {
+fn app_witness_score(witnesses: &[&AppWitness], policy: &ConvergencePolicy) -> usize {
     witnesses_by_epoch(witnesses)
         .values()
         .map(|senders| senders.len().min(policy.witness_quorum_senders_per_epoch))
         .sum()
 }
 
-fn witnesses_by_epoch(witnesses: &[AppWitness]) -> BTreeMap<u64, BTreeSet<Vec<u8>>> {
+fn witnesses_by_epoch(witnesses: &[&AppWitness]) -> BTreeMap<u64, BTreeSet<Vec<u8>>> {
     let mut by_epoch: BTreeMap<u64, BTreeSet<Vec<u8>>> = BTreeMap::new();
     for witness in witnesses {
         by_epoch
@@ -375,4 +500,234 @@ fn witnesses_by_epoch(witnesses: &[AppWitness]) -> BTreeMap<u64, BTreeSet<Vec<u8
             .insert(witness.sender.clone());
     }
     by_epoch
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sender(name: &str) -> Vec<u8> {
+        name.as_bytes().to_vec()
+    }
+
+    fn witness(epoch: u64, name: &str) -> AppWitness {
+        AppWitness {
+            epoch,
+            sender: sender(name),
+        }
+    }
+
+    fn candidate(
+        id: &str,
+        fork_epoch: u64,
+        tip_epoch: u64,
+        witnesses: Vec<AppWitness>,
+    ) -> BranchCandidate {
+        BranchCandidate {
+            id: id.into(),
+            fork_epoch,
+            tip_epoch,
+            tip_priority: CommitOrderingPriority::Ordinary,
+            tip_committer: sender(id),
+            tip_digest: [0; 32],
+            app_witnesses: witnesses,
+        }
+    }
+
+    fn members(names: &[&str]) -> BTreeSet<Vec<u8>> {
+        names.iter().map(|name| sender(name)).collect()
+    }
+
+    fn v2(policy_epoch: u64, names: &[&str]) -> SelectionPolicy {
+        SelectionPolicy::V2 {
+            policy_epoch,
+            pass_members: members(names),
+        }
+    }
+
+    /// mdk#2254: a two-day branch (1 commit, 7 senders in one epoch) against
+    /// a stale branch (an admin Add from a device one epoch behind plus the
+    /// invitee's post-join commit, with 3 senders including the invitee).
+    fn incident() -> Vec<BranchCandidate> {
+        let weekend = candidate(
+            "weekend",
+            124,
+            125,
+            ["a", "b", "c", "d", "e", "f", "g"]
+                .iter()
+                .map(|name| witness(125, name))
+                .collect(),
+        );
+        let stale = candidate(
+            "stale",
+            124,
+            126,
+            vec![
+                witness(125, "admin"),
+                witness(126, "admin"),
+                witness(126, "invitee"),
+                witness(126, "c"),
+            ],
+        );
+        vec![weekend, stale]
+    }
+
+    const INCIDENT_MEMBERS: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "admin"];
+
+    #[test]
+    fn v1_rewinds_the_witnessed_branch_in_the_incident_shape() {
+        let candidates = incident();
+        let policy = ConvergencePolicy::default();
+        let selected = select_canonical_branch(126, &candidates, &policy).unwrap();
+        assert_eq!(selected.id, "stale");
+    }
+
+    #[test]
+    fn v2_keeps_the_branch_more_members_used() {
+        let candidates = incident();
+        let policy = ConvergencePolicy::default();
+        let selection = v2(124, &INCIDENT_MEMBERS);
+        let selected = select_canonical_branch_with(126, &candidates, &policy, &selection).unwrap();
+        assert_eq!(selected.id, "weekend");
+
+        let trace = select_canonical_branch_traced_with(126, &candidates, &policy, &selection);
+        assert_eq!(trace.selected_branch_id.as_deref(), Some("weekend"));
+        let decisive = trace.rule_trace.iter().find(|rule| rule.decisive).unwrap();
+        assert_eq!(decisive.rule_name, "protected_senders");
+        assert_eq!(decisive.winner_value, "7");
+        assert_eq!(
+            decisive.other_value, "2",
+            "the invitee joined on the stale branch and does not count"
+        );
+    }
+
+    #[test]
+    fn v2_ignores_senders_who_were_not_pass_members() {
+        // The challenger's only quorum comes from accounts added on its own
+        // branch, so it is not witness-protected and loses on protection.
+        let defender = candidate("defender", 10, 11, vec![witness(11, "a"), witness(11, "b")]);
+        let challenger = candidate(
+            "challenger",
+            10,
+            13,
+            vec![witness(11, "x"), witness(11, "y"), witness(12, "z")],
+        );
+        let candidates = vec![defender, challenger];
+        let policy = ConvergencePolicy::default();
+        let selection = v2(10, &["a", "b", "c"]);
+        let score = candidates[1].score_with(&policy, &selection);
+        assert_eq!(score.protected_senders, 0);
+        assert!(!score.witness_quorum_met);
+        assert_eq!(
+            select_canonical_branch_with(13, &candidates, &policy, &selection)
+                .unwrap()
+                .id,
+            "defender"
+        );
+        assert_eq!(
+            select_canonical_branch(13, &candidates, &policy)
+                .unwrap()
+                .id,
+            "challenger",
+            "v1 lets the deeper branch's own invitees out-vote the group"
+        );
+    }
+
+    #[test]
+    fn v2_ignores_witnesses_at_or_below_the_policy_epoch() {
+        // The device replayed from epoch 8, so both candidates carry shared
+        // history witnesses at epochs 9 and 10; the policy epoch is 10.
+        let shared = vec![witness(9, "a"), witness(9, "b"), witness(10, "c")];
+        let mut left = shared.clone();
+        left.extend([witness(11, "a")]);
+        let mut right = shared;
+        right.extend([witness(11, "b"), witness(11, "c")]);
+        let candidates = vec![
+            candidate("left", 8, 11, left),
+            candidate("right", 8, 11, right),
+        ];
+        let policy = ConvergencePolicy::default();
+        let selection = v2(10, &["a", "b", "c"]);
+        assert_eq!(
+            candidates[0]
+                .score_with(&policy, &selection)
+                .protected_senders,
+            0
+        );
+        assert_eq!(
+            candidates[1]
+                .score_with(&policy, &selection)
+                .protected_senders,
+            2
+        );
+        assert_eq!(
+            select_canonical_branch_with(11, &candidates, &policy, &selection)
+                .unwrap()
+                .id,
+            "right"
+        );
+    }
+
+    #[test]
+    fn v2_without_witnesses_orders_like_v1() {
+        let candidates = vec![
+            candidate("deep", 4, 7, vec![]),
+            candidate("shallow", 4, 5, vec![]),
+        ];
+        let policy = ConvergencePolicy::default();
+        let v1_choice = select_canonical_branch(7, &candidates, &policy).unwrap();
+        let v2_choice =
+            select_canonical_branch_with(7, &candidates, &policy, &v2(4, &["deep", "shallow"]))
+                .unwrap();
+        assert_eq!(v1_choice.id, "deep");
+        assert_eq!(v2_choice.id, v1_choice.id);
+    }
+
+    #[test]
+    fn only_a_v2_trace_lists_protected_senders() {
+        let candidates = incident();
+        let policy = ConvergencePolicy::default();
+        let v1_rules: Vec<_> = select_canonical_branch_traced(126, &candidates, &policy)
+            .rule_trace
+            .into_iter()
+            .map(|rule| rule.rule_name)
+            .collect();
+        assert_eq!(
+            v1_rules,
+            [
+                "effective_commit_depth",
+                "witness_quorum_met",
+                "app_witness_score",
+                "tip_priority",
+                "tip_committer",
+                "tip_digest"
+            ]
+        );
+        let v2_rules: Vec<_> = select_canonical_branch_traced_with(
+            126,
+            &candidates,
+            &policy,
+            &v2(124, &INCIDENT_MEMBERS),
+        )
+        .rule_trace
+        .into_iter()
+        .map(|rule| rule.rule_name)
+        .collect();
+        assert_eq!(v2_rules.first().copied(), Some("protected_senders"));
+        assert_eq!(&v2_rules[1..], v1_rules.as_slice());
+    }
+
+    #[test]
+    fn epoch_facts_select_v2_only_when_required() {
+        let facts = EpochPolicyFacts {
+            convergence_v2_required: false,
+            members: members(&["a"]),
+        };
+        assert_eq!(facts.selection_policy(3), SelectionPolicy::V1);
+        let facts = EpochPolicyFacts {
+            convergence_v2_required: true,
+            ..facts
+        };
+        assert_eq!(facts.selection_policy(3), v2(3, &["a"]));
+    }
 }

@@ -8,10 +8,13 @@ Verified against the adopted Marmot protocol at commit
    input alone starts another pass. It makes no administrative-progress
    guarantee while valid selection-relevant input, including self-updates,
    continues without bound.
-2. The active policy is the implicit mandatory convergence-v1 baseline. There
-   is deliberately no group field or negotiable local override for the current
-   values. Adding a component now would create migration and mixed-policy states
-   without enabling a supported policy choice.
+2. A group that does not require `marmot.group.convergence-policy.v2`
+   (`0x8010`) uses the implicit mandatory convergence-v1 baseline. There is
+   deliberately no group field or negotiable local override for the constants.
+   Policy v2 (marmot#438) is the first policy shipped under decision 3: a pass
+   uses it when the policy-epoch GroupContext requires `0x8010`. It reuses every
+   v1 constant and changes only which witnesses count and the comparison order
+   (`protected_senders` first).
 3. A future change to selection, eligibility, retention, witness scoring,
    admissible input, or bounded-pass lifecycle semantics requires a new required
    app component and capability. Clients may not infer it from software version.

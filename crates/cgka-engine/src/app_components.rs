@@ -4,17 +4,17 @@ use cgka_traits::agent_text_stream::AgentTextStreamQuicPolicyV1;
 use cgka_traits::app_components::AGENT_TEXT_STREAM_QUIC_COMPONENT_ID;
 use cgka_traits::app_components::{
     ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID, AppComponentData,
-    AppComponentId, AppComponentSet, GROUP_ADMIN_POLICY_COMPONENT_ID,
-    GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
-    GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
-    GROUP_LIFECYCLE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
-    GroupLifecycleV1, GroupProfileV1, MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID,
-    NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, PROTOCOL_OWNED_APP_COMPONENT_IDS,
-    SAFE_AAD_COMPONENT_ID, decode_components_list, decode_encrypted_media_policy_v1,
-    decode_encrypted_media_policy_v2, decode_group_avatar_url_v1, decode_group_blossom_image_v1,
-    decode_group_lifecycle_v1, decode_group_profile_v1, decode_nostr_routing_v1,
-    decode_quic_varint, encode_component_vectors, encode_components_list,
-    encode_group_lifecycle_v1, encode_group_profile_v1,
+    AppComponentId, AppComponentSet, CONVERGENCE_POLICY_V2_COMPONENT_ID,
+    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID, GROUP_LIFECYCLE_COMPONENT_ID,
+    GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, GroupLifecycleV1,
+    GroupProfileV1, MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID,
+    NostrRoutingV1, PROTOCOL_OWNED_APP_COMPONENT_IDS, SAFE_AAD_COMPONENT_ID,
+    decode_components_list, decode_encrypted_media_policy_v1, decode_encrypted_media_policy_v2,
+    decode_group_avatar_url_v1, decode_group_blossom_image_v1, decode_group_lifecycle_v1,
+    decode_group_profile_v1, decode_nostr_routing_v1, decode_quic_varint, encode_component_vectors,
+    encode_components_list, encode_group_lifecycle_v1, encode_group_profile_v1,
 };
 use cgka_traits::engine::CommitOrderingPriority;
 use cgka_traits::error::EngineError;
@@ -833,7 +833,62 @@ pub(crate) fn validate_current_profile_invariants_for_staged_commit(
         validate_current_profile_group_context(extensions, "resulting group state")?;
     let leaves = conceptual_resulting_leaves(group, staged, committer_index)?;
     validate_resulting_leaf_capabilities(leaves.iter(), extensions, &required_components)?;
-    validate_group_lifecycle_transition(group, staged, committer_index)
+    validate_group_lifecycle_transition(group, staged, committer_index)?;
+    validate_convergence_policy_v2_transition(group, staged)
+}
+
+/// `marmot.group.convergence-policy.v2` rules that span the parent and the
+/// resulting state (spec app-components/convergence-policy-v2.md): the entry
+/// is present exactly when the component is required, it is never
+/// un-required (there is no downgrade to policy v1), and once present no
+/// AppDataUpdate may target it. Its empty-bytes rule is per operation in
+/// [`validate_app_component_bytes`]; leaf support is the shared
+/// required-component check.
+fn validate_convergence_policy_v2_transition(
+    group: &MlsGroup,
+    staged: &StagedCommit,
+) -> Result<(), EngineError> {
+    let before_required =
+        required_app_components_of_group(group)?.contains(CONVERGENCE_POLICY_V2_COMPONENT_ID);
+    let before_present = app_component_bytes(group, CONVERGENCE_POLICY_V2_COMPONENT_ID).is_some();
+    let after_extensions = staged.group_context().extensions();
+    let after_required =
+        required_app_components_of_extensions(after_extensions, "resulting group state")?
+            .contains(CONVERGENCE_POLICY_V2_COMPONENT_ID);
+    let after_present = after_extensions
+        .app_data_dictionary()
+        .is_some_and(|dictionary| {
+            dictionary
+                .dictionary()
+                .get(&CONVERGENCE_POLICY_V2_COMPONENT_ID)
+                .is_some()
+        });
+
+    if before_required && !after_required {
+        return Err(EngineError::Other(
+            "commit is invalid: convergence-policy-v2 cannot be un-required".into(),
+        ));
+    }
+    if after_required != after_present {
+        return Err(EngineError::Other(
+            "commit is invalid: convergence-policy-v2 entry must be present exactly when required"
+                .into(),
+        ));
+    }
+    if before_present
+        && staged.queued_proposals().any(|queued| {
+            matches!(
+                queued.proposal(),
+                Proposal::AppDataUpdate(update)
+                    if update.component_id() == CONVERGENCE_POLICY_V2_COMPONENT_ID
+            )
+        })
+    {
+        return Err(EngineError::Other(
+            "commit is invalid: convergence-policy-v2 cannot be updated once present".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn lifecycle_from_extensions(
@@ -1666,6 +1721,9 @@ fn validate_app_component_bytes(
                     EngineError::Serialize(format!("invalid group lifecycle component: {error}"))
                 })
         }
+        CONVERGENCE_POLICY_V2_COMPONENT_ID if !data.is_empty() => Err(EngineError::Serialize(
+            "convergence-policy-v2 state must be empty".into(),
+        )),
         _ => Ok(()),
     }
 }
@@ -1770,6 +1828,11 @@ fn validate_app_component_remove_against(
     if component_id == GROUP_LIFECYCLE_COMPONENT_ID {
         return Err(EngineError::Other(
             "group lifecycle component cannot be removed".into(),
+        ));
+    }
+    if component_id == CONVERGENCE_POLICY_V2_COMPONENT_ID {
+        return Err(EngineError::Other(
+            "convergence-policy-v2 component cannot be removed".into(),
         ));
     }
     if resulting_required.contains(component_id) {

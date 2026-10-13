@@ -89,6 +89,10 @@ pub struct OpenMlsMaterializedCandidate {
     /// this branch. Locally authored applications use it to prove which
     /// candidate state encrypted their otherwise undecryptable own ciphertext.
     pub epoch_authenticators: BTreeMap<u64, String>,
+    /// Active-policy inputs at every epoch materialized while replaying this
+    /// branch, keyed like `epoch_authenticators`. The pass reads the entry at
+    /// its policy epoch ([`selection_policy_for_candidates`]).
+    pub epoch_policy_facts: BTreeMap<u64, crate::convergence::EpochPolicyFacts>,
 }
 
 impl OpenMlsMaterializedCandidate {
@@ -347,6 +351,7 @@ struct OpenMlsReplayOutput {
     final_epoch: u64,
     final_members: Vec<Member>,
     epoch_authenticators: BTreeMap<u64, String>,
+    epoch_policy_facts: BTreeMap<u64, crate::convergence::EpochPolicyFacts>,
 }
 
 /// Presentation output stays private; public replay observations retain their API.
@@ -1150,6 +1155,7 @@ fn materialize_openmls_candidate_paths_budgeted<S: StorageProvider>(
             consumed_proposal_refs,
             observations,
             epoch_authenticators: replay.epoch_authenticators,
+            epoch_policy_facts: replay.epoch_policy_facts,
         });
     }
     candidates.sort_by(|a, b| a.branch_id.cmp(&b.branch_id));
@@ -1254,11 +1260,17 @@ fn canonicalize_openmls_batch_with_materialized(
         admit_app_witnesses,
         "production canonicalization must admit application witnesses"
     );
+    let selection = selection_policy_for_candidates(
+        &materialized,
+        input.state.current_tip_epoch,
+        &input.policy.convergence,
+    );
     Ok(crate::canonicalization::canonicalize_with_shared_seen(
         input,
         shared_seen_message_ids.as_ref(),
         materialized_candidates,
         admit_app_witnesses,
+        &selection,
     ))
 }
 
@@ -3901,6 +3913,10 @@ fn process_openmls_messages_inner<S: StorageProvider>(
         mls_group.epoch().as_u64(),
         own_commit_post_merge_epoch_authenticator(&mls_group),
     )]);
+    let mut epoch_policy_facts = BTreeMap::from([(
+        mls_group.epoch().as_u64(),
+        epoch_policy_facts_of(&mls_group)?,
+    )]);
     // An own commit is pre-validated only while every commit replayed before
     // it was canonical (`Processed`): it was created from the canonical state
     // at its source epoch, so on a diverging prefix its anchor state would
@@ -3981,6 +3997,10 @@ fn process_openmls_messages_inner<S: StorageProvider>(
             epoch_authenticators.insert(
                 mls_group.epoch().as_u64(),
                 own_commit_post_merge_epoch_authenticator(&mls_group),
+            );
+            epoch_policy_facts.insert(
+                mls_group.epoch().as_u64(),
+                epoch_policy_facts_of(&mls_group)?,
             );
             observations.push(OpenMlsReplayObservation::CommitStaged {
                 message_id,
@@ -4288,6 +4308,10 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     mls_group.epoch().as_u64(),
                     own_commit_post_merge_epoch_authenticator(&mls_group),
                 );
+                epoch_policy_facts.insert(
+                    mls_group.epoch().as_u64(),
+                    epoch_policy_facts_of(&mls_group)?,
+                );
                 crate::app_components::validate_current_profile_group_invariants(&mls_group)
                     .map_err(|error| OpenMlsProjectionError::InvalidCommit {
                         message_id,
@@ -4305,6 +4329,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         final_epoch: mls_group.epoch().as_u64(),
                         final_members: marmot_members(&mls_group),
                         epoch_authenticators: BTreeMap::new(),
+                        epoch_policy_facts: BTreeMap::new(),
                     };
                     update_group_record_from_replay(storage, group_id, &intermediate)?;
                     retain_current_group_epoch_snapshot(
@@ -4422,7 +4447,73 @@ fn process_openmls_messages_inner<S: StorageProvider>(
         final_epoch: mls_group.epoch().as_u64(),
         final_members: marmot_members(&mls_group),
         epoch_authenticators,
+        epoch_policy_facts,
     })
+}
+
+/// The active-policy inputs of one replayed state (spec convergence.md,
+/// "Active policy" and "App-payload witnesses").
+fn epoch_policy_facts_of(
+    group: &MlsGroup,
+) -> Result<crate::convergence::EpochPolicyFacts, OpenMlsProjectionError> {
+    let required = crate::app_components::required_app_components_of_group(group)
+        .map_err(|error| OpenMlsProjectionError::Replay(format!("policy facts: {error}")))?;
+    Ok(crate::convergence::EpochPolicyFacts {
+        convergence_v2_required: required
+            .contains(cgka_traits::app_components::CONVERGENCE_POLICY_V2_COMPONENT_ID),
+        members: crate::app_components::member_account_pubkeys(group)
+            .into_iter()
+            .map(|account| account.to_vec())
+            .collect(),
+    })
+}
+
+/// The convergence policy a pass over `candidates` uses.
+///
+/// The policy epoch is the latest epoch every eligible candidate shares, found
+/// as the highest epoch at which all of them recorded the same authenticated
+/// state. A candidate's `fork_epoch` here is the pass's replay start, which
+/// depends on what this device holds unresolved, so it cannot stand in for
+/// the shared state. Fewer than two eligible candidates select nothing
+/// contested, and the pass keeps policy v1.
+pub(crate) fn selection_policy_for_candidates(
+    candidates: &[OpenMlsMaterializedCandidate],
+    current_tip_epoch: u64,
+    policy: &crate::convergence::ConvergencePolicy,
+) -> crate::convergence::SelectionPolicy {
+    let eligible: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| {
+            crate::convergence::is_branch_eligible(
+                current_tip_epoch,
+                &candidate.branch_candidate(),
+                policy,
+            )
+        })
+        .collect();
+    let [first, rest @ ..] = eligible.as_slice() else {
+        return crate::convergence::SelectionPolicy::V1;
+    };
+    if rest.is_empty() {
+        return crate::convergence::SelectionPolicy::V1;
+    }
+    let Some(policy_epoch) = first
+        .epoch_authenticators
+        .iter()
+        .rev()
+        .find(|(epoch, authenticator)| {
+            rest.iter()
+                .all(|other| other.epoch_authenticators.get(*epoch) == Some(*authenticator))
+        })
+        .map(|(epoch, _)| *epoch)
+    else {
+        return crate::convergence::SelectionPolicy::V1;
+    };
+    first
+        .epoch_policy_facts
+        .get(&policy_epoch)
+        .map(|facts| facts.selection_policy(policy_epoch))
+        .unwrap_or_default()
 }
 
 fn marmot_members(group: &MlsGroup) -> Vec<Member> {

@@ -5,13 +5,14 @@ use cgka_conformance_simulator::canonicalization::{
     DroppedMessageReason, PeeledMessage, PeeledMessageKind, canonicalize,
 };
 use cgka_conformance_simulator::convergence::{
-    AppWitness, BranchCandidate, ConvergencePolicy, select_canonical_branch,
+    AppWitness, BranchCandidate, ConvergencePolicy, SelectionPolicy, select_canonical_branch,
+    select_canonical_branch_with,
 };
 use cgka_conformance_simulator::policy_cases::parse_policy_cases;
 use cgka_conformance_simulator::reference_convergence::{
     ReferenceAppMessage, ReferenceCandidate, ReferenceCommit, ReferenceDisposition, ReferenceInput,
-    ReferencePolicy, ReferencePriority, ReferenceProposal, ReferenceWitness, WitnessMode, evaluate,
-    select,
+    ReferencePolicy, ReferencePriority, ReferenceProposal, ReferenceV2Pass, ReferenceWitness,
+    WitnessMode, evaluate, select, select_v2,
 };
 use cgka_traits::engine::CommitOrderingPriority;
 use proptest::prelude::*;
@@ -450,6 +451,57 @@ proptest! {
             "selector drift at current_tip={}, policy={:?}, candidates={:?}",
             current_tip,
             policy,
+            candidates
+        );
+    }
+
+    #[test]
+    fn small_shrinkable_v2_selector_inputs_match_independent_model(
+        current_tip in 0u64..9,
+        policy_epoch in 0u64..4,
+        depth_a in 1u64..5,
+        depth_b in 1u64..5,
+        privileged_a in any::<bool>(),
+        privileged_b in any::<bool>(),
+        committer_a in 0u8..4,
+        committer_b in 0u8..4,
+        witnesses_a in arb_witnesses(),
+        witnesses_b in arb_witnesses(),
+        members in proptest::collection::btree_set(0u8..4, 0..4),
+    ) {
+        // Both candidates fork at the policy epoch, as in the engine path; the
+        // member set and the epoch filter vary independently of the witnesses.
+        let policy = ConvergencePolicy::default();
+        let pass_members: BTreeSet<Vec<u8>> = members.into_iter().map(|member| vec![member]).collect();
+        let candidates = vec![
+            BranchCandidate {
+                id: "a".into(), fork_epoch: policy_epoch, tip_epoch: policy_epoch + depth_a,
+                tip_priority: if privileged_a { CommitOrderingPriority::Privileged } else { CommitOrderingPriority::Ordinary },
+                tip_committer: vec![committer_a], tip_digest: [0; 32], app_witnesses: witnesses_a,
+            },
+            BranchCandidate {
+                id: "b".into(), fork_epoch: policy_epoch, tip_epoch: policy_epoch + depth_b,
+                tip_priority: if privileged_b { CommitOrderingPriority::Privileged } else { CommitOrderingPriority::Ordinary },
+                tip_committer: vec![committer_b], tip_digest: [1; 32], app_witnesses: witnesses_b,
+            },
+        ];
+        let selection = SelectionPolicy::V2 { policy_epoch, pass_members: pass_members.clone() };
+        let reference: Vec<ReferenceCandidate> = candidates.iter().map(reference_candidate).collect();
+        let reference_refs: Vec<&ReferenceCandidate> = reference.iter().collect();
+        let production = select_canonical_branch_with(current_tip, &candidates, &policy, &selection)
+            .map(|c| c.id.as_str());
+        let model = select_v2(
+            current_tip,
+            &reference_refs,
+            &reference_policy(&policy),
+            &ReferenceV2Pass { policy_epoch, pass_members },
+        )
+        .map(|c| c.id.as_str());
+        prop_assert!(
+            model == production,
+            "v2 selector drift at current_tip={}, policy_epoch={}, candidates={:?}",
+            current_tip,
+            policy_epoch,
             candidates
         );
     }

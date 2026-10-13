@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use crate::convergence::{
     AppWitness, BranchCandidate, BranchSelectionTrace, ConvergencePolicy, ConvergencePolicyError,
-    is_branch_eligible, select_canonical_branch, select_canonical_branch_traced,
+    SelectionPolicy, is_branch_eligible, select_canonical_branch_traced_with,
+    select_canonical_branch_with,
 };
 use cgka_traits::engine::CommitOrderingPriority;
 use serde::{Deserialize, Serialize};
@@ -326,14 +327,29 @@ pub enum CanonicalizationError {
 }
 
 pub fn canonicalize(input: CanonicalizationInput) -> CanonicalizationResult {
-    canonicalize_internal(input, &[], true, None)
+    canonicalize_internal(input, &[], true, None, &SelectionPolicy::V1)
 }
 
 pub fn canonicalize_with_materialized_candidates(
     input: CanonicalizationInput,
     materialized_candidates: Vec<MaterializedCandidate>,
 ) -> CanonicalizationResult {
-    canonicalize_internal(input, &materialized_candidates, true, None)
+    canonicalize_with_materialized_candidates_and_selection(
+        input,
+        materialized_candidates,
+        &SelectionPolicy::V1,
+    )
+}
+
+/// [`canonicalize_with_materialized_candidates`] under an explicit
+/// convergence policy. The engine derives `selection` from the policy-epoch
+/// state; model callers supply it directly.
+pub fn canonicalize_with_materialized_candidates_and_selection(
+    input: CanonicalizationInput,
+    materialized_candidates: Vec<MaterializedCandidate>,
+    selection: &SelectionPolicy,
+) -> CanonicalizationResult {
+    canonicalize_internal(input, &materialized_candidates, true, None, selection)
 }
 
 /// Crate-private entry for the engine's stored-message convergence path: the
@@ -347,12 +363,14 @@ pub(crate) fn canonicalize_with_shared_seen(
     shared_seen_message_ids: Option<&Arc<BTreeSet<String>>>,
     materialized_candidates: Vec<MaterializedCandidate>,
     admit_app_witnesses: bool,
+    selection: &SelectionPolicy,
 ) -> CanonicalizationResult {
     canonicalize_internal(
         input,
         &materialized_candidates,
         admit_app_witnesses,
         shared_seen_message_ids.map(Arc::as_ref),
+        selection,
     )
 }
 
@@ -366,6 +384,7 @@ fn canonicalize_internal(
     materialized_candidates: &[MaterializedCandidate],
     admit_app_witnesses: bool,
     shared_seen_message_ids: Option<&BTreeSet<String>>,
+    selection: &SelectionPolicy,
 ) -> CanonicalizationResult {
     let mut already_seen = Vec::new();
     // Dedup against the base sets by lookup; only ids first observed in this
@@ -406,15 +425,17 @@ fn canonicalize_internal(
     if admit_app_witnesses {
         attach_app_witnesses(&mut materialized_graph, &unique_messages, &input.policy);
     }
-    let selected_branch = select_canonical_branch(
+    let selected_branch = select_canonical_branch_with(
         input.state.current_tip_epoch,
         &materialized_graph.candidates,
         &input.policy.convergence,
+        selection,
     );
-    let selection_trace = Some(select_canonical_branch_traced(
+    let selection_trace = Some(select_canonical_branch_traced_with(
         input.state.current_tip_epoch,
         &materialized_graph.candidates,
         &input.policy.convergence,
+        selection,
     ));
     let candidate_count = materialized_graph.candidates.len();
     let eligible_count = materialized_graph

@@ -537,6 +537,75 @@ pub fn select<'a>(
         .max_by(|a, b| compare(&score(a, policy), &score(b, policy)))
 }
 
+/// Convergence policy v2 inputs for one pass (spec convergence.md, "Active
+/// policy"): the shared policy epoch and the account identities with a leaf in
+/// that state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceV2Pass {
+    pub policy_epoch: u64,
+    pub pass_members: BTreeSet<Vec<u8>>,
+}
+
+/// Policy v2 score: `protected_senders` first, then the v1 score computed over
+/// counted witnesses only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceV2Score {
+    pub protected_senders: usize,
+    pub rest: ReferenceScore,
+}
+
+pub fn score_v2(
+    candidate: &ReferenceCandidate,
+    policy: &ReferencePolicy,
+    pass: &ReferenceV2Pass,
+) -> ReferenceV2Score {
+    let counted = ReferenceCandidate {
+        app_witnesses: candidate
+            .app_witnesses
+            .iter()
+            .filter(|witness| {
+                witness.epoch > pass.policy_epoch && pass.pass_members.contains(&witness.sender)
+            })
+            .cloned()
+            .collect(),
+        ..candidate.clone()
+    };
+    let rest = score(&counted, policy);
+    let protected_senders = if rest.witness_quorum_met {
+        counted
+            .app_witnesses
+            .iter()
+            .map(|witness| witness.sender.as_slice())
+            .collect::<BTreeSet<_>>()
+            .len()
+    } else {
+        0
+    };
+    ReferenceV2Score {
+        protected_senders,
+        rest,
+    }
+}
+
+pub fn select_v2<'a>(
+    current_tip_epoch: u64,
+    candidates: &'a [&ReferenceCandidate],
+    policy: &ReferencePolicy,
+    pass: &ReferenceV2Pass,
+) -> Option<&'a ReferenceCandidate> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|candidate| eligible(current_tip_epoch, candidate, policy))
+        .max_by(|a, b| {
+            let a = score_v2(a, policy, pass);
+            let b = score_v2(b, policy, pass);
+            a.protected_senders
+                .cmp(&b.protected_senders)
+                .then_with(|| compare(&a.rest, &b.rest))
+        })
+}
+
 fn eligible(current_tip: u64, candidate: &ReferenceCandidate, policy: &ReferencePolicy) -> bool {
     current_tip.saturating_sub(candidate.fork_epoch) <= policy.max_rewind_commits
 }

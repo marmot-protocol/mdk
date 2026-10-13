@@ -4526,7 +4526,8 @@ impl MarmotApp {
         )
         .account_identity_proof_signer(signer.as_proof_signer())
         .feature_registry(app_feature_registry())
-        .supported_app_components(self.supported_app_component_ids());
+        .supported_app_components(self.supported_app_component_ids())
+        .activatable_app_components(activatable_app_components());
         if defer_group_hydration {
             session_config = session_config.defer_group_hydration();
         }
@@ -7264,6 +7265,7 @@ impl MarmotApp {
         // negotiation: each group's required component id selects exactly one.
         components.insert(GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID);
         components.insert(GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID);
+        components.insert(cgka_traits::app_components::CONVERGENCE_POLICY_V2_COMPONENT_ID);
         components.into_iter().collect()
     }
 
@@ -7350,6 +7352,17 @@ fn dev_maintenance_timing(config: &MarmotAppConfig) -> Option<MaintenanceTiming>
         );
         None
     }
+}
+
+/// Components existing groups start requiring once every member supports them.
+/// Convergence policy v2 activates automatically: it changes only how clients
+/// choose between forked branches, so it needs no admin decision.
+fn activatable_app_components() -> Vec<cgka_traits::app_components::ActivatableAppComponent> {
+    vec![cgka_traits::app_components::ActivatableAppComponent {
+        component_id: cgka_traits::app_components::CONVERGENCE_POLICY_V2_COMPONENT_ID,
+        initial_state: Vec::new(),
+        mode: cgka_traits::app_components::ComponentActivationMode::Automatic,
+    }]
 }
 
 fn app_feature_registry() -> FeatureRegistry {
