@@ -1074,12 +1074,15 @@ impl<S: StorageProvider> Engine<S> {
         let settled = self
             .advance_convergence_inputs_with_deadline(group_id, now_ms, deadline)
             .await?;
-        // Inbound input settled above. A held group authors nothing new: its
-        // queued intents, pending disband and SelfRemove wait for the release.
-        if !settled || self.commits_held(group_id) {
+        if !settled {
             return Ok(Vec::new());
         }
-        if let Some(result) = self.prepare_pending_disband(group_id).await? {
+        // Inbound input settled above. A held group authors no new commit: its
+        // pending disband, queued commit intents (and anything queued behind
+        // them) and SelfRemove wait for the release. A queued leave is a
+        // proposal, not a commit, so it still drains.
+        let held = self.commits_held(group_id);
+        if !held && let Some(result) = self.prepare_pending_disband(group_id).await? {
             return Ok(vec![result]);
         }
 
@@ -1099,6 +1102,9 @@ impl<S: StorageProvider> Engine<S> {
             return Ok(Vec::new());
         }
         for record in queued {
+            if held && !matches!(record.intent, SendIntent::Leave { .. }) {
+                break;
+            }
             // A regenerated intent the host has not yet confirmed or retired
             // is still the host's obligation: re-preparing it would publish
             // the same logical message twice (mdk#1472).
@@ -1342,9 +1348,6 @@ impl<S: StorageProvider> Engine<S> {
             AdvanceConvergenceStatus::ForegroundBudgetExhausted => {
                 return Ok(Some(OutboundQueueReason::ForegroundBudgetExhausted));
             }
-        }
-        if self.commits_held(group_id) {
-            return Ok(None);
         }
         self.stage_due_self_remove_auto_commit(group_id, now_ms)
             .await

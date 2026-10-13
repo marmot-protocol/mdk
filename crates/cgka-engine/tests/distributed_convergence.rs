@@ -9767,6 +9767,84 @@ async fn commit_hold_keeps_queued_commit_intents_queued_until_released() {
     assert_eq!(drained.len(), 1, "{drained:?}");
 }
 
+/// mdk#2258: a queued leave is a SelfRemove proposal, not a commit, so it
+/// still drains while the host holds the group's commits.
+#[tokio::test]
+async fn commit_hold_still_drains_a_queued_leave_proposal() {
+    let (mut alice, _alice_storage) = build_client(b"alice");
+    let (mut bob, _bob_storage) = build_client(b"bob");
+    let (mut carol, carol_storage) = build_client(b"carol");
+    let (mut david, _david_storage) = build_client(b"david");
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "held queued leave".into(),
+            description: "".into(),
+            members: vec![bob_kp, carol_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let (pending, welcomes) = match create {
+        SendResult::GroupCreated { pending, welcomes } => (pending, welcomes),
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"carol"))
+        .await
+        .unwrap();
+
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![david_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let (commit, _pending) = evolution(invite);
+    let commit = route(commit, &group_id);
+    assert!(matches!(
+        carol.ingest(commit.clone()).await.unwrap(),
+        cgka_traits::ingest::IngestOutcome::Buffered { .. }
+    ));
+    assert!(matches!(
+        carol
+            .send(SendIntent::Leave {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap(),
+        SendResult::Queued { .. }
+    ));
+    carol
+        .set_convergence_policy(CanonicalizationPolicy {
+            settlement_quiescence_ms: 0,
+            ..CanonicalizationPolicy::default()
+        })
+        .expect("convergence policy accepted");
+
+    let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let hold = held.clone();
+    carol.set_commit_hold(Some(std::sync::Arc::new(move |_, _| {
+        hold.load(std::sync::atomic::Ordering::SeqCst)
+    })));
+    let drained = carol.advance_convergence(&group_id).await.unwrap();
+    assert!(
+        matches!(drained.as_slice(), [SendResult::Proposal { .. }]),
+        "{drained:?}"
+    );
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(2));
+    assert_message_state(&carol_storage, &commit, MessageState::Processed);
+    assert!(held.load(std::sync::atomic::Ordering::SeqCst));
+}
+
 #[tokio::test]
 async fn trait_advance_convergence_drains_queued_outbound_intent() {
     let (mut alice, _alice_storage) = build_client(b"alice");

@@ -1677,6 +1677,10 @@ impl<S: StorageProvider> Engine<S> {
             self.drop_self_remove_auto_commit_schedules_for_group(group_id);
             return Ok(false);
         }
+        // A held group keeps its schedule; the commit waits for the release.
+        if self.commits_held(group_id) {
+            return Ok(false);
+        }
         if let Some(state) = self.epoch_manager.state(group_id)
             && !state.is_stable()
         {

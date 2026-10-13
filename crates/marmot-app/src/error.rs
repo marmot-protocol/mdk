@@ -162,8 +162,9 @@ pub enum AppError {
     GroupRemoved(String),
     /// The group moved past this device's local epoch and recovery has not
     /// caught it up yet. A commit authored now would fork the group
-    /// (mdk#2258), so group changes wait. Retryable once the group syncs, or
-    /// once the user dismisses the group's history notice.
+    /// (mdk#2258), so group changes wait. Retryable once recovery clears the
+    /// gap or the local epoch moves past it; dismissing the group's history
+    /// notice does not release it.
     #[error("group is still catching up on missed changes; try again once it has synced")]
     GroupCatchingUp(String),
     /// Host-supplied draft attachment metadata failed validation before storage.
