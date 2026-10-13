@@ -418,6 +418,8 @@ mod tests {
                 }
             }
         }
+        let health_account = account.clone();
+        let health_group = group.clone();
         let account = CString::new(account).unwrap();
         let group = CString::new(group).unwrap();
         unsafe {
@@ -553,6 +555,106 @@ mod tests {
                 },
             });
             free_boxed(boxed(rejected));
+        }
+        // Exercise health observation through the public ABI, not just DTO conversion.
+        {
+            use crate::attachment_management::*;
+            use crate::subscriptions::attachment_management::*;
+            let account_ref = CString::new(health_account.clone()).unwrap();
+            let group_ref = CString::new(health_group.clone()).unwrap();
+            let query = MarmotAttachmentJobQuery {
+                group_id_hex: group_ref.as_ptr(),
+                view: MarmotAttachmentJobView::All as u32,
+                origin: MarmotAttachmentJobOrigin::Any as u32,
+            };
+            unsafe {
+                let mut sub = ptr::null_mut();
+                assert_eq!(
+                    marmot_subscribe_attachment_management(
+                        &client,
+                        account_ref.as_ptr(),
+                        &query,
+                        &mut sub
+                    ),
+                    MarmotStatus::Ok
+                );
+                let mut initial = ptr::null_mut();
+                // Invalid output must not dequeue the initial item.
+                assert_eq!(
+                    marmot_attachment_management_subscription_next(sub, 10, ptr::null_mut()),
+                    MarmotStatus::NullPointer
+                );
+                assert_eq!(
+                    marmot_attachment_management_subscription_next(sub, 5000, &mut initial),
+                    MarmotStatus::Ok
+                );
+                assert!(!initial.is_null());
+                assert!((*initial).available);
+                assert!((*initial).has_automatic_recovery_failed);
+                assert!(!(*initial).automatic_recovery_failed);
+                let mut next = initial;
+                assert_eq!(
+                    marmot_attachment_management_subscription_next(sub, 20, &mut next),
+                    MarmotStatus::Timeout
+                );
+                assert!(
+                    next.is_null(),
+                    "timeout clears output and preserves observation"
+                );
+                // A real source revision produces a replacement after the coalescing window.
+                client
+                    .block_on(client.marmot.send_media_attachments(
+                        health_account.clone(),
+                        health_group.clone(),
+                        vec![MediaAttachmentReferenceFfi {
+                            locators: vec![MediaLocatorFfi {
+                                kind: "blossom-v1".into(),
+                                value: format!("https://media.example/{}.bin", "44".repeat(32)),
+                            }],
+                            ciphertext_sha256: "44".repeat(32),
+                            plaintext_sha256: "55".repeat(32),
+                            nonce_hex: "66".repeat(12),
+                            file_name: "replacement.png".into(),
+                            media_type: "image/png".into(),
+                            version: EncryptedMediaVersionFfi::V2,
+                            source_epoch: 0,
+                            dim: None,
+                            thumbhash: None,
+                        }],
+                        None,
+                    ))
+                    .unwrap();
+                assert_eq!(
+                    marmot_attachment_management_subscription_next(sub, 5000, &mut next),
+                    MarmotStatus::Ok
+                );
+                assert!(!next.is_null());
+                let mut same = true;
+                assert_eq!(
+                    marmot_attachment_management_version_same_as(
+                        (*next).version,
+                        (*initial).version,
+                        &mut same
+                    ),
+                    MarmotStatus::Ok
+                );
+                assert!(!same, "source change must replace the observed generation");
+                assert_eq!(
+                    marmot_attachment_management_subscription_cancel(sub),
+                    MarmotStatus::Ok
+                );
+                let mut closed = initial;
+                assert_eq!(
+                    marmot_attachment_management_subscription_next(sub, 5000, &mut closed),
+                    MarmotStatus::Closed
+                );
+                assert!(closed.is_null());
+                marmot_attachment_management_subscription_free(sub);
+                // Returned roots outlive the subscription and remain independently owned.
+                assert!((*initial).available && (*next).available);
+                marmot_attachment_management_snapshot_free(initial);
+                marmot_attachment_management_snapshot_free(next);
+            }
         }
         client.block_on(client.marmot.shutdown_and_close()).unwrap();
         #[cfg(feature = "alloc-audit")]

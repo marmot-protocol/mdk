@@ -469,7 +469,7 @@ diff-gates the checked-in header.
 
 ## Download management and chat health
 
-Use the [per-chat health contract](../marmot-uniffi/ATTACHMENT-MANAGEMENT.md) for per-chat transfer visibility, explicit partial totals and independently observed recovery health. Replacement feeds use existing native invalidations with no idle polling. Queries and embedded handles are borrowed; C results have deep-free roots and independently cloneable continuations and versions.
+Use the [per-chat health contract](../marmot-uniffi/ATTACHMENT-MANAGEMENT.md) for per-chat transfer visibility, explicit partial totals and independently observed recovery health. Replacement feeds use existing native invalidations with no idle polling. Queries and embedded handles are borrowed; C results have deep-free roots and independently cloneable continuations and versions. `has_automatic_recovery_failed` preserves the optional observation: when false, `automatic_recovery_failed` is unspecified. An unavailable chat has no recovery assertion.
 
 ## Account attachment history
 

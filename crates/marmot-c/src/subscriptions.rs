@@ -1380,4 +1380,4 @@ pub unsafe extern "C" fn marmot_block_list_subscription_snapshot(
     })
 }
 
-mod attachment_management;
+pub(crate) mod attachment_management;
