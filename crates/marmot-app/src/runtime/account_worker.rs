@@ -6139,13 +6139,12 @@ async fn publish_next_local_submission(
             if let Some((deadline, _)) = client
                 .local_edit_lookup_retries
                 .get(&candidate.group_id_hex)
+                && *deadline > now
             {
-                if *deadline > now {
-                    let delay = deadline.duration_since(now);
-                    retry_after = Some(retry_after.map_or(delay, |current| current.min(delay)));
-                    deferred_groups.insert(candidate.group_id_hex.clone());
-                    continue;
-                }
+                let delay = deadline.duration_since(now);
+                retry_after = Some(retry_after.map_or(delay, |current| current.min(delay)));
+                deferred_groups.insert(candidate.group_id_hex.clone());
+                continue;
             }
             match client.retained_edit_waits_for_original(&candidate) {
                 Ok(true) => {
