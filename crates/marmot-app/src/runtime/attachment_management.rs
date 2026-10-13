@@ -171,7 +171,7 @@ impl MarmotAppRuntime {
         })
         .await
     }
-    /// Event-driven head replacements, at most4Hz. Explicit continuation pages remain pull-based.
+    /// Event-driven head replacements, at most 4 Hz. Explicit continuation pages remain pull-based.
     pub async fn subscribe_attachment_management(
         &self,
         account: &str,

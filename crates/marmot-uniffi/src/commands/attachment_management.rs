@@ -48,7 +48,7 @@ impl Marmot {
             .await?
             .into())
     }
-    /// Event-driven replacement heads, at most4Hz, with one-shot retention expiry and no idle polling.
+    /// Event-driven replacement heads, at most 4 Hz, with one-shot retention expiry and no idle polling.
     pub async fn subscribe_attachment_management(
         &self,
         account_ref: String,

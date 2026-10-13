@@ -42,7 +42,7 @@ This is the current integration entry point for Swift/iOS, Swift/macOS and Kotli
 | --- | --- |
 | [Complete method reference](API-REFERENCE.md) | Every exported constructor, runtime method, object method, free function and host callback, with signatures, purpose, source and API-selection guidance. |
 | [Release integration index](../../docs/integration/README.md) | Per-release upgrade guides: required changes, changed defaults, optional adoption, examples and acceptance checks. Read every intervening guide when skipping versions. |
-| [Download management and chat health](ATTACHMENT-MANAGEMENT.md) | Global/chat transfer pages, partial totals, intent-fenced cancellation, recovery evidence and event-driven observation. |
+| [Download management and chat health](ATTACHMENT-MANAGEMENT.md) | Per-chat transfer pages, partial totals, existing per-item controls, recovery evidence and event-driven observation. |
 | [Changelog](CHANGELOG.md) | Binding-level changes per release, including unreleased work on `master`. |
 | [Distribution](DISTRIBUTION.md) | Exact artifact layout, platform setup, checksums, Apple resources and source/binary pairing. |
 | [Chat lists](../../docs/marmot-architecture/further-context/chat-projections-native.md) | Bounded list windows, account attention, navigation and sequence handling. |
