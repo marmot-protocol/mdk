@@ -1886,6 +1886,66 @@ where
                             self.complete_maintenance_obligation(&mut obligation, now)?;
                             continue;
                         }
+                        // The exact commit is a pending frozen fanout. Resume it
+                        // rather than staging a second rotation over it.
+                        if let Some(message_id) = evolution.signed_message_id.as_ref()
+                            && self
+                                .session
+                                .outbound_fanouts_for_group(&obligation.group_id)?
+                                .iter()
+                                .any(|fanout| {
+                                    fanout.message_id() == message_id
+                                        && matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+                                })
+                        {
+                            self.maintenance_activity
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .self_update_attempts += 1;
+                            let started = self.monotonic_clock.elapsed();
+                            let resumed = self
+                                .resume_outbound_fanouts_for_group(Some(&obligation.group_id))
+                                .await
+                                .map(|(effects, _blocked_groups)| effects);
+                            let confirmed = resumed.as_ref().is_ok_and(|effects| {
+                                effects
+                                    .pending
+                                    .iter()
+                                    .any(|r| matches!(r, PendingResolution::Confirmed { .. }))
+                            });
+                            self.note_maintenance_duration(
+                                started,
+                                false,
+                                resumed
+                                    .as_ref()
+                                    .map_or(true, |e| !e.failures.is_empty() && !confirmed),
+                            );
+                            let resumed = resumed.inspect_err(|_error| {
+                                self.maintenance_activity
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .failed_attempts += 1;
+                            })?;
+                            if !confirmed && !resumed.failures.is_empty() {
+                                let mut activity = self
+                                    .maintenance_activity
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                activity.failed_attempts =
+                                    activity.failed_attempts.saturating_add(1);
+                            }
+                            output.absorb_account_effects(resumed);
+                            if confirmed {
+                                self.complete_maintenance_obligation(&mut obligation, now)?;
+                            } else {
+                                obligation.phase = MaintenancePhase::PendingPublication;
+                                self.put_maintenance_obligation_if_changed(
+                                    &original_obligation,
+                                    &obligation,
+                                )?;
+                            }
+                            continue;
+                        }
                         if let (Some(pending), Some(message_id)) =
                             (evolution.pending_ref, evolution.signed_message_id)
                             && let Some(fanout) = self.session.transport_fanout(&message_id)?
@@ -2144,10 +2204,27 @@ where
                     .as_ref()
                     .is_some_and(|state| state.pending_replacement.is_some()),
             );
+        // Self-update commits publish through frozen fanouts (mdk#2255);
+        // legacy records only finish rotations staged before that change.
+        let evolution_commits = self
+            .session
+            .group_evolutions()?
+            .into_iter()
+            .filter_map(|evolution| evolution.signed_message_id)
+            .collect::<HashSet<_>>();
+        let frozen_ambiguous = self
+            .session
+            .outbound_fanouts()?
+            .iter()
+            .filter(|fanout| {
+                evolution_commits.contains(fanout.message_id()) && fanout.possible_exposure()
+            })
+            .count();
         let ambiguous_exposure = fanouts
             .iter()
             .filter(|fanout| fanout.possible_exposure)
             .count()
+            + frozen_ambiguous
             + usize::from(lifecycle.as_ref().is_some_and(|state| {
                 state.pending_replacement.as_ref().is_some_and(|pending| {
                     pending.last_failure_code.as_deref() == Some("ambiguous_exposure")
@@ -3480,15 +3557,10 @@ where
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
     ) -> AccountResult<()> {
-        let maintenance_evolution = messages.len() == 1
-            && self
-                .session
-                .group_evolutions()?
-                .into_iter()
-                .any(|evolution| {
-                    evolution.signed_message_id.as_ref()
-                        == messages.first().map(|message| &message.id)
-                });
+        let maintenance_evolution = match messages.as_slice() {
+            [message] => self.has_legacy_evolution_fanout(&message.id)?,
+            _ => false,
+        };
         if maintenance_evolution {
             // A crash can land after the first relay acknowledgement and its
             // durable maintenance-fanout write but before local MLS
@@ -3739,18 +3811,7 @@ where
         context: Option<AuditEventContext>,
     ) -> AccountResult<()> {
         let commit_id = commit.id.clone();
-        let maintenance_evolution = self
-            .session
-            .group_evolutions()?
-            .into_iter()
-            .any(|evolution| {
-                evolution.signed_message_id.as_ref() == Some(&commit_id)
-                    && matches!(
-                        evolution.semantic,
-                        GroupEvolutionSemantic::SelfUpdate { .. }
-                    )
-            });
-        if maintenance_evolution {
+        if self.has_legacy_evolution_fanout(&commit_id)? {
             let commit_status = self
                 .publish_legacy_one(commit, output, context.clone())
                 .await?;
@@ -3791,6 +3852,20 @@ where
         Ok(())
     }
 
+    /// Self-update commits staged before mdk#2255 were published through the
+    /// legacy `DurableTransportFanout`. Those exact events finish on the path
+    /// that already holds their attempt and exposure history. Every new group
+    /// evolution uses the frozen `OutboundFanout`, like every other commit.
+    fn has_legacy_evolution_fanout(
+        &self,
+        message_id: &cgka_traits::MessageId,
+    ) -> AccountResult<bool> {
+        Ok(self
+            .session
+            .transport_fanout(message_id)?
+            .is_some_and(|fanout| fanout.evolution_id.is_some()))
+    }
+
     fn mark_transport_fanout_evolution_confirmed(&self, message_id: &cgka_traits::MessageId) {
         let Ok(Some(mut fanout)) = self.session.transport_fanout(message_id) else {
             return;
@@ -3819,8 +3894,24 @@ where
                 self.session.delete_transport_fanout(&fanout.id)?;
                 continue;
             }
-            if fanout.evolution_id.is_some() && !fanout.evolution_confirmed {
-                continue;
+            if let Some(evolution_id) = fanout.evolution_id.as_ref()
+                && !fanout.evolution_confirmed
+            {
+                // The marker write after confirmation is best-effort. Re-derive
+                // it from the evolution the confirm transaction itself wrote,
+                // so a failed marker cannot strand the remaining relays.
+                let confirmed = self
+                    .session
+                    .group_evolutions()?
+                    .into_iter()
+                    .any(|evolution| {
+                        &evolution.id == evolution_id
+                            && evolution.phase == GroupEvolutionPhase::Confirmed
+                    });
+                if !confirmed {
+                    continue;
+                }
+                self.mark_transport_fanout_evolution_confirmed(&fanout.id);
             }
             self.finish_transport_fanout(&fanout.id, output).await?;
         }
@@ -3850,6 +3941,37 @@ where
             .map(|target| target.endpoint.clone())
             .collect::<Vec<_>>();
         if !remaining.is_empty() {
+            // Secondary retries are audited like the first pass, so a relay
+            // that never received the exact event is visible (mdk#2255).
+            let msg_id_hex = hex::encode(message_id.as_slice());
+            let wire = publish_wire_metadata(&fanout.exact_message);
+            let artifact_kind = match &fanout.exact_message.envelope {
+                TransportEnvelope::Welcome { .. } => Some(MessageArtifactKind::Welcome),
+                TransportEnvelope::GroupMessage { .. } => None,
+            };
+            let target_kind = publish_target_kind(&fanout.target).to_string();
+            let publish_context = AuditEventContext {
+                operation_id: Some(format!("publish-{msg_id_hex}")),
+                ..AuditEventContext::default()
+            };
+            self.session.record_audit_event(
+                fanout.group_id.as_ref(),
+                Some(publish_context.clone()),
+                AuditEventKind::PublishAttempt {
+                    msg_id: msg_id_hex.clone(),
+                    artifact_kind,
+                    target_kind: target_kind.clone(),
+                    relay_url: None,
+                    relay_urls: remaining
+                        .iter()
+                        .map(|endpoint| endpoint.0.clone())
+                        .collect(),
+                    required_acks: fanout.required_acks as u64,
+                    transport: Some(wire.clone()),
+                },
+            );
+            let mut pass_accepted = Vec::new();
+            let mut pass_failed = Vec::new();
             // Concurrent single-endpoint publishes with `required_acks: 1`,
             // the per-endpoint contract the old sequential loop used; see
             // `drive_outbound_fanout` for why a multi-endpoint batch would
@@ -3868,6 +3990,25 @@ where
             for (endpoint, result) in futures::future::join_all(attempts).await {
                 match result {
                     Ok(report) => {
+                        if report
+                            .accepted
+                            .iter()
+                            .any(|receipt| receipt.endpoint == endpoint)
+                        {
+                            pass_accepted.push(endpoint.0.clone());
+                        } else {
+                            pass_failed.push(PublishRelayFailure {
+                                relay_url: endpoint.0.clone(),
+                                reason: report
+                                    .failed
+                                    .iter()
+                                    .find(|failure| failure.endpoint == endpoint)
+                                    .map_or_else(
+                                        || "publish acknowledgement unknown".to_owned(),
+                                        |failure| failure.reason.clone(),
+                                    ),
+                            });
+                        }
                         apply_report_to_fanout(
                             &mut fanout,
                             std::slice::from_ref(&endpoint),
@@ -3882,7 +4023,11 @@ where
                         }
                         output.reports.push(report);
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        pass_failed.push(PublishRelayFailure {
+                            relay_url: endpoint.0.clone(),
+                            reason: error.to_string(),
+                        });
                         fanout.possible_exposure = true;
                         if let Some(target) = fanout
                             .targets
@@ -3902,6 +4047,26 @@ where
                 }
             }
             self.session.put_transport_fanout(&fanout)?;
+            let accepted_total = fanout
+                .targets
+                .iter()
+                .filter(|target| target.state == TransportFanoutAttemptState::Accepted)
+                .count();
+            self.session.record_audit_event(
+                fanout.group_id.as_ref(),
+                Some(publish_context),
+                AuditEventKind::PublishOutcome {
+                    msg_id: msg_id_hex,
+                    artifact_kind,
+                    target_kind,
+                    relay_url: None,
+                    accepted_relay_urls: pass_accepted,
+                    failed_relays: pass_failed,
+                    required_acks: fanout.required_acks as u64,
+                    met_required_acks: accepted_total >= fanout.required_acks.max(1),
+                    transport: Some(wire),
+                },
+            );
         }
         Ok(())
     }
@@ -4209,6 +4374,24 @@ where
                 fanout.mark_attempt_started_at(index, now_ms)?;
             }
             self.session.put_outbound_fanout(&fanout)?;
+            // Every pass is audited, including secondary retries after the
+            // first acknowledgement confirmed the pending MLS state (mdk#2255).
+            self.session.record_audit_event(
+                fanout.group_id(),
+                context.clone(),
+                AuditEventKind::PublishAttempt {
+                    msg_id: hex::encode(fanout.message_id().as_slice()),
+                    artifact_kind: None,
+                    target_kind: "frozen_group_fanout".into(),
+                    relay_url: None,
+                    relay_urls: due
+                        .iter()
+                        .map(|&index| endpoints[index].0.clone())
+                        .collect(),
+                    required_acks: fanout.request().required_acks as u64,
+                    transport: Some(publish_wire_metadata(&fanout.request().message)),
+                },
+            );
 
             // Publish every outstanding endpoint concurrently as
             // single-endpoint requests with `required_acks: 1`, the same
@@ -4227,6 +4410,8 @@ where
             // An already-met quorum alone must not cancel every retry. Only
             // explicit foreground pressure may interrupt this secondary tail.
             let finish_retries = accepted >= ack_goal;
+            let mut pass_accepted = Vec::new();
+            let mut pass_failed = Vec::new();
             let mut attempts = due
                 .iter()
                 .map(|&index| {
@@ -4301,8 +4486,15 @@ where
                         )
                     }
                 };
-                if let Some(failure) = failure {
-                    fanout.record_target_failure(index, failure)?;
+                match failure {
+                    Some(failure) => {
+                        pass_failed.push(PublishRelayFailure {
+                            relay_url: failure.endpoint.0.clone(),
+                            reason: failure.reason.clone(),
+                        });
+                        fanout.record_target_failure(index, failure)?;
+                    }
+                    None => pass_accepted.push(endpoints[index].0.clone()),
                 }
                 self.session.put_outbound_fanout(&fanout)?;
             }
@@ -4313,10 +4505,12 @@ where
                     if fanout.target_status(index)
                         == Some(cgka_traits::FanoutTargetStatus::Attempting)
                     {
-                        fanout.record_target_failure(
-                            index,
-                            ambiguous_endpoint_failure(endpoints[index].clone()),
-                        )?;
+                        let failure = ambiguous_endpoint_failure(endpoints[index].clone());
+                        pass_failed.push(PublishRelayFailure {
+                            relay_url: failure.endpoint.0.clone(),
+                            reason: failure.reason.clone(),
+                        });
+                        fanout.record_target_failure(index, failure)?;
                     }
                 }
                 self.session.put_outbound_fanout(&fanout)?;
@@ -4334,8 +4528,8 @@ where
                     artifact_kind: None,
                     target_kind: "frozen_group_fanout".into(),
                     relay_url: None,
-                    accepted_relay_urls: Vec::new(),
-                    failed_relays: Vec::new(),
+                    accepted_relay_urls: pass_accepted,
+                    failed_relays: pass_failed,
                     required_acks: report.required_acks as u64,
                     met_required_acks: report.met_required_acks(),
                     transport: Some(publish_wire_metadata(&fanout.request().message)),
