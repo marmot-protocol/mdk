@@ -8075,6 +8075,7 @@ async fn member_key_package_falls_back_to_current_directory_for_local_account() 
         follow_source_relays: Vec::new(),
         relay_lists: AccountRelayListStatus::empty(),
         key_package: Some(DirectoryKeyPackage {
+            client_label: None,
             key_package_id: "current-directory".into(),
             key_package_ref_hex: metadata.key_package_ref_hex.clone(),
             key_package_event_id: String::new(),
@@ -10520,6 +10521,7 @@ fn directory_entry_reconciles_nostr_components_independently() {
     cached.relay_lists.inbox.created_at = 30;
     cached.relay_lists.inbox.relays = vec!["wss://cached-inbox.example".into()];
     cached.key_package = Some(DirectoryKeyPackage {
+        client_label: None,
         key_package_id: "old-package".into(),
         key_package_ref_hex: String::new(),
         key_package_event_id: String::new(),
@@ -10537,6 +10539,7 @@ fn directory_entry_reconciles_nostr_components_independently() {
     shared.relay_lists.inbox.created_at = 20;
     shared.relay_lists.inbox.relays = vec!["wss://shared-inbox.example".into()];
     shared.key_package = Some(DirectoryKeyPackage {
+        client_label: None,
         key_package_id: "new-package".into(),
         key_package_ref_hex: String::new(),
         key_package_event_id: String::new(),

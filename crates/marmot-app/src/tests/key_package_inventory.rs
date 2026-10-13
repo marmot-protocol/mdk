@@ -569,6 +569,7 @@ fn assert_local_only_invariants(entries: &[crate::AccountKeyPackageInventoryEntr
                 && !entry.record.relay
                 && entry.local_state != AccountKeyPackageLocalState::NotLocal
                 && entry.record.local == entry.local_state.is_local()
+                && entry.is_this_installation == entry.local_state.is_local()
         }),
         "local inventory must stay local-only with typed durable states"
     );

@@ -194,6 +194,7 @@ impl From<AccountKeyPackageLocalState> for AccountKeyPackageLocalStateFfi {
 pub struct AccountKeyPackageInventoryEntryFfi {
     pub record: AccountKeyPackageFfi,
     pub local_state: AccountKeyPackageLocalStateFfi,
+    pub is_this_installation: bool,
 }
 
 impl From<AccountKeyPackageInventoryEntry> for AccountKeyPackageInventoryEntryFfi {
@@ -201,6 +202,7 @@ impl From<AccountKeyPackageInventoryEntry> for AccountKeyPackageInventoryEntryFf
         Self {
             record: value.record.into(),
             local_state: value.local_state.into(),
+            is_this_installation: value.is_this_installation,
         }
     }
 }
@@ -525,6 +527,7 @@ mod tests {
             let ffi = AccountKeyPackageInventoryEntryFfi::from(AccountKeyPackageInventoryEntry {
                 record: record.clone(),
                 local_state: state,
+                is_this_installation: state.is_local(),
             });
             assert_eq!(ffi.record.account_ref.as_deref(), Some("device"));
             assert_eq!(ffi.record.key_package_id, "stable-slot");
@@ -534,6 +537,7 @@ mod tests {
             assert!(ffi.record.local);
             assert!(!ffi.record.relay);
             assert_eq!(ffi.local_state, expected);
+            assert_eq!(ffi.is_this_installation, state.is_local());
         }
     }
 

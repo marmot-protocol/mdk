@@ -10,6 +10,18 @@ methods. Generated disposal/concurrency helpers are platform scaffolding, not ad
 MDK commands. C has a separate [complete symbol index](../marmot-c/API-REFERENCE.md), including
 its lifetime helpers and compatibility-only entry points.
 
+`group_roster(...) -> GroupRosterFfi` contains `members: Vec<GroupMemberDetailsFfi>`.
+`group_members(...) -> Vec<AppGroupMemberRecordFfi>` uses the other member record. Both
+expose `devices: Option<Vec<MemberDeviceFfi>>`: `None` means unknown (staged,
+pending, seed or identity-only rows without canonical admission, or projection
+unavailable); `Some(list)` is canonical and authoritative, always nonempty for
+an admitted member. Disbanded historical rows have `None`. See the
+[device projection contract](../marmot-uniffi/README.md#device-local-membership-events)
+for ID stability, ordering, cache-only labels, and unknown join times.
+`local_account_key_packages` and `refresh_account_key_packages` return
+`Vec<AccountKeyPackageInventoryEntryFfi>`; each row has `is_this_installation: bool`
+reflecting durable local ownership. No runtime methods are added.
+
 ## Reading the reference
 
 - Signatures below use exact Rust export spelling and types; Swift/Kotlin normally expose

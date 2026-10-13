@@ -33,6 +33,7 @@
 //! - `rec f: M from F` — nested record by value.
 //! - `opt_rec f: M from F` — `Option<record>` → nullable owned `*mut M`.
 //! - `vec f/f_len: M from F` — `Vec<record>` → owned `(ptr, len)` pair.
+//! - `opt_vec has_f/f/f_len: M` — optional record array with an explicit presence flag.
 //! - `str_vec f/f_len` — `Vec<String>` → owned `(char**, len)` pair.
 //! - `json_str`, `json_opt_str`, `json_str_vec` — corresponding string forms
 //!   encoded as JSON string literals, preserving embedded NULs losslessly.
@@ -233,6 +234,20 @@ macro_rules! c_mirror {
             {$($lets)* let ($f, $fl) = crate::memory::owned_vec(
                 $value.$f.into_iter().map(<$mir>::from).collect());}
             {$($names)* $f, $fl,}
+            {$($fr)* crate::memory::free_vec($this.$f, $this.$fl);}
+            $($rest)*);
+    };
+
+    (@munch [$($m:tt)*] $name:ident, $ffi:ty, $value:ident, $this:ident,
+        {$($sf:tt)*} {$($lets:tt)*} {$($names:tt)*} {$($fr:tt)*}
+        $(#[$fm:meta])* opt_vec $hf:ident/$f:ident/$fl:ident: $mir:ty, $($rest:tt)*
+    ) => {
+        c_mirror!(@munch [$($m)*] $name, $ffi, $value, $this,
+            {$($sf)* $(#[$fm])* pub $hf: bool, pub $f: *mut $mir, pub $fl: usize,}
+            {$($lets)* let $hf = $value.$f.is_some();
+                let ($f, $fl) = crate::memory::owned_vec(
+                    $value.$f.unwrap_or_default().into_iter().map(<$mir>::from).collect());}
+            {$($names)* $hf, $f, $fl,}
             {$($fr)* crate::memory::free_vec($this.$f, $this.$fl);}
             $($rest)*);
     };

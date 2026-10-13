@@ -110,6 +110,7 @@ c_mirror! {
     list(MarmotAccountKeyPackageInventoryEntryList, marmot_account_key_package_inventory_entry_list_free) {
         rec record: MarmotAccountKeyPackage,
         copy local_state: MarmotAccountKeyPackageLocalState,
+        copy is_this_installation: bool,
     }
 }
 
@@ -335,6 +336,7 @@ mod tests {
                     relay: false,
                 },
                 local_state: AccountKeyPackageLocalStateFfi::Current,
+                is_this_installation: true,
             }]
             .into();
         assert_eq!(mirror.len, 1);
@@ -343,6 +345,7 @@ mod tests {
         assert_eq!(first.record.published_at, 7);
         assert_eq!(first.record.key_package_bytes, 64);
         assert!(first.record.local);
+        assert!(first.is_this_installation);
         assert!(!first.record.relay);
         assert_eq!(
             first.local_state,

@@ -918,6 +918,7 @@ mod tests {
             conversions::AccountKeyPackageLocalStateFfi::Current
         );
         assert!(local[0].record.local);
+        assert!(local[0].is_this_installation);
         assert!(!local[0].record.relay);
 
         let refreshed = kit
@@ -929,6 +930,7 @@ mod tests {
             .find(|entry| entry.local_state == conversions::AccountKeyPackageLocalStateFfi::Current)
             .expect("current row");
         assert!(current.record.local);
+        assert!(current.is_this_installation);
         assert_eq!(
             current.record.key_package_ref_hex,
             local[0].record.key_package_ref_hex

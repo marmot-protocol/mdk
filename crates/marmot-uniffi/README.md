@@ -588,7 +588,9 @@ It is a synchronous SQLCipher read on the calling thread; do not invoke it on a
 UI or main thread. `refreshAccountKeyPackages` is the explicit network merge;
 replace the displayed snapshot with its result. On refresh failure or
 cancellation, keep the local result. Both return
-`AccountKeyPackageInventoryEntryFfi` (`record` plus `localState`). Existing
+`AccountKeyPackageInventoryEntryFfi` (`record`, `localState`, and `isThisInstallation`).
+`isThisInstallation` equals `localState.is_local()`: current, pending, retained,
+and other owned bundles are true; relay-only rows are false. Existing
 `AccountKeyPackageFfi` is unchanged. `localState` and `record.relay` are the
 authoritative display distinctions; empty event IDs and `publishedAt` are not
 publication proof. A retained package stays `RetainedPrivateMaterial` even when
@@ -756,6 +758,39 @@ the conversion cache. Custom events do not change chat-list activity or notifica
 
 
 ## Device-local membership events
+
+`group_roster(...)` returns `GroupRosterFfi` with `members: Vec<GroupMemberDetailsFfi>`;
+`group_members(...)` returns `Vec<AppGroupMemberRecordFfi>`. Both member records expose
+`devices: Option<Vec<MemberDeviceFfi>>` (Kotlin `List<MemberDeviceFfi>?`). `None`
+(Kotlin `null`) means MDK does not know: staged, pending, seed or identity-only
+rows without canonical admission, or an unavailable projection. `Some(list)` is
+canonical and authoritative; an admitted member always has at least one device.
+Disbanded historical rosters have `None` after live MLS state is deleted.
+Each device has `device_id`, `leaf_index`, `client_label`, `joined_at`, and
+`is_this_installation`. The active installation sorts first,
+then devices sort by leaf index. Account-level `local`/`is_self` retain their
+existing meaning; `is_this_installation` identifies only the active own leaf and signer.
+`local_account_key_packages(...)` and `refresh_account_key_packages(...)` return
+`Vec<AccountKeyPackageInventoryEntryFfi>` with `is_this_installation: bool`
+(Kotlin `isThisInstallation: Boolean`) derived from durable local ownership.
+Existing MLS member counts remain leaf counts; the member rows provide person counts.
+
+`device_id` is lowercase SHA-256 hex over the domain `marmot-app/member-device-id/v1`,
+length-prefixed opaque MLS group bytes, and length-prefixed leaf signature-key bytes
+(lengths are big-endian u64). It is stable through MDK SelfUpdate and reopen because
+MDK retains its installation signer. A client rotating its leaf signature key
+appears as a new device. Leaf indices can be reused after removal and are for
+display/debug only. There is no persisted device continuity state.
+
+`client_label` is advisory, cache-only KeyPackage `client` metadata matched by
+account and signature key: at most 64 Unicode characters, stripped of control
+and bidirectional override/isolate characters and trimmed. A missing label or
+cache mismatch returns `None`. The latest directory package per account and our
+durable signed publication supply enrichment; replacing a cached package can
+lose an older device's label. Projection performs no network reads or discovery.
+`joined_at` is always `None`; no join timestamp is inferred or backfilled. Treat
+labels and device identifiers as private presentation data, never log them.
+
 
 The group-event firehose distinguishes account-level timeline activity from
 `LocalGroupCopyTerminated`, `LocalGroupCopyRestored`, and

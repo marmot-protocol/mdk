@@ -8,7 +8,7 @@ use marmot_uniffi::conversions::{
     GroupConversationSnapshotFfi, GroupDetailsFfi, GroupInviteDeclineResultFfi,
     GroupLifecycleStateFfi, GroupManagementStateFfi, GroupMemberActionStateFfi,
     GroupMemberDetailsFfi, GroupMutationResultFfi, GroupRecoveryStatusFfi,
-    GroupRejoinInvitationFfi, GroupRosterFfi, MemberRefFfi, SelfMembershipFfi,
+    GroupRejoinInvitationFfi, GroupRosterFfi, MemberDeviceFfi, MemberRefFfi, SelfMembershipFfi,
 };
 // Group-creation option/image records live on the command module rather
 // than `conversions`, because they are inputs, not projections.
@@ -206,6 +206,17 @@ c_mirror! {
 }
 
 c_mirror! {
+    /// Canonical group-scoped device, owned and freed by its parent member row.
+    MarmotMemberDevice from MemberDeviceFfi {
+        str device_id,
+        copy leaf_index: u32,
+        opt_str client_label,
+        opt_copy has_joined_at/joined_at: u64,
+        copy is_this_installation: bool,
+    }
+}
+
+c_mirror! {
     /// One member row of the group roster.
     MarmotAppGroupMemberRecord from AppGroupMemberRecordFfi,
     list(MarmotAppGroupMemberRecordList, marmot_app_group_member_record_list_free) {
@@ -213,6 +224,8 @@ c_mirror! {
         /// Local account label when this member is one of ours. Nullable.
         opt_str account,
         copy local: bool,
+        /// False means unknown; true means canonical admitted devices (nonempty).
+        opt_vec has_devices/devices/devices_len: MarmotMemberDevice,
     }
 }
 
@@ -232,6 +245,8 @@ c_mirror! {
         str member_id_hex,
         opt_str account,
         copy local: bool,
+        /// False means unknown; true means canonical admitted devices (nonempty).
+        opt_vec has_devices/devices/devices_len: MarmotMemberDevice,
         copy is_admin: bool,
         copy is_self: bool,
         str npub,
@@ -362,6 +377,105 @@ mod tests {
     use super::*;
     use crate::memory::boxed;
     use marmot_uniffi::conversions::SendAcceptDispositionFfi;
+
+    #[test]
+    fn member_devices_deep_free() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let start = crate::memory::audit::live_allocations();
+        let mirror: MarmotAppGroupMemberRecordList = vec![AppGroupMemberRecordFfi {
+            member_id_hex: "aa".repeat(32),
+            account: Some("local".into()),
+            local: true,
+            devices: Some(vec![
+                MemberDeviceFfi {
+                    device_id: "bb".repeat(32),
+                    leaf_index: 3,
+                    client_label: Some("Client".into()),
+                    joined_at: None,
+                    is_this_installation: true,
+                },
+                MemberDeviceFfi {
+                    device_id: "cc".repeat(32),
+                    leaf_index: 4,
+                    client_label: None,
+                    joined_at: Some(17),
+                    is_this_installation: false,
+                },
+            ]),
+        }]
+        .into();
+        let row = unsafe { &*mirror.items };
+        assert!(row.has_devices);
+        assert_eq!(row.devices_len, 2);
+        let devices = unsafe { std::slice::from_raw_parts(row.devices, row.devices_len) };
+        assert_eq!(devices[0].leaf_index, 3);
+        assert!(devices[0].is_this_installation);
+        assert!(!devices[0].has_joined_at);
+        assert!(devices[1].has_joined_at);
+        assert_eq!(devices[1].joined_at, 17);
+        assert!(devices[1].client_label.is_null());
+        unsafe { marmot_app_group_member_record_list_free(boxed(mirror)) };
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), start);
+    }
+
+    #[test]
+    fn unknown_member_devices_deep_free() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let start = crate::memory::audit::live_allocations();
+        let mirror: MarmotAppGroupMemberRecordList = vec![AppGroupMemberRecordFfi {
+            member_id_hex: "aa".repeat(32),
+            account: None,
+            local: false,
+            devices: None,
+        }]
+        .into();
+        let row = unsafe { &*mirror.items };
+        assert!(!row.has_devices);
+        assert!(row.devices.is_null());
+        assert_eq!(row.devices_len, 0);
+        unsafe { marmot_app_group_member_record_list_free(boxed(mirror)) };
+        for devices in [
+            None,
+            Some(vec![MemberDeviceFfi {
+                device_id: "bb".repeat(32),
+                leaf_index: 1,
+                client_label: Some("Client".into()),
+                joined_at: None,
+                is_this_installation: true,
+            }]),
+        ] {
+            let known = devices.is_some();
+            let mirror: MarmotGroupRoster = GroupRosterFfi {
+                group_id_hex: "01".repeat(16),
+                members: vec![GroupMemberDetailsFfi {
+                    member_id_hex: "aa".repeat(32),
+                    account: None,
+                    local: false,
+                    devices,
+                    is_admin: false,
+                    is_self: false,
+                    npub: "npub".into(),
+                    display_name: None,
+                }],
+                epoch: 1,
+                roster_revision: 1,
+                self_membership: SelfMembershipFfi::Member,
+                member_count: 1,
+                lifecycle_state: GroupLifecycleStateFfi::Stable,
+            }
+            .into();
+            let row = unsafe { &*mirror.members };
+            assert_eq!(row.has_devices, known);
+            assert_eq!(row.devices_len, usize::from(known));
+            assert_eq!(row.devices.is_null(), !known);
+            unsafe { marmot_group_roster_free(boxed(mirror)) };
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), start);
+    }
 
     #[test]
     fn app_component_deep_free() {

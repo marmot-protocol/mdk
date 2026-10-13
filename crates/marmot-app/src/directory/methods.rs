@@ -1436,6 +1436,53 @@ impl MarmotApp {
         Ok(records)
     }
 
+    pub(crate) fn member_device_key_packages(
+        &self,
+        account_ids: &[String],
+    ) -> Result<super::records::MemberDeviceKeyPackages, AppError> {
+        let mut selected = HashMap::new();
+        for cache in self.directory_caches()? {
+            for (id, json) in cache.key_packages_for_ids(account_ids)? {
+                // Preserve the first private cache's slot, including an empty slot.
+                selected.entry(id).or_insert_with(|| {
+                    json.as_deref()
+                        .map(serde_json::from_str)
+                        .transpose()
+                        .map_err(Into::into)
+                });
+            }
+        }
+        for (id, json) in self
+            .shared_storage()?
+            .directory_key_packages_for_ids(account_ids)?
+        {
+            let shared: Result<Option<super::records::MemberDeviceKeyPackage>, AppError> = json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(Into::into);
+            match selected.entry(id) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(shared);
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    // A decode failure makes this account's enrichment unavailable.
+                    let replace = match (slot.get(), &shared) {
+                        (Ok(current), Ok(Some(candidate))) => current
+                            .as_ref()
+                            .is_none_or(|current| candidate.created_at > current.created_at),
+                        (Ok(_), Err(_)) => true,
+                        _ => false,
+                    };
+                    if replace {
+                        *slot.get_mut() = shared;
+                    }
+                }
+            }
+        }
+        Ok(selected)
+    }
+
     pub(crate) fn directory_entry_for_account_id_with_handles(
         &self,
         account_id_hex: &str,
@@ -1506,6 +1553,7 @@ impl MarmotApp {
         entry.account_id_hex = fetched.account_id_hex.clone();
         entry.relay_lists = merge_relay_list_status(entry.relay_lists, fetched.relay_lists.clone());
         entry.key_package = Some(DirectoryKeyPackage {
+            client_label: fetched.client_label.clone(),
             key_package_id: fetched.key_package_id.clone(),
             key_package_ref_hex: fetched.key_package_ref_hex.clone(),
             key_package_event_id: fetched.key_package_event_id.clone(),

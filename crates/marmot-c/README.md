@@ -269,6 +269,9 @@ random roll from the same wordlists. Free those strings with
 
 ## KeyPackage inventory
 
+Inventory rows include `is_this_installation`, derived from local ownership;
+relay-only rows are false.
+
 `marmot_account_key_packages` returns the current KeyPackage winner per
 addressable slot plus local-only rows. `marmot_account_key_package_relay_events`
 returns observed relay history from the same validated fetch window, including
@@ -303,6 +306,15 @@ Free each result with `marmot_presented_chat_list_update_free` and the handle wi
 for version ordering, localization, readiness, and account-switch behavior.
 
 ## Chat screens and avatars
+
+`MarmotAppGroupMemberRecord` and roster rows (`MarmotGroupMemberDetails` from
+`marmot_group_roster`) own a `MarmotMemberDevice` array (`has_devices`, `devices`,
+`devices_len`). `has_devices = false` means unknown, with NULL/zero array; true
+means canonical authoritative devices, always nonempty for an admitted member.
+Parent deep-frees release the array and its strings. See the
+[shared optional-device contract](../marmot-uniffi/README.md#device-local-membership-events).
+`client_label` is nullable; `has_joined_at` represents the optional `joined_at`
+(currently always absent).
 
 Live Chats/Unread/Archived/Left windows and independent account attention follow the
 [native handoff contract](../../docs/marmot-architecture/further-context/chat-projections-native.md)

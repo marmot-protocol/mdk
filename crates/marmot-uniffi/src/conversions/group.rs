@@ -8,8 +8,8 @@ use marmot_app::{
     AppGroupHydrationQuarantineReason, AppGroupLifecycleState, AppGroupMemberIds,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupNostrRoutingComponent,
     AppGroupProfileComponent, AppGroupRecord, AppGroupRoster, AppProtocolProfile,
-    AppQuarantinedGroup, CreatedGroup, GroupInviteDeclineResult, account_id_hex_from_ref,
-    npub_for_account_id,
+    AppQuarantinedGroup, CreatedGroup, GroupInviteDeclineResult, MemberDevice,
+    account_id_hex_from_ref, npub_for_account_id,
 };
 
 use super::account::SendSummaryFfi;
@@ -226,11 +226,35 @@ impl From<AppGroupEncryptedMediaComponent> for AppGroupEncryptedMediaComponentFf
     }
 }
 
+/// Canonical group-scoped device; leaf_index is display/debug only.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MemberDeviceFfi {
+    pub device_id: String,
+    pub leaf_index: u32,
+    pub client_label: Option<String>,
+    pub joined_at: Option<u64>,
+    pub is_this_installation: bool,
+}
+
+impl From<MemberDevice> for MemberDeviceFfi {
+    fn from(value: MemberDevice) -> Self {
+        Self {
+            device_id: value.device_id,
+            leaf_index: value.leaf_index,
+            client_label: value.client_label,
+            joined_at: value.joined_at,
+            is_this_installation: value.is_this_installation,
+        }
+    }
+}
+
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct AppGroupMemberRecordFfi {
     pub member_id_hex: String,
     pub account: Option<String>,
     pub local: bool,
+    /// None means unknown; Some contains canonical admitted devices (always nonempty).
+    pub devices: Option<Vec<MemberDeviceFfi>>,
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -256,6 +280,9 @@ impl From<AppGroupMemberRecord> for AppGroupMemberRecordFfi {
             member_id_hex: value.member_id_hex,
             account: value.account,
             local: value.local,
+            devices: value
+                .devices
+                .map(|devices| devices.into_iter().map(Into::into).collect()),
         }
     }
 }
@@ -272,6 +299,8 @@ pub struct GroupMemberDetailsFfi {
     pub member_id_hex: String,
     pub account: Option<String>,
     pub local: bool,
+    /// None means unknown; Some contains canonical admitted devices (always nonempty).
+    pub devices: Option<Vec<MemberDeviceFfi>>,
     pub is_admin: bool,
     pub is_self: bool,
     pub npub: String,
@@ -422,6 +451,7 @@ pub(crate) fn group_details_ffi(
                 member_id_hex: member.member_id_hex,
                 account: member.account,
                 local: member.local,
+                devices: member.devices,
             })
         })
         .collect::<Result<Vec<_>, MarmotKitError>>()?;
@@ -472,6 +502,9 @@ pub(crate) fn group_roster_ffi(roster: AppGroupRoster) -> Result<GroupRosterFfi,
                 member_id_hex: member.member_id_hex,
                 account: member.account,
                 local: member.local,
+                devices: member
+                    .devices
+                    .map(|devices| devices.into_iter().map(Into::into).collect()),
                 is_admin: member.is_admin,
                 is_self: member.is_self,
                 npub,
@@ -781,6 +814,13 @@ mod group_roster_tests {
                 member_id_hex: self_id.to_owned(),
                 account: Some("alice".to_owned()),
                 local: true,
+                devices: Some(vec![MemberDevice {
+                    device_id: "ab".repeat(32),
+                    leaf_index: 7,
+                    client_label: Some("Client".into()),
+                    joined_at: None,
+                    is_this_installation: true,
+                }]),
                 is_admin: true,
                 is_self: true,
                 display_name: Some("Alice".to_owned()),
@@ -791,12 +831,25 @@ mod group_roster_tests {
             member_count: 1,
             lifecycle_state: AppGroupLifecycleState::Stable,
         };
+        let mut unknown_roster = roster.clone();
+        unknown_roster.members[0].devices = None;
+        assert!(
+            group_roster_ffi(unknown_roster).unwrap().members[0]
+                .devices
+                .is_none()
+        );
         let ffi = group_roster_ffi(roster).expect("ffi roster");
         assert_eq!(ffi.epoch, 12);
         assert_eq!(ffi.roster_revision, 12);
         assert!(matches!(ffi.self_membership, SelfMembershipFfi::Removed));
         assert_eq!(ffi.members.len(), 1);
         assert_eq!(ffi.members[0].display_name.as_deref(), Some("Alice"));
+        let device = &ffi.members[0].devices.as_ref().unwrap()[0];
+        assert_eq!(device.device_id, "ab".repeat(32));
+        assert_eq!(device.leaf_index, 7);
+        assert_eq!(device.client_label.as_deref(), Some("Client"));
+        assert!(device.joined_at.is_none());
+        assert!(device.is_this_installation);
     }
 
     include!(concat!(
@@ -889,5 +942,43 @@ impl From<marmot_app::GroupRecoveryStatus> for GroupRecoveryStatusFfi {
             history_may_be_incomplete: value.history_may_be_incomplete,
             history_notice_ids: value.history_notice_ids,
         }
+    }
+}
+
+#[cfg(test)]
+mod member_device_tests {
+    use super::*;
+    #[test]
+    fn member_device_conversion_preserves_all_fields_in_list() {
+        let device = MemberDevice {
+            device_id: "ab".repeat(32),
+            leaf_index: 7,
+            client_label: Some("Client".into()),
+            joined_at: None,
+            is_this_installation: true,
+        };
+        let member = AppGroupMemberRecord {
+            member_id_hex: "01".repeat(32),
+            account: Some("local".into()),
+            local: true,
+            devices: Some(vec![device.clone()]),
+        };
+        let mut unknown_member = member.clone();
+        unknown_member.devices = None;
+        assert!(
+            AppGroupMemberRecordFfi::from(unknown_member)
+                .devices
+                .is_none()
+        );
+        let ffi: AppGroupMemberRecordFfi = member.into();
+        assert_eq!(ffi.devices.as_ref().unwrap().len(), 1);
+        assert_eq!(ffi.devices.as_ref().unwrap()[0].device_id, device.device_id);
+        assert_eq!(ffi.devices.as_ref().unwrap()[0].leaf_index, 7);
+        assert_eq!(
+            ffi.devices.as_ref().unwrap()[0].client_label,
+            device.client_label
+        );
+        assert_eq!(ffi.devices.as_ref().unwrap()[0].joined_at, None);
+        assert!(ffi.devices.as_ref().unwrap()[0].is_this_installation);
     }
 }

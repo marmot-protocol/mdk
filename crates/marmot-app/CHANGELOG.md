@@ -4,6 +4,17 @@
 
 - `MarmotAppRuntime::submit_prepared_media_snapshot` admits the captured ordinary-media payload with a stable token and consumes only its unchanged captured draft in the same transaction. Newer or cleared drafts cannot replace the payload or block admission.
 
+### Added
+
+- Devices are unknown when not canonically admitted or unavailable; known lists
+  are authoritative and nonempty for admitted members.
+
+- Person-level member and roster records expose optional `MemberDevice` arrays with
+  group-scoped signature-key IDs, display/debug leaf indices, cache-only client
+  labels, unknown join times and an active-installation flag. Sibling leaves
+  share one account row; staged rows receive devices only after admission.
+  KeyPackage inventory adds `is_this_installation` from local ownership.
+
 ## 0.13.0 - 2026-10-12
 
 ### Breaking changes

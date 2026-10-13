@@ -164,6 +164,7 @@ mod tests {
             member_id_hex: member_id_hex.to_owned(),
             account: None,
             local: is_self,
+            devices: None,
             is_admin,
             is_self,
             npub: "npub1placeholder".into(),

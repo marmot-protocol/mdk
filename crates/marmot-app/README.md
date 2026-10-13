@@ -235,6 +235,16 @@ membership, provider response, profile hydration, and network completion, withou
 
 ## Groups and invitations
 
+Member and roster records expose `devices: Option<Vec<MemberDevice>>` grouped by
+account. `None` means unknown (staged/pending/seed/identity-only rows without
+canonical admission, or projection unavailable); `Some(list)` is authoritative
+and always nonempty for an admitted member. Disbanded historical rosters have
+`None` after live MLS state is deleted. See the
+[binding contract](../marmot-uniffi/README.md#device-local-membership-events) for
+group-scoped IDs, active-installation flags, cache-only labels, and unknown join
+times. KeyPackage inventory `is_this_installation` equals `local_state.is_local()`.
+
+
 **Creating and inviting.** Group creation and invites take pubkeys at the action boundary. The app canonicalizes and
 deduplicates the requested roster and fetches current KeyPackages in bounded multi-author relay batches before building
 the MLS add.

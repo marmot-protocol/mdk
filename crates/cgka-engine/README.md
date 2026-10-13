@@ -38,6 +38,12 @@ It does **not** do transport (plug in a `TransportPeeler`), persistence beyond `
 
 ## KeyPackage validation before membership changes
 
+`canonical_group_membership` includes authenticated account/signature-key/leaf
+evidence for device projection, with the active own leaf checked against the
+installation signer. Staged membership remains separate. Validated KeyPackage
+metadata includes its leaf signature key for cache-only label matching.
+
+
 Create and Invite validate transported KeyPackages through OpenMLS and the Marmot identity/profile checks before
 adding members. They also reject LeafNode capabilities that explicitly advertise RFC 9420 section 7.2 default
 extension or proposal types. Unknown capability values remain accepted for protocol extensibility.

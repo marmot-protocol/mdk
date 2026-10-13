@@ -261,6 +261,31 @@ pub(crate) fn relay_list_queries(account_id_hex: String) -> Vec<DirectoryEventQu
         .collect()
 }
 
+/// Bounded advisory display metadata from a validated or locally signed event.
+pub(crate) fn key_package_client_label(event: &NostrTransportEvent) -> Option<String> {
+    let mut tags = event.tags.iter().filter(|tag| {
+        tag.first()
+            .is_some_and(|name| name == transport_nostr_adapter::CLIENT_TAG)
+    });
+    let tag = tags.next()?;
+    if tags.next().is_some() {
+        return None;
+    }
+    sanitize_client_label(tag.get(1)?.as_str())
+}
+
+pub(crate) fn sanitize_client_label(label: &str) -> Option<String> {
+    let label: String = label
+        .chars()
+        .filter(|c| {
+            !c.is_control() && !matches!(*c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+        .take(64)
+        .collect();
+    let label = label.trim();
+    (!label.is_empty()).then(|| label.to_owned())
+}
+
 /// Temporary interoperability policy. Retire this ranking when device-aware
 /// delivery in https://github.com/marmot-protocol/mdk/issues/1696 replaces
 /// single-package selection. Keep separate from cryptographic admission so
@@ -390,6 +415,10 @@ fn cached_key_package_from_entry(
     let (decoded, key_package_ref_hex) =
         validated_cached_key_package_with_ref(&entry.account_id_hex, &key_package)?;
     Ok(Some(FetchedKeyPackage {
+        client_label: key_package
+            .client_label
+            .as_deref()
+            .and_then(sanitize_client_label),
         account_id_hex: entry.account_id_hex,
         key_package: decoded,
         key_package_id: key_package.key_package_id,
@@ -500,6 +529,23 @@ pub(crate) fn key_package_from_record(
 fn key_package_from_borrowed_record(
     record: &RelayEventRecord,
 ) -> Result<FetchedKeyPackage, AppError> {
+    key_package_from_record_with_metadata(record, |package| {
+        key_package_metadata(package)
+            .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))
+    })
+    .map(|(fetched, _)| fetched)
+}
+
+pub(crate) fn key_package_from_record_with_metadata(
+    record: &RelayEventRecord,
+    validate: impl FnOnce(&KeyPackage) -> Result<cgka_engine::key_package::KeyPackageMetadata, AppError>,
+) -> Result<
+    (
+        FetchedKeyPackage,
+        cgka_engine::key_package::KeyPackageMetadata,
+    ),
+    AppError,
+> {
     let event = &record.event;
     require_key_package_tag(event, "mls_protocol_version", |value| value == "1.0")?;
     let key_package_id = event
@@ -530,8 +576,7 @@ fn key_package_from_borrowed_record(
         key_package_event_id_from_hex(&event.id)?,
     )
     .with_protocol_profile(ProtocolProfile::Current);
-    let metadata = key_package_metadata(&key_package)
-        .map_err(|e| AppError::InvalidKeyPackageEvent(e.to_string()))?;
+    let metadata = validate(&key_package)?;
     require_key_package_tag(event, "mls_ciphersuite", |value| {
         value == format!("0x{:04x}", metadata.ciphersuite)
     })?;
@@ -574,16 +619,20 @@ fn key_package_from_borrowed_record(
             .map(|endpoint| endpoint.0.clone())
             .collect::<Vec<_>>(),
     );
-    Ok(FetchedKeyPackage {
-        account_id_hex: event.pubkey.clone(),
-        key_package,
-        key_package_id,
-        key_package_ref_hex: metadata.key_package_ref_hex,
-        key_package_event_id: event.id.clone(),
-        created_at: event.created_at,
-        source_relays,
-        relay_lists: AccountRelayListStatus::empty(),
-    })
+    Ok((
+        FetchedKeyPackage {
+            client_label: key_package_client_label(event),
+            account_id_hex: event.pubkey.clone(),
+            key_package,
+            key_package_id,
+            key_package_ref_hex: metadata.key_package_ref_hex.clone(),
+            key_package_event_id: event.id.clone(),
+            created_at: event.created_at,
+            source_relays,
+            relay_lists: AccountRelayListStatus::empty(),
+        },
+        metadata,
+    ))
 }
 
 pub(crate) fn account_key_package_record_from_fetched(
@@ -842,6 +891,7 @@ fn attach_local_state(
             };
             AccountKeyPackageInventoryEntry {
                 record,
+                is_this_installation: local_state.is_local(),
                 local_state,
             }
         })
@@ -1491,6 +1541,7 @@ mod tests {
     ) -> AccountKeyPackageInventoryEntry {
         AccountKeyPackageInventoryEntry {
             record: record(event, reference, local, relay),
+            is_this_installation: local_state.is_local(),
             local_state,
         }
     }
@@ -1512,6 +1563,69 @@ mod tests {
             local,
             relay,
         }
+    }
+
+    #[test]
+    fn inventory_installation_flag_tracks_ownership_not_relay_observation() {
+        for state in [
+            AccountKeyPackageLocalState::Current,
+            AccountKeyPackageLocalState::PendingReplacement,
+            AccountKeyPackageLocalState::RetainedPrivateMaterial,
+            AccountKeyPackageLocalState::OtherOwned,
+        ] {
+            let local = entry("local", "owned", true, false, state);
+            let rows = attach_local_state(
+                vec![
+                    local.record.clone(),
+                    record("remote", "foreign", false, true),
+                ],
+                &[local],
+            );
+            assert!(rows[0].is_this_installation);
+            assert!(!rows[1].is_this_installation);
+        }
+    }
+
+    #[test]
+    fn member_device_label_cache_is_backward_compatible_and_survives_serialization() {
+        let legacy = serde_json::json!({ "key_package_id": "slot", "key_package_hex": "00",
+            "created_at": 1, "source_relays": [] });
+        let mut cached: DirectoryKeyPackage = serde_json::from_value(legacy).unwrap();
+        assert!(cached.client_label.is_none());
+        cached.client_label = Some("Client".into());
+        let reopened: DirectoryKeyPackage =
+            serde_json::from_str(&serde_json::to_string(&cached).unwrap()).unwrap();
+        assert_eq!(reopened.client_label.as_deref(), Some("Client"));
+    }
+
+    #[test]
+    fn member_device_labels_are_bounded_sanitized_and_optional() {
+        assert_eq!(
+            sanitize_client_label("  Client\n\u{202e}  ").as_deref(),
+            Some("Client")
+        );
+        assert_eq!(
+            sanitize_client_label(&"é".repeat(80))
+                .unwrap()
+                .chars()
+                .count(),
+            64
+        );
+        assert!(sanitize_client_label("\n\t").is_none());
+        let mut event = NostrTransportEvent {
+            id: String::new(),
+            pubkey: String::new(),
+            created_at: 0,
+            kind: 30443,
+            tags: vec![],
+            content: String::new(),
+            sig: None,
+        };
+        assert!(key_package_client_label(&event).is_none());
+        event.tags.push(vec!["client".into(), " Client\n".into()]);
+        assert_eq!(key_package_client_label(&event).as_deref(), Some("Client"));
+        event.tags.push(vec!["client".into(), "Other".into()]);
+        assert!(key_package_client_label(&event).is_none());
     }
 
     #[test]

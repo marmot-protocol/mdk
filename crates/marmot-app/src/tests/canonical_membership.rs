@@ -8,9 +8,12 @@ fn app_at(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClient>) -> Marmo
     MarmotApp::with_relay_and_config(
         dir.path(),
         "wss://relay.example",
-        MarmotAppConfig::default()
-            .with_dev_settlement_quiescence_ms(0)
-            .with_dev_scheduled_convergence_delay_ms(0),
+        MarmotAppConfig {
+            key_package_client_name: Some("Test Client".into()),
+            ..MarmotAppConfig::default()
+        }
+        .with_dev_settlement_quiescence_ms(0)
+        .with_dev_scheduled_convergence_delay_ms(0),
     )
     .with_test_relay_client(relay)
 }
@@ -286,6 +289,9 @@ async fn real_departure_then_disband_projects_after_mls_deletion() {
         .save_state_with_pending_local_group_deletion_frontier_clears()
         .unwrap();
     let assert_projection = |app: &MarmotApp, client: &AppClient| {
+        let roster = client.group_roster_session(&group).unwrap();
+        assert!(!roster.members.is_empty());
+        assert!(roster.members.iter().all(|member| member.devices.is_none()));
         let rows = app
             .timeline_messages_with_query(
                 "carol",
@@ -1762,4 +1768,465 @@ async fn assert_managed_worker_retains_activity(late_checkpoint: bool) {
     .expect("quiet worker retry must deliver the one-shot activity");
     assert_eq!(timeline.take_snapshot().messages.len(), baseline + 2);
     runtime.shutdown().await;
+}
+
+/// Canonical devices remain separate from the account roster and leaf positions.
+#[tokio::test]
+async fn member_devices_group_accounts_and_survive_self_update_reopen_and_leaf_reuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let sibling_dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let secret = home
+        .load_signing_keys("bob")
+        .unwrap()
+        .secret_key()
+        .to_secret_hex();
+    AccountHome::open(sibling_dir.path())
+        .import_account("bob", &secret)
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = app_at(&dir, relay.clone());
+    let sibling_app = app_at(&sibling_dir, relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let mut bob_client = app.client("bob").await.unwrap();
+    bob_client.publish_key_package().await.unwrap();
+    bob_client.sync().await.unwrap();
+    let mut alice = app.client("alice").await.unwrap();
+    let mut alice_cursor = 0;
+    let mut bob_cursor = 0;
+    let group = alice
+        .create_group("sibling departure", &[&bob.account_id_hex])
+        .await
+        .unwrap();
+    deliver_new(&mut bob_client, &relay, &mut bob_cursor).await;
+    bob_client.sync().await.unwrap();
+    bob_client.accept_group_invite(&group).unwrap();
+    let mut sibling = sibling_app.client("bob").await.unwrap();
+    sibling.sync().await.unwrap();
+    let mut sibling_cursor = relay.published_events.lock().unwrap().len();
+    let kp = published_key_package(&mut sibling, &relay).await;
+    let effects = alice
+        .runtime
+        .send(SendIntent::Invite {
+            group_id: group.clone(),
+            key_packages: vec![kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    alice
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+    deliver_new(&mut sibling, &relay, &mut sibling_cursor).await;
+    sibling.sync().await.unwrap();
+    sibling.accept_group_invite(&group).unwrap();
+    deliver_new(&mut bob_client, &relay, &mut bob_cursor).await;
+    bob_client.sync().await.unwrap();
+    bob_client.retry_group_convergence(&group).await.unwrap();
+    let surviving_leaf = bob_client.runtime.own_leaf_index(&group).unwrap();
+    let departing_leaf = sibling.runtime.own_leaf_index(&group).unwrap();
+    assert_ne!(surviving_leaf, departing_leaf);
+
+    let rows = bob_client.members(&group).unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "one person row per account, including sibling leaves"
+    );
+    let devices = rows
+        .iter()
+        .find(|m| m.member_id_hex == bob.account_id_hex)
+        .unwrap()
+        .devices
+        .clone()
+        .unwrap();
+    assert_eq!(devices.len(), 2);
+    assert_eq!(devices[0].leaf_index, surviving_leaf);
+    assert!(devices[0].is_this_installation);
+    assert!(!devices[1].is_this_installation);
+    assert_ne!(devices[0].device_id, devices[1].device_id);
+    assert!(devices.iter().all(|d| d.joined_at.is_none()));
+    assert!(devices.iter().all(|d| {
+        d.device_id.len() == 64
+            && d.device_id
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    }));
+    assert_eq!(bob_client.members(&group).unwrap(), rows);
+    assert_eq!(
+        bob_client.group_roster_session(&group).unwrap().members,
+        rows
+    );
+    assert!(rows.iter().all(|row| {
+        row.devices
+            .as_ref()
+            .is_some_and(|devices| !devices.is_empty())
+    }));
+    let sibling_devices = sibling
+        .members(&group)
+        .unwrap()
+        .into_iter()
+        .find(|member| member.member_id_hex == bob.account_id_hex)
+        .unwrap()
+        .devices
+        .unwrap();
+    assert_eq!(sibling_devices[0].leaf_index, departing_leaf);
+    assert!(sibling_devices[0].is_this_installation);
+    assert!(!sibling_devices[1].is_this_installation);
+    assert_eq!(sibling_devices[1].leaf_index, surviving_leaf);
+    // The retained signed publication enriches our own leaf even when the
+    // account's addressable cache slot has been replaced by a sibling.
+    assert_eq!(devices[0].client_label.as_deref(), Some("Test Client"));
+    let selected = alice
+        .members(&group)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.member_id_hex == bob.account_id_hex)
+        .unwrap()
+        .devices
+        .unwrap();
+    assert_eq!(
+        selected
+            .iter()
+            .find(|d| d.leaf_index == surviving_leaf)
+            .unwrap()
+            .client_label
+            .as_deref(),
+        Some("Test Client")
+    );
+    assert!(
+        selected
+            .iter()
+            .find(|d| d.leaf_index == departing_leaf)
+            .unwrap()
+            .client_label
+            .is_none()
+    );
+    assert!(selected.iter().all(|d| !d.is_this_installation));
+    // Mirror-only staged accounts stay visible without inventing admitted leaves.
+    let staged_account = home.create_account("staged").unwrap();
+    let storage = app.account_storage("alice").unwrap();
+    let original = storage.get_group(&group).unwrap();
+    let mut staged = original.clone();
+    let mut member = staged.members[0].clone();
+    member.id = MemberId::new(hex::decode(&staged_account.account_id_hex).unwrap());
+    staged.members.push(member);
+    storage.put_group(&staged).unwrap();
+    let staged_rows = alice.members(&group).unwrap();
+    assert_eq!(staged_rows.len(), 3);
+    assert!(
+        staged_rows
+            .iter()
+            .find(|member| member.member_id_hex == staged_account.account_id_hex)
+            .unwrap()
+            .devices
+            .is_none()
+    );
+    assert_eq!(
+        alice.group_roster_session(&group).unwrap().members,
+        staged_rows
+    );
+    storage.put_group(&original).unwrap();
+    assert_eq!(
+        rows.iter()
+            .find(|m| m.member_id_hex != bob.account_id_hex)
+            .unwrap()
+            .devices
+            .as_ref()
+            .unwrap()[0]
+            .client_label
+            .as_deref(),
+        Some("Test Client")
+    );
+
+    let effects = bob_client
+        .runtime
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap();
+    bob_client
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+    assert_eq!(bob_client.members(&group).unwrap(), rows);
+    deliver_new(&mut alice, &relay, &mut alice_cursor).await;
+    alice.sync().await.unwrap();
+    alice.retry_group_convergence(&group).await.unwrap();
+    drop(bob_client);
+    let bob_client = app.client("bob").await.unwrap();
+    assert_eq!(bob_client.members(&group).unwrap(), rows);
+
+    let old = alice
+        .members(&group)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.member_id_hex == bob.account_id_hex)
+        .unwrap()
+        .devices
+        .unwrap();
+    let effects = alice
+        .runtime
+        .send(SendIntent::RemoveMembers {
+            group_id: group.clone(),
+            members: vec![MemberId::new(hex::decode(&bob.account_id_hex).unwrap())],
+        })
+        .await
+        .unwrap();
+    alice
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+    assert!(
+        alice
+            .members(&group)
+            .unwrap()
+            .iter()
+            .all(|m| m.member_id_hex != bob.account_id_hex)
+    );
+    let replacement_dir = tempfile::tempdir().unwrap();
+    AccountHome::open(replacement_dir.path())
+        .import_account("bob", &secret)
+        .unwrap();
+    let replacement_app = app_at(&replacement_dir, relay.clone());
+    let mut replacement = replacement_app.client("bob").await.unwrap();
+    let kp = published_key_package(&mut replacement, &relay).await;
+    let effects = alice
+        .runtime
+        .send(SendIntent::Invite {
+            group_id: group.clone(),
+            key_packages: vec![kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    alice
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+    let new = alice
+        .members(&group)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.member_id_hex == bob.account_id_hex)
+        .unwrap()
+        .devices
+        .unwrap();
+    assert_eq!(new.len(), 1);
+    let reused = old
+        .iter()
+        .find(|d| d.leaf_index == new[0].leaf_index)
+        .expect("OpenMLS reuses a removed slot");
+    assert_ne!(reused.device_id, new[0].device_id);
+    assert!(
+        new[0].client_label.is_none(),
+        "a cached sibling label must not follow an account to another signature key"
+    );
+    assert!(!new[0].is_this_installation);
+}
+
+async fn member_device_label_fixture() -> (tempfile::TempDir, MarmotApp, AppClient, GroupId, String)
+{
+    let dir = tempfile::tempdir().unwrap();
+    let remote_dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let bob = AccountHome::open(remote_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = app_at(&dir, relay.clone());
+    let remote = app_at(&remote_dir, relay);
+    let mut bob_client = remote.client("bob").await.unwrap();
+    bob_client.publish_key_package().await.unwrap();
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let mut alice = app.client("alice").await.unwrap();
+    let group = alice
+        .create_group("label regression", &[&bob.account_id_hex])
+        .await
+        .unwrap();
+    (dir, app, alice, group, bob.account_id_hex)
+}
+
+#[tokio::test]
+async fn member_device_labels_unreadable_advisory_row_preserves_roster_and_snapshot() {
+    let (_dir, app, mut alice, group, bob_id) = member_device_label_fixture().await;
+    let second = alice.create_group("second roster", &[]).await.unwrap();
+    let second_members = alice.members(&second).unwrap();
+    let before = alice.members(&group).unwrap();
+    let shared = app.shared_storage().unwrap();
+    let mut record = shared.public_directory_user(&bob_id).unwrap().unwrap();
+    record.key_package_json = Some("unreadable json".into());
+    shared.put_public_directory_user(&record).unwrap();
+    let mut expected = before;
+    for member in &mut expected {
+        if member.member_id_hex == bob_id {
+            for device in member.devices.as_mut().unwrap() {
+                device.client_label = None;
+            }
+        }
+    }
+    assert_eq!(alice.members(&group).unwrap(), expected);
+    assert_eq!(
+        alice.group_roster_session(&group).unwrap().members,
+        expected
+    );
+    assert_eq!(
+        alice
+            .group_read_snapshot()
+            .unwrap()
+            .members(&group)
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        alice
+            .group_read_snapshot()
+            .unwrap()
+            .members(&second)
+            .unwrap(),
+        second_members
+    );
+    // A failed advisory store read must also be harmless.
+    let connection = rusqlite::Connection::open(app.shared_storage_path()).unwrap();
+    connection
+        .execute(
+            "UPDATE directory_users SET key_package_json = X'FF' WHERE account_id_hex = ?1",
+            [&bob_id],
+        )
+        .unwrap();
+    assert_eq!(
+        alice
+            .members(&group)
+            .unwrap()
+            .iter()
+            .map(|m| m.devices.as_ref().unwrap().len())
+            .sum::<usize>(),
+        2
+    );
+    // Authoritative failures still fail roster capture.
+    let path = app.account_storage_path("alice");
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let key = app
+        .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let authoritative = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &authoritative,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    authoritative
+        .execute(
+            "UPDATE cgka_groups SET record = 'unreadable json' WHERE id = ?1",
+            [group.as_slice()],
+        )
+        .unwrap();
+    assert!(alice.members(&group).is_err());
+    assert!(alice.group_roster_session(&group).is_err());
+    assert!(alice.group_read_snapshot().is_err());
+}
+
+#[tokio::test]
+async fn member_device_labels_capture_ignores_follow_edges_and_relay_metadata() {
+    let (_dir, app, alice, group, bob_id) = member_device_label_fixture().await;
+    let expected = alice.members(&group).unwrap();
+    let path = app.directory_cache_path("alice");
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let key = app
+        .sqlcipher_key(
+            "alice",
+            &keys,
+            &path,
+            crate::sqlcipher::SqlcipherDatabaseKind::DirectoryCache,
+        )
+        .unwrap();
+    let private = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &private,
+        &key,
+        storage_sqlite::SqlCipherHardening::live_cache(),
+    )
+    .unwrap();
+    private.execute_batch("DROP TABLE directory_user_follows; UPDATE directory_users SET relay_lists_json = 'unreadable json'").unwrap();
+    let connection = rusqlite::Connection::open(app.shared_storage_path()).unwrap();
+    connection.execute("INSERT INTO directory_user_follows (account_id_hex, follow_account_id_hex, position) VALUES (?1, X'FF', 0)", [&bob_id]).unwrap();
+    connection.execute("UPDATE directory_users SET relay_lists_json = 'unreadable json' WHERE account_id_hex = ?1", [&bob_id]).unwrap();
+    assert_eq!(
+        alice
+            .group_read_snapshot()
+            .unwrap()
+            .members(&group)
+            .unwrap(),
+        expected
+    );
+}
+
+#[tokio::test]
+async fn member_device_labels_reuse_validation_until_package_changes() {
+    let (_dir, app, alice, group, bob_id) = member_device_label_fixture().await;
+    let expected = alice.members(&group).unwrap();
+    let warmed = alice
+        .member_device_validation_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        warmed, 2,
+        "each package, including the local publication, validates once"
+    );
+    assert_eq!(
+        alice
+            .group_read_snapshot()
+            .unwrap()
+            .members(&group)
+            .unwrap(),
+        expected
+    );
+    assert_eq!(alice.members(&group).unwrap(), expected);
+    assert_eq!(
+        alice
+            .member_device_validation_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        warmed,
+        "unchanged packages must not be revalidated"
+    );
+    let shared = app.shared_storage().unwrap();
+    let mut record = shared.public_directory_user(&bob_id).unwrap().unwrap();
+    let mut package: DirectoryKeyPackage =
+        serde_json::from_str(record.key_package_json.as_ref().unwrap()).unwrap();
+    package.created_at += 1;
+    package.key_package_hex = "00".into();
+    record.key_package_json = Some(serde_json::to_string(&package).unwrap());
+    shared.put_public_directory_user(&record).unwrap();
+    let members = alice.members(&group).unwrap();
+    assert!(
+        members
+            .iter()
+            .find(|m| m.member_id_hex == bob_id)
+            .unwrap()
+            .devices
+            .as_ref()
+            .unwrap()[0]
+            .client_label
+            .is_none()
+    );
+    assert_eq!(
+        alice
+            .member_device_validation_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        warmed + 1
+    );
+    alice.members(&group).unwrap();
+    assert_eq!(
+        alice
+            .member_device_validation_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        warmed + 1,
+        "unchanged rejected packages must not be revalidated"
+    );
 }

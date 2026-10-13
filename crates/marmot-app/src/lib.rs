@@ -237,7 +237,7 @@ pub use groups::{
     AppInitialGroupImage, AppPreparedGroupImageUpload, AppPreparedGroupImageUploadState,
     AppPriorNostrRoute, AppProtocolProfile, AppQuarantinedGroup, GroupRecoveryStatus,
     GroupRejoinInvitation, GroupSystemEventProvenance, MAX_GROUP_MEMBER_IDS_PAGE_SIZE,
-    PendingGroupInvite, group_system_event_from_message,
+    MemberDevice, PendingGroupInvite, group_system_event_from_message,
 };
 pub use ids::{
     account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
@@ -1249,6 +1249,7 @@ pub struct GroupInviteDeclineResult {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FetchedKeyPackage {
+    pub client_label: Option<String>,
     pub account_id_hex: String,
     pub key_package: KeyPackage,
     pub key_package_id: String,
@@ -1318,6 +1319,7 @@ impl AccountKeyPackageLocalState {
 pub struct AccountKeyPackageInventoryEntry {
     pub record: AccountKeyPackageRecord,
     pub local_state: AccountKeyPackageLocalState,
+    pub is_this_installation: bool,
 }
 
 /// Observed relay history for an account's kind-30443 KeyPackage events.
@@ -1984,6 +1986,9 @@ impl MarmotApp {
         let recovery_loss_imports = open.recovery_loss_imports;
         let audit_v5_enabled = open.runtime.session().audit_v5_enabled();
         let mut client = AppClient {
+            member_device_package_validations: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            member_device_validation_count: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             test_recovery_selection_witness: None,
             audit_v5_probe: audit_v5_enabled.then(client::audit_v5_probe::WelcomeProbe::live),
@@ -5206,6 +5211,7 @@ impl MarmotApp {
                     local: true,
                     relay: false,
                 },
+                is_this_installation: local_state.is_local(),
                 local_state,
             });
         }
@@ -7714,6 +7720,7 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
                 .account_relay_list_status_for_account_id(&account_id_hex)
                 .unwrap_or_else(|_| AccountRelayListStatus::empty());
             let fetched = FetchedKeyPackage {
+                client_label: crate::key_package_records::key_package_client_label(&event),
                 account_id_hex,
                 key_package: publication.key_package.clone(),
                 key_package_id: publication.slot_id.clone(),

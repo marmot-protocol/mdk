@@ -1949,6 +1949,7 @@ typedef struct MarmotAccountKeyPackageList {
 typedef struct MarmotAccountKeyPackageInventoryEntry {
   struct MarmotAccountKeyPackage record;
   enum MarmotAccountKeyPackageLocalState local_state;
+  bool is_this_installation;
 } MarmotAccountKeyPackageInventoryEntry;
 
 /**
@@ -2016,6 +2017,21 @@ typedef struct MarmotMemberRef {
 } MarmotMemberRef;
 
 /**
+ * Canonical group-scoped device, owned and freed by its parent member row.
+ */
+typedef struct MarmotMemberDevice {
+  char *device_id;
+  uint32_t leaf_index;
+  char *client_label;
+  bool has_joined_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t joined_at;
+  bool is_this_installation;
+} MarmotMemberDevice;
+
+/**
  * One member row of the group roster.
  */
 typedef struct MarmotAppGroupMemberRecord {
@@ -2025,6 +2041,12 @@ typedef struct MarmotAppGroupMemberRecord {
    */
   char *account;
   bool local;
+  /**
+   * False means unknown; true means canonical admitted devices (nonempty).
+   */
+  bool has_devices;
+  struct MarmotMemberDevice *devices;
+  uintptr_t devices_len;
 } MarmotAppGroupMemberRecord;
 
 /**
@@ -2165,6 +2187,12 @@ typedef struct MarmotGroupMemberDetails {
   char *member_id_hex;
   char *account;
   bool local;
+  /**
+   * False means unknown; true means canonical admitted devices (nonempty).
+   */
+  bool has_devices;
+  struct MarmotMemberDevice *devices;
+  uintptr_t devices_len;
   bool is_admin;
   bool is_self;
   char *npub;
