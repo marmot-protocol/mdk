@@ -2560,6 +2560,13 @@ impl MarmotApp {
             .query(filters, EVIDENCE_PHASE_BUDGET, deadline)
             .await;
         session.shutdown().await;
+        // Shared request caps can let a noisy relay end the evidence read of
+        // another relay. Never turn that partial read into a durable new Present
+        // selection. Keep verified deletions below: they can still suppress an
+        // already-cached target. Missing evidence is never evidence of absence.
+        if !outcome.completed {
+            candidates.clear();
+        }
         for json in outcome.events_json {
             let Some(event) = parse_verified(&json) else {
                 continue;

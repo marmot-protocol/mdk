@@ -320,6 +320,13 @@ impl PublicEventSocketRegistry {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Cheap pre-dial cancellation/capacity check. Registration rechecks this
+    /// under the same mutex after the connect, since cancellation can race I/O.
+    fn accepts_dials(&self) -> bool {
+        let state = self.lock();
+        !state.closed && state.sockets.len() < MAX_SOCKETS_PER_REQUEST
+    }
+
     /// Adopt a connected socket, or drop it when the registry is closed or full.
     fn register(&self, stream: TcpStream) -> Option<Arc<SocketSlot>> {
         let mut state = self.lock();
@@ -803,6 +810,7 @@ impl PinnedPublicEventTransport {
         // Replacing the SDK transport must not override an authenticated proxy
         // or an invalid-config refusal with a direct pinned socket.
         if !matches!(crate::network_proxy::socks5_proxy(), Ok(None))
+            || !self.sockets.accepts_dials()
             || self.meter.is_exhausted()
             || Instant::now() >= self.deadline
         {
@@ -833,6 +841,9 @@ impl PinnedPublicEventTransport {
         .await
         .map_err(|_| refused())?
         .map_err(SdkError::transport)?;
+        if !self.sockets.accepts_dials() {
+            return Err(refused());
+        }
         let socket = connect_pinned(&addrs, connect_deadline)
             .await
             .map_err(SdkError::transport)?;
@@ -906,6 +917,121 @@ mod tests {
     ) -> Result<Vec<SocketAddr>, PublicEventDialRefused> {
         let url = Url::parse(url).unwrap();
         resolve_relay_addrs_with(&url, allow_loopback, move |_, _| async move { Ok(answer) }).await
+    }
+
+    #[tokio::test]
+    async fn pinned_tls_uses_hostname_for_sni_and_certificate_verification() {
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+        use tokio_tungstenite::Connector;
+        let certificate = rcgen::generate_simple_self_signed(vec!["relay.example".into()]).unwrap();
+        let der = certificate.cert.der().clone();
+        let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![der.clone()],
+            PrivatePkcs8KeyDer::from(certificate.signing_key.serialize_der()).into(),
+        )
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        for (hostname, trust_test_root, succeeds) in [
+            ("relay.example", true, true),
+            ("wrong.example", true, false),
+            ("relay.example", false, false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let acceptor = acceptor.clone();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                if let Ok(tls) = acceptor.accept(socket).await {
+                    let sni = tls.get_ref().1.server_name().map(str::to_owned);
+                    if let Ok(mut ws) = tokio_tungstenite::accept_async(tls).await {
+                        let _ = ws.close(None).await;
+                        return sni;
+                    }
+                }
+                None
+            });
+            let deadline = Instant::now() + Duration::from_secs(3);
+            // No DNS lookup: the socket dials the admitted address, while the
+            // unchanged URL supplies the distinct certificate name and SNI.
+            let socket = connect_pinned(&[addr], deadline).await.unwrap();
+            let registry = PublicEventSocketRegistry::new();
+            let slot = registry.register(socket).unwrap();
+            let meter = PublicEventTrafficMeter::new(limits(16, 4 * 1024 * 1024, 64));
+            let io = PinnedSocketIo::new(slot, PublicEventPhaseRoute::new(&meter), deadline);
+            let connector = if trust_test_root {
+                let mut roots = rustls::RootCertStore::empty();
+                roots.add(der.clone()).unwrap();
+                let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+                Some(Connector::Rustls(Arc::new(config)))
+            } else {
+                // Production default: the explicit rustls-tls-webpki-roots
+                // workspace feature must reject this self-signed certificate.
+                None
+            };
+            let result = timeout_at(
+                deadline,
+                tokio_tungstenite::client_async_tls_with_config(
+                    format!("wss://{hostname}:{}", addr.port()),
+                    io,
+                    Some(public_event_websocket_config()),
+                    connector,
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), succeeds);
+            drop(result);
+            registry.close_all();
+            let sni = timeout_at(deadline, server).await.unwrap().unwrap();
+            if succeeds {
+                assert_eq!(sni.as_deref(), Some(hostname));
+            }
+            assert!(
+                meter.bytes() > 0,
+                "TLS handshake traffic is metered below TLS"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_registry_refuses_dial_before_tcp_connect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let registry = PublicEventSocketRegistry::new();
+        registry.close_all();
+        let request = PublicEventTrafficMeter::new(limits(16, 4 * 1024 * 1024, 64));
+        let transport = PinnedPublicEventTransport::new(
+            RelaySafetyPolicy::with_allow_loopback(true),
+            PublicEventPhaseRoute::new(&request),
+            registry,
+            Instant::now() + Duration::from_secs(2),
+        );
+        assert!(
+            transport
+                .dial(&format!("ws://{}", listener.local_addr().unwrap()))
+                .await
+                .is_err()
+        );
+        assert!(
+            timeout_at(
+                Instant::now() + Duration::from_millis(100),
+                listener.accept()
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(request.bytes(), 0);
     }
 
     #[tokio::test]

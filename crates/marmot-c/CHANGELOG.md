@@ -56,8 +56,6 @@ status values are appended. See the [client upgrade guide](../../docs/integratio
   `marmot_media_file_transfer_control_*` and
   `marmot_max_file_media_ciphertext_bytes`. New symbols and borrowed input records require
   matching headers/libraries; existing byte-array APIs retain their bounds.
-
-
 - Add `marmot_propose_onboarding_relay_repair` and nested typed relay-repair
   preview records. `MarmotOnboardingRepairProposal` gains an optional
   `relay_repair` pointer; regenerate and recompile with the matching header

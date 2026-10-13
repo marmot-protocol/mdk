@@ -76,6 +76,9 @@ url.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
+rustls.workspace = true
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 criterion.workspace = true
 keyring-core.workspace = true
 marmot-forensics.workspace = true

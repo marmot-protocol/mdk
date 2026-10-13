@@ -8,7 +8,7 @@ use crate::{
 const COALESCED_REFRESH_WAIT: Duration = Duration::from_secs(12);
 
 impl MarmotAppRuntime {
-    /// Synchronous, network-free cached reads for first-frame host state.
+    /// Synchronous, network-free cached reads for host state.
     ///
     /// Returns exactly one result per input, duplicates included, in input
     /// order. The whole request (at most 16 references) is validated before
@@ -17,6 +17,9 @@ impl MarmotAppRuntime {
     /// `Busy` (retryable) rather than waiting or reporting `Missing`. A local
     /// preview operation blocks only the same account's synchronous cache read. Never
     /// sleeps, blocks on an async lock, or enters the async runtime.
+    /// A cold call may synchronously access the keystore, open SQLCipher and
+    /// migrate/verify the cache. Hosts should warm it off the UI thread before
+    /// relying on a first-frame read; network-free does not mean storage-free.
     pub fn cached_public_event_previews(
         &self,
         account_ref: &str,

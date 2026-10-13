@@ -134,10 +134,18 @@ The runtime owns these local SQLite stores:
   recomputes every retained field from stored lengths. Cached reads perform no network I/O; the bounded refresh dials
   through a request-owned transport that validates and pins every resolved relay address, charges raw received wire
   bytes below TLS/WebSocket parsing to one request budget, and force-closes its sockets at the request deadline.
+  An evidence read that is truncated, disconnected or over budget cannot admit newly fetched target content;
+  verified deletions can still suppress already-cached targets. A noisy relay may deny refresh availability, never
+  turn a partial deletion read into durable new content. Relay completion does not prove complete history or honesty.
+  A cold synchronous cached read may open SQLCipher and access the keystore; warm it off the UI thread for first-frame
+  use. Contention returns `Busy`, never a false miss.
   Schema 1 migrates in place in one transaction; the unreleased schemas 2 and 3 and any unknown schema fail closed and
   are never recreated. Resolved author metadata goes only to the
   same account's un-promoted directory search-graph tier. It uses a separate key domain, closes with app storage and
   is removed with the account. See [the host integration contract](../marmot-uniffi/README.md#verified-public-event-previews).
+  The schema-1 upgrade retains caches from earlier pre-release builds. Unknown/future schemas and failed provenance
+  checks retain their evidence for diagnosis rather than silently erasing deletion knowledge. Changing the cache's
+  SQLCipher key requires a coordinated cache/provenance migration; rekeying only the encrypted file is insufficient.
 - **Per-account directory cache** (`accounts/<label>/app-cache.sqlite3`, SQLCipher): the Nostr user directory —
   local-account links, profile metadata, follow-list caches, bounded search-graph edges, discovered user relay lists,
   and KeyPackages. A root-level `app-cache.sqlite3` is a legacy location that is migrated and then removed.

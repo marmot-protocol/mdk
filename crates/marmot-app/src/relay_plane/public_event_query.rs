@@ -20,8 +20,8 @@ use std::time::Duration;
 
 use cgka_traits::TransportEndpoint;
 use nostr_sdk::prelude::{
-    AcquisitionLimits, Client as NostrSdkClient, EventId, Filter, Kind, PublicKey, RelayUrl,
-    ReqTarget, SingleLetterTag,
+    AcquisitionEnd, AcquisitionLimits, Client as NostrSdkClient, EventId, Filter, Kind, PublicKey,
+    RelayUrl, ReqTarget, SingleLetterTag,
 };
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout_at};
@@ -70,6 +70,9 @@ pub(crate) struct PublicEventQueryBudget {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PublicEventQueryOutcome {
+    /// Every connected relay satisfied the request exit policy without traffic
+    /// exhaustion. This is not proof of historical completeness or relay honesty.
+    pub(crate) completed: bool,
     /// Distinct serialized events in arrival order, within the budget.
     pub(crate) events_json: Vec<String>,
     /// Raw `EVENT` envelopes this phase received, duplicates, invalid and
@@ -210,7 +213,9 @@ impl PublicEventQuerySession {
             PublicEventTrafficLimits {
                 max_items: budget.max_items,
                 max_bytes: budget.max_bytes,
-                max_messages: usize::MAX,
+                // Reserve half of the request's control-message allowance for
+                // the other phase, just as we reserve items and wire bytes.
+                max_messages: 32,
             },
         );
         self.route.route_to(&phase);
@@ -234,6 +239,7 @@ impl PublicEventQuerySession {
         .await;
         outcome.received_items = phase.items();
         outcome.received_bytes = phase.bytes();
+        outcome.completed &= !phase.is_exhausted();
         if phase.is_exhausted() {
             self.sockets.close_open_sockets();
             // Cancel the SDK's automatic reconnect/backoff before the next phase
@@ -349,6 +355,11 @@ async fn acquire(
     let Ok(report) = handle.finish().await else {
         return;
     };
+    outcome.completed = report.relays.len() == connected.len()
+        && report
+            .relays
+            .values()
+            .all(|relay| matches!(relay.end, AcquisitionEnd::Completed));
     let mut retained_bytes = 0usize;
     for relay in report.relays.values() {
         for event in &relay.events {
@@ -358,6 +369,7 @@ async fn acquire(
             }
             retained_bytes = retained_bytes.saturating_add(json.len());
             if outcome.events_json.len() >= budget.max_items || retained_bytes > budget.max_bytes {
+                outcome.completed = false;
                 return;
             }
             outcome.events_json.push(json);

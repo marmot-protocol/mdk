@@ -1340,6 +1340,93 @@ fn eviction_removes_whole_cohorts_and_documents_the_end_of_deletion_knowledge() 
 }
 
 #[tokio::test]
+async fn truncated_deletion_read_never_admits_a_new_target() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let keys = Keys::generate();
+    let note = signed(&keys, 1, crate::unix_now_seconds(), "deleted content");
+    let reference = super_reference(&note);
+    let note_json = note.as_json();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let mut sockets = tokio::task::JoinSet::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            let note_json = note_json.clone();
+            sockets.spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(socket).await else {
+                    return;
+                };
+                while let Some(Ok(message)) = ws.next().await {
+                    let Ok(text) = message.to_text() else {
+                        continue;
+                    };
+                    let Ok(request) = serde_json::from_str::<serde_json::Value>(text) else {
+                        continue;
+                    };
+                    if request[0] != "REQ" {
+                        continue;
+                    }
+                    let subscription = request[1].as_str().unwrap();
+                    if request[2]["ids"].is_array() {
+                        let target = format!("[\"EVENT\",\"{subscription}\",{note_json}]");
+                        if ws.send(Message::text(target)).await.is_err() {
+                            return;
+                        }
+                        if ws
+                            .send(Message::text(
+                                serde_json::json!(["EOSE", subscription]).to_string(),
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    } else {
+                        // The target was fetched successfully, but one noisy
+                        // relay consumes the reserved evidence allowance.
+                        for _ in 0..65 {
+                            if ws
+                                .send(Message::text("[\"NOTICE\",\"noise\"]"))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), &url);
+    let candidates = app
+        .fetch_public_event_candidates(&reference, &[], None)
+        .await;
+    server.abort();
+    let _ = server.await;
+    let (_cache_dir, cache) = fixture();
+    assert!(
+        candidates.is_empty(),
+        "incomplete evidence must discard newly fetched content"
+    );
+    assert!(matches!(
+        cache
+            .admit_state(&reference, &candidates, crate::unix_now_seconds())
+            .unwrap(),
+        PublicEventCacheResult::Missing
+    ));
+    assert!(
+        cache
+            .lookup(&reference, crate::unix_now_seconds())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn target_and_evidence_queries_reuse_the_same_relay_connection() {
     use futures::{SinkExt, StreamExt};
     use std::sync::atomic::{AtomicUsize, Ordering};
