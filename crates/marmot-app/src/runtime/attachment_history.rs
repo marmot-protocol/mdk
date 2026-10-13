@@ -66,7 +66,7 @@ pub(crate) fn category(media_type: &str) -> AttachmentCategory {
 }
 
 /// Preserve the parser verdict and derive presentation role from source-owned emoji metadata.
-fn present(
+pub(super) fn present(
     entry: storage_sqlite::AttachmentHistoryEntry,
     allow_loopback: bool,
 ) -> Result<AttachmentEntry, AppError> {

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- Account-wide attachment candidate pages, group/sender/date queries and opaque account/query-bound cursor/version handles. Filtered empty pages can continue; source changes require restart. Existing group history and acquisition primitives are unchanged.
+
+### Fixed
+
 - Edit failures preserve distinct invalid-target and retryable rate-limit outcomes across the runtime, native bindings and connector. Retained edits in permanently missing groups reject instead of deferring forever; uncertain lookup failures use bounded group retry backoff.
 
 - `Marmot::send_prepared_media_with_client_token` exposes captured ordinary-media admission with transactional conditional draft consumption. Use the original token and revision for live retries, recover ownership by token after interruption, and pair regenerated Swift/Kotlin bindings with the matching library. See [local sends](LOCAL-SENDS.md).
