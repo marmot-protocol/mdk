@@ -69,6 +69,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+storage-sqlite = { workspace = true, features = ["test-support"] }
 tokio-tungstenite.workspace = true
 keyring-core.workspace = true
 marmot-forensics.workspace = true

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- `AppError` adds `GroupCatchingUp`; update exhaustive matches.
+- `AttachmentTransferState` adds `StorageBlocked`: free disk cannot cover the
+  publication reserve for the body. Update exhaustive matches; the job keeps
+  its checkpoint and readmits once space frees or on explicit Retry.
+
 ### Added
 
 - Account-wide local attachment pages expose bounded typed metadata, group/sender/date selection, continuation cursors and retention deadlines. Reads start no acquisition or relay activity.
@@ -11,6 +18,54 @@
 - Edit failures preserve distinct invalid-target and retryable rate-limit outcomes across the runtime, native bindings and connector. Retained edits in permanently missing groups reject instead of deferring forever; uncertain lookup failures use bounded group retry backoff.
 
 - `MarmotAppRuntime::submit_prepared_media_snapshot` admits the captured ordinary-media payload with a stable token and consumes only its unchanged captured draft in the same transaction. Newer or cleared drafts cannot replace the payload or block admission.
+
+- `MarmotAppRuntime::acknowledge_group_catching_up` records that the user accepts the fork risk of changing a group that is still catching up, so the next group change at the current epoch proceeds.
+
+### Fixed
+
+- Group changes fail with `AppError::GroupCatchingUp` while unresolved epoch-gap recovery (pending, parked or with its notice dismissed) covers the group's current local epoch. Before, a device that knew the group had moved on could still commit from its stale epoch and fork the group (mdk#2258). The check is advisory: after the user accepts the risk, `acknowledge_group_catching_up` lets the change through. Due self-updates wait up to 24 hours for the gap to close. Messages and leave are not affected.
+- A failed or cancelled transport activation no longer leaves untracked REQs
+  live on the relay. They used to stay open until disconnect, be re-sent on
+  every reconnect, and use up the relay's per-connection subscription limit
+  until the account's own subscriptions were refused (#2262).
+- A live replay that a relay cut short at its default page (500 events on
+  strfry) no longer counts as complete coverage. The relay's stored history is
+  paged backwards before its end-of-stored-events counts, so older events in
+  the replay window are no longer skipped (#2263).
+- An explicit attachment download the device lacks room to publish no longer
+  retries forever. The publication reserve (disk reserve plus four times the
+  plaintext) is checked as soon as a response declares the size, as a body
+  grows, and before the completed-body receipt, counting the staging,
+  checkpoint and decrypted-file bytes the attempt itself still has to write.
+  A shortage, or a database that reports it is full while publishing, parks
+  the job as `AttachmentTransferState::StorageBlocked` with its ciphertext
+  checkpoint instead of scheduling a timer, recording the free space it needs
+  in the worker's own frame. The worker readmits it once free space exceeds
+  that by 4 MiB and admission would pass; a job that parks again waits out its
+  park streak (15 s doubling to an hour), and explicit Retry readmits at once.
+  With a strong validator the in-memory sink publishes a checkpointed body
+  without another request and the file sink re-requests at most its unsaved
+  tail; without one both start over. A full database records at least the free
+  space seen at the refusal plus the body and withdraws the completed-body
+  receipt. If even the park write fails, the error is returned and the lease
+  recovers the job. Parked checkpoints keep their quota reservation for at
+  most seven days after the latest park. Explicit bodies between the transfer
+  limit and 512 MiB now take the file sink and need the reserve plus five
+  bodies free (six with a strong validator) instead of about four, because
+  their staging and checkpoint copies are counted (#2239).
+- Receiving an attachment no longer holds several copies of it in native
+  memory. The body buffer is reserved once from the declared length (an
+  undeclared length grows geometrically to half the transfer limit and then
+  once to the limit, so the buffer never exceeds the limit and the copy while
+  it grows holds at most 1.5 times it; a failed reservation is a transient
+  failure, not an abort), decrypted in place, explicit downloads above the
+  automatic transfer limit stream through the existing private file sink, and
+  in-memory publication stores a body larger than one 64 KiB staging chunk as
+  chunk rows, so SQLite keeps no bind, record or trigger-rewrite copy of it.
+  Integrity checks, resume and retention behavior are unchanged (#2241).
+- Self-update maintenance commits now publish through the same durable frozen fanout as every other commit. They still confirm on the first relay acknowledgement, and the app's fanout retry schedule keeps retrying every group relay that missed them. Self-updates staged before upgrading finish on their legacy record, which no longer stops retrying when its post-confirmation marker write fails.
+- Every publish pass, including secondary retries after a commit confirmed, writes `publish_attempt` and `publish_outcome` audit rows with the endpoints attempted, accepted and failed in that pass.
+- A relay still pending when a multi-relay signed publish meets quorum is now reported as `publish acknowledgement unknown` instead of being dropped from the outcome.
 
 ## 0.13.0 - 2026-10-12
 

@@ -98,6 +98,36 @@ pub(crate) use sync::{
 
 #[cfg(test)]
 const CREATE_GROUP_LOOKUP_CONCURRENCY: usize = 8;
+/// How long a due self-update waits for unresolved epoch-gap recovery before
+/// it proceeds anyway (mdk#2258). Periodic rotation runs every 24 to 36 days,
+/// so a day's delay costs little, while the bound keeps forged gap evidence
+/// from suppressing rotation.
+const EPOCH_GAP_SELF_UPDATE_HOLD_MS: u64 = 24 * 60 * 60 * 1_000;
+
+fn self_update_waits_for_epoch_gap(open_since_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(open_since_ms) < EPOCH_GAP_SELF_UPDATE_HOLD_MS
+}
+
+#[cfg(test)]
+mod epoch_gap_hold_tests {
+    use super::{EPOCH_GAP_SELF_UPDATE_HOLD_MS, self_update_waits_for_epoch_gap};
+
+    /// mdk#2258: forged gap evidence can delay automatic rotation by at most
+    /// the bound, never suppress it.
+    #[test]
+    fn self_update_waits_for_an_epoch_gap_only_within_the_bound() {
+        let since = 1_000_000;
+        assert!(self_update_waits_for_epoch_gap(since, since));
+        assert!(self_update_waits_for_epoch_gap(
+            since,
+            since + EPOCH_GAP_SELF_UPDATE_HOLD_MS - 1
+        ));
+        assert!(!self_update_waits_for_epoch_gap(
+            since,
+            since + EPOCH_GAP_SELF_UPDATE_HOLD_MS
+        ));
+    }
+}
 #[cfg(test)]
 const INVITE_LOOKUP_CONCURRENCY: usize = CREATE_GROUP_LOOKUP_CONCURRENCY;
 
@@ -839,6 +869,11 @@ pub struct AppClient {
     /// (see `Self::drain_epoch_stall_escalations`).
     pub(crate) pending_epoch_stall_escalations: Vec<crate::EpochStallEscalation>,
     pub(crate) pending_convergence_groups: HashSet<GroupId>,
+    /// Groups whose epoch-gap hold the user explicitly accepted, with the
+    /// local epoch they accepted it at (mdk#2258). An acknowledgement admits
+    /// one group change attempt at that epoch only. Process-local: a rebuilt
+    /// client asks again.
+    pub(crate) stale_commit_acknowledgements: HashMap<GroupId, cgka_traits::EpochId>,
     /// Batch-start local-deletion frontiers crossed by authenticated fresh
     /// activity. They remain pending until the crossing projection and marker
     /// clears commit in the same account-state transaction.
@@ -1354,7 +1389,8 @@ impl AppClient {
             "sweep",
             crate::ProductUnit::Attempt,
         );
-        let effects = self.runtime.run_due_maintenance().await;
+        let held = self.epoch_gap_held_groups()?;
+        let effects = self.runtime.run_due_maintenance_holding(&held).await;
         let mut activity = self.runtime.take_maintenance_activity();
         activity.absorb(previous);
         // Timed executions replace their matching count-only sample, never add
@@ -2730,6 +2766,7 @@ impl AppClient {
         telemetry: Option<&AppPerformanceTelemetry>,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
+        self.ensure_group_caught_up(group_id)?;
 
         let key_package_started_at = Instant::now();
         let requirements = self
@@ -2995,6 +3032,7 @@ impl AppClient {
         member_refs: &[&str],
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
+        self.ensure_group_caught_up(group_id)?;
         let mut members = Vec::with_capacity(member_refs.len());
         for member in member_refs {
             members.push(self.app.member_id(member)?);
@@ -3075,6 +3113,7 @@ impl AppClient {
         group_id: &GroupId,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
+        self.ensure_group_caught_up(group_id)?;
         let audit_context = Self::local_human_action_context(
             "enable_group_disbanding",
             vec!["lifecycle"],
@@ -3132,6 +3171,7 @@ impl AppClient {
         group_id: &GroupId,
     ) -> Result<AppDisbandRequest, AppError> {
         self.ensure_group(group_id)?;
+        self.ensure_group_caught_up(group_id)?;
         let audit_context = Self::local_human_action_context(
             "disband_group",
             vec!["lifecycle", "membership", "admins"],
@@ -3827,6 +3867,7 @@ impl AppClient {
         audit_context: AuditEventContext,
         wake_targets: &[String],
     ) -> Result<SendSummary, AppError> {
+        self.ensure_group_caught_up(group_id)?;
         let component = AppGroupAdminPolicyComponent::new(admins).to_app_component_data()?;
 
         self.sync_runtime_groups().await?;
@@ -3876,6 +3917,7 @@ impl AppClient {
     ) -> Result<SendSummary, AppError> {
         validate_app_component(component_id, &data)?;
         self.ensure_group(group_id)?;
+        self.ensure_group_caught_up(group_id)?;
         self.sync_runtime_groups().await?;
         // `required_capabilities` is read out of the MLS GroupContext, not
         // from local config, so any admin in the group can mark an
@@ -3948,6 +3990,7 @@ impl AppClient {
         disappearing_message_secs: u64,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
+        self.ensure_group_caught_up(group_id)?;
         let component = AppGroupMessageRetentionComponent::new(disappearing_message_secs)
             .to_app_component_data()?;
         let audit_context = Self::local_human_action_context(
@@ -3984,6 +4027,7 @@ impl AppClient {
         endpoints: Vec<AppBlobEndpoint>,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
+        self.ensure_group_caught_up(group_id)?;
         let endpoint_count = endpoints.len() as u64;
         let mut allowed_locator_kinds = Vec::new();
         for endpoint in &endpoints {
@@ -4059,6 +4103,7 @@ impl AppClient {
         thumbhash: Option<String>,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
+        self.ensure_group_caught_up(group_id)?;
         let component = match url {
             Some(url) if !url.is_empty() => {
                 AppGroupAvatarUrlComponent::new(url, dim, thumbhash)?.to_app_component_data()?
@@ -5624,6 +5669,7 @@ impl AppClient {
         media_type: &str,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group_application_messages_allowed(group_id)?;
+        self.ensure_group_caught_up(group_id)?;
         let audit_context = Self::local_human_action_context(
             "update_group_image",
             vec!["image"],
@@ -5968,6 +6014,7 @@ impl AppClient {
         }
         validate_group_profile(name.unwrap_or(""), description.unwrap_or(""))?;
         self.ensure_group(group_id)?;
+        self.ensure_group_caught_up(group_id)?;
         let mut fields = Vec::new();
         if name.is_some() {
             fields.push("name");
@@ -6023,6 +6070,93 @@ impl AppClient {
         } else {
             Err(AppError::UnknownGroup(group_id_hex))
         }
+    }
+
+    /// Refuse a group change while unresolved epoch-gap recovery says the
+    /// group moved past this device's local epoch (mdk#2258). A commit
+    /// authored from that epoch forks the group, and fork choice can then
+    /// rewind everyone else's history onto it. The pre-send sync only
+    /// re-registers subscriptions, so it cannot prove the device caught up.
+    ///
+    /// The gate is advisory: the evidence behind an epoch gap is
+    /// undecryptable traffic anyone can mint, so it must never wedge a group.
+    /// [`Self::acknowledge_group_catching_up`] lets the user accept the fork
+    /// risk for the current epoch. Without that, the gate lifts when recovery
+    /// clears the gap or the device leaves the stalled epoch. Dismissing the
+    /// history notice accepts missing history, not fork risk, so it does not
+    /// lift the gate.
+    ///
+    /// Application messages and leave are not gated: neither commits.
+    fn ensure_group_caught_up(&mut self, group_id: &GroupId) -> Result<(), AppError> {
+        let epoch = self.runtime.group_record(group_id)?.epoch;
+        // An acknowledgement admits exactly one attempt: consumed here even if
+        // the change then fails, so a different change asks again.
+        let acknowledged = self.stale_commit_acknowledgements.remove(group_id) == Some(epoch);
+        if self.epoch_gap_open_since(group_id, epoch)?.is_none() {
+            return Ok(());
+        }
+        if acknowledged {
+            tracing::info!(
+                target: "marmot_app::client",
+                method = "ensure_group_caught_up",
+                "user accepted fork risk for a group change while catching up"
+            );
+            return Ok(());
+        }
+        tracing::info!(
+            target: "marmot_app::client",
+            method = "ensure_group_caught_up",
+            "group change refused while epoch-gap recovery is unresolved"
+        );
+        Err(AppError::GroupCatchingUp(hex::encode(group_id.as_slice())))
+    }
+
+    /// Record that the user accepts the fork risk of changing a group that is
+    /// still catching up, after [`AppError::GroupCatchingUp`]. The next group
+    /// change attempt at the current local epoch proceeds; the attempt
+    /// consumes the acknowledgement whether or not it commits. Returns `false`, recording
+    /// nothing, when the group is not catching up.
+    pub fn acknowledge_group_catching_up(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
+        self.ensure_group(group_id)?;
+        let epoch = self.runtime.group_record(group_id)?.epoch;
+        if self.epoch_gap_open_since(group_id, epoch)?.is_none() {
+            self.stale_commit_acknowledgements.remove(group_id);
+            return Ok(false);
+        }
+        self.stale_commit_acknowledgements
+            .insert(group_id.clone(), epoch);
+        Ok(true)
+    }
+
+    /// When unresolved epoch-gap recovery first covered this group's `epoch`.
+    fn epoch_gap_open_since(
+        &self,
+        group_id: &GroupId,
+        epoch: cgka_traits::EpochId,
+    ) -> Result<Option<u64>, AppError> {
+        Ok(self
+            .app
+            .account_storage(&self.state.label)?
+            .epoch_gap_recovery_open_since(group_id.as_slice(), epoch.0)?)
+    }
+
+    /// Groups whose due self-updates wait for epoch-gap recovery. Automatic
+    /// rotation has nobody to ask, so the hold is bounded by
+    /// [`EPOCH_GAP_SELF_UPDATE_HOLD_MS`]: forged gap evidence can delay
+    /// rotation but never suppress it.
+    fn epoch_gap_held_groups(&self) -> Result<Vec<GroupId>, AppError> {
+        let now_ms = recovery::wall_now_ms()?;
+        let mut held = Vec::new();
+        for group_id in self.runtime.live_group_ids()? {
+            let epoch = self.runtime.group_record(&group_id)?.epoch;
+            if self
+                .epoch_gap_open_since(&group_id, epoch)?
+                .is_some_and(|since| self_update_waits_for_epoch_gap(since, now_ms))
+            {
+                held.push(group_id);
+            }
+        }
+        Ok(held)
     }
 
     /// Fail before optimistic projection, media upload, or any other

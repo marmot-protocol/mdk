@@ -180,13 +180,17 @@ async fn dispatch_hosted_runtime_command(
         crate::Command::UsageDiagnostics { command } => {
             crate::usage_diagnostics_command(runtime, command)
         }
-        crate::Command::Group { command } => {
+        crate::Command::Group {
+            command,
+            accept_stale,
+        } => {
             crate::commands::groups::group_command_with_runtime(
                 &account_home,
                 &app,
                 runtime,
                 command,
                 cli.account.clone(),
+                accept_stale,
             )
             .await
         }
@@ -200,13 +204,17 @@ async fn dispatch_hosted_runtime_command(
             )
             .await
         }
-        crate::Command::Groups { command } => {
+        crate::Command::Groups {
+            command,
+            accept_stale,
+        } => {
             crate::commands::groups::groups_command_with_runtime(
                 &account_home,
                 &app,
                 runtime,
                 command,
                 cli.account.clone(),
+                accept_stale,
             )
             .await
         }

@@ -193,6 +193,10 @@ pub enum MarmotKitError {
     /// group was disbanded.
     #[error("this device was removed from group {group_id_hex}")]
     GroupRemoved { group_id_hex: String },
+    /// The group moved past this device and recovery has not caught it up.
+    /// Group changes would fork it, so they wait; retry once it has synced.
+    #[error("group {group_id_hex} is still catching up on missed changes")]
+    GroupCatchingUp { group_id_hex: String },
     #[error("member {member_id_hex} is not in group {group_id_hex}")]
     MemberNotInGroup {
         group_id_hex: String,
@@ -449,6 +453,9 @@ impl From<&AppError> for MarmotKitError {
                 group_id_hex: group_id_hex.clone(),
             },
             AppError::GroupRemoved(group_id_hex) => Self::GroupRemoved {
+                group_id_hex: group_id_hex.clone(),
+            },
+            AppError::GroupCatchingUp(group_id_hex) => Self::GroupCatchingUp {
                 group_id_hex: group_id_hex.clone(),
             },
             AppError::MessageDraftRevisionConflict => Self::MessageDraftRevisionConflict,

@@ -726,6 +726,12 @@ c_cmd! {
     /// `marmot_group_app_component_free`.
     async fn marmot_group_app_component(account_ref: str, group_id_hex: str, component_id: val u16) -> opt_rec(MarmotGroupAppComponent) = group_app_component;
 
+    /// After a group change returns `MARMOT_STATUS_GROUP_CATCHING_UP`, record
+    /// that the user accepts the risk of splitting the group, then retry the
+    /// change. Admits one attempt at the current epoch, consumed even if it
+    /// fails; not persisted. Writes false when the group is not catching up.
+    async fn marmot_acknowledge_group_catching_up(account_ref: str, group_id_hex: str) -> scalar(bool) = acknowledge_group_catching_up;
+
     /// Query advisory membership health and pending rejoin offers.
     /// Free with `marmot_group_recovery_status_free`.
     async fn marmot_group_recovery_status(account_ref: str, group_id_hex: str) -> rec(MarmotGroupRecoveryStatus) = group_recovery_status;

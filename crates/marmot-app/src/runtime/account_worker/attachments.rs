@@ -135,6 +135,17 @@ fn retry_at(storage: &SqliteAccountStorage, job: &AttachmentAcquisition, now: u6
     )
 }
 
+/// The scheduler's clock. Tests may pin it per account directory to cross
+/// readmission backoffs without sleeping; transfers, leases and publication
+/// keep wall time.
+#[cfg_attr(not(test), allow(unused_variables))]
+fn scheduler_now(client: &AppClient) -> u64 {
+    let now = crate::unix_now_seconds();
+    #[cfg(test)]
+    let now = test_clock::adjust(&client.app.account_dir(&client.state.label), now);
+    now
+}
+
 pub(super) fn schedule(
     client: &AppClient,
     shared: &RuntimeSharedServices,
@@ -148,7 +159,7 @@ pub(super) fn schedule(
         return Ok(false);
     }
     let storage = client.app.account_storage(&client.state.label)?;
-    let now = crate::unix_now_seconds();
+    let now = scheduler_now(client);
     // Abandoned ciphertext expires even after automatic acquisition is disabled.
     let partials = storage.prune_attachment_partials(now, 64)?;
     let orphan_uploads = storage
@@ -212,7 +223,28 @@ pub(super) fn schedule(
         admission.waiting = None;
         return Ok(more);
     }
-    let free = fs4::available_space(client.app.account_dir(&client.state.label)).unwrap_or(0);
+    let free = crate::media::attachment_resume::available_space(
+        &client.app.account_dir(&client.state.label),
+    )
+    .ok();
+    // Jobs parked for disk space rejoin the due page only once the device can
+    // publish them; their checkpoints make the readmitted attempt local work.
+    // Unknown free space readmits nothing, as it admits nothing below.
+    let readmitted = match free {
+        Some(free) => storage.readmit_storage_blocked_attachments(
+            now,
+            policy.disk_reserve,
+            free,
+            policy.transfer_limit,
+            policy.automatic,
+        )?,
+        None => 0,
+    };
+    if readmitted > 0 {
+        shared.attachment_updates.send_modify(|_| {});
+    }
+    let more = more || readmitted == ATTACHMENT_ACQUISITION_BATCH_LIMIT;
+    let free = free.unwrap_or(0);
     let candidates = storage.attachment_transfer_candidates(now, 32, policy.automatic)?;
     if candidates.is_empty() {
         admission.waiting = None;
@@ -414,12 +446,48 @@ pub(super) fn complete_acquired(
 ) -> Result<(), AppError> {
     let storage = client.app.account_storage(&client.state.label)?;
     let fallback = super::super::attachment_controls::default_policy(&client.app.config);
-    complete_acquired_stored(&storage, &fallback, job, result, byte_budget, &|| false)
+    complete_acquired_stored(
+        &storage,
+        &fallback,
+        &client.app.account_dir(&client.state.label),
+        job,
+        result,
+        byte_budget,
+        &|| false,
+    )
 }
 
+/// Headroom a job records when the database reports it is full while
+/// publishing a `plaintext`-byte body. The disk itself is the likely cause, so
+/// the target is the publication reserve a retried attempt needs in the
+/// worker's frame (`multiple` bodies), but never less than the free space
+/// measured at the refusal plus one more body: readmission then waits until
+/// the volume has actually gained room, rather than refetching into the same
+/// full database whenever free space looked sufficient. `held` is staging this
+/// attempt still occupies at the measurement, which the worker frame does not.
+fn full_database_headroom(
+    directory: &std::path::Path,
+    policy: &storage_sqlite::AttachmentDownloadPolicy,
+    plaintext: u64,
+    multiple: u64,
+    held: u64,
+) -> u64 {
+    let required = plaintext.saturating_mul(multiple);
+    match crate::media::attachment_resume::available_space(directory) {
+        Ok(free) => required.max(
+            free.saturating_add(held)
+                .saturating_sub(policy.disk_reserve)
+                .saturating_add(plaintext),
+        ),
+        Err(_) => required,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn complete_acquired_stored(
     storage: &SqliteAccountStorage,
     fallback: &storage_sqlite::AttachmentDownloadPolicy,
+    directory: &std::path::Path,
     job: &AttachmentAcquisition,
     result: Result<crate::client::AcquiredMediaBody, AttachmentDownloadFailure>,
     byte_budget: u64,
@@ -442,6 +510,15 @@ pub(super) fn complete_acquired_stored(
                 Err(cgka_traits::StorageError::InvalidAttachmentBody(_)) => {
                     storage.fail_attachment_acquisition(job, None)?;
                 }
+                // The database itself ran out of room: park, never retry on a
+                // timer. A retried file attempt stages the body again before
+                // publishing it, so it needs five bodies; the decrypted file
+                // this attempt still holds is released before the worker looks.
+                Err(cgka_traits::StorageError::Capacity(_)) => {
+                    let headroom =
+                        full_database_headroom(directory, &policy, file.len, 5, file.len);
+                    storage.block_attachment_storage(job, headroom, now)?;
+                }
                 _ => {
                     storage.fail_attachment_acquisition(job, Some(retry_at(storage, job, now)))?;
                 }
@@ -457,6 +534,13 @@ pub(super) fn complete_acquired_stored(
             let byte_budget = byte_budget.min(policy.retained_bytes);
             match storage.complete_attachment_acquisition(job, &plaintext, now, byte_budget) {
                 Ok(AttachmentPublishResult::Published | AttachmentPublishResult::Superseded) => {}
+                // A full database parks like a failed free-space check would;
+                // the in-memory sink holds no staging on disk.
+                Err(cgka_traits::StorageError::Capacity(_)) => {
+                    let headroom =
+                        full_database_headroom(directory, &policy, plaintext.len() as u64, 4, 0);
+                    storage.block_attachment_storage(job, headroom, now)?;
+                }
                 Ok(AttachmentPublishResult::CapacityBlocked) | Err(_) => {
                     storage.fail_attachment_acquisition(job, Some(retry_at(storage, job, now)))?;
                 }
@@ -467,6 +551,11 @@ pub(super) fn complete_acquired_stored(
         }
         Err(AttachmentDownloadFailure::SizeLimit(_, limit)) => {
             storage.block_attachment_size_policy(job, limit, now)?;
+        }
+        // Disk, not the network, is the blocker: park with the checkpoint until
+        // free space covers the reserve or the user retries, never on a timer.
+        Err(AttachmentDownloadFailure::StorageBlocked { headroom }) => {
+            storage.block_attachment_storage(job, headroom, now)?;
         }
         Err(AttachmentDownloadFailure::Stop(_)) => {
             storage.fail_attachment_acquisition(job, None)?;
@@ -491,6 +580,36 @@ fn complete(
         result.map(crate::client::AcquiredMediaBody::Memory),
         byte_budget,
     )
+}
+
+/// Per-account-directory pinned scheduler clocks for tests, read by
+/// [`scheduler_now`].
+#[cfg(test)]
+pub(super) mod test_clock {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static CLOCKS: Mutex<BTreeMap<PathBuf, u64>> = Mutex::new(BTreeMap::new());
+
+    /// Pin the scheduler for `root` and everything beneath it at `at`, so due
+    /// times compare exactly.
+    pub(crate) fn set_now(root: &Path, at: u64) {
+        CLOCKS.lock().unwrap().insert(root.to_path_buf(), at);
+    }
+    /// Return `root` to wall time.
+    pub(crate) fn clear(root: &Path) {
+        CLOCKS.lock().unwrap().remove(root);
+    }
+    /// The scheduler's reading for `path` when wall time is `now`.
+    pub(super) fn adjust(path: &Path, now: u64) -> u64 {
+        CLOCKS
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(root, _)| path.starts_with(root))
+            .map_or(now, |(_, at)| *at)
+    }
 }
 
 #[cfg(test)]

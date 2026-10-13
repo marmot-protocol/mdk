@@ -2038,6 +2038,7 @@ impl MarmotApp {
             recovery_job_admission_expired: false,
             pending_epoch_stall_escalations: Vec::new(),
             pending_convergence_groups: std::collections::HashSet::new(),
+            stale_commit_acknowledgements: std::collections::HashMap::new(),
             pending_local_group_deletion_frontier_clears: std::collections::HashMap::new(),
             pending_application_event_acks: std::collections::HashSet::new(),
             fail_next_published_app_message_acknowledgement: cfg!(
