@@ -4,7 +4,7 @@ Use `account_attachment_history_page` to browse locally known attachments across
 
 ## Paging and filtering
 
-`AccountAttachmentQueryFfi` has group and sender selections plus inclusive `min_timeline_at`/`max_timeline_at` timeline timestamps. Empty selections mean all. Selections use OR within each list and AND across lists and dates. IDs are case-normalized, sorted and deduplicated before cursor binding; groups are nonempty opaque MLS IDs, not 32-byte Nostr routing IDs. Group IDs are capped at 256 bytes and senders are 32-byte hexadecimal keys. Each list has at most 100 input entries. Invalid IDs, reversed/overflowing dates and limits outside 1–100 return typed outcomes without rows.
+`AccountAttachmentQueryFfi` has group and sender selections plus inclusive `min_timeline_at`/`max_timeline_at` timeline timestamps. Empty selections mean all. Selections use OR within each list and AND across lists and dates. IDs are case-normalized, sorted and deduplicated before cursor binding; groups are nonempty opaque MLS IDs, not 32-byte Nostr routing IDs. Group IDs are capped at 256 decoded bytes (512 hex characters) and senders are 32-byte hexadecimal keys. Each list has at most 100 input entries. Invalid IDs, reversed/overflowing dates and limits outside 1–100 return typed outcomes without rows.
 
 Each page seeks at most `limit` original attachment candidates plus one look-ahead slot in the existing SQLite attachment index. It returns group/source/message identity and the typed shared-parser attachment outcome, including rejected slots and original album indices. Ordering is newest timeline time first, then group/message identity, then original album order. No message-level page is split by a host.
 

@@ -6,13 +6,12 @@
 
 - Add bounded per-chat attachment and qualified recovery health with event-driven local observations and existing per-item controls. Shared bindings require matching artifacts and C layouts require the generated matching header.
 
+- Bounded account-wide attachment pages with group/sender selections, inclusive date bounds and account/query-bound continuation cursors.
+
 ### Breaking changes
 
 - Migrations 0108 through 0109 advance account storage to schema 109 with account-wide attachment seek/expiry indexes, invalidation counters and bounded current-work management. Older binaries reject the upgraded database; downgrade is unsupported.
 
-### Added
-
-- Bounded account-wide attachment pages with group/sender selections, inclusive date bounds and account/query-bound continuation cursors.
 
 ## 0.13.0 - 2026-10-12
 

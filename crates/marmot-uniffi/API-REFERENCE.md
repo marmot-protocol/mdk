@@ -4614,7 +4614,7 @@ Read one page of current non-ready transfer candidates for the required chat, wi
 pub async fn subscribe_attachment_management( &self, account_ref: String, query: AttachmentJobQueryFfi, ) -> Result<Arc<AttachmentManagementSubscription>, MarmotKitError>
 ```
 
-Observe revalidated initial and coalesced replacement heads, at most4Hz. Existing native events and one-shot expiry invalidate the view without an idle polling loop. Continued pages remain explicit reads. Close observation when leaving/backgrounding the screen; closure does not cancel downloads or dismiss history notices.
+Observe revalidated initial and coalesced replacement heads, at most 4 Hz. Existing native events and one-shot expiry invalidate the view without an idle polling loop. Continued pages remain explicit reads. Close observation when leaving/backgrounding the screen; closure does not cancel downloads or dismiss history notices.
 
 [Source](src/commands/attachment_management.rs#L52)
 
