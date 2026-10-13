@@ -1127,6 +1127,26 @@ pub enum TransportAdapterError {
 }
 
 impl TransportAdapterError {
+    /// Stable, privacy-safe category for audit and telemetry.
+    ///
+    /// Never derived from `Display`, which prefixes every publish failure with
+    /// `"publish failed: "` and may carry adapter detail such as endpoints.
+    #[must_use]
+    pub fn privacy_safe_kind(&self) -> &'static str {
+        match self {
+            Self::AccountNotActive(_) => "transport_account_not_active",
+            Self::Closed => "transport_closed",
+            Self::InvalidInboundEncoding => "transport_invalid_inbound_encoding",
+            Self::InvalidInboundSignature => "transport_invalid_inbound_signature",
+            Self::PublishTargetMismatch { .. } => "transport_publish_target_mismatch",
+            Self::Subscription(_) => "transport_subscription_failed",
+            Self::Publish(_) => "transport_publish_failed",
+            Self::PublishEndpoints(_) => "insufficient_publish_acknowledgements",
+            Self::Backend(_) => "transport_backend",
+            Self::Other(_) => "transport_other",
+        }
+    }
+
     pub fn publish_endpoint_failures(&self) -> &[TransportEndpointFailure] {
         match self {
             Self::PublishEndpoints(failure) => failure.endpoint_failures.as_slice(),
@@ -1661,5 +1681,57 @@ mod tests {
         .unwrap();
 
         assert_eq!(failure.rejection_category, None);
+    }
+
+    #[test]
+    fn adapter_error_privacy_safe_kind_never_carries_display_detail() {
+        let secret = "wss://secret.example/npub1secret";
+        let cases = [
+            (
+                TransportAdapterError::AccountNotActive(MemberId::new(vec![0xA1; 32])),
+                "transport_account_not_active",
+            ),
+            (TransportAdapterError::Closed, "transport_closed"),
+            (
+                TransportAdapterError::InvalidInboundEncoding,
+                "transport_invalid_inbound_encoding",
+            ),
+            (
+                TransportAdapterError::InvalidInboundSignature,
+                "transport_invalid_inbound_signature",
+            ),
+            (
+                TransportAdapterError::PublishTargetMismatch {
+                    envelope: secret.into(),
+                    target: secret.into(),
+                },
+                "transport_publish_target_mismatch",
+            ),
+            (
+                TransportAdapterError::Subscription(secret.into()),
+                "transport_subscription_failed",
+            ),
+            (
+                TransportAdapterError::Publish(secret.into()),
+                "transport_publish_failed",
+            ),
+            (
+                TransportAdapterError::PublishEndpoints(
+                    TransportPublishFailure::with_endpoint_failures(secret, Vec::new()),
+                ),
+                "insufficient_publish_acknowledgements",
+            ),
+            (
+                TransportAdapterError::Backend(secret.into()),
+                "transport_backend",
+            ),
+            (
+                TransportAdapterError::Other(secret.into()),
+                "transport_other",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.privacy_safe_kind(), expected, "{error:?}");
+        }
     }
 }

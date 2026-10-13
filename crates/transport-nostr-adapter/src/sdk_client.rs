@@ -2768,13 +2768,15 @@ impl NostrSdkRelayClient {
         // immediately.
         // Own the relay before awaiting its handshake. The pool helper keeps
         // a read lock that blocks registering other concurrent publish targets.
+        // `Err(true)` is a handshake that outlived the connect budget, kept
+        // apart from immediate dial errors so audit can tell them apart.
         let connected = match self.client.relay(endpoint.clone()).await {
             Ok(Some(relay)) => relay
                 .try_connect()
                 .timeout(SDK_RELAY_CONNECT_WAIT)
                 .await
-                .map_err(|_| ()),
-            Ok(None) | Err(_) => Err(()),
+                .map_err(|error| error.kind() == SdkErrorKind::Timeout),
+            Ok(None) | Err(_) => Err(false),
         };
         match connected {
             Ok(()) => Ok(endpoint),
@@ -2783,9 +2785,14 @@ impl NostrSdkRelayClient {
             // `TransportAdapterError::Publish` Display (see
             // `finish_publish_outcome`), which upper layers may log. The
             // endpoint stays available on the structured failure record.
-            Err(_) => Err(TransportEndpointFailure {
+            Err(timed_out) => Err(TransportEndpointFailure {
                 endpoint: transport_endpoint,
-                reason: "connect relay failed".to_owned(),
+                reason: if timed_out {
+                    "connect relay timed out"
+                } else {
+                    "connect relay failed"
+                }
+                .to_owned(),
                 kind: TransportEndpointFailureKind::RetryableUnavailable,
                 rejection_category: None,
             }),
@@ -7449,7 +7456,35 @@ mod tests {
             TransportEndpointFailureKind::RetryableUnavailable,
             "a failed connection proves the event was never exposed to the relay",
         );
+        assert_eq!(failures[0].reason, "connect relay failed");
         assert_eq!(sdk.relay_health().await.total_relays, 0);
+    }
+
+    /// mdk#2264: a handshake that outlives `SDK_RELAY_CONNECT_WAIT` must be
+    /// distinguishable from an immediate dial error in the per-relay reason.
+    #[tokio::test(start_paused = true)]
+    async fn publish_connect_timeout_is_reported_separately_from_dial_errors() {
+        // Bound and listening, but never accepted: the kernel completes TCP
+        // while the WebSocket handshake waits forever.
+        let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", silent.local_addr().unwrap()));
+        let sdk = signed_sdk(Keys::generate());
+        let dto = signed_group_event_dto();
+
+        let error = sdk
+            .publish_event(std::slice::from_ref(&endpoint), &dto, 1)
+            .await
+            .expect_err("an event cannot be published without a relay connection");
+
+        let failures = error.publish_endpoint_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].reason, "connect relay timed out");
+        assert_eq!(
+            failures[0].kind,
+            TransportEndpointFailureKind::RetryableUnavailable,
+            "a connect timeout proves the event was never sent",
+        );
+        drop(silent);
     }
 
     #[tokio::test(start_paused = true)]

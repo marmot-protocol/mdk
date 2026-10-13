@@ -6149,6 +6149,52 @@ async fn publish_auth_quorum_does_not_wait_for_unobserved_fallback() {
     plane.shutdown().await;
 }
 
+/// mdk#2255: a public relay still pending when quorum is met may yet store
+/// the event. Report it with unknown-acknowledgement evidence so the caller's
+/// durable fanout keeps it owed instead of silently dropping it.
+#[tokio::test]
+async fn publish_quorum_reports_cancelled_public_relay_as_unknown() {
+    use nostr_relay_builder::{LocalRelay, RelayBuilder};
+
+    let gate = PublicAckGate(Arc::new(tokio::sync::Semaphore::new(0)));
+    let held = LocalRelay::new(RelayBuilder::default().write_policy(gate.clone()));
+    let open = LocalRelay::new(RelayBuilder::default());
+    held.run().await.unwrap();
+    open.run().await.unwrap();
+    let endpoints = vec![
+        TransportEndpoint(held.url().await.to_string()),
+        TransportEndpoint(open.url().await.to_string()),
+    ];
+    let plane = MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(30), true);
+    let fallback = Arc::new(ObservedPublishClient::new(PublishCompletion::Return).await);
+    let adapter = plane.account_adapter(fallback.account_id.clone(), fallback.clone());
+    let signed = EventBuilder::new(Kind::TextNote, "quorum before a held relay")
+        .finalize(&Keys::generate())
+        .unwrap();
+    let event = NostrTransportEvent::from_nostr_event(&signed).unwrap();
+
+    let outcome = timeout(
+        Duration::from_secs(4),
+        adapter.publish_signed_event(fallback.as_ref(), &endpoints, &event, 1),
+    )
+    .await
+    .expect("met quorum must not wait for the held relay")
+    .unwrap();
+    gate.0.add_permits(1);
+
+    assert_eq!(outcome.accepted.len(), 1);
+    assert_eq!(outcome.accepted[0].endpoint, endpoints[1]);
+    assert_eq!(outcome.failed.len(), 1, "{:?}", outcome.failed);
+    assert_eq!(outcome.failed[0].endpoint, endpoints[0]);
+    assert_eq!(
+        outcome.failed[0].kind,
+        TransportEndpointFailureKind::PossiblyExposed
+    );
+    fallback.inner.shutdown_accounts().await;
+    fallback.inner.client().shutdown().await;
+    plane.shutdown().await;
+}
+
 #[tokio::test]
 #[allow(clippy::disallowed_methods)]
 async fn publish_allows_independent_account_registration() {
