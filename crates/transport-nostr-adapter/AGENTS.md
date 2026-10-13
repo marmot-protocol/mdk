@@ -71,7 +71,7 @@ for reconnect/backoff and relay status mechanics.
   - A relay that sent `RELAY_REPLAY_PAGE_LIMIT` or more moves to `RelayReplay::Paging`, which is neither complete nor
     settled. `page_replay` then fetches the window backwards with `acquire_history` until a page comes back short;
     only then does that relay's EOSE count.
-  - A failed or over-long paging stays incomplete for the next activation and recovery. So does a full page that
+  - A failed, unsupported or over-long paging stays incomplete for the next activation and recovery. So does a full page that
     cannot move past its oldest second, because that second may hide more events and everything older.
 - Record each REQ's filter `since` in its SDK account context before the REQ goes out, find it by subscription id
   when the REQ closes, and keep a closed REQ's floor for the rest of the context's life: routing is content-keyed,

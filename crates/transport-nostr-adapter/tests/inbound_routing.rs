@@ -5709,3 +5709,55 @@ async fn retired_subscribe_task_keeps_an_id_the_live_routes_want() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(closes_of_added(), 1, "the live route's REQ stays open");
 }
+
+/// A replay that delivered a full page may have been clamped by the relay. A
+/// backend that cannot page backwards cannot prove the older history was
+/// served, so that relay's EOSE must not complete the coverage (#2263).
+#[tokio::test]
+async fn full_page_replay_stays_incomplete_when_paging_is_unsupported() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone() as Arc<dyn NostrRelayClient>);
+    let account_id = MemberId::new(vec![0xF8; 32]);
+    let group = TransportGroupSubscription {
+        group_id: cgka_traits::GroupId::new(vec![0xB8; 32]),
+        transport_group_id: vec![0xC8; 32],
+        endpoints: vec![TransportEndpoint("wss://group.example".into())],
+        retained_since: None,
+    };
+    let inbox = TransportEndpoint("wss://inbox.example".into());
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![inbox.clone()],
+            group_subscriptions: vec![group.clone()],
+            since: Some(Timestamp(1_700_000_000)),
+        })
+        .await
+        .expect("activation succeeds");
+    let issued = relay.take_issued_subscriptions();
+    let inbox_id = issued
+        .iter()
+        .find(|subscription| matches!(subscription, NostrSubscription::AccountInbox { .. }))
+        .expect("the inbox REQ was issued")
+        .subscription_id();
+    let group_id = issued_group_id(&issued, &group.group_id);
+    let endpoint = group.endpoints[0].clone();
+    for index in 0..transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT {
+        adapter
+            .observe_relay_event(NostrRelayEvent {
+                endpoint: endpoint.clone(),
+                subscription_id: Some(group_id.clone()),
+                event: group_event(&format!("{index:04x}"), &group.transport_group_id),
+            })
+            .await;
+    }
+    adapter.handle_relay_eose(inbox, inbox_id).await;
+    adapter.handle_relay_eose(endpoint, group_id).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let eose = adapter.account_subscription_eose(&account_id).await;
+    assert!(
+        !eose.complete(),
+        "a full page with no paging is not coverage"
+    );
+    assert!(!eose.settled(), "the relay stays in paging, not answered");
+}

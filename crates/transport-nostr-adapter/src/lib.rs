@@ -2011,8 +2011,9 @@ impl NostrTransportAdapter {
                     Some(page) => page,
                     None => break false,
                 },
-                // A backend that cannot page keeps the unpaged behaviour.
-                Err(NostrAcquisitionError::Unsupported) => break true,
+                // A backend that cannot page cannot prove the older history
+                // was served, so the replay stays incomplete.
+                Err(NostrAcquisitionError::Unsupported) => break false,
                 Err(NostrAcquisitionError::InvalidRequest) => break false,
             };
             let received = page.events.len();
