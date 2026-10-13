@@ -3415,7 +3415,7 @@ async fn legacy_self_update_fanout_retries_after_lost_confirmation_marker() {
     );
 }
 
-/// mdk#2264: a legacy publish that fails on every relay must keep each relay's
+/// mdk#2264: a legacy Welcome publish that fails on every relay must keep each relay's
 /// cause in the audit log and on the durable fanout, instead of one
 /// `unclassified` adapter row with no relay detail.
 #[tokio::test]
@@ -3425,11 +3425,14 @@ async fn adapter_publish_failure_records_per_relay_causes() {
     let database = dir.path().join("alice.sqlite");
     let audit_path = dir.path().join("audit.jsonl");
     let mut initial = current_session(database.clone(), &key, b"alice");
+    let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let bob_key_package = bob.fresh_key_package().await.unwrap();
+    drop(bob);
     let created = initial
         .create_group(CreateGroupRequest {
             name: "adapter failure causes".into(),
             description: String::new(),
-            members: Vec::new(),
+            members: vec![bob_key_package],
             required_features: Vec::new(),
             app_components: Vec::new(),
             initial_admins: Vec::new(),
@@ -3437,6 +3440,13 @@ async fn adapter_publish_failure_records_per_relay_causes() {
         .await
         .unwrap();
     let group_id = created.group_id;
+    let welcome = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { welcomes, pending } => {
+            initial.confirm_published(*pending).await.unwrap();
+            welcomes[0].clone()
+        }
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
     drop(initial);
 
     let mut session = current_session(database, &key, b"alice");
@@ -3454,8 +3464,8 @@ async fn adapter_publish_failure_records_per_relay_causes() {
         )
         .unwrap(),
     ));
-    let timed_out = TransportEndpoint("wss://group-timed-out.example".into());
-    let refused = TransportEndpoint("wss://group-refused.example".into());
+    let timed_out = TransportEndpoint("wss://inbox-timed-out.example".into());
+    let refused = TransportEndpoint("wss://inbox-refused.example".into());
     let adapter = RecordingAdapter::default();
     adapter.fail_endpoints_with_reasons(
         TransportEndpointFailureKind::RetryableUnavailable,
@@ -3464,13 +3474,7 @@ async fn adapter_publish_failure_records_per_relay_causes() {
             (refused.clone(), "connect relay failed"),
         ],
     );
-    let routing =
-        StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())])
-            .with_group_route(
-                group_id.clone(),
-                group_id.as_slice().to_vec(),
-                vec![timed_out.clone(), refused.clone()],
-            );
+    let routing = StaticTransportRouting::new(vec![timed_out.clone(), refused.clone()]);
     let wall = Arc::new(TestWallClock::new(120_000));
     let monotonic = Arc::new(TestMonotonicClock::default());
     let mut runtime = AccountDeviceRuntime::new(
@@ -3485,23 +3489,16 @@ async fn adapter_publish_failure_records_per_relay_causes() {
         Arc::new(TestRandom::new(0)),
     );
 
-    let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
-    runtime.run_due_maintenance().await.unwrap();
-    monotonic.set_millis(60_000);
-    wall.set(120_060);
-    runtime.run_due_maintenance().await.unwrap();
-    // This assertion covers the first publication. A frozen self-update can
-    // already publish at the second tick; advancing again would exercise its
-    // legitimate retry and increment every target's attempt count.
-    if adapter.publishes().is_empty() {
-        let jittered = runtime
-            .session()
-            .maintenance_obligation(&obligation_id)
-            .unwrap()
-            .unwrap();
-        wall.set(jittered.not_before.unwrap().0);
-        runtime.run_due_maintenance().await.unwrap();
-    }
+    // Welcomes retain the legacy batch path. New self-updates use frozen
+    // single-endpoint fanouts and no longer exercise this adapter-error seam.
+    runtime
+        .publish_welcome_messages_with_audit_context(
+            vec![welcome],
+            Some(group_id),
+            Default::default(),
+        )
+        .await
+        .unwrap();
     assert_eq!(adapter.publishes().len(), 1);
 
     let fanout = runtime.session().transport_fanouts().unwrap().remove(0);
