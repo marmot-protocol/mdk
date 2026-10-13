@@ -9069,3 +9069,9 @@ fn group_contributes_co_members(group: &AppGroupRecord) -> bool {
 }
 
 mod moderation;
+
+mod account_attachment_history;
+pub use account_attachment_history::{
+    AccountAttachmentCursor, AccountAttachmentEntry, AccountAttachmentPage,
+    AccountAttachmentPageRead, AccountAttachmentQuery, AccountAttachmentVersion,
+};

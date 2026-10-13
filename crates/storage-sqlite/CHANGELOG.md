@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Migration 0108 advances account storage to schema 108 with account-wide attachment seek/expiry indexes and invalidation counters. Older binaries reject the upgraded database; downgrade is unsupported.
+
+### Added
+
+- Bounded account-wide attachment pages with group/sender selections, inclusive date bounds and account/query-bound continuation cursors.
+
 - `SqliteAccountStorage::epoch_gap_recovery_open_since` reports when an unresolved epoch-gap obligation (pending, parked or retired by the user) covering a group's local epoch was first armed.
 
 ## 0.13.0 - 2026-10-12

@@ -2,8 +2,21 @@
 
 ## Unreleased
 
-- Group changes fail with the new `AppError::GroupCatchingUp` while unresolved epoch-gap recovery (pending, parked or with its notice dismissed) covers the group's current local epoch. Before, a device that knew the group had moved on could still commit from its stale epoch and fork the group (mdk#2258). The check is advisory: after the user accepts the risk, `MarmotAppRuntime::acknowledge_group_catching_up` lets the next change at that epoch through. Due self-updates wait up to 24 hours for the gap to close. Messages and leave are not affected. Update exhaustive `AppError` matches.
+### Breaking changes
+
+- `AppError` adds `GroupCatchingUp`; update exhaustive matches.
+
+### Added
+
+- Account-wide local attachment pages expose bounded typed metadata, group/sender/date selection, continuation cursors and retention deadlines. Reads start no acquisition or relay activity.
+
 - `MarmotAppRuntime::submit_prepared_media_snapshot` admits the captured ordinary-media payload with a stable token and consumes only its unchanged captured draft in the same transaction. Newer or cleared drafts cannot replace the payload or block admission.
+
+- `MarmotAppRuntime::acknowledge_group_catching_up` records that the user accepts the fork risk of changing a group that is still catching up, so the next group change at the current epoch proceeds.
+
+### Fixed
+
+- Group changes fail with `AppError::GroupCatchingUp` while unresolved epoch-gap recovery (pending, parked or with its notice dismissed) covers the group's current local epoch. Before, a device that knew the group had moved on could still commit from its stale epoch and fork the group (mdk#2258). The check is advisory: after the user accepts the risk, `acknowledge_group_catching_up` lets the change through. Due self-updates wait up to 24 hours for the gap to close. Messages and leave are not affected.
 
 ## 0.13.0 - 2026-10-12
 

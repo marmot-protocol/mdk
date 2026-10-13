@@ -55,4 +55,5 @@ mod attachment_access;
 mod attachment_controls;
 pub use attachment_controls::AttachmentTransferSubscription;
 
+mod account_attachment_history;
 mod startup_diagnostics;

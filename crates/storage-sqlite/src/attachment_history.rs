@@ -131,7 +131,7 @@ fn page_sql(cursor: bool) -> String {
                 ELSE '[]' END) e
          WHERE t.group_id_hex=attachment_history.group_id_hex
            AND t.message_id_hex=attachment_history.message_id_hex
-           AND CASE WHEN e.type='array' THEN json_extract(e.value,'$[0]')='emoji' ELSE 0 END)
+           AND CASE WHEN e.type='array' THEN json_extract(e.value,'$[0]')='emoji' ELSE 0 END) AS emoji_tags_json
         FROM attachment_history INDEXED BY idx_attachment_history_page
         WHERE group_id_hex=?1 AND visible=1{seek}
         ORDER BY order_class DESC,order_primary DESC,order_phase DESC,order_at DESC,message_id_hex DESC,attachment_order DESC
@@ -242,40 +242,7 @@ impl SqliteAccountStorage {
                         message: r.get(4)?,
                         attachment_order: r.get(5)?,
                     };
-                    let json: String = r.get(12)?;
-                    let entry = AttachmentHistoryEntry {
-                        message_id_hex: key.message.clone(),
-                        attachment_index: usize::try_from(nonnegative(r, 6)?)
-                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, i64::MAX))?,
-                        source_message_id_hex: r.get(7)?,
-                        source_epoch: r
-                            .get::<_, Option<i64>>(8)?
-                            .map(|v| {
-                                u64::try_from(v)
-                                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(8, v))
-                            })
-                            .transpose()?,
-                        sender: r.get(9)?,
-                        timeline_at: nonnegative(r, 10)?,
-                        received_at: nonnegative(r, 11)?,
-                        emoji_tags: serde_json::from_str::<Vec<serde_json::Value>>(
-                            &r.get::<_, String>(13)?,
-                        )
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter_map(|tag| serde_json::from_value(tag).ok())
-                        .collect(),
-                        slot: serde_json::from_str(&json).map_err(|_| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                12,
-                                rusqlite::types::Type::Text,
-                                Box::new(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    "attachment index contains invalid JSON",
-                                )),
-                            )
-                        })?,
-                    };
+                    let entry = entry_from_row(r)?;
                     Ok((key, entry))
                 })
                 .storage()?
@@ -302,6 +269,58 @@ impl SqliteAccountStorage {
         })
     }
 }
+
+fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentHistoryEntry> {
+    let slot_index = r.as_ref().column_index("slot_json")?;
+    let json: String = r.get("slot_json")?;
+    let slot = serde_json::from_str(&json).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            slot_index,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "attachment index contains invalid JSON",
+            )),
+        )
+    })?;
+    let emoji_tags =
+        serde_json::from_str::<Vec<serde_json::Value>>(&r.get::<_, String>("emoji_tags_json")?)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|tag| serde_json::from_value(tag).ok())
+            .collect();
+    entry_with_metadata(r, slot, emoji_tags)
+}
+
+fn entry_with_metadata(
+    r: &rusqlite::Row<'_>,
+    slot: serde_json::Value,
+    emoji_tags: Vec<Vec<String>>,
+) -> rusqlite::Result<AttachmentHistoryEntry> {
+    let attachment_index = r.as_ref().column_index("attachment_index")?;
+    let source_epoch_index = r.as_ref().column_index("source_epoch")?;
+    Ok(AttachmentHistoryEntry {
+        message_id_hex: r.get("message_id_hex")?,
+        attachment_index: usize::try_from(nonnegative(r, attachment_index)?)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(attachment_index, i64::MAX))?,
+        source_message_id_hex: r.get("source_message_id_hex")?,
+        source_epoch: r
+            .get::<_, Option<i64>>("source_epoch")?
+            .map(|v| {
+                u64::try_from(v)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(source_epoch_index, v))
+            })
+            .transpose()?,
+        sender: r.get("sender")?,
+        timeline_at: nonnegative(r, r.as_ref().column_index("timeline_at")?)?,
+        received_at: nonnegative(r, r.as_ref().column_index("received_at")?)?,
+        emoji_tags,
+        slot,
+    })
+}
+
+mod account;
+pub use account::*;
 
 #[cfg(test)]
 mod tests;

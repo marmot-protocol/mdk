@@ -104,12 +104,12 @@ tokio-socks = "0.5.2"
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 zeroize = "1"
 keyring-core = "1"
-quinn = { version = "0.11", default-features = false, features = ["log", "platform-verifier", "runtime-tokio", "rustls-ring"] }
+quinn = { version = "0.11", default-features = false, features = ["log", "runtime-tokio", "rustls-ring"] }
 rcgen = "0.14"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
-# Already in the graph through quinn's platform-verifier feature; direct dep so
-# the broker can build ALPN-carrying rustls client configs with platform trust.
-rustls-platform-verifier = "0.7"
+# Direct verifier for the transports' ALPN-carrying Rustls client configs.
+# Quinn's convenience verifier feature is unused and would add a second copy.
+rustls-platform-verifier = "0.6"
 nostr = { git = "https://github.com/erskingardner/rust-nostr", rev = "a9c7a6423d104c603de6ea8244265ea17f0f9d89", default-features = false, features = ["std", "rand", "os-rng", "nip04", "nip49", "nip59"] }
 nostr-sdk = { git = "https://github.com/erskingardner/rust-nostr", rev = "a9c7a6423d104c603de6ea8244265ea17f0f9d89", features = ["local-relay"] }
 nostr-gossip = { git = "https://github.com/erskingardner/rust-nostr", rev = "a9c7a6423d104c603de6ea8244265ea17f0f9d89" }
