@@ -562,7 +562,7 @@ pub struct NostrRelayEvent {
     pub event: NostrTransportEvent,
 }
 
-/// End-of-stored-events progress across one account replay's route snapshot,
+/// End-of-stored-events progress across one account's live inbox and batch REQs,
 /// from [`NostrTransportAdapter::account_subscription_eose`].
 ///
 /// The logical-subscription counts preserve the coarse progress used for
@@ -573,8 +573,8 @@ pub struct NostrRelayEvent {
 /// retryable rather than converting availability pressure into success.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AccountSubscriptionEose {
-    /// Subscriptions this account's activation issued: its inbox plus one per
-    /// group route. Temporary post-join maintenance subscriptions are not
+    /// The account's live subscriptions in the snapshot: its inbox plus one
+    /// per group batch. Temporary post-join maintenance subscriptions are not
     /// among them — they are installed and removed on their own gate.
     pub subscriptions: usize,
     /// Of those, how many at least one relay has reported end-of-stored-events
@@ -1459,12 +1459,14 @@ impl NostrTransportAdapter {
             .subscription_endpoint_eose(subscription_id, relay)
     }
 
-    /// End-of-stored-events progress across the route snapshot issued by the
-    /// account's most recent activation — its inbox plus one per group route,
-    /// with every endpoint retained as an independent proof obligation.
+    /// End-of-stored-events progress across the account's live inbox and group
+    /// batch REQs, with every endpoint retained as an independent proof
+    /// obligation.
     ///
-    /// A later group-route sync does not shrink the snapshot; only a new
-    /// activation replaces it. This lets a caller draining an unfloored
+    /// A group sync that changes the routes replaces the batch entries with
+    /// its repack's, staged before their REQs go out; a route it still wants
+    /// is never owed from a later floor, and only a removed route stops being
+    /// owed. This lets a caller draining an unfloored
     /// re-activation avoid mistaking a quiet or fast-empty relay for a finished
     /// history replay. It reports counts only: no ids, endpoints, or routes
     /// cross the boundary.
@@ -2150,10 +2152,11 @@ impl NostrTransportAdapter {
                         .await
                     {
                         PagedWindow::Complete => {}
-                        other => {
-                            outcome = other;
-                            break;
-                        }
+                        PagedWindow::Closed => return,
+                        // One route that does not finish leaves the batch
+                        // incomplete, but the others still page their older
+                        // history on this attempt.
+                        other => outcome = other,
                     }
                 }
             }
@@ -2703,10 +2706,11 @@ struct AccountRoutes {
     /// arm's `by_transport_group` entries.
     inbox_endpoints: Vec<CanonicalEndpoint>,
     groups: Vec<TransportGroupSubscription>,
-    /// The `since` each live group REQ was issued with, by route. A group sync
-    /// reissues a live retained route only when that widens it: the new REQ
-    /// replaces the live one under the same id, so a narrower filter could cut
-    /// off history the live one is still returning. Ids never carry `since`.
+    /// The `since` each live group route was issued with, by route. A group
+    /// sync adds a live retained route again only when that widens it; its
+    /// repack then issues the route at the wider floor, in a batch with a new
+    /// id, so a narrower filter never cuts off history the live one is still
+    /// returning. Ids never carry `since`.
     group_since: HashMap<NostrSubscriptionRouteKey, Option<Timestamp>>,
     /// Attempt the live subscriptions for this account were issued under. Held
     /// here so `account_subscription_ids` can rebuild exactly the ids that went
@@ -2720,11 +2724,14 @@ struct AccountRoutes {
     next_batch: u32,
 }
 
-/// Immutable endpoint coverage for the most recent account activation.
+/// Endpoint coverage for the account's live inbox and group batch REQs, as
+/// the most recent activation issued them and later group syncs repacked
+/// them.
 ///
-/// Group-route synchronization may change the adapter's live routing table
-/// while a replay is draining. Keeping this snapshot separate prevents such a
-/// change from shrinking the proof obligation of the already-issued replay.
+/// Kept apart from the live routing table: a sync stages its batches here
+/// before their REQs go out and only then retires the ones they replace, so
+/// a route still wanted is always owed from no later a floor than before,
+/// and only a route the sync removed stops being owed.
 #[derive(Clone, Default)]
 struct AccountReplayCoverage {
     subscriptions: HashMap<String, HashMap<RelayIndex, RelayReplay>>,

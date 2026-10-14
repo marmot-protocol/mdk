@@ -27,8 +27,8 @@ use nostr_sdk::prelude::{Client, EventBuilder, FinalizeEvent, Keys, Kind, RelayO
 use tokio::task::JoinHandle;
 use transport_nostr_adapter::{
     GROUP_BATCH_ROUTES, NostrReconciliationFailure, NostrReconciliationProgress, NostrRelayClient,
-    NostrSdkRelayClient, NostrSubscription, NostrTransportAdapter, SubscriptionAttempt,
-    SubscriptionRouteKind,
+    NostrSdkRelayClient, NostrSubscription, NostrTransportAdapter, RELAY_REPLAY_PAGE_LIMIT,
+    SubscriptionAttempt, SubscriptionRouteKind,
 };
 
 const QUIET: Duration = Duration::from_millis(600);
@@ -1658,6 +1658,63 @@ async fn a_batch_page_saturated_by_one_second_is_paged_per_route() {
     );
     assert_eq!(delivered, GROUP_BATCH_ROUTES * (NEWEST + OLDER));
     assert!(complete, "every route's own paging completed");
+    fx.shutdown().await;
+}
+
+/// One route that saturates a second on its own keeps the batch
+/// incomplete, but never keeps the batch's other routes from paging their
+/// older history. Route 0 sorts first and holds 500 events in the newest
+/// second; every other route's history still arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_route_that_saturates_alone_does_not_stop_the_others_paging() {
+    const NEWEST: usize = 10;
+    const OLDER: usize = 5;
+    let fx = Fixture::new(LimitConfig::default(), false).await;
+    let keys = Keys::generate();
+    let mut stored = 0;
+    for group in 0..GROUP_BATCH_ROUTES {
+        let (newest, older) = if group == 0 {
+            (RELAY_REPLAY_PAGE_LIMIT, 0)
+        } else {
+            (NEWEST, OLDER)
+        };
+        for index in 0..newest + older {
+            let created_at = if index < newest {
+                1_700_100_000
+            } else {
+                1_700_000_000 + (group * OLDER + index) as u64
+            };
+            let event = EventBuilder::new(Kind::MlsGroupMessage, format!("alone-{group}-{index}"))
+                .tags([Tag::custom("h", [hex::encode(route(group))])])
+                .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(created_at))
+                .finalize(&keys)
+                .unwrap();
+            fx.database
+                .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+                .await
+                .unwrap();
+            stored += 1;
+        }
+    }
+    let url = fx.limit.url();
+    fx.adapter
+        .activate_account(
+            fx.activation(std::slice::from_ref(&url), groups(GROUP_BATCH_ROUTES, &url)),
+        )
+        .await
+        .unwrap();
+    let delivered = distinct_deliveries(&fx.adapter, Duration::from_secs(15)).await;
+    let complete = fx
+        .adapter
+        .account_subscription_eose(&fx.account)
+        .await
+        .complete();
+    eprintln!(
+        "[h] one saturated route delivered={delivered}/{stored} complete={complete} {}",
+        fx.limit.stats().summary()
+    );
+    assert_eq!(delivered, stored, "every route's history arrives");
+    assert!(!complete, "the saturated route keeps the batch incomplete");
     fx.shutdown().await;
 }
 

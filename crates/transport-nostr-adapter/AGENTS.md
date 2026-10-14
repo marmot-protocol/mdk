@@ -125,7 +125,8 @@ for reconnect/backoff and relay status mechanics.
   its floor widens (`AccountRoutes::group_since`): the repack then issues it at the wider floor.
 - Send group routes as batched REQs, never one REQ per route (#2266): `NostrSubscription::GroupBatch` carries up to
   `GROUP_BATCH_ROUTES` routes that share normalized endpoints and `since` as one `#h` filter, so an account stays far
-  under a relay's per-connection REQ limit and recovery's one-shot fetches always find room. `AccountRoutes::batches`
+  under a relay's per-connection REQ limit and recovery's one-shot fetches find room (capacity still depends on how many
+  relay-set and floor families the routes form). `AccountRoutes::batches`
   always carries exactly `AccountRoutes::groups`. Activation packs every route (`pack_group_batches`) and numbers
   batches from 0. A group sync that changes the route set repacks every batch (`repacked_group_routes`): each route
   keeps the floor it was issued at, or starts at the sync's floor when the activation's replay coverage is complete;

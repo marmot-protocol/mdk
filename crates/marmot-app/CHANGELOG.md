@@ -37,7 +37,8 @@
   Live group subscriptions go out in batches of up to 50 routes per REQ instead of
   one REQ per group, so a 1,000-group account holds about 21 REQs per relay where
   it used to hit strfry's 200 at about 200 groups. Groups past the limit are no longer
-  refused, and history recovery's fetches on that connection always find room.
+  refused, and history recovery's fetches on that connection find room unless an
+  account's routes split across many relay sets or floors.
 
 - Inviting or looking up an account that has published only legacy-profile KeyPackages
   (including MDK 0.8 publications) returns `MissingKeyPackage` with reason `ObsoleteOnly`
