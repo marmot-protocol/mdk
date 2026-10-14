@@ -547,7 +547,14 @@ pub struct MarmotApp {
     /// In-memory view of the persisted per-kind authoring floors; see
     /// `sign_replaceable_identity_event`.
     replaceable_identity_created_at: Arc<Mutex<HashMap<(String, u64), u64>>>,
+    /// Edit seconds already handed out per (sender, group, target), so a direct
+    /// edit and a concurrently admitted retained edit never share one; see
+    /// [`Self::reserve_edit_created_at`].
+    edit_created_at: Arc<Mutex<HashMap<EditClockKey, u64>>>,
 }
+
+/// (sender, group id hex, target message id hex) for [`MarmotApp::reserve_edit_created_at`].
+type EditClockKey = (String, String, String);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentTextStreamFinishRequest {
@@ -1683,6 +1690,7 @@ impl MarmotApp {
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
+            edit_created_at: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1777,6 +1785,7 @@ impl MarmotApp {
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
+            edit_created_at: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -3149,6 +3158,38 @@ impl MarmotApp {
             .advance_replaceable_record_floor(account_ref, kind, created_at)?;
         latest.insert(key, created_at);
         Ok(created_at)
+    }
+
+    /// Pick the next edit second for `target` and reserve it. Recipients order
+    /// edits by `(second, event id)`, so it must follow `stored_latest` (the
+    /// newest edit this sender stored for the target) and every second already
+    /// handed out: a direct edit stores its event only after choosing, while a
+    /// retained admission may choose concurrently on another thread. Callers
+    /// read `stored_latest` before calling, and the lock is never held across
+    /// storage or relay I/O. `None` means the 30-second bound is exhausted.
+    pub(crate) fn reserve_edit_created_at(
+        &self,
+        sender: &str,
+        group_id_hex: &str,
+        target_message_id_hex: &str,
+        now: u64,
+        stored_latest: Option<u64>,
+    ) -> Option<u64> {
+        let mut reserved = self
+            .edit_created_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A reservation older than now no longer constrains the next pick.
+        reserved.retain(|_, at| *at >= now);
+        let key = (
+            sender.to_owned(),
+            group_id_hex.to_owned(),
+            target_message_id_hex.to_owned(),
+        );
+        let latest = stored_latest.max(reserved.get(&key).copied());
+        let created_at = crate::local_submissions::next_edit_created_at(now, latest)?;
+        reserved.insert(key, created_at);
+        Some(created_at)
     }
 
     pub(crate) fn spawn_quorum_cancelled_delivery(&self, delivery: QuorumCancelledDelivery) {

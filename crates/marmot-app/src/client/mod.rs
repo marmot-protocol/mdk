@@ -4482,11 +4482,18 @@ impl AppClient {
                     .ok_or(AppError::InvalidEditTarget)?;
                 // Not `target.edit`: a target awaiting its publish retry exposes
                 // no accepted edits, but its earlier edits still compete.
-                created_at = crate::local_submissions::next_edit_created_at(
-                    created_at,
-                    storage.latest_authored_edit_at(&group_hex, target_message_id, &sender)?,
-                )
-                .ok_or(AppError::EditRateLimited)?;
+                let stored_latest =
+                    storage.latest_authored_edit_at(&group_hex, target_message_id, &sender)?;
+                created_at = self
+                    .app
+                    .reserve_edit_created_at(
+                        &sender,
+                        &group_hex,
+                        target_message_id,
+                        created_at,
+                        stored_latest,
+                    )
+                    .ok_or(AppError::EditRateLimited)?;
                 intent
             }
             AppMessageIntent::Delete { target_message_id } => {
