@@ -74,8 +74,9 @@ impl Marmot {
     }
 
     /// Fetch one referenced event from relays when it is missing or stale,
-    /// then return its local state. Event-ID previews never refetch once
-    /// cached; `naddr` previews refetch after 30 minutes. Calls within 30
+    /// then return its local state. An event-ID preview never refetches once
+    /// every relay answered the fetch that cached it; otherwise, and for
+    /// `naddr` previews, it refetches after 30 minutes. Calls within 30
     /// seconds of a finished fetch for the same reference return local state.
     /// A failed or empty fetch keeps prior content.
     pub async fn resolve_public_event_preview(

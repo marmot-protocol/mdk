@@ -4610,8 +4610,8 @@ Network-free read of cached public Nostr events referenced from message content,
 pub async fn resolve_public_event_preview( &self, account_ref: String, reference: String, ) -> Result<PublicEventPreviewFfi, MarmotKitError>
 ```
 
-Fetch one referenced event from at most two safe relay hints plus the configured directory relays when it is missing or stale, store it if it verifies and matches, and return the resulting local state. Event-ID previews never refetch once a complete fetch confirmed them; `naddr` previews, and event-ID previews admitted while a relay did not finish, refetch after 30 minutes. `naddr` keeps the newest version. Author-signed NIP-09 deletions apply in either tag form, and a deleted version never returns. Calls within 30 seconds of a finished fetch for the same reference return local state without network I/O, as does any call while the row is fresh, so call it for every reference a screen shows. A failed or empty fetch keeps prior content and stores no miss.
+Fetch one referenced event from at most two safe relay hints plus the configured directory relays when it is missing or stale, store it if it verifies and matches, and return the resulting local state. An event-ID preview never refetches once every relay answered the fetch that cached it; otherwise, and for `naddr` previews, it refetches after 30 minutes. `naddr` keeps the newest version. Author-signed NIP-09 deletions apply in either tag form: an `e` tag removes that event (an `naddr` falls back to the previous version), an `a` tag removes every version up to its timestamp. Calls within 30 seconds of a finished fetch for the same reference return local state without network I/O, as does any call while the row is fresh, so call it for every reference a screen shows. A failed or empty fetch keeps prior content and stores no miss.
 
-[Source](src/commands/public_event_preview.rs#L81)
+[Source](src/commands/public_event_preview.rs#L82)
 
 </details>

@@ -13,15 +13,18 @@
 //! - A coordinate keeps the newest version: higher `created_at`, then the
 //!   lower event ID (NIP-01).
 //! - NIP-09 deletions count only when signed by the verified event author, in
-//!   either form: an `e` tag deletes that exact event, an `a` tag deletes every
-//!   version of the coordinate up to its own `created_at`. A row keeps the
-//!   newest deletion time it has seen (`deleted_through`), even while it shows
-//!   a newer version, so a relay that kept an older version cannot restore it.
-//!   Rows that carry a deletion time are evicted last.
+//!   either form: an `e` tag deletes that exact event (for a coordinate, the
+//!   previous version becomes current), an `a` tag deletes every version up to
+//!   its own `created_at`. A row keeps the newest `a` deletion time it has seen
+//!   (`deleted_through`), even while it shows a newer version, so a relay that
+//!   kept an older version cannot restore it. Rows that carry a deletion time
+//!   are evicted after other rows, but never the row just written.
+//! - Once a refresh has verified events, one follow-up query asks their author
+//!   for deletions the first query could not attribute.
 //! - Not-found results and fetch failures are never stored. A fetch where a
 //!   relay did not complete may admit what it found, but never confirms a row,
 //!   and an event-ID row it admits is rechecked after 30 minutes.
-//! - Complete event-ID rows never refetch. Coordinate rows refetch after
+//! - Event-ID rows from a fetch every relay answered never refetch. Coordinate rows refetch after
 //!   30 minutes. Any finished refresh starts a 30-second in-memory cooldown
 //!   per key.
 //!
@@ -37,7 +40,7 @@ use marmot_account::AccountSummary;
 use nostr::event::Event;
 use nostr::nips::nip01::Coordinate;
 use nostr::nips::nip19::{FromBech32, Nip19};
-use nostr::prelude::{EventId, Filter, Kind, PublicKey, RelayUrl};
+use nostr::prelude::{EventId, Filter, Kind, RelayUrl};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::{AppError, MarmotApp, blocking_app_task, unix_now_seconds};
@@ -266,27 +269,50 @@ fn deletion_time(event: &Event, deletions: &[&Event]) -> Option<u64> {
         .max()
 }
 
-/// The author to ask again when an event-ID lookup's unattributed kind-5
-/// query came back full without that author's deletion: requests signed by
-/// other keys may have crowded it out.
-fn crowded_deletion_author(
-    id: &EventId,
-    stored: Option<&Event>,
-    fetched: &[Event],
-) -> Option<PublicKey> {
-    let author = fetched
-        .iter()
-        .find(|event| event.id == *id)
-        .or(stored)?
-        .pubkey;
-    let id = id.to_hex();
-    let deletions = fetched
-        .iter()
-        .filter(|event| event.kind == Kind::EventDeletion && has_tag(event, "e", &id))
-        .collect::<Vec<_>>();
-    (deletions.len() >= EVENT_DELETION_QUERY_LIMIT
-        && !deletions.iter().any(|deletion| deletion.pubkey == author))
-    .then_some(author)
+/// One author-scoped kind-5 query for verified events the first query could
+/// not cover: an event ID whose unattributed answer came back full (deletions
+/// by other keys may hide the author's), the coordinate of an addressable
+/// event linked by ID, and `naddr` versions this refresh found.
+fn follow_up_deletions(target: &Target, stored: Option<&Event>, fetched: &[Event]) -> Vec<Filter> {
+    let deletions = |author| Filter::new().kind(Kind::EventDeletion).author(author);
+    match target {
+        Target::EventId(id) => {
+            let fetched_event = fetched.iter().find(|event| event.id == *id);
+            let Some(event) = fetched_event.or(stored) else {
+                return Vec::new();
+            };
+            let mut filters = Vec::new();
+            let hex = id.to_hex();
+            let answers = fetched
+                .iter()
+                .filter(|event| event.kind == Kind::EventDeletion && has_tag(event, "e", &hex))
+                .collect::<Vec<_>>();
+            if answers.len() >= EVENT_DELETION_QUERY_LIMIT
+                && !answers.iter().any(|answer| answer.pubkey == event.pubkey)
+            {
+                filters.push(deletions(event.pubkey).event(*id).limit(4));
+            }
+            // The first query already asked for the cached event's coordinate.
+            if stored.is_none()
+                && let Some(coordinate) = event_coordinate(event)
+            {
+                filters.push(deletions(event.pubkey).coordinate(&coordinate).limit(4));
+            }
+            filters
+        }
+        Target::Coordinate(coordinate) => {
+            let versions = fetched
+                .iter()
+                .filter(|event| target.matches(event))
+                .filter(|event| stored.is_none_or(|stored| stored.id != event.id))
+                .map(|event| event.id)
+                .collect::<Vec<_>>();
+            if versions.is_empty() {
+                return Vec::new();
+            }
+            vec![deletions(coordinate.public_key).events(versions).limit(8)]
+        }
+    }
 }
 
 /// What the cache holds for one key: the shown event, if any, and the newest
@@ -316,8 +342,19 @@ impl Stored {
     }
 }
 
-/// The row a refresh leads to, or `None` when nothing is known.
-fn admit(target: &Target, stored: Option<&Row>, fetched: &[Event]) -> Option<Row> {
+/// What a refresh leads to for one key.
+#[derive(Debug, PartialEq, Eq)]
+enum Admitted {
+    /// Nothing is known.
+    Nothing,
+    /// The only known version was deleted by ID and no deletion bound
+    /// remains, so the key goes back to unknown.
+    Cleared,
+    Row(Row),
+}
+
+/// The state a refresh leads to, given the stored row and verified events.
+fn admit(target: &Target, stored: Option<&Row>, fetched: &[Event]) -> Admitted {
     let deletions = fetched
         .iter()
         .filter(|event| event.kind == Kind::EventDeletion)
@@ -331,11 +368,13 @@ fn admit(target: &Target, stored: Option<&Row>, fetched: &[Event]) -> Option<Row
     match target {
         Target::EventId(_) => {
             // A deleted event ID stays deleted.
-            if stored.is_some_and(|row| row.event.is_none()) {
-                return stored.cloned();
+            if let Some(row) = stored.filter(|row| row.event.is_none()) {
+                return Admitted::Row(row.clone());
             }
-            let event = candidates.into_iter().next()?;
-            Some(match deletion_time(event, &deletions) {
+            let Some(event) = candidates.into_iter().next() else {
+                return Admitted::Nothing;
+            };
+            Admitted::Row(match deletion_time(event, &deletions) {
                 Some(through) => Row {
                     event: None,
                     deleted_through: Some(through),
@@ -357,25 +396,31 @@ fn admit(target: &Target, stored: Option<&Row>, fetched: &[Event]) -> Option<Row
                     deleted_through = deleted_through.max(Some(deletion.created_at.as_secs()));
                 }
             }
-            // An `e` deletion of one version hides it and every older version.
-            for event in &candidates {
-                if deletion_time(event, &deletions).is_some() {
-                    deleted_through = deleted_through.max(Some(event.created_at.as_secs()));
-                }
-            }
+            // Only an `a` deletion sets the bound. An `e` deletion removes that
+            // one version, and the previous version becomes current.
+            let mut deleted_by_id = false;
             let shown = candidates
                 .into_iter()
                 .filter(|event| {
                     deleted_through.is_none_or(|through| event.created_at.as_secs() > through)
                 })
+                .filter(|event| {
+                    let deleted = deletion_time(event, &deletions).is_some();
+                    deleted_by_id |= deleted;
+                    !deleted
+                })
                 .fold(None::<&Event>, |best, event| match best {
                     Some(current) if !supersedes(event, current) => Some(current),
                     _ => Some(event),
                 });
-            (shown.is_some() || deleted_through.is_some()).then(|| Row {
-                event: shown.map(|event| Box::new(event.clone())),
-                deleted_through,
-            })
+            match (shown, deleted_through) {
+                (None, None) if deleted_by_id => Admitted::Cleared,
+                (None, None) => Admitted::Nothing,
+                (shown, deleted_through) => Admitted::Row(Row {
+                    event: shown.map(|event| Box::new(event.clone())),
+                    deleted_through,
+                }),
+            }
         }
     }
 }
@@ -468,8 +513,16 @@ fn persist_refresh(
     now: u64,
 ) -> Result<(), AppError> {
     let stored = read_row(conn, key)?;
-    let Some(row) = admit(target, stored.as_ref().map(|stored| &stored.row), fetched) else {
-        return Ok(());
+    let row = match admit(target, stored.as_ref().map(|stored| &stored.row), fetched) {
+        Admitted::Nothing => return Ok(()),
+        Admitted::Cleared => {
+            conn.execute(
+                "DELETE FROM public_event_previews WHERE cache_key = ?1",
+                [key],
+            )?;
+            return Ok(());
+        }
+        Admitted::Row(row) => row,
     };
     if stored.as_ref().is_some_and(|stored| stored.row == row) {
         if complete {
@@ -482,7 +535,7 @@ fn persist_refresh(
         return Ok(());
     }
     write_row(conn, key, &row, complete, now)?;
-    trim(conn)
+    trim(conn, key)
 }
 
 fn write_row(
@@ -519,8 +572,9 @@ fn write_row(
 }
 
 /// Evict least recently used rows until both budgets hold, rows without a
-/// deletion time first.
-fn trim(conn: &Connection) -> Result<(), AppError> {
+/// deletion time first. The row just written (`keep`) is never evicted, so a
+/// cache full of deletion times still admits new previews.
+fn trim(conn: &Connection, keep: &str) -> Result<(), AppError> {
     let (mut count, mut total): (i64, i64) = conn.query_row(
         "SELECT count(*), coalesce(sum(bytes), 0) FROM public_event_previews",
         [],
@@ -530,10 +584,10 @@ fn trim(conn: &Connection) -> Result<(), AppError> {
         return Ok(());
     }
     let mut statement = conn.prepare(
-        "SELECT cache_key, bytes FROM public_event_previews
+        "SELECT cache_key, bytes FROM public_event_previews WHERE cache_key != ?1
          ORDER BY deleted_through IS NOT NULL, touched_at, cache_key",
     )?;
-    let mut rows = statement.query([])?;
+    let mut rows = statement.query([keep])?;
     let mut evict = Vec::new();
     while count > MAX_ENTRIES || total > MAX_TOTAL_BYTES {
         let Some(row) = rows.next()? else { break };
@@ -663,17 +717,16 @@ impl MarmotApp {
                 MAX_FETCHED_EVENTS,
             )
             .await;
-        let fetched = match (fetched, &parsed.target) {
-            (Ok(mut fetched), Target::EventId(id)) => {
-                if let Some(author) = crowded_deletion_author(id, stored_event, &fetched.events) {
-                    let filter = Filter::new()
-                        .kind(Kind::EventDeletion)
-                        .author(author)
-                        .event(*id)
-                        .limit(4);
+        // One follow-up asks the verified author about deletions the first
+        // query could not attribute. If it does not finish, nothing it should
+        // have covered is confirmed.
+        let fetched = match fetched {
+            Ok(mut fetched) => {
+                let filters = follow_up_deletions(&parsed.target, stored_event, &fetched.events);
+                if !filters.is_empty() {
                     match self
                         .relay_plane
-                        .fetch_public_events(relays, vec![filter], MAX_FETCHED_EVENTS)
+                        .fetch_public_events(relays, filters, MAX_FETCHED_EVENTS)
                         .await
                     {
                         Ok(more) => {
@@ -685,7 +738,7 @@ impl MarmotApp {
                 }
                 Ok(fetched)
             }
-            (fetched, _) => fetched,
+            Err(error) => Err(error),
         };
         // Start the cooldown only once a fetch finished, so a cancelled
         // refresh can be retried at once.
