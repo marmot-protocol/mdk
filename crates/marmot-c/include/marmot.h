@@ -205,13 +205,12 @@ enum MarmotStatus
   /**
    * The edit target is missing, not a chat message, sent by another
    * account, deleted, or withdrawn by convergence; nothing was published.
-   * 103 and 104 are left for the pending key-package statuses (mdk#2178).
    */
-  MARMOT_STATUS_INVALID_EDIT_TARGET = 105,
+  MARMOT_STATUS_INVALID_EDIT_TARGET = 103,
   /**
    * Too many edits of one message in a burst; retry after a few seconds.
    */
-  MARMOT_STATUS_EDIT_RATE_LIMITED = 106,
+  MARMOT_STATUS_EDIT_RATE_LIMITED = 104,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L

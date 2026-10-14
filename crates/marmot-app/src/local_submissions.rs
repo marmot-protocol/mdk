@@ -411,11 +411,18 @@ impl MarmotApp {
                         "pending edit requires an outgoing text message".into(),
                     ));
                 }
+                // Order after every edit this account stored for the target,
+                // direct or retained: an original awaiting its publish retry
+                // exposes no accepted edits, yet they compete once it recovers.
                 // Hosts already match this documented message (0.11.0), so
                 // retained admissions keep it rather than `EditRateLimited`.
                 event_created_at = next_edit_created_at(
                     created_at,
-                    original_row.edit.map(|previous| previous.edited_at),
+                    storage.latest_authored_edit_at(
+                        &group_hex,
+                        &original.message_id_hex,
+                        &account.account_id_hex,
+                    )?,
                 )
                 .ok_or_else(|| {
                     AppError::InvalidAppMessagePayload(

@@ -152,10 +152,9 @@ pub enum MarmotStatus {
     GroupCommitUndelivered = 102,
     /// The edit target is missing, not a chat message, sent by another
     /// account, deleted, or withdrawn by convergence; nothing was published.
-    /// 103 and 104 are left for the pending key-package statuses (mdk#2178).
-    InvalidEditTarget = 105,
+    InvalidEditTarget = 103,
     /// Too many edits of one message in a burst; retry after a few seconds.
-    EditRateLimited = 106,
+    EditRateLimited = 104,
 }
 
 thread_local! {
@@ -547,11 +546,11 @@ mod tests {
         );
         assert_eq!(
             status_from_error(&MarmotKitError::InvalidEditTarget) as i32,
-            105
+            103
         );
         assert_eq!(
             status_from_error(&MarmotKitError::EditRateLimited) as i32,
-            106
+            104
         );
         assert_eq!(
             status_from_error(&MarmotKitError::BlockListUnavailable) as i32,
