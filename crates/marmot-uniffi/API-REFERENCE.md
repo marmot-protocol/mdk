@@ -2388,7 +2388,7 @@ Run the engine-owned disappearing-message sweep for one account using the suppli
 pub async fn edit_message( &self, account_ref: String, group_id_hex: String, target_message_id: String, content: String, ) -> Result<SendSummaryFfi, MarmotKitError>
 ```
 
-Edit `target_message_id` by publishing a kind-1009 event that references it and carries the replacement plaintext in `content`. Recipients honour the edit only when its authenticated author matches the target's author; MDK ignores mismatched edits. It returns `InvalidEditTarget`, publishing nothing, unless the target is an available chat message this account sent. Competing edits resolve by `created_at`, then the lexically smallest event id (NIP-01).
+Edit `target_message_id` by publishing a kind-1009 event that references it and carries the replacement plaintext in `content`. Recipients honour the edit only when its authenticated author matches the target's author; MDK ignores mismatched edits. It returns `InvalidEditTarget`, publishing nothing, unless the target is an available chat message this account sent. Competing edits resolve by `created_at`, then the larger event id.
 
 [Source](src/commands/message.rs#L193)
 
