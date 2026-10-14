@@ -297,3 +297,113 @@ fn victim_scan_uses_the_retained_lru_index() {
     );
     assert!(!plan.contains("TEMP B-TREE"), "{plan}");
 }
+
+#[test]
+fn failed_or_cancelled_file_import_keeps_older_bodies() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let old = ready(&store, "old", 100);
+    seed(&store, "new");
+    let new = request(&store, "new");
+    let job = store
+        .claim_attachment_acquisition(&new, LATE, LATE + 100)
+        .unwrap()
+        .unwrap();
+    // The old body fills the budget, so the import needs room.
+    let budget = LEN;
+    let wrong = vec![0u8; BODY.len()];
+    assert!(
+        store
+            .complete_attachment_acquisition_from_reader(
+                &job,
+                &mut &wrong[..],
+                LEN,
+                LATE,
+                budget,
+                &|| false
+            )
+            .is_err(),
+        "a body that misses its digest is not published"
+    );
+    assert!(retained(&store, &old));
+    assert!(
+        store
+            .complete_attachment_acquisition_from_reader(
+                &job,
+                &mut &BODY[..],
+                LEN,
+                LATE,
+                budget,
+                &|| true
+            )
+            .is_err(),
+        "a cancelled import is not published"
+    );
+    assert!(retained(&store, &old));
+    assert_eq!(store.retained_attachment_byte_count().unwrap(), LEN);
+
+    // Only the verified seal releases the older body.
+    assert_eq!(
+        store
+            .complete_attachment_acquisition_from_reader(
+                &job,
+                &mut &BODY[..],
+                LEN,
+                LATE,
+                budget,
+                &|| false
+            )
+            .unwrap(),
+        AttachmentPublishResult::Published
+    );
+    assert!(!retained(&store, &old));
+    assert!(retained(&store, &new));
+    assert_eq!(store.retained_attachment_byte_count().unwrap(), LEN);
+}
+
+#[test]
+fn failed_file_staging_keeps_older_bodies() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let old = ready(&store, "old", 100);
+    let mut reader = std::io::Cursor::new(BODY.to_vec());
+    assert!(
+        store
+            .stage_attachment_upload_files(
+                GROUP,
+                3,
+                &mut [AttachmentUploadSource {
+                    reader: &mut reader,
+                    len: LEN,
+                    digest: [9; 32],
+                }],
+                LATE,
+                LEN,
+                &|| false,
+            )
+            .is_err(),
+        "a snapshot that misses its digest is not staged"
+    );
+    assert!(retained(&store, &old));
+    assert_eq!(store.retained_attachment_byte_count().unwrap(), LEN);
+
+    let mut reader = std::io::Cursor::new(BODY.to_vec());
+    let tokens = store
+        .stage_attachment_upload_files(
+            GROUP,
+            3,
+            &mut [AttachmentUploadSource {
+                reader: &mut reader,
+                len: LEN,
+                digest: digest(),
+            }],
+            LATE,
+            LEN,
+            &|| false,
+        )
+        .unwrap();
+    assert_eq!(tokens.len(), 1);
+    assert!(
+        !retained(&store, &old),
+        "completion releases the older body"
+    );
+    assert_eq!(store.retained_attachment_byte_count().unwrap(), LEN);
+}

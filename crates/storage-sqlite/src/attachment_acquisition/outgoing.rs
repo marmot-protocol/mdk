@@ -218,20 +218,21 @@ impl SqliteAccountStorage {
                 // The staged bytes already reserve their quota. Convert once the
                 // complete message is processed; repeated slots need extra quota.
                 let (used,partial,already,own_partial):(u64,u64,bool,u64)=conn.query_row("SELECT (SELECT byte_count FROM attachment_retention_usage WHERE id=1),(SELECT reserved_bytes FROM attachment_partial_usage WHERE id=1),EXISTS(SELECT 1 FROM retained_attachment_bytes WHERE token=?1),coalesce((SELECT total FROM attachment_partial WHERE token=?1),0)",[&asset.token],|r|Ok((nonnegative(r,0)?,nonnegative(r,1)?,r.get(2)?,nonnegative(r,3)?))).storage()?;
-                let budget:Option<u64>=conn.query_row("SELECT retained_bytes FROM attachment_download_policy WHERE id=1",[],|r|nonnegative(r,0)).optional().storage()?;
-                let keep_staged=staging_has_unfulfilled_owner(&conn,&token,now,Some((message,entry.attachment_index)))?;
-                let credit=if keep_staged || consumed.contains_key(&token) {0}else{size};
-                let projected=used.saturating_add(partial.saturating_sub(own_partial)).saturating_add(size).saturating_sub(credit).saturating_sub(consumed.values().copied().sum::<u64>());
-                if !already && credit != size && !super::eviction::make_room(&conn,projected,budget.unwrap_or(fallback_budget),u64_to_i64(now)?)? {
-                    conn.execute("UPDATE attachment_acquisition SET automatic_history=1,body_completed=1,state=4,due=NULL,attempt=NULL WHERE token=?1",[&asset.token]).storage()?;
-                    continue;
-                }
+                // Verify before making room: eviction commits only with a copy.
                 if !already && (quarantined || !verify_staged_upload(&conn,&token,&digest,size,&verified_files)?) {
                     // Discard proven-corrupt bytes, keeping only metadata until
                     // every live source has a durable unavailable receipt.
                     conn.execute("DELETE FROM outgoing_attachment_upload_bodies WHERE token=?1",[&token]).storage()?;
                     conn.execute("DELETE FROM outgoing_attachment_upload_files WHERE token=?1",[&token]).storage()?;
                     conn.execute("UPDATE outgoing_attachment_uploads SET bytes=x'',quarantined=1 WHERE token=?1",[&token]).storage()?;
+                    conn.execute("UPDATE attachment_acquisition SET automatic_history=1,body_completed=1,state=4,due=NULL,attempt=NULL WHERE token=?1",[&asset.token]).storage()?;
+                    continue;
+                }
+                let budget:Option<u64>=conn.query_row("SELECT retained_bytes FROM attachment_download_policy WHERE id=1",[],|r|nonnegative(r,0)).optional().storage()?;
+                let keep_staged=staging_has_unfulfilled_owner(&conn,&token,now,Some((message,entry.attachment_index)))?;
+                let credit=if keep_staged || consumed.contains_key(&token) {0}else{size};
+                let projected=used.saturating_add(partial.saturating_sub(own_partial)).saturating_add(size).saturating_sub(credit).saturating_sub(consumed.values().copied().sum::<u64>());
+                if !already && credit != size && !super::eviction::make_room(&conn,projected,budget.unwrap_or(fallback_budget),u64_to_i64(now)?)? {
                     conn.execute("UPDATE attachment_acquisition SET automatic_history=1,body_completed=1,state=4,due=NULL,attempt=NULL WHERE token=?1",[&asset.token]).storage()?;
                     continue;
                 }

@@ -821,6 +821,54 @@ fn corrupt_shared_upload_is_quarantined_without_reacquisition() {
     );
 }
 
+/// Corrupt shared bytes are quarantined before promotion makes room, so a
+/// copy that is never written cannot cost an older retained body.
+#[test]
+fn corrupt_shared_upload_promotion_never_evicts_retained_bodies() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "victim");
+    let victim = request(&store, "victim");
+    publish(&store, &victim);
+    // Long unused, so eviction may take it.
+    sql(
+        &store,
+        "UPDATE attachment_acquisition SET retained_used_at=0",
+    );
+    for message in ["a-poison", "b-poison"] {
+        sent(&store, message);
+    }
+    staged(&store, "a-poison");
+    store
+        .protect_attachment_uploads(GROUP, "b-poison", &source("b-poison").tags)
+        .unwrap();
+    sql(&store, "UPDATE outgoing_attachment_uploads SET bytes=x'00'");
+    // No headroom: the shared copy for a-poison would need eviction.
+    let budget = usage(&store);
+    assert_eq!(
+        store
+            .recover_attachment_uploads(10_000, 64, budget)
+            .unwrap(),
+        0
+    );
+    for message in ["a-poison", "b-poison"] {
+        assert_eq!(
+            transfer(&store, message, true).state,
+            AttachmentTransferState::CompletedUnretained
+        );
+    }
+    let kept: bool = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM retained_attachment_bytes WHERE token=?1)",
+            [&victim.token],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(kept, "the healthy body survives the corrupt promotion");
+    assert_eq!(usage(&store), BODY.len() as u64);
+}
+
 /// Accepted pending and confirmed sources survive cleanup when optional owner INSERT fails.
 #[test]
 fn ownerless_committed_sources_survive_both_abandonment_paths() {

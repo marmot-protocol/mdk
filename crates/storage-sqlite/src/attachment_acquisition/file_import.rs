@@ -52,7 +52,7 @@ pub(super) fn complete(
     let reservation = store.connection.with_transaction(|| {
         let conn = store.lock()?;
         let now = u64_to_i64(clock())?;
-        if let Some(refused) = publication_refusal(&conn, job, now, len, budget)? {
+        if let Some(refused) = publication_refusal(&conn, job, now, len, budget, false)? {
             return Ok(Err(refused));
         }
         let exists: bool = conn
@@ -109,7 +109,9 @@ pub(super) fn complete(
             }
             // This import already reserves its full length. Do not charge it
             // again, but retain all source, permission, lease and quota checks.
-            if let Some(refused) = publication_refusal(&conn, job, u64_to_i64(clock())?, 0, budget)?
+            // The reservation may exceed the budget until the seal evicts.
+            if let Some(refused) =
+                publication_refusal(&conn, job, u64_to_i64(clock())?, 0, budget, false)?
             {
                 return Ok(Some(refused));
             }
@@ -141,7 +143,8 @@ pub(super) fn complete(
             return Ok(AttachmentPublishResult::Superseded);
         }
         let now = u64_to_i64(clock())?;
-        if let Some(refused) = publication_refusal(&conn, job, now, 0, budget)? {
+        // Only the seal, with the verified body, releases older bodies.
+        if let Some(refused) = publication_refusal(&conn, job, now, 0, budget, true)? {
             return Ok(refused);
         }
         seal_chunked_file(&conn, &job.reference.token, &reservation.nonce)?;

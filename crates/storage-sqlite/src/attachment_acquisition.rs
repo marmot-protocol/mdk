@@ -649,7 +649,7 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             if let Some(refused) =
-                publication_refusal(&conn, job, now, plaintext.len() as u64, byte_budget)?
+                publication_refusal(&conn, job, now, plaintext.len() as u64, byte_budget, true)?
             {
                 return Ok(refused);
             }
@@ -998,12 +998,17 @@ impl SqliteAccountStorage {
 /// Shared publication admission: store, attempt, lease, source, acceptance and
 /// expiry fences, then the retained+partial quota (excluding this job's own
 /// partial reservation). `Some` is the refusal to return without inserting.
+/// `evict` releases least-recently-used bodies to fit; pass it only from the
+/// transaction that commits the verified bytes, so a failed or cancelled
+/// import never costs other bodies. Without it, bytes eviction could release
+/// count as room.
 fn publication_refusal(
     conn: &Connection,
     job: &AttachmentAcquisition,
     now: i64,
     len: u64,
     byte_budget: u64,
+    evict: bool,
 ) -> StorageResult<Option<AttachmentPublishResult>> {
     if !matches_store(conn, &job.reference)? {
         return Ok(Some(AttachmentPublishResult::Superseded));
@@ -1047,7 +1052,12 @@ fn publication_refusal(
     let projected = used
         .saturating_add(partial_used.saturating_sub(own_partial))
         .saturating_add(len);
-    if !eviction::make_room(conn, projected, byte_budget, now)? {
+    let fits = if evict {
+        eviction::make_room(conn, projected, byte_budget, now)?
+    } else {
+        eviction::can_make_room(conn, projected, byte_budget, now)?
+    };
+    if !fits {
         conn.execute("UPDATE attachment_acquisition SET body_completed=1,state=4,due=NULL,attempt=NULL WHERE token=?1 AND automatic_history=1", [&job.reference.token]).storage()?;
         return Ok(Some(AttachmentPublishResult::CapacityBlocked));
     }

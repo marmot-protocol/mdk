@@ -55,7 +55,7 @@ pub(super) fn stage(
         if !accepted { return Err(invalid("outgoing attachment group unavailable")); }
         let (used,partial,count): (u64,u64,i64) = conn.query_row("SELECT (SELECT byte_count FROM attachment_retention_usage WHERE id=1),(SELECT reserved_bytes FROM attachment_partial_usage WHERE id=1),(SELECT count(*) FROM outgoing_attachment_uploads)", [], |r| Ok((nonnegative(r,0)?,nonnegative(r,1)?,r.get(2)?))).storage()?;
         if count+sources.len() as i64>256
-            || !super::eviction::make_room(&conn, used.saturating_add(partial).saturating_add(incoming), budget, u64_to_i64(now)?)? {
+            || !super::eviction::can_make_room(&conn, used.saturating_add(partial).saturating_add(incoming), budget, u64_to_i64(now)?)? {
             return Err(invalid("outgoing attachment retention capacity unavailable"));
         }
         let mut result = Vec::with_capacity(sources.len());
@@ -126,6 +126,12 @@ pub(super) fn stage(
         for (token,nonce) in &batch.reservations {
             if !owns(&conn,token,nonce)? { return Err(invalid("outgoing attachment reservation unavailable")); }
             conn.execute("UPDATE outgoing_attachment_upload_files SET completed=1 WHERE token=?1 AND nonce=?2",params![token,nonce]).storage()?;
+        }
+        // The reservations already count. Evict only now, with verified bodies,
+        // so a failed or cancelled staging never costs older retained bodies.
+        let (used,partial): (u64,u64) = conn.query_row("SELECT (SELECT byte_count FROM attachment_retention_usage WHERE id=1),(SELECT reserved_bytes FROM attachment_partial_usage WHERE id=1)", [], |r| Ok((nonnegative(r,0)?,nonnegative(r,1)?))).storage()?;
+        if !super::eviction::make_room(&conn, used.saturating_add(partial), budget, u64_to_i64(now)?)? {
+            return Err(invalid("outgoing attachment retention capacity unavailable"));
         }
         Ok(())
     })?;
