@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 const ACCEPT_STALE_HELP: &str = "If the group is still catching up on missed changes, make this \
 group change anyway. The device may be behind, so the change can split the group for everyone";
 
+/// mdk#2255: a group change while the group's last change has not reached
+/// every relay fails with `group_commit_undelivered` unless the caller accepts it.
+const ACCEPT_UNDELIVERED_HELP: &str = "If the group's last change has not reached every relay yet, make this group change anyway. Members who read only those relays may not follow either change";
+
 #[derive(Parser, Clone, Debug, Serialize, Deserialize)]
 #[command(
     name = "wn",
@@ -185,6 +189,9 @@ pub(crate) enum Command {
         #[arg(long, global = true, help = ACCEPT_STALE_HELP)]
         #[serde(default)]
         accept_stale: bool,
+        #[arg(long, global = true, help = ACCEPT_UNDELIVERED_HELP)]
+        #[serde(default)]
+        accept_undelivered: bool,
     },
     #[command(about = "Create groups and manage membership and admin state")]
     Groups {
@@ -193,6 +200,9 @@ pub(crate) enum Command {
         #[arg(long, global = true, help = ACCEPT_STALE_HELP)]
         #[serde(default)]
         accept_stale: bool,
+        #[arg(long, global = true, help = ACCEPT_UNDELIVERED_HELP)]
+        #[serde(default)]
+        accept_undelivered: bool,
     },
     #[command(hide = true)]
     Message {
@@ -715,6 +725,14 @@ pub(crate) enum GroupsCommand {
         about = "Show which group-management actions the selected account can take right now"
     )]
     Management {
+        #[arg(help = "Group id to inspect")]
+        group_id: String,
+    },
+    #[command(
+        name = "commit-delivery",
+        about = "Show the relays still owed the group's oldest undelivered change, if any"
+    )]
+    CommitDelivery {
         #[arg(help = "Group id to inspect")]
         group_id: String,
     },

@@ -483,6 +483,14 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         respond: oneshot::Sender<Result<bool, AppError>>,
     },
+    AcknowledgeGroupCommitUndelivered {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<bool, AppError>>,
+    },
+    GroupCommitDelivery {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<Option<crate::GroupCommitDelivery>, AppError>>,
+    },
     ConfirmGroupRejoin {
         welcome_id: cgka_traits::MessageId,
         token: Vec<u8>,
@@ -763,6 +771,7 @@ impl AccountWorkerCommand {
                 | Self::QuarantinedGroups { .. }
                 | Self::GroupRecoveryStatus { .. }
                 | Self::HistoryNotices { .. }
+                | Self::GroupCommitDelivery { .. }
         )
     }
 
@@ -5319,6 +5328,26 @@ fn account_worker_command_future<'a>(
                 true
             })
         }
+        AccountWorkerCommand::AcknowledgeGroupCommitUndelivered { group_id, respond } => {
+            Box::pin(async move {
+                let _ = respond_diagnosed(
+                    shared,
+                    storage_permit.as_ref(),
+                    respond,
+                    client.acknowledge_group_commit_undelivered(&group_id),
+                );
+                true
+            })
+        }
+        AccountWorkerCommand::GroupCommitDelivery { group_id, respond } => Box::pin(async move {
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.group_commit_delivery(&group_id),
+            );
+            true
+        }),
         AccountWorkerCommand::DismissHistoryNotice { notice_id, respond } => {
             Box::pin(async move {
                 let result = client.dismiss_history_notice(&notice_id);

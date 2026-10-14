@@ -168,6 +168,13 @@ pub enum AppError {
     /// history notice does not release it.
     #[error("group is still catching up on missed changes; try again once it has synced")]
     GroupCatchingUp(String),
+    /// The group's last change has been owed to a group relay for over two
+    /// minutes, so members who read only that relay cannot follow it
+    /// (mdk#2255). MDK keeps retrying the owed relays. Retryable once they accept the change.
+    /// Or, after the user accepts that some members may miss changes,
+    /// `acknowledge_group_commit_undelivered` and retry.
+    #[error("the group's last change has not reached every relay yet; try again shortly")]
+    GroupCommitUndelivered(String),
     /// Host-supplied draft attachment metadata failed validation before storage.
     #[error("invalid message draft: {0}")]
     InvalidMessageDraft(String),
@@ -459,6 +466,7 @@ impl AppError {
             Self::GroupDisbanding(_) => "group_disbanding",
             Self::GroupRemoved(_) => "group_removed",
             Self::GroupCatchingUp(_) => "group_catching_up",
+            Self::GroupCommitUndelivered(_) => "group_commit_undelivered",
             Self::InvalidMessageDraft(_) => "invalid_message_draft",
             Self::MessageDraftRevisionConflict => "message_draft_revision_conflict",
             Self::AgentStreamMissingStart => "agent_stream_missing_start",

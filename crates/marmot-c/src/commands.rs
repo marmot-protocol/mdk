@@ -51,10 +51,11 @@ use crate::types::group::{
     MarmotAppBlobEndpoint, MarmotAppGroupMemberIdsList, MarmotAppGroupMemberRecordList,
     MarmotAppGroupMlsState, MarmotAppGroupRecord, MarmotAppQuarantinedGroupList,
     MarmotCreateGroupOptions, MarmotCreatedGroup, MarmotDisbandRequest, MarmotGroupAppComponent,
-    MarmotGroupConversationSnapshot, MarmotGroupDetails, MarmotGroupInviteDeclineResult,
-    MarmotGroupManagementState, MarmotGroupMutationResult, MarmotGroupRecoveryStatus,
-    MarmotGroupRoster, MarmotInitialGroupImage, MarmotMemberKeyPackagePrewarmSummary,
-    MarmotMemberRef, MarmotPreparedGroupImageUpload, MarmotPreparedGroupImageUploadList,
+    MarmotGroupCommitDelivery, MarmotGroupConversationSnapshot, MarmotGroupDetails,
+    MarmotGroupInviteDeclineResult, MarmotGroupManagementState, MarmotGroupMutationResult,
+    MarmotGroupRecoveryStatus, MarmotGroupRoster, MarmotInitialGroupImage,
+    MarmotMemberKeyPackagePrewarmSummary, MarmotMemberRef, MarmotPreparedGroupImageUpload,
+    MarmotPreparedGroupImageUploadList,
 };
 use crate::types::history_notice::MarmotHistoryNoticeList;
 use crate::types::local_submissions::{
@@ -731,6 +732,20 @@ c_cmd! {
     /// change. Admits one attempt at the current epoch, consumed even if it
     /// fails; not persisted. Writes false when the group is not catching up.
     async fn marmot_acknowledge_group_catching_up(account_ref: str, group_id_hex: str) -> scalar(bool) = acknowledge_group_catching_up;
+
+    /// After a group change returns `MARMOT_STATUS_GROUP_COMMIT_UNDELIVERED`,
+    /// record that the user accepts that members on relays still owed the
+    /// group's last change may not follow, then retry the change. Admits one
+    /// attempt, consumed even if it fails; not persisted. Writes false when no
+    /// relay is owed the group's last change.
+    async fn marmot_acknowledge_group_commit_undelivered(account_ref: str, group_id_hex: str) -> scalar(bool) = acknowledge_group_commit_undelivered;
+
+    /// The group's oldest change that some group relays have not accepted yet,
+    /// or NULL once every relay has accepted or definitively rejected it.
+    /// Non-NULL is not a refusal: group changes return
+    /// `MARMOT_STATUS_GROUP_COMMIT_UNDELIVERED` only once `since` is two minutes
+    /// old. Poll while showing it. Free with `marmot_group_commit_delivery_free`.
+    async fn marmot_group_commit_delivery(account_ref: str, group_id_hex: str) -> opt_rec(MarmotGroupCommitDelivery) = group_commit_delivery;
 
     /// Query advisory membership health and pending rejoin offers.
     /// Free with `marmot_group_recovery_status_free`.

@@ -25,6 +25,21 @@ pub struct GroupAppComponentFfi {
     pub data: Vec<u8>,
 }
 
+/// The group's oldest change that some group relays have not accepted yet
+/// (mdk#2255). Members who read only those relays cannot follow the group until
+/// they do; MDK keeps retrying them with the exact event. A newer change can be
+/// owed to other relays as well.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct GroupCommitDeliveryFfi {
+    pub group_id_hex: String,
+    /// Relays that have not accepted the change yet.
+    pub owed_relay_urls: Vec<String>,
+    /// Relays the change was published to.
+    pub relay_count: u32,
+    /// When the first relay accepted the change, in Unix seconds.
+    pub since: u64,
+}
+
 /// Canonical create result carrying the exact durable chat-list projection.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct CreatedGroupFfi {

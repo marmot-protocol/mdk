@@ -15,6 +15,12 @@ versioning through the workspace version in the root `Cargo.toml`.
   `group_catching_up` (carrying `group_id`) instead of committing from the stale epoch and forking
   the group (mdk#2258). Retry once the group has synced, or pass `--accept-stale` to `wn groups` to
   make the change anyway. MarmotKit reports it as `GroupCatchingUp`.
+- Group changes while the group's last change has not reached every group relay now fail with the
+  JSON error code `group_commit_undelivered` (carrying `group_id`), instead of building on a change
+  that members on those relays cannot see (mdk#2255). MDK keeps retrying those relays. Retry once
+  they accept it, or pass `--accept-undelivered` to `wn groups` to make the change anyway.
+  `wn groups commit-delivery <group-hex>` lists the relays still owed the change. MarmotKit reports
+  it as `GroupCommitUndelivered`.
 
 ## [0.13.0] - 2026-10-12
 

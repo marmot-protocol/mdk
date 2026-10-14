@@ -390,6 +390,12 @@ Group changes for a group whose unresolved epoch-gap recovery covers its current
 return `MARMOT_STATUS_GROUP_CATCHING_UP`. Retry after it syncs, or, once the user accepts that
 the change may split the group, call `marmot_acknowledge_group_catching_up` and retry. See the
 [shared contract](../marmot-uniffi/README.md#history-may-be-incomplete-notices).
+Group changes can return `MARMOT_STATUS_GROUP_COMMIT_UNDELIVERED` when the group's last change
+has not reached every group relay; `marmot_group_commit_delivery` reports the owed relays
+immediately (free with `marmot_group_commit_delivery_free`), and
+`marmot_acknowledge_group_commit_undelivered` lets one change through. See the
+[shared contract](../marmot-uniffi/README.md#history-may-be-incomplete-notices) for when the
+status is returned.
 
 ## Group reporting
 
