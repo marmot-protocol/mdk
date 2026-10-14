@@ -596,6 +596,18 @@ mod tests {
             106
         );
         assert_eq!(
+            status_from_error(&MarmotKitError::MediaReferenceStaleEpoch {
+                reference_epoch: 2,
+                group_epoch: 3,
+            }) as i32,
+            107
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::MediaReferenceEpochUnsettled { reference_epoch: 2 })
+                as i32,
+            108
+        );
+        assert_eq!(
             status_from_error(&MarmotKitError::BlockListUnavailable) as i32,
             79
         );

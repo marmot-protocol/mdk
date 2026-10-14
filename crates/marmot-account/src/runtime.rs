@@ -96,9 +96,12 @@ pub enum SelfUpdateHold {
     /// forks the group (mdk#2258).
     EpochGap,
     /// An attachment upload for the group is in flight. Its media key is bound
-    /// to the epoch it was encrypted under, so an automatic rotation would make
-    /// the finished upload unsendable (mdk#2158). A self-update the user asked
-    /// for is not held: the user chose to change the group now.
+    /// to the epoch it was encrypted under, so a periodic rotation would make
+    /// the finished upload unsendable (mdk#2158). Only periodic rotations are
+    /// held: the post-join rotation replaces key material the welcome exposed,
+    /// and a self-update the user asked for changes the group now. A manual
+    /// request made while a periodic rotation is already owed joins it, so it
+    /// waits with it.
     Upload,
 }
 
@@ -112,11 +115,11 @@ impl SelfUpdateHold {
     }
 
     /// Whether this hold defers a due self-update started by `trigger`: an
-    /// epoch gap holds every rotation, an upload only automatic ones.
+    /// epoch gap holds every rotation, an upload only periodic ones.
     pub fn applies_to(self, trigger: MaintenanceTrigger) -> bool {
         match self {
             Self::EpochGap => true,
-            Self::Upload => trigger != MaintenanceTrigger::Manual,
+            Self::Upload => trigger == MaintenanceTrigger::Periodic,
         }
     }
 }
@@ -1596,9 +1599,10 @@ where
     }
 
     /// [`Self::run_due_maintenance`], but no new self-update commit is
-    /// authored for a `held` group; each hold names why, as the obligation's
-    /// failure code. A held obligation stays owed and retries on a later
-    /// sweep; publication of an already-staged commit is not held.
+    /// authored for a `held` group whose hold applies to the obligation's
+    /// trigger ([`SelfUpdateHold::applies_to`]); each hold names why, as the
+    /// obligation's failure code. A held obligation stays owed and retries on a
+    /// later sweep; publication of an already-staged commit is not held.
     pub async fn run_due_maintenance_holding(
         &mut self,
         held: &[(GroupId, SelfUpdateHold)],

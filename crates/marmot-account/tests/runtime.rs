@@ -6684,10 +6684,11 @@ async fn held_group_defers_a_due_self_update_until_the_hold_lifts() {
 }
 
 /// mdk#2158: a group with an attachment upload in flight keeps its due
-/// automatic self-update owed, recorded as an upload hold, until the upload
-/// ends. A self-update the user asked for is not held.
+/// periodic self-update owed, recorded as an upload hold, until the upload
+/// ends. A self-update the user asked for and the post-join rotation are not
+/// held.
 #[tokio::test]
-async fn upload_hold_defers_automatic_self_updates_but_not_manual_ones() {
+async fn upload_hold_defers_only_periodic_self_updates() {
     let (_dir, mut runtime, group_id, source_epoch) =
         manual_only_group_runtime(MaintenanceTiming::immediate()).await;
     let held = [(group_id.clone(), marmot_account::SelfUpdateHold::Upload)];
@@ -6711,7 +6712,7 @@ async fn upload_hold_defers_automatic_self_updates_but_not_manual_ones() {
         source_epoch.0 + 1
     );
 
-    // An automatic rotation that is due waits for the upload.
+    // A periodic rotation that is due waits for the upload.
     let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
     let mut obligation = runtime
         .session()
@@ -6745,6 +6746,30 @@ async fn upload_hold_defers_automatic_self_updates_but_not_manual_ones() {
     assert_eq!(
         runtime.session().epoch(&group_id).unwrap().0,
         source_epoch.0 + 2
+    );
+
+    // A post-join rotation goes ahead during an upload.
+    let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
+    let mut obligation = runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+    obligation.trigger = cgka_traits::MaintenanceTrigger::PostJoin;
+    obligation.phase = cgka_traits::MaintenancePhase::Retry;
+    runtime
+        .session()
+        .put_maintenance_obligation(&obligation)
+        .unwrap();
+    let mut rotated = false;
+    for _ in 0..3 {
+        let effects = runtime.run_due_maintenance_holding(&held).await.unwrap();
+        rotated |= confirmed(&effects);
+    }
+    assert!(rotated, "a post-join self-update is not held by an upload");
+    assert_eq!(
+        runtime.session().epoch(&group_id).unwrap().0,
+        source_epoch.0 + 3
     );
 }
 

@@ -82,7 +82,7 @@ mod retention;
 mod sync;
 #[cfg(test)]
 mod upload_cleanup_tests;
-mod upload_holds;
+pub(crate) mod upload_holds;
 
 use epoch_stall::EpochStallDetector;
 use push::notification_trigger_for_intent;
@@ -415,9 +415,10 @@ pub(crate) struct EncryptedMediaUploadFinish {
     /// File-backed uploads only: a cancellation observed before message
     /// admission prevents publication. Admission itself is not interruptible.
     control: Option<Arc<crate::MediaFileTransferControl>>,
-    /// Holds the group's due self-update while the upload is in flight, until
-    /// this finish is consumed or dropped (mdk#2158).
-    _epoch_hold: upload_holds::UploadEpochHold,
+    /// Holds the group's due periodic self-update while the upload is in
+    /// flight: until the send is admitted, through the admission grace when the
+    /// upload is sent separately, or until this finish drops (mdk#2158).
+    epoch_hold: upload_holds::UploadEpochHold,
 }
 
 /// Preserve the primary upload/admission failure when orphan cleanup also fails.
@@ -698,7 +699,9 @@ pub struct AppClient {
     pub(crate) relay_plane: MarmotRelayPlane,
     pub(crate) transport_signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
     pub(crate) blossom_http_transport: BlossomHttpTransport,
-    /// Attachment uploads in flight; each holds its group's due self-update.
+    /// Attachment uploads in flight; each holds its group's due periodic
+    /// self-update. Per client: only uploads this client prepares hold the
+    /// rotations its own maintenance sweep runs.
     pub(crate) upload_epoch_holds: upload_holds::UploadEpochHolds,
     pub(crate) state: AccountState,
     /// O(1) membership index over `state.seen_events`, kept in lockstep by
@@ -5292,7 +5295,7 @@ impl AppClient {
         };
         let (source_epoch, media_secret) = self.encrypted_media_secret(group_id)?;
         // The media key is now bound to `source_epoch`: hold this device's own
-        // rotation for the group until the upload is sent, admitted or dropped.
+        // periodic rotation for the group until the upload is sent or dropped.
         let epoch_hold = self
             .upload_epoch_holds
             .hold(group_id.clone(), std::time::Instant::now());
@@ -5332,7 +5335,7 @@ impl AppClient {
                 caption,
                 message_tags,
                 control,
-                _epoch_hold: epoch_hold,
+                epoch_hold,
             },
         ))
     }
@@ -5361,8 +5364,12 @@ impl AppClient {
             return Err(error);
         }
         if !finish.should_send {
-            // Upload only: the host sends the references later, and admission
-            // then protects the bound uploads; unsent ones expire.
+            // Upload only: token admission, or the host, sends the references
+            // in a separate command, and admission then protects the bound
+            // uploads; unsent ones expire. Keep the group held through the
+            // grace so that send still finds the epoch the upload was
+            // encrypted under.
+            finish.epoch_hold.linger(std::time::Instant::now());
             return Ok((result, Some(uploads)));
         }
         let attachments = result
@@ -6135,7 +6142,8 @@ impl AppClient {
     }
 
     /// Groups whose due self-update waits, and why: epoch-gap recovery first,
-    /// then an attachment upload in flight (mdk#2158).
+    /// then an attachment upload in flight or within its admission grace
+    /// (mdk#2158).
     fn self_update_holds(
         &self,
     ) -> Result<Vec<(GroupId, marmot_account::SelfUpdateHold)>, AppError> {
