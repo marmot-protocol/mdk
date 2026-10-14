@@ -34,6 +34,10 @@ pub use process::{ParsedEvent, PromptTransport};
 
 /// Default maximum byte length for one Marmot reply chunk.
 pub const DEFAULT_MAX_REPLY_BYTES: usize = 30_000;
+/// Assistant-text bytes one backend turn may produce before it is stopped.
+pub const MAX_TURN_TEXT_BYTES: usize = 1024 * 1024;
+/// Reply chunks one backend turn may produce before it is stopped.
+pub const MAX_TURN_REPLY_CHUNKS: usize = 256;
 /// Maximum plaintext byte length accepted by the Marmot message layer.
 pub const MARMOT_MESSAGE_BYTES_CEILING: usize = 60_000;
 /// Default maximum attachments accepted in one inbound turn.

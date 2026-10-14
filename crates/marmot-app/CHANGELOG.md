@@ -5,6 +5,9 @@
 ### Breaking changes
 
 - `AppError` adds `GroupCatchingUp` and `GroupCommitUndelivered`; update exhaustive matches.
+- `AppError::MissingKeyPackage` is now `{ account, reason: MissingKeyPackageReason }`.
+  `ObsoleteOnly` means a completed lookup found only legacy-profile KeyPackages, so the
+  recipient must update and publish a current one; `NotFound` keeps the previous meaning.
 - `AttachmentTransferState` adds `StorageBlocked`: free disk cannot cover the
   publication reserve for the body. Update exhaustive matches; the job keeps
   its checkpoint and readmits once space frees or on explicit Retry.
@@ -23,6 +26,11 @@
 
 ### Fixed
 
+- Inviting or looking up an account that has published only legacy-profile KeyPackages
+  (including MDK 0.8 publications) returns `MissingKeyPackage` with reason `ObsoleteOnly`
+  instead of `InvalidKeyPackageEvent` (mdk#1975). Legacy packages are still never selected,
+  never hide a current package's rejection, and an incomplete lookup still reports
+  `RelayDirectory`.
 - Group changes fail with `AppError::GroupCatchingUp` while unresolved epoch-gap recovery (pending, parked or with its notice dismissed) covers the group's current local epoch. Before, a device that knew the group had moved on could still commit from its stale epoch and fork the group (mdk#2258). The check is advisory: after the user accepts the risk, `acknowledge_group_catching_up` lets the change through. Due self-updates wait up to 24 hours for the gap to close. Messages and leave are not affected.
 - A failed or cancelled transport activation no longer leaves untracked REQs
   live on the relay. They used to stay open until disconnect, be re-sent on
@@ -67,6 +75,14 @@
 - Every publish pass, including secondary retries after a commit confirmed, writes `publish_attempt` and `publish_outcome` audit rows with the endpoints attempted, accepted and failed in that pass.
 - A relay still pending when a multi-relay signed publish meets quorum is now reported as `publish acknowledgement unknown` instead of being dropped from the outcome.
 - Group changes fail with `AppError::GroupCommitUndelivered` once the group's last confirmed change has been owed to a group relay for two minutes. Before, a device could keep building on a change that members reading only the other relays never received (mdk#2255). The check is advisory: after the user accepts the risk, `acknowledge_group_commit_undelivered` lets one change through. Both advisory checks are evaluated together, so a change refused by both can be acknowledged past each in turn. Due self-updates wait up to an hour for delivery. Messages and leave are not affected.
+- History recovery now records why each relay failed. The v5
+  `recovery_attempt_finished` row lists each failed relay once, as a hashed
+  endpoint reference, with a failure class: NEG-ERR and its reason's category,
+  strfry's negentropy-cap NOTICE, a first-reply or pass timeout, a relay outside
+  the pool or not usable, the comparison limit, a refused or unexpected fetch,
+  withheld events, the pass's own budget, or a local error. `relays_failed`
+  and `relays_incomplete` now count distinct relays; before, they were summed
+  per compared route and could exceed `relays_required` (#2265).
 
 ## 0.13.0 - 2026-10-12
 

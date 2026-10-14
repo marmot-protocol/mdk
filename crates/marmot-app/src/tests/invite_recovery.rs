@@ -179,12 +179,12 @@ async fn invite_recovery_honors_signed_event_and_coordinate_deletions() {
         assert!(matches!(
             app.resolve_member_key_packages(&[&account.account_id_hex])
                 .await,
-            Err(AppError::MissingKeyPackage(_))
+            Err(AppError::MissingKeyPackage { .. })
         ));
         assert!(matches!(
             app.fetch_latest_key_package_for_account_id(&account.account_id_hex, vec![])
                 .await,
-            Err(AppError::MissingKeyPackage(_))
+            Err(AppError::MissingKeyPackage { .. })
         ));
     }
 }
@@ -392,7 +392,7 @@ async fn invite_recovery_does_not_resurrect_an_older_slot_after_revoking_its_win
     assert!(matches!(
         app.resolve_member_key_packages(&[&account.account_id_hex])
             .await,
-        Err(AppError::MissingKeyPackage(_))
+        Err(AppError::MissingKeyPackage { .. })
     ));
 }
 
@@ -413,7 +413,7 @@ async fn invite_recovery_mixed_batch_preserves_first_failed_recipient() {
         ])
         .await;
     assert!(
-        matches!(result, Err(AppError::MissingKeyPackage(account)) if account == accounts[2].account_id_hex)
+        matches!(result, Err(AppError::MissingKeyPackage { account, reason: crate::MissingKeyPackageReason::NotFound }) if account == accounts[2].account_id_hex)
     );
 }
 
@@ -586,7 +586,7 @@ async fn invite_recovery_preserves_only_unrevoked_future_record_cache_fallback()
             .fetch_latest_key_package_for_account_id(&account.account_id_hex, vec![])
             .await;
         if revoke_cached {
-            assert!(matches!(result, Err(AppError::MissingKeyPackage(_))));
+            assert!(matches!(result, Err(AppError::MissingKeyPackage { .. })));
         } else {
             assert_eq!(
                 result.unwrap().key_package_event_id,
@@ -626,7 +626,7 @@ async fn invite_recovery_group_preflight_keeps_failed_roster_unchanged_and_allow
         client
             .invite_members(&group, &[&member.account_id_hex])
             .await,
-        Err(AppError::MissingKeyPackage(_))
+        Err(AppError::MissingKeyPackage { .. })
     ));
     let after = client.group_mls_state(&group).unwrap();
     assert_eq!(after.member_count, before.member_count);
@@ -756,7 +756,7 @@ async fn invite_recovery_verified_deletion_rejects_despite_other_incomplete_rout
     assert!(matches!(
         app.resolve_member_key_packages(&[&account.account_id_hex])
             .await,
-        Err(AppError::MissingKeyPackage(_))
+        Err(AppError::MissingKeyPackage { .. })
     ));
 }
 
@@ -837,7 +837,7 @@ async fn invite_recovery_future_only_cache_requires_its_own_completed_deletion_p
     assert!(matches!(
         app.fetch_latest_key_package_for_account_id(&account.account_id_hex, vec![])
             .await,
-        Err(AppError::MissingKeyPackage(_))
+        Err(AppError::MissingKeyPackage { .. })
     ));
 }
 
@@ -1022,7 +1022,7 @@ async fn invite_recovery_diagnostic_cache_event_ids_are_canonical_or_ineligible(
             .fetch_latest_key_package_for_account_id(&account.account_id_hex, vec![])
             .await;
         if empty {
-            assert!(matches!(result, Err(AppError::MissingKeyPackage(_))));
+            assert!(matches!(result, Err(AppError::MissingKeyPackage { .. })));
         } else {
             assert_eq!(result.unwrap().key_package_event_id, canonical_id);
         }

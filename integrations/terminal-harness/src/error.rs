@@ -32,6 +32,8 @@ pub enum HarnessError {
     BackendTimedOut,
     #[error("backend stream error")]
     BackendStream,
+    #[error("backend output exceeded a per-turn limit")]
+    OutputLimitExceeded,
     #[error("backend process failed to start")]
     BackendSpawn,
     #[error("inbound attachment count exceeds the configured limit")]
@@ -80,6 +82,7 @@ impl HarnessError {
             Self::ControlRejected { .. } => "control_rejected",
             Self::BackendTimedOut => "backend_timeout",
             Self::BackendStream => "backend_stream",
+            Self::OutputLimitExceeded => "output_limit_exceeded",
             Self::BackendSpawn => "backend_spawn",
             Self::AttachmentCountLimit => "attachment_count_limit",
             Self::AttachmentBytesLimit => "attachment_bytes_limit",

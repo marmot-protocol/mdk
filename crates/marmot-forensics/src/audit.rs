@@ -37,7 +37,7 @@ pub use recovery::{
     EoseRepairReceiver, EoseRepairTrigger, RECOVERY_AUDIT_MAX_ENDPOINTS,
     RECOVERY_AUDIT_MAX_OBLIGATIONS, RecoveryAttemptScope, RecoveryGoalBound, RecoveryNeedChange,
     RecoveryNextAttempt, RecoveryObligationCause, RecoveryObligationVerdict, RecoveryPassOutcome,
-    RecoveryScopeProgress, TransportCursorTrigger,
+    RecoveryRelayFailure, RecoveryRelayOutcome, RecoveryScopeProgress, TransportCursorTrigger,
 };
 pub use refusal::{
     SUBSCRIPTION_REFUSAL_AUDIT_MAX_ENTRIES, SubscriptionRefusalCategory, SubscriptionRefusalEntry,
@@ -739,6 +739,16 @@ pub enum AuditEventKind {
         met_required_acks: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         transport: Option<AuditTransportWire>,
+        /// Seconds from the published event's outer `created_at` to this
+        /// outcome on the publisher's clock, saturating at zero. A retry
+        /// resends the exact signed event, so for a commit this is how long it
+        /// has waited for relays since it was wrapped; a member whose cursor
+        /// passed that `created_at` before a relay accepted it cannot receive
+        /// it live (mdk#2256). Absent on rows written before this field
+        /// existed. Audit v5 only: a v4 recorder drops it (see
+        /// [`AuditEventKind::without_v5_only_fields`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_age_secs: Option<u64>,
     },
     /// Account runtime could not complete publish before endpoint receipts.
     PublishFailure {
@@ -1281,10 +1291,18 @@ pub enum AuditEventKind {
     /// not proof of complete history: only `routes_certified` routes carry a
     /// comparison certificate for the frozen window.
     ///
-    /// Relay counts are distinct endpoints over the frozen plan
-    /// (`relays_required`, `relays_admitted`) and summed per compared route
-    /// (`relays_failed`, `relays_incomplete`: answered but withheld a claimed
-    /// event). v5 only.
+    /// Relay counts are distinct endpoints: over the frozen plan
+    /// (`relays_required`, `relays_admitted`) and over the compared routes
+    /// (`relays_failed`, and its subset `relays_incomplete`: answered but left
+    /// claimed events unreturned, withheld by the relay or left by the pass's
+    /// own limits; `relay_outcomes` tells which). Rows before mdk#2265 summed
+    /// the last two per compared route. `relay_outcomes` says why each failed
+    /// relay failed, at most [`RECOVERY_AUDIT_MAX_ENDPOINTS`] of them, each
+    /// once; a failure the comparison backend did not attribute to a relay is
+    /// counted but not listed. v5 writes each relay as a hashed `endpoint_ref`.
+    /// It is empty when no relay failed, and absent from rows before mdk#2265,
+    /// so absence alone is ambiguous. A route the pass gave up on before its
+    /// relays answered attributes no relay. v5 only.
     RecoveryAttemptFinished {
         attempt_serial: u64,
         duration_ms: u64,
@@ -1304,6 +1322,8 @@ pub enum AuditEventKind {
         relays_admitted: u64,
         relays_failed: u64,
         relays_incomplete: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        relay_outcomes: Vec<RecoveryRelayOutcome>,
     },
     /// The owner's verdict on one obligation after a pass it settled, read
     /// back from storage after the checkpoint committed. Group-scoped demand
@@ -1473,6 +1493,37 @@ impl AuditEventKind {
             AuditEventKind::TransportCursorAdvanced { .. } => "transport_cursor_advanced",
             AuditEventKind::SubscriptionEoseRepaired { .. } => "subscription_eose_repaired",
             AuditEventKind::SubscriptionRefused { .. } => "subscription_refused",
+        }
+    }
+
+    /// This kind without the fields only audit v5 carries. The frozen v4
+    /// schema cannot express them, so a v4 recorder writes this projection.
+    pub fn without_v5_only_fields(self) -> Self {
+        match self {
+            AuditEventKind::PublishOutcome {
+                msg_id,
+                artifact_kind,
+                target_kind,
+                relay_url,
+                accepted_relay_urls,
+                failed_relays,
+                required_acks,
+                met_required_acks,
+                transport,
+                event_age_secs: _,
+            } => AuditEventKind::PublishOutcome {
+                msg_id,
+                artifact_kind,
+                target_kind,
+                relay_url,
+                accepted_relay_urls,
+                failed_relays,
+                required_acks,
+                met_required_acks,
+                transport,
+                event_age_secs: None,
+            },
+            kind => kind,
         }
     }
 
@@ -2198,7 +2249,7 @@ impl JsonlRecorder {
         inner.seq = seq.wrapping_add(1);
         let body = match &inner.format {
             RecorderFormat::V4 => {
-                let kind = record.kind;
+                let kind = record.kind.without_v5_only_fields();
                 let context = stamp_system_human_action(record.context, &kind);
                 let event = AuditEvent {
                     schema_version: AUDIT_LOG_SCHEMA_VERSION.to_string(),

@@ -3201,6 +3201,47 @@
         "failed"
       ]
     },
+    "Operational_recoveryRelayFailure": {
+      "enum": [
+        "neg_err",
+        "neg_cap_notice",
+        "negentropy_unsupported",
+        "first_reply_timeout",
+        "route_timeout",
+        "not_in_pool",
+        "not_operational",
+        "limit_reached",
+        "id_fetch_refused",
+        "unrequested_event",
+        "withheld",
+        "pass_limit",
+        "local_error"
+      ]
+    },
+    "Operational_recoveryRelayOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "endpoint_ref",
+        "failure",
+        "routes"
+      ],
+      "properties": {
+        "endpoint_ref": {
+          "$ref": "#/$defs/EndpointRef"
+        },
+        "failure": {
+          "$ref": "#/$defs/Operational_recoveryRelayFailure"
+        },
+        "refusal_category": {
+          "$ref": "#/$defs/Operational_subscriptionRefusalCategory"
+        },
+        "routes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
     "Operational_recoveryScopeProgress": {
       "enum": [
         "progressed",
@@ -3857,6 +3898,9 @@
         },
         "met_required_acks": {
           "type": "boolean"
+        },
+        "event_age_secs": {
+          "$ref": "#/$defs/Operational_u64"
         },
         "record_context": {
           "$ref": "#/$defs/Operational_auditEventContext"
@@ -4912,6 +4956,14 @@
         },
         "relays_incomplete": {
           "$ref": "#/$defs/Operational_u64"
+        },
+        "relay_outcomes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/Operational_recoveryRelayOutcome"
+          }
         },
         "record_context": {
           "$ref": "#/$defs/Operational_auditEventContext"

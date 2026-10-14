@@ -94,8 +94,9 @@ pub use relay_list::{
 };
 #[cfg(feature = "sdk")]
 pub use sdk_client::{
-    NostrReconciliationItem, NostrReconciliationProgress, NostrReconciliationSummary,
-    NostrSdkRelayClient, NostrSdkRelayHealth, NostrSdkSubscriptionPlan, RelayRegistrationOutcome,
+    NostrReconciliationEndpointFailure, NostrReconciliationFailure, NostrReconciliationItem,
+    NostrReconciliationProgress, NostrReconciliationSummary, NostrSdkRelayClient,
+    NostrSdkRelayHealth, NostrSdkSubscriptionPlan, RelayRegistrationOutcome,
     sdk_subscription_refusal, sign_transport_event_for_publish,
 };
 use telemetry::EoseRepairClaim;
@@ -2550,6 +2551,7 @@ impl ReplayWindow {
                 transport_group_id,
                 since,
                 until,
+                newest: None,
             },
         }
     }

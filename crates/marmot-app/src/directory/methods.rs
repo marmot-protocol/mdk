@@ -530,7 +530,7 @@ impl MarmotApp {
             observation.directory_sample(
                 match &result {
                     Ok(_) => "success",
-                    Err(AppError::MissingKeyPackage(_)) => "empty",
+                    Err(AppError::MissingKeyPackage { .. }) => "empty",
                     Err(AppError::InvalidKeyPackageEvent(_)) => "invalid",
                     Err(_) => "failure",
                 },
