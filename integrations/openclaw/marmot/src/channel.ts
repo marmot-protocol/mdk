@@ -293,8 +293,10 @@ export function createMarmotMessageActionAdapter(
 /**
  * Channel-owned `edit` action: `message(action:"edit", messageId, message)`
  * replaces the text of a chat message this agent sent, keeping its place in the
- * conversation (for example a status line updated as work progresses). Routes
- * through the send-time cache, then an explicit or current `to` group.
+ * conversation (for example a status line updated as work progresses). The host
+ * authorizes the explicit or current `to` group, so that group always wins; the
+ * send-time cache only fills in a missing target, and a cached message from a
+ * different group is refused rather than edited there.
  */
 async function handleEditAction(
   ctx: ChannelMessageActionContext,
@@ -318,10 +320,17 @@ async function handleEditAction(
   if (text === undefined || text.trim().length === 0) {
     return jsonResult({ ok: false, error: "message required: the replacement text" });
   }
-  const cached = deps.sentTargetFor?.(messageId);
   const rawTo =
     typeof ctx.params.to === "string" ? ctx.params.to : ctx.toolContext?.currentMessagingTarget;
-  const groupIdHex = cached?.groupIdHex ?? normalizeMarmotTarget(rawTo ?? "");
+  const authorized = normalizeMarmotTarget(rawTo ?? "");
+  const cached = deps.sentTargetFor?.(messageId);
+  if (authorized && cached && cached.groupIdHex.toLowerCase() !== authorized) {
+    return jsonResult({
+      ok: false,
+      error: "this message was sent to a different conversation than the edit target",
+    });
+  }
+  const groupIdHex = authorized || cached?.groupIdHex;
   if (!groupIdHex) {
     return jsonResult({ ok: false, error: "could not resolve group for this message id" });
   }

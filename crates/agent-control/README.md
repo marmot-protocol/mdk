@@ -73,7 +73,9 @@ timeline reads return the latest text. The runtime refuses, before publishing an
 a chat message, sent by another account, deleted, or withdrawn by convergence (`invalid_edit_target`, not retryable).
 Successive edits get strictly newer seconds so the last one sent stays effective; a burst that would stamp more than 30
 seconds ahead returns the retryable `edit_rate_limited`. Edits have no idempotency key: after an uncertain response,
-read the target with `timeline_message_get` before retrying.
+read the target with `timeline_message_get` before retrying. The `final_sent` ids name the edit event, not the message:
+keep passing the original message id to later `edit_message` and `timeline_message_get` calls, since an edit event id is
+not an editable target and returns `invalid_edit_target`.
 
 ## Materialized timeline reads
 

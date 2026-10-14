@@ -485,6 +485,55 @@ describe("createMarmotMessageActionAdapter", () => {
     expect(resultOk(result)).toBe(true);
   });
 
+  it("refuses to edit a cached message from another conversation than the authorized target", async () => {
+    const editMessage = vi.fn(async () => undefined);
+    const adapter = createMarmotMessageActionAdapter({
+      deleteByMessageId: async () => false,
+      sentTargetFor: () => ({ marmotAccountIdHex: HEX32("ab"), groupIdHex: HEX32("bb") }),
+      resolveTarget: async () => ({
+        client: messageActionClient({ editMessage }),
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+    });
+
+    // The host authorized group A (explicit `to`, or the current conversation);
+    // the message was sent to group B. Nothing may be published to B.
+    const explicit = await adapter.handleAction!(
+      editCtx({ messageId: HEX32("99"), message: "x", to: HEX32("cc") }),
+    );
+    const current = await adapter.handleAction!(
+      editCtx(
+        { messageId: HEX32("99"), message: "x" },
+        { currentMessagingTarget: `marmot:${HEX32("cc")}` },
+      ),
+    );
+
+    for (const result of [explicit, current]) {
+      expect(resultOk(result)).toBe(false);
+      expect(resultError(result)).toMatch(/different conversation/);
+    }
+    expect(editMessage).not.toHaveBeenCalled();
+  });
+
+  it("edits a cached message when it matches the authorized target", async () => {
+    const editMessage = vi.fn(async () => undefined);
+    const adapter = createMarmotMessageActionAdapter({
+      deleteByMessageId: async () => false,
+      sentTargetFor: () => ({ marmotAccountIdHex: HEX32("ab"), groupIdHex: HEX32("cc") }),
+      resolveTarget: async () => ({
+        client: messageActionClient({ editMessage }),
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+    });
+
+    const result = await adapter.handleAction!(
+      editCtx({ messageId: HEX32("99"), message: "x", to: `marmot:${HEX32("cc").toUpperCase()}` }),
+    );
+
+    expect(editMessage).toHaveBeenCalledWith(HEX32("ab"), HEX32("cc"), HEX32("99"), "x");
+    expect(resultOk(result)).toBe(true);
+  });
+
   it("edits in the current conversation on a cache miss", async () => {
     const editMessage = vi.fn(async () => undefined);
     const adapter = createMarmotMessageActionAdapter({
