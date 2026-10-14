@@ -1189,29 +1189,33 @@ async fn notification_lag_repair_leaves_reqs_issued_after_the_lag() {
         })
         .await
         .unwrap();
-    let group_id = |byte: u8| {
-        issued_id(&relay, |subscription| {
-            subscription.carries_group(&GroupId::new(vec![byte; 16]))
-        })
-    };
+    // The sync repacked both groups into one batch issued after the lag; the
+    // activation's batch it replaced is closed.
+    let live_batch = relay
+        .subscriptions
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|subscription| subscription.carries_group(&GroupId::new(vec![0x52; 16])))
+        .expect("the repacked batch was issued")
+        .subscription_id();
     let inbox_id = issued_id(&relay, |subscription| {
         matches!(subscription, NostrSubscription::AccountInbox { .. })
     });
 
     tokio::time::sleep(NOTIFICATION_LAG_EOSE_REPAIR_SETTLE).await;
-    let mut expected = vec![
-        (inbox_id, vec![endpoint.clone()]),
-        (group_id(0x51), vec![endpoint.clone()]),
-    ];
-    expected.sort();
-    assert_eq!(reissued_reqs(&relay, 2).await, expected);
+    assert_eq!(
+        reissued_reqs(&relay, 1).await,
+        vec![(inbox_id, vec![endpoint.clone()])]
+    );
     assert!(
         !relay
             .reissued
             .lock()
             .unwrap()
             .iter()
-            .any(|(id, _)| id == &group_id(0x52)),
+            .any(|(id, _)| id == &live_batch),
         "the REQ issued after the lag is not restarted"
     );
     relay_plane.shutdown().await;

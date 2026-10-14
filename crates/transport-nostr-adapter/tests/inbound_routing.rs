@@ -1328,8 +1328,8 @@ async fn reissued_live_subscription_keeps_synchronous_callbacks() {
         .await
         .expect("group sync succeeds");
 
-    // The widened old route goes out in a new batch of its own: its floor
-    // differs from the new route's, and existing batches are never re-issued.
+    // The sync repacks both routes into fresh batches, one each because their
+    // floors differ, and closes the activation's batch they replace.
     let old_subscription_id = adapter
         .group_route_subscription_id(&account_id, &old_transport_group_id)
         .await
@@ -1349,11 +1349,11 @@ async fn reissued_live_subscription_keeps_synchronous_callbacks() {
         adapter.subscription_synced(&new_subscription_id).await,
         Some(true)
     );
-    // The inbox, the activation's batch, which still carries the old route,
-    // and the sync's two batches. All but the inbox were served in subscribe.
+    // The inbox and the sync's two batches; the replaced activation batch is
+    // no longer tracked. Both batches were served in subscribe.
     let sync = adapter.relay_sync().await;
-    assert_eq!(sync.tracked_subscriptions, 4);
-    assert_eq!(sync.synced_subscriptions, 3);
+    assert_eq!(sync.tracked_subscriptions, 3);
+    assert_eq!(sync.synced_subscriptions, 2);
     assert_eq!(sync.first_event.sample_count(), 3);
     assert_eq!(sync.eose.sample_count(), 3);
 }
@@ -1451,12 +1451,13 @@ async fn failed_group_sync_rolls_back_staged_routes_and_telemetry() {
         .sync_account_groups(group_sync)
         .await
         .expect("retry succeeds from the prior group set");
-    // The retry packs the new route and the widened old route, which share a
-    // relay and a floor, into one batch.
+    // The retry repacks the new route and the widened old route, which share
+    // a relay and a floor, into one batch, and closes the activation's batch.
     let metrics = adapter.metrics().await;
     assert_eq!(metrics.active_group_subscriptions, 2);
     assert_eq!(metrics.subscriptions_created, 3);
-    assert_eq!(adapter.relay_sync().await.tracked_subscriptions, 3);
+    assert_eq!(metrics.subscriptions_removed, 1);
+    assert_eq!(adapter.relay_sync().await.tracked_subscriptions, 2);
     let delivered = adapter
         .handle_relay_event(NostrRelayEvent {
             endpoint,
@@ -1498,7 +1499,8 @@ async fn cancelled_group_sync_rolls_back_staged_routes_and_telemetry() {
         .await
         .expect("activation succeeds");
     let relay_sync_before = adapter.relay_sync().await;
-    // The sync's batch follows the activation's batch 0.
+    // The sync repacks its one route into batch 1, after the activation's
+    // batch 0.
     let new_subscription_id =
         batch_subscription_id(&adapter, &account_id, std::slice::from_ref(&endpoint), 1).await;
 
@@ -1669,9 +1671,10 @@ async fn cancelled_reissues_preserve_live_gates_and_apply_eose_on_rollback() {
         .await
         .expect("widening relay subscribe started");
 
-    // The sync stages new batches per relay and floor: 2 and 4 for the new
-    // routes, 3 and 5 for the widened old ones. The live batches carrying the
-    // old routes are not issued again.
+    // The sync repacks every route into fresh batches per relay and floor: 2
+    // and 4 for the new routes, 3 and 5 for the widened old ones. The live
+    // batches carrying the old routes stay open until the sync commits, which
+    // would close them.
     let staged_unsynced_widening_id =
         batch_subscription_id(&adapter, &account_id, &unsynced_old.endpoints, 5).await;
     assert_eq!(
@@ -1695,7 +1698,8 @@ async fn cancelled_reissues_preserve_live_gates_and_apply_eose_on_rollback() {
             .subscription_synced(&unsynced_old_subscription_id)
             .await,
         Some(true),
-        "the live batch's EOSE is final: the sync is not issuing it again"
+        "the live batch's EOSE is final: the sync replaces it with new ids \
+         rather than reissuing it under its own"
     );
     assert_eq!(
         adapter
@@ -2061,7 +2065,7 @@ async fn synced_group_subscriptions_replace_old_routes() {
         .account_subscription_attempt(&MemberId::new(vec![0xA1; 32]))
         .await
         .expect("the account is active");
-    // The activation's batch carried only the old route, so it closes.
+    // The sync's repack replaces the activation's batch, so it closes.
     let unsubscribed = relay.unsubscribed.lock().unwrap();
     assert_eq!(
         unsubscribed.as_slice(),
@@ -2205,8 +2209,8 @@ async fn rotating_current_route_reissues_the_displaced_route_for_full_backfill_o
         .account_subscription_attempt(&account_id)
         .await
         .expect("the account is active");
-    // Each route goes out in a new batch of its own: their relays and floors
-    // differ, and the activation's batch 0 is not issued again.
+    // The sync repacks both routes into fresh batches, one each because their
+    // relays and floors differ, replacing the activation's batch 0.
     let issued_after_rotation = relay
         .subscriptions
         .lock()
@@ -2401,8 +2405,10 @@ async fn a_live_retained_route_is_reissued_only_to_widen_it() {
     relay.take_issued_subscriptions();
 
     // Route 1 was replaced after the REQ it is live on was issued. That REQ
-    // already reaches further back than the switch floor, and a reissue under
-    // the same id would replace it with a narrower one.
+    // already reaches further back than the switch floor. The sync repacks
+    // every route, so route 1 goes out again, but at the floor it is live at:
+    // the activation's replay has not completed, so a narrower floor could
+    // cut off history the replaced REQ was still returning.
     adapter
         .sync_account_groups(sync(
             vec![
@@ -2415,12 +2421,15 @@ async fn a_live_retained_route_is_reissued_only_to_widen_it() {
         .expect("route change sync succeeds");
     assert_eq!(
         issued_group_floors(&relay),
-        vec![(2, Some(Timestamp(cursor + 900)))],
-        "the displaced route keeps its wider live REQ"
+        vec![
+            (2, Some(Timestamp(cursor + 900))),
+            (1, Some(Timestamp(cursor))),
+        ],
+        "the displaced route keeps its wider live floor"
     );
 
     // Route 2 is displaced in turn, with a switch floor below the cursor its
-    // live REQ was issued with: the reissue widens it.
+    // live REQ was issued with: the repack widens it. Route 1 keeps its floor.
     let rotated = vec![
         floored_route(&group_id, 3, None),
         floored_route(&group_id, 2, Some(cursor + 300)),
@@ -2435,6 +2444,7 @@ async fn a_live_retained_route_is_reissued_only_to_widen_it() {
         vec![
             (3, Some(Timestamp(cursor + 1_200))),
             (2, Some(Timestamp(cursor + 300))),
+            (1, Some(Timestamp(cursor))),
         ]
     );
 
@@ -2575,7 +2585,7 @@ async fn failed_unsubscribe_is_retried_and_drained_on_next_sync() {
         .await
         .expect("the account is active");
     {
-        // The activation's batch carried only the old group, so it closes.
+        // The sync's repack replaces the activation's batch, so it closes.
         let unsubscribed = relay.unsubscribed.lock().unwrap();
         assert_eq!(
             unsubscribed.as_slice(),
@@ -2810,10 +2820,10 @@ async fn pending_unsubscribe_for_readded_group_is_discarded_not_replayed() {
 
     let removed_id = batch_subscription_id(&adapter, &account_id, &group.endpoints, 0).await;
 
-    // Re-add the same group. Its route goes out in a new batch, and batch
-    // numbers are never reused, so the queued unsubscribe cannot carry the id
-    // the re-add just established. It still names a REQ no route wants, so
-    // the re-add's drain sends it rather than discarding it.
+    // Re-add the same group. The sync repacks its route into a fresh batch,
+    // and batch numbers are never reused, so the queued unsubscribe cannot
+    // carry the id the re-add just established. It still names a REQ no route
+    // wants, so the re-add's drain sends it rather than discarding it.
     adapter
         .sync_account_groups(TransportGroupSync {
             account_id: account_id.clone(),
@@ -3627,10 +3637,13 @@ async fn account_subscription_eose_follows_the_latest_activation_snapshot() {
     );
 }
 
-/// A whole-account replay is complete only after every endpoint in the route
-/// snapshot used to issue it has served every relevant subscription. A fast,
-/// empty relay must not stand in for a slower relay that holds the missing
-/// history, and a mid-attempt route shrink must not erase that obligation.
+/// A whole-account replay is complete only after every endpoint of every
+/// still-wanted route has served the subscription carrying it. A fast, empty
+/// relay must not stand in for a slower relay that holds the missing history,
+/// and a mid-attempt group sync must not erase that obligation. Coverage is
+/// no longer frozen across a changed sync: the sync's repack moves each
+/// wanted route's obligation, on all of its relays, onto the batch that now
+/// carries it. The name is kept for grep-ability.
 #[tokio::test]
 async fn account_subscription_eose_requires_the_frozen_relay_coverage() {
     let relay = Arc::new(FakeRelayClient::default());
@@ -3733,40 +3746,49 @@ async fn account_subscription_eose_requires_the_frozen_relay_coverage() {
         "the group subscription still lacks B's EOSE"
     );
 
-    // An explicit route update may affect the next replay attempt, but it
-    // cannot silently shrink the coverage snapshot of this one.
-    let shrunk_group = TransportGroupSubscription {
+    // A sync that joins a group on relay A alone repacks every route. The
+    // still-wanted group keeps both relays, so A answering the repacked
+    // batches cannot settle what B still owes for it.
+    let joined = TransportGroupSubscription {
+        group_id: cgka_traits::GroupId::new(vec![0x55; 16]),
+        transport_group_id: vec![0x66; 32],
         endpoints: vec![group_a.clone()],
-        ..group.clone()
+        retained_since: None,
     };
     adapter
         .sync_account_groups(TransportGroupSync {
             account_id: account_id.clone(),
-            group_subscriptions: vec![shrunk_group.clone()],
+            group_subscriptions: vec![group.clone(), joined.clone()],
             since: None,
         })
         .await
-        .expect("route shrink succeeds");
-    // The shrunk route goes out in a new batch under the same attempt; the
-    // activation's batch, now wanting no route, closes.
-    let shrunk_group_id = group_subscription_id(&adapter, &account_id, &shrunk_group).await;
-    assert_ne!(shrunk_group_id, group_id);
-    adapter.handle_relay_eose(group_a, shrunk_group_id).await;
+        .expect("group join succeeds");
+    let repacked_group_id = group_subscription_id(&adapter, &account_id, &group).await;
+    let joined_id = group_subscription_id(&adapter, &account_id, &joined).await;
+    assert_ne!(repacked_group_id, group_id, "the sync repacks the route");
+    adapter
+        .handle_relay_eose(group_a.clone(), repacked_group_id.clone())
+        .await;
+    adapter.handle_relay_eose(group_a, joined_id).await;
+    let progress = adapter.account_subscription_eose(&account_id).await;
+    assert_eq!(
+        progress.subscriptions, 3,
+        "the inbox and the two repacked batches; the replaced batch left"
+    );
     assert!(
-        !adapter
-            .account_subscription_eose(&account_id)
-            .await
-            .complete(),
-        "a route shrink must not complete an older replay attempt"
+        !progress.complete(),
+        "a group sync must not shrink the obligation of a route it still wants"
     );
 
-    adapter.handle_relay_eose(group_b_inbound, group_id).await;
+    adapter
+        .handle_relay_eose(group_b_inbound, repacked_group_id)
+        .await;
     assert!(
         adapter
             .account_subscription_eose(&account_id)
             .await
             .complete(),
-        "the frozen snapshot completes once B serves its relevant EOSE"
+        "the coverage completes once B serves the batch now carrying the route"
     );
 }
 
@@ -3789,9 +3811,10 @@ fn issued_group_id(issued: &[NostrSubscription], group: &cgka_traits::GroupId) -
 /// coming, so its repair re-issues each REQ issued by the lag, on just the
 /// relays that have not reported EOSE for it. It never re-issues a REQ a relay
 /// already answered, one issued after the lag, or the same REQ twice on one
-/// relay. The fresh EOSE then completes the activation's coverage and the
-/// post-join maintenance boundary. A later lag that loses a re-issued REQ's
-/// fresh EOSE is repaired from the client's EOSE record, with no traffic.
+/// relay. The fresh EOSE then completes the post-join maintenance boundary
+/// and, once the group sync's repacked batch has answered too, the account's
+/// coverage. A later lag that loses a re-issued REQ's fresh EOSE is repaired
+/// from the client's EOSE record, with no traffic.
 #[tokio::test]
 async fn lag_repair_reissues_only_reqs_awaiting_eose_from_before_the_lag() {
     let relay = Arc::new(FakeRelayClient::default());
@@ -3881,8 +3904,9 @@ async fn lag_repair_reissues_only_reqs_awaiting_eose_from_before_the_lag() {
         vec![(account_id.clone(), late_id.clone(), vec![a.clone()])]
     );
 
-    // The re-issued REQs' fresh EOSE completes the activation's coverage and
-    // the maintenance boundary.
+    // The re-issued REQs' fresh EOSE completes the inbox and the maintenance
+    // boundary. The sync repacked both groups into the late batch, which
+    // replaced the activation's batch in coverage and has not answered yet.
     assert!(
         !adapter
             .account_subscription_eose(&account_id)
@@ -3891,10 +3915,11 @@ async fn lag_repair_reissues_only_reqs_awaiting_eose_from_before_the_lag() {
     );
     adapter.handle_relay_eose(b, inbox_id).await;
     assert!(
-        adapter
+        !adapter
             .account_subscription_eose(&account_id)
             .await
-            .complete()
+            .complete(),
+        "the repacked batch still owes A's EOSE"
     );
     assert_eq!(
         adapter
@@ -3944,6 +3969,13 @@ async fn lag_repair_reissues_only_reqs_awaiting_eose_from_before_the_lag() {
     assert_eq!(
         adapter.subscription_endpoint_eose(&late_id, &a).await,
         Some(true)
+    );
+    assert!(
+        adapter
+            .account_subscription_eose(&account_id)
+            .await
+            .complete(),
+        "the repacked batch's recorded answer completes the coverage"
     );
 }
 
@@ -5627,7 +5659,8 @@ async fn cancelled_group_sync_closes_the_reqs_it_installed() {
         })
         .await
         .expect("activation succeeds");
-    // The sync's batch follows the activation's batch 0.
+    // The sync repacks kept and added into batch 1, after the activation's
+    // batch 0.
     let added_id = batch_subscription_id(&adapter, &account_id, &added.endpoints, 1).await;
 
     cancel_held_group_sync(&relay, &adapter, &account_id, vec![kept.clone(), added]).await;
@@ -5652,9 +5685,10 @@ async fn cancelled_group_sync_closes_the_reqs_it_installed() {
 
 /// A cancelled sync's straggler that outlives the wait must not close a REQ
 /// the retried sync has since made live, or the live route would stop
-/// receiving. The retry never reuses the abandoned batch's id: batch numbers
-/// are spent when a sync stages them. So the straggler closes only its own
-/// abandoned REQ, and the retry's batch stays open.
+/// receiving. The retry repacks into fresh batch numbers and never reuses the
+/// abandoned batch's id: numbers are spent when a sync stages them. So the
+/// straggler closes only its own abandoned REQ, and the retry's batch stays
+/// open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retired_subscribe_task_keeps_an_id_the_live_routes_want() {
     let relay = Arc::new(ReleasableSubscribeRelayClient::default());
@@ -5670,7 +5704,8 @@ async fn retired_subscribe_task_keeps_an_id_the_live_routes_want() {
         })
         .await
         .expect("activation succeeds");
-    // The cancelled sync's batch follows the activation's batch 0.
+    // The cancelled sync repacks kept and added into batch 1, after the
+    // activation's batch 0.
     let added_id = batch_subscription_id(&adapter, &account_id, &added.endpoints, 1).await;
     let closes_of = |id: &str| {
         relay
@@ -5853,7 +5888,8 @@ async fn straggler_registering_during_the_next_sweep_closes_its_req() {
 /// A retired straggler's route check and CLOSE must not interleave with a
 /// retry registering the same route: the retry's registration has to land
 /// after the straggler's CLOSE, so the live route keeps its REQ. The retry
-/// carries the route in a new batch, so the straggler's CLOSE never names it.
+/// repacks the route into a fresh batch, so the straggler's CLOSE never names
+/// it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retired_straggler_close_cannot_interleave_with_a_retry() {
     let relay = Arc::new(ReleasableSubscribeRelayClient::default());
@@ -5869,7 +5905,8 @@ async fn retired_straggler_close_cannot_interleave_with_a_retry() {
         })
         .await
         .expect("activation succeeds");
-    // The cancelled sync's batch follows the activation's batch 0.
+    // The cancelled sync repacks kept and added into batch 1, after the
+    // activation's batch 0.
     let added_id = batch_subscription_id(&adapter, &account_id, &added.endpoints, 1).await;
 
     cancel_held_group_sync(

@@ -122,18 +122,21 @@ for reconnect/backoff and relay status mechanics.
   with, and a retained route at its `TransportGroupSubscription::retained_since`, never later than the activation's
   `since`. A route with a retained floor is retained wherever it sits; among floorless routes the first per group is
   the current one and a later distinct one is retained and backfilled in full. Re-add a live retained route only when
-  its floor widens (`AccountRoutes::group_since`): it goes out in a new batch at the wider floor, while its old batch
-  keeps returning what it was.
+  its floor widens (`AccountRoutes::group_since`): the repack then issues it at the wider floor.
 - Send group routes as batched REQs, never one REQ per route (#2266): `NostrSubscription::GroupBatch` carries up to
   `GROUP_BATCH_ROUTES` routes that share normalized endpoints and `since` as one `#h` filter, so an account stays far
-  under a relay's per-connection REQ limit and recovery's one-shot fetches always find room. Activation packs every
-  route (`pack_group_batches`) and numbers batches from 0; a group sync packs only the routes it adds into new batches
-  numbered from `AccountRoutes::next_batch`, which staging spends whether or not the sync commits, so no id is ever
-  reused within an attempt. A sync never re-issues a live batch: a removed route stays in its batch's filter (its
-  events match no route and are dropped) until the next activation repacks, and the batch closes once no route it
-  carries is wanted (`LiveGroupBatch::wanted`). Coverage, refusals, lag repair and `account_subscription_ids` are per
-  batch; a clamped batch replay pages its whole filter (`NostrAcquisitionScope::GroupsWindow`) up to
-  `REPLAY_PAGE_MAX_PAGES` per route it carries. Post-join maintenance and one-shot fetches stay per route.
+  under a relay's per-connection REQ limit and recovery's one-shot fetches always find room. `AccountRoutes::batches`
+  always carries exactly `AccountRoutes::groups`. Activation packs every route (`pack_group_batches`) and numbers
+  batches from 0. A group sync that changes the route set repacks every batch (`repacked_group_routes`): each route
+  keeps the floor it was issued at, or starts at the sync's floor when the activation's replay coverage is complete;
+  the new batches go out before the replaced ones close, and replay coverage swaps them (`replace_replay_batches`), so
+  a sync's batches page like an activation's. Never append batches or leave a removed route in a live filter: that
+  fragments batches back to the REQ limit, and a removed route's events still reach the relay client, which then
+  suppresses the re-added route's replay of them. Batch numbers come from `AccountRoutes::next_batch`, which staging
+  spends whether or not the sync commits, so no id is reused within an attempt. Coverage, refusals, lag repair and
+  `account_subscription_ids` are per batch; a clamped batch replay pages its whole filter
+  (`NostrAcquisitionScope::GroupsWindow`) up to `REPLAY_PAGE_MAX_PAGES` per route it carries. Post-join maintenance
+  and one-shot fetches stay per route.
 - Recovery maintenance ids include the owner's durable attempt serial. A duplicate install joins only a live session;
   after failure, cancellation, removal or account reactivation, require a strictly greater serial for that account/group.
   Never clear `maintenance_attempt_high_water` while the adapter lives: CLOSE and route removal cannot recall late EOSE.

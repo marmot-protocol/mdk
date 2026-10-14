@@ -1465,23 +1465,7 @@ async fn store_events_at(database: &MemoryDatabase, timestamps: impl IntoIterato
 async fn a_batch_replay_past_500_events_is_paged_for_every_group() {
     const PER_GROUP: usize = 15;
     let fx = Fixture::new(LimitConfig::default(), false).await;
-    let keys = Keys::generate();
-    for group in 0..GROUP_BATCH_ROUTES {
-        for index in 0..PER_GROUP {
-            let event =
-                EventBuilder::new(Kind::MlsGroupMessage, format!("batched-{group}-{index}"))
-                    .tags([Tag::custom("h", [hex::encode(route(group))])])
-                    .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(
-                        1_700_000_000 + (group * PER_GROUP + index) as u64,
-                    ))
-                    .finalize(&keys)
-                    .unwrap();
-            fx.database
-                .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
-                .await
-                .unwrap();
-        }
-    }
+    store_events_per_group(&fx.database, GROUP_BATCH_ROUTES, PER_GROUP).await;
     let url = fx.limit.url();
     fx.adapter
         .activate_account(
@@ -1506,11 +1490,40 @@ async fn a_batch_replay_past_500_events_is_paged_for_every_group() {
     fx.shutdown().await;
 }
 
-/// A group sync never re-issues a live batch. A joined group goes out in a
-/// new batch; a left group stays in its batch's filter while any group there
-/// is still wanted, and the batch closes once none is.
+/// Store `per_group` kind-445 events for each of the first `groups` routes.
+async fn store_events_per_group(database: &MemoryDatabase, groups: usize, per_group: usize) {
+    let keys = Keys::generate();
+    for group in 0..groups {
+        for index in 0..per_group {
+            let event =
+                EventBuilder::new(Kind::MlsGroupMessage, format!("batched-{group}-{index}"))
+                    .tags([Tag::custom("h", [hex::encode(route(group))])])
+                    .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(
+                        1_700_000_000 + (group * per_group + index) as u64,
+                    ))
+                    .finalize(&keys)
+                    .unwrap();
+            database
+                .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+                .await
+                .unwrap();
+        }
+    }
+}
+
+fn group_sync(fx: &Fixture, groups: Vec<TransportGroupSubscription>) -> TransportGroupSync {
+    TransportGroupSync {
+        account_id: fx.account.clone(),
+        group_subscriptions: groups,
+        since: None,
+    }
+}
+
+/// Any change of routes repacks every group batch: the new batches go out
+/// and then the ones they replace close. A left group leaves the filters at
+/// once, and the batch count stays the packed count however routes change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_group_sync_adds_batches_and_closes_only_emptied_ones() {
+async fn a_group_sync_repacks_every_batch() {
     let fx = Fixture::new(LimitConfig::default(), false).await;
     let url = fx.limit.url();
     let all = groups(GROUP_BATCH_ROUTES + 10, &url);
@@ -1520,55 +1533,152 @@ async fn a_group_sync_adds_batches_and_closes_only_emptied_ones() {
         .unwrap();
     let mut stats = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
     assert_eq!(stats.active_now(), live_reqs(all.len()));
-    let sync = |desired: Vec<TransportGroupSubscription>| {
-        let adapter = fx.adapter.clone();
-        let account = fx.account.clone();
-        async move {
-            adapter
-                .sync_account_groups(TransportGroupSync {
-                    account_id: account,
-                    group_subscriptions: desired,
-                    since: None,
-                })
-                .await
-                .unwrap();
-        }
-    };
-    let step = |label: &str, before: &LimitStats, after: &LimitStats, reqs, closes| {
-        assert_eq!(after.total_reqs - before.total_reqs, reqs, "{label}: REQs");
-        assert_eq!(after.closes - before.closes, closes, "{label}: CLOSEs");
+    let mut step = async |label: &str, desired: Vec<TransportGroupSubscription>| {
+        let before = stats.clone();
+        let count = desired.len();
+        fx.adapter
+            .sync_account_groups(group_sync(&fx, desired))
+            .await
+            .unwrap();
+        let after = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+        let replaced = before.active_now() - 1;
+        assert_eq!(
+            after.total_reqs - before.total_reqs,
+            live_reqs(count) - 1,
+            "{label}: the packed batches go out"
+        );
+        assert_eq!(
+            after.closes - before.closes,
+            replaced,
+            "{label}: the old ones close"
+        );
+        assert_eq!(after.active_now(), live_reqs(count), "{label}");
         assert_eq!(after.rejections_total(), 0, "{label}");
+        stats = after;
     };
 
-    // Join one group: one new batch REQ, nothing re-issued or closed.
-    let mut joined = all.clone();
-    joined.extend(groups(GROUP_BATCH_ROUTES + 11, &url).split_off(GROUP_BATCH_ROUTES + 10));
-    sync(joined.clone()).await;
-    let after = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
-    step("join", &stats, &after, 1, 0);
-    stats = after;
-
-    // Leave one group of the first, full batch: its batch stays live.
+    let joined = groups(GROUP_BATCH_ROUTES + 11, &url);
+    step("join", joined.clone()).await;
     let mut left = joined.clone();
     left.remove(0);
-    sync(left.clone()).await;
+    step("leave", left.clone()).await;
+    step("leave a batch's worth", left.split_off(GROUP_BATCH_ROUTES)).await;
+    // Unchanged routes repack nothing.
+    let unchanged = fx.limit.stats();
+    fx.adapter
+        .sync_account_groups(group_sync(
+            &fx,
+            groups(GROUP_BATCH_ROUTES + 11, &url).split_off(GROUP_BATCH_ROUTES + 1),
+        ))
+        .await
+        .unwrap();
     let after = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
-    step("leave one", &stats, &after, 0, 0);
-    stats = after;
+    assert_eq!(after.total_reqs, unchanged.total_reqs);
+    fx.shutdown().await;
+}
 
-    // Leave the joined group, the only one in its batch: that batch closes.
-    left.pop();
-    sync(left.clone()).await;
-    let after = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
-    step("leave a whole batch", &stats, &after, 0, 1);
-    stats = after;
+/// A group sync's batches are paged like an activation's: 50 groups added by
+/// one sync, with 750 stored events behind their shared batch REQ, all
+/// arrive and their replay counts as coverage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_synced_batch_replay_past_500_events_is_paged_for_every_group() {
+    const PER_GROUP: usize = 15;
+    let fx = Fixture::new(LimitConfig::default(), false).await;
+    store_events_per_group(&fx.database, GROUP_BATCH_ROUTES, PER_GROUP).await;
+    let url = fx.limit.url();
+    fx.adapter
+        .activate_account(fx.activation(std::slice::from_ref(&url), Vec::new()))
+        .await
+        .unwrap();
+    fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    fx.adapter
+        .sync_account_groups(group_sync(&fx, groups(GROUP_BATCH_ROUTES, &url)))
+        .await
+        .unwrap();
+    let delivered = distinct_deliveries(&fx.adapter, Duration::from_secs(15)).await;
+    let complete = fx
+        .adapter
+        .account_subscription_eose(&fx.account)
+        .await
+        .complete();
+    eprintln!(
+        "[h] synced batch delivered={delivered} complete={complete} {}",
+        fx.limit.stats().summary()
+    );
+    assert_eq!(delivered, GROUP_BATCH_ROUTES * PER_GROUP);
+    assert!(complete, "the paged synced batch counts as coverage");
+    fx.shutdown().await;
+}
 
-    // Leave the rest of the first batch: it closes too.
-    let rest = left.split_off(GROUP_BATCH_ROUTES - 1);
-    sync(rest).await;
-    let after = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
-    step("empty the first batch", &stats, &after, 0, 1);
-    assert_eq!(after.active_now(), 2, "the inbox and the second batch");
+/// Groups joined one sync at a time stay packed: 199 joins on top of an
+/// inbox hold the same few REQs one activation of 199 groups would, far
+/// from the relay's limit. Each repack briefly holds both packings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn groups_joined_one_at_a_time_stay_packed() {
+    const G: usize = 199;
+    let fx = Fixture::new(LimitConfig::default(), false).await;
+    let url = fx.limit.url();
+    fx.adapter
+        .activate_account(fx.activation(std::slice::from_ref(&url), Vec::new()))
+        .await
+        .unwrap();
+    for joined in 1..=G {
+        fx.adapter
+            .sync_account_groups(group_sync(&fx, groups(joined, &url)))
+            .await
+            .unwrap();
+    }
+    let stats = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    eprintln!("[b] joined one at a time G={G} {}", stats.summary());
+    assert_eq!(stats.active_now(), live_reqs(G));
+    assert!(stats.peak_active() <= 1 + 2 * G.div_ceil(GROUP_BATCH_ROUTES));
+    assert_eq!(stats.rejections_total(), 0);
+    fx.shutdown().await;
+}
+
+/// A group left and joined again gets what was published to it meanwhile.
+/// Its route leaves every live filter when it is left, so the relay client
+/// never takes in an event no route then wanted, which would keep the
+/// re-added route's replay of it from ever being delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_left_and_joined_again_gets_what_was_published_meanwhile() {
+    let fx = Fixture::new(LimitConfig::default(), false).await;
+    let url = fx.limit.url();
+    let both = groups(2, &url);
+    fx.adapter
+        .activate_account(fx.activation(std::slice::from_ref(&url), both.clone()))
+        .await
+        .unwrap();
+    fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    fx.adapter
+        .sync_account_groups(group_sync(&fx, both[1..].to_vec()))
+        .await
+        .unwrap();
+    fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+
+    // Published live to the relay while group 0 is left.
+    let publisher = Client::default();
+    publisher.add_relay(fx.upstream_url.as_str()).await.unwrap();
+    publisher.connect().await;
+    let event = EventBuilder::new(Kind::MlsGroupMessage, "published while left")
+        .tags([Tag::custom("h", [hex::encode(route(0))])])
+        .finalize(&Keys::generate())
+        .unwrap();
+    publisher.send_event(&event).await.unwrap();
+    // Anything a live filter would take in arrives in this window.
+    let meanwhile = delivered_groups(&fx.adapter, 1, Duration::from_secs(2)).await;
+    assert!(meanwhile.is_empty(), "no live route wants group 0");
+
+    fx.adapter
+        .sync_account_groups(group_sync(&fx, both))
+        .await
+        .unwrap();
+    let delivered = delivered_groups(&fx.adapter, 1, Duration::from_secs(10)).await;
+    assert!(
+        delivered.contains(group_id(0).as_slice()),
+        "the re-added group's replay delivers the event"
+    );
+    publisher.shutdown().await;
     fx.shutdown().await;
 }
 
