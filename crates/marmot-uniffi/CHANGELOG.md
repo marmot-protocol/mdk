@@ -4,6 +4,10 @@
 
 ### Breaking changes
 
+- `MarmotKitError::MissingKeyPackage` adds `reason: MissingKeyPackageReasonFfi`. `ObsoleteOnly`
+  means the recipient has published only obsolete KeyPackages and must update their app;
+  these recipients previously surfaced as `InvalidKeyPackageEvent` (mdk#1975). `NotFound`
+  keeps the previous meaning. Regenerate bindings and update Swift associated-value patterns.
 - `MarmotKitError` adds `GroupCatchingUp`: a group change was refused because the group may have moved past this device and recovery has not caught it up yet (mdk#2258). Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
 - `AttachmentTransferStateFfi` adds `StorageBlocked`: free disk cannot cover
   the publication reserve for the body, checkpoints are kept, and the job

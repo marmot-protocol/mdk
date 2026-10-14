@@ -739,6 +739,16 @@ pub enum AuditEventKind {
         met_required_acks: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         transport: Option<AuditTransportWire>,
+        /// Seconds from the published event's outer `created_at` to this
+        /// outcome on the publisher's clock, saturating at zero. A retry
+        /// resends the exact signed event, so for a commit this is how long it
+        /// has waited for relays since it was wrapped; a member whose cursor
+        /// passed that `created_at` before a relay accepted it cannot receive
+        /// it live (mdk#2256). Absent on rows written before this field
+        /// existed. Audit v5 only: a v4 recorder drops it (see
+        /// [`AuditEventKind::without_v5_only_fields`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_age_secs: Option<u64>,
     },
     /// Account runtime could not complete publish before endpoint receipts.
     PublishFailure {
@@ -1486,6 +1496,37 @@ impl AuditEventKind {
         }
     }
 
+    /// This kind without the fields only audit v5 carries. The frozen v4
+    /// schema cannot express them, so a v4 recorder writes this projection.
+    pub fn without_v5_only_fields(self) -> Self {
+        match self {
+            AuditEventKind::PublishOutcome {
+                msg_id,
+                artifact_kind,
+                target_kind,
+                relay_url,
+                accepted_relay_urls,
+                failed_relays,
+                required_acks,
+                met_required_acks,
+                transport,
+                event_age_secs: _,
+            } => AuditEventKind::PublishOutcome {
+                msg_id,
+                artifact_kind,
+                target_kind,
+                relay_url,
+                accepted_relay_urls,
+                failed_relays,
+                required_acks,
+                met_required_acks,
+                transport,
+                event_age_secs: None,
+            },
+            kind => kind,
+        }
+    }
+
     /// Kinds that exist only in audit v5. The frozen v4 schema cannot express
     /// them, so a v4 recorder drops them instead of writing an invalid row.
     pub fn is_v5_only(&self) -> bool {
@@ -2208,7 +2249,7 @@ impl JsonlRecorder {
         inner.seq = seq.wrapping_add(1);
         let body = match &inner.format {
             RecorderFormat::V4 => {
-                let kind = record.kind;
+                let kind = record.kind.without_v5_only_fields();
                 let context = stamp_system_human_action(record.context, &kind);
                 let event = AuditEvent {
                     schema_version: AUDIT_LOG_SCHEMA_VERSION.to_string(),

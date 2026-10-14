@@ -539,14 +539,21 @@ fn acquisition_filter(request: &NostrAcquisitionRequest) -> Result<Filter, Nostr
             transport_group_id,
             since,
             until,
-        } => Filter::new()
-            .kind(Kind::MlsGroupMessage)
-            .custom_tags(
-                SingleLetterTag::from_char('h').expect("h is a valid single-letter tag"),
-                [hex::encode(transport_group_id)],
-            )
-            .since(NostrTimestamp::from_secs(*since))
-            .until(NostrTimestamp::from_secs(*until)),
+            newest,
+        } => {
+            let filter = Filter::new()
+                .kind(Kind::MlsGroupMessage)
+                .custom_tags(
+                    SingleLetterTag::from_char('h').expect("h is a valid single-letter tag"),
+                    [hex::encode(transport_group_id)],
+                )
+                .since(NostrTimestamp::from_secs(*since))
+                .until(NostrTimestamp::from_secs(*until));
+            match newest {
+                Some(newest) => filter.limit(*newest),
+                None => filter,
+            }
+        }
     })
 }
 

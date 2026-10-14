@@ -3588,6 +3588,56 @@ impl MarmotRelayPlaneAccountAdapter {
         Ok(Some(result?))
     }
 
+    /// Fetch the newest kind-445 events of one group route from `endpoints`,
+    /// inside `[since, until]` and `limits`. The answer is investigation, not
+    /// coverage. Relays send the page newest first, so only a page a relay
+    /// ended itself holds its oldest events; a relay cut short by a budget or
+    /// the deadline, and a request the plane refuses, contribute nothing.
+    pub(crate) async fn acquire_group_window(
+        &self,
+        transport_group_id: [u8; 32],
+        endpoints: Vec<TransportEndpoint>,
+        since: u64,
+        until: u64,
+        limits: transport_nostr_adapter::NostrAcquisitionLimits,
+    ) -> Vec<transport_nostr_adapter::NostrRelayEvent> {
+        let request = NostrAcquisitionRequest {
+            account_id: self.account_id.clone(),
+            scope: transport_nostr_adapter::NostrAcquisitionScope::GroupWindow {
+                transport_group_id,
+                since,
+                until,
+                newest: Some(limits.max_received_items_per_endpoint),
+            },
+            endpoints,
+            limits,
+        };
+        let Ok(result) = self
+            .relay_plane
+            .acquire_history(request, NostrAcquisitionCancellation::new())
+            .await
+        else {
+            return Vec::new();
+        };
+        result
+            .endpoints
+            .into_iter()
+            .filter(|answer| {
+                answer.end == transport_nostr_adapter::NostrAcquisitionEnd::RequestPolicySatisfied
+            })
+            .flat_map(|answer| {
+                let endpoint = answer.endpoint;
+                answer.events.into_iter().map(move |event| {
+                    transport_nostr_adapter::NostrRelayEvent {
+                        endpoint: endpoint.clone(),
+                        subscription_id: None,
+                        event,
+                    }
+                })
+            })
+            .collect()
+    }
+
     /// This account's deliveries for one owned comparison event. The worker
     /// admits them directly, never through the live queue.
     pub(crate) async fn recovered_deliveries(

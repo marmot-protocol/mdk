@@ -149,7 +149,7 @@ Each line serializes an `AuditEvent`:
 
 | Top-level field | Type | Present when | Meaning |
 | --- | --- | --- | --- |
-| `schema_version` | string | Always | Current value: `marmot-forensics-audit/v4`. |
+| `schema_version` | string | Always | `marmot-forensics-audit/v4` in v4 files. New recording writes v5 rows instead (see [v5 recording and delivery](#v5-recording-and-delivery)). |
 | `seq` | u64 | Always | Recorder-local sequence number. Starts at `0` for each `JsonlRecorder` opening and uses wrapping increment. |
 | `wall_time_ms` | u64 | Always | `SystemTime::now()` milliseconds since Unix epoch at record time. Falls back to `0` if system time is before epoch. |
 | `recorder_session_id` | string | Optional | Locally generated id for this recorder opening. Present for `JsonlRecorder` rows. |
@@ -572,6 +572,7 @@ adapter error carries per-endpoint failures also emits this row, with empty `acc
 | `failed_relays` | Endpoint failure objects with `relay_url` and `reason` for this pass. An endpoint whose result is unknown, such as one cancelled once quorum was met, reports `publish acknowledgement unknown` and stays owed for retry. |
 | `required_acks` | Adapter quorum target. |
 | `met_required_acks` | Whether accepted endpoint count satisfied `required_acks`. |
+| `event_age_secs` | v5 only. Seconds from the published event's outer `created_at` to this outcome on the publisher's clock. Retries resend the exact signed event, so for a commit this is how long it has waited for relays since it was wrapped (mdk#2256). Absent on rows written before the field existed. |
 
 ### `publish_failure`
 
@@ -1483,10 +1484,9 @@ validation also enforces value constraints. One invalid row rejects the entire s
 A file's name never substitutes for validation. An unfinished trailing row stays deferred until a later snapshot.
 The validator has HTTP/file reference resolution disabled and compiles only the bundled schema.
 
-No v1-v3 migration or sanitization is performed. Historical schemas remain committed for offline interpretation;
-new app and default recorder paths use v4. Deploy Goggles v4-only acceptance before the historical server purge.
-Rejected bodies must not be stored as quarantined artifacts by Goggles. Client adoption and server deployment are
-separate from this SDK change.
+No v1-v3 migration or sanitization is performed. Historical schemas remain committed for offline interpretation.
+New app recording writes v5 only; this gate remains to drain v4 files written before v5 recording, and the v4
+schema is frozen. Rejected bodies must not be stored as quarantined artifacts by Goggles.
 
 ### Legacy local cleanup
 
@@ -1543,17 +1543,19 @@ for `device_label`; C hosts use `marmot_set_audit_log_tracker_config_v4` for har
 The producer member reference is derived internally; hosts do not supply it. Destructive live rotation
 (`JsonlRecorder::rotate`, including app delete of the active file) emits `recorder_started` and then the most
 recently recorded `source_context` into the fresh file. Size-based segment rolls stay one continuous session and
-repeat the latest source row before ordinary events, without replaying lifecycle rows. Current recording and upload
-are v4-only; historical v2/v3 source rows remain valid under their original schemas and do not carry this field.
+repeat the latest source row before ordinary events, without replaying lifecycle rows. New recording writes v5, and
+the legacy whole-file upload accepts only v4 files; historical v2/v3 source rows remain valid under their original
+schemas and do not carry this field.
 Older segments, or recorders that never received source context, may still lack source metadata; analyzers may associate it with validated source rows
 for the same producer/session or leave identity unknown. Joining `local_member_ref` to a later
 `group_state_changed.subject_member_ref` is a diagnostic correlation, not a membership interval or
 removed-versus-stale classification. External consumers must adopt the optional field before using that join.
 
-Goggles validates with strict `additionalProperties: false`: adding even an optional field to an existing v4
-variant is a consumer compatibility change. The `local_member_ref` addition caused whole-upload rejection until
-Goggles synchronized its schema. Coordinate future field/kind changes with consumer schema releases and validate
-representative producer JSONL against the consumer schema before distributing clients. This segmentation fix adds
+Goggles validates v5 rows strictly (`additionalProperties: false`), as it did v4: adding even an optional field to an
+existing v5 kind is a consumer compatibility change. Under v4, the `local_member_ref` addition caused whole-upload
+rejection until Goggles synchronized its schema. Coordinate future v5 field/kind changes with consumer schema
+releases and validate representative producer JSONL against the consumer's v5 schema before distributing clients.
+The v4 schema is frozen; a field it cannot express is dropped by a v4 recorder. This segmentation fix adds
 no fields or schema version; source metadata stays in the validated JSONL body, never upload headers or user-assigned
 account/device names. Goggles can correlate retained metadata by engine/account/recorder-session identity, but cannot
 recover startup evidence that was never uploaded or has expired.

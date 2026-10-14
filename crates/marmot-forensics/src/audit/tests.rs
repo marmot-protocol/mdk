@@ -734,6 +734,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             required_acks: 1,
             met_required_acks: true,
             transport: None,
+            event_age_secs: Some(5_700),
         },
         AuditEventKind::PublishFailure {
             msg_id: "ab".repeat(32),
@@ -1087,11 +1088,12 @@ fn sample_v5_only_kinds() -> Vec<AuditEventKind> {
     ]
 }
 
-/// Sample kinds the frozen v4 schema can express.
+/// Sample kinds the frozen v4 schema can express, as a v4 recorder writes them.
 fn sample_v4_audit_event_kinds() -> Vec<AuditEventKind> {
     sample_audit_event_kinds()
         .into_iter()
         .filter(|kind| !kind.is_v5_only())
+        .map(AuditEventKind::without_v5_only_fields)
         .collect()
 }
 
@@ -2962,6 +2964,7 @@ fn application_send_operation_survives_v5_export_without_wire_schema_changes() {
                     required_acks: 1,
                     met_required_acks: true,
                     transport: None,
+                    event_age_secs: None,
                 },
             )
             .with_context(context.clone()),
@@ -2989,4 +2992,65 @@ fn application_send_operation_survives_v5_export_without_wire_schema_changes() {
     for sensitive in [event_id, message_id, hex::encode(group), operation] {
         assert!(!contents.contains(&sensitive));
     }
+}
+
+/// `publish_outcome.event_age_secs` is audit v5 only (mdk#2256): the frozen v4
+/// schema cannot express it, so a v4 recorder writes the row without it.
+#[test]
+fn only_a_v5_recorder_writes_a_publish_event_age() {
+    use crate::v5::{BuildProfile, Platform, Producer};
+    let outcome = || AuditEventKind::PublishOutcome {
+        msg_id: "ab".repeat(32),
+        artifact_kind: Some(MessageArtifactKind::Commit),
+        target_kind: "group".into(),
+        relay_url: None,
+        accepted_relay_urls: vec!["wss://relay.example".into()],
+        failed_relays: vec![],
+        required_acks: 1,
+        met_required_acks: true,
+        transport: None,
+        event_age_secs: Some(5_700),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let v4_path = dir.path().join("audit-v4.jsonl");
+    let v4 = JsonlRecorder::open_with_account_ref(&v4_path, "e".repeat(32), None).unwrap();
+    v4.record(AuditRecord::new(None, outcome()));
+    drop(v4);
+    let v4_schema: serde_json::Value =
+        serde_json::from_str(include_str!("../../schema/audit-log-event.v4.schema.json")).unwrap();
+    let v4_validator = jsonschema::validator_for(&v4_schema).unwrap();
+    let row = fs::read_to_string(&v4_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|row| row["kind"]["type"] == "publish_outcome")
+        .expect("the v4 recorder writes the outcome");
+    assert!(row["kind"].get("event_age_secs").is_none());
+    assert!(
+        v4_validator.is_valid(&row),
+        "the row fits the frozen v4 schema"
+    );
+
+    let v5_path = default_v5_jsonl_path(dir.path(), &"11".repeat(16));
+    let v5 = JsonlRecorder::open_v5_with_account_ref(
+        &v5_path,
+        "11".repeat(16),
+        None,
+        Producer {
+            mdk_revision: None,
+            build_profile: BuildProfile::Debug,
+            platform: Platform::Other,
+            host_build: None,
+        },
+    )
+    .unwrap();
+    v5.record(AuditRecord::new(None, outcome()));
+    drop(v5);
+    let row = fs::read_to_string(&v5_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|row| row["event"]["type"] == "publish_outcome")
+        .expect("the v5 recorder writes the outcome");
+    assert_eq!(row["event"]["event_age_secs"], 5_700);
 }

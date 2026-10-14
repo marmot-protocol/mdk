@@ -3710,6 +3710,10 @@ async fn legacy_self_update_fanout_retries_after_lost_confirmation_marker() {
             .len(),
         1
     );
+    // mdk#2256: the retry resends the commit's wrap-time `created_at` (0 from
+    // the test peeler); the row says how old it is on the publisher's clock.
+    assert_eq!(commit.timestamp, Timestamp(0));
+    assert_eq!(last_outcome["event"]["event_age_secs"], 100_000);
 }
 
 /// mdk#2264: a legacy publish that fails on every relay must keep each relay's

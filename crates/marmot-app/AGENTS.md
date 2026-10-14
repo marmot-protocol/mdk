@@ -180,7 +180,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   no inline executor. Runtime catch-ups (`SyncMode::Drain`) only drain the live queue and never run a job, so
   they cross a worker-owned job (mdk#2110); `sync()` drains, then runs one job in place; nothing
   re-subscribes to recover history, and only startup, a frozen wake or an unactivated client installs live
-  subscriptions. Explicit full-history repair runs the job in place: one comparison pass over every route of its
+  subscriptions. The job's one non-comparison fetch is the epoch-gap window (`fetch_epoch_gap_window`, mdk#2256): the
+  newest events of an epoch-gap group route from the relays that failed without answering its comparison. Never run it
+  while a compared relay still owes older history (#2086), keep only pages a relay ended itself, and admit the route's
+  comparison and window events together oldest first. Window events (`PendingSource::Window`) must not touch the
+  route's certificate, replay cursor or admission verdict. Explicit full-history repair runs the job in place: one comparison pass over every route of its
   grant inside the repair budget. It never reports complete: history below the retained window is unsearched
   (`BelowRetentionWindow` when the window certified), so never certify explicit history from a window; that
   result closes the request (`close_explicit_history_request`, revision-checked) instead of leaving debt that parks

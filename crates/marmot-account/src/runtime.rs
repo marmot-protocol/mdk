@@ -4205,6 +4205,10 @@ where
                     required_acks: fanout.required_acks as u64,
                     met_required_acks: accepted_total >= fanout.required_acks.max(1),
                     transport: Some(wire),
+                    event_age_secs: publish_event_age_secs(
+                        &fanout.exact_message,
+                        self.wall_clock.now(),
+                    ),
                 },
             );
         }
@@ -4673,6 +4677,10 @@ where
                     required_acks: report.required_acks as u64,
                     met_required_acks: report.met_required_acks(),
                     transport: Some(publish_wire_metadata(&fanout.request().message)),
+                    event_age_secs: publish_event_age_secs(
+                        &fanout.request().message,
+                        self.wall_clock.now(),
+                    ),
                 },
             );
             output.reports.push(report);
@@ -5228,6 +5236,10 @@ where
                             required_acks: required_acks as u64,
                             met_required_acks: accepted_before >= required_acks.max(1),
                             transport: Some(wire.clone()),
+                            event_age_secs: publish_event_age_secs(
+                                &fanout.exact_message,
+                                self.wall_clock.now(),
+                            ),
                         },
                     );
                 }
@@ -5307,6 +5319,10 @@ where
                 required_acks: report.required_acks as u64,
                 met_required_acks: published,
                 transport: Some(wire.clone()),
+                event_age_secs: publish_event_age_secs(
+                    &fanout.exact_message,
+                    self.wall_clock.now(),
+                ),
             },
         );
         if !published {
@@ -5860,6 +5876,13 @@ fn welcome_recipient(message: &TransportMessage) -> Option<MemberId> {
         TransportEnvelope::Welcome { recipient } => Some(recipient.clone()),
         TransportEnvelope::GroupMessage { .. } => None,
     }
+}
+
+/// How long `message` had existed at `now`, from its outer `created_at`, for
+/// the `publish_outcome` row. Retries resend the exact signed event, so this
+/// grows with every retry of one publish (mdk#2256).
+fn publish_event_age_secs(message: &TransportMessage, now: Timestamp) -> Option<u64> {
+    Some(now.0.saturating_sub(message.timestamp.0))
 }
 
 /// Build the outbound transport wire envelope for a publish, from the message's

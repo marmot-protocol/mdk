@@ -3899,6 +3899,9 @@
         "met_required_acks": {
           "type": "boolean"
         },
+        "event_age_secs": {
+          "$ref": "#/$defs/Operational_u64"
+        },
         "record_context": {
           "$ref": "#/$defs/Operational_auditEventContext"
         }
