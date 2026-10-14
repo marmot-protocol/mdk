@@ -3417,20 +3417,22 @@ async fn legacy_self_update_fanout_retries_after_lost_confirmation_marker() {
 
 /// mdk#2264: a legacy publish that fails on every relay must keep each relay's
 /// cause in the audit log and on the durable fanout, instead of one
-/// `unclassified` adapter row with no relay detail.
+/// `unclassified` adapter row with no relay detail. Founding Welcomes still
+/// publish through the legacy path; self-update commits moved to the frozen
+/// fanout (mdk#2255), which records per-relay causes in its own outcome rows.
 #[tokio::test]
 async fn adapter_publish_failure_records_per_relay_causes() {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("marmot adapter failure cause key").unwrap();
-    let database = dir.path().join("alice.sqlite");
     let audit_path = dir.path().join("audit.jsonl");
-    let mut bob = current_session(dir.path().join("bob.sqlite"), &key, b"bob");
-    let bob_kp = bob.fresh_key_package().await.unwrap();
-    let bob_id = bob.self_id();
-    let mut session = current_session(database, &key, b"alice");
+    let mut bob_session = current_session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let bob_kp = bob_session.fresh_key_package().await.unwrap();
+    let bob_id = bob_session.self_id();
+
+    let mut session = current_session(dir.path().join("alice.sqlite"), &key, b"alice");
     session.set_audit_recorder(v5_audit_recorder(&audit_path));
-    let timed_out = TransportEndpoint("wss://inbox-timed-out.example".into());
-    let refused = TransportEndpoint("wss://inbox-refused.example".into());
+    let timed_out = TransportEndpoint("wss://bob-timed-out.example".into());
+    let refused = TransportEndpoint("wss://bob-refused.example".into());
     let adapter = RecordingAdapter::default();
     adapter.fail_endpoints_with_reasons(
         TransportEndpointFailureKind::RetryableUnavailable,
@@ -3469,6 +3471,10 @@ async fn adapter_publish_failure_records_per_relay_causes() {
         publishes[0].target.endpoints(),
         &[timed_out.clone(), refused.clone()]
     );
+    assert!(matches!(
+        publishes[0].message.envelope,
+        TransportEnvelope::Welcome { .. }
+    ));
 
     let fanout = runtime.session().transport_fanouts().unwrap().remove(0);
     assert_eq!(fanout.targets.len(), 2);
