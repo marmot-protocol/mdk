@@ -46,7 +46,7 @@ pub mod subscriptions;
 
 pub use conversions::conversation_window::*;
 use conversions::group_id_from_hex;
-pub use errors::MarmotKitError;
+pub use errors::{MarmotKitError, MissingKeyPackageReasonFfi};
 pub use external_signer::ExternalAccountSignerFfi;
 pub use markdown::{
     MarkdownAlignmentFfi, MarkdownAutolinkKindFfi, MarkdownBlockFfi, MarkdownCodeBlockKindFfi,

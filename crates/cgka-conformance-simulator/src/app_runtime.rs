@@ -2668,7 +2668,7 @@ fn app_error_kind(error: &AppError) -> &str {
         AppError::GroupInviteNotPending => "group_invite_not_pending",
         AppError::UserBlocked => "user_blocked",
         AppError::MessageDraftRevisionConflict => "message_draft_revision_conflict",
-        AppError::MissingKeyPackage(_) => "missing_key_package",
+        AppError::MissingKeyPackage { .. } => "missing_key_package",
         AppError::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
         _ => "app_runtime_operation",
     }
@@ -2777,7 +2777,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::InvalidRelayTelemetrySettings(_)
         | AppError::InvalidAuditLogFile(_)
         | AppError::AgentStreamInvalidCandidate(_) => SubjectFailureCategory::Protocol,
-        AppError::MissingKeyPackage(_)
+        AppError::MissingKeyPackage { .. }
         | AppError::MissingMemberInboxRoute(_)
         | AppError::UnknownGroup(_)
         | AppError::GroupInviteNotPending

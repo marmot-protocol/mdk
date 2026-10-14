@@ -8054,7 +8054,7 @@ async fn member_key_package_skips_local_legacy_cache() {
     assert!(
         matches!(
             &result,
-            Err(AppError::MissingKeyPackage(_) | AppError::MissingRelayLists(_))
+            Err(AppError::MissingKeyPackage { .. } | AppError::MissingRelayLists(_))
         ),
         "legacy local cache must not be selected for invites; got {result:?}"
     );
@@ -9184,7 +9184,9 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
             .await
             .err()
             .expect("future-only discovery must fail closed");
-        assert!(matches!(error, AppError::MissingKeyPackage(id) if id == members[0]));
+        assert!(
+            matches!(error, AppError::MissingKeyPackage { account: id, reason: crate::MissingKeyPackageReason::NotFound } if id == members[0])
+        );
         assert!(
             fetcher.requests.lock().unwrap().iter().any(|request| {
                 request
@@ -9196,12 +9198,16 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
         );
         let refs = members.iter().map(String::as_str).collect::<Vec<_>>();
         let ordinary = app.resolve_member_key_packages(&refs).await.unwrap_err();
-        assert!(matches!(ordinary, AppError::MissingKeyPackage(id) if id == members[0]));
+        assert!(
+            matches!(ordinary, AppError::MissingKeyPackage { account: id, reason: crate::MissingKeyPackageReason::NotFound } if id == members[0])
+        );
         let prewarm = app
             .prewarm_group_member_key_packages(&refs)
             .await
             .unwrap_err();
-        assert!(matches!(prewarm, AppError::MissingKeyPackage(id) if id == members[0]));
+        assert!(
+            matches!(prewarm, AppError::MissingKeyPackage { account: id, reason: crate::MissingKeyPackageReason::NotFound } if id == members[0])
+        );
     }
 }
 
@@ -9431,7 +9437,7 @@ async fn relay_list_fallback_failure_preserves_valid_siblings_and_input_order() 
         .await
         .expect_err("the first member is missing and the third relay-list fallback fails");
     assert!(
-        matches!(error, AppError::MissingKeyPackage(account_id) if account_id == accounts[0].account_id_hex),
+        matches!(error, AppError::MissingKeyPackage { account: account_id, reason: crate::MissingKeyPackageReason::NotFound } if account_id == accounts[0].account_id_hex),
         "the first canonical member error must win over a later relay-list failure"
     );
     let requests_after_partial = fetcher.requests.lock().unwrap().len();
@@ -9468,7 +9474,7 @@ async fn member_key_package_set_reports_missing_packages_in_input_order() {
         .expect_err("both packages are absent");
 
     assert!(
-        matches!(error, AppError::MissingKeyPackage(account_id) if account_id == accounts[1].account_id_hex),
+        matches!(error, AppError::MissingKeyPackage { account: account_id, reason: crate::MissingKeyPackageReason::NotFound } if account_id == accounts[1].account_id_hex),
         "the first canonical input error must win regardless of batch completion order"
     );
 }
@@ -14582,7 +14588,16 @@ fn app_error_display_does_not_expose_group_or_account_ids() {
     let account_id = "bb".repeat(32);
     let errors = [
         AppError::UnknownGroup(group_id.clone()).to_string(),
-        AppError::MissingKeyPackage(account_id.clone()).to_string(),
+        AppError::MissingKeyPackage {
+            account: account_id.clone(),
+            reason: crate::MissingKeyPackageReason::NotFound,
+        }
+        .to_string(),
+        AppError::MissingKeyPackage {
+            account: account_id.clone(),
+            reason: crate::MissingKeyPackageReason::ObsoleteOnly,
+        }
+        .to_string(),
         AppError::MissingMemberInboxRoute(account_id.clone()).to_string(),
         AppError::MissingDirectoryEntry(account_id.clone()).to_string(),
         AppError::AccountHome(AccountHomeError::SecretNotFound(account_id.clone())).to_string(),

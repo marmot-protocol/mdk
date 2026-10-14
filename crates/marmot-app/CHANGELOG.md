@@ -5,6 +5,9 @@
 ### Breaking changes
 
 - `AppError` adds `GroupCatchingUp` and `GroupCommitUndelivered`; update exhaustive matches.
+- `AppError::MissingKeyPackage` is now `{ account, reason: MissingKeyPackageReason }`.
+  `ObsoleteOnly` means a completed lookup found only legacy-profile KeyPackages, so the
+  recipient must update and publish a current one; `NotFound` keeps the previous meaning.
 - `AttachmentTransferState` adds `StorageBlocked`: free disk cannot cover the
   publication reserve for the body. Update exhaustive matches; the job keeps
   its checkpoint and readmits once space frees or on explicit Retry.
@@ -21,6 +24,11 @@
 
 ### Fixed
 
+- Inviting or looking up an account that has published only legacy-profile KeyPackages
+  (including MDK 0.8 publications) returns `MissingKeyPackage` with reason `ObsoleteOnly`
+  instead of `InvalidKeyPackageEvent` (mdk#1975). Legacy packages are still never selected,
+  never hide a current package's rejection, and an incomplete lookup still reports
+  `RelayDirectory`.
 - Group changes fail with `AppError::GroupCatchingUp` while unresolved epoch-gap recovery (pending, parked or with its notice dismissed) covers the group's current local epoch. Before, a device that knew the group had moved on could still commit from its stale epoch and fork the group (mdk#2258). The check is advisory: after the user accepts the risk, `acknowledge_group_catching_up` lets the change through. Due self-updates wait up to 24 hours for the gap to close. Messages and leave are not affected.
 - A failed or cancelled transport activation no longer leaves untracked REQs
   live on the relay. They used to stay open until disconnect, be re-sent on

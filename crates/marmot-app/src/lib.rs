@@ -225,7 +225,9 @@ pub use drafts::{
     MessageDraftInvalidation, MessageDraftRevision, MessageDraftSummary, SelectedMessageDraft,
     SelectedMessageDraftAttachment, SelectedMessageDraftContent,
 };
-pub use error::{AccountCatchUpFailure, AppError, FullHistoryRepairIncompleteReason};
+pub use error::{
+    AccountCatchUpFailure, AppError, FullHistoryRepairIncompleteReason, MissingKeyPackageReason,
+};
 pub use groups::{
     AppAgentTextStreamComponent, AppBlobEndpoint, AppCreateGroupOptions, AppDisbandFailureReason,
     AppDisbandRequest, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
@@ -4771,7 +4773,10 @@ impl MarmotApp {
     fn latest_key_package(&self, label: &str) -> Result<KeyPackage, AppError> {
         let path = self.key_package_record_path(label);
         if !path.exists() {
-            return Err(AppError::MissingKeyPackage(label.to_owned()));
+            return Err(AppError::MissingKeyPackage {
+                account: label.to_owned(),
+                reason: MissingKeyPackageReason::NotFound,
+            });
         }
         let record: KeyPackageRecord = read_json(path)?;
         let key_package = key_package_from_hex_with_optional_source(

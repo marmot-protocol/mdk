@@ -45,6 +45,30 @@ impl std::fmt::Display for AccountCatchUpFailure {
     }
 }
 
+/// Why a completed KeyPackage lookup found nothing usable for joins.
+/// Both reasons describe only the searched relays; neither proves global
+/// absence, and neither relaxes current-profile admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum MissingKeyPackageReason {
+    /// No newest slot held a KeyPackage publication.
+    #[error("no published key package for account")]
+    NotFound,
+    /// Every newest slot held a legacy-profile publication: the account
+    /// must update and publish a current KeyPackage before it can be invited.
+    #[error("account has only obsolete key packages published")]
+    ObsoleteOnly,
+}
+
+impl MissingKeyPackageReason {
+    /// Stable token for CLI JSON and diagnostics.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::ObsoleteOnly => "obsolete_only",
+        }
+    }
+}
+
 /// Why an explicit repair stopped without qualified history completion.
 /// These bounded codes contain no relay, account or event identities. The
 /// comparison job reports `CoverageUnproven`, `BelowRetentionWindow`,
@@ -115,8 +139,11 @@ pub enum AppError {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Hex(#[from] hex::FromHexError),
-    #[error("no published key package for account")]
-    MissingKeyPackage(String),
+    #[error("{reason}")]
+    MissingKeyPackage {
+        account: String,
+        reason: MissingKeyPackageReason,
+    },
     /// The canonical invite target has no Marmot inbox endpoint that survives
     /// this device's relay-safety policy. Kept per-recipient for typed host
     /// presentation, while Display remains identity-free for safe diagnostics.
@@ -452,7 +479,7 @@ impl AppError {
                 _ => "sqlite",
             },
             Self::Hex(_) => "hex",
-            Self::MissingKeyPackage(_) => "missing_key_package",
+            Self::MissingKeyPackage { .. } => "missing_key_package",
             Self::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
             Self::GroupCreateIncludesCreator => "group_create_includes_creator",
             Self::UnknownGroup(_) => "unknown_group",

@@ -637,10 +637,11 @@ fn app_error_json(err: &AppError) -> Value {
     }
     match err {
         AppError::AccountHome(err) => account_home_error_json(err),
-        AppError::MissingKeyPackage(account) => json!({
+        AppError::MissingKeyPackage { account, reason } => json!({
             "code": "missing_key_package",
             "message": err.to_string(),
             "account_id": account,
+            "reason": reason.as_str(),
             "repair": {
                 "local": format!("wn --account {account} keys publish"),
                 "remote": "wn keys fetch <npub-or-hex> --bootstrap-relays <relay-url>"
@@ -935,10 +936,14 @@ mod tests {
     #[test]
     fn missing_key_package_errors_include_repair_guidance() {
         let account = "11".repeat(32);
-        let error = wn_error_json(&WnError::App(AppError::MissingKeyPackage(account.clone())));
+        let error = wn_error_json(&WnError::App(AppError::MissingKeyPackage {
+            account: account.clone(),
+            reason: marmot_app::MissingKeyPackageReason::ObsoleteOnly,
+        }));
 
         assert_eq!(error["code"], "missing_key_package");
         assert_eq!(error["account_id"], account);
+        assert_eq!(error["reason"], "obsolete_only");
         assert_eq!(
             error["repair"]["local"],
             format!("wn --account {account} keys publish")

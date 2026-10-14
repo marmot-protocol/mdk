@@ -19,6 +19,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Changed
 
+- Recipients with only obsolete KeyPackages now return `MARMOT_STATUS_MISSING_KEY_PACKAGE` (15)
+  instead of `MARMOT_STATUS_INVALID_KEY_PACKAGE_EVENT`; the error detail ends in
+  `[obsolete_only]` (or `[not_found]`) (mdk#1975). Status values are unchanged.
 - `MarmotAttachmentTransferState` appends
   `MARMOT_ATTACHMENT_TRANSFER_STATE_STORAGE_BLOCKED`; existing discriminants
   are unchanged. Recompile against the regenerated `marmot.h` with the matching

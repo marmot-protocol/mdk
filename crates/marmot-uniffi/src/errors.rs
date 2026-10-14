@@ -2,6 +2,35 @@ use cgka_traits::error::EngineError;
 use marmot_account::AccountHomeError;
 use marmot_app::AppError;
 
+/// Why a completed KeyPackage lookup found nothing to invite. Describes the
+/// searched relays only; the set only grows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MissingKeyPackageReasonFfi {
+    /// No KeyPackage publication was found.
+    NotFound,
+    /// Only legacy-profile KeyPackages were found: the recipient must update
+    /// their app and publish a current KeyPackage.
+    ObsoleteOnly,
+}
+
+impl From<marmot_app::MissingKeyPackageReason> for MissingKeyPackageReasonFfi {
+    fn from(value: marmot_app::MissingKeyPackageReason) -> Self {
+        match value {
+            marmot_app::MissingKeyPackageReason::NotFound => Self::NotFound,
+            marmot_app::MissingKeyPackageReason::ObsoleteOnly => Self::ObsoleteOnly,
+        }
+    }
+}
+
+impl std::fmt::Display for MissingKeyPackageReasonFfi {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::NotFound => "not_found",
+            Self::ObsoleteOnly => "obsolete_only",
+        })
+    }
+}
+
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MarmotKitError {
     #[error("user is blocked")]
@@ -107,8 +136,14 @@ pub enum MarmotKitError {
     /// host apps can present a setup/invite state without string matching.
     #[error("invalid key package event: {details}")]
     InvalidKeyPackageEvent { details: String },
-    #[error("missing key package for {account}")]
-    MissingKeyPackage { account: String },
+    /// A completed lookup found no KeyPackage this device may invite. Branch on
+    /// `reason`: `ObsoleteOnly` means the recipient must update their app and
+    /// publish a current KeyPackage; `NotFound` means none was published.
+    #[error("missing key package for {account} [{reason}]")]
+    MissingKeyPackage {
+        account: String,
+        reason: MissingKeyPackageReasonFfi,
+    },
     /// The invite target has no kind-10050 inbox endpoint that this device can
     /// safely use. The account id lets hosts identify the affected selection
     /// without parsing display text.
@@ -493,8 +528,9 @@ impl From<&AppError> for MarmotKitError {
             AppError::Hex(err) => Self::InvalidHex {
                 details: err.to_string(),
             },
-            AppError::MissingKeyPackage(account) => Self::MissingKeyPackage {
+            AppError::MissingKeyPackage { account, reason } => Self::MissingKeyPackage {
                 account: account.clone(),
+                reason: (*reason).into(),
             },
             AppError::MissingMemberInboxRoute(account) => Self::MissingMemberInboxRoute {
                 account: account.clone(),
