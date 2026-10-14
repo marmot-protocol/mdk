@@ -273,14 +273,16 @@ async fn fetch_epoch_gap_window(
             max_duration: remaining.min(EPOCH_GAP_WINDOW_MAX_DURATION),
         },
     );
-    let events = tokio::time::timeout_at(deadline, fetch)
-        .await
-        .unwrap_or_default();
+    let (events, timed_out) = match tokio::time::timeout_at(deadline, fetch).await {
+        Ok(events) => (events, false),
+        Err(_) => (Vec::new(), true),
+    };
     tracing::info!(
         target: "marmot_app::client::sync::comparison_job",
         method = "fetch_epoch_gap_window",
         relays,
         events = events.len(),
+        timed_out,
         "fetched an epoch-gap route's newest window from relays that failed to compare it"
     );
     events
