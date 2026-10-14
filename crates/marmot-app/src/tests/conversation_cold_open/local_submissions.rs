@@ -1243,3 +1243,99 @@ async fn prepared_media_snapshot_rollback_preserves_both_draft_and_admission() {
     drop(store);
     h.app.close_storage().unwrap();
 }
+
+#[tokio::test]
+async fn retained_edit_orders_after_direct_edits_of_a_recovering_original() {
+    // While the original awaits its publish retry it exposes no accepted
+    // edits, but direct edits sent meanwhile are stored and compete by
+    // (second, event id) once it recovers. A later retained revision must be
+    // stamped after them so it is the one that stays effective.
+    let h = History::new(0).await;
+    let group_hex = hex::encode(h.group.as_slice());
+    let storage = h.app.account_storage("alice").unwrap();
+    let alice = h
+        .app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let (original, _) = h
+        .app
+        .admit_local_message_at(
+            "alice",
+            &h.group,
+            "original-token".into(),
+            LocalMessageRequest {
+                content: "original".into(),
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+            42,
+        )
+        .unwrap();
+    storage
+        .invalidate_app_event_by_message_id(
+            &group_hex,
+            &original.message_id_hex,
+            crate::LOCAL_PUBLISH_FAILED_REASON,
+        )
+        .unwrap();
+    let edit_time = 1_000;
+    for (offset, id) in [(0, "d0"), (1, "d1")] {
+        h.app
+            .record_account_app_event(
+                "alice",
+                &crate::AppMessageProjection {
+                    authority: None,
+                    message_id_hex: id.repeat(32),
+                    source_message_id_hex: None,
+                    direction: "sent".into(),
+                    group_id_hex: group_hex.clone(),
+                    sender: alice.clone(),
+                    plaintext: format!("direct revision {offset}"),
+                    kind: cgka_traits::app_event::MARMOT_APP_EVENT_KIND_EDIT,
+                    tags: vec![vec!["e".into(), original.message_id_hex.clone()]],
+                    source_epoch: None,
+                    retention: None,
+                    recorded_at: Some(edit_time + offset),
+                    origin_commit_id: None,
+                    moderation_grant: false,
+                },
+            )
+            .unwrap();
+    }
+
+    h.app
+        .admit_local_message_with_edit_at(
+            "alice",
+            &h.group,
+            "edit-token".into(),
+            LocalMessageRequest {
+                content: "retained revision".into(),
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+            Some("original-token".into()),
+            edit_time,
+        )
+        .unwrap();
+    assert_eq!(
+        storage
+            .latest_authored_edit_at(&group_hex, &original.message_id_hex, &alice)
+            .unwrap(),
+        Some(edit_time + 2),
+        "the retained revision must follow both direct edits"
+    );
+
+    storage
+        .clear_local_publish_failure(&group_hex, &original.message_id_hex)
+        .unwrap();
+    let row = storage
+        .timeline_message(&group_hex, &original.message_id_hex)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.plaintext, "retained revision");
+    h.app.close_storage().unwrap();
+}
