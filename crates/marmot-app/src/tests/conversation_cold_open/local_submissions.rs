@@ -1490,3 +1490,36 @@ async fn retained_edit_of_a_deleted_message_is_refused_at_admission() {
     );
     h.app.close_storage().unwrap();
 }
+
+#[tokio::test]
+async fn edit_clock_pruning_never_reissues_a_second_to_an_older_caller() {
+    // Edit X reserves T; an edit of another target at T+1 prunes X's
+    // reservation; a caller that captured (T, nothing stored) before either
+    // then resumes for X. It must not receive T again.
+    let h = History::new(0).await;
+    let group_hex = hex::encode(h.group.as_slice());
+    let alice = h
+        .app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let (x, y) = ("a1".repeat(32), "b2".repeat(32));
+    let t = 1_000;
+    assert_eq!(
+        h.app
+            .reserve_edit_created_at(&alice, &group_hex, &x, t, None),
+        Some(t)
+    );
+    assert_eq!(
+        h.app
+            .reserve_edit_created_at(&alice, &group_hex, &y, t + 1, None),
+        Some(t + 1)
+    );
+    let resumed = h
+        .app
+        .reserve_edit_created_at(&alice, &group_hex, &x, t, None)
+        .unwrap();
+    assert!(resumed > t, "reissued second {resumed} for {x}");
+    h.app.close_storage().unwrap();
+}

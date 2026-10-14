@@ -552,11 +552,21 @@ pub struct MarmotApp {
     /// Edit seconds already handed out per (sender, group, target), so a direct
     /// edit and a concurrently admitted retained edit never share one; see
     /// [`Self::reserve_edit_created_at`].
-    edit_created_at: Arc<Mutex<HashMap<EditClockKey, u64>>>,
+    edit_created_at: Arc<Mutex<EditClock>>,
 }
 
 /// (sender, group id hex, target message id hex) for [`MarmotApp::reserve_edit_created_at`].
 type EditClockKey = (String, String, String);
+
+/// Edit seconds handed out, pruned against a time floor that never moves back.
+#[derive(Default)]
+struct EditClock {
+    /// The newest `now` any caller reserved with. A caller holding an older
+    /// `now` picks at or after it, so pruning can never hand it a second that a
+    /// pruned reservation already used.
+    now_floor: u64,
+    reserved: HashMap<EditClockKey, u64>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentTextStreamFinishRequest {
@@ -1692,7 +1702,7 @@ impl MarmotApp {
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
-            edit_created_at: Arc::new(Mutex::new(HashMap::new())),
+            edit_created_at: Arc::new(Mutex::new(EditClock::default())),
         }
     }
 
@@ -1787,7 +1797,7 @@ impl MarmotApp {
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
-            edit_created_at: Arc::new(Mutex::new(HashMap::new())),
+            edit_created_at: Arc::new(Mutex::new(EditClock::default())),
         }
     }
 
@@ -3177,20 +3187,24 @@ impl MarmotApp {
         now: u64,
         stored_latest: Option<u64>,
     ) -> Option<u64> {
-        let mut reserved = self
+        let mut clock = self
             .edit_created_at
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // A reservation older than now no longer constrains the next pick.
-        reserved.retain(|_, at| *at >= now);
+        // A caller may resume with a `now` (and stored snapshot) older than
+        // another caller's. Picking at or after the floor keeps every pick
+        // above any reservation pruned below, which is all pruning removes.
+        clock.now_floor = clock.now_floor.max(now);
+        let now = clock.now_floor;
+        clock.reserved.retain(|_, at| *at >= now);
         let key = (
             sender.to_owned(),
             group_id_hex.to_owned(),
             target_message_id_hex.to_owned(),
         );
-        let latest = stored_latest.max(reserved.get(&key).copied());
+        let latest = stored_latest.max(clock.reserved.get(&key).copied());
         let created_at = crate::local_submissions::next_edit_created_at(now, latest)?;
-        reserved.insert(key, created_at);
+        clock.reserved.insert(key, created_at);
         Some(created_at)
     }
 
