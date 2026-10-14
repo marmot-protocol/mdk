@@ -79,7 +79,7 @@ jobs:
             echo "source_sha=$source_sha"
             echo "builder_sha=$source_sha"
           } >> "$GITHUB_OUTPUT"
-      # The organization shares five macOS runners across every repository.
+      # macOS minutes are the most expensive CI lane (Blacksmith-hosted).
       # Pull requests build the Apple candidates only when MarmotKit or its
       # workflows change; master pushes, the weekly schedule, and manual runs
       # always build them, so a dependency or toolchain bump is still covered
@@ -114,13 +114,12 @@ jobs:
 
   apple-build:
     name: Build Apple candidate input (${{ matrix.part }})
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-latest
     needs: identity
     if: needs.identity.outputs.run_apple == 'true'
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      max-parallel: 3
       matrix:
         include:
           - part: swift
@@ -393,7 +392,7 @@ jobs:
 
   ios-package:
     name: Assemble and validate iOS candidate
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-latest
     needs: [identity, apple-build]
     timeout-minutes: 60
     steps:
@@ -485,7 +484,7 @@ jobs:
 
   macos-package:
     name: Assemble and validate macOS candidate
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-latest
     needs: [identity, apple-build]
     timeout-minutes: 60
     steps:

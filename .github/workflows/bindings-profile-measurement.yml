@@ -161,7 +161,7 @@ jobs:
 
   apple-measurement:
     name: Compare Apple archive profiles
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-latest
     needs: identity
     timeout-minutes: 240
     steps:

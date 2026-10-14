@@ -1126,7 +1126,7 @@ within the current workflow run, verifies their source, builder, toolchain,
 profile, feature and run provenance, then assembles and validates the Android,
 iOS and macOS candidate packages. Pull requests build the Apple inputs and
 packages only when they change `crates/marmot-uniffi/` (other than Markdown) or a
-MarmotKit bindings workflow, because macOS runners are scarce; every other pull
+MarmotKit bindings workflow, because macOS minutes are expensive; every other pull
 request still builds and validates the Android package, and `master` pushes always
 build the complete matrix. Pull requests restore the trusted release
 cache read-only; only runs using the workflow from `master` may update it. A

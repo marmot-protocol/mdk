@@ -1,0 +1,5 @@
+# Blacksmith-hosted runner labels (https://docs.blacksmith.sh).
+self-hosted-runner:
+  labels:
+    - blacksmith-6vcpu-macos-latest
+    - blacksmith-6vcpu-macos-15
