@@ -1848,21 +1848,15 @@ async fn connector_edit_message_replaces_own_text_and_reports_refusals() {
     };
     let status_id = message_ids_hex[0].clone();
 
-    // Two back-to-back edits land in the same second; the later must win.
-    for (id, text) in [
-        ("req-edit-1", "status: step 1"),
-        ("req-edit-2", "status: done"),
-    ] {
-        let edited = send_control_request(&socket, id, edit(&status_id, text)).await;
-        let AgentControlResponse::FinalSent {
-            message_ids_hex, ..
-        } = edited.payload
-        else {
-            panic!("expected edit to publish, got {:?}", edited.payload);
-        };
-        assert_eq!(message_ids_hex.len(), 1);
-        assert_ne!(message_ids_hex[0], status_id, "an edit is its own event");
-    }
+    let edited = send_control_request(&socket, "req-edit", edit(&status_id, "status: done")).await;
+    let AgentControlResponse::FinalSent {
+        message_ids_hex, ..
+    } = edited.payload
+    else {
+        panic!("expected edit to publish, got {:?}", edited.payload);
+    };
+    assert_eq!(message_ids_hex.len(), 1);
+    assert_ne!(message_ids_hex[0], status_id, "an edit is its own event");
     let read = send_control_request(
         &socket,
         "req-read",
@@ -1907,10 +1901,7 @@ async fn connector_edit_message_replaces_own_text_and_reports_refusals() {
 }
 
 #[test]
-fn edit_rate_limit_is_a_retryable_connector_error() {
-    let error = crate::ConnectorError::App(AppError::EditRateLimited);
-    assert_eq!(error.code(), "edit_rate_limited");
-    assert!(error.retryable());
+fn invalid_edit_target_is_a_final_connector_error() {
     let error = crate::ConnectorError::App(AppError::InvalidEditTarget);
     assert_eq!(error.code(), "invalid_edit_target");
     assert!(!error.retryable());

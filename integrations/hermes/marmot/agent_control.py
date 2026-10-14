@@ -350,9 +350,8 @@ class MarmotAgentControlClient:
     ) -> Dict[str, Any]:
         """Replace the text of a chat message this account sent.
 
-        The connector refuses any other target with ``invalid_edit_target`` and
-        a burst of edits with the retryable ``edit_rate_limited``; nothing is
-        published in either case.
+        The connector refuses any other target with ``invalid_edit_target``;
+        nothing is published then.
         """
         if not isinstance(text, str):
             raise TypeError("text must be a string")

@@ -632,8 +632,8 @@ export class MarmotAgentControlClient {
 
   /**
    * Replace the text of a chat message this account sent (kind-1009 edit). The
-   * connector refuses other targets with `invalid_edit_target` and a burst of
-   * edits with the retryable `edit_rate_limited`; nothing is published then.
+   * connector refuses other targets with `invalid_edit_target`; nothing is
+   * published then.
    */
   async editMessage(
     accountIdHex: string,

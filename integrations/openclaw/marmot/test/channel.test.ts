@@ -634,13 +634,9 @@ describe("createMarmotMessageActionAdapter", () => {
     expect(editMessage).not.toHaveBeenCalled();
   });
 
-  it("explains refused and rate-limited edits", async () => {
+  it("explains a refused edit", async () => {
     const refusals: Record<string, AgentControlError> = {
       [HEX32("01")]: new AgentControlError("refused", { code: "invalid_edit_target" }),
-      [HEX32("02")]: new AgentControlError("limited", {
-        code: "edit_rate_limited",
-        retryable: true,
-      }),
     };
     const adapter = createMarmotMessageActionAdapter({
       deleteByMessageId: async () => false,
@@ -659,11 +655,6 @@ describe("createMarmotMessageActionAdapter", () => {
     );
     expect(resultOk(refused)).toBe(false);
     expect(resultError(refused)).toMatch(/this agent sent/);
-    const limited = await adapter.handleAction!(
-      editCtx({ messageId: HEX32("02"), message: "x", to: HEX32("cc") }),
-    );
-    expect(resultError(limited)).toMatch(/retry shortly/);
-    expect((limited.details as { retryable?: boolean }).retryable).toBe(true);
   });
 
   it("deletes via the send-time cache on a cache hit", async () => {

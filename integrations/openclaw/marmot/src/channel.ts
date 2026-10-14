@@ -364,13 +364,6 @@ async function handleEditAction(
         error: "only an available message this agent sent can be edited",
       });
     }
-    if (error instanceof AgentControlError && error.code === "edit_rate_limited") {
-      return jsonResult({
-        ok: false,
-        retryable: true,
-        error: "too many edits of this message; nothing was published, retry shortly",
-      });
-    }
     return jsonResult({ ok: false, error: "edit failed" });
   }
 }

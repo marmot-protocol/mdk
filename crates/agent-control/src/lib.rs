@@ -246,8 +246,7 @@ pub enum AgentControlRequest {
         target_message_id_hex: String,
     },
     /// Replace the text of a chat message this account sent. The runtime
-    /// refuses any other target before publication (`invalid_edit_target`)
-    /// and a burst past its timestamp bound (`edit_rate_limited`, retryable).
+    /// refuses any other target before publication (`invalid_edit_target`).
     EditMessage {
         account_id_hex: String,
         group_id_hex: String,
