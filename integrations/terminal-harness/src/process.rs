@@ -4,7 +4,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStderr, ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
@@ -15,6 +15,114 @@ use crate::{HarnessError, Outcome, RunFailure, RunnerEvent, TRACE_TARGET};
 
 const STDERR_CAPTURE_BYTES: usize = 4096;
 const POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Largest single stdout JSONL record, excluding its delimiter.
+pub const MAX_BACKEND_RECORD_BYTES: usize = 4 * 1024 * 1024;
+/// Total raw stdout bytes one backend invocation may write.
+pub const MAX_BACKEND_STDOUT_BYTES: usize = 64 * 1024 * 1024;
+const STDOUT_SCRATCH_BYTES: usize = 8 * 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+enum FrameError {
+    Limit,
+    Io,
+}
+
+/// Incremental LF-delimited stdout reader with fixed scratch space.
+///
+/// Holds at most one record of `max_record_bytes` plus the scratch buffer, so a
+/// newline-free or oversized record is rejected before it is parsed. A read that
+/// crosses `max_stdout_bytes` frames only its in-budget prefix, so the records
+/// emitted before a breach never depend on how the pipe split its writes.
+struct RecordFramer<R> {
+    reader: R,
+    scratch: Box<[u8]>,
+    start: usize,
+    end: usize,
+    record: Vec<u8>,
+    max_record_bytes: usize,
+    remaining_stdout_bytes: usize,
+    over_budget: bool,
+    eof: bool,
+}
+
+impl<R: AsyncRead + Unpin> RecordFramer<R> {
+    fn new(reader: R, max_record_bytes: usize, max_stdout_bytes: usize) -> Self {
+        Self {
+            reader,
+            scratch: vec![0; STDOUT_SCRATCH_BYTES].into_boxed_slice(),
+            start: 0,
+            end: 0,
+            record: Vec::new(),
+            max_record_bytes,
+            remaining_stdout_bytes: max_stdout_bytes,
+            over_budget: false,
+            eof: false,
+        }
+    }
+
+    /// Returns the next record without its LF (and a CR directly before that LF),
+    /// the final unterminated record at EOF, or `None` after EOF. Cancel-safe:
+    /// it awaits only when no buffered bytes remain.
+    async fn next_record(&mut self) -> Result<Option<Vec<u8>>, FrameError> {
+        loop {
+            if let Some(record) = self.take_buffered_record()? {
+                return Ok(Some(record));
+            }
+            if self.over_budget {
+                return Err(FrameError::Limit);
+            }
+            if self.eof {
+                return Ok((!self.record.is_empty()).then(|| std::mem::take(&mut self.record)));
+            }
+            // Read at most one byte past the budget so a breach is exact.
+            let want = self
+                .scratch
+                .len()
+                .min(self.remaining_stdout_bytes.saturating_add(1));
+            let read = self
+                .reader
+                .read(&mut self.scratch[..want])
+                .await
+                .map_err(|_| FrameError::Io)?;
+            if read == 0 {
+                self.eof = true;
+                continue;
+            }
+            let accepted = read.min(self.remaining_stdout_bytes);
+            self.over_budget = read > accepted;
+            self.remaining_stdout_bytes -= accepted;
+            self.start = 0;
+            self.end = accepted;
+        }
+    }
+
+    fn take_buffered_record(&mut self) -> Result<Option<Vec<u8>>, FrameError> {
+        let pending = &self.scratch[self.start..self.end];
+        if pending.is_empty() {
+            return Ok(None);
+        }
+        let delimiter = pending.iter().position(|byte| *byte == b'\n');
+        let take = delimiter.unwrap_or(pending.len());
+        if self.record.len() + take > self.max_record_bytes {
+            return Err(FrameError::Limit);
+        }
+        self.record.extend_from_slice(&pending[..take]);
+        match delimiter {
+            Some(position) => {
+                self.start += position + 1;
+                let mut record = std::mem::take(&mut self.record);
+                if record.last() == Some(&b'\r') {
+                    record.pop();
+                }
+                Ok(Some(record))
+            }
+            None => {
+                self.start = self.end;
+                Ok(None)
+            }
+        }
+    }
+}
 
 #[cfg(unix)]
 struct ProcessGroupGuard {
@@ -348,7 +456,8 @@ where
     let mut reported_liveness_unknown = false;
 
     let lifecycle_result = timeout_at(total_deadline, async {
-        let mut lines = BufReader::new(stdout).lines();
+        let mut records =
+            RecordFramer::new(stdout, MAX_BACKEND_RECORD_BYTES, MAX_BACKEND_STDOUT_BYTES);
         let mut child_status = None;
         let mut post_exit_deadline = None;
         // Preserve exit polling and its backoff while stdout is active.
@@ -360,6 +469,9 @@ where
             tokio::task::consume_budget().await;
             let line = tokio::select! {
                 biased;
+                // The bridge stops listening once it rejects the turn's output;
+                // stop the backend instead of letting it keep working unseen.
+                _ = tx.closed() => return Err(HarnessError::BackendStream),
                 _ = sleep_until(post_exit_deadline.unwrap_or(total_deadline)), if post_exit_deadline.is_some() => break,
                 status = &mut child_exit, if child_status.is_none() => {
                     child_status = Some(status.map_err(HarnessError::from)?);
@@ -368,7 +480,7 @@ where
                     // notification loses the race to exit observation. Drain to EOF.
                     continue;
                 },
-                line = lines.next_line() => Some(line),
+                record = records.next_record() => Some(record),
                 _ = sleep_until(idle_deadline) => {
                     if !reported_liveness_unknown {
                         tx.send(RunnerEvent::LivenessUnknown)
@@ -380,11 +492,13 @@ where
                     continue;
                 }
             };
-            let line = match line.expect("line branch returns a value") {
-                Err(_) => return Err(HarnessError::BackendStream),
-                Ok(Some(line)) => line,
+            let record = match line.expect("record branch returns a value") {
+                Err(FrameError::Limit) => return Err(HarnessError::OutputLimitExceeded),
+                Err(FrameError::Io) => return Err(HarnessError::BackendStream),
+                Ok(Some(record)) => record,
                 Ok(None) => break,
             };
+            let line = String::from_utf8(record).map_err(|_| HarnessError::BackendStream)?;
             if !line.is_empty() {
                 match parse_event(&line) {
                     Ok(ParsedEvent::Session(session_id)) => {
@@ -730,6 +844,93 @@ fn truncate_to_char_boundary(value: &mut String, max_bytes: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ChunkedReader {
+        data: Vec<u8>,
+        position: usize,
+        chunk: usize,
+    }
+
+    impl AsyncRead for ChunkedReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let end = self
+                .data
+                .len()
+                .min(self.position + self.chunk.min(buf.remaining()));
+            let position = self.position;
+            buf.put_slice(&self.data[position..end]);
+            self.position = end;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn frame_all(
+        data: &[u8],
+        chunk: usize,
+        max_record: usize,
+        max_stdout: usize,
+    ) -> (Vec<Vec<u8>>, Option<FrameError>) {
+        let reader = ChunkedReader {
+            data: data.to_vec(),
+            position: 0,
+            chunk,
+        };
+        let mut framer = RecordFramer::new(reader, max_record, max_stdout);
+        let mut records = Vec::new();
+        loop {
+            match framer.next_record().await {
+                Ok(Some(record)) => records.push(record),
+                Ok(None) => return (records, None),
+                Err(error) => return (records, Some(error)),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn framer_admits_records_at_the_cap_and_rejects_one_byte_over() {
+        for chunk in [1, 3, STDOUT_SCRATCH_BYTES] {
+            assert_eq!(
+                frame_all(b"abcd\nefgh", chunk, 4, 64).await,
+                (vec![b"abcd".to_vec(), b"efgh".to_vec()], None)
+            );
+            // A CR before LF is stripped but counts toward the record cap.
+            assert_eq!(
+                frame_all(b"abc\r\n", chunk, 4, 64).await,
+                (vec![b"abc".to_vec()], None)
+            );
+            // Newline-free output is rejected once it passes the record cap.
+            assert_eq!(
+                frame_all(b"abcde", chunk, 4, 64).await,
+                (Vec::new(), Some(FrameError::Limit))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn framer_emits_the_same_in_budget_records_for_every_chunk_size() {
+        let data = b"ab\n\ncd\nef";
+        assert_eq!(frame_all(data, 1, 8, data.len()).await.1, None);
+        for max_stdout in 0..data.len() {
+            let (expected, error) = frame_all(data, 1, 8, max_stdout).await;
+            assert_eq!(error, Some(FrameError::Limit));
+            for chunk in [2, 4, STDOUT_SCRATCH_BYTES] {
+                assert_eq!(
+                    frame_all(data, chunk, 8, max_stdout).await,
+                    (expected.clone(), Some(FrameError::Limit)),
+                    "chunk {chunk}, max_stdout {max_stdout}"
+                );
+            }
+        }
+        // A record whose delimiter fits inside the cap is delivered before the breach.
+        assert_eq!(
+            frame_all(b"ab\ncd", STDOUT_SCRATCH_BYTES, 8, 4).await,
+            (vec![b"ab".to_vec()], Some(FrameError::Limit))
+        );
+    }
 
     #[test]
     fn ansi_stripping_and_utf8_truncation_are_safe() {

@@ -194,6 +194,59 @@ pub enum TransportCursorTrigger {
     NoticeRetired,
 }
 
+/// Why one relay failed a recovery pass's comparison:
+/// `transport_nostr_adapter::NostrReconciliationFailure`, one to one. Each
+/// names the stage that failed the relay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryRelayFailure {
+    /// The relay answered NEG-OPEN with NEG-ERR; `refusal_category` names
+    /// the reason's prefix.
+    NegErr,
+    /// The relay's concurrent-negentropy cap NOTICE refused the comparison.
+    NegCapNotice,
+    /// The relay does not support negentropy, or broke its protocol.
+    NegentropyUnsupported,
+    /// No first negentropy reply in time.
+    FirstReplyTimeout,
+    /// The pass deadline ended the comparison or its fetches.
+    RouteTimeout,
+    /// The account's relay pool does not hold the relay.
+    NotInPool,
+    /// The relay was not connected or not usable.
+    NotOperational,
+    /// The relay's matching set filled the comparison limit.
+    LimitReached,
+    /// The relay did not serve an exact-ID fetch for events it claimed.
+    IdFetchRefused,
+    /// The relay returned an event the pass did not ask for.
+    UnrequestedEvent,
+    /// The relay reached EOSE on an exact-ID fetch without a claimed event.
+    Withheld,
+    /// The pass's own budget or ordering left some of the relay's claimed
+    /// events for a later pass. Not the relay's fault.
+    PassLimit,
+    /// A local fault, not attributable to the relay.
+    LocalError,
+}
+
+/// One relay that failed a recovery pass, on
+/// [`crate::AuditEventKind::RecoveryAttemptFinished`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryRelayOutcome {
+    /// The failing relay. v5 records it as a hashed endpoint reference.
+    pub relay_url: String,
+    /// Why it failed the first compared route it failed in this pass.
+    pub failure: RecoveryRelayFailure,
+    /// The NEG-ERR reason's prefix, present exactly when `failure` is
+    /// `neg_err`. The reason text itself is never recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal_category: Option<crate::audit::SubscriptionRefusalCategory>,
+    /// Compared routes this relay failed in the pass. At least one.
+    pub routes: u64,
+}
+
 /// Whose notification receiver lagged, for a lag-lost EOSE repair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -271,6 +324,114 @@ mod tests {
             .filter(|line| line.contains("\"recovery_") || line.contains("\"transport_cursor"))
             .collect();
         (dir, lines)
+    }
+
+    fn outcome(relay: &str, failure: RecoveryRelayFailure) -> RecoveryRelayOutcome {
+        RecoveryRelayOutcome {
+            relay_url: format!("wss://{relay}.secret.example"),
+            failure,
+            refusal_category: (failure == RecoveryRelayFailure::NegErr)
+                .then_some(crate::audit::SubscriptionRefusalCategory::Unclassified),
+            routes: 1,
+        }
+    }
+
+    fn finished(
+        relays_failed: u64,
+        relays_incomplete: u64,
+        relay_outcomes: Vec<RecoveryRelayOutcome>,
+    ) -> AuditEventKind {
+        AuditEventKind::RecoveryAttemptFinished {
+            attempt_serial: 4,
+            duration_ms: 10,
+            outcome: RecoveryPassOutcome::Progressed,
+            error_kind: None,
+            obligation_count: 1,
+            routes_compared: 2,
+            routes_certified: 0,
+            routes_uncertified: 2,
+            events_retrieved: 0,
+            events_duplicate: 0,
+            events_rejected: 0,
+            events_retained: 0,
+            events_refused: 0,
+            relays_required: 2,
+            relays_admitted: 2,
+            relays_failed,
+            relays_incomplete,
+            relay_outcomes,
+        }
+    }
+
+    /// Each failed relay says why it failed (mdk#2265), as a hashed endpoint
+    /// reference; a list that cannot describe the counts is refused.
+    #[test]
+    fn finished_row_lists_each_failed_relay_once_with_its_class() {
+        use RecoveryRelayFailure as F;
+        let many = (0..RECOVERY_AUDIT_MAX_ENDPOINTS + 1)
+            .map(|index| outcome(&format!("r{index:02}"), F::RouteTimeout))
+            .collect::<Vec<_>>();
+        let mut no_category = outcome("a", F::NegErr);
+        no_category.refusal_category = None;
+        let mut stray_category = outcome("a", F::FirstReplyTimeout);
+        stray_category.refusal_category = Some(crate::audit::SubscriptionRefusalCategory::Blocked);
+        let mut no_routes = outcome("a", F::Withheld);
+        no_routes.routes = 0;
+        let (_dir, lines) = v5_lines(vec![
+            // Written: no failure, and two failed relays with their classes.
+            finished(0, 0, Vec::new()),
+            finished(
+                2,
+                1,
+                vec![outcome("a", F::NegErr), outcome("b", F::Withheld)],
+            ),
+            // Written: a full list may stand for more failed relays, and a
+            // failure the backend did not attribute to a relay is counted but
+            // not listed.
+            finished(20, 0, many[..RECOVERY_AUDIT_MAX_ENDPOINTS].to_vec()),
+            finished(2, 0, vec![outcome("a", F::NotInPool)]),
+            // Refused: more relays listed than failed, over the bound, a
+            // repeated relay, a NEG-ERR without its category or a category
+            // without NEG-ERR, a relay that failed no route, and more
+            // incomplete relays than failed ones.
+            finished(0, 0, vec![outcome("a", F::NotInPool)]),
+            finished(17, 0, many),
+            finished(
+                2,
+                0,
+                vec![outcome("a", F::NotInPool), outcome("a", F::NotInPool)],
+            ),
+            finished(1, 0, vec![no_category]),
+            finished(1, 0, vec![stray_category]),
+            finished(1, 0, vec![no_routes]),
+            finished(1, 2, vec![outcome("a", F::Withheld)]),
+        ]);
+        assert_eq!(
+            lines.len(),
+            4,
+            "only consistent rows are written: {lines:#?}"
+        );
+        let schema: serde_json::Value = serde_json::from_str(v5::JSON_SCHEMA).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for line in &lines {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(validator.is_valid(&value), "{line}");
+            v5::Record::from_json(line.as_bytes()).unwrap();
+            assert!(!line.contains("wss://"), "relay URLs never reach v5");
+        }
+        let event = &serde_json::from_str::<serde_json::Value>(&lines[1]).unwrap()["event"];
+        let outcomes = event["relay_outcomes"].as_array().unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes[0]["endpoint_ref"].is_string());
+        assert_eq!(outcomes[0]["failure"], "neg_err");
+        assert_eq!(outcomes[0]["refusal_category"], "unclassified");
+        assert_eq!(outcomes[1]["failure"], "withheld");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&lines[0]).unwrap()["event"]
+                .get("relay_outcomes")
+                .is_none(),
+            "an empty list is omitted"
+        );
     }
 
     #[test]
@@ -528,6 +689,25 @@ mod tests {
                 T::NoticeRetired
             ]),
             defined("Operational_transportCursorTrigger")
+        );
+        use RecoveryRelayFailure as F;
+        assert_eq!(
+            names(&[
+                F::NegErr,
+                F::NegCapNotice,
+                F::NegentropyUnsupported,
+                F::FirstReplyTimeout,
+                F::RouteTimeout,
+                F::NotInPool,
+                F::NotOperational,
+                F::LimitReached,
+                F::IdFetchRefused,
+                F::UnrequestedEvent,
+                F::Withheld,
+                F::PassLimit,
+                F::LocalError
+            ]),
+            defined("Operational_recoveryRelayFailure")
         );
     }
 }

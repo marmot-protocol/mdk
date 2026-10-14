@@ -430,6 +430,7 @@ mod tests {
             },
             MarmotKitError::MissingKeyPackage {
                 account: "a".into(),
+                reason: marmot_uniffi::MissingKeyPackageReasonFfi::NotFound,
             },
             MarmotKitError::MissingMemberInboxRoute {
                 account: "a".into(),

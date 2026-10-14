@@ -1180,7 +1180,7 @@ fn wipe_failure_reason(err: &AppError) -> String {
         AppError::Account(_) | AppError::AccountHome(_) => "account error",
         AppError::Session(_) => "session error",
         AppError::UnknownGroup(_) => "unknown local group",
-        AppError::MissingKeyPackage(_) => "no published key package",
+        AppError::MissingKeyPackage { .. } => "no published key package",
         _ => "operation failed",
     };
     category.to_owned()

@@ -26,8 +26,8 @@ use nostr_relay_builder::{LocalRelay, RelayBuilder};
 use nostr_sdk::prelude::{Client, EventBuilder, FinalizeEvent, Keys, Kind, RelayOptions, Tag};
 use tokio::task::JoinHandle;
 use transport_nostr_adapter::{
-    NostrReconciliationProgress, NostrRelayClient, NostrSdkRelayClient, NostrSubscription,
-    NostrTransportAdapter, SubscriptionAttempt, SubscriptionRouteKind,
+    NostrReconciliationFailure, NostrReconciliationProgress, NostrRelayClient, NostrSdkRelayClient,
+    NostrSubscription, NostrTransportAdapter, SubscriptionAttempt, SubscriptionRouteKind,
 };
 
 const QUIET: Duration = Duration::from_millis(600);
@@ -1207,6 +1207,114 @@ async fn fast_and_slow_reconciliation_failure_paths() {
     assert!(all_failed(&refused_results, 2), "{refused_results:?}");
     assert!(refused_results.iter().all(|(ms, _)| *ms < 100));
     assert!(all_failed(&dropped_results, 1), "{dropped_results:?}");
+    fx.shutdown().await;
+}
+
+/// One pass's failure class per endpoint, in endpoint order.
+async fn failure_classes(fx: &Fixture, endpoints: &[String]) -> Vec<NostrReconciliationFailure> {
+    let (summary, _) = fx
+        .sdk
+        .reconcile_subscription(
+            route_on(endpoints, &fx.account),
+            &[],
+            SINCE,
+            UNTIL,
+            &Cursor::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        summary
+            .endpoint_failures
+            .iter()
+            .map(|failure| failure.endpoint.clone())
+            .collect::<Vec<_>>(),
+        summary.failed_endpoints,
+        "every failed endpoint has exactly one class"
+    );
+    let mut sorted = endpoints.to_vec();
+    sorted.sort();
+    sorted
+        .iter()
+        .map(|endpoint| {
+            summary
+                .endpoint_failures
+                .iter()
+                .find(|failure| failure.endpoint.as_str().trim_end_matches('/') == endpoint)
+                .map(|failure| failure.failure)
+                .unwrap_or_else(|| panic!("endpoint did not fail: {:?}", summary.endpoint_failures))
+        })
+        .collect()
+}
+
+/// Each way a relay can fail a comparison keeps its own class (#2265):
+/// NEG-ERR with its reason's prefix, the negentropy-cap NOTICE, no first
+/// reply, the pass deadline, an endpoint outside the pool, and a relay the SDK
+/// will not use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconciliation_names_why_each_relay_failed() {
+    use NostrReconciliationFailure as Failure;
+    let (fx, url) = connected_fixture(LimitConfig::default(), 10).await;
+    let one = std::slice::from_ref(&url);
+    let mut observed = Vec::new();
+    for (fault, expected) in [
+        (
+            NegFault::ErrOnOpen,
+            Failure::NegErr(Some(
+                cgka_traits::TransportEndpointRejectionCategory::Blocked,
+            )),
+        ),
+        (NegFault::SilentOpen, Failure::FirstReplyTimeout),
+        (NegFault::FingerprintThenStall, Failure::RouteTimeout),
+    ] {
+        fx.limit.set_neg_fault(fault);
+        observed.push((
+            format!("{fault:?}"),
+            failure_classes(&fx, one).await,
+            expected,
+        ));
+    }
+    fx.limit.set_neg_fault(NegFault::None);
+
+    let capped = LimitRelay::start(
+        fx.upstream_url.clone(),
+        LimitConfig {
+            max_neg_sessions: 0,
+            ..LimitConfig::default()
+        },
+    )
+    .await;
+    fx.sdk
+        .client()
+        .add_relay(capped.url())
+        .opts(fast_retry_options())
+        .await
+        .unwrap();
+    fx.sdk.client().connect().await;
+    capped
+        .wait_for(SETTLE_TIMEOUT, |s| s.open_connections() == 1)
+        .await;
+    observed.push((
+        "neg_cap".into(),
+        failure_classes(&fx, &[capped.url()]).await,
+        Failure::NegCapNotice,
+    ));
+    observed.push((
+        "not_in_pool".into(),
+        failure_classes(&fx, &["ws://127.0.0.1:9".to_owned()]).await,
+        Failure::NotInPool,
+    ));
+    let dead = dead_relay(&fx.sdk).await;
+    observed.push((
+        "not_operational".into(),
+        failure_classes(&fx, &[dead]).await,
+        Failure::NotOperational,
+    ));
+    eprintln!("[g] failure classes: {observed:?}");
+    for (label, classes, expected) in observed {
+        assert_eq!(classes, vec![expected], "{label}");
+    }
+    assert!(capped.stats().neg_cap_notices >= 1);
     fx.shutdown().await;
 }
 

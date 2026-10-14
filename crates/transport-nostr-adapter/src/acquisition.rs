@@ -26,6 +26,11 @@ pub enum NostrAcquisitionScope {
         transport_group_id: [u8; 32],
         since: u64,
         until: u64,
+        /// Ask for at most this many of the window's newest events (the
+        /// NIP-01 `limit`, which relays answer newest first). `None` leaves
+        /// the order and page size to the relay, so the item budget may cut
+        /// any prefix of the window.
+        newest: Option<usize>,
     },
 }
 

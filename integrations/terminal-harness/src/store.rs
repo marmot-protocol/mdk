@@ -514,6 +514,20 @@ impl FinalDeliveryStore {
         Ok(true)
     }
 
+    /// Removes every pending record for one reply set, so reconciliation never
+    /// sends output from a turn that was stopped.
+    pub(crate) async fn discard_reply(&self, group_ref: &str, reply_to_ref: &str) -> Result<()> {
+        let mut state = self.state.lock().await;
+        let mut next = state.clone();
+        next.records.retain(|_, record| {
+            record.group_ref != group_ref || record.reply_to_ref != reply_to_ref
+        });
+        if next.records.len() == state.records.len() {
+            return Ok(());
+        }
+        self.commit(&mut state, next).await
+    }
+
     pub(crate) async fn mark_incomplete_final(
         &self,
         group_ref: &str,

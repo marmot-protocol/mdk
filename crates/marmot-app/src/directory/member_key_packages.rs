@@ -330,7 +330,7 @@ impl MarmotApp {
         if let Some(observation) = observation {
             observation.finish(match &result {
                 Ok(_) => "usable",
-                Err(AppError::MissingKeyPackage(_)) => "absent",
+                Err(AppError::MissingKeyPackage { .. }) => "absent",
                 Err(AppError::InvalidKeyPackageEvent(_)) => "invalid",
                 Err(_) => "unavailable",
             });
@@ -446,7 +446,7 @@ impl MarmotApp {
             for outcome in &outcomes {
                 let outcome = match outcome {
                     Some(Ok(_)) => "success",
-                    Some(Err(AppError::MissingKeyPackage(_))) | None => "empty",
+                    Some(Err(AppError::MissingKeyPackage { .. })) | None => "empty",
                     Some(Err(_)) => "failure",
                 };
                 observation.directory_sample(outcome, "network", 1);
@@ -488,9 +488,10 @@ impl MarmotApp {
         let mut key_packages = Vec::with_capacity(targets.len());
         for (index, outcome) in outcomes.into_iter().enumerate() {
             match outcome.unwrap_or_else(|| {
-                Err(AppError::MissingKeyPackage(
-                    targets[index].account_id_hex.clone(),
-                ))
+                Err(AppError::MissingKeyPackage {
+                    account: targets[index].account_id_hex.clone(),
+                    reason: crate::MissingKeyPackageReason::NotFound,
+                })
             }) {
                 Ok(key_package) => {
                     let safe_inbox = self.retain_safe_discovered_endpoints(
@@ -903,13 +904,11 @@ impl MarmotApp {
                     self.directory_freshness(),
                     requirements,
                 )
-                .and_then(|selection| {
-                    selection
-                        .value
-                        .ok_or_else(|| AppError::MissingKeyPackage(account_id.clone()))
-                });
+                .map(|selection| selection.value);
+                // Batch results prove no coverage; every absence or rejection
+                // is decided by the per-member recovery below.
                 match selected {
-                    Ok(selected)
+                    Ok(Some(selected))
                         if purpose == MemberResolutionPurpose::Prewarm
                             || !multiple_authors
                             || selected.priority == 2 =>
@@ -1011,10 +1010,8 @@ impl MarmotApp {
                                 records.freshness,
                                 requirements,
                             )?
-                            .value
-                            .ok_or_else(|| {
-                                AppError::MissingKeyPackage(target.account_id_hex.clone())
-                            })?
+                            // Recovery returned, so lookup coverage is complete.
+                            .into_value_or_missing(&target.account_id_hex)?
                             .fetched;
                             fetched.relay_lists = target.relay_lists;
                             Ok::<_, AppError>(fetched)
