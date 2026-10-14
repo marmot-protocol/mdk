@@ -4169,6 +4169,66 @@ async fn edit_target_preflight_body() {
 }
 
 #[test]
+fn edits_of_an_original_awaiting_publish_retry_stay_ordered() {
+    run_composed_app_runtime_test("edit-recovering-original", edit_recovering_original_body);
+}
+
+async fn edit_recovering_original_body() {
+    // While an original's own publish is being retried it exposes no accepted
+    // edits, yet the edits sent meanwhile compete by (second, event id) once
+    // it recovers. Each must still take a strictly newer second.
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("edits", &[]).await.unwrap();
+    let group_hex = hex::encode(group_id.as_slice());
+    let original = client.send(&group_id, b"status: starting").await.unwrap();
+    let original_id = original.message_ids[0].clone();
+    let storage = app.account_storage("alice").unwrap();
+    storage
+        .invalidate_app_event_by_message_id(
+            &group_hex,
+            &original_id,
+            crate::LOCAL_PUBLISH_FAILED_REASON,
+        )
+        .unwrap();
+
+    let mut stamped = Vec::new();
+    for content in ["status: step 1", "status: step 2"] {
+        let (event, _) = client
+            .send_app_event(
+                &group_id,
+                AppMessageIntent::Edit {
+                    target_message_id: original_id.clone(),
+                    content: content.to_owned(),
+                },
+            )
+            .await
+            .expect("a target awaiting its publish retry stays editable");
+        stamped.push(event.created_at);
+    }
+    assert!(
+        stamped[1] > stamped[0],
+        "edits sent while the original recovers must take newer seconds: {stamped:?}"
+    );
+
+    storage
+        .clear_local_publish_failure(&group_hex, &original_id)
+        .unwrap();
+    let row = app
+        .timeline_message("alice", &group_hex, &original_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.invalidation_status, None);
+    assert_eq!(row.plaintext, "status: step 2");
+}
+
+#[test]
 fn pending_disband_is_projected_and_blocks_optimistic_application_messages() {
     run_composed_app_runtime_test(
         "pending-disband-composer-gate",

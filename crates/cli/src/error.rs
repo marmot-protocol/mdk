@@ -836,6 +836,20 @@ fn app_error_json(err: &AppError) -> Value {
             "message": err.to_string(),
             "repair": { "action": "retry the original account setup operation" },
         }),
+        AppError::InvalidEditTarget => json!({
+            "code": "invalid_edit_target",
+            "message": err.to_string(),
+            "repair": {
+                "action": "edit only an available chat message this account sent; nothing was published",
+            },
+        }),
+        AppError::EditRateLimited => json!({
+            "code": "edit_rate_limited",
+            "message": err.to_string(),
+            "repair": {
+                "action": "nothing was published; retry the same edit after a few seconds",
+            },
+        }),
         other => json!({
             "code": "command_failed",
             "message": other.to_string(),
@@ -930,6 +944,26 @@ mod tests {
         let rendered = json.to_string();
         assert!(!rendered.contains("127.0.0.1"));
         assert!(!rendered.contains("cert"));
+    }
+
+    #[test]
+    fn edit_refusals_keep_distinct_codes() {
+        let invalid = wn_error_json(&WnError::App(AppError::InvalidEditTarget));
+        assert_eq!(invalid["code"], "invalid_edit_target");
+        assert!(
+            invalid["repair"]["action"]
+                .as_str()
+                .unwrap()
+                .contains("this account sent")
+        );
+        let limited = wn_error_json(&WnError::App(AppError::EditRateLimited));
+        assert_eq!(limited["code"], "edit_rate_limited");
+        assert!(
+            limited["repair"]["action"]
+                .as_str()
+                .unwrap()
+                .contains("retry")
+        );
     }
 
     #[test]
