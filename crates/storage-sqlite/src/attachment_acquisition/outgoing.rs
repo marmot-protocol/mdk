@@ -213,7 +213,7 @@ impl SqliteAccountStorage {
                 let digest:[u8;32]=digest.try_into().map_err(|_|invalid("invalid outgoing attachment digest"))?;
                 let AttachmentDemand::Requested(asset)=self.request_attachment_acquisition(group,&entry,digest,now)? else {continue;};
                 let conn=self.lock()?;
-                let eligible:bool=conn.query_row("SELECT NOT EXISTS(SELECT 1 FROM retained_attachment_files f WHERE f.token=?1 AND f.completed=0) AND cancelled=0 AND (state<>4 OR body_completed=1) AND NOT(?2 AND explicit_request=1 AND body_completed=0) FROM attachment_acquisition WHERE token=?1",params![asset.token,quarantined],|r|r.get(0)).storage()?;
+                let eligible:bool=conn.query_row("SELECT NOT EXISTS(SELECT 1 FROM retained_attachment_files f WHERE f.token=?1 AND f.completed=0) AND cancelled=0 AND (state<>4 OR body_completed=1) AND NOT(?2 AND explicit_request=1 AND body_completed=0) AND NOT(state=3 AND retained_evicted=1) FROM attachment_acquisition WHERE token=?1",params![asset.token,quarantined],|r|r.get(0)).storage()?;
                 if !eligible {continue;}
                 // The staged bytes already reserve their quota. Convert once the
                 // complete message is processed; repeated slots need extra quota.
@@ -239,7 +239,7 @@ impl SqliteAccountStorage {
                 // INSERT ... SELECT bytes would materialize the whole value in
                 // SQLite; copy through bounded incremental BLOB I/O instead.
                 if !already {copy_staged_body(&conn,&token,&asset.token,size)?;}
-                conn.execute("UPDATE attachment_acquisition SET state=3,body_completed=1,due=NULL,attempt=NULL,permission_paused=0,retained_used_at=?2 WHERE token=?1",params![asset.token,u64_to_i64(now)?]).storage()?;
+                conn.execute("UPDATE attachment_acquisition SET state=3,body_completed=1,due=NULL,attempt=NULL,permission_paused=0,retained_used_at=?2,retained_evicted=0 WHERE token=?1",params![asset.token,u64_to_i64(now)?]).storage()?;
                 if !keep_staged {consumed.insert(token,size);} promoted+=1;
             }
             let conn=self.lock()?;
@@ -353,7 +353,7 @@ impl SqliteAccountStorage {
                 }
                 for (message, index) in inspected {
                     conn.execute("UPDATE outgoing_attachment_uploads SET recovery_message_id_hex=?2,recovery_attachment_index=?3 WHERE token=?1",params![token,message,index]).storage()?;
-                    let eligible:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM attachment_history h JOIN app_events a USING(group_id_hex,message_id_hex) WHERE h.group_id_hex=?1 AND h.message_id_hex=?2 AND h.attachment_index=?3 AND h.visible=1 AND a.direction='sent' AND NOT EXISTS(SELECT 1 FROM attachment_acquisition q WHERE q.group_id_hex=h.group_id_hex AND q.message_id_hex=h.message_id_hex AND q.attachment_index=h.attachment_index AND ((q.state=3 AND EXISTS(SELECT 1 FROM retained_attachment_bytes b WHERE b.token=q.token)) OR (?4 AND q.body_completed=1))))",params![group,message,index,quarantined],|r|r.get(0)).storage()?;
+                    let eligible:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM attachment_history h JOIN app_events a USING(group_id_hex,message_id_hex) WHERE h.group_id_hex=?1 AND h.message_id_hex=?2 AND h.attachment_index=?3 AND h.visible=1 AND a.direction='sent' AND NOT EXISTS(SELECT 1 FROM attachment_acquisition q WHERE q.group_id_hex=h.group_id_hex AND q.message_id_hex=h.message_id_hex AND q.attachment_index=h.attachment_index AND ((q.state=3 AND (q.retained_evicted=1 OR EXISTS(SELECT 1 FROM retained_attachment_bytes b WHERE b.token=q.token))) OR (?4 AND q.body_completed=1))))",params![group,message,index,quarantined],|r|r.get(0)).storage()?;
                     if eligible {
                         candidates.insert((group.clone(), message));
                     }
@@ -600,6 +600,7 @@ fn staging_has_unfulfilled_owner(
         AND (u.quarantined=0 OR q.token IS NULL OR q.body_completed=0)
         AND (q.token IS NULL OR (q.cancelled=0 AND (q.state<>4 OR q.body_completed=1)))
         AND NOT EXISTS(SELECT 1 FROM retained_attachment_bytes b WHERE b.token=q.token AND q.state=3)
+        AND (q.token IS NULL OR NOT (q.state=3 AND q.retained_evicted=1))
     ) OR EXISTS(
         SELECT 1 FROM outgoing_attachment_uploads u JOIN app_events a ON a.group_id_hex=u.group_id_hex
         WHERE u.token=?1 AND a.direction='sent' AND a.invalidated=0 AND a.source_message_id_hex IS NULL

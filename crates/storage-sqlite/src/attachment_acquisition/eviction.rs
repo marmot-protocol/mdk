@@ -6,9 +6,9 @@
 //! publish. Staged uploads and checkpoints are never evicted here.
 //!
 //! An evicted row stays Ready without bytes, which hosts see as
-//! `PreviouslyAcquiredUnavailable`. Ordinary automatic demand never re-arms
-//! it, so eviction cannot start a download loop; explicit download-again
-//! restores it from the original source.
+//! `PreviouslyAcquiredUnavailable`, marked `retained_evicted`. Neither ordinary
+//! automatic demand nor staged-upload recovery re-arms it, so eviction cannot
+//! start a download or copy loop; explicit download-again restores it.
 use super::*;
 
 /// A body published or read this recently is never evicted, so an attachment
@@ -87,6 +87,11 @@ pub(super) fn make_room(
         // Cascades to the chunked file row; the usage triggers release both.
         conn.execute_cached(
             "DELETE FROM retained_attachment_bytes WHERE token=?1",
+            [token],
+        )
+        .storage()?;
+        conn.execute_cached(
+            "UPDATE attachment_acquisition SET retained_evicted=1 WHERE token=?1",
             [token],
         )
         .storage()?;

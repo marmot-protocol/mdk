@@ -219,7 +219,7 @@ pub(super) fn schedule(
         || orphan_uploads == 64;
     // Metadata and expiry maintenance continue when disk or network slots are full.
     // Admission itself never evicts an acquired asset and never increments attempts
-    // while paused. Checkpoint and publication evict least-recently-used bodies.
+    // while paused. Publication evicts least-recently-used bodies.
     if http.permits.available_permits() <= 1 {
         admission.waiting = None;
         return Ok(more);

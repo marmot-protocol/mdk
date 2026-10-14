@@ -13,9 +13,10 @@
 - `AttachmentTransferState` adds `StorageBlocked`; update exhaustive matches.
 - Migration 0110 advances account storage to schema 110 on first open. Older
   binaries reject the upgraded database; downgrade is unsupported. It adds
-  `attachment_acquisition.retained_used_at` and a partial index for
-  least-recently-used eviction. Bodies retained before the upgrade start as
-  the oldest.
+  `attachment_acquisition.retained_used_at`, a partial index for
+  least-recently-used eviction, and `retained_evicted`, which keeps an evicted
+  sent copy out of staged-upload recovery. Bodies retained before the upgrade
+  start as the oldest.
 - `attachment_acquisition_fits_budget` takes the current Unix time.
 
 ### Added
@@ -44,15 +45,18 @@
 ### Changed
 
 - A full retained budget no longer blocks new attachment bytes indefinitely.
-  Publication, a transfer's first checkpoint reservation, outgoing staging and
-  sent-copy promotion evict the least-recently-used Ready bodies (by
-  publication or latest local read) until the new bytes fit. A body used within
-  `ATTACHMENT_EVICTION_PROTECTION_SECONDS` (one hour) is kept, and staged
-  uploads and checkpoints are never evicted. Eviction releases nothing when it
-  cannot cover the whole deficit, so the caller refuses as before. Admission
-  counts evictable bytes as room without evicting. An evicted row reports
-  `PreviouslyAcquiredUnavailable`; ordinary demand never re-arms it, and
-  explicit download-again restores it.
+  Publication (in-memory and the file-import seal), outgoing staging
+  completion and verified sent-copy promotion evict the least-recently-used
+  Ready bodies (by publication or latest local read) until the new bytes fit,
+  in the transaction that commits those bytes. Admission, checkpoint
+  reservations and file-import reservations count evictable bytes as room
+  without evicting, so a failed, cancelled or pruned attempt releases no older
+  body. A body used within `ATTACHMENT_EVICTION_PROTECTION_SECONDS` (one hour)
+  is kept, and staged uploads and checkpoints are never evicted. Eviction
+  releases nothing when it cannot cover the whole deficit, so the caller
+  refuses as before. An evicted row reports `PreviouslyAcquiredUnavailable`;
+  neither ordinary demand nor staged-upload recovery re-arms it, and explicit
+  download-again restores it.
 
 ### Fixed
 

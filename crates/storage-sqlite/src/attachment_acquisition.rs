@@ -671,7 +671,7 @@ impl SqliteAccountStorage {
                 .storage()?;
             }
             conn.execute(
-                "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL,storage_blocked_headroom=NULL,storage_park_count=0,retained_used_at=?2 WHERE token=?1",
+                "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL,storage_blocked_headroom=NULL,storage_park_count=0,retained_used_at=?2,retained_evicted=0 WHERE token=?1",
                 params![job.reference.token, now],
             )
             .storage()?;

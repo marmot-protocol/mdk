@@ -869,6 +869,49 @@ fn corrupt_shared_upload_promotion_never_evicts_retained_bodies() {
     assert_eq!(usage(&store), BODY.len() as u64);
 }
 
+/// An evicted sent copy stays unavailable: staged-upload recovery treats it as
+/// satisfied, so shared owners cannot take turns evicting one another.
+#[test]
+fn evicted_sent_copies_are_not_recovered_from_shared_staging() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    for message in ["a-shared", "b-shared", "c-shared"] {
+        sent(&store, message);
+    }
+    staged(&store, "a-shared");
+    for message in ["b-shared", "c-shared"] {
+        store
+            .protect_attachment_uploads(GROUP, message, &source(message).tags)
+            .unwrap();
+    }
+    // The staged body plus one retained copy fill the budget.
+    let budget = 2 * BODY.len() as u64;
+    let hour = ATTACHMENT_EVICTION_PROTECTION_SECONDS;
+    store.recover_attachment_uploads(11, 64, budget).unwrap();
+    assert_eq!(
+        transfer(&store, "a-shared", true).state,
+        AttachmentTransferState::Ready
+    );
+    // Past the protection window, a sibling's copy evicts a-shared.
+    store
+        .recover_attachment_uploads(11 + hour + 1, 64, budget)
+        .unwrap();
+    assert_eq!(
+        transfer(&store, "a-shared", true).state,
+        AttachmentTransferState::PreviouslyAcquiredUnavailable
+    );
+    // Later recoveries never copy the evicted source back.
+    for round in 2..5 {
+        store
+            .recover_attachment_uploads(11 + round * (hour + 1), 64, budget)
+            .unwrap();
+        assert_eq!(
+            transfer(&store, "a-shared", true).state,
+            AttachmentTransferState::PreviouslyAcquiredUnavailable,
+            "round {round}"
+        );
+    }
+}
+
 /// Accepted pending and confirmed sources survive cleanup when optional owner INSERT fails.
 #[test]
 fn ownerless_committed_sources_survive_both_abandonment_paths() {

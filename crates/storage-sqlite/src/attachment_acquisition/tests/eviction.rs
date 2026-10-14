@@ -158,7 +158,7 @@ fn admission_counts_evictable_bodies_without_evicting() {
 }
 
 #[test]
-fn checkpoint_reservation_evicts_for_the_complete_representation() {
+fn over_budget_checkpoint_evicts_nothing_until_the_body_is_kept() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let old = ready(&store, "old", 100);
     seed(&store, "large");
@@ -167,13 +167,22 @@ fn checkpoint_reservation_evicts_for_the_complete_representation() {
         .claim_attachment_acquisition(&large, LATE, LATE + 100)
         .unwrap()
         .unwrap();
+    // Evictable room admits the full reservation without releasing anything.
     assert!(
         store
             .checkpoint_attachment_partial(&job, &partial_identity(20), 0, b"abc", LATE, LEN + 10)
             .unwrap()
     );
-    assert!(!retained(&store, &old));
-    assert_eq!(store.retained_attachment_byte_count().unwrap(), 0);
+    assert!(retained(&store, &old));
+    // A failed attempt drops its reservation; the older body is still stored.
+    assert!(store.fail_attachment_acquisition(&job, None).unwrap());
+    assert_eq!(
+        partial_usage(&store),
+        0,
+        "the terminal attempt releases its checkpoint"
+    );
+    assert!(retained(&store, &old));
+    assert_eq!(store.retained_attachment_byte_count().unwrap(), LEN);
 }
 
 #[test]
@@ -190,6 +199,16 @@ fn evicted_bodies_stay_unavailable_until_explicitly_requested_again() {
         transfer(&store, "old", true).state,
         AttachmentTransferState::PreviouslyAcquiredUnavailable
     );
+    let evicted: bool = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT retained_evicted FROM attachment_acquisition WHERE token=?1",
+            [&old.token],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(evicted, "eviction marks the row for staging recovery");
     // Ordinary demand never re-arms an evicted body.
     assert_eq!(request(&store, "old"), old);
     assert_eq!(

@@ -139,9 +139,13 @@ budget, the least-recently-used Ready bodies are evicted first (migration 0110's
 `retained_used_at`: publication or latest local read). A body used within the last
 hour is never evicted. Eviction validates before mutating: when it cannot cover the
 whole deficit, it releases nothing and the caller refuses as before (pause/retry).
+Only the transaction that commits verified bytes evicts (publication, the file-import
+seal, staging completion, a verified sent-copy promotion); admission and checkpoint or
+import reservations only count evictable room, so a failed attempt costs no older body.
 Staged outgoing uploads and checkpoints are never evicted. An evicted row stays Ready
-without bytes (`PreviouslyAcquiredUnavailable`); ordinary demand never re-arms it, and
-explicit download-again fetches it from its source while the blob remains available. Filesystem free-space and WAL overhead admission
+without bytes (`PreviouslyAcquiredUnavailable`, `retained_evicted`); neither ordinary
+demand nor staged-upload recovery re-arms it, and explicit download-again fetches it
+from its source while the blob remains available. Filesystem free-space and WAL overhead admission
 belong to worker integration. Publication copies the verified plaintext into
 chunk rows of at most 64 KiB, so SQLite keeps no whole-body copy beside the
 caller's buffer. Local storage reads return at most 1 MiB and recheck
@@ -265,7 +269,7 @@ The first checkpoint reserves the complete declared ciphertext size against the 
 budget as retained plaintext. Worker admission, append and publication share this accounting;
 existing prefixes can finish when reservations fill the budget. New demand pauses without
 spending transfer attempts. Atomic publication replaces its own reservation while preserving
-other jobs' allocations. Complete small responses skip the final checkpoint write. A first checkpoint may evict least-recently-used Ready bodies, never other jobs' prefixes. Success, terminal/parked state,
+other jobs' allocations. Complete small responses skip the final checkpoint write. A first checkpoint counts evictable Ready bodies as room but evicts nothing; publication does. Success, terminal/parked state,
 source removal/invalidation, explicit removal and store reset delete partials transactionally.
 Expired message jobs cascade to their partials. Abandoned checkpoints expire 24 hours after
 last progress, reclaimed in indexed batches of 64 by non-frozen worker maintenance, including

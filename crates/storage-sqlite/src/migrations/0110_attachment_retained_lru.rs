@@ -10,9 +10,14 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     // rows start at 0, so bodies retained before this migration are evicted
     // first, oldest admitted (lowest rowid) first. The partial index serves the
     // oldest-first victim scan; its implicit rowid breaks ties in that order.
+    // `retained_evicted` marks a Ready row whose body eviction released: it
+    // stays satisfied, so staged-upload recovery never copies it back. Lost
+    // bytes without the marker remain recoverable from staging as before.
     tx.execute_batch(
         "ALTER TABLE attachment_acquisition ADD COLUMN retained_used_at INTEGER NOT NULL DEFAULT 0
              CHECK(retained_used_at>=0);
+        ALTER TABLE attachment_acquisition ADD COLUMN retained_evicted INTEGER NOT NULL DEFAULT 0
+             CHECK(retained_evicted IN(0,1));
         CREATE INDEX attachment_acquisition_retained_lru
             ON attachment_acquisition(retained_used_at) WHERE state=3;",
     )
@@ -56,6 +61,19 @@ mod tests {
             conn.execute("UPDATE attachment_acquisition SET retained_used_at=-1", [])
                 .is_err(),
             "negative use times are rejected"
+        );
+        let evicted: i64 = conn
+            .query_row(
+                "SELECT retained_evicted FROM attachment_acquisition",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(evicted, 0, "existing rows are not evicted");
+        assert!(
+            conn.execute("UPDATE attachment_acquisition SET retained_evicted=2", [])
+                .is_err(),
+            "the eviction marker is boolean"
         );
         let plan: String = conn
             .query_row(

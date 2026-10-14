@@ -354,10 +354,11 @@ impl SqliteAccountStorage {
             let used = reserved_bytes(&conn)?;
             let replaced = old.as_ref().map_or(0, |v| v.3);
             // Reserve the complete representation on its first checkpoint.
-            // Other interrupted jobs cannot consume space needed to finish it;
-            // least-recently-used retained bodies are evicted to make room.
+            // Other interrupted jobs cannot consume space needed to finish it.
+            // Bytes eviction could release count as room, but only publication
+            // evicts: a failed, cancelled or pruned attempt costs no older body.
             let projected = used.saturating_sub(replaced).saturating_add(identity.total);
-            if !super::eviction::make_room(&conn, projected, byte_budget, u64_to_i64(now)?)? {
+            if !super::eviction::can_make_room(&conn, projected, byte_budget, u64_to_i64(now)?)? {
                 return Ok(false);
             }
             if offset == 0 {
