@@ -1389,6 +1389,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::GroupDisbanding(_) => "read_marker_failed:group_disbanding",
         AppError::GroupRemoved(_) => "read_marker_failed:group_removed",
         AppError::GroupCatchingUp(_) => "read_marker_failed:group_catching_up",
+        AppError::GroupCommitUndelivered(_) => "read_marker_failed:group_commit_undelivered",
         AppError::MessageDraftRevisionConflict => {
             "read_marker_failed:message_draft_revision_conflict"
         }

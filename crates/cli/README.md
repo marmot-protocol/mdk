@@ -260,6 +260,7 @@ wn --account <npub-or-hex> groups disband <group-hex> --confirm
 wn --account <npub-or-hex> groups disband-status <group-hex>
 wn --account <npub-or-hex> groups acknowledge-disband-failure <group-hex>
 wn --account <npub-or-hex> groups recovery-status <group-hex>
+wn --account <npub-or-hex> groups commit-delivery <group-hex>
 wn --account <npub-or-hex> groups confirm-rejoin <welcome-id-hex> --local-state-token <hex> --confirm
 wn --account <npub-or-hex> groups decline-rejoin <welcome-id-hex>
 wn --account <npub-or-hex> groups quarantined
@@ -283,6 +284,13 @@ The hidden legacy `group` namespace keeps `create`, `members`, `invite` (with `-
 group changes (membership, admins, profile, image, retention, disbanding) fail with JSON error code
 `group_catching_up`. A change from a stale epoch can split the group for everyone. Retry once the group syncs, or pass
 `--accept-stale` to make the change anyway; scheduled self-updates wait up to a day for the group to catch up.
+
+**Changes not yet on every relay.** A group change counts as published once one group relay accepts it; MDK keeps
+retrying the others with the same event. Until they accept it, members who read only those relays cannot follow it, so
+once a change has been owed to a relay for two minutes, group changes fail with JSON error code
+`group_commit_undelivered`. `groups commit-delivery <group-hex>` shows the oldest change still owed to a relay, the
+relays owing it and when the first relay accepted it; it reports owed relays immediately, before the two minutes pass. Retry once they accept it, or pass `--accept-undelivered` to make the change anyway;
+scheduled self-updates wait up to an hour.
 
 **Group identifiers.** Every `<group-hex>` is the canonical MLS group id (`group_id` in JSON; opaque bytes, 16 bytes for
 OpenMLS-created groups). It is not the 32-byte Nostr routing handle shown under `nostr_routing.nostr_group_id_hex`,

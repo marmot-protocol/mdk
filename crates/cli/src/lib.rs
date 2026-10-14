@@ -670,26 +670,34 @@ async fn execute_inner(
         Command::Group {
             command,
             accept_stale,
+            accept_undelivered,
         } => {
             commands::groups::group_command(
                 &account_home,
                 &app,
                 command,
                 account_flag,
-                accept_stale,
+                crate::commands::groups::AcceptedGroupChangeRisks {
+                    stale: accept_stale,
+                    undelivered: accept_undelivered,
+                },
             )
             .await
         }
         Command::Groups {
             command,
             accept_stale,
+            accept_undelivered,
         } => {
             commands::groups::groups_command(
                 &account_home,
                 &app,
                 command,
                 account_flag,
-                accept_stale,
+                crate::commands::groups::AcceptedGroupChangeRisks {
+                    stale: accept_stale,
+                    undelivered: accept_undelivered,
+                },
             )
             .await
         }
@@ -2571,10 +2579,59 @@ mod tests {
                 Command::Groups {
                     command: crate::GroupsCommand::Rename { .. },
                     accept_stale,
+                    ..
                 } => assert_eq!(accept_stale, args.contains(&"--accept-stale")),
                 other => panic!("expected a groups rename command, got {other:?}"),
             }
         }
+    }
+
+    /// mdk#2255: `--accept-undelivered` is opt-in, parses on either side of the
+    /// group subcommand, and combines with `--accept-stale`.
+    #[test]
+    fn groups_accept_undelivered_flag_parses() {
+        for args in [
+            &["wn", "groups", "rename", "GROUP", "NAME"][..],
+            &[
+                "wn",
+                "groups",
+                "rename",
+                "GROUP",
+                "NAME",
+                "--accept-undelivered",
+            ][..],
+            &[
+                "wn",
+                "groups",
+                "--accept-undelivered",
+                "--accept-stale",
+                "rename",
+                "GROUP",
+                "NAME",
+            ][..],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("rename parses");
+            match cli.command {
+                Command::Groups {
+                    command: crate::GroupsCommand::Rename { .. },
+                    accept_stale,
+                    accept_undelivered,
+                } => {
+                    assert_eq!(accept_stale, args.contains(&"--accept-stale"));
+                    assert_eq!(accept_undelivered, args.contains(&"--accept-undelivered"));
+                }
+                other => panic!("expected a groups rename command, got {other:?}"),
+            }
+        }
+        let cli = Cli::try_parse_from(["wn", "groups", "commit-delivery", "GROUP"])
+            .expect("commit-delivery parses");
+        assert!(matches!(
+            cli.command,
+            Command::Groups {
+                command: crate::GroupsCommand::CommitDelivery { .. },
+                ..
+            }
+        ));
     }
 
     #[test]

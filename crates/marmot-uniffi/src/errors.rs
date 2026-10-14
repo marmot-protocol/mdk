@@ -192,6 +192,11 @@ pub enum MarmotKitError {
     /// Group changes would fork it, so they wait; retry once it has synced.
     #[error("group {group_id_hex} is still catching up on missed changes")]
     GroupCatchingUp { group_id_hex: String },
+    /// The group's last change has not reached every group relay yet, so
+    /// members who read only those relays cannot follow it. MDK keeps retrying
+    /// them; retry once they accept, or after `acknowledge_group_commit_undelivered`.
+    #[error("group {group_id_hex}'s last change has not reached every relay yet")]
+    GroupCommitUndelivered { group_id_hex: String },
     #[error("member {member_id_hex} is not in group {group_id_hex}")]
     MemberNotInGroup {
         group_id_hex: String,
@@ -449,6 +454,9 @@ impl From<&AppError> for MarmotKitError {
                 group_id_hex: group_id_hex.clone(),
             },
             AppError::GroupCatchingUp(group_id_hex) => Self::GroupCatchingUp {
+                group_id_hex: group_id_hex.clone(),
+            },
+            AppError::GroupCommitUndelivered(group_id_hex) => Self::GroupCommitUndelivered {
                 group_id_hex: group_id_hex.clone(),
             },
             AppError::MessageDraftRevisionConflict => Self::MessageDraftRevisionConflict,

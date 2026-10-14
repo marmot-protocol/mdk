@@ -12,7 +12,7 @@ use crate::Marmot;
 use crate::conversions::{
     AppBlobEndpointFfi, AppGroupMemberIdsFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi,
     AppGroupRecordFfi, AppQuarantinedGroupFfi, CreatedGroupFfi, DisbandRequestFfi,
-    GroupAppComponentFfi, GroupConversationSnapshotFfi, GroupDetailsFfi,
+    GroupAppComponentFfi, GroupCommitDeliveryFfi, GroupConversationSnapshotFfi, GroupDetailsFfi,
     GroupInviteDeclineResultFfi, GroupMaintenanceStatusFfi, GroupManagementStateFfi,
     GroupMemberActionStateFfi, GroupMutationResultFfi, GroupRosterFfi,
     KeyPackageMaintenanceStatusFfi, MaintenanceRunSummaryFfi, MemberRefFfi,
@@ -929,6 +929,49 @@ impl Marmot {
             .runtime
             .acknowledge_group_catching_up(&account_ref, &group_id)
             .await?)
+    }
+
+    /// After a group change fails with `GroupCommitUndelivered`, record that the
+    /// user accepts the risk: the group's last change has not reached every
+    /// relay, so members on those relays may not follow this change either.
+    /// Retry the change afterwards. Admits one change attempt, consumed even if
+    /// it fails, and is not persisted. Returns false when no relay is owed the
+    /// group's last change.
+    pub async fn acknowledge_group_commit_undelivered(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<bool, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .acknowledge_group_commit_undelivered(&account_ref, &group_id)
+            .await?)
+    }
+
+    /// The group's oldest change that some group relays have not accepted yet,
+    /// or `None` once every relay has accepted or definitively rejected it.
+    /// `Some` means show "not delivered to every relay yet"; it does not mean
+    /// the next change fails. Group changes fail with `GroupCommitUndelivered`
+    /// only once `since` is two minutes old, because a healthy relay cut off at
+    /// the first acknowledgement is retried after 30 seconds. No event
+    /// announces delivery completing; poll while showing it.
+    pub async fn group_commit_delivery(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<Option<GroupCommitDeliveryFfi>, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .group_commit_delivery(&account_ref, &group_id)
+            .await?
+            .map(|delivery| GroupCommitDeliveryFfi {
+                group_id_hex,
+                owed_relay_urls: delivery.owed_relay_urls,
+                relay_count: delivery.relay_count,
+                since: delivery.since,
+            }))
     }
 
     /// Re-read on GroupStateUpdated; display uncertainty separately from whether

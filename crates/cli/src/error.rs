@@ -686,6 +686,16 @@ fn app_error_json(err: &AppError) -> Value {
             "message": err.to_string(),
             "group_id": group_id,
         }),
+        // Retryable: the group's last change has not reached every relay yet
+        // and is still being retried (mdk#2255).
+        AppError::GroupCommitUndelivered(group_id) => json!({
+            "code": "group_commit_undelivered",
+            "message": err.to_string(),
+            "group_id": group_id,
+            "next_commands": {
+                "status": "wn groups commit-delivery <group-hex>",
+            },
+        }),
         AppError::GroupInviteNotPending => json!({
             "code": "group_invite_not_pending",
             "message": err.to_string(),

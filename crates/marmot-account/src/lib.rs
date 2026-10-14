@@ -31,7 +31,7 @@ pub use runtime::{
     CompletedWelcomePublishTask, FailedApplicationMessage, MaintenanceActivity,
     MaintenanceAttemptDuration, MaintenanceTiming, PendingResolution, PreparedSessionCommit,
     PreparedSessionSend, PreparedWelcomePublishTask, PublishFailure, PublishedApplicationMessage,
-    UnresolvedApplicationMessage, UnresolvedPublish, UnresolvedPublishReason,
+    UndeliveredCommit, UnresolvedApplicationMessage, UnresolvedPublish, UnresolvedPublishReason,
     WelcomeDeliveryFailure,
 };
 pub use secret_store::{AccountSecretStore, KeychainSecretStore, LocalFileSecretStore};
