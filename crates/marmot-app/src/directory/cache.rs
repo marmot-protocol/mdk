@@ -105,7 +105,7 @@ impl DirectoryCache {
         Ok(self.conn.close()?)
     }
 
-    fn lock(&self) -> Result<ConnectionGuard<'_>, AppError> {
+    pub(crate) fn lock(&self) -> Result<ConnectionGuard<'_>, AppError> {
         Ok(self.conn.lock()?)
     }
 
@@ -957,7 +957,10 @@ mod tests {
             let conn = cache.lock().unwrap();
             assert_eq!(
                 migration_rows(&conn),
-                vec![(1, "0001_directory_cache".into())]
+                vec![
+                    (1, "0001_directory_cache".into()),
+                    (2, "0002_public_event_previews".into())
+                ]
             );
             let count: i64 = conn.query_row(
                 "SELECT count(*) FROM sqlite_master WHERE name LIKE 'directory_%' AND type IN ('table', 'index')",
@@ -970,10 +973,7 @@ mod tests {
         cache.close().unwrap();
         let key = SqlCipherKey::new("test-key").unwrap();
         let cache = DirectoryCache::open(dir.path().join("directory.sqlite3"), &key).unwrap();
-        assert_eq!(
-            migration_rows(&cache.lock().unwrap()),
-            vec![(1, "0001_directory_cache".into())]
-        );
+        assert_eq!(migration_rows(&cache.lock().unwrap()).len(), 2);
     }
 
     #[test]
@@ -987,7 +987,10 @@ mod tests {
         cache
             .lock()
             .unwrap()
-            .execute_batch("DROP TABLE app_cache_schema_migrations")
+            // An unversioned cache predates every later migration.
+            .execute_batch(
+                "DROP TABLE app_cache_schema_migrations; DROP TABLE public_event_previews",
+            )
             .unwrap();
         cache.close().unwrap();
         let key = SqlCipherKey::new("test-key").unwrap();
@@ -1001,7 +1004,7 @@ mod tests {
             cache.search_graph_follows(&account_id(3)).unwrap(),
             Some(vec![account_id(4)])
         );
-        assert_eq!(migration_rows(&cache.lock().unwrap()).len(), 1);
+        assert_eq!(migration_rows(&cache.lock().unwrap()).len(), 2);
     }
 
     #[test]
@@ -1011,7 +1014,7 @@ mod tests {
             .lock()
             .unwrap()
             .execute(
-                "INSERT INTO app_cache_schema_migrations VALUES (2, 'private-name', 0)",
+                "INSERT INTO app_cache_schema_migrations VALUES (3, 'private-name', 0)",
                 [],
             )
             .unwrap();
@@ -1022,15 +1025,15 @@ mod tests {
             DirectoryCache::open(path.clone(), &key),
             Err(AppError::Storage(
                 cgka_traits::storage::StorageError::UnsupportedSchemaVersion {
-                    found: 2,
-                    latest_supported: 1
+                    found: 3,
+                    latest_supported: 2
                 }
             ))
         ));
         let conn = Connection::open(&path).unwrap();
         open_hardened_sqlcipher(&conn, &key, SqlCipherHardening::live_cache()).unwrap();
         conn.execute_batch(
-            "DELETE FROM app_cache_schema_migrations WHERE version = 2;
+            "DELETE FROM app_cache_schema_migrations WHERE version = 3;
             UPDATE app_cache_schema_migrations SET name = 'private-name'",
         )
         .unwrap();
@@ -1090,7 +1093,7 @@ mod tests {
         )
         .unwrap();
         migrations::run_all(&mut conn).unwrap();
-        assert_eq!(migration_rows(&conn).len(), 1);
+        assert_eq!(migration_rows(&conn).len(), 2);
         assert!(!DirectoryCache::table_exists_locked(&conn, "user_directory_records").unwrap());
     }
 
@@ -1376,6 +1379,6 @@ mod tests {
         assert_eq!(entry.follows, vec![bob]);
         assert_eq!(user_count, 1);
         assert!(!legacy_table_exists);
-        assert_eq!(migration_rows(&cache.lock().unwrap()).len(), 1);
+        assert_eq!(migration_rows(&cache.lock().unwrap()).len(), 2);
     }
 }

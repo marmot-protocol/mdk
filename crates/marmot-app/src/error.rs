@@ -147,6 +147,8 @@ pub enum AppError {
     ChatPresentationNotReady,
     #[error("invalid cached identity page: {0}")]
     InvalidCachedIdentityPage(String),
+    #[error("invalid public event reference batch: {0}")]
+    InvalidPublicEventReferences(String),
     #[error("invalid chat pin: {0}")]
     InvalidChatPin(String),
     #[error("group is disbanding or disbanded; outbound work is blocked")]
@@ -462,6 +464,7 @@ impl AppError {
             Self::ChatPresentationNotReady => "chat_presentation_not_ready",
             Self::DirectConversationIndexNotReady => "direct_conversation_index_not_ready",
             Self::InvalidCachedIdentityPage(_) => "invalid_cached_identity_page",
+            Self::InvalidPublicEventReferences(_) => "invalid_public_event_references",
             Self::InvalidChatPin(_) => "invalid_chat_pin",
             Self::GroupDisbanding(_) => "group_disbanding",
             Self::GroupRemoved(_) => "group_removed",

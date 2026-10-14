@@ -4649,6 +4649,37 @@ impl MarmotAppRuntime {
         Ok(follows)
     }
 
+    /// Network-free cached previews of public events referenced from message
+    /// content, one per reference (at most 16) in input order. Unparseable
+    /// references come back `Unsupported`. A cold call may open the account's
+    /// encrypted cache, so warm it off the UI thread.
+    pub fn cached_public_event_previews(
+        &self,
+        account_ref: &str,
+        references: &[String],
+    ) -> Result<Vec<crate::PublicEventPreviewRead>, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .cached_public_event_previews(&account, references)
+    }
+
+    /// Fetch one referenced public event from relays when it is missing or
+    /// stale, then return its local state. Event-ID previews never refetch
+    /// once cached; `naddr` previews refetch after 30 minutes. Repeat calls
+    /// within 30 seconds of a finished fetch return local state.
+    pub async fn resolve_public_event_preview(
+        &self,
+        account_ref: &str,
+        reference: &str,
+    ) -> Result<crate::PublicEventPreviewRead, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .resolve_public_event_preview(&account, reference)
+            .await
+    }
+
     /// Fast, network-free membership check against [`Self::account_follows`].
     pub fn is_following(
         &self,

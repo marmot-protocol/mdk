@@ -2753,6 +2753,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::InvalidChatPin(_)
         | AppError::InvalidGroupMembershipPage(_)
         | AppError::InvalidCachedIdentityPage(_)
+        | AppError::InvalidPublicEventReferences(_)
         | AppError::InvalidMessageDraft(_)
         | AppError::InvalidPublicKey
         | AppError::UnexpectedPrivateKey

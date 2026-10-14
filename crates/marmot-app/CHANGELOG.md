@@ -11,6 +11,8 @@
 
 ### Added
 
+- `MarmotAppRuntime::cached_public_event_previews` and `resolve_public_event_preview` keep verified public Nostr events referenced from message content in the account's directory cache (mdk#1547). The cache adds directory-cache migration 2; an older build refuses the upgraded cache. `AppError` adds `InvalidPublicEventReferences` for batches over 16 references.
+
 - Account-wide local attachment pages expose bounded typed metadata, group/sender/date selection, continuation cursors and retention deadlines. Reads start no acquisition or relay activity.
 
 - `MarmotAppRuntime::submit_prepared_media_snapshot` admits the captured ordinary-media payload with a stable token and consumes only its unchanged captured draft in the same transaction. Newer or cleared drafts cannot replace the payload or block admission.

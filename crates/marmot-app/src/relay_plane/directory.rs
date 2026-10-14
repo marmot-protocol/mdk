@@ -722,11 +722,9 @@ fn directory_query_filter(query: &DirectoryEventQuery, recipient: bool) -> Resul
 }
 
 impl NostrSdkDirectoryRelayFetcher {
-    async fn fetch_request_events(
-        &self,
-        request: DirectoryFetchRequest,
-    ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
-        let relay_urls = parsed_directory_relay_urls(&request.endpoints)?;
+    /// Add and connect `relay_urls`, returning those that connected within
+    /// the connect wait. Relays that did not connect are removed again.
+    async fn connect_relays(&self, relay_urls: Vec<RelayUrl>) -> Result<Vec<RelayUrl>, String> {
         let mut connect_candidates = Vec::new();
         let mut added = vec![false; relay_urls.len()];
         let mut add_failure_count = 0usize;
@@ -788,6 +786,16 @@ impl NostrSdkDirectoryRelayFetcher {
                 "connect relays failed: add_failures={add_failure_count}, connect_timeouts={connect_timeout_count}, connect_failures={connect_failure_count}, task_failures={task_failure_count}"
             ));
         }
+        Ok(relay_urls)
+    }
+
+    async fn fetch_request_events(
+        &self,
+        request: DirectoryFetchRequest,
+    ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
+        let relay_urls = self
+            .connect_relays(parsed_directory_relay_urls(&request.endpoints)?)
+            .await?;
 
         let mut records = Vec::new();
         for query in request.queries {
@@ -817,6 +825,42 @@ impl NostrSdkDirectoryRelayFetcher {
         }
         Ok(records)
     }
+}
+
+/// One bounded, anonymous read of public events matching `filters`.
+///
+/// Uses an owned client like [`DirectoryRelayFetcher::fetch_directory_events`],
+/// so hint relays never join a long-lived pool. Signatures are verified here;
+/// callers still match every event against the reference they asked for.
+pub(crate) async fn fetch_public_events(
+    endpoints: &[TransportEndpoint],
+    filters: Vec<Filter>,
+    max_events: usize,
+) -> Result<Vec<Event>, String> {
+    let fetcher = NostrSdkDirectoryRelayFetcher::standalone();
+    let result = async {
+        let relay_urls = fetcher
+            .connect_relays(parsed_directory_relay_urls(endpoints)?)
+            .await?;
+        let events = fetcher
+            .client
+            .fetch_events(ReqTarget::manual(
+                relay_urls.into_iter().map(|url| (url, filters.clone())),
+            ))
+            .timeout(DIRECTORY_RELAY_FETCH_WAIT)
+            .max_events(max_events)
+            .with_outcomes()
+            .await
+            .map_err(|_| "fetch public events failed".to_owned())?;
+        Ok(events
+            .events
+            .into_iter()
+            .filter(|event| event.verify().is_ok())
+            .collect())
+    }
+    .await;
+    fetcher.client.shutdown().await;
+    result
 }
 
 #[async_trait]

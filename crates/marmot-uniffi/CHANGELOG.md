@@ -15,6 +15,8 @@
 
 ### Added
 
+- `Marmot::cached_public_event_previews` and `Marmot::resolve_public_event_preview` cache verified public Nostr events referenced from message content (mdk#1547). Cached reads are network-free and survive restarts; resolve fetches missing or stale previews. See [public event previews](README.md#public-event-previews).
+
 - Account-wide attachment candidate pages, group/sender/date queries and opaque account/query-bound cursor/version handles. Filtered empty pages can continue; source changes require restart. Existing group history and acquisition primitives are unchanged.
 
 - `Marmot::send_prepared_media_with_client_token` exposes captured ordinary-media admission with transactional conditional draft consumption. Use the original token and revision for live retries, recover ownership by token after interruption, and pair regenerated Swift/Kotlin bindings with the matching library. See [local sends](LOCAL-SENDS.md).

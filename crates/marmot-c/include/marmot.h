@@ -701,6 +701,28 @@ typedef enum MarmotMatchQuality {
 } MarmotMatchQuality;
 
 /**
+ * Local state of one referenced public event.
+ */
+typedef enum MarmotPublicEventPreviewState {
+  /**
+   * `event_json` is non-NULL and `fetched_at` is set.
+   */
+  MARMOT_PUBLIC_EVENT_PREVIEW_STATE_PRESENT,
+  /**
+   * The author published a NIP-09 deletion request for the event.
+   */
+  MARMOT_PUBLIC_EVENT_PREVIEW_STATE_DELETED,
+  /**
+   * Nothing is cached. Not durable: a refresh may still find it.
+   */
+  MARMOT_PUBLIC_EVENT_PREVIEW_STATE_MISSING,
+  /**
+   * Not a `note`, `nevent`, `naddr` or hex event ID.
+   */
+  MARMOT_PUBLIC_EVENT_PREVIEW_STATE_UNSUPPORTED,
+} MarmotPublicEventPreviewState;
+
+/**
  * Where a prepared group image sits in the upload lifecycle.
  */
 typedef enum MarmotPreparedGroupImageUploadState {
@@ -3465,6 +3487,37 @@ typedef struct MarmotCachedIdentityProjectionList {
   struct MarmotCachedIdentityProjection *items;
   uintptr_t len;
 } MarmotCachedIdentityProjectionList;
+
+/**
+ * One result per requested reference, in request order.
+ */
+typedef struct MarmotPublicEventPreview {
+  /**
+   * The reference exactly as the caller passed it.
+   */
+  char *reference;
+  enum MarmotPublicEventPreviewState state;
+  /**
+   * The signature-verified event as NIP-01 JSON; NULL unless `Present`.
+   */
+  char *event_json;
+  /**
+   * When a relay last confirmed the event, in Unix seconds.
+   */
+  bool has_fetched_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t fetched_at;
+} MarmotPublicEventPreview;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotPublicEventPreviewList {
+  struct MarmotPublicEventPreview *items;
+  uintptr_t len;
+} MarmotPublicEventPreviewList;
 
 /**
  * Attachment metadata without the plaintext bytes.
@@ -8334,6 +8387,38 @@ MarmotStatus marmot_cached_identity_projections(const struct MarmotClient *clien
                                                 struct MarmotCachedIdentityProjectionList **out);
 
 /**
+ * Network-free cached previews of public events referenced from message
+ * content, one row per reference (at most 16) in order. Free with
+ * `marmot_public_event_preview_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_cached_public_event_previews(const struct MarmotClient *client,
+                                                 const char *account_ref,
+                                                 const char *const *references,
+                                                 uintptr_t references_len,
+                                                 struct MarmotPublicEventPreviewList **out);
+
+/**
+ * Fetch one referenced public event when it is missing or stale, then
+ * return its local state. Free with `marmot_public_event_preview_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_resolve_public_event_preview(const struct MarmotClient *client,
+                                                 const char *account_ref,
+                                                 const char *reference,
+                                                 struct MarmotPublicEventPreview **out);
+
+/**
  * Every stored draft for the account, attachment metadata only.
  * Free with `marmot_message_draft_summary_list_free`.
  *
@@ -12314,6 +12399,25 @@ void marmot_content_report_page_free(struct MarmotContentReportPage *ptr);
  * this library.
  */
 void marmot_report_dismissal_page_free(struct MarmotReportDismissalPage *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_public_event_preview_free(struct MarmotPublicEventPreview *ptr);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_public_event_preview_list_free(struct MarmotPublicEventPreviewList *list);
 
 /**
  * Free a value of this type returned by this library. NULL
