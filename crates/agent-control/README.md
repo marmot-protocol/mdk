@@ -71,7 +71,7 @@ of the account's active reactions on the target in one durable delete event.
 in place instead of appending new ones. It publishes a kind-1009 edit; the message keeps its identity and position, and
 timeline reads return the latest text. The runtime refuses, before publishing anything, any target that is missing, not
 a chat message, sent by another account, deleted, or withdrawn by convergence (`invalid_edit_target`, not retryable).
-Competing edits resolve by `created_at`, then the lexically smallest event id (NIP-01), so two edits sent in the same
+Competing edits resolve by `created_at`, then the larger event id, so two edits sent in the same
 second settle on the same text everywhere, though not necessarily the one sent last. Edits have no idempotency key: after an uncertain response,
 read the target with `timeline_message_get` before retrying. The `final_sent` ids name the edit event, not the message:
 keep passing the original message id to later `edit_message` and `timeline_message_get` calls, since an edit event id is
