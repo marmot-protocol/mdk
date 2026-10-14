@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use cgka_traits::{
     GroupId, MemberId, TransportAccountActivation, TransportAdapter, TransportAdapterError,
-    TransportEndpoint, TransportGroupSubscription,
+    TransportEndpoint, TransportGroupSubscription, TransportGroupSync,
 };
 use limit_relay::{LimitConfig, LimitRelay, LimitStats, NegFault, RejectStyle, ReqOutcome, reason};
 use nostr_relay_builder::prelude::{MemoryDatabase, MemoryDatabaseOptions, NostrDatabase};
@@ -26,8 +26,9 @@ use nostr_relay_builder::{LocalRelay, RelayBuilder};
 use nostr_sdk::prelude::{Client, EventBuilder, FinalizeEvent, Keys, Kind, RelayOptions, Tag};
 use tokio::task::JoinHandle;
 use transport_nostr_adapter::{
-    NostrReconciliationFailure, NostrReconciliationProgress, NostrRelayClient, NostrSdkRelayClient,
-    NostrSubscription, NostrTransportAdapter, SubscriptionAttempt, SubscriptionRouteKind,
+    GROUP_BATCH_ROUTES, NostrReconciliationFailure, NostrReconciliationProgress, NostrRelayClient,
+    NostrSdkRelayClient, NostrSubscription, NostrTransportAdapter, SubscriptionAttempt,
+    SubscriptionRouteKind,
 };
 
 const QUIET: Duration = Duration::from_millis(600);
@@ -35,6 +36,9 @@ const SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
 /// Observation window for retry storms after the subscription set settles.
 const STORM_WINDOW: Duration = Duration::from_secs(3);
 const SINCE: u64 = 1_700_000_000 - 30 * 24 * 60 * 60;
+/// A relay REQ limit the tests below can fill with a few batches: an inbox
+/// and four full batches (200 groups) fill it exactly.
+const SMALL_REQ_LIMIT: usize = 5;
 const UNTIL: u64 = 1_700_200_000;
 
 struct Fixture {
@@ -132,6 +136,19 @@ fn fast_retry_options() -> RelayOptions {
         .adjust_retry_interval(false)
 }
 
+/// Live REQs an activation of `groups` routes sharing one relay and floor
+/// sends: its inbox plus one per batch.
+fn live_reqs(groups: usize) -> usize {
+    1 + groups.div_ceil(GROUP_BATCH_ROUTES)
+}
+
+fn small_limit() -> LimitConfig {
+    LimitConfig {
+        max_subscriptions: SMALL_REQ_LIMIT,
+        ..LimitConfig::default()
+    }
+}
+
 fn route(index: usize) -> Vec<u8> {
     let mut route = [0x5a_u8; 32];
     route[..4].copy_from_slice(&(index as u32).to_be_bytes());
@@ -204,6 +221,11 @@ fn assert_filter_shapes(stats: &LimitStats) {
         "disallowed kinds requested: {:?}",
         stats.disallowed_kinds_seen
     );
+    assert!(
+        stats.max_tag_values_seen <= GROUP_BATCH_ROUTES,
+        "a filter carried {} values for one tag",
+        stats.max_tag_values_seen
+    );
     for shape_reason in [
         reason::TOO_MANY_FILTERS,
         reason::TOO_MANY_KINDS,
@@ -222,8 +244,8 @@ fn assert_filter_shapes(stats: &LimitStats) {
 // ---------------------------------------------------------------------------
 
 /// Every REQ an activation of 250 groups plus an inbox sends stays within the
-/// production filter limits. The 200-REQ socket limit refuses the overflow,
-/// which is reported, not asserted away.
+/// production filter limits: five full batches of `#h` values and the inbox,
+/// far under the 200-REQ socket limit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn activation_of_250_groups_sends_only_production_shaped_reqs() {
     let fx = Fixture::new(LimitConfig::default(), false).await;
@@ -239,8 +261,40 @@ async fn activation_of_250_groups_sends_only_production_shaped_reqs() {
         stats.req_log.iter().all(|r| r.filters == 1),
         "one filter per live REQ"
     );
-    assert_eq!(stats.total_reqs, 251);
+    assert_eq!(stats.total_reqs, live_reqs(250));
+    assert_eq!(stats.rejections_total(), 0);
+    assert_eq!(stats.max_tag_values_seen, GROUP_BATCH_ROUTES);
     assert_eq!(stats.open_connections(), 1, "one socket carries every REQ");
+    fx.shutdown().await;
+}
+
+/// The account #2266 found at the limit: one REQ per group filled a 200-REQ
+/// connection at about 200 groups and the rest were refused. Batched, 1,000
+/// groups take 21 REQs, and every group's stored history arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_thousand_groups_fit_in_a_few_reqs_and_every_group_delivers() {
+    const G: usize = 1_000;
+    let fx = Fixture::new(LimitConfig::default(), false).await;
+    fx.store_group_events(G).await;
+    let url = fx.limit.url();
+    fx.adapter
+        .activate_account(fx.activation(std::slice::from_ref(&url), groups(G, &url)))
+        .await
+        .unwrap();
+    let delivered = delivered_groups(&fx.adapter, G, Duration::from_secs(20)).await;
+    let stats = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    let eose = fx.adapter.account_subscription_eose(&fx.account).await;
+    eprintln!(
+        "[a] G={G} delivered={} complete={} {}",
+        delivered.len(),
+        eose.complete(),
+        stats.summary()
+    );
+    assert_filter_shapes(&stats);
+    assert_eq!(stats.total_reqs, live_reqs(G));
+    assert_eq!(stats.rejections_total(), 0);
+    assert_eq!(delivered.len(), G);
+    assert!(eose.complete());
     fx.shutdown().await;
 }
 
@@ -322,8 +376,8 @@ async fn reconciliation_neg_open_and_id_fetches_are_production_shaped() {
     fx.shutdown().await;
 }
 
-/// With 200 live REQs on the socket (inbox + 199 groups), run a
-/// reconciliation on the same client. `neg_counts = false` is the deployed
+/// With the socket's every REQ slot live (an inbox and four batches under a
+/// five-REQ limit), run a reconciliation on the same client. `neg_counts = false` is the deployed
 /// strfry 1.1.3 model (separate NEG counter); `true` is the alternative where
 /// NEG sessions share the REQ cap (answered with the NEG cap NOTICE).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -332,7 +386,7 @@ async fn reconciliation_on_a_full_socket_under_both_neg_policies() {
         let fx = Fixture::new(
             LimitConfig {
                 neg_counts_toward_limit: neg_counts,
-                ..LimitConfig::default()
+                ..small_limit()
             },
             false,
         )
@@ -371,8 +425,8 @@ async fn reconciliation_on_a_full_socket_under_both_neg_policies() {
         );
         assert_filter_shapes(&stats);
         // Finding: the comparison may pass, but the follow-up id-fetch REQ is
-        // the socket's 201st live REQ and is refused, so nothing is returned
-        // and the relay counts as failed. With NEG counted, the comparison
+        // one REQ past the socket's limit and is refused, so nothing is
+        // returned and the relay counts as failed. With NEG counted, the comparison
         // itself is refused first.
         assert!(ok, "reconciliation reports the failure per relay");
         assert_eq!(relays_failed, 1);
@@ -391,8 +445,41 @@ async fn reconciliation_on_a_full_socket_under_both_neg_policies() {
     }
 }
 
+/// #2266's recovery failure: an inbox and 199 groups filled the production
+/// 200-REQ limit, so recovery's id fetch was refused and nothing was
+/// recovered. Batched, the same account holds five REQs and the pass
+/// recovers everything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovery_finds_room_beside_199_batched_groups() {
+    let fx = Fixture::new(LimitConfig::default(), false).await;
+    store_timed_events(&fx.database, 20).await;
+    let url = fx.limit.url();
+    fx.adapter
+        .activate_account(fx.activation(std::slice::from_ref(&url), groups(199, &url)))
+        .await
+        .unwrap();
+    let live = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    assert_eq!(live.active_now(), live_reqs(199));
+    let (summary, events) = fx
+        .sdk
+        .reconcile_subscription(
+            reconciliation_route(&url, &fx.account),
+            &[],
+            SINCE,
+            UNTIL,
+            &Cursor::default(),
+        )
+        .await
+        .unwrap();
+    let stats = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    assert_eq!(summary.relays_failed, 0);
+    assert_eq!(events.len(), 20);
+    assert_eq!(stats.rejections_total(), 0);
+    fx.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
-// (b) 200 / 201 boundary
+// (b) REQ-limit boundary, under a five-REQ limit
 // ---------------------------------------------------------------------------
 
 struct BoundaryReport {
@@ -433,11 +520,11 @@ async fn activate_at_boundary(fx: &Fixture, group_count: usize) -> BoundaryRepor
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn inbox_plus_199_groups_fill_the_socket_without_refusal() {
-    let fx = Fixture::new(LimitConfig::default(), false).await;
-    let report = activate_at_boundary(&fx, 199).await;
+async fn inbox_plus_four_batches_fill_the_socket_without_refusal() {
+    let fx = Fixture::new(small_limit(), false).await;
+    let report = activate_at_boundary(&fx, 200).await;
     eprintln!(
-        "[b] G=199 delivered={} complete={} settled={} refusals={:?} reqs_in_window={} {}",
+        "[b] G=200 delivered={} complete={} settled={} refusals={:?} reqs_in_window={} {}",
         report.delivered,
         report.complete,
         report.settled,
@@ -445,25 +532,27 @@ async fn inbox_plus_199_groups_fill_the_socket_without_refusal() {
         report.reqs_in_window,
         report.stats.summary()
     );
-    assert_eq!(report.stats.total_reqs, 200);
+    assert_eq!(report.stats.total_reqs, SMALL_REQ_LIMIT);
     assert_eq!(report.stats.rejections_total(), 0);
-    assert_eq!(report.stats.active_now(), 200);
-    assert_eq!(report.delivered, 199);
+    assert_eq!(report.stats.active_now(), SMALL_REQ_LIMIT);
+    assert_eq!(report.delivered, 200);
     assert!(report.complete);
     assert_eq!(report.reqs_in_window, 0);
     fx.shutdown().await;
 }
 
-/// Beyond 200 live REQs the relay refuses the overflow. Report which route
-/// is refused, what the adapter records, whether the rest still deliver, and
+/// Beyond the REQ limit the relay refuses the overflow. Report which REQ is
+/// refused, what the adapter records, whether the rest still deliver, and
 /// whether anything retries. Then re-activate (the app re-activates rather
-/// than reusing while coverage is incomplete) and measure the cost.
+/// than reusing while coverage is incomplete) and measure the cost. Group
+/// counts are whole batches, so a refused batch withholds exactly one batch
+/// of groups.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn overflow_beyond_200_is_refused_once_and_not_retried() {
-    for group_count in [200_usize, 201] {
-        let fx = Fixture::new(LimitConfig::default(), false).await;
+async fn overflow_beyond_the_req_limit_is_refused_once_and_not_retried() {
+    for group_count in [250_usize, 300] {
+        let fx = Fixture::new(small_limit(), false).await;
         let report = activate_at_boundary(&fx, group_count).await;
-        let overflow = group_count + 1 - 200;
+        let overflow = live_reqs(group_count) - SMALL_REQ_LIMIT;
         eprintln!(
             "[b] G={group_count} delivered={} complete={} settled={} subscriptions_refused={} \
              refusals={:?} reqs_in_window={} {}",
@@ -475,13 +564,13 @@ async fn overflow_beyond_200_is_refused_once_and_not_retried() {
             report.reqs_in_window,
             report.stats.summary()
         );
-        assert_eq!(report.stats.total_reqs, group_count + 1);
+        assert_eq!(report.stats.total_reqs, live_reqs(group_count));
         assert_eq!(
             report.stats.rejections.get(reason::TOO_MANY_SUBSCRIPTIONS),
             Some(&overflow)
         );
-        assert_eq!(report.stats.active_now(), 200);
-        assert_eq!(report.stats.peak_active(), 200);
+        assert_eq!(report.stats.active_now(), SMALL_REQ_LIMIT);
+        assert_eq!(report.stats.peak_active(), SMALL_REQ_LIMIT);
         assert_eq!(report.reqs_in_window, 0, "no retry storm after the refusal");
         assert!(
             !report.complete,
@@ -489,11 +578,11 @@ async fn overflow_beyond_200_is_refused_once_and_not_retried() {
         );
         assert!(report.settled, "the refusal settles the wait");
         assert_eq!(report.subscriptions_refused, overflow);
-        let refused_groups = report.refusals.get("group").copied().unwrap_or(0) as usize;
+        let refused_batches = report.refusals.get("group").copied().unwrap_or(0) as usize;
         assert_eq!(
             report.delivered,
-            group_count - refused_groups,
-            "every accepted group delivers"
+            group_count - refused_batches * GROUP_BATCH_ROUTES,
+            "every group in an accepted batch delivers"
         );
 
         // Re-activation, as `MarmotRelayPlaneAccountAdapter::activate_account`
@@ -523,11 +612,11 @@ async fn overflow_beyond_200_is_refused_once_and_not_retried() {
             "[b] G={group_count} reactivations (reqs, closes, closes_unknown, rejections, refusals, active): {per_activation:?}"
         );
         for (reqs, closes, _, rejections, _, active) in &per_activation {
-            assert_eq!(*reqs, group_count + 1);
-            // Only the 200 live REQs are CLOSEd: the SDK already dropped the refused one.
-            assert_eq!(*closes, 200);
+            assert_eq!(*reqs, live_reqs(group_count));
+            // Only the live REQs are CLOSEd: the SDK already dropped the refused ones.
+            assert_eq!(*closes, SMALL_REQ_LIMIT);
             assert_eq!(*rejections, overflow);
-            assert_eq!(*active, 200);
+            assert_eq!(*active, SMALL_REQ_LIMIT);
         }
         fx.shutdown().await;
     }
@@ -537,14 +626,19 @@ async fn overflow_beyond_200_is_refused_once_and_not_retried() {
 // (c) Reconnect storm
 // ---------------------------------------------------------------------------
 
-async fn reconnect_storm(group_count: usize, drops: usize) -> Vec<(usize, usize, usize)> {
-    let fx = Fixture::new(LimitConfig::default(), true).await;
+async fn reconnect_storm(
+    config: LimitConfig,
+    group_count: usize,
+    drops: usize,
+) -> Vec<(usize, usize, usize)> {
+    let limit = config.max_subscriptions;
+    let fx = Fixture::new(config, true).await;
     let url = fx.limit.url();
     fx.adapter
         .activate_account(fx.activation(std::slice::from_ref(&url), groups(group_count, &url)))
         .await
         .unwrap();
-    let expected = (group_count + 1).min(200);
+    let expected = live_reqs(group_count).min(limit);
     let first = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
     assert_eq!(first.active_now(), expected);
     let mut rounds = Vec::new();
@@ -590,23 +684,23 @@ async fn reconnect_storm(group_count: usize, drops: usize) -> Vec<(usize, usize,
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reconnect_storm_resends_exactly_the_live_set() {
-    let rounds = reconnect_storm(150, 10).await;
+    let rounds = reconnect_storm(LimitConfig::default(), 150, 10).await;
     assert!(
         rounds
             .iter()
-            .all(|&(reqs, dup, rej)| reqs == 151 && dup == 0 && rej == 0)
+            .all(|&(reqs, dup, rej)| reqs == live_reqs(150) && dup == 0 && rej == 0)
     );
 }
 
 /// At the limit, the refused REQ was dropped from the SDK registry, so a
-/// reconnect re-sends only the 200 the relay accepted.
+/// reconnect re-sends only the REQs the relay accepted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reconnect_storm_at_the_limit_does_not_resend_the_refused_req() {
-    let rounds = reconnect_storm(200, 5).await;
+    let rounds = reconnect_storm(small_limit(), 250, 5).await;
     assert!(
         rounds
             .iter()
-            .all(|&(reqs, dup, rej)| reqs == 200 && dup == 0 && rej == 0)
+            .all(|&(reqs, dup, rej)| reqs == SMALL_REQ_LIMIT && dup == 0 && rej == 0)
     );
 }
 
@@ -637,7 +731,7 @@ async fn dead_relay(sdk: &NostrSdkRelayClient) -> String {
 #[allow(dead_code)]
 #[derive(Debug)]
 struct LeakCheck {
-    /// Live REQs once a clean activation of 1+G settles.
+    /// Live REQs once a clean activation of G groups settles.
     active_after_activation: usize,
     reqs_on_reconnect: usize,
     active_after_reconnect: usize,
@@ -649,7 +743,7 @@ struct LeakCheck {
 }
 
 /// Activate cleanly, then force a reconnect, and report REQs that are live
-/// beyond the clean activation's 1+G.
+/// beyond the clean activation's inbox and batches.
 async fn leak_check(fx: &Fixture, group_count: usize, label: &str) -> LeakCheck {
     let url = fx.limit.url();
     let mark = Instant::now();
@@ -693,8 +787,9 @@ async fn leak_check(fx: &Fixture, group_count: usize, label: &str) -> LeakCheck 
     check
 }
 
-/// One group route that nostr-sdk cannot operate fails `subscribe_all`. Every
-/// REQ its sibling tasks handed to the SDK must be closed by the rollback, and
+/// One group route that nostr-sdk cannot operate fails `subscribe_all`: its own
+/// batch, since its endpoints differ. Every REQ its sibling tasks handed to
+/// the SDK must be closed by the rollback, and
 /// none may come back on reconnect (#2262). Before the fix `subscribe_all`
 /// aborted the siblings mid-flight and tracked ids only after the SDK call, so
 /// REQs leaked on most runs.
@@ -731,8 +826,8 @@ async fn failed_activation_rollback_leaves_no_untracked_reqs() {
         active_after_rollback.iter().all(|&active| active == 0),
         "rollback left live REQs: {active_after_rollback:?}"
     );
-    assert_eq!(check.active_after_activation, G + 1);
-    assert_eq!(check.active_after_reconnect, G + 1, "{check:?}");
+    assert_eq!(check.active_after_activation, live_reqs(G));
+    assert_eq!(check.active_after_reconnect, live_reqs(G), "{check:?}");
     assert_eq!(check.stale_on_reconnect, 0, "{check:?}");
     fx.shutdown().await;
 }
@@ -774,15 +869,15 @@ async fn dropped_activation_futures_leave_no_untracked_reqs() {
         DROPS as usize - completed
     );
     let check = leak_check(&fx, G, "after dropped activations").await;
-    assert_eq!(check.active_after_activation, G + 1, "{check:?}");
-    assert_eq!(check.active_after_reconnect, G + 1, "{check:?}");
+    assert_eq!(check.active_after_activation, live_reqs(G), "{check:?}");
+    assert_eq!(check.active_after_reconnect, live_reqs(G), "{check:?}");
     assert_eq!(check.stale_on_reconnect, 0, "{check:?}");
     fx.shutdown().await;
 }
 
-/// A group sync reuses its activation's ids, so a late or repeated subscribe
-/// can name an id another live REQ already holds. nostr-sdk refuses it without
-/// registering anything; the failed call must not close the live REQ (#2262).
+/// A late or repeated subscribe can name an id another live REQ already
+/// holds. nostr-sdk refuses it without registering anything; the failed call
+/// must not close the live REQ (#2262).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn duplicate_subscribe_leaves_the_live_req_open() {
     let fx = Fixture::new(LimitConfig::default(), false).await;
@@ -793,10 +888,13 @@ async fn duplicate_subscribe_leaves_the_live_req_open() {
         .unwrap();
     let settled = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
     let group = groups(1, &url).remove(0);
-    let duplicate = NostrSubscription::Group {
+    // The activation's only batch, under its own id.
+    let duplicate = NostrSubscription::GroupBatch {
         account_id: fx.account.clone(),
-        group_id: group.group_id,
-        transport_group_id: group.transport_group_id,
+        routes: vec![transport_nostr_adapter::GroupBatchRoute {
+            group_id: group.group_id,
+            transport_group_id: group.transport_group_id,
+        }],
         endpoints: group.endpoints,
         since: None,
         attempt: fx
@@ -804,11 +902,12 @@ async fn duplicate_subscribe_leaves_the_live_req_open() {
             .account_subscription_attempt(&fx.account)
             .await
             .expect("the account is active"),
+        batch: 0,
     };
     assert!(fx.sdk.subscribe(duplicate).await.is_err());
     let after = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
     assert_eq!(after.closes, settled.closes, "no CLOSE for the live id");
-    assert_eq!(after.active_now(), 2, "inbox and group REQs stay live");
+    assert_eq!(after.active_now(), 2, "inbox and batch REQs stay live");
     fx.shutdown().await;
 }
 
@@ -856,7 +955,7 @@ async fn permanently_refused_inbox_is_not_resent_in_a_loop() {
             fx.limit.drop_all_connections();
             fx.limit
                 .wait_for(SETTLE_TIMEOUT, |s| {
-                    s.connections.len() > connections_before && s.active_now() >= 20
+                    s.connections.len() > connections_before && s.active_now() >= live_reqs(20) - 1
                 })
                 .await;
             let after = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
@@ -888,7 +987,11 @@ async fn permanently_refused_inbox_is_not_resent_in_a_loop() {
             per_activation.iter().all(|&n| n == 1),
             "one inbox REQ per activation"
         );
-        assert_eq!(stats.active_now(), 20, "groups stay live");
+        assert_eq!(
+            stats.active_now(),
+            live_reqs(20) - 1,
+            "the group batch stays live"
+        );
         match style {
             RejectStyle::Closed => {
                 assert!(
@@ -1354,6 +1457,121 @@ async fn store_events_at(database: &MemoryDatabase, timestamps: impl IntoIterato
     }
 }
 
+/// A batch's routes share each 500-event replay page. 50 groups with 15
+/// events each are 750 stored events behind one batch REQ: the relay clamps
+/// the replay, and paging the batch's filter must deliver every group's
+/// history before the batch's EOSE counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_replay_past_500_events_is_paged_for_every_group() {
+    const PER_GROUP: usize = 15;
+    let fx = Fixture::new(LimitConfig::default(), false).await;
+    let keys = Keys::generate();
+    for group in 0..GROUP_BATCH_ROUTES {
+        for index in 0..PER_GROUP {
+            let event =
+                EventBuilder::new(Kind::MlsGroupMessage, format!("batched-{group}-{index}"))
+                    .tags([Tag::custom("h", [hex::encode(route(group))])])
+                    .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(
+                        1_700_000_000 + (group * PER_GROUP + index) as u64,
+                    ))
+                    .finalize(&keys)
+                    .unwrap();
+            fx.database
+                .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+                .await
+                .unwrap();
+        }
+    }
+    let url = fx.limit.url();
+    fx.adapter
+        .activate_account(
+            fx.activation(std::slice::from_ref(&url), groups(GROUP_BATCH_ROUTES, &url)),
+        )
+        .await
+        .unwrap();
+    let delivered = distinct_deliveries(&fx.adapter, Duration::from_secs(15)).await;
+    let complete = fx
+        .adapter
+        .account_subscription_eose(&fx.account)
+        .await
+        .complete();
+    let stats = fx.limit.stats();
+    eprintln!(
+        "[h] batch delivered={delivered} complete={complete} {}",
+        stats.summary()
+    );
+    assert_eq!(stats.active_now(), live_reqs(GROUP_BATCH_ROUTES));
+    assert_eq!(delivered, GROUP_BATCH_ROUTES * PER_GROUP);
+    assert!(complete, "the paged batch counts as coverage");
+    fx.shutdown().await;
+}
+
+/// A group sync never re-issues a live batch. A joined group goes out in a
+/// new batch; a left group stays in its batch's filter while any group there
+/// is still wanted, and the batch closes once none is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_sync_adds_batches_and_closes_only_emptied_ones() {
+    let fx = Fixture::new(LimitConfig::default(), false).await;
+    let url = fx.limit.url();
+    let all = groups(GROUP_BATCH_ROUTES + 10, &url);
+    fx.adapter
+        .activate_account(fx.activation(std::slice::from_ref(&url), all.clone()))
+        .await
+        .unwrap();
+    let mut stats = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    assert_eq!(stats.active_now(), live_reqs(all.len()));
+    let sync = |desired: Vec<TransportGroupSubscription>| {
+        let adapter = fx.adapter.clone();
+        let account = fx.account.clone();
+        async move {
+            adapter
+                .sync_account_groups(TransportGroupSync {
+                    account_id: account,
+                    group_subscriptions: desired,
+                    since: None,
+                })
+                .await
+                .unwrap();
+        }
+    };
+    let step = |label: &str, before: &LimitStats, after: &LimitStats, reqs, closes| {
+        assert_eq!(after.total_reqs - before.total_reqs, reqs, "{label}: REQs");
+        assert_eq!(after.closes - before.closes, closes, "{label}: CLOSEs");
+        assert_eq!(after.rejections_total(), 0, "{label}");
+    };
+
+    // Join one group: one new batch REQ, nothing re-issued or closed.
+    let mut joined = all.clone();
+    joined.extend(groups(GROUP_BATCH_ROUTES + 11, &url).split_off(GROUP_BATCH_ROUTES + 10));
+    sync(joined.clone()).await;
+    let after = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    step("join", &stats, &after, 1, 0);
+    stats = after;
+
+    // Leave one group of the first, full batch: its batch stays live.
+    let mut left = joined.clone();
+    left.remove(0);
+    sync(left.clone()).await;
+    let after = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    step("leave one", &stats, &after, 0, 0);
+    stats = after;
+
+    // Leave the joined group, the only one in its batch: that batch closes.
+    left.pop();
+    sync(left.clone()).await;
+    let after = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    step("leave a whole batch", &stats, &after, 0, 1);
+    stats = after;
+
+    // Leave the rest of the first batch: it closes too.
+    let rest = left.split_off(GROUP_BATCH_ROUTES - 1);
+    sync(rest).await;
+    let after = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    step("empty the first batch", &stats, &after, 0, 1);
+    assert_eq!(after.active_now(), 2, "the inbox and the second batch");
+    fx.shutdown().await;
+}
+
 /// Replay one group route over `stored` events and report what arrived.
 async fn replay_one_group(stored: usize, clamp: Option<u64>) -> (usize, bool, LimitStats) {
     replay_one_group_at((0..stored as u64).map(|index| 1_700_000_000 + index), clamp).await
@@ -1501,12 +1719,12 @@ async fn stored_replay_under_a_page_is_not_paged() {
 
 /// With a simulated ~20 ms round trip, a relay that refuses promptly fails a
 /// pass in one or two round trips, not a timeout: NEG-ERR on NEG-OPEN costs
-/// one, and a full socket (the comparison succeeds, the id-fetch REQ is the
-/// 201st and is CLOSED) costs about two.
+/// one, and a full socket (the comparison succeeds, the id-fetch REQ is one
+/// past the limit and is CLOSED) costs about two.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prompt_relay_refusals_fail_in_round_trips() {
     const RTT: Duration = Duration::from_millis(20);
-    let (fx, url) = connected_fixture(LimitConfig::default(), 10).await;
+    let (fx, url) = connected_fixture(small_limit(), 10).await;
     fx.limit.set_client_delay(RTT);
     let endpoints = std::slice::from_ref(&url);
     let healthy = timed_failures(&fx, endpoints, 2).await;

@@ -7,7 +7,8 @@ agnostic; the optional `sdk` feature adds a `nostr-sdk` backed `NostrSdkRelayCli
 ## What this crate does
 
 - Activates account inbox subscriptions and group subscriptions, refreshes group subscriptions for an active account,
-  and removes stale group subscriptions when an active account's group set changes.
+  and removes stale group subscriptions when an active account's group set changes. Group routes go out batched, up
+  to `GROUP_BATCH_ROUTES` (50) per REQ, so a 1,000-group account holds about 21 REQs per relay.
 - Converts relay-delivered `NostrTransportEvent` values into account-scoped `TransportDelivery` values.
 - Routes kind `445` group messages by endpoint + transport group id.
 - Routes signed kind `1059` giftwraps through the account-inbox plane.

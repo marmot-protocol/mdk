@@ -990,11 +990,9 @@ impl ScriptedPushRelayClient {
             .unwrap()
             .iter()
             .filter(|subscription| {
-                matches!(
-                    subscription,
-                    NostrSubscription::Group { account_id, group_id, .. }
-                        if account_id == expected_account_id && group_id == expected_group_id
-                )
+                subscription.is_group_route()
+                    && subscription.account_id() == expected_account_id
+                    && subscription.carries_group(expected_group_id)
             })
             .count()
     }
@@ -1014,11 +1012,9 @@ impl ScriptedPushRelayClient {
             .unwrap()
             .iter()
             .filter(|subscription| {
-                matches!(
-                    subscription,
-                    NostrSubscription::Group { account_id, group_id, .. }
-                        if account_id == expected_account_id && group_id == expected_group_id
-                )
+                subscription.is_group_route()
+                    && subscription.account_id() == expected_account_id
+                    && subscription.carries_group(expected_group_id)
             })
             .count()
     }
@@ -1122,7 +1118,7 @@ impl NostrRelayClient for ScriptedPushRelayClient {
             .lock()
             .unwrap()
             .push(subscription.clone());
-        if matches!(&subscription, NostrSubscription::Group { .. }) {
+        if subscription.is_group_route() {
             self.group_subscribe_attempts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
@@ -1147,7 +1143,7 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         };
         let block_for_account_group = {
             let mut blocked_account = self.block_account_group_subscribe.lock().unwrap();
-            if matches!(&subscription, NostrSubscription::Group { .. })
+            if subscription.is_group_route()
                 && blocked_account.as_deref() == Some(subscription.account_id().as_slice())
             {
                 blocked_account.take();
@@ -12389,7 +12385,8 @@ fn reopened_unbounded_overflow_waits_for_explicit_full_history_repair() {
         assert!(
             subscriptions.iter().all(|subscription| match subscription {
                 NostrSubscription::AccountInbox { since, .. }
-                | NostrSubscription::Group { since, .. } => since.is_some(),
+                | NostrSubscription::Group { since, .. }
+                | NostrSubscription::GroupBatch { since, .. } => since.is_some(),
                 NostrSubscription::GroupMaintenance { .. } => true,
             }),
             "opening live interest cannot independently authorize an unfloored replay"
@@ -17032,10 +17029,7 @@ fn group_subscriptions(relay: &ScriptedPushRelayClient, group_id: &GroupId) -> u
         .unwrap()
         .iter()
         .filter(|subscription| {
-            matches!(
-                subscription,
-                NostrSubscription::Group { group_id: subscribed, .. } if subscribed == group_id
-            )
+            subscription.is_group_route() && subscription.carries_group(group_id)
         })
         .count()
 }
@@ -17463,6 +17457,7 @@ async fn key_package_publication_never_issues_a_full_history_subscription() {
                 subscription,
                 NostrSubscription::AccountInbox { since: None, .. }
                     | NostrSubscription::Group { since: None, .. }
+                    | NostrSubscription::GroupBatch { since: None, .. }
             )
         })
         .count();

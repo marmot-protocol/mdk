@@ -122,10 +122,21 @@ const SUBSCRIBE_STRAGGLER_WAIT: Duration = Duration::from_secs(2);
 /// before its EOSE counts as coverage.
 pub const RELAY_REPLAY_PAGE_LIMIT: usize = 500;
 
-/// Upper bound on backward pages for one relay's replay of one REQ. A replay
-/// still truncated after this many pages stays incomplete rather than paging
+/// Upper bound on backward pages for one relay's replay of one group route,
+/// or of the inbox. A batched REQ pages up to this many per route it carries,
+/// so batching never shortens the history a route's replay reaches. A replay
+/// still truncated after its bound stays incomplete rather than paging
 /// without end; recovery owns history that deep.
 const REPLAY_PAGE_MAX_PAGES: usize = 64;
+
+/// The most group routes one live REQ carries, as `#h` values of a single
+/// filter (#2266). One REQ per route reached a relay's per-connection REQ
+/// limit (200 on strfry) at about 200 groups and then refused the rest and
+/// recovery's own fetches. Batching keeps a 10,000-route account under that
+/// limit. A refused batch leaves every route it carries without that relay,
+/// and its routes share each 500-event replay page, which the page bound
+/// scales with.
+pub const GROUP_BATCH_ROUTES: usize = 50;
 
 /// Budget for one backward replay page. The item cap sits well above
 /// [`RELAY_REPLAY_PAGE_LIMIT`] so a relay that does not clamp still answers a
@@ -187,6 +198,13 @@ impl SubscriptionAttempt {
     }
 }
 
+/// One group route a [`NostrSubscription::GroupBatch`] carries.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GroupBatchRoute {
+    pub group_id: GroupId,
+    pub transport_group_id: Vec<u8>,
+}
+
 /// Low-level relay subscription request emitted by [`NostrTransportAdapter`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NostrSubscription {
@@ -205,6 +223,21 @@ pub enum NostrSubscription {
         since: Option<Timestamp>,
         /// Activation attempt that issued this REQ; see [`SubscriptionAttempt`].
         attempt: SubscriptionAttempt,
+    },
+    /// The live REQ for up to [`GROUP_BATCH_ROUTES`] group routes that share
+    /// endpoints and `since`: one filter whose `#h` values are their routing
+    /// ids. Activation packs every group route into batches; a group sync
+    /// adds batches for the routes it adds and closes a batch only once none
+    /// of its routes is live. `batch` numbers the account's batches within
+    /// its activation attempt, so an id names one batch's REQ for good.
+    GroupBatch {
+        account_id: MemberId,
+        routes: Vec<GroupBatchRoute>,
+        endpoints: Vec<TransportEndpoint>,
+        since: Option<Timestamp>,
+        /// Activation attempt that issued this REQ; see [`SubscriptionAttempt`].
+        attempt: SubscriptionAttempt,
+        batch: u32,
     },
     /// Temporary history subscription used only by post-join maintenance.
     ///
@@ -259,6 +292,21 @@ impl NostrSubscription {
                     ],
                 )
             }
+            Self::GroupBatch {
+                account_id,
+                endpoints,
+                attempt,
+                batch,
+                ..
+            } => compact_subscription_id(
+                "group-batch",
+                &[
+                    account_id.as_slice(),
+                    endpoint_set_digest(endpoints).as_bytes(),
+                    &batch.to_be_bytes(),
+                    &attempt.to_be_bytes(),
+                ],
+            ),
             Self::GroupMaintenance {
                 account_id,
                 group_id,
@@ -285,6 +333,7 @@ impl NostrSubscription {
         match self {
             Self::AccountInbox { endpoints, .. }
             | Self::Group { endpoints, .. }
+            | Self::GroupBatch { endpoints, .. }
             | Self::GroupMaintenance { endpoints, .. } => endpoints,
         }
     }
@@ -293,8 +342,29 @@ impl NostrSubscription {
     /// [`SubscriptionAttempt`].
     pub fn attempt(&self) -> SubscriptionAttempt {
         match self {
-            Self::AccountInbox { attempt, .. } | Self::Group { attempt, .. } => *attempt,
+            Self::AccountInbox { attempt, .. }
+            | Self::Group { attempt, .. }
+            | Self::GroupBatch { attempt, .. } => *attempt,
             Self::GroupMaintenance { .. } => SubscriptionAttempt::INITIAL,
+        }
+    }
+
+    /// Whether this is a live group-route REQ: one route, or a batch of them.
+    pub fn is_group_route(&self) -> bool {
+        matches!(self, Self::Group { .. } | Self::GroupBatch { .. })
+    }
+
+    /// Whether this REQ asks for group `group_id`'s events: its own route or
+    /// maintenance REQ, or a batch carrying one of its routes.
+    pub fn carries_group(&self, group_id: &GroupId) -> bool {
+        match self {
+            Self::Group { group_id: own, .. } | Self::GroupMaintenance { group_id: own, .. } => {
+                own == group_id
+            }
+            Self::GroupBatch { routes, .. } => {
+                routes.iter().any(|route| &route.group_id == group_id)
+            }
+            Self::AccountInbox { .. } => false,
         }
     }
 
@@ -303,6 +373,7 @@ impl NostrSubscription {
         match self {
             Self::AccountInbox { account_id, .. }
             | Self::Group { account_id, .. }
+            | Self::GroupBatch { account_id, .. }
             | Self::GroupMaintenance { account_id, .. } => account_id,
         }
     }
@@ -328,6 +399,16 @@ impl NostrSubscription {
                 group_id: group_id.clone(),
                 transport_group_id: transport_group_id.clone(),
                 endpoints: normalized_endpoints(endpoints),
+            },
+            Self::GroupBatch {
+                account_id,
+                attempt,
+                batch,
+                ..
+            } => NostrSubscriptionRouteKey::GroupBatch {
+                account_id: account_id.clone(),
+                attempt: *attempt,
+                batch: *batch,
             },
             Self::GroupMaintenance {
                 account_id,
@@ -356,6 +437,13 @@ enum NostrSubscriptionRouteKey {
         group_id: GroupId,
         transport_group_id: Vec<u8>,
         endpoints: Vec<TransportEndpoint>,
+    },
+    /// Never live again once closed: batch numbers are not reused within an
+    /// attempt, and attempts are not reused at all.
+    GroupBatch {
+        account_id: MemberId,
+        attempt: SubscriptionAttempt,
+        batch: u32,
     },
     GroupMaintenance {
         account_id: MemberId,
@@ -1388,6 +1476,28 @@ impl NostrTransportAdapter {
             .account_subscription_eose(account_id)
     }
 
+    /// The id of the live batch REQ carrying the account's group route
+    /// `transport_group_id`, or `None` when no live batch wants it.
+    pub async fn group_route_subscription_id(
+        &self,
+        account_id: &MemberId,
+        transport_group_id: &[u8],
+    ) -> Option<String> {
+        let state = self.state.read().await;
+        let routes = state.accounts.get(account_id)?;
+        routes
+            .batches
+            .iter()
+            .rev()
+            .find(|batch| {
+                batch
+                    .wanted
+                    .iter()
+                    .any(|key| matches!(key, NostrSubscriptionRouteKey::Group { transport_group_id: wanted, .. } if wanted == transport_group_id))
+            })
+            .map(|batch| batch.subscription.subscription_id())
+    }
+
     /// The activation attempt an account's live subscriptions were issued
     /// under, or `None` when the account is not active.
     ///
@@ -2010,8 +2120,9 @@ impl NostrTransportAdapter {
         let mut until = paging.until;
         let mut pages = 0;
         let mut delivered = 0;
+        let max_pages = paging.window.max_pages();
         let complete = loop {
-            if pages == REPLAY_PAGE_MAX_PAGES {
+            if pages == max_pages {
                 break false;
             }
             pages += 1;
@@ -2114,7 +2225,7 @@ impl TransportAdapter for NostrTransportAdapter {
                 state
                     .accounts
                     .get(&account_id)
-                    .map(|routes| 1 + routes.groups.len())
+                    .map(|routes| 1 + routes.batches.len())
                     .unwrap_or_default(),
                 state.next_activation_attempt(&account_id),
             )
@@ -2127,18 +2238,26 @@ impl TransportAdapter for NostrTransportAdapter {
         // subscription-keyed. The SDK client is a no-op on an empty id list.
         self.relay_client.unsubscribe_account(&account_id).await?;
 
-        let mut issued = Vec::with_capacity(1 + activation.group_subscriptions.len());
+        let prior_route_keys = prior_group_route_keys(&account_id, &activation.group_subscriptions);
+        let routes = activation
+            .group_subscriptions
+            .iter()
+            .map(|group| {
+                let since =
+                    group_route_since(&account_id, group, &prior_route_keys, activation.since);
+                group_subscription(&account_id, group, since, attempt)
+            })
+            .collect::<Vec<_>>();
+        // Every group route goes out in a batch REQ (#2266).
+        let batches = pack_group_batches(&account_id, &routes, attempt, 0);
+        let mut issued = Vec::with_capacity(1 + batches.len());
         issued.push(account_inbox_subscription(
             &account_id,
             activation.inbox_endpoints.clone(),
             inbox_since(activation.since),
             attempt,
         ));
-        let prior_route_keys = prior_group_route_keys(&account_id, &activation.group_subscriptions);
-        for group in &activation.group_subscriptions {
-            let since = group_route_since(&account_id, group, &prior_route_keys, activation.since);
-            issued.push(group_subscription(&account_id, group, since, attempt));
-        }
+        issued.extend(batches.iter().cloned());
         // Register routing/telemetry state BEFORE the relay REQs go out: a
         // relay may stream stored events the moment it sees a subscription,
         // and an event arriving before the routes exist is dropped as
@@ -2156,7 +2275,7 @@ impl TransportAdapter for NostrTransportAdapter {
             state.clear_pending_unsubscribes_for_account(&account_id);
             state.record_subscription_starts(&issued, now_ms);
             state.record_account_replay_start(&account_id, &issued);
-            state.activate(activation, replaced_count, attempt, &issued);
+            state.activate(activation, replaced_count, attempt, &routes, &batches);
         }
 
         if let Err(error) = self.subscribe_all("activate_account", &issued).await {
@@ -2219,7 +2338,7 @@ impl TransportAdapter for NostrTransportAdapter {
             }
         }
 
-        let (to_add, to_remove) = {
+        let (to_add, to_remove, added_batches) = {
             let state = self.state.read().await;
             // The `AccountNotActive` guard above ran under the subscription
             // lock this call holds, and only activate/sync/deactivate can
@@ -2240,14 +2359,20 @@ impl TransportAdapter for NostrTransportAdapter {
             // new attempt, so both sides of the diff carry the activation's own
             // attempt and the ids stay stable across it.
             let attempt = routes.attempt;
-            diff_group_subscriptions(
+            let (to_add, to_remove) = diff_group_subscriptions(
                 &sync.account_id,
                 &routes.groups,
                 &routes.group_since,
                 &sync.group_subscriptions,
                 sync.since,
                 attempt,
-            )
+            );
+            // Added routes go out in new batches; existing batches are never
+            // re-issued, so their routes' replay is not repeated. A removed
+            // route stays in its batch's filter until the next activation.
+            let added_batches =
+                pack_group_batches(&sync.account_id, &to_add, attempt, routes.next_batch);
+            (to_add, to_remove, added_batches)
         };
 
         // Stage new route coverage and a telemetry overlay BEFORE the relay REQs
@@ -2256,8 +2381,16 @@ impl TransportAdapter for NostrTransportAdapter {
         let now_ms = self.now_ms();
         {
             let mut state = self.state.write().await;
-            state.stage_subscription_starts(&to_add, now_ms);
+            state.stage_subscription_starts(&added_batches, now_ms);
             state.stage_group_routes(&to_add);
+            // Spend the batch numbers whether or not this sync commits: a
+            // failed sync's batch may still be closing under its id, which a
+            // later batch must never reuse.
+            if let Some(routes) = state.accounts.get_mut(&sync.account_id) {
+                routes.next_batch = routes
+                    .next_batch
+                    .saturating_add(u32::try_from(added_batches.len()).unwrap_or(u32::MAX));
+            }
         }
         // Keep the lifecycle lock in a detached cleanup guard. If this future
         // is cancelled at any later await, dropping the sender wakes the guard,
@@ -2268,7 +2401,7 @@ impl TransportAdapter for NostrTransportAdapter {
         let cleanup_state = Arc::clone(&self.state);
         let cleanup_client = Arc::clone(&self.relay_client);
         let cleanup_barriers = Arc::clone(&self.subscribe_tasks);
-        let cleanup_batch = to_add.clone();
+        let cleanup_batch = added_batches.clone();
         tokio::spawn(async move {
             let _subscription_guard = subscription_guard;
             if staging_abandoned.await.is_err() {
@@ -2287,7 +2420,10 @@ impl TransportAdapter for NostrTransportAdapter {
             }
         });
 
-        if let Err(error) = self.subscribe_all("sync_account_groups", &to_add).await {
+        if let Err(error) = self
+            .subscribe_all("sync_account_groups", &added_batches)
+            .await
+        {
             // The authoritative routes and committed telemetry were never
             // replaced. Discard only this batch's staged callbacks and rebuild
             // the derived route index to remove its temporary coverage, then
@@ -2301,7 +2437,7 @@ impl TransportAdapter for NostrTransportAdapter {
                 &self.relay_client,
                 &self.state,
                 &self.subscribe_tasks,
-                to_add,
+                added_batches,
             )
             .await;
             let _ = staging_complete.send(());
@@ -2316,9 +2452,9 @@ impl TransportAdapter for NostrTransportAdapter {
         {
             let mut state = self.state.write().await;
             state.commit_staged_subscription_starts();
-            state.forget_subscription_starts(&to_remove);
-            state.sync_groups(sync, &to_add, &to_remove);
-            state.queue_pending_unsubscribes(to_remove);
+            let idle = state.sync_groups(sync, &to_add, &to_remove, &added_batches);
+            state.forget_subscription_starts(&idle);
+            state.queue_pending_unsubscribes(idle);
         };
 
         let (confirmed, failed_unsubscribe_count) = self.drain_pending_unsubscribes().await;
@@ -2326,7 +2462,7 @@ impl TransportAdapter for NostrTransportAdapter {
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
             method = "sync_account_groups",
-            subscriptions_created = to_add.len(),
+            subscriptions_created = added_batches.len(),
             unsubscribes_confirmed = confirmed,
             "applied transport group subscription diff"
         );
@@ -2353,7 +2489,7 @@ impl TransportAdapter for NostrTransportAdapter {
             state
                 .accounts
                 .get(account_id)
-                .map(|routes| 1 + routes.groups.len())
+                .map(|routes| 1 + routes.batches.len())
                 .unwrap_or_default()
         };
         tracing::debug!(
@@ -2492,6 +2628,30 @@ struct AccountRoutes {
     /// on the wire, and so a group sync reuses the activation's attempt rather
     /// than minting a new one.
     attempt: SubscriptionAttempt,
+    /// The live batch REQs carrying the group routes, in issue order.
+    batches: Vec<LiveGroupBatch>,
+    /// The number the next batch a group sync adds takes within `attempt`.
+    /// Spent when a sync stages its batches, so numbers are never reused.
+    next_batch: u32,
+}
+
+/// One live batch REQ and which of the routes it carries are still wanted.
+/// A route a sync removes stays in the REQ's filter until the next
+/// activation repacks; its events then match no route and are dropped. The
+/// REQ closes once none of its routes is wanted.
+#[derive(Clone)]
+struct LiveGroupBatch {
+    subscription: NostrSubscription,
+    wanted: HashSet<NostrSubscriptionRouteKey>,
+}
+
+impl LiveGroupBatch {
+    fn new(subscription: NostrSubscription) -> Self {
+        Self {
+            wanted: batch_route_keys(&subscription),
+            subscription,
+        }
+    }
 }
 
 /// Immutable endpoint coverage for the most recent account activation.
@@ -2510,17 +2670,18 @@ struct AccountReplayCoverage {
 }
 
 /// The stored-history window of one activation REQ.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ReplayWindow {
     scope: ReplayScope,
     /// The REQ's `since`, or 0 when it asked for full history.
     since: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ReplayScope {
     Inbox,
-    Group([u8; 32]),
+    /// The routing ids of the group routes the REQ carries.
+    Groups(Vec<[u8; 32]>),
 }
 
 impl ReplayWindow {
@@ -2532,9 +2693,18 @@ impl ReplayWindow {
                 since,
                 ..
             } => (
-                ReplayScope::Group(transport_group_id.as_slice().try_into().ok()?),
+                ReplayScope::Groups(vec![transport_group_id.as_slice().try_into().ok()?]),
                 since,
             ),
+            NostrSubscription::GroupBatch { routes, since, .. } => {
+                let mut ids = routes
+                    .iter()
+                    .map(|route| route.transport_group_id.as_slice().try_into().ok())
+                    .collect::<Option<Vec<[u8; 32]>>>()?;
+                ids.sort_unstable();
+                ids.dedup();
+                (ReplayScope::Groups(ids), since)
+            }
             NostrSubscription::GroupMaintenance { .. } => return None,
         };
         Some(Self {
@@ -2543,16 +2713,24 @@ impl ReplayWindow {
         })
     }
 
-    fn acquisition_scope(self, until: u64) -> NostrAcquisitionScope {
+    fn acquisition_scope(&self, until: u64) -> NostrAcquisitionScope {
         let since = self.since.min(until);
-        match self.scope {
+        match &self.scope {
             ReplayScope::Inbox => NostrAcquisitionScope::AccountInboxWindow { since, until },
-            ReplayScope::Group(transport_group_id) => NostrAcquisitionScope::GroupWindow {
-                transport_group_id,
+            ReplayScope::Groups(transport_group_ids) => NostrAcquisitionScope::GroupsWindow {
+                transport_group_ids: transport_group_ids.clone(),
                 since,
                 until,
-                newest: None,
             },
+        }
+    }
+
+    /// The most backward pages a replay of this window may take: the
+    /// per-route bound for each route its REQ carries.
+    fn max_pages(&self) -> usize {
+        match &self.scope {
+            ReplayScope::Inbox => REPLAY_PAGE_MAX_PAGES,
+            ReplayScope::Groups(ids) => REPLAY_PAGE_MAX_PAGES.saturating_mul(ids.len().max(1)),
         }
     }
 }
@@ -2649,7 +2827,7 @@ impl AccountReplayCoverage {
         relay: RelayIndex,
     ) -> Option<(ReplayWindow, u64)> {
         let stored = self.stored.remove(&(subscription_id.to_owned(), relay));
-        let window = self.windows.get(subscription_id).copied();
+        let window = self.windows.get(subscription_id).cloned();
         let replay = self.replay_mut(subscription_id, relay)?;
         if *replay != RelayReplay::Awaiting {
             if *replay != RelayReplay::Paging {
@@ -2923,9 +3101,10 @@ impl AdapterState {
         activation: TransportAccountActivation,
         replaced: usize,
         attempt: SubscriptionAttempt,
-        issued: &[NostrSubscription],
+        routes: &[NostrSubscription],
+        batches: &[NostrSubscription],
     ) {
-        self.metrics.subscriptions_created += 1 + activation.group_subscriptions.len();
+        self.metrics.subscriptions_created += 1 + batches.len();
         self.metrics.subscriptions_removed += replaced;
         // Raise the high-water mark before the routes take a copy of it: the
         // routes are the reconstruction source for `account_subscription_ids`,
@@ -2942,28 +3121,50 @@ impl AdapterState {
                     .map(CanonicalEndpoint::new)
                     .collect(),
                 groups: activation.group_subscriptions,
-                group_since: issued_group_since(issued).collect(),
+                group_since: issued_group_since(routes).collect(),
                 attempt,
+                batches: batches.iter().cloned().map(LiveGroupBatch::new).collect(),
+                next_batch: u32::try_from(batches.len()).unwrap_or(u32::MAX),
             },
         );
         self.rebuild_transport_group_index();
     }
 
+    /// Commit a group sync: its routes, the batches it added, and the routes
+    /// it removed, which no batch wants any more. Returns the batches that
+    /// now carry no wanted route, for the caller to close.
     fn sync_groups(
         &mut self,
         sync: TransportGroupSync,
         added: &[NostrSubscription],
         removed: &[NostrSubscription],
-    ) {
-        if let Some(account) = self.accounts.get_mut(&sync.account_id) {
-            account.groups = sync.group_subscriptions;
-            for subscription in removed {
-                account.group_since.remove(&subscription.route_key());
-            }
-            account.group_since.extend(issued_group_since(added));
-            self.metrics.subscriptions_created += added.len();
-            self.rebuild_transport_group_index();
+        added_batches: &[NostrSubscription],
+    ) -> Vec<NostrSubscription> {
+        let Some(account) = self.accounts.get_mut(&sync.account_id) else {
+            return Vec::new();
+        };
+        account.groups = sync.group_subscriptions;
+        let removed_keys = removed
+            .iter()
+            .map(NostrSubscription::route_key)
+            .collect::<HashSet<_>>();
+        for key in &removed_keys {
+            account.group_since.remove(key);
         }
+        account.group_since.extend(issued_group_since(added));
+        for batch in &mut account.batches {
+            batch.wanted.retain(|key| !removed_keys.contains(key));
+        }
+        account
+            .batches
+            .extend(added_batches.iter().cloned().map(LiveGroupBatch::new));
+        let (live, idle): (Vec<_>, Vec<_>) = std::mem::take(&mut account.batches)
+            .into_iter()
+            .partition(|batch| !batch.wanted.is_empty());
+        account.batches = live;
+        self.metrics.subscriptions_created += added_batches.len();
+        self.rebuild_transport_group_index();
+        idle.into_iter().map(|batch| batch.subscription).collect()
     }
 
     /// Queue relay unsubscribes whose relay-side teardown has not been
@@ -3153,7 +3354,12 @@ impl AdapterState {
         self.sync.begin_staged_subscription_starts();
         self.staged_group_subscriptions = subscriptions
             .iter()
-            .filter(|subscription| matches!(subscription, NostrSubscription::Group { .. }))
+            .filter(|subscription| {
+                matches!(
+                    subscription,
+                    NostrSubscription::Group { .. } | NostrSubscription::GroupBatch { .. }
+                )
+            })
             .map(|subscription| {
                 (
                     subscription.subscription_id(),
@@ -3192,7 +3398,7 @@ impl AdapterState {
     }
 
     /// Subscription ids implied by an account's stored routes: its inbox plus
-    /// one per group.
+    /// one per live group batch.
     ///
     /// Ids are derived from account/group/endpoint state plus the activation
     /// attempt stored alongside those routes — never `since`. `since` is not
@@ -3206,7 +3412,7 @@ impl AdapterState {
         let Some(routes) = self.accounts.get(account_id) else {
             return Vec::new();
         };
-        let mut ids = Vec::with_capacity(1 + routes.groups.len());
+        let mut ids = Vec::with_capacity(1 + routes.batches.len());
         ids.push(
             account_inbox_subscription(
                 account_id,
@@ -3220,9 +3426,12 @@ impl AdapterState {
             )
             .subscription_id(),
         );
-        for group in &routes.groups {
-            ids.push(group_subscription(account_id, group, None, routes.attempt).subscription_id());
-        }
+        ids.extend(
+            routes
+                .batches
+                .iter()
+                .map(|batch| batch.subscription.subscription_id()),
+        );
         ids
     }
 
@@ -3269,12 +3478,11 @@ impl AdapterState {
                 routes.attempt,
             );
             live.push((account.clone(), inbox.subscription_id(), inbox));
-            for group in &routes.groups {
-                let subscription = group_subscription(account, group, None, routes.attempt);
+            for batch in &routes.batches {
                 live.push((
                     account.clone(),
-                    subscription.subscription_id(),
-                    subscription,
+                    batch.subscription.subscription_id(),
+                    batch.subscription.clone(),
                 ));
             }
         }
@@ -3533,6 +3741,81 @@ fn group_subscription(
 /// Route identity of a group subscription, independent of both the `since`
 /// floor and the issuing attempt. Route comparison spans activations, so it
 /// must not see either.
+/// Pack per-route group REQs into batches of at most [`GROUP_BATCH_ROUTES`]
+/// routes that share endpoints and `since`, keeping the routes' order, and
+/// number them from `first_batch`. Only routes with one floor share a batch,
+/// so a deep retained or newly joined route never drags the others' replay
+/// back with it.
+fn pack_group_batches(
+    account_id: &MemberId,
+    routes: &[NostrSubscription],
+    attempt: SubscriptionAttempt,
+    first_batch: u32,
+) -> Vec<NostrSubscription> {
+    type BatchKey = (Vec<TransportEndpoint>, Option<Timestamp>);
+    let mut families: Vec<(BatchKey, Vec<TransportEndpoint>, Vec<GroupBatchRoute>)> = Vec::new();
+    for route in routes {
+        let NostrSubscription::Group {
+            group_id,
+            transport_group_id,
+            endpoints,
+            since,
+            ..
+        } = route
+        else {
+            continue;
+        };
+        let key = (normalized_endpoints(endpoints), *since);
+        let member = GroupBatchRoute {
+            group_id: group_id.clone(),
+            transport_group_id: transport_group_id.clone(),
+        };
+        match families.iter_mut().find(|(family, ..)| *family == key) {
+            Some((_, _, members)) => members.push(member),
+            None => families.push((key, endpoints.clone(), vec![member])),
+        }
+    }
+    let mut batch = first_batch;
+    let mut batches = Vec::new();
+    for ((_, since), endpoints, members) in families {
+        for chunk in members.chunks(GROUP_BATCH_ROUTES) {
+            batches.push(NostrSubscription::GroupBatch {
+                account_id: account_id.clone(),
+                routes: chunk.to_vec(),
+                endpoints: endpoints.clone(),
+                since,
+                attempt,
+                batch,
+            });
+            batch = batch.saturating_add(1);
+        }
+    }
+    batches
+}
+
+/// The route keys of the group routes a batch carries.
+fn batch_route_keys(subscription: &NostrSubscription) -> HashSet<NostrSubscriptionRouteKey> {
+    let NostrSubscription::GroupBatch {
+        account_id,
+        routes,
+        endpoints,
+        ..
+    } = subscription
+    else {
+        return HashSet::new();
+    };
+    let endpoints = normalized_endpoints(endpoints);
+    routes
+        .iter()
+        .map(|route| NostrSubscriptionRouteKey::Group {
+            account_id: account_id.clone(),
+            group_id: route.group_id.clone(),
+            transport_group_id: route.transport_group_id.clone(),
+            endpoints: endpoints.clone(),
+        })
+        .collect()
+}
+
 fn group_route_key(
     account_id: &MemberId,
     group: &TransportGroupSubscription,
@@ -3721,4 +4004,87 @@ fn compact_subscription_id(kind: &str, components: &[&[u8]]) -> String {
 fn hash_component(hasher: &mut Sha256, component: &[u8]) {
     hasher.update((component.len() as u64).to_be_bytes());
     hasher.update(component);
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    fn route(index: u8, endpoint: &str, since: Option<u64>) -> NostrSubscription {
+        NostrSubscription::Group {
+            account_id: MemberId::new(vec![0xA1; 32]),
+            group_id: GroupId::new(vec![index; 16]),
+            transport_group_id: vec![index; 32],
+            endpoints: vec![TransportEndpoint(endpoint.to_owned())],
+            since: since.map(Timestamp),
+            attempt: SubscriptionAttempt::INITIAL,
+        }
+    }
+
+    fn batch_shape(batch: &NostrSubscription) -> (u32, usize, Option<Timestamp>) {
+        let NostrSubscription::GroupBatch {
+            routes,
+            since,
+            batch,
+            ..
+        } = batch
+        else {
+            panic!("a group batch");
+        };
+        (*batch, routes.len(), *since)
+    }
+
+    /// Routes share a batch only with routes on the same relays at the same
+    /// floor, in their order, at most `GROUP_BATCH_ROUTES` to a batch, and the
+    /// batches are numbered from the first number given.
+    #[test]
+    fn routes_pack_by_relays_and_floor_in_whole_batches() {
+        let mut routes = (0..GROUP_BATCH_ROUTES as u8 + 3)
+            .map(|index| route(index, "wss://a.example", Some(100)))
+            .collect::<Vec<_>>();
+        routes.push(route(200, "wss://a.example", Some(50)));
+        routes.push(route(201, "wss://b.example", Some(100)));
+        let account = MemberId::new(vec![0xA1; 32]);
+        let batches = pack_group_batches(&account, &routes, SubscriptionAttempt::INITIAL, 7);
+        assert_eq!(
+            batches.iter().map(batch_shape).collect::<Vec<_>>(),
+            vec![
+                (7, GROUP_BATCH_ROUTES, Some(Timestamp(100))),
+                (8, 3, Some(Timestamp(100))),
+                (9, 1, Some(Timestamp(50))),
+                (10, 1, Some(Timestamp(100))),
+            ]
+        );
+        let ids = batches
+            .iter()
+            .map(NostrSubscription::subscription_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(ids.len(), batches.len(), "every batch has its own id");
+        assert!(batches[0].carries_group(&GroupId::new(vec![0; 16])));
+        assert!(!batches[0].carries_group(&GroupId::new(vec![200; 16])));
+    }
+
+    /// A batch's replay pages as deep, per route it carries, as one route's
+    /// replay did alone.
+    #[test]
+    fn a_batch_replay_pages_per_route_it_carries() {
+        let routes = (0..3)
+            .map(|index| route(index, "wss://a.example", None))
+            .collect::<Vec<_>>();
+        let account = MemberId::new(vec![0xA1; 32]);
+        let batch =
+            pack_group_batches(&account, &routes, SubscriptionAttempt::INITIAL, 0).remove(0);
+        let window = ReplayWindow::for_subscription(&batch).expect("a batch has a window");
+        assert_eq!(window.max_pages(), 3 * REPLAY_PAGE_MAX_PAGES);
+        let NostrAcquisitionScope::GroupsWindow {
+            transport_group_ids,
+            since,
+            until,
+        } = window.acquisition_scope(500)
+        else {
+            panic!("a batch pages its whole filter");
+        };
+        assert_eq!(transport_group_ids.len(), 3);
+        assert_eq!((since, until), (0, 500));
+    }
 }

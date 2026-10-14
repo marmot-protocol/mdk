@@ -160,6 +160,8 @@ pub struct LimitStats {
     pub max_filters_seen: usize,
     pub max_kinds_seen: usize,
     pub max_tag_keys_seen: usize,
+    /// Most values one tag key (`#h`, `#p`, ...) carried in a REQ filter.
+    pub max_tag_values_seen: usize,
     pub disallowed_kinds_seen: BTreeSet<u64>,
     /// REQ filters whose `limit` was clamped (absent or above the clamp).
     pub clamped_filters: usize,
@@ -249,7 +251,7 @@ impl LimitStats {
     pub fn summary(&self) -> String {
         format!(
             "reqs={} accepted={} rejections={:?} active_now={} peak_active={} open_conns={} \
-             conns={} max_filters={} max_kinds={} max_tag_keys={} disallowed_kinds={:?} \
+             conns={} max_filters={} max_kinds={} max_tag_keys={} max_tag_values={} disallowed_kinds={:?} \
              clamped_filters={} max_req_limit={} reqs_with_active_id={} closes={} \
              closes_unknown={} upstream_closed={} neg_opens={} neg_active_now={} neg_closes={} \
              neg_closes_unknown={} neg_cap_notices={} neg_rejections={:?} upstream_neg_errs={} \
@@ -265,6 +267,7 @@ impl LimitStats {
             self.max_filters_seen,
             self.max_kinds_seen,
             self.max_tag_keys_seen,
+            self.max_tag_values_seen,
             self.disallowed_kinds_seen,
             self.clamped_filters,
             self.max_req_limit_seen,
@@ -544,6 +547,21 @@ fn filter_kinds(filter: &Value) -> Vec<u64> {
         .unwrap_or_default()
 }
 
+/// Most values any one tag key carries across `filters`.
+fn max_tag_values(filters: &[Value]) -> usize {
+    filters
+        .iter()
+        .filter_map(Value::as_object)
+        .flat_map(|object| {
+            object
+                .iter()
+                .filter(|(key, _)| key.starts_with('#'))
+                .filter_map(|(_, values)| values.as_array().map(Vec::len))
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// The first limit a set of filters breaks, recording what it saw.
 fn filter_violation(
     filters: &[Value],
@@ -621,6 +639,10 @@ fn inspect_client_frame(
                 &mut shared.stats.max_tag_keys_seen,
                 &mut shared.stats.disallowed_kinds_seen,
             );
+            shared.stats.max_tag_values_seen = shared
+                .stats
+                .max_tag_values_seen
+                .max(max_tag_values(filters));
             if violation.is_none()
                 && !already_active
                 && shared.counted(connection, config) >= config.max_subscriptions

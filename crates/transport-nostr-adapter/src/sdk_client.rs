@@ -554,6 +554,18 @@ fn acquisition_filter(request: &NostrAcquisitionRequest) -> Result<Filter, Nostr
                 None => filter,
             }
         }
+        NostrAcquisitionScope::GroupsWindow {
+            transport_group_ids,
+            since,
+            until,
+        } => Filter::new()
+            .kind(Kind::MlsGroupMessage)
+            .custom_tags(
+                SingleLetterTag::from_char('h').expect("h is a valid single-letter tag"),
+                transport_group_ids.iter().map(hex::encode),
+            )
+            .since(NostrTimestamp::from_secs(*since))
+            .until(NostrTimestamp::from_secs(*until)),
     })
 }
 
@@ -2698,6 +2710,31 @@ impl NostrSdkRelayClient {
                     account_id: account_id.clone(),
                     subscription_id,
                     endpoints: parse_endpoints(endpoints, "group subscription")?,
+                    filter,
+                })
+            }
+            NostrSubscription::GroupBatch {
+                account_id,
+                routes,
+                endpoints,
+                since,
+                ..
+            } => {
+                let h_tags = routes
+                    .iter()
+                    .map(|route| hex::encode(&route.transport_group_id))
+                    .collect::<std::collections::BTreeSet<_>>();
+                let mut filter = Filter::new()
+                    .kind(Kind::MlsGroupMessage)
+                    .custom_tags(SingleLetterTag::from_char('h').expect("h is a tag"), h_tags);
+                if let Some(since) = since {
+                    filter = filter.since(NostrTimestamp::from_secs(since.0));
+                }
+                let subscription_id = SubscriptionId::new(subscription.subscription_id());
+                Ok(NostrSdkSubscriptionPlan {
+                    account_id: account_id.clone(),
+                    subscription_id,
+                    endpoints: parse_endpoints(endpoints, "group batch subscription")?,
                     filter,
                 })
             }
@@ -5331,13 +5368,14 @@ mod tests {
             .add_event(stored_group_event(&group.transport_group_id, 5_000))
             .await
             .unwrap();
-        let group_req = NostrSubscription::Group {
+        // The activation's only group batch.
+        let group_req = NostrSubscription::GroupBatch {
             account_id: account_id.clone(),
-            group_id: group.group_id.clone(),
-            transport_group_id: group.transport_group_id.clone(),
+            routes: Vec::new(),
             endpoints: group.endpoints.clone(),
             since: None,
             attempt: SubscriptionAttempt::INITIAL.next(),
+            batch: 0,
         }
         .subscription_id();
         // Forward end-of-stored-events as the relay plane's consumer does,

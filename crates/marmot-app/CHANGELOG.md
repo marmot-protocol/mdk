@@ -33,6 +33,12 @@
 ### Fixed
 
 - `edit_message` refuses with `AppError::InvalidEditTarget`, publishing nothing, unless the target is an available chat message this account sent. Before, the CLI, bindings and connector could publish an edit of another account's message, a reaction, or a deleted message to the whole group, report it as sent, and have every recipient ignore it. Queued local edits apply the same rule at admission. The check is fail-fast against this device's view when the edit is requested, not a guarantee: recipients stay authoritative, and a delete that lands afterwards still yields an ignored edit. A target whose own publish failed and is awaiting retry stays editable.
+- Accounts in many groups no longer fill a relay connection's REQ limit (mdk#2266).
+  Live group subscriptions go out in batches of up to 50 routes per REQ instead of
+  one REQ per group, so a 1,000-group account holds about 21 REQs per relay where
+  it used to hit strfry's 200 at about 200 groups. Groups past the limit are no longer
+  refused, and history recovery's fetches on that connection always find room.
+
 - Inviting or looking up an account that has published only legacy-profile KeyPackages
   (including MDK 0.8 publications) returns `MissingKeyPackage` with reason `ObsoleteOnly`
   instead of `InvalidKeyPackageEvent` (mdk#1975). Legacy packages are still never selected,

@@ -1063,9 +1063,7 @@ async fn notification_lag_reissues_reqs_whose_eose_it_may_have_lost() {
     let inbox_id = issued_id(&relay, |subscription| {
         matches!(subscription, NostrSubscription::AccountInbox { .. })
     });
-    let group_id = issued_id(&relay, |subscription| {
-        matches!(subscription, NostrSubscription::Group { .. })
-    });
+    let group_id = issued_id(&relay, NostrSubscription::is_group_route);
     let maintenance_id = relay_plane
         .inner
         .transport
@@ -1193,10 +1191,7 @@ async fn notification_lag_repair_leaves_reqs_issued_after_the_lag() {
         .unwrap();
     let group_id = |byte: u8| {
         issued_id(&relay, |subscription| {
-            matches!(
-                subscription,
-                NostrSubscription::Group { group_id, .. } if group_id.as_slice() == [byte; 16]
-            )
+            subscription.carries_group(&GroupId::new(vec![byte; 16]))
         })
     };
     let inbox_id = issued_id(&relay, |subscription| {
@@ -1967,7 +1962,15 @@ async fn unsafe_group_routes_isolated() {
         .await
         .unwrap();
     let subscriptions = relay.subscriptions.lock().unwrap().clone();
-    assert_eq!(subscriptions.len(), 3, "inbox and two usable groups");
+    // The two usable groups share the safe relay, so one batch carries both.
+    assert_eq!(subscriptions.len(), 2, "inbox and one batch");
+    let batch = subscriptions
+        .iter()
+        .find(|subscription| subscription.is_group_route())
+        .expect("the usable groups' batch");
+    for (id, usable) in [(0, true), (1, true), (2, false)] {
+        assert_eq!(batch.carries_group(&GroupId::new(vec![id; 16])), usable);
+    }
     for subscription in subscriptions {
         assert_eq!(subscription.endpoints(), std::slice::from_ref(&safe));
     }
@@ -2075,6 +2078,7 @@ async fn relay_plane_deduplicates_canonical_relay_endpoints() {
     assert!(subscriptions.iter().all(|subscription| match subscription {
         NostrSubscription::AccountInbox { endpoints, .. }
         | NostrSubscription::Group { endpoints, .. }
+        | NostrSubscription::GroupBatch { endpoints, .. }
         | NostrSubscription::GroupMaintenance { endpoints, .. } => endpoints.len() == 1,
     }));
 }
@@ -2622,17 +2626,19 @@ async fn group_subscriptions_remain_account_scoped_for_shared_group_routes() {
     let subscriptions = relay.subscriptions.lock().unwrap().clone();
     let group_subscriptions = subscriptions
         .iter()
-        .filter(|subscription| matches!(subscription, NostrSubscription::Group { .. }))
+        .filter(|subscription| subscription.is_group_route())
         .collect::<Vec<_>>();
     assert_eq!(group_subscriptions.len(), 2);
-    assert!(group_subscriptions.iter().any(|subscription| matches!(
-        subscription,
-        NostrSubscription::Group { account_id, .. } if account_id == &alice
-    )));
-    assert!(group_subscriptions.iter().any(|subscription| matches!(
-        subscription,
-        NostrSubscription::Group { account_id, .. } if account_id == &bob
-    )));
+    assert!(
+        group_subscriptions
+            .iter()
+            .any(|subscription| subscription.account_id() == &alice)
+    );
+    assert!(
+        group_subscriptions
+            .iter()
+            .any(|subscription| subscription.account_id() == &bob)
+    );
 }
 
 #[tokio::test]
