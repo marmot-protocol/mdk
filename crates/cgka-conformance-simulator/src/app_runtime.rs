@@ -2664,6 +2664,7 @@ fn app_error_kind(error: &AppError) -> &str {
         AppError::GroupRemoved(_) => "group_removed",
         AppError::GroupDisbanding(_) => "group_disbanding",
         AppError::GroupCatchingUp(_) => "group_catching_up",
+        AppError::GroupCommitUndelivered(_) => "group_commit_undelivered",
         AppError::GroupInviteNotPending => "group_invite_not_pending",
         AppError::UserBlocked => "user_blocked",
         AppError::MessageDraftRevisionConflict => "message_draft_revision_conflict",
@@ -2702,6 +2703,7 @@ fn app_error_retryable(error: &AppError) -> bool {
             | AppError::DirectConversationIndexNotReady
             | AppError::MemberDiscoveryIncomplete(_)
             | AppError::GroupCatchingUp(_)
+            | AppError::GroupCommitUndelivered(_)
     )
 }
 fn app_error(error: AppError) -> SubjectError {
@@ -2737,6 +2739,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::TransportClosed
         | AppError::AccountCatchUp(_)
         | AppError::GroupCatchingUp(_)
+        | AppError::GroupCommitUndelivered(_)
         | AppError::FullHistoryRepairIncomplete { .. }
         | AppError::RelayDirectory(_)
         | AppError::MemberDiscoveryIncomplete(_)

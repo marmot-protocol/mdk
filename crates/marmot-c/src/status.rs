@@ -147,10 +147,13 @@ pub enum MarmotStatus {
     /// The group moved past this device and recovery has not caught it up;
     /// group changes would fork it. Retry once it has synced (mdk#2258).
     GroupCatchingUp = 101,
+    /// The group's last change has not reached every group relay yet; group
+    /// changes wait while MDK retries them (mdk#2255).
+    GroupCommitUndelivered = 102,
     /// Completed discovery found only validated obsolete KeyPackages.
-    ObsoleteKeyPackage = 102,
+    ObsoleteKeyPackage = 103,
     /// Bounded member discovery could not establish missing or obsolete-only packages.
-    MemberDiscoveryIncomplete = 103,
+    MemberDiscoveryIncomplete = 104,
 }
 
 thread_local! {
@@ -282,6 +285,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::GroupDisbanding { .. } => MarmotStatus::GroupDisbanding,
         MarmotKitError::GroupRemoved { .. } => MarmotStatus::GroupRemoved,
         MarmotKitError::GroupCatchingUp { .. } => MarmotStatus::GroupCatchingUp,
+        MarmotKitError::GroupCommitUndelivered { .. } => MarmotStatus::GroupCommitUndelivered,
         MarmotKitError::StorageClosed { .. } => MarmotStatus::StorageClosed,
         MarmotKitError::GroupSendQueueFull { .. } => MarmotStatus::GroupSendQueueFull,
         MarmotKitError::CreatedGroupProjectionUnavailable { .. } => {
@@ -478,6 +482,9 @@ mod tests {
             MarmotKitError::GroupCatchingUp {
                 group_id_hex: "aa".into(),
             },
+            MarmotKitError::GroupCommitUndelivered {
+                group_id_hex: "aa".into(),
+            },
             MarmotKitError::MemberNotInGroup {
                 group_id_hex: "aa".into(),
                 member_id_hex: "bb".into(),
@@ -528,7 +535,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            94,
+            95,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
@@ -558,14 +565,14 @@ mod tests {
             status_from_error(&MarmotKitError::ObsoleteKeyPackage {
                 account: "private".into()
             }) as i32,
-            102
+            103
         );
         assert!(!take_last_error().unwrap().contains("private"));
         assert_eq!(
             status_from_error(&MarmotKitError::MemberDiscoveryIncomplete {
                 account: "private".into()
             }) as i32,
-            103
+            104
         );
         assert!(!take_last_error().unwrap().contains("private"));
         let mut seen = std::collections::BTreeSet::new();

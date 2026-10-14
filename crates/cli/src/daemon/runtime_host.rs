@@ -183,6 +183,7 @@ async fn dispatch_hosted_runtime_command(
         crate::Command::Group {
             command,
             accept_stale,
+            accept_undelivered,
         } => {
             crate::commands::groups::group_command_with_runtime(
                 &account_home,
@@ -190,7 +191,10 @@ async fn dispatch_hosted_runtime_command(
                 runtime,
                 command,
                 cli.account.clone(),
-                accept_stale,
+                crate::commands::groups::AcceptedGroupChangeRisks {
+                    stale: accept_stale,
+                    undelivered: accept_undelivered,
+                },
             )
             .await
         }
@@ -207,6 +211,7 @@ async fn dispatch_hosted_runtime_command(
         crate::Command::Groups {
             command,
             accept_stale,
+            accept_undelivered,
         } => {
             crate::commands::groups::groups_command_with_runtime(
                 &account_home,
@@ -214,7 +219,10 @@ async fn dispatch_hosted_runtime_command(
                 runtime,
                 command,
                 cli.account.clone(),
-                accept_stale,
+                crate::commands::groups::AcceptedGroupChangeRisks {
+                    stale: accept_stale,
+                    undelivered: accept_undelivered,
+                },
             )
             .await
         }

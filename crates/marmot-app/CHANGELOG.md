@@ -4,7 +4,7 @@
 
 ### Breaking changes
 
-- `AppError` adds `GroupCatchingUp`; update exhaustive matches.
+- `AppError` adds `GroupCatchingUp` and `GroupCommitUndelivered`; update exhaustive matches.
 - `AttachmentTransferState` adds `StorageBlocked`: free disk cannot cover the
   publication reserve for the body. Update exhaustive matches; the job keeps
   its checkpoint and readmits once space frees or on explicit Retry.
@@ -16,6 +16,8 @@
 - `MarmotAppRuntime::submit_prepared_media_snapshot` admits the captured ordinary-media payload with a stable token and consumes only its unchanged captured draft in the same transaction. Newer or cleared drafts cannot replace the payload or block admission.
 
 - `MarmotAppRuntime::acknowledge_group_catching_up` records that the user accepts the fork risk of changing a group that is still catching up, so the next group change at the current epoch proceeds.
+
+- `MarmotAppRuntime::group_commit_delivery` returns the relays still owed the group's last change (`GroupCommitDelivery`), and `acknowledge_group_commit_undelivered` lets the next group change through after `GroupCommitUndelivered`.
 
 ### Fixed
 
@@ -62,6 +64,7 @@
 - Self-update maintenance commits now publish through the same durable frozen fanout as every other commit. They still confirm on the first relay acknowledgement, and the app's fanout retry schedule keeps retrying every group relay that missed them. Self-updates staged before upgrading finish on their legacy record, which no longer stops retrying when its post-confirmation marker write fails.
 - Every publish pass, including secondary retries after a commit confirmed, writes `publish_attempt` and `publish_outcome` audit rows with the endpoints attempted, accepted and failed in that pass.
 - A relay still pending when a multi-relay signed publish meets quorum is now reported as `publish acknowledgement unknown` instead of being dropped from the outcome.
+- Group changes fail with `AppError::GroupCommitUndelivered` once the group's last confirmed change has been owed to a group relay for two minutes. Before, a device could keep building on a change that members reading only the other relays never received (mdk#2255). The check is advisory: after the user accepts the risk, `acknowledge_group_commit_undelivered` lets one change through. Both advisory checks are evaluated together, so a change refused by both can be acknowledged past each in turn. Due self-updates wait up to an hour for delivery. Messages and leave are not affected.
 
 ## 0.13.0 - 2026-10-12
 

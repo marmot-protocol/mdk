@@ -9,11 +9,13 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
-- Append invitation diagnostic statuses `MARMOT_STATUS_OBSOLETE_KEY_PACKAGE` (102) and `MARMOT_STATUS_MEMBER_DISCOVERY_INCOMPLETE` (103). Existing status values remain unchanged; detail strings omit recipient identity. Member discovery failures previously mapped to the relay-directory status use 103; hosts should offer retry for this outcome.
+- Append invitation diagnostic statuses `MARMOT_STATUS_OBSOLETE_KEY_PACKAGE` (103) and `MARMOT_STATUS_MEMBER_DISCOVERY_INCOMPLETE` (104). Existing status values remain unchanged; detail strings omit recipient identity. Member discovery failures previously mapped to the relay-directory status use 104; hosts should offer retry for this outcome.
 - Account attachment pages, bounded borrowed query inputs and opaque cursor/version handles with deep-free and version-clone functions. New records/symbols require matching headers and libraries; existing group history remains supported.
 - Add `marmot_send_prepared_media_with_client_token` for captured ordinary-media admission and conditional draft consumption. Inputs are borrowed; the nullable captured revision remains owned by its selected-draft root. The owned result uses the existing `marmot_local_send_acceptance_free`; layouts and status values are unchanged. Use matching regenerated headers and libraries.
 
 - Add `MARMOT_STATUS_GROUP_CATCHING_UP` (101): a group change was refused because unresolved epoch-gap recovery covers the group's current local epoch (mdk#2258). Retry after it syncs, or call the new `marmot_acknowledge_group_catching_up` once the user accepts that the change may split the group, then retry. Use matching regenerated headers and libraries.
+
+- Add `MARMOT_STATUS_GROUP_COMMIT_UNDELIVERED` (102): a group change was refused because the group's last change has not reached every group relay yet (mdk#2255). Add `marmot_group_commit_delivery` (record `MarmotGroupCommitDelivery`, freed with `marmot_group_commit_delivery_free`) to list the owed relays, and `marmot_acknowledge_group_commit_undelivered` to let one change through once the user accepts the risk. Use matching regenerated headers and libraries.
 
 ### Changed
 

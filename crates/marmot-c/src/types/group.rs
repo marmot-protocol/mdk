@@ -4,7 +4,7 @@ use marmot_uniffi::conversions::{
     AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi, AppGroupHydrationQuarantineReasonFfi,
     AppGroupMemberIdsFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi, AppGroupRecordFfi,
     AppProtocolProfileFfi, AppQuarantinedGroupFfi, CreatedGroupFfi, DisbandFailureReasonFfi,
-    DisbandRequestFfi, EncryptedMediaVersionFfi, GroupAppComponentFfi,
+    DisbandRequestFfi, EncryptedMediaVersionFfi, GroupAppComponentFfi, GroupCommitDeliveryFfi,
     GroupConversationSnapshotFfi, GroupDetailsFfi, GroupInviteDeclineResultFfi,
     GroupLifecycleStateFfi, GroupManagementStateFfi, GroupMemberActionStateFfi,
     GroupMemberDetailsFfi, GroupMutationResultFfi, GroupRecoveryStatusFfi,
@@ -27,6 +27,19 @@ c_mirror! {
     MarmotGroupAppComponent from GroupAppComponentFfi, free marmot_group_app_component_free {
         copy component_id: u16,
         bytes data/data_len,
+    }
+}
+
+c_mirror! {
+    /// The group's oldest change that some group relays have not accepted yet.
+    /// Members who read only those relays cannot follow the group until they do.
+    /// `since` is when the first relay accepted it, in Unix seconds.
+    MarmotGroupCommitDelivery from GroupCommitDeliveryFfi,
+    free marmot_group_commit_delivery_free {
+        str group_id_hex,
+        str_vec owed_relay_urls/owed_relay_urls_len,
+        copy relay_count: u32,
+        copy since: u64,
     }
 }
 
