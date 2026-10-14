@@ -60,7 +60,8 @@ a limit, and does not provide authoritative removal or pagination semantics.
 C8-A/B are discovery, not permission to download. Automatic attachment acquisition
 waits for invitation acceptance; avatars may be acquired before acceptance.
 Retained history remains available after leaving a group. Retain secrets and
-acquired bytes until source deletion/expiry or explicit local removal. Ordinary
+acquired bytes until source deletion/expiry, explicit local removal, or
+least-recently-used eviction under a full retained budget (see below). Ordinary
 history refresh, repair and restart must not undo explicit removal.
 
 The storage migration backfills the derived index once from the existing materialized
@@ -131,10 +132,16 @@ failure. Successful re-admission requeues only parked jobs. Worker integration
 must re-admit affected canonical sources after acceptance/unblocking/rejoin and
 on startup; a due-only sweep cannot discover policy changes.
 
-Bytes have no LRU. Publication enforces a caller-supplied account payload-byte
-budget and a 512 MiB storage ceiling per object; the existing stricter transport
-ciphertext cap remains in force (also 512 MiB, including AEAD overhead). Capacity refusal preserves existing objects and
-requires the caller to pause/retry. Filesystem free-space and WAL overhead admission
+Publication enforces a caller-supplied account payload-byte budget and a 512 MiB
+storage ceiling per object; the existing stricter transport ciphertext cap remains
+in force (also 512 MiB, including AEAD overhead). When new bytes would exceed the
+budget, the least-recently-used Ready bodies are evicted first (migration 0110's
+`retained_used_at`: publication or latest local read). A body used within the last
+hour is never evicted. Eviction validates before mutating: when it cannot cover the
+whole deficit, it releases nothing and the caller refuses as before (pause/retry).
+Staged outgoing uploads and checkpoints are never evicted. An evicted row stays Ready
+without bytes (`PreviouslyAcquiredUnavailable`); ordinary demand never re-arms it, and
+explicit download-again fetches it from its source while the blob remains available. Filesystem free-space and WAL overhead admission
 belong to worker integration. Publication copies the verified plaintext into
 chunk rows of at most 64 KiB, so SQLite keeps no whole-body copy beside the
 caller's buffer. Local storage reads return at most 1 MiB and recheck
@@ -175,7 +182,7 @@ Starting Rust-configurable resource defaults (`AttachmentAcquisitionPolicy::defa
 
 | Policy | Default |
 | --- | --- |
-| Retained plaintext per account | 2 GiB, no eviction |
+| Retained plaintext per account | 2 GiB, least-recently-used eviction |
 | Free disk reserve | 256 MiB, plus four admission-sized objects for SQLite/WAL overhead |
 | Automatic ciphertext ceiling | 64 MiB, enforced during streaming, including chunked bodies |
 | Concurrent automatic transfers | One across accounts in a runtime |
@@ -211,7 +218,7 @@ Worker exit cancels active HTTP and releases permits. Before scheduling any tran
 a new exclusive account worker reclaims abandoned fetching attempts in batches of 64;
 old completions remain fenced, and existing retry deadlines/ready bytes are unchanged.
 Expired leases remain a fallback for interruption recovery.
-Ready bytes are SQLCipher-protected and source/lease/expiry-fenced; no automatic LRU applies.
+Ready bytes are SQLCipher-protected and source/lease/expiry-fenced; a full budget evicts least-recently-used bodies.
 
 C8-C2 introduced complete-body retries. C8-C3 below preserves compatible partial transfers.
 C8-D1 exposes native availability/local bytes; C8-D2 exposes progress and explicit controls.
@@ -258,7 +265,7 @@ The first checkpoint reserves the complete declared ciphertext size against the 
 budget as retained plaintext. Worker admission, append and publication share this accounting;
 existing prefixes can finish when reservations fill the budget. New demand pauses without
 spending transfer attempts. Atomic publication replaces its own reservation while preserving
-other jobs' allocations. Complete small responses skip the final checkpoint write. No retained-byte eviction is introduced. Success, terminal/parked state,
+other jobs' allocations. Complete small responses skip the final checkpoint write. A first checkpoint may evict least-recently-used Ready bodies, never other jobs' prefixes. Success, terminal/parked state,
 source removal/invalidation, explicit removal and store reset delete partials transactionally.
 Expired message jobs cascade to their partials. Abandoned checkpoints expire 24 hours after
 last progress, reclaimed in indexed batches of 64 by non-frozen worker maintenance, including

@@ -1,7 +1,8 @@
 //! C8-C storage foundation. No network, parser, secret warming or scheduler.
 //! Callers request only shared-parser accepted references, reserve media capacity
 //! before claiming, and authenticate/decrypt the complete body before publishing.
-//! Bytes stay in the account's SQLCipher store; there is no attachment LRU.
+//! Bytes stay in the account's SQLCipher store. When the retained budget is
+//! full, the least-recently-used bodies are evicted (`eviction.rs`).
 use crate::chat_presentation::nonnegative;
 use crate::connection::CachedSql;
 use crate::{SqliteAccountStorage, SqliteResultExt, u64_to_i64};
@@ -670,8 +671,8 @@ impl SqliteAccountStorage {
                 .storage()?;
             }
             conn.execute(
-                "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL,storage_blocked_headroom=NULL,storage_park_count=0 WHERE token=?1",
-                [&job.reference.token],
+                "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL,storage_blocked_headroom=NULL,storage_park_count=0,retained_used_at=?2 WHERE token=?1",
+                params![job.reference.token, now],
             )
             .storage()?;
             Ok(AttachmentPublishResult::Published)
@@ -931,6 +932,7 @@ impl SqliteAccountStorage {
             let Some(row_id) = row_id else {
                 return Ok(None);
             };
+            eviction::touch(conn, &reference.token, now)?;
             if let Some(bytes) = file_import::read(conn, &reference.token, offset, limit)? {
                 return Ok(Some(bytes));
             }
@@ -1042,11 +1044,10 @@ fn publication_refusal(
             |r| nonnegative(r, 0),
         )
         .storage()?;
-    if used
+    let projected = used
         .saturating_add(partial_used.saturating_sub(own_partial))
-        .saturating_add(len)
-        > byte_budget
-    {
+        .saturating_add(len);
+    if !eviction::make_room(conn, projected, byte_budget, now)? {
         conn.execute("UPDATE attachment_acquisition SET body_completed=1,state=4,due=NULL,attempt=NULL WHERE token=?1 AND automatic_history=1", [&job.reference.token]).storage()?;
         return Ok(Some(AttachmentPublishResult::CapacityBlocked));
     }
@@ -1061,6 +1062,8 @@ pub use partial::{
     STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS,
 };
 
+mod eviction;
+pub use eviction::ATTACHMENT_EVICTION_PROTECTION_SECONDS;
 mod file_import;
 mod file_staging;
 

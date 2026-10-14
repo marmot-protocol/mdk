@@ -30,6 +30,15 @@
 
 - `MarmotAppRuntime::group_commit_delivery` returns the relays still owed the group's last change (`GroupCommitDelivery`), and `acknowledge_group_commit_undelivered` lets the next group change through after `GroupCommitUndelivered`.
 
+### Changed
+
+- When an account's retained attachment budget is full, the attachment worker
+  and outgoing retention evict the least-recently-used cached bodies instead of
+  re-scheduling every new download indefinitely as `RetryScheduled`. A body
+  published or read within the last hour is kept. An evicted attachment reports
+  `PreviouslyAcquiredUnavailable` and returns through download-again while its
+  blob remains available.
+
 ### Fixed
 
 - `edit_message` refuses with `AppError::InvalidEditTarget`, publishing nothing, unless the target is an available chat message this account sent. Before, the CLI, bindings and connector could publish an edit of another account's message, a reaction, or a deleted message to the whole group, report it as sent, and have every recipient ignore it. Queued local edits apply the same rule at admission. The check is fail-fast against this device's view when the edit is requested, not a guarantee: recipients stay authoritative, and a delete that lands afterwards still yields an ignored edit. A target whose own publish failed and is awaiting retry stays editable.

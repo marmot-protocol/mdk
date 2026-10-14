@@ -79,7 +79,8 @@ impl SqliteAccountStorage {
             let accepted: bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM account_groups WHERE group_id_hex=?1)",[group],|row|row.get(0)).storage()?;
             if !accepted { return Err(invalid("outgoing attachment group unavailable")); }
             let (used,partial,count):(u64,u64,i64)=conn.query_row("SELECT (SELECT byte_count FROM attachment_retention_usage WHERE id=1),(SELECT reserved_bytes FROM attachment_partial_usage WHERE id=1),(SELECT count(*) FROM outgoing_attachment_uploads)",[],|r|Ok((nonnegative(r,0)?,nonnegative(r,1)?,r.get(2)?))).storage()?;
-            if used.saturating_add(partial).saturating_add(incoming)>byte_budget || count+plaintext.len() as i64>MAX_STAGED_UPLOADS {
+            if count+plaintext.len() as i64>MAX_STAGED_UPLOADS
+                || !super::eviction::make_room(&conn,used.saturating_add(partial).saturating_add(incoming),byte_budget,u64_to_i64(now)?)? {
                 return Err(invalid("outgoing attachment retention capacity unavailable"));
             }
             let mut tokens=Vec::with_capacity(plaintext.len());
@@ -220,7 +221,8 @@ impl SqliteAccountStorage {
                 let budget:Option<u64>=conn.query_row("SELECT retained_bytes FROM attachment_download_policy WHERE id=1",[],|r|nonnegative(r,0)).optional().storage()?;
                 let keep_staged=staging_has_unfulfilled_owner(&conn,&token,now,Some((message,entry.attachment_index)))?;
                 let credit=if keep_staged || consumed.contains_key(&token) {0}else{size};
-                if !already && credit != size && used.saturating_add(partial.saturating_sub(own_partial)).saturating_add(size).saturating_sub(credit).saturating_sub(consumed.values().copied().sum::<u64>())>budget.unwrap_or(fallback_budget) {
+                let projected=used.saturating_add(partial.saturating_sub(own_partial)).saturating_add(size).saturating_sub(credit).saturating_sub(consumed.values().copied().sum::<u64>());
+                if !already && credit != size && !super::eviction::make_room(&conn,projected,budget.unwrap_or(fallback_budget),u64_to_i64(now)?)? {
                     conn.execute("UPDATE attachment_acquisition SET automatic_history=1,body_completed=1,state=4,due=NULL,attempt=NULL WHERE token=?1",[&asset.token]).storage()?;
                     continue;
                 }
@@ -236,7 +238,7 @@ impl SqliteAccountStorage {
                 // INSERT ... SELECT bytes would materialize the whole value in
                 // SQLite; copy through bounded incremental BLOB I/O instead.
                 if !already {copy_staged_body(&conn,&token,&asset.token,size)?;}
-                conn.execute("UPDATE attachment_acquisition SET state=3,body_completed=1,due=NULL,attempt=NULL,permission_paused=0 WHERE token=?1",[&asset.token]).storage()?;
+                conn.execute("UPDATE attachment_acquisition SET state=3,body_completed=1,due=NULL,attempt=NULL,permission_paused=0,retained_used_at=?2 WHERE token=?1",params![asset.token,u64_to_i64(now)?]).storage()?;
                 if !keep_staged {consumed.insert(token,size);} promoted+=1;
             }
             let conn=self.lock()?;

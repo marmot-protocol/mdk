@@ -1425,14 +1425,14 @@ fn attachment_partial_reservation_prevents_pressure_deadlock() {
     assert_eq!(partial_usage(&store), 6);
     assert!(
         !store
-            .attachment_acquisition_fits_budget(&new, 20, 20)
+            .attachment_acquisition_fits_budget(&new, 20, 20, 12)
             .unwrap()
     );
     // A full reservation can resume even when the account budget is saturated,
     // including when its size is smaller than the policy's maximum transfer.
     assert!(
         store
-            .attachment_acquisition_fits_budget(&a, 20, 20)
+            .attachment_acquisition_fits_budget(&a, 20, 20, 12)
             .unwrap()
     );
     assert!(
@@ -1444,13 +1444,13 @@ fn attachment_partial_reservation_prevents_pressure_deadlock() {
     store.remove_local_attachment(GROUP, "a", 0).unwrap();
     assert!(
         store
-            .attachment_acquisition_fits_budget(&new, 10, 20)
+            .attachment_acquisition_fits_budget(&new, 10, 20, 12)
             .unwrap()
     );
     store.remove_local_attachment(GROUP, "b", 0).unwrap();
     assert!(
         store
-            .attachment_acquisition_fits_budget(&new, 20, 20)
+            .attachment_acquisition_fits_budget(&new, 20, 20, 12)
             .unwrap()
     );
 }
@@ -1540,7 +1540,7 @@ fn attachment_partial_cleanup_is_locator_ciphertext_and_attempt_scoped() {
     assert_eq!(partial_usage(&store), 0);
     assert!(
         store
-            .attachment_acquisition_fits_budget(&asset, 100, 100)
+            .attachment_acquisition_fits_budget(&asset, 100, 100, 13)
             .unwrap()
     );
 }
@@ -3968,6 +3968,7 @@ fn array_publication_declares_length_and_skips_the_trigger_rewrite() {
     assert_eq!(store.lock().unwrap().total_changes() - before, 3);
 }
 
+mod eviction;
 mod outgoing;
 mod outgoing_files;
 mod promotion;

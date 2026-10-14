@@ -54,7 +54,8 @@ pub(super) fn stage(
         let accepted: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM account_groups WHERE group_id_hex=?1)", [group], |r| r.get(0)).storage()?;
         if !accepted { return Err(invalid("outgoing attachment group unavailable")); }
         let (used,partial,count): (u64,u64,i64) = conn.query_row("SELECT (SELECT byte_count FROM attachment_retention_usage WHERE id=1),(SELECT reserved_bytes FROM attachment_partial_usage WHERE id=1),(SELECT count(*) FROM outgoing_attachment_uploads)", [], |r| Ok((nonnegative(r,0)?,nonnegative(r,1)?,r.get(2)?))).storage()?;
-        if used.saturating_add(partial).saturating_add(incoming)>budget || count+sources.len() as i64>256 {
+        if count+sources.len() as i64>256
+            || !super::eviction::make_room(&conn, used.saturating_add(partial).saturating_add(incoming), budget, u64_to_i64(now)?)? {
             return Err(invalid("outgoing attachment retention capacity unavailable"));
         }
         let mut result = Vec::with_capacity(sources.len());

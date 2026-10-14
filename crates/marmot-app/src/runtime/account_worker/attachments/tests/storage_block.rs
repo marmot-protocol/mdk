@@ -14,6 +14,7 @@
 use super::*;
 use crate::media::attachment_resume::test_free_space;
 use crate::runtime::account_worker::attachments::test_clock;
+use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use storage_sqlite::{AttachmentTransferState, STORAGE_READMIT_MARGIN_BYTES};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1249,6 +1250,118 @@ async fn receive_peak(plain_len: u64, transfer_limit: u64, explicit: bool, sink:
             assert_eq!(requests.load(Ordering::SeqCst), 2);
         }
     }
+    stop.send(()).unwrap();
+    server.await.unwrap();
+}
+
+/// Retain `plain` under a second message with the same attachment slot, as a
+/// body published long ago, and return its asset reference.
+fn retain_old_body(
+    storage: &SqliteAccountStorage,
+    reference: &crate::MediaAttachmentReference,
+    plain: &[u8],
+) -> storage_sqlite::AttachmentAssetRef {
+    let (message, source) = ("44".repeat(32), "55".repeat(32));
+    let tag = vec![
+        "imeta".into(),
+        format!("v {}", reference.version),
+        format!("locator blossom-v1 {}", reference.locators[0].value),
+        format!("ciphertext_sha256 {}", reference.ciphertext_sha256),
+        format!("plaintext_sha256 {}", reference.plaintext_sha256),
+        format!("nonce {}", reference.nonce_hex),
+        format!("m {}", reference.media_type),
+        format!("filename {}", reference.file_name),
+    ];
+    storage
+        .record_app_event(&StoredAppEvent {
+            group_id_hex: GROUP.into(),
+            message_id_hex: message.clone(),
+            source_message_id_hex: Some(source.clone()),
+            source_epoch: Some(3),
+            direction: "received".into(),
+            sender: "33".repeat(32),
+            plaintext: String::new(),
+            kind: 9,
+            tags: vec![tag],
+            recorded_at: 5,
+            received_at: 5,
+            origin_commit_id: None,
+            moderation_grant: false,
+        })
+        .unwrap();
+    // Published at an early clock, so its last use is long past.
+    let entry = storage
+        .attachment_control_entry(GROUP, &message, &source, 0, 50)
+        .unwrap()
+        .unwrap();
+    let digest: [u8; 32] = Sha256::digest(plain).into();
+    let storage_sqlite::AttachmentDemand::Requested(asset) = storage
+        .request_attachment_acquisition(GROUP, &entry, digest, 50)
+        .unwrap()
+    else {
+        panic!("old body demand");
+    };
+    let job = storage
+        .claim_attachment_acquisition(&asset, 100, 200)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        storage
+            .complete_attachment_acquisition(&job, plain, 100, u64::MAX)
+            .unwrap(),
+        storage_sqlite::AttachmentPublishResult::Published
+    );
+    asset
+}
+
+/// A full retained budget used to defer admission every 15 s without end, so
+/// the download spun forever. Now the least-recently-used body is evicted, the
+/// new download publishes, and the evicted one waits for download-again.
+#[tokio::test]
+async fn full_retained_budget_evicts_the_oldest_body_for_a_new_download() {
+    let plain = vec![0x55; 700 * 1024];
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (reference, cipher) = loopback_reference(&listener, &plain);
+    let requests = Arc::new(AtomicUsize::new(0));
+    let (stop, stopped) = oneshot::channel();
+    let server = serve(
+        listener,
+        cipher,
+        Framing {
+            etag: false,
+            chunked: false,
+        },
+        Arc::clone(&requests),
+        stopped,
+    );
+    let mut fixture = explicit_fixture(&reference, MIB).await;
+    let old = retain_old_body(&fixture.storage, &reference, &plain);
+    fixture.policy.retained_bytes = MIB;
+    fixture
+        .storage
+        .set_attachment_download_policy(&fixture.policy, crate::unix_now_seconds())
+        .unwrap();
+    fixture.tick().await;
+    // Publication evicts the old body: both bodies do not fit one MiB.
+    fixture.publish_memory(&plain).await;
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    let evicted = fixture
+        .storage
+        .attachment_transfer_status(
+            GROUP,
+            &"44".repeat(32),
+            &"55".repeat(32),
+            0,
+            crate::unix_now_seconds(),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(evicted.reference, Some(old));
+    assert_eq!(
+        evicted.state,
+        AttachmentTransferState::PreviouslyAcquiredUnavailable
+    );
     stop.send(()).unwrap();
     server.await.unwrap();
 }

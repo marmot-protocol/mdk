@@ -354,8 +354,10 @@ impl SqliteAccountStorage {
             let used = reserved_bytes(&conn)?;
             let replaced = old.as_ref().map_or(0, |v| v.3);
             // Reserve the complete representation on its first checkpoint.
-            // Other interrupted jobs cannot consume space needed to finish it.
-            if used.saturating_sub(replaced).saturating_add(identity.total) > byte_budget {
+            // Other interrupted jobs cannot consume space needed to finish it;
+            // least-recently-used retained bodies are evicted to make room.
+            let projected = used.saturating_sub(replaced).saturating_add(identity.total);
+            if !super::eviction::make_room(&conn, projected, byte_budget, u64_to_i64(now)?)? {
                 return Ok(false);
             }
             if offset == 0 {
@@ -415,11 +417,14 @@ impl SqliteAccountStorage {
 
     /// Account bytes committed to retained data and complete partial representations.
     /// Existing prefixes keep their reservation; new transfers reserve the policy cap.
+    /// Bytes that least-recently-used eviction could release count as room, but
+    /// this check never evicts: the transfer does, once it knows the real size.
     pub fn attachment_acquisition_fits_budget(
         &self,
         reference: &AttachmentAssetRef,
         maximum: u64,
         budget: u64,
+        now: u64,
     ) -> StorageResult<bool> {
         let conn = self.lock()?;
         if !matches_store(&conn, reference)? {
@@ -437,11 +442,11 @@ impl SqliteAccountStorage {
             [&reference.token], |r| nonnegative(r,0),
         ).storage()?;
         let required = if own > 0 { own.min(maximum) } else { maximum };
-        Ok(reserved_bytes(&conn)?
+        let projected = reserved_bytes(&conn)?
             .saturating_sub(own)
             .saturating_sub(own_import)
-            .saturating_add(required)
-            <= budget)
+            .saturating_add(required);
+        super::eviction::can_make_room(&conn, projected, budget, u64_to_i64(now)?)
     }
 
     /// Read only under a current attempt. Optional expected identity is checked

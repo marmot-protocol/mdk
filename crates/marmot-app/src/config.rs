@@ -67,7 +67,8 @@ pub enum AttachmentAcquisitionMode {
 }
 
 /// Automatic attachment policy. Quota is retained plaintext; disk admission
-/// additionally reserves space for SQLite/WAL copies. No automatic eviction.
+/// additionally reserves space for SQLite/WAL copies. A full quota evicts the
+/// least-recently-used retained bodies; one used within the last hour is kept.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttachmentAcquisitionPolicy {
     pub retained_bytes_per_account: u64,

@@ -35,6 +35,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `MARMOT_ATTACHMENT_TRANSFER_STATE_STORAGE_BLOCKED`; existing discriminants
   are unchanged. Recompile against the regenerated `marmot.h` with the matching
   library and handle the new value as "free up storage", not as a retry timer.
+- A full retained attachment budget now evicts the least-recently-used cached
+  bodies instead of leaving new downloads in `MARMOT_ATTACHMENT_TRANSFER_STATE_RETRY_SCHEDULED`
+  indefinitely. A body published or read within the last hour is kept. An evicted
+  attachment reports `MARMOT_ATTACHMENT_TRANSFER_STATE_PREVIOUSLY_ACQUIRED_UNAVAILABLE`;
+  offer download-again.
 
 ## [0.13.0] - 2026-10-12
 

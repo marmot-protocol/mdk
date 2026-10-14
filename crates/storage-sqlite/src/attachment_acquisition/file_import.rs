@@ -140,13 +140,14 @@ pub(super) fn complete(
         if !owns(&conn, job, &reservation.nonce)? {
             return Ok(AttachmentPublishResult::Superseded);
         }
-        if let Some(refused) = publication_refusal(&conn, job, u64_to_i64(clock())?, 0, budget)? {
+        let now = u64_to_i64(clock())?;
+        if let Some(refused) = publication_refusal(&conn, job, now, 0, budget)? {
             return Ok(refused);
         }
         seal_chunked_file(&conn, &job.reference.token, &reservation.nonce)?;
         conn.execute(
-            "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL,storage_blocked_headroom=NULL,storage_park_count=0 WHERE token=?1",
-            [&job.reference.token],
+            "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL,storage_blocked_headroom=NULL,storage_park_count=0,retained_used_at=?2 WHERE token=?1",
+            params![job.reference.token, now],
         )
         .storage()?;
         Ok(AttachmentPublishResult::Published)

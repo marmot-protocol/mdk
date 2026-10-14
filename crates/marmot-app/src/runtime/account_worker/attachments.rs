@@ -218,7 +218,8 @@ pub(super) fn schedule(
         || partials == 64
         || orphan_uploads == 64;
     // Metadata and expiry maintenance continue when disk or network slots are full.
-    // Admission never evicts an acquired asset and never increments attempts while paused.
+    // Admission itself never evicts an acquired asset and never increments attempts
+    // while paused. Checkpoint and publication evict least-recently-used bodies.
     if http.permits.available_permits() <= 1 {
         admission.waiting = None;
         return Ok(more);
@@ -301,6 +302,7 @@ pub(super) fn schedule(
             &candidate,
             reservation,
             policy.retained_bytes,
+            now,
         )? {
             // Defer without spending an attempt. This also lets reserved prefixes
             // beyond the bounded candidate page reach the worker under pressure.

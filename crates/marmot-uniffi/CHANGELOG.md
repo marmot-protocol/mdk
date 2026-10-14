@@ -35,6 +35,14 @@
 
 - `Marmot::group_commit_delivery` returns the relays still owed the group's last change (`GroupCommitDeliveryFfi`), and `Marmot::acknowledge_group_commit_undelivered` lets one change through after `GroupCommitUndelivered` once the user accepts the risk. See [the delivery notes](README.md#history-may-be-incomplete-notices).
 
+### Changed
+
+- A full retained attachment budget now evicts the least-recently-used cached
+  bodies instead of leaving new downloads in `RetryScheduled` indefinitely. A
+  body published or read within the last hour is kept. An evicted attachment
+  reports `PreviouslyAcquiredUnavailable`; offer download-again. See
+  [the attachment access contract](ATTACHMENT-ACCESS.md).
+
 ### Fixed
 
 - `edit_message` returns `InvalidEditTarget`, publishing nothing, unless the target is an available chat message this account sent. Before, an edit of another account's message, a reaction or a deleted message was published to the group and reported as sent, then ignored by every recipient. The check uses this device's view when the edit is requested; recipients stay authoritative.

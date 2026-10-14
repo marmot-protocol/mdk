@@ -11,6 +11,12 @@
   a partial index for parked rows, and keeps ciphertext checkpoints for jobs
   parked on disk space.
 - `AttachmentTransferState` adds `StorageBlocked`; update exhaustive matches.
+- Migration 0110 advances account storage to schema 110 on first open. Older
+  binaries reject the upgraded database; downgrade is unsupported. It adds
+  `attachment_acquisition.retained_used_at` and a partial index for
+  least-recently-used eviction. Bodies retained before the upgrade start as
+  the oldest.
+- `attachment_acquisition_fits_budget` takes the current Unix time.
 
 ### Added
 
@@ -34,6 +40,19 @@
   `limit_database_pages_for_test` and `attachment_partial_bytes_for_test` to
   dependents' tests (mdk#2239).
 - `SqliteAccountStorage::epoch_gap_recovery_open_since` reports when an unresolved epoch-gap obligation (pending, parked or retired by the user) covering a group's local epoch was first armed.
+
+### Changed
+
+- A full retained budget no longer blocks new attachment bytes indefinitely.
+  Publication, a transfer's first checkpoint reservation, outgoing staging and
+  sent-copy promotion evict the least-recently-used Ready bodies (by
+  publication or latest local read) until the new bytes fit. A body used within
+  `ATTACHMENT_EVICTION_PROTECTION_SECONDS` (one hour) is kept, and staged
+  uploads and checkpoints are never evicted. Eviction releases nothing when it
+  cannot cover the whole deficit, so the caller refuses as before. Admission
+  counts evictable bytes as room without evicting. An evicted row reports
+  `PreviouslyAcquiredUnavailable`; ordinary demand never re-arms it, and
+  explicit download-again restores it.
 
 ### Fixed
 

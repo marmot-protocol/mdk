@@ -138,11 +138,14 @@ plus four times the body free, counting the staging, checkpoint and decrypted-fi
 attempt itself still has to write: about four bodies for the in-memory sink (five with a
 strong validator, for its checkpoint), five for the file sink and six for the file sink with
 a strong validator. Automatic transfers have a two-minute deadline. Policy requires retained quota at
-least equal to the automatic cap. Retained-quota pressure appears as `RetryScheduled` with a
-retry time; a body the device cannot publish parks as `StorageBlocked` (see the state table);
+least equal to the automatic cap. When the retained quota is full, the least-recently-used
+cached bodies are evicted to make room. A body published or read within the last hour is never
+evicted; an evicted body reports `PreviouslyAcquiredUnavailable` and returns through
+download-again while its blob remains available. Quota pressure that eviction cannot relieve
+appears as `RetryScheduled` with a retry time; a body the device cannot publish parks as `StorageBlocked` (see the state table);
 an intentionally high disk reserve can pause work.
 Disable stops active automatic work and pauses automatic queues; explicit work and cached files
-remain. Re-enable preserves individual cancellations/removals. No automatic retained-byte eviction.
+remain. Re-enable preserves individual cancellations/removals.
 Raising the cap readmits size-policy failures with remaining retry budget, never cryptographic failures. The legacy
 `downloadMedia` API remains compatible and returns transient complete bytes.
 
@@ -300,8 +303,8 @@ header/library; returned automatic-request records use
 ## Genuine outgoing retention
 
 Migration 101 attempts private staging in the encrypted per-account database after a
-successful HTTP upload. Retention shares the existing byte quota and checks free-disk
-reserve and SQLite/WAL headroom, without evicting retained assets. Quota, disk, staging
+successful HTTP upload. Retention shares the existing byte quota, evicting least-recently-used
+retained bodies when the quota is full, and checks free-disk reserve and SQLite/WAL headroom. Quota, disk, staging
 capacity or storage failures skip optional retention; they cannot reject the upload
 or prevent sending. Existing upload file/count/aggregate limits remain unchanged.
 The optional store accepts at most 256 outstanding staged uploads.
