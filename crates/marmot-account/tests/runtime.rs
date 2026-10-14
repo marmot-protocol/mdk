@@ -3770,22 +3770,25 @@ async fn frozen_self_update_publish_failure_records_per_relay_causes() {
     runtime.run_due_maintenance().await.unwrap();
 
     // One pass: the exact commit goes to each relay as its own request.
+    let single_endpoints = |publishes: &[TransportPublishRequest]| {
+        let mut endpoints = publishes
+            .iter()
+            .map(|publish| {
+                assert_eq!(publish.required_acks, 1);
+                let [endpoint] = publish.target.endpoints() else {
+                    panic!("one endpoint per request: {:?}", publish.target);
+                };
+                endpoint.clone()
+            })
+            .collect::<Vec<_>>();
+        endpoints.sort_by(|left, right| left.0.cmp(&right.0));
+        endpoints
+    };
     let publishes = adapter.publishes();
     assert_eq!(publishes.len(), 2);
     assert_eq!(publishes[0].message, publishes[1].message);
-    let mut published_endpoints = publishes
-        .iter()
-        .map(|publish| {
-            assert_eq!(publish.required_acks, 1);
-            let [endpoint] = publish.target.endpoints() else {
-                panic!("one endpoint per request: {:?}", publish.target);
-            };
-            endpoint.clone()
-        })
-        .collect::<Vec<_>>();
-    published_endpoints.sort_by(|left, right| left.0.cmp(&right.0));
     assert_eq!(
-        published_endpoints,
+        single_endpoints(&publishes),
         vec![refused.clone(), timed_out.clone()]
     );
 
@@ -3833,7 +3836,11 @@ async fn frozen_self_update_publish_failure_records_per_relay_causes() {
     // A relay that just failed waits for its backoff before the exact retry.
     runtime.run_due_maintenance().await.unwrap();
     assert_eq!(adapter.publishes().len(), 2);
-    wall.set(wall.now().0.saturating_add(5));
+    let failed_at = wall.now().0;
+    wall.set(failed_at + 4);
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(adapter.publishes().len(), 2, "backoff has not elapsed");
+    wall.set(failed_at + 5);
     runtime.run_due_maintenance().await.unwrap();
     let publishes = adapter.publishes();
     assert_eq!(
@@ -3845,6 +3852,11 @@ async fn frozen_self_update_publish_failure_records_per_relay_causes() {
         publishes
             .iter()
             .all(|publish| publish.message == publishes[0].message)
+    );
+    assert_eq!(
+        single_endpoints(&publishes[2..]),
+        vec![refused.clone(), timed_out.clone()],
+        "the retry reaches every failed relay"
     );
     drop(runtime);
 
