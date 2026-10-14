@@ -11,6 +11,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- `wn messages edit` refuses, publishing nothing, unless the target is an available chat message this account sent, and reports `invalid_edit_target` in JSON output. A burst of edits of one message reports the retryable `edit_rate_limited` instead of publishing out of order. Both used to fall through to `command_failed` or publish an edit every recipient ignored.
+
 - Group changes on a group that may have moved past this device now fail with the JSON error code
   `group_catching_up` (carrying `group_id`) instead of committing from the stale epoch and forking
   the group (mdk#2258). Retry once the group has synced, or pass `--accept-stale` to `wn groups` to

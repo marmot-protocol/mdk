@@ -4465,10 +4465,10 @@ impl AppClient {
                 ref target_message_id,
                 ..
             } if prepared.is_none() => {
-                let target = self
-                    .app
-                    .account_storage(&self.state.label)?
-                    .timeline_message(&hex::encode(group_id.as_slice()), target_message_id)?
+                let storage = self.app.account_storage(&self.state.label)?;
+                let group_hex = hex::encode(group_id.as_slice());
+                storage
+                    .timeline_message(&group_hex, target_message_id)?
                     .filter(|target| {
                         target.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT
                             && target.sender == sender
@@ -4480,9 +4480,11 @@ impl AppClient {
                             })
                     })
                     .ok_or(AppError::InvalidEditTarget)?;
+                // Not `target.edit`: a target awaiting its publish retry exposes
+                // no accepted edits, but its earlier edits still compete.
                 created_at = crate::local_submissions::next_edit_created_at(
                     created_at,
-                    target.edit.map(|previous| previous.edited_at),
+                    storage.latest_authored_edit_at(&group_hex, target_message_id, &sender)?,
                 )
                 .ok_or(AppError::EditRateLimited)?;
                 intent

@@ -117,6 +117,41 @@ pub(super) fn apply(row: &mut TimelineRow, versions: &[TimelineEditVersion]) {
 }
 
 impl SqliteAccountStorage {
+    /// The newest timestamp `sender` put on any stored edit of `target`, whether
+    /// or not it is accepted right now. A target whose own publish is being
+    /// retried exposes no accepted edits, yet its earlier edits still compete by
+    /// `(second, event id)` once it recovers, so the next edit must follow them.
+    pub fn latest_authored_edit_at(
+        &self,
+        group: &str,
+        target: &str,
+        sender: &str,
+    ) -> StorageResult<Option<u64>> {
+        self.connection.with_deferred_read(|conn| {
+            let latest: Option<i64> = conn
+                .query_row_cached(
+                    "SELECT MAX(app_events.recorded_at)
+                     FROM message_modifier_edges AS edges
+                     CROSS JOIN app_events
+                       ON app_events.group_id_hex = edges.group_id_hex
+                      AND app_events.message_id_hex = edges.modifier_message_id_hex
+                     WHERE edges.group_id_hex = ?1
+                       AND edges.kind = ?2
+                       AND edges.target_message_id_hex = ?3
+                       AND app_events.sender = ?4",
+                    params![
+                        group,
+                        u64_to_i64(MARMOT_APP_EVENT_KIND_EDIT)?,
+                        target,
+                        sender
+                    ],
+                    |row| row.get(0),
+                )
+                .storage()?;
+            Ok(latest.map(|at| at.try_into().unwrap_or_default()))
+        })
+    }
+
     /// Read accepted edit history separately from the bounded screen payload.
     /// A cursor is an exclusive (timestamp, id) key, so it survives removal of its event.
     /// Output is capped at 100; resolution work is scoped to this target's retained edits.
