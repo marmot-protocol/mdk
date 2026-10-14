@@ -97,6 +97,12 @@
   withheld events, the pass's own budget, or a local error. `relays_failed`
   and `relays_incomplete` now count distinct relays; before, they were summed
   per compared route and could exceed `relays_required` (#2265).
+- Attachment transfer subscriptions deliver a frame as soon as a row's transfer
+  state changes, for example to `Ready`, `Failed` or `Cancelled`, instead of up
+  to 250 ms after the previous frame, so a small download opens when the engine
+  finishes it. Progress-only changes are still coalesced to at most four frames
+  per second, and presentation and idle wakes still read at most four times a
+  second (#2157).
 
 ## 0.13.0 - 2026-10-12
 
