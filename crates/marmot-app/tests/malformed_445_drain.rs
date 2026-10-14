@@ -17,6 +17,9 @@
 //! real message land in his backlog, and a cold boot's first catch-up must
 //! deliver the real message and record zero sync failures.
 
+// Test fixtures dial local relays directly; the proxy policy is crate-private.
+#![allow(clippy::disallowed_methods)]
+
 use std::time::Duration;
 
 use base64::Engine as _;

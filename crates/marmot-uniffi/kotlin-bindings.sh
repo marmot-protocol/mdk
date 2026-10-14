@@ -158,7 +158,7 @@ require_rust_targets() {
       echo "supported ABIs: $SUPPORTED_ANDROID_ABIS" >&2
       return 1
     fi
-    if ! rustup target list --installed | grep -qx "$target"; then
+    if ! rustup target list --installed | grep -x "$target" > /dev/null; then
       missing+=("$target")
     fi
   done

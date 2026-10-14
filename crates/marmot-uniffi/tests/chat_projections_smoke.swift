@@ -2,7 +2,20 @@ import Foundation
 
 @main
 struct ChatProjectionsSmoke {
+    /// Exercise generated record layout and enum discriminants, including presentation roles.
     static func main() throws {
+        for query in [
+            AccountAttachmentQueryFfi(groups: [], senders: [], minTimelineAt: nil, maxTimelineAt: nil),
+            AccountAttachmentQueryFfi(groups: ["aa"], senders: ["sender"], minTimelineAt: 0, maxTimelineAt: UInt64.max),
+        ] {
+            let copy = try FfiConverterTypeAccountAttachmentQueryFfi.lift(FfiConverterTypeAccountAttachmentQueryFfi.lower(query))
+            precondition(copy == query)
+        }
+        for role in [AttachmentRoleFfi.shared, .inlineEmoji] {
+            let entry = AttachmentEntryFfi(messageIdHex: "m", sourceMessageIdHex: "s", sender: "a", timelineAt: 1, receivedAt: 2, sourceEpoch: nil, category: .rejected, role: role, attachment: .rejected(attachmentIndex: 7, rejection: MediaAttachmentRejectionFfi(kind: .unsupportedFormat, detail: "unsupported")))
+            let copy = try FfiConverterTypeAttachmentEntryFfi.lift(FfiConverterTypeAttachmentEntryFfi.lower(entry))
+            precondition(copy == entry)
+        }
         for preview in [SelectedChatPreviewFfi.draft(draft: ChatListDraftPreviewFfi(text: "draft 🦀", textTruncated: true, attachmentCount: 2, attachmentKind: .mixed)), .message, .invitation, .empty] {
             let copy = try FfiConverterTypeSelectedChatPreviewFfi.lift(FfiConverterTypeSelectedChatPreviewFfi.lower(preview))
             precondition(copy == preview)
@@ -84,7 +97,11 @@ struct ChatProjectionsSmoke {
                 let value = ChatListWindowSnapshotFfi(subscriptionGeneration: "generation", sequence: UInt64.max,
                     view: view, rows: [], hasMoreBefore: true, hasMoreAfter: false, anchor: anchor)
                 let copy = try FfiConverterTypeChatListWindowSnapshotFfi.lift(FfiConverterTypeChatListWindowSnapshotFfi.lower(value))
-                precondition(copy == value)
+                // Rows can hold opaque draft-version objects, so the snapshot has no synthesized Equatable.
+                precondition(copy.subscriptionGeneration == value.subscriptionGeneration && copy.sequence == value.sequence)
+                precondition(copy.view == value.view && copy.rows.isEmpty)
+                precondition(copy.hasMoreBefore == value.hasMoreBefore && copy.hasMoreAfter == value.hasMoreAfter)
+                precondition(copy.anchor == value.anchor)
             }
         }
         let total = AccountAttentionTotalFfi(unreadCount: UInt64.max, unreadMentionCount: 7,

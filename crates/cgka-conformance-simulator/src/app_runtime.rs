@@ -1491,6 +1491,7 @@ impl AppRuntimeHarness {
                     },
                     received_payloads: layered.application.visible_plaintexts,
                     added_members: Vec::new(),
+                    withdrawn_added_members: Vec::new(),
                     removed_members: Vec::new(),
                     epoch_changes: Vec::new(),
                     app_invalidations: Vec::new(),
@@ -2662,6 +2663,8 @@ fn app_error_kind(error: &AppError) -> &str {
         AppError::UnknownGroup(_) => "unknown_group",
         AppError::GroupRemoved(_) => "group_removed",
         AppError::GroupDisbanding(_) => "group_disbanding",
+        AppError::GroupCatchingUp(_) => "group_catching_up",
+        AppError::GroupCommitUndelivered(_) => "group_commit_undelivered",
         AppError::GroupInviteNotPending => "group_invite_not_pending",
         AppError::UserBlocked => "user_blocked",
         AppError::MessageDraftRevisionConflict => "message_draft_revision_conflict",
@@ -2696,6 +2699,8 @@ fn app_error_retryable(error: &AppError) -> bool {
             | AppError::TransportClosed
             | AppError::ChatPresentationNotReady
             | AppError::DirectConversationIndexNotReady
+            | AppError::GroupCatchingUp(_)
+            | AppError::GroupCommitUndelivered(_)
     )
 }
 fn app_error(error: AppError) -> SubjectError {
@@ -2730,6 +2735,8 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::RuntimeStopping
         | AppError::TransportClosed
         | AppError::AccountCatchUp(_)
+        | AppError::GroupCatchingUp(_)
+        | AppError::GroupCommitUndelivered(_)
         | AppError::FullHistoryRepairIncomplete { .. }
         | AppError::RelayDirectory(_)
         | AppError::Publish(_)
@@ -2796,7 +2803,10 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::OnboardingRequired
         | AppError::AccountSetupResetNotApplicable
         | AppError::AccountSetupKeyPackageRecoveryAvailable
-        | AppError::ReactionNotFound => SubjectFailureCategory::ExpectedRefusal,
+        | AppError::ReactionNotFound
+        | AppError::InvalidReportedPublicKey
+        | AppError::CannotReportSelf
+        | AppError::ModerationReportRateLimited => SubjectFailureCategory::ExpectedRefusal,
         AppError::Account(_)
         | AppError::AccountHome(_)
         | AppError::Session(_)
@@ -2807,7 +2817,9 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::CreatedGroupProjectionUnavailable(_)
         | AppError::SqlcipherKeyDerivation(_)
         | AppError::BlockListUnavailable
-        | AppError::BlockPublicationUncertain => SubjectFailureCategory::Environment,
+        | AppError::BlockPublicationUncertain
+        | AppError::ModerationReportingNotConfigured
+        | AppError::InvalidModerationReportConfig(_) => SubjectFailureCategory::Environment,
     };
     SubjectError::classified(
         category,

@@ -68,6 +68,7 @@ mod tests {
                     &[Migration {
                         version: 88,
                         name: "0088_draft_attachment_descriptors",
+                        suspend_foreign_keys: &[],
                         apply: interrupted,
                     }]
                 )

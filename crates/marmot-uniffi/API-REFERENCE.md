@@ -1,9 +1,9 @@
 # Complete MarmotKit method reference
 
-This reference inventories the UniFFI exports in the 0.10.2 source baseline and is maintained
-alongside source changes. Start with the [integration guide](README.md#integration-guide-and-api-reference)
-for API selection, lifecycle, localization and ownership. For this release's changes, read
-[0.10.1 → 0.10.2](../../docs/integration/0.10.2.md).
+This reference inventories the UniFFI exports and is maintained alongside source changes.
+Start with the [integration guide](README.md#integration-guide-and-api-reference)
+for API selection, lifecycle, localization and ownership. For the 0.13.0 changes, read
+[0.12.0 → 0.13.0](../../docs/integration/0.13.0.md).
 
 This inventories runtime/object methods, free functions and host callback methods. `AttachmentHistoryCursor` is an opaque object with no exported
 methods. Generated disposal/concurrency helpers are platform scaffolding, not additional
@@ -134,6 +134,18 @@ Create a generated identity and return at durable local readiness with the exact
 
 [Source](src/commands/account.rs#L153)
 
+### `Marmot::create_identity_with_initial_profile`
+
+**Current.**
+
+```rust
+pub async fn create_identity_with_initial_profile( &self, profile: UserProfileMetadataFfi, default_relays: Vec<String>, bootstrap_relays: Vec<String>, inbox_relays: Vec<String>, ) -> Result<IdentityCreationResultFfi, MarmotKitError>
+```
+
+Create a generated identity whose first public kind-0 is the caller's `profile`, returning at durable local readiness like `create_identity_with_profile`. Use it whenever onboarding collects a name: creating with the generated default and then calling `publish_user_profile` exposes the default to relays first, and contacts can keep seeing it. The returned `profile` is the stamped copy that setup publishes and caches; `readiness` remains the authority for relay publication. A setup resumed past its first local step ignores `profile` and returns the profile its bootstrap publishes; change it afterwards with `publish_user_profile`. `inbox_relays` (default empty) sets the kind-10050 inbox list separately; empty declares `default_relays` in both lists.
+
+[Source](src/commands/account.rs#L172)
+
 ### `Marmot::account_setup_readiness`
 
 **Current.**
@@ -144,7 +156,7 @@ pub fn account_setup_readiness( &self, account_ref: String, ) -> Result<AccountS
 
 Read setup readiness without performing network I/O.
 
-[Source](src/commands/account.rs#L188)
+[Source](src/commands/account.rs#L189)
 
 ### `Marmot::login`
 
@@ -156,7 +168,7 @@ pub async fn login( &self, identity: String, default_relays: Vec<String>, bootst
 
 Log in with an existing identity. `identity` can be an `nsec` (private key) for a local-signing account, or an `npub` to track a public identity without local signing. `inbox_relays` (default empty) sets the kind-10050 inbox list separately; empty declares `default_relays` in both lists.
 
-[Source](src/commands/account.rs#L202)
+[Source](src/commands/account.rs#L203)
 
 ### `Marmot::reset_incomplete_account_setup`
 
@@ -168,7 +180,7 @@ pub async fn reset_incomplete_account_setup( &self, nsec: String, acknowledge_po
 
 Remove only the legacy ambiguous partial-account shape so a subsequent `login` with the same nsec can recreate it. The acknowledgement is required because old local state cannot prove that no KeyPackage was exposed before its stable slot was lost.
 
-[Source](src/commands/account.rs#L239)
+[Source](src/commands/account.rs#L240)
 
 ### `Marmot::login_recovering_incomplete_setup`
 
@@ -180,7 +192,7 @@ pub async fn login_recovering_incomplete_setup( &self, nsec: String, default_rel
 
 Consent-gated one-call recovery for installations stranded before MDK had durable account-setup journals. This validates the same nsec, removes only the recognized ambiguous partial shape, preserves an existing account-id Keychain credential, and immediately retries login. `inbox_relays` (default empty) sets the kind-10050 inbox list separately; empty declares `default_relays` in both lists.
 
-[Source](src/commands/account.rs#L259)
+[Source](src/commands/account.rs#L260)
 
 ### `Marmot::login_external_signer`
 
@@ -192,7 +204,7 @@ pub async fn login_external_signer( &self, public_key: String, signer: std::sync
 
 Log in with an external account signer such as Amber/NIP-55. `inbox_relays` (default empty) sets the kind-10050 inbox list separately; empty declares `default_relays` in both lists.
 
-[Source](src/commands/account.rs#L307)
+[Source](src/commands/account.rs#L308)
 
 ### `Marmot::register_external_signer`
 
@@ -204,7 +216,7 @@ pub async fn register_external_signer( &self, account_ref: String, signer: std::
 
 Re-register an external signer for an already-known external account.
 
-[Source](src/commands/account.rs#L345)
+[Source](src/commands/account.rs#L346)
 
 ### `Marmot::sign_in_account`
 
@@ -216,7 +228,7 @@ pub async fn sign_in_account( &self, account_ref: String, ) -> Result<AccountSum
 
 Re-activate a non-destructively signed-out local account. This clears the durable signed-out marker and starts the account worker again; relay list/key-package repair can still be driven by the existing publish commands after sign-in.
 
-[Source](src/commands/account.rs#L360)
+[Source](src/commands/account.rs#L361)
 
 ### `Marmot::publish_relay_lists`
 
@@ -228,7 +240,7 @@ pub async fn publish_relay_lists( &self, account_ref: String, default_relays: Ve
 
 Publish (or re-publish) the NIP-65 and inbox relay lists for `account_ref`. Each call writes fresh replaceable events to the account relays and schedules best-effort public indexer copies when eligible; call when the lists need publication rather than on every launch. Indexers are not advertised as account relays. `inbox_relays` (default empty) sets the kind-10050 inbox list separately; empty declares `default_relays` in both lists.
 
-[Source](src/commands/account.rs#L384)
+[Source](src/commands/account.rs#L385)
 
 ### `Marmot::account_nip65_relays`
 
@@ -240,7 +252,7 @@ pub fn account_nip65_relays(&self, account_ref: String) -> Result<Vec<String>, M
 
 Read the account NIP-65 relay list.
 
-[Source](src/commands/account.rs#L403)
+[Source](src/commands/account.rs#L404)
 
 ### `Marmot::account_inbox_relays`
 
@@ -252,7 +264,7 @@ pub fn account_inbox_relays(&self, account_ref: String) -> Result<Vec<String>, M
 
 Read the account inbox relay list.
 
-[Source](src/commands/account.rs#L407)
+[Source](src/commands/account.rs#L408)
 
 ### `Marmot::account_key_packages`
 
@@ -264,7 +276,7 @@ pub async fn account_key_packages( &self, account_ref: String, bootstrap_relays:
 
 List the local and relay-discovered Marmot KeyPackage publications for `account_ref`. Relay-backed rows are the current winner per addressable slot in the validated fetch window.
 
-[Source](src/commands/account.rs#L414)
+[Source](src/commands/account.rs#L415)
 
 ### `Marmot::local_account_key_packages`
 
@@ -276,7 +288,7 @@ pub fn local_account_key_packages( &self, account_ref: String, ) -> Result<Vec<c
 
 Local-storage KeyPackage inventory with typed durable provenance. Does not wait for network startup or issue a directory query. Synchronous SQLCipher I/O on the calling thread; keep it off a UI or main thread.
 
-[Source](src/commands/account.rs#L432)
+[Source](src/commands/account.rs#L433)
 
 ### `Marmot::refresh_account_key_packages`
 
@@ -288,7 +300,7 @@ pub async fn refresh_account_key_packages( &self, account_ref: String, bootstrap
 
 Fetch validated relay observations, then merge a fresh local snapshot. Empty `bootstrap_relays` remains network-enabled. On failure, keep the previously rendered local result.
 
-[Source](src/commands/account.rs#L447)
+[Source](src/commands/account.rs#L448)
 
 ### `Marmot::account_key_package_relay_events`
 
@@ -300,7 +312,7 @@ pub async fn account_key_package_relay_events( &self, account_ref: String, boots
 
 Observed relay history for `account_ref`: current and superseded kind-30443 events from one validated fetch window. Clients can pass a superseded event id and its source relays to the existing deletion API.
 
-[Source](src/commands/account.rs#L464)
+[Source](src/commands/account.rs#L465)
 
 ### `Marmot::publish_new_key_package`
 
@@ -312,7 +324,7 @@ pub async fn publish_new_key_package( &self, account_ref: String, ) -> Result<u6
 
 Publish a new fresh KeyPackage for `account_ref`.
 
-[Source](src/commands/account.rs#L479)
+[Source](src/commands/account.rs#L480)
 
 ### `Marmot::rotate_key_package`
 
@@ -324,7 +336,7 @@ pub async fn rotate_key_package(&self, account_ref: String) -> Result<u64, Marmo
 
 Rotate the account's KeyPackage: mint and publish a fresh one, superseding the current slot. This is the sanctioned repair for an epoch-stalled group. `publish_new_key_package` is the same operation under its legacy name.
 
-[Source](src/commands/account.rs#L490)
+[Source](src/commands/account.rs#L491)
 
 ### `Marmot::republish_key_package`
 
@@ -336,7 +348,7 @@ pub async fn republish_key_package(&self, account_ref: String) -> Result<u64, Ma
 
 Re-publish the latest cached KeyPackage when possible, otherwise publish a fresh one.
 
-[Source](src/commands/account.rs#L496)
+[Source](src/commands/account.rs#L497)
 
 ### `Marmot::delete_account_key_package`
 
@@ -348,7 +360,7 @@ pub async fn delete_account_key_package( &self, account_ref: String, event_id_he
 
 Publish a NIP-09 deletion for a KeyPackage event.
 
-[Source](src/commands/account.rs#L501)
+[Source](src/commands/account.rs#L502)
 
 ### `Marmot::set_account_nip65_relays`
 
@@ -360,7 +372,7 @@ pub async fn set_account_nip65_relays( &self, account_ref: String, relays: Vec<S
 
 Publish the account read/write relay selection to its operational relays and copy it to public indexers.
 
-[Source](src/commands/account.rs#L514)
+[Source](src/commands/account.rs#L515)
 
 ### `Marmot::set_account_inbox_relays`
 
@@ -372,7 +384,7 @@ pub async fn set_account_inbox_relays( &self, account_ref: String, relays: Vec<S
 
 Publish the account inbox relay selection to its operational relays and copy it to public indexers.
 
-[Source](src/commands/account.rs#L533)
+[Source](src/commands/account.rs#L534)
 
 ### `Marmot::account_follows`
 
@@ -384,7 +396,7 @@ pub fn account_follows(&self, account_ref: String) -> Result<Vec<String>, Marmot
 
 Return the complete locally cached kind-3 follow list for `account_ref` as canonical lowercase public-key hex strings.
 
-[Source](src/commands/account.rs#L561)
+[Source](src/commands/account.rs#L562)
 
 ### `Marmot::is_following`
 
@@ -396,7 +408,7 @@ pub fn is_following( &self, account_ref: String, user_ref: String, ) -> Result<b
 
 Return whether `account_ref` currently follows `user_ref`, using the same local cache as `Self::account_follows`. `user_ref` accepts npub, hex, `nostr:npub…`, and Marmot profile links.
 
-[Source](src/commands/account.rs#L568)
+[Source](src/commands/account.rs#L569)
 
 ### `Marmot::follow_user`
 
@@ -408,7 +420,7 @@ pub async fn follow_user( &self, account_ref: String, user_ref: String, ) -> Res
 
 Follow `user_ref` while preserving every other entry in the account's current kind-3 contact list. Returns the complete updated list.
 
-[Source](src/commands/account.rs#L586)
+[Source](src/commands/account.rs#L587)
 
 ### `Marmot::unfollow_user`
 
@@ -420,7 +432,7 @@ pub async fn unfollow_user( &self, account_ref: String, user_ref: String, ) -> R
 
 Unfollow `user_ref` while preserving every other entry in the account's current kind-3 contact list. Returns the complete updated list.
 
-[Source](src/commands/account.rs#L600)
+[Source](src/commands/account.rs#L601)
 
 ### `Marmot::reveal_nsec`
 
@@ -432,7 +444,7 @@ pub fn reveal_nsec(&self, account_ref: String) -> Result<String, MarmotKitError>
 
 Export the active account's raw private key in canonical `nsec1...` bech32 form for an in-app key-backup display (mdk#543).
 
-[Source](src/commands/account.rs#L624)
+[Source](src/commands/account.rs#L625)
 
 ### `Marmot::export_encrypted_secret_key`
 
@@ -444,7 +456,7 @@ pub fn export_encrypted_secret_key( &self, account_ref: String, passphrase: Stri
 
 Export the active account's private key as a password-encrypted NIP-49 `ncryptsec1...` bech32 backup string (mdk#544).
 
-[Source](src/commands/account.rs#L641)
+[Source](src/commands/account.rs#L642)
 
 ### `Marmot::publish_user_profile`
 
@@ -456,7 +468,7 @@ pub async fn publish_user_profile( &self, account_ref: String, profile: UserProf
 
 Publish Nostr kind:0 metadata with explicit caller-supplied relay overrides. Most app clients should use `publish_user_profile_using_account_relays` so relay selection remains owned by MDK. This override remains for diagnostics, tests, and specialized clients. Public indexers receive a best-effort copy of the same event.
 
-[Source](src/commands/account.rs#L663)
+[Source](src/commands/account.rs#L664)
 
 ### `Marmot::publish_user_profile_using_account_relays`
 
@@ -468,7 +480,7 @@ pub async fn publish_user_profile_using_account_relays( &self, account_ref: Stri
 
 Publish Nostr kind:0 metadata using one coherent snapshot of the selected account's MDK-owned relay configuration. Public indexers receive a best-effort copy of the same event.
 
-[Source](src/commands/account.rs#L692)
+[Source](src/commands/account.rs#L693)
 
 ### `Marmot::upload_profile_image`
 
@@ -480,7 +492,7 @@ pub async fn upload_profile_image( &self, account_ref: String, data: Vec<u8>, me
 
 Upload a public raster profile image to Blossom with the account's signer. The returned HTTPS URL can be published as kind:0 `picture`.
 
-[Source](src/commands/account.rs#L710)
+[Source](src/commands/account.rs#L711)
 
 ### `Marmot::download_profile_image`
 
@@ -492,7 +504,7 @@ pub async fn download_profile_image( &self, url: String, max_bytes: u64, ) -> Re
 
 Fetch one untrusted kind:0 profile `picture` URL with MDK dial-safe HTTPS policy, address pinning, and bounded streaming.
 
-[Source](src/commands/account.rs#L725)
+[Source](src/commands/account.rs#L726)
 
 </details>
 
@@ -1141,6 +1153,16 @@ pub fn parse_markdown(&self, text: String) -> MarkdownDocumentFfi
 
 Parse plaintext message content into the same Markdown AST returned on message and timeline records. Useful for draft previews and host-side fallback rendering.
 
+Local-time timestamps are `MarkdownInlineFfi::Timestamp { unix_seconds: i64, style:
+MarkdownTimestampStyleFfi }`, preserving signed seconds and a typed style rather
+than formatted text. The nine styles are `ShortTime`, `LongTime`, `ShortDate`,
+`LongDate`, `ShortDateTime` (the parser's default), `LongDateTime`, `CompactDateTime`,
+`CompactDateTimeSeconds` and `Relative`. Invalid syntax remains literal text.
+Hosts format using the device locale/timezone at render time, refresh after
+locale/timezone/clock changes and resume, and refresh visible `Relative` nodes as
+time passes. See [Markdown rendering](README.md#markdown-rendering) for the style
+mapping and optional absolute-time tooltip/accessibility guidance.
+
 [Source](src/commands/directory.rs#L66)
 
 ### `Marmot::user_profile`
@@ -1669,6 +1691,42 @@ Set the per-group disappearing-message retention, wrapping the engine's `update_
 
 [Source](src/commands/group.rs#L902)
 
+### `Marmot::acknowledge_group_catching_up`
+
+**Current.**
+
+```rust
+pub async fn acknowledge_group_catching_up( &self, account_ref: String, group_id_hex: String, ) -> Result<bool, MarmotKitError>
+```
+
+Call only after a group change failed with `GroupCatchingUp` and the user chose to continue anyway. The group may have moved past this device, so the change can split the group for everyone (mdk#2258). Records the acknowledgement for the group at the device's current epoch, then retry the original change. It admits exactly one change attempt and is consumed even if that attempt fails, so a different change asks again. It is not persisted, so a restarted app asks again too. Returns `false`, recording nothing, when the group is not catching up. It is a separate call rather than a flag on every group-change method, and it is distinct from `dismiss_history_notice`, which accepts missing history, not fork risk. Runs on the account worker; no network I/O.
+
+[Source](src/commands/group.rs#L922)
+
+### `Marmot::acknowledge_group_commit_undelivered`
+
+**Current.**
+
+```rust
+pub async fn acknowledge_group_commit_undelivered( &self, account_ref: String, group_id_hex: String, ) -> Result<bool, MarmotKitError>
+```
+
+Call only after a group change failed with `GroupCommitUndelivered` and the user chose to continue anyway. The group's last change confirmed on its first relay acknowledgement but some group relays have not accepted it, so members who read only those relays cannot follow it, or the new change built on it (mdk#2255). Records the acknowledgement for the commit that is currently owed, then retry the original change. It admits exactly one change attempt and is consumed even if that attempt fails, so a different change asks again. It is not persisted. Returns `false`, recording nothing, when no relay is owed the group's last change. Distinct from `acknowledge_group_catching_up`; a change can need both. Runs on the account worker; no network I/O.
+
+[Source](src/commands/group.rs#L940)
+
+### `Marmot::group_commit_delivery`
+
+**Current.**
+
+```rust
+pub async fn group_commit_delivery( &self, account_ref: String, group_id_hex: String, ) -> Result<Option<GroupCommitDeliveryFfi>, MarmotKitError>
+```
+
+Returns the group's oldest change that some group relays have not accepted yet, or `None` once every relay has accepted or definitively rejected it. `owed_relay_urls` lists the relays MDK is still retrying with the exact event; `since` is when the first relay accepted the change, in Unix seconds. A newer change can be owed to other relays as well. Owed relays are reported immediately, so use it to show "not delivered to every relay yet" proactively. `Some` alone does not mean the next change fails: group changes fail with `GroupCommitUndelivered` only once `since` is two minutes old, because a healthy relay cut off at the first acknowledgement is retried after 30 seconds. No event announces delivery completing, so poll while the indicator is visible. Local read on the account worker; no network I/O.
+
+[Source](src/commands/group.rs#L959)
+
 ### `Marmot::group_recovery_status`
 
 **Current.**
@@ -1679,7 +1737,7 @@ pub async fn group_recovery_status( &self, account_ref: String, group_id_hex: St
 
 Re-read on GroupStateUpdated; display uncertainty separately from whether the user accepted the original invitation. `history_may_be_incomplete` and `history_notice_ids` report recovery parked on this group's own history; account-wide occurrences are listed only by `history_notices`, and each id can be passed to `dismiss_history_notice`.
 
-[Source](src/commands/group.rs#L919)
+[Source](src/commands/group.rs#L980)
 
 ### `Marmot::confirm_group_rejoin`
 
@@ -1691,7 +1749,7 @@ pub async fn confirm_group_rejoin( &self, account_ref: String, welcome_id_hex: S
 
 Call only after explicit user consent to replace the active copy. Show the offer's authenticated inviter and pass its exact id and state token.
 
-[Source](src/commands/group.rs#L934)
+[Source](src/commands/group.rs#L995)
 
 ### `Marmot::decline_group_rejoin`
 
@@ -1703,7 +1761,7 @@ pub async fn decline_group_rejoin( &self, account_ref: String, welcome_id_hex: S
 
 Decline a proposed recovery rejoin.
 
-[Source](src/commands/group.rs#L949)
+[Source](src/commands/group.rs#L1010)
 
 ### `Marmot::accept_group_invite`
 
@@ -1715,7 +1773,7 @@ pub async fn accept_group_invite( &self, account_ref: String, group_id_hex: Stri
 
 Accept a pending group invitation.
 
-[Source](src/commands/group.rs#L961)
+[Source](src/commands/group.rs#L1022)
 
 ### `Marmot::decline_group_invite`
 
@@ -1727,7 +1785,7 @@ pub async fn decline_group_invite( &self, account_ref: String, group_id_hex: Str
 
 Decline a pending group invitation.
 
-[Source](src/commands/group.rs#L974)
+[Source](src/commands/group.rs#L1035)
 
 ### `Marmot::update_group_profile`
 
@@ -1739,7 +1797,7 @@ pub async fn update_group_profile( &self, account_ref: String, group_id_hex: Str
 
 Update the group name and description.
 
-[Source](src/commands/group.rs#L987)
+[Source](src/commands/group.rs#L1048)
 
 ### `Marmot::update_group_image`
 
@@ -1751,7 +1809,7 @@ pub async fn update_group_image( &self, account_ref: String, group_id_hex: Strin
 
 Encrypt and upload a group avatar to Blossom, then commit the `marmot.group.blossom.image.v1` component. `plaintext` must contain the decoded image bytes; use `clear_group_image` to remove an existing encrypted Blossom avatar.
 
-[Source](src/commands/group.rs#L1006)
+[Source](src/commands/group.rs#L1067)
 
 ### `Marmot::clear_group_image`
 
@@ -1763,7 +1821,7 @@ pub async fn clear_group_image( &self, account_ref: String, group_id_hex: String
 
 Clear the group's encrypted Blossom avatar by committing the absent `marmot.group.blossom.image.v1` component state.
 
-[Source](src/commands/group.rs#L1024)
+[Source](src/commands/group.rs#L1085)
 
 ### `Marmot::download_group_blossom_image`
 
@@ -1775,7 +1833,7 @@ pub async fn download_group_blossom_image( &self, account_ref: String, group_id_
 
 Fetch and decrypt the group's encrypted Blossom avatar (`marmot.group.blossom.image.v1`) into raw image bytes (PNG/JPEG/…). Errors when the group has no Blossom image set. Presence and the content hash (for caching) are on `AppGroupRecordFfi::image_hash_hex`; when the group also carries a URL avatar, the URL takes precedence for rendering.
 
-[Source](src/commands/group.rs#L1043)
+[Source](src/commands/group.rs#L1104)
 
 ### `Marmot::update_group_avatar_url`
 
@@ -1787,7 +1845,7 @@ pub async fn update_group_avatar_url( &self, account_ref: String, group_id_hex: 
 
 Set (or clear, with `url = None`) the group's URL-based avatar (`marmot.group.avatar-url.v1`). The URL is validated (https-only, no localhost/private hosts) and normalized before it is committed.
 
-[Source](src/commands/group.rs#L1059)
+[Source](src/commands/group.rs#L1120)
 
 ### `Marmot::replace_encrypted_media_blob_endpoints`
 
@@ -1799,7 +1857,7 @@ pub async fn replace_encrypted_media_blob_endpoints( &self, account_ref: String,
 
 Replace the group's encrypted-media default blob endpoints as a full `marmot.group.encrypted-media.v1` component update. Requires the caller to be an admin.
 
-[Source](src/commands/group.rs#L1078)
+[Source](src/commands/group.rs#L1139)
 
 ### `Marmot::promote_admin`
 
@@ -1811,7 +1869,7 @@ pub async fn promote_admin( &self, account_ref: String, group_id_hex: String, me
 
 Grant admin rights to `member_ref` (npub or hex). Requires the caller to be an admin; publishes a group state update.
 
-[Source](src/commands/group.rs#L1098)
+[Source](src/commands/group.rs#L1159)
 
 ### `Marmot::demote_admin`
 
@@ -1823,7 +1881,7 @@ pub async fn demote_admin( &self, account_ref: String, group_id_hex: String, mem
 
 Revoke `member_ref`'s admin rights.
 
-[Source](src/commands/group.rs#L1117)
+[Source](src/commands/group.rs#L1178)
 
 ### `Marmot::self_demote_admin`
 
@@ -1835,7 +1893,7 @@ pub async fn self_demote_admin( &self, account_ref: String, group_id_hex: String
 
 Step down as an admin of `group_id_hex` (demote the active account).
 
-[Source](src/commands/group.rs#L1136)
+[Source](src/commands/group.rs#L1197)
 
 ### `Marmot::invite_members_detailed`
 
@@ -1847,7 +1905,7 @@ pub async fn invite_members_detailed( &self, account_ref: String, group_id_hex: 
 
 Same as `Self::invite_members`, returning the post-mutation group snapshot.
 
-[Source](src/commands/group.rs#L1155)
+[Source](src/commands/group.rs#L1216)
 
 ### `Marmot::invite_members_detailed_with_initial_admins`
 
@@ -1859,7 +1917,7 @@ pub async fn invite_members_detailed_with_initial_admins( &self, account_ref: St
 
 Same as `Self::invite_members_with_initial_admins`, returning the post-mutation group snapshot.
 
-[Source](src/commands/group.rs#L1172)
+[Source](src/commands/group.rs#L1233)
 
 ### `Marmot::remove_members_detailed`
 
@@ -1871,7 +1929,7 @@ pub async fn remove_members_detailed( &self, account_ref: String, group_id_hex: 
 
 Remove selected members and return detailed operation outcome.
 
-[Source](src/commands/group.rs#L1197)
+[Source](src/commands/group.rs#L1258)
 
 ### `Marmot::promote_admin_detailed`
 
@@ -1883,7 +1941,7 @@ pub async fn promote_admin_detailed( &self, account_ref: String, group_id_hex: S
 
 Promote selected members and return detailed operation outcome.
 
-[Source](src/commands/group.rs#L1216)
+[Source](src/commands/group.rs#L1277)
 
 ### `Marmot::demote_admin_detailed`
 
@@ -1895,7 +1953,7 @@ pub async fn demote_admin_detailed( &self, account_ref: String, group_id_hex: St
 
 Demote selected administrators and return detailed operation outcome.
 
-[Source](src/commands/group.rs#L1235)
+[Source](src/commands/group.rs#L1296)
 
 ### `Marmot::self_demote_admin_detailed`
 
@@ -1907,7 +1965,7 @@ pub async fn self_demote_admin_detailed( &self, account_ref: String, group_id_he
 
 Demote the current account and return detailed operation outcome.
 
-[Source](src/commands/group.rs#L1254)
+[Source](src/commands/group.rs#L1315)
 
 ### `Marmot::group_mls_state`
 
@@ -1919,7 +1977,7 @@ pub async fn group_mls_state( &self, account_ref: String, group_id_hex: String, 
 
 Current MLS state (epoch, member count, required components) for the conversation developer/debug view.
 
-[Source](src/commands/group.rs#L1274)
+[Source](src/commands/group.rs#L1335)
 
 ### `Marmot::quarantined_groups`
 
@@ -1931,7 +1989,7 @@ pub async fn quarantined_groups( &self, account_ref: String, ) -> Result<Vec<App
 
 Stored groups that failed session-open hydration and were skipped so the rest of the account could open (mdk#151 / #417). These groups are not in the live roster and otherwise vanish from the account with no explanation; surface them in a per-group recovery flow (mdk#426) distinct from healthy and archived groups, using `reason` to pick the per-reason guidance, and offer `Self::retry_hydrate_quarantined_group`.
 
-[Source](src/commands/group.rs#L1294)
+[Source](src/commands/group.rs#L1355)
 
 ### `Marmot::retry_hydrate_quarantined_group`
 
@@ -1943,7 +2001,7 @@ pub async fn retry_hydrate_quarantined_group( &self, account_ref: String, group_
 
 Re-attempt hydration of a single quarantined group (mdk#426).
 
-[Source](src/commands/group.rs#L1310)
+[Source](src/commands/group.rs#L1371)
 
 ### `Marmot::set_group_archived`
 
@@ -1955,7 +2013,7 @@ pub async fn set_group_archived( &self, account_ref: String, group_id_hex: Strin
 
 Flag a group archived (or restore it). Local-only projection state — it does not change membership or publish anything. The chats list filters archived groups unless `include_archived` is set.
 
-[Source](src/commands/group.rs#L1325)
+[Source](src/commands/group.rs#L1386)
 
 ### `Marmot::group_maintenance_status`
 
@@ -1967,7 +2025,7 @@ pub async fn group_maintenance_status( &self, account_ref: String, group_id_hex:
 
 Inspect maintenance status for a group.
 
-[Source](src/commands/group.rs#L1340)
+[Source](src/commands/group.rs#L1401)
 
 ### `Marmot::key_package_maintenance_status`
 
@@ -1979,7 +2037,7 @@ pub async fn key_package_maintenance_status( &self, account_ref: String, ) -> Re
 
 Inspect account KeyPackage maintenance status.
 
-[Source](src/commands/group.rs#L1353)
+[Source](src/commands/group.rs#L1414)
 
 ### `Marmot::schedule_group_self_update`
 
@@ -1991,7 +2049,7 @@ pub async fn schedule_group_self_update( &self, account_ref: String, group_id_he
 
 Schedule a group self-update.
 
-[Source](src/commands/group.rs#L1364)
+[Source](src/commands/group.rs#L1425)
 
 ### `Marmot::periodic_maintenance_policy`
 
@@ -2003,7 +2061,7 @@ pub async fn periodic_maintenance_policy( &self, account_ref: String, ) -> Resul
 
 Read periodic maintenance policy.
 
-[Source](src/commands/group.rs#L1376)
+[Source](src/commands/group.rs#L1437)
 
 ### `Marmot::set_periodic_maintenance_policy`
 
@@ -2015,7 +2073,7 @@ pub async fn set_periodic_maintenance_policy( &self, account_ref: String, policy
 
 Set periodic maintenance policy.
 
-[Source](src/commands/group.rs#L1387)
+[Source](src/commands/group.rs#L1448)
 
 ### `Marmot::pause_maintenance`
 
@@ -2027,7 +2085,7 @@ pub async fn pause_maintenance(&self, account_ref: String) -> Result<(), MarmotK
 
 Pause maintenance for an account.
 
-[Source](src/commands/group.rs#L1398)
+[Source](src/commands/group.rs#L1459)
 
 ### `Marmot::resume_maintenance`
 
@@ -2039,7 +2097,7 @@ pub async fn resume_maintenance(&self, account_ref: String) -> Result<(), Marmot
 
 Resume maintenance for an account.
 
-[Source](src/commands/group.rs#L1402)
+[Source](src/commands/group.rs#L1463)
 
 ### `Marmot::run_due_maintenance`
 
@@ -2051,7 +2109,7 @@ pub async fn run_due_maintenance( &self, account_ref: String, ) -> Result<Mainte
 
 Run due maintenance for an account.
 
-[Source](src/commands/group.rs#L1406)
+[Source](src/commands/group.rs#L1467)
 
 </details>
 
@@ -2097,7 +2155,7 @@ pub fn parse_media_imeta_tag( tag: MessageTagFfi, source_epoch: u64, ) -> Result
 
 Parse one authenticated encrypted-media `imeta` tag using MDK's frozen V1 or current V2 validation rules.
 
-[Source](src/commands/media.rs#L23)
+[Source](src/commands/media.rs#L26)
 
 ### `Marmot::build_media_imeta_tag`
 
@@ -2109,7 +2167,7 @@ pub async fn build_media_imeta_tag( &self, account_ref: String, group_id_hex: St
 
 Build one outbound encrypted-media `imeta` tag without publishing it.
 
-[Source](src/commands/media.rs#L39)
+[Source](src/commands/media.rs#L42)
 
 ### `Marmot::send_media_attachments`
 
@@ -2121,7 +2179,7 @@ pub async fn send_media_attachments( &self, account_ref: String, group_id_hex: S
 
 Send already-uploaded encrypted media attachments as a kind-9 chat carrying ordered NIP-92 `imeta` tags.
 
-[Source](src/commands/media.rs#L56)
+[Source](src/commands/media.rs#L59)
 
 ### `Marmot::send_tagged_media`
 
@@ -2133,7 +2191,7 @@ pub async fn send_tagged_media( &self, account_ref: String, group_id_hex: String
 
 `send_media_attachments` plus application tags on the same kind-9. For NIP-30 custom emoji, upload the image with `upload_media(send = false)`, then send its reference with an `["emoji", shortcode, reference.locators[0].value]` tag; receivers match the tag URL to the `imeta` locator and render that attachment inline. Same tag limits as `send_tagged_text`. `upload_media` with `MediaUploadRequestFfi.message_tags` and `send = true` is the one-call equivalent.
 
-[Source](src/commands/media.rs#L79)
+[Source](src/commands/media.rs#L82)
 
 ### `Marmot::send_media_reference`
 
@@ -2145,7 +2203,7 @@ pub async fn send_media_reference( &self, account_ref: String, group_id_hex: Str
 
 Backward-compatible single-attachment send helper. Prefer `send_media_attachments` for new callers so one chat can carry ordered mixed media attachments.
 
-[Source](src/commands/media.rs#L132)
+[Source](src/commands/media.rs#L135)
 
 ### `Marmot::upload_media`
 
@@ -2157,7 +2215,21 @@ pub async fn upload_media( &self, account_ref: String, group_id_hex: String, req
 
 Encrypt plaintext attachments, upload the ciphertext blobs, and optionally send the resulting media references into the group.
 
-[Source](src/commands/media.rs#L145)
+[Source](src/commands/media.rs#L148)
+
+### `Marmot::upload_media_files`
+
+**Current.** **C:** `marmot_upload_media_files`.
+
+```rust
+pub async fn upload_media_files( &self, account_ref: String, group_id_hex: String, request: MediaFileUploadRequestFfi, control: Arc<MediaFileTransferControlFfi>, ) -> Result<MediaUploadResultFfi, MarmotKitError>
+```
+
+File-backed `upload_media` for large attachments. Each `source_path` (a regular file, not a symlink; `expected_size` must match when set) is snapshotted and encrypted into owner-only temporary files under the account directory with 64 KiB buffers before the first PUT, so plaintext never crosses the FFI as a byte array. Ordered server fallback re-sends identical ciphertext from offset 0; a server whose descriptor omits or mismatches `sha256`/`size` fails over. The batch ciphertext ceiling is `max_file_media_ciphertext_bytes()`, including each 16-byte AEAD tag. Optional local retention uses the file-backed bound and existing account quota; a retention failure does not reject an otherwise successful upload. Explicit large acquisitions stream ciphertext into private files and authenticate it before bounded local publication; resumable ciphertext checkpoints never grant readable plaintext. Legacy array APIs retain their smaller bounds. `control` reports monotonic `processed_bytes` and cancels preparation, transfer and fallback. There is no dedicated cancellation error variant: after an error, `control.is_cancelled()` distinguishes requested cancellation (`InvalidMediaReference`, detail `media transfer cancelled`). Snapshots are deleted on completion or failure; after a crash, the next account worker start or file upload removes snapshots older than 24 hours.
+
+File-backed uploads have no fixed worker-response timeout; per-endpoint network deadlines still apply. Cancellation observed before message admission starts prevents publication. Admission is not interruptible once started, including while durable acceptance is pending.
+
+[Source](src/commands/media.rs#L172)
 
 ### `Marmot::download_media`
 
@@ -2169,7 +2241,7 @@ pub async fn download_media( &self, account_ref: String, group_id_hex: String, r
 
 Fetch an encrypted media blob and decrypt it using the group's encrypted media component secret.
 
-[Source](src/commands/media.rs#L169)
+[Source](src/commands/media.rs#L202)
 
 ### `Marmot::list_media`
 
@@ -2181,7 +2253,7 @@ pub fn list_media( &self, account_ref: String, group_id_hex: String, limit: Opti
 
 Typed media references projected from group message history. Host apps can pass a returned `reference` back to `download_media`.
 
-[Source](src/commands/media.rs#L190)
+[Source](src/commands/media.rs#L223)
 
 </details>
 
@@ -2246,7 +2318,7 @@ pub async fn react_with_media( &self, account_ref: String, group_id_hex: String,
 
 React with a custom emoji image. `emoji` is the reaction content (e.g. `:shortcode:`), `attachments` are already-uploaded references emitted as `imeta` on the kind-7, and `tags` name them (NIP-30 `["emoji", shortcode, url]`). The reaction retains its media epoch secret like a chat, so the image stays decryptable after the group advances. Same tag limits as `send_tagged_text`; repeating an existing reaction with the same content is a no-op.
 
-[Source](src/commands/media.rs#L104)
+[Source](src/commands/media.rs#L107)
 
 ### `Marmot::unreact_from_message`
 
@@ -2363,6 +2435,17 @@ send time, and an accepted open poll remains votable after conversation reclassi
 
 [Source](src/commands/message.rs#L254)
 
+### `Marmot::message_reactions`
+
+```rust
+pub fn message_reactions( &self, account_ref: String, group_id_hex: String, message_id_hex: String, ) -> Result<Vec<crate::conversions::TimelineUserReactionFfi>, MarmotKitError>
+```
+
+Read every effective user/emoji pair for an exact account/group/message. Use for reaction details, because conversation references contain only a bounded preview. Returns one local snapshot, ordered by timestamp/sender/emoji, with duplicate events collapsed to the latest pair. Blocked reactors and hidden, deleted, invalidated or retention-pruned targets are excluded. Run off the UI thread, refresh on installed conversation revisions, and discard results when the owning screen closes. No network work, localization or durable client cache is involved; records are caller-owned. See [conversation details](CONVERSATION-WINDOW.md#complete-reaction-details).
+
+[Source](src/commands/timeline.rs#L19)
+
+
 ### `Marmot::poll_votes`
 
 **Current.** Use for a "View votes" sheet that lists who chose each option.
@@ -2380,7 +2463,7 @@ last vote's `voted_at` and `voter_account_id_hex` while `has_more_after` is true
 votes from former members are not bounded by the current group size. Re-read from the start when the poll row is
 reprojected, and run this synchronous query off the UI thread. See [Polls](POLLS.md).
 
-[Source](src/commands/timeline.rs#L54)
+[Source](src/commands/timeline.rs#L83)
 
 ### `Marmot::messages`
 
@@ -2409,7 +2492,7 @@ pub async fn report_message( &self, account_ref: String, group_id_hex: String, m
 
 Publish a report with a typed reason and explanation for a target message.
 
-[Source](src/commands/moderation.rs#L110)
+[Source](src/commands/moderation.rs#L203)
 
 ### `Marmot::dismiss_reports`
 
@@ -2421,7 +2504,7 @@ pub async fn dismiss_reports( &self, account_ref: String, group_id_hex: String, 
 
 Publish an admin dismissal label for selected reports.
 
-[Source](src/commands/moderation.rs#L130)
+[Source](src/commands/moderation.rs#L223)
 
 ### `Marmot::content_reports`
 
@@ -2433,7 +2516,7 @@ pub fn content_reports( &self, account_ref: String, group_id_hex: String, messag
 
 Read a bounded page of reports with per-report dismissal state.
 
-[Source](src/commands/moderation.rs#L148)
+[Source](src/commands/moderation.rs#L241)
 
 ### `Marmot::reported_message`
 
@@ -2445,7 +2528,7 @@ pub fn reported_message( &self, account_ref: String, group_id_hex: String, messa
 
 Read the report target through deletion-masked timeline presentation.
 
-[Source](src/commands/moderation.rs#L167)
+[Source](src/commands/moderation.rs#L260)
 
 ### `Marmot::report_dismissals`
 
@@ -2457,7 +2540,43 @@ pub fn report_dismissals( &self, account_ref: String, group_id_hex: String, repo
 
 Read a bounded page of dismissal labels.
 
-[Source](src/commands/moderation.rs#L182)
+[Source](src/commands/moderation.rs#L275)
+
+### `Marmot::submit_moderation_report`
+
+**Current.**
+
+```rust
+pub async fn submit_moderation_report( &self, account_ref: String, reported_pubkey: String, reason: ReportReasonFfi, explanation: String, origin: ModerationReportOriginFfi, ) -> Result<ModerationReportOutcomeFfi, MarmotKitError>
+```
+
+Privately report a user to the deployment's moderation team: a NIP-56 kind-1984 report about `reported_pubkey` (hex or `npub`), sealed by the account key and gift-wrapped per NIP-59 to the configured reports key, published only to the configured relays. It carries the reported key, the NIP-56 type mapped from `reason`, an origin label and the trimmed explanation (at most 1,000 characters; empty is omitted), and never message content, message ids, group ids or relay metadata. Additive to `report_message`, which stays the in-group path and is unchanged; "Block and Report" still calls `block_user` separately. `Published`, `AcceptedPending` and `CompletionUnknown` follow send summaries: the two retained states are queued, retried on catch-up and must not be resubmitted. A repeat of the same reported key, reason and origin within 10 minutes returns the existing outcome. Typed errors: `ModerationReportingNotConfigured`, `InvalidReportedPublicKey`, `CannotReportSelf`, `ModerationReportRateLimited` (20 per account per hour). Sign-out and wipe delete the account's queued reports. See [moderation reports](../../docs/marmot-architecture/moderation-reports.md).
+
+[Source](src/commands/moderation.rs#L169)
+
+### `Marmot::moderation_reporting_available`
+
+**Current.**
+
+```rust
+pub fn moderation_reporting_available(&self) -> bool
+```
+
+True when a valid moderation-report destination is installed (from `MarmotOptions.moderation_report_config` or `configure_moderation_reporting`). Gate the report-to-operator affordance on it.
+
+[Source](src/commands/moderation.rs#L190)
+
+### `Marmot::configure_moderation_reporting`
+
+**Current.**
+
+```rust
+pub fn configure_moderation_reporting( &self, config: Option<ModerationReportConfigFfi>, ) -> Result<(), MarmotKitError>
+```
+
+Install (`Some`) or clear (`None`) the moderation-report destination at runtime and learn why one was rejected. The recipient is 64-character hex or `npub`; every relay must pass the relay safety policy. One bad entry rejects the whole destination with `InvalidModerationReportConfig` and leaves reporting unconfigured; nothing is partially applied. Prefer `MarmotOptions.moderation_report_config` set per build flavor so production and staging never mix.
+
+[Source](src/commands/moderation.rs#L195)
 
 </details>
 
@@ -2588,6 +2707,18 @@ pub async fn recover_onboarding( &self, account_ref: String, acknowledge_latest_
 Preserve opaque evidence, sign out, and retire the old attempt. Hosts invalidate old UI callbacks first, acknowledge latest-only retention, then explicitly begin again and use the snapshot's recovery_epoch.
 
 [Source](src/commands/onboarding.rs#L41)
+
+### `Marmot::propose_onboarding_relay_repair`
+
+**Current.**
+
+```rust
+pub async fn propose_onboarding_relay_repair( &self, account_ref: String, step: OnboardingStepFfi, ) -> Result<OnboardingSnapshotFfi, MarmotKitError>
+```
+
+Preview an exact, minimal general or inbox relay-list repair. The returned `proposal.relay_repair` carries the source event ID, ordered before/after tags, unchanged content, typed occurrence diff, and repair mode. This method only persists a revision-bound proposal; it never signs or publishes. Show the diff and use `approve_onboarding_repair` (or its epoch-aware variant) only when `ApproveRepair` is offered. `ManualReview` deliberately has no approval action; prefill an editor from `before_tags` or offer a separately labeled full reset. Preserve the account, attempt, recovery epoch, source event, and snapshot revision until approval.
+
+[Source](src/commands/onboarding.rs#L271)
 
 ### `Marmot::approve_onboarding_repair_in_epoch`
 
@@ -2806,7 +2937,7 @@ pub async fn cancel_onboarding_repair( &self, account_ref: String, ) -> Result<O
 
 Dismiss an unapproved repair proposal; this cannot undo already-approved publication intent.
 
-[Source](src/commands/onboarding.rs#L269)
+[Source](src/commands/onboarding.rs#L283)
 
 </details>
 
@@ -3237,7 +3368,7 @@ pub fn message_edit_history( &self, account_ref: String, group_id_hex: String, t
 
 Accepted edit versions, oldest first within a latest-first page (1..=100). Supply both cursor fields from the first version to load older versions. Run this synchronous details query off the UI thread; screens already carry effective content.
 
-[Source](src/commands/timeline.rs#L12)
+[Source](src/commands/timeline.rs#L41)
 
 ### `Marmot::timeline_messages`
 
@@ -3249,7 +3380,7 @@ pub fn timeline_messages( &self, account_ref: String, query: TimelineMessageQuer
 
 Materialized conversation timeline for a group or account-wide tail.
 
-[Source](src/commands/timeline.rs#L99)
+[Source](src/commands/timeline.rs#L128)
 
 </details>
 
@@ -3343,6 +3474,21 @@ Observe block-list snapshots.
 </details>
 
 <details>
+<summary>conversions/conversation_window.rs</summary>
+
+### `MessageDraftRevisionFfi::includes_chat_list_version`
+
+```rust
+pub fn includes_chat_list_version(&self, version: Arc<ChatListDraftVersionFfi>) -> bool
+```
+
+Compare a chat-list row’s opaque `draft_version` with this captured composer revision. True means the same account store/group and a version no newer than this revision; false includes foreign store/group metadata and newer identical edits. This is presentation correlation, not mutation authorization. Keep both values device-local and use revision-checked cleanup. See [pending-send draft presentation](CHAT-LIST-ROWS.md#pending-send-draft-presentation-0130).
+
+[Source](src/conversions/conversation_window.rs#L340)
+
+</details>
+
+<details>
 <summary>conversions/attachment_history.rs</summary>
 
 ### `AttachmentHistoryVersion::change_since`
@@ -3356,6 +3502,71 @@ pub fn change_since( &self, previous: Arc<AttachmentHistoryVersion>, ) -> Attach
 Compare current with an older version, including after the last page. RestartRequired means discard all loaded rows before restarting at the head.
 
 [Source](src/conversions/attachment_history.rs#L24)
+
+</details>
+
+<details>
+<summary>conversions/media.rs</summary>
+
+### `MediaFileTransferControlFfi::new`
+
+**Current constructor.** **C:** `marmot_media_file_transfer_control_new`.
+
+```rust
+pub fn new() -> std::sync::Arc<Self>
+```
+
+Create one control per file-backed operation; it is never reused across operations.
+
+[Source](src/conversions/media.rs#L376)
+
+### `MediaFileTransferControlFfi::cancel`
+
+**Current.** **C:** `marmot_media_file_transfer_control_cancel`.
+
+```rust
+pub fn cancel(&self)
+```
+
+Request cancellation. Preparation, body transfer and server fallback stop at the next chunk; nothing is published when cancellation is observed before message admission starts. Admission is not interruptible once started, even before durable acceptance returns; cancellation cannot retract an admitted message.
+
+[Source](src/conversions/media.rs#L382)
+
+### `MediaFileTransferControlFfi::is_cancelled`
+
+**Current.** **C:** `marmot_media_file_transfer_control_is_cancelled`.
+
+```rust
+pub fn is_cancelled(&self) -> bool
+```
+
+Whether `cancel` was called. It is not an outcome: await the operation's result.
+
+[Source](src/conversions/media.rs#L386)
+
+### `MediaFileTransferControlFfi::processed_bytes`
+
+**Current.** **C:** `marmot_media_file_transfer_control_processed_bytes`.
+
+```rust
+pub fn processed_bytes(&self) -> u64
+```
+
+Monotonic local work counter across snapshot, encryption and upload of the current attachment. Not a percentage or a delivery signal.
+
+[Source](src/conversions/media.rs#L390)
+
+### `max_file_media_ciphertext_bytes`
+
+**Current free function.** Generated Swift/Kotlin name: `maxFileMediaCiphertextBytes`. **C:** `marmot_max_file_media_ciphertext_bytes`.
+
+```rust
+pub fn max_file_media_ciphertext_bytes() -> u64
+```
+
+Per-batch ciphertext ceiling for file-backed uploads (an implementation resource bound, not protocol).
+
+[Source](src/conversions/media.rs#L398)
 
 </details>
 
@@ -3449,7 +3660,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options. Existing constructors are compatibility wrappers around this entry point.
 
-[Source](src/lib.rs#L242)
+[Source](src/lib.rs#L252)
 
 ### `Marmot::new_with_options`
 
@@ -3461,7 +3672,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L258)
+[Source](src/lib.rs#L268)
 
 ### `Marmot::new`
 
@@ -3473,7 +3684,7 @@ pub fn new(root_path: String, relay_urls: Vec<String>) -> Result<Arc<Self>, Marm
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) via the default keychain-backed account home — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L286)
+[Source](src/lib.rs#L296)
 
 ### `Marmot::new_with_secret_store`
 
@@ -3485,7 +3696,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L304)
+[Source](src/lib.rs#L314)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -3497,7 +3708,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L334)
+[Source](src/lib.rs#L344)
 
 ### `Marmot::new_with_client_name`
 
@@ -3509,7 +3720,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels are omitted. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L353)
+[Source](src/lib.rs#L363)
 
 ### `Marmot::start`
 
@@ -3521,7 +3732,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L390)
+[Source](src/lib.rs#L400)
 
 ### `Marmot::shutdown`
 
@@ -3533,7 +3744,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L402)
+[Source](src/lib.rs#L412)
 
 ### `Marmot::shutdown_and_close`
 
@@ -3545,7 +3756,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L437)
+[Source](src/lib.rs#L447)
 
 ### `Marmot::storage_is_closed`
 
@@ -3557,7 +3768,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L445)
+[Source](src/lib.rs#L455)
 
 ### `Marmot::is_stopping`
 
@@ -3569,7 +3780,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L452)
+[Source](src/lib.rs#L462)
 
 </details>
 
@@ -4186,7 +4397,7 @@ Read a retained submission's local state without relay I/O. `None` means no reta
 association. `Completed` describes the worker attempt; inspect its summary disposition
 and follow timeline updates for later delivery. See [local sends](LOCAL-SENDS.md).
 
-[Source](src/commands/local_submissions.rs#L149)
+[Source](src/commands/local_submissions.rs#L203)
 
 ### `Marmot::edit_local_message_with_client_token`
 
@@ -4227,6 +4438,16 @@ acceptance, not delivery; never clear a newer composer on completion. See [local
 
 [Source](src/commands/local_submissions.rs#L103)
 
+### `Marmot::send_prepared_media_with_client_token`
+
+```rust
+pub async fn send_prepared_media_with_client_token( &self, account_ref: String, group_id_hex: String, attachments: Vec<MediaAttachmentReferenceFfi>, caption: Option<String>, client_token: String, consuming_draft: Option<Arc<MessageDraftRevisionFfi>>, ) -> Result<LocalSendAcceptanceFfi, MarmotKitError>
+```
+
+Admit an uploaded ordinary-media snapshot with its stable client token and optional captured draft revision. Conditional consumption is transactional, bound to ordered plaintext SHA-256 hashes, and preserves newer drafts. The method has no reply target. See the [captured-media contract](LOCAL-SENDS.md#captured-ordinary-media-drafts) for token replay, interruption recovery and matching bindings.
+
+[Source](src/commands/local_submissions.rs#L125)
+
 ### `Marmot::send_text_with_client_token`
 
 ```rust
@@ -4250,7 +4471,19 @@ The result includes uploaded references and optional local acceptance. Uploads t
 are not idempotent or restart-resumable; query token status after unknown outcomes.
 See [local sends](LOCAL-SENDS.md) for cancellation and epoch-bound media handling.
 
-[Source](src/commands/local_submissions.rs#L125)
+[Source](src/commands/local_submissions.rs#L150)
+
+### `Marmot::upload_media_files_with_client_token`
+
+**C:** `marmot_upload_media_files_with_client_token`.
+
+```rust
+pub async fn upload_media_files_with_client_token( &self, account_ref: String, group_id_hex: String, request: MediaFileUploadRequestFfi, control: Arc<MediaFileTransferControlFfi>, client_token: String, ) -> Result<MediaUploadSubmissionFfi, MarmotKitError>
+```
+
+File-backed `upload_media_with_client_token`: every attachment is prepared and uploaded before durable token admission. Cancellation observed before admission starts returns an error and admits nothing. Once admission starts it is not interruptible, even before durable acceptance returns; follow `local_send_status` and timeline delivery, including uncertain-delivery handling. Admission rejects references from a source epoch that is no longer current. There is no fixed worker-response timeout; per-endpoint network deadlines still apply.
+
+[Source](src/commands/local_submissions.rs#L177)
 
 </details>
 
@@ -4274,7 +4507,7 @@ must enforce those separately and bound any untrusted JSON before passing it.
 </details>
 
 <details>
-<summary>New exports — complete and organize before merging</summary>
+<summary>Audit v5 tracker and configuration</summary>
 
 ### `Marmot::post_audit_log_tracker_update_v5`
 
@@ -4297,3 +4530,64 @@ Install or remove an in-memory v5 OTLP audit destination. With `enabled: true`, 
 [Source](src/commands/audit.rs#L54)
 
 </details>
+
+<details>
+<summary>Account attachment history</summary>
+
+### `AccountAttachmentVersion::change_since`
+
+```rust
+pub fn change_since( &self, previous: Arc<AccountAttachmentVersion>, ) -> AttachmentHistoryChangeFfi
+```
+
+Compare a freshly read account version with the original loaded-page baseline. RestartRequired discards loaded rows; Additions offers a head refresh while old-page cursors remain valid. The opaque value is not a row count; retain it in memory only.
+
+[Source](src/conversions/account_attachment_history.rs#L35)
+
+### `Marmot::account_attachment_history_page`
+
+```rust
+pub async fn account_attachment_history_page( &self, account_ref: String, query: AccountAttachmentQueryFfi, limit: u32, cursor: Option<Arc<AccountAttachmentCursor>>, ) -> Result<AccountAttachmentPageReadFfi, MarmotKitError>
+```
+
+Read at most 100 indexed attachment candidates across one local account with group, sender and inclusive date constraints. Empty filtered pages can have a continuation. Keep handles in memory, replace pages on RestartRequired, and use the typed metadata with the existing on-demand open/download APIs. See [Account attachment history](ACCOUNT-ATTACHMENT-HISTORY.md) for bounds and ownership.
+
+[Source](src/commands/account_attachment_history.rs#L7)
+
+### `Marmot::account_attachment_history_version`
+
+```rust
+pub async fn account_attachment_history_version( &self, account_ref: String, ) -> Result<Arc<AccountAttachmentVersion>, MarmotKitError>
+```
+
+Read the constant-work local account attachment change token, including after exhaustion. No network, acquisition or decryption starts. Keep the original loaded-page baseline and compare it using change_since; replace rows on RestartRequired and offer refresh on Additions.
+
+[Source](src/commands/account_attachment_history.rs#L26)
+
+</details>
+
+<details>
+<summary>Native startup diagnostics</summary>
+
+### `Marmot::set_startup_diagnostics_enabled`
+
+```rust
+pub fn set_startup_diagnostics_enabled(&self, enabled: bool) -> Result<(), MarmotKitError>
+```
+
+Explicitly enable or revoke bounded native progress for a diagnostic investigation. Capture is off by default and shared by clones of this app handle. It does not change database content, diagnostic-sharing/upload consent, network behavior or cryptographic settings. Re-enabling an already-enabled capture preserves its history; disabling clears it and fences in-flight observations from later captures. Enable before the first account policy read when diagnosing account opening.
+
+[Source](src/commands/startup_diagnostics.rs#L6)
+
+### `Marmot::startup_diagnostics_snapshot`
+
+```rust
+pub fn startup_diagnostics_snapshot(&self) -> Result<NativeStartupSnapshotFfi, MarmotKitError>
+```
+
+Synchronously clone fixed native phases, monotonic durations and migration progress from independent memory. This does not query account storage or the keystore, and remains usable before `start` or while an account-opening future is blocked. At most 16 active scopes and 96 events are retained; drop counters expose truncation. Tokens are anonymous process-local scope numbers. No identifiers, paths, call arguments/results, keys or error messages are returned. Bound serialized host exports separately and collect only in an explicitly enabled diagnostic flow.
+
+[Source](src/commands/startup_diagnostics.rs#L11)
+
+</details>
+

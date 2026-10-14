@@ -2573,6 +2573,9 @@
         },
         {
           "$ref": "#/$defs/OperationalEvent_subscription_eose_repaired"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_subscription_refused"
         }
       ]
     },
@@ -3247,6 +3250,62 @@
         "notification_lag",
         "follow_up"
       ]
+    },
+    "Operational_subscriptionRefusalRoute": {
+      "enum": [
+        "inbox",
+        "group",
+        "maintenance"
+      ]
+    },
+    "Operational_subscriptionRefusalCategory": {
+      "enum": [
+        "duplicate",
+        "pow",
+        "blocked",
+        "rate_limited",
+        "invalid",
+        "error",
+        "unsupported",
+        "auth_required",
+        "restricted",
+        "unclassified"
+      ]
+    },
+    "Operational_subscriptionRefusalOutcome": {
+      "enum": [
+        "pending",
+        "dropped"
+      ]
+    },
+    "Operational_subscriptionRefusal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "route_kind",
+        "endpoint_ref",
+        "refusal_category",
+        "disposition",
+        "count"
+      ],
+      "properties": {
+        "route_kind": {
+          "$ref": "#/$defs/Operational_subscriptionRefusalRoute"
+        },
+        "endpoint_ref": {
+          "$ref": "#/$defs/EndpointRef"
+        },
+        "refusal_category": {
+          "$ref": "#/$defs/Operational_subscriptionRefusalCategory"
+        },
+        "disposition": {
+          "$ref": "#/$defs/Operational_subscriptionRefusalOutcome"
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
     },
     "OperationalDiagnosticRef": {
       "type": "string",
@@ -5009,6 +5068,34 @@
           "type": "boolean"
         },
         "dropped_before": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_subscription_refused": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "refusals",
+        "dropped"
+      ],
+      "properties": {
+        "type": {
+          "const": "subscription_refused"
+        },
+        "refusals": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/Operational_subscriptionRefusal"
+          }
+        },
+        "dropped": {
           "$ref": "#/$defs/Operational_u64"
         },
         "record_context": {

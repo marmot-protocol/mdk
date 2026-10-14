@@ -1,0 +1,11 @@
+hpke-rs-libcrux 0.7.0, copyright its upstream contributors.
+Licensed under MPL-2.0; see LICENSE-MPL-2.0 and retained source headers.
+Copied from crates.io published archive checksum:
+4c1ace95ef11fbbd84527eada5fc1304f66720fc4c008db30d888d62d3c52613
+Source: https://github.com/celabshq/libcrux/tree/c5fb80f37530ee9b2df9501ae5ff8cb4a973a4bd/crates/protocols/hpke/libcrux_provider
+
+Local compatibility backport: only the normalized Cargo.toml exact
+libcrux-kem dependency requirement changes from =0.0.9 to =0.0.10.
+The package version and Rust source remain unchanged.
+Fixes dependency exposure to RUSTSEC-2026-0330 and RUSTSEC-2026-0331.
+Cargo.toml.orig is retained as upstream provenance, not used by Cargo.

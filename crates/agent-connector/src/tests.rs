@@ -1224,6 +1224,75 @@ async fn connector_socket_bind_preserves_existing_non_socket_path() {
 }
 
 #[tokio::test]
+async fn connector_socket_bind_reports_overlong_staging_path_before_creating_parent() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let probe = dir.path().join("x").join("wn-agent.sock");
+    let limit = (1..=256)
+        .take_while(|bytes| {
+            std::os::unix::net::SocketAddr::from_pathname("x".repeat(*bytes)).is_ok()
+        })
+        .last()
+        .unwrap();
+    let parent_len = 1 + limit - probe.as_os_str().as_bytes().len();
+    let socket = dir
+        .path()
+        .join("x".repeat(parent_len))
+        .join("wn-agent.sock");
+    assert_eq!(socket.as_os_str().as_bytes().len(), limit);
+    assert!(fs_private::validate_private_unix_socket_path(&socket).is_err());
+    let error = bind_connector_socket(&socket).unwrap_err();
+    assert_eq!(error.code(), "socket_path_too_long");
+    assert!(!error.retryable());
+    assert!(
+        error
+            .client_message()
+            .contains("shorten --home or --socket")
+    );
+    assert!(!error.to_string().contains(dir.path().to_str().unwrap()));
+    assert!(!socket.parent().unwrap().exists());
+    assert!(!fs_private::socket_staging_dir(&socket).exists());
+}
+
+#[tokio::test]
+async fn management_socket_can_exceed_the_budget_while_regular_control_still_fits() {
+    use std::os::unix::ffi::OsStrExt;
+
+    // macOS spells /tmp through a symlink to world-writable /private/tmp.
+    // Use the real short base so the control bind tests socket length rather
+    // than the production rejection of an untrusted directory alias.
+    let short_temp_base = std::fs::canonicalize("/tmp").unwrap();
+    let dir = tempfile::tempdir_in(short_temp_base).unwrap();
+    let probe = dir
+        .path()
+        .join("x")
+        .join("dev")
+        .join("usage-diagnostics.sock");
+    let limit = (1..=256)
+        .take_while(|bytes| {
+            std::os::unix::net::SocketAddr::from_pathname("x".repeat(*bytes)).is_ok()
+        })
+        .last()
+        .unwrap();
+    let staged_len = fs_private::socket_staging_dir(&probe)
+        .join("usage-diagnostics.sock")
+        .as_os_str()
+        .as_bytes()
+        .len();
+    let home = dir.path().join("x".repeat(2 + limit - staged_len));
+    let control = home.join("dev").join("wn-agent.sock");
+    let management = home.join("dev").join("usage-diagnostics.sock");
+    assert!(fs_private::validate_private_unix_socket_path(&control).is_ok());
+    assert!(management.as_os_str().as_bytes().len() <= limit);
+    let error = crate::usage_diagnostics::bind(&home).unwrap_err();
+    assert_eq!(error.code(), "socket_path_too_long");
+    assert!(!home.exists());
+    let listener = bind_connector_socket(&control).unwrap();
+    assert!(listener.local_addr().is_ok());
+}
+
+#[tokio::test]
 async fn connector_socket_bind_applies_configured_group_modes() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("dev").join("wn-agent.sock");
@@ -7747,4 +7816,564 @@ async fn connector_leave_group_case(block_cleanup: bool) {
     ));
     assert!(reopened.contains(&agent.account_id_hex, &missing).unwrap());
     connector.runtime.shutdown().await;
+}
+async fn mock_relay_url() -> (MockRelay, String) {
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    (relay, relay_url)
+}
+
+/// Publish one NIP-65 and one inbox list, each naming a second relay, so every
+/// entry a later edit must preserve is a real reachable endpoint.
+async fn publish_nip65_and_inbox(
+    app: &MarmotApp,
+    account: &marmot_account::AccountSummary,
+    relay_endpoint: cgka_traits::TransportEndpoint,
+    read_only_endpoint: cgka_traits::TransportEndpoint,
+    write_only_endpoint: cgka_traits::TransportEndpoint,
+    inbox_endpoint: cgka_traits::TransportEndpoint,
+) {
+    app.publish_account_nip65_relay_set(
+        &account.label,
+        vec![relay_endpoint.clone(), read_only_endpoint],
+        vec![relay_endpoint.clone(), write_only_endpoint],
+        vec![relay_endpoint.clone()],
+    )
+    .await
+    .unwrap();
+    app.publish_account_relay_list_kind(
+        &account.label,
+        "inbox",
+        vec![relay_endpoint.clone(), inbox_endpoint],
+        vec![relay_endpoint],
+    )
+    .await
+    .unwrap();
+}
+
+/// Deterministic publication targets for the relay-list preservation test.
+/// `None` refuses all writes; `Some(url)` refuses NIP-65 declarations adopting
+/// that URL while accepting seeds and removals. Reads remain available.
+#[derive(Debug)]
+struct RelayListTestWritePolicy(Option<String>);
+
+impl nostr_relay_builder::builder::WritePolicy for RelayListTestWritePolicy {
+    fn admit_event<'a>(
+        &'a self,
+        event: &'a nostr_relay_builder::prelude::Event,
+        _addr: &'a std::net::SocketAddr,
+    ) -> nostr_relay_builder::prelude::BoxedFuture<'a, nostr_relay_builder::builder::PolicyResult>
+    {
+        Box::pin(async move {
+            let reject = match &self.0 {
+                None => true,
+                Some(url) => {
+                    event.kind.as_u16() == 10002
+                        && event.tags.iter().any(|tag| {
+                            let tag = tag.as_slice();
+                            tag.first().is_some_and(|name| name == "r") && tag.get(1) == Some(url)
+                        })
+                }
+            };
+            if reject {
+                nostr_relay_builder::builder::PolicyResult::Reject("fixture write refusal".into())
+            } else {
+                nostr_relay_builder::builder::PolicyResult::Accept
+            }
+        })
+    }
+}
+
+async fn relay_list_test_relay(
+    rejected_nip65_url: Option<String>,
+) -> (nostr_relay_builder::LocalRelay, String) {
+    let relay = nostr_relay_builder::LocalRelay::new(
+        nostr_relay_builder::RelayBuilder::default()
+            .write_policy(RelayListTestWritePolicy(rejected_nip65_url)),
+    );
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    (relay, url)
+}
+
+#[tokio::test]
+async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_added_relay, added_url) = mock_relay_url().await;
+    // Seed on the primary relay. For the NIP-65 add, both old outbox relays
+    // refuse that declaration, so only the newly adopted relay can acknowledge
+    // it. This makes the route assertion below independent of quorum races.
+    let (_relay, relay_url) = relay_list_test_relay(Some(added_url.clone())).await;
+    let (_write_relay, write_url) = relay_list_test_relay(None).await;
+    let (_read_relay, read_url) = mock_relay_url().await;
+    let (_inbox_relay, inbox_url) = mock_relay_url().await;
+    let (_inbox_added_relay, inbox_added_url) = mock_relay_url().await;
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let relay_endpoint = crate::validation::endpoint(&relay_url);
+    publish_nip65_and_inbox(
+        &app,
+        &account,
+        relay_endpoint.clone(),
+        crate::validation::endpoint(&read_url),
+        crate::validation::endpoint(&write_url),
+        crate::validation::endpoint(&inbox_url),
+    )
+    .await;
+
+    let seeded = app.account_relay_list_status(&account.label).unwrap();
+    assert!(
+        seeded.inbox.relays.contains(&inbox_url),
+        "seeded local inbox list must contain the untouched entry: {:?}",
+        seeded.inbox
+    );
+    // Give both seeded replaceable kinds an older timestamp than their first
+    // edit. Same-second event-id ordering could otherwise keep the seed on
+    // the relay, just as the removal below needs a newer second than the add.
+    sleep(Duration::from_millis(1_100)).await;
+
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    // kind 10002 is replaceable: adding one relay must keep the read-only,
+    // write-only and inbox entries the request never named.
+    connector
+        .relay_list_edit_response(crate::relays::RelayListEdit {
+            account_id_hex: account.account_id_hex.clone(),
+            relay_type: agent_control::AgentControlRelayListType::Nip65,
+            url: added_url.clone(),
+            direction: agent_control::AgentControlRelayListDirection::Both,
+            add: true,
+        })
+        .await
+        .unwrap();
+    let inbox_edit = connector
+        .relay_list_edit_response(crate::relays::RelayListEdit {
+            account_id_hex: account.account_id_hex.clone(),
+            relay_type: agent_control::AgentControlRelayListType::Inbox,
+            url: inbox_added_url.clone(),
+            direction: agent_control::AgentControlRelayListDirection::Both,
+            add: true,
+        })
+        .await
+        .unwrap();
+
+    let AgentControlResponse::RelayLists { relay_lists, .. } = inbox_edit else {
+        panic!("expected inbox edit response: {inbox_edit:?}");
+    };
+    assert!(
+        relay_lists.inbox.relays.contains(&inbox_url),
+        "edit response must preserve the untouched inbox entry: {:?}",
+        relay_lists.inbox
+    );
+    assert!(
+        relay_lists.inbox.relays.contains(&inbox_added_url),
+        "edit response must include the added inbox entry: {:?}",
+        relay_lists.inbox
+    );
+
+    // Publications require one acknowledgement, not an acknowledgement from
+    // every endpoint. Read all possible accepting relays: querying only the
+    // primary relay can legitimately return its older replaceable event.
+    let publication_route = vec![
+        relay_endpoint.clone(),
+        crate::validation::endpoint(&write_url),
+        crate::validation::endpoint(&added_url),
+        crate::validation::endpoint(&inbox_added_url),
+    ];
+
+    // Publication requires one acknowledgement, not every routed relay's ACK.
+    // Also, an overlapping directory read can share a pre-edit query. Wait for
+    // this relay to expose the acknowledged revision before checking its tags.
+    let published = timeout(Duration::from_secs(15), async {
+        loop {
+            let status = app
+                .fetch_current_account_relay_list_status_for_account_id(
+                    &account.account_id_hex,
+                    publication_route.clone(),
+                    Some("nip65"),
+                )
+                .await
+                .unwrap()
+                .expect("published relay lists");
+            if status.inbox.created_at >= relay_lists.inbox.created_at {
+                break status;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the routed relay must expose the acknowledged inbox revision");
+    for expected in [&added_url, &read_url, &relay_url] {
+        assert!(
+            published
+                .nip65
+                .read_relays
+                .iter()
+                .any(|relay| relay == expected),
+            "read set should still hold {expected}"
+        );
+    }
+    for expected in [&relay_url, &write_url] {
+        assert!(
+            published
+                .nip65
+                .write_relays
+                .iter()
+                .any(|relay| relay == expected),
+            "write set should still hold {expected}"
+        );
+    }
+    for expected in [&inbox_url, &inbox_added_url] {
+        assert!(
+            published.inbox.relays.iter().any(|relay| relay == expected),
+            "inbox list should still hold {expected}; readback={:?}, edit={:?}",
+            published.inbox,
+            relay_lists.inbox
+        );
+    }
+
+    // The relay being adopted must actually receive the event that names it: it
+    // is not in the account's pre-edit outbox, so the route has to include it.
+    let added_copy = app
+        .fetch_current_account_relay_list_status_for_account_id(
+            &account.account_id_hex,
+            vec![crate::validation::endpoint(&added_url)],
+            Some("nip65"),
+        )
+        .await
+        .unwrap()
+        .expect("the added relay received the list naming it");
+    assert!(
+        added_copy
+            .nip65
+            .read_relays
+            .iter()
+            .any(|relay| relay == &added_url)
+    );
+
+    // Removing one entry keeps the rest, in both list kinds. Replaceable events
+    // are second-resolution: a removal published in the same second as the
+    // addition cannot supersede it, so the removal waits for the next second.
+    sleep(Duration::from_millis(1_100)).await;
+    connector
+        .relay_list_edit_response(crate::relays::RelayListEdit {
+            account_id_hex: account.account_id_hex.clone(),
+            relay_type: agent_control::AgentControlRelayListType::Nip65,
+            url: added_url.clone(),
+            direction: agent_control::AgentControlRelayListDirection::Both,
+            add: false,
+        })
+        .await
+        .unwrap();
+    let published = app
+        .fetch_current_account_relay_list_status_for_account_id(
+            &account.account_id_hex,
+            publication_route,
+            Some("nip65"),
+        )
+        .await
+        .unwrap()
+        .expect("published relay lists");
+    assert!(
+        !published
+            .nip65
+            .read_relays
+            .iter()
+            .any(|relay| relay == &added_url)
+    );
+    assert!(
+        published
+            .nip65
+            .read_relays
+            .iter()
+            .any(|relay| relay == &read_url)
+    );
+}
+
+#[tokio::test]
+async fn connector_relay_lists_reports_the_cached_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, relay_url) = mock_relay_url().await;
+    let (_read_relay, read_url) = mock_relay_url().await;
+    let (_write_relay, write_url) = mock_relay_url().await;
+    let (_inbox_relay, inbox_url) = mock_relay_url().await;
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    publish_nip65_and_inbox(
+        &app,
+        &account,
+        crate::validation::endpoint(&relay_url),
+        crate::validation::endpoint(&read_url),
+        crate::validation::endpoint(&write_url),
+        crate::validation::endpoint(&inbox_url),
+    )
+    .await;
+
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    let response = connector
+        .relay_lists_response(&account.account_id_hex)
+        .unwrap();
+    let AgentControlResponse::RelayLists {
+        account_id_hex,
+        relay_lists,
+    } = response
+    else {
+        panic!("expected relay lists response, got {response:?}");
+    };
+    assert_eq!(account_id_hex, account.account_id_hex);
+    assert!(
+        relay_lists
+            .nip65
+            .write_relays
+            .iter()
+            .any(|relay| relay == &write_url)
+    );
+    assert!(
+        relay_lists
+            .inbox
+            .relays
+            .iter()
+            .any(|relay| relay == &inbox_url)
+    );
+    assert!(relay_lists.nip65.created_at > 0);
+    assert!(relay_lists.inbox.created_at > 0);
+}
+
+#[tokio::test]
+async fn connector_relay_list_edit_refuses_an_unconfirmed_published_list() {
+    let dir = tempfile::tempdir().unwrap();
+    // The relay the connector reads through holds no relay-list event, and the
+    // account has never published one: the read is unconfirmed, so the edit must
+    // refuse rather than publish a list built from nothing.
+    let (_relay, relay_url) = mock_relay_url().await;
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    let error = connector
+        .relay_list_edit_response(crate::relays::RelayListEdit {
+            account_id_hex: account.account_id_hex.clone(),
+            relay_type: agent_control::AgentControlRelayListType::Nip65,
+            url: relay_url,
+            direction: agent_control::AgentControlRelayListDirection::Both,
+            add: true,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "relay_list_inconclusive");
+    assert!(error.retryable());
+}
+
+#[tokio::test]
+async fn connector_relay_list_edit_rejects_invalid_inputs_before_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    // Loopback relays stay a dev-only gate: this connector does not set it, so a
+    // `ws://` loopback entry is refused even though a local agent may well reach
+    // one. No relay is configured: validation precedes any relay read.
+    let mut config = test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        Vec::new(),
+        false,
+        false,
+    );
+    config.allow_loopback_relays = false;
+    let connector = AgentConnector::open(config).unwrap();
+
+    for url in [
+        "",
+        "not-a-relay",
+        "http://relay.example",
+        "wss://relay.example\u{1b}]8;;https://evil.example\u{7}",
+    ] {
+        let error = connector
+            .relay_list_edit_response(crate::relays::RelayListEdit {
+                account_id_hex: account.account_id_hex.clone(),
+                relay_type: agent_control::AgentControlRelayListType::Nip65,
+                url: url.to_owned(),
+                direction: agent_control::AgentControlRelayListDirection::Both,
+                add: true,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "invalid_relay_url", "url {url:?}");
+    }
+
+    let error = connector
+        .relay_list_edit_response(crate::relays::RelayListEdit {
+            account_id_hex: account.account_id_hex.clone(),
+            relay_type: agent_control::AgentControlRelayListType::Nip65,
+            url: "ws://127.0.0.1:8080".to_owned(),
+            direction: agent_control::AgentControlRelayListDirection::Both,
+            add: true,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "invalid_relay_url");
+
+    // The inbox list has no read/write roles, so a named direction is refused
+    // rather than silently ignored.
+    let error = connector
+        .relay_list_edit_response(crate::relays::RelayListEdit {
+            account_id_hex: account.account_id_hex.clone(),
+            relay_type: agent_control::AgentControlRelayListType::Inbox,
+            url: "wss://inbox.example".to_owned(),
+            direction: agent_control::AgentControlRelayListDirection::Read,
+            add: true,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "invalid_relay_list_edit");
+}
+
+#[tokio::test]
+async fn connector_relay_list_edit_starts_from_the_newer_cached_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_lagging_relay, lagging_url) = mock_relay_url().await;
+    let (_current_relay, current_url) = mock_relay_url().await;
+    let (_old_entry_relay, old_entry_url) = mock_relay_url().await;
+    let (_current_entry_relay, current_entry_url) = mock_relay_url().await;
+    let (_added_relay, added_url) = mock_relay_url().await;
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), lagging_url.clone());
+    let lagging_endpoint = crate::validation::endpoint(&lagging_url);
+    let current_endpoint = crate::validation::endpoint(&current_url);
+
+    // The pre-edit list: read-only entries routed through the relay the
+    // connector will read through, and no write relay. That empty write set is
+    // what keeps the next publication off this relay, so it goes on serving this
+    // copy after the account has moved on.
+    app.publish_account_nip65_relay_set(
+        &account.label,
+        vec![
+            lagging_endpoint.clone(),
+            crate::validation::endpoint(&old_entry_url),
+        ],
+        Vec::new(),
+        vec![lagging_endpoint.clone()],
+    )
+    .await
+    .unwrap();
+
+    // Replaceable-event timestamps are second-resolution, so the newer list has
+    // to be published in a later second to supersede the cached copy anywhere.
+    sleep(Duration::from_millis(1_100)).await;
+
+    // The newer local edit, published where the lagging relay cannot see it.
+    app.publish_account_nip65_relay_set(
+        &account.label,
+        vec![
+            current_endpoint.clone(),
+            crate::validation::endpoint(&current_entry_url),
+        ],
+        vec![current_endpoint.clone()],
+        vec![current_endpoint.clone()],
+    )
+    .await
+    .unwrap();
+    let cached = app.account_relay_list_status(&account.label).unwrap();
+    assert!(
+        cached
+            .nip65
+            .read_relays
+            .iter()
+            .any(|relay| relay == &current_entry_url),
+        "cached list before the stale read"
+    );
+
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![lagging_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+    // Pin the premise: the read this publish makes returns the pre-edit copy,
+    // and the cache is not older than it.
+    let read_copy = app
+        .fetch_current_account_relay_list_status_for_account_id(
+            &account.account_id_hex,
+            vec![lagging_endpoint.clone()],
+            Some("nip65"),
+        )
+        .await
+        .unwrap()
+        .expect("lagging relay copy");
+    assert!(
+        read_copy
+            .nip65
+            .read_relays
+            .iter()
+            .any(|relay| relay == &old_entry_url)
+    );
+    assert!(cached.nip65.created_at >= read_copy.nip65.created_at);
+
+    connector
+        .relay_list_edit_response(crate::relays::RelayListEdit {
+            account_id_hex: account.account_id_hex.clone(),
+            relay_type: agent_control::AgentControlRelayListType::Nip65,
+            url: added_url.clone(),
+            direction: agent_control::AgentControlRelayListDirection::Both,
+            add: true,
+        })
+        .await
+        .unwrap();
+
+    // What the lagging relay now holds is the newer list plus the edit, not the
+    // pre-edit entries that same relay was still serving.
+    let published = app
+        .fetch_current_account_relay_list_status_for_account_id(
+            &account.account_id_hex,
+            vec![lagging_endpoint.clone()],
+            Some("nip65"),
+        )
+        .await
+        .unwrap()
+        .expect("published relay list");
+    for expected in [&added_url, &current_entry_url] {
+        assert!(
+            published
+                .nip65
+                .read_relays
+                .iter()
+                .any(|relay| relay == expected),
+            "published list should hold {expected}"
+        );
+    }
+    assert!(
+        !published
+            .nip65
+            .read_relays
+            .iter()
+            .any(|relay| relay == &old_entry_url),
+        "the pre-edit entries the lagging relay served must not come back"
+    );
 }

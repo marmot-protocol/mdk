@@ -32,11 +32,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod recovery;
+mod refusal;
 pub use recovery::{
     EoseRepairReceiver, EoseRepairTrigger, RECOVERY_AUDIT_MAX_ENDPOINTS,
     RECOVERY_AUDIT_MAX_OBLIGATIONS, RecoveryAttemptScope, RecoveryGoalBound, RecoveryNeedChange,
     RecoveryNextAttempt, RecoveryObligationCause, RecoveryObligationVerdict, RecoveryPassOutcome,
     RecoveryScopeProgress, TransportCursorTrigger,
+};
+pub use refusal::{
+    SUBSCRIPTION_REFUSAL_AUDIT_MAX_ENTRIES, SubscriptionRefusalCategory, SubscriptionRefusalEntry,
+    SubscriptionRefusalOutcome, SubscriptionRefusalRoute,
 };
 
 pub const AUDIT_LOG_SCHEMA_VERSION: &str = "marmot-forensics-audit/v4";
@@ -95,6 +100,24 @@ pub fn member_ref_hex(member_identity: &[u8]) -> MemberRefHex {
     hasher.update(b"marmot-audit-member-ref/v1");
     hasher.update(member_identity);
     hex::encode(&hasher.finalize()[..16])
+}
+
+/// Stable diagnostic identity for one logical application send in one group.
+///
+/// Callers supply the validated inner application-event id, which survives
+/// durable queuing, re-encryption and frozen transport retries. The result is
+/// a domain-separated digest, never the raw event or group id. It belongs in
+/// [`AuditEventContext::operation_id`], not in an outbound message inventory;
+/// v5 applies its ordinary operation-reference protection on export.
+/// Individual preparation/publication attempts remain separate audit rows.
+pub fn application_send_operation_id(group_id: &[u8], app_event_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"marmot-audit-application-send/v1\0");
+    hasher.update((group_id.len() as u64).to_be_bytes());
+    hasher.update(group_id);
+    hasher.update((app_event_id.len() as u64).to_be_bytes());
+    hasher.update(app_event_id.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 /// Hex-encoded 32-byte SHA-256 digest.
@@ -1367,6 +1390,27 @@ pub enum AuditEventKind {
         follow_up_scheduled: bool,
         dropped_before: u64,
     },
+    /// Relays ended live subscriptions of this account with `CLOSED`. The Nostr
+    /// adapter queues each refusal as it arrives; the account worker records
+    /// what it holds at its next publication seam, so recording never delays
+    /// relay traffic.
+    ///
+    /// One entry per refusing relay, route kind (`inbox`, `group`,
+    /// `maintenance`), reason category and disposition, in arrival order, with
+    /// `count` repeats since the previous row. `pending` means the relay
+    /// client kept the REQ to send again after AUTH or a reconnect; `dropped`
+    /// means it gave the REQ up, and that relay serves nothing for the route
+    /// until the subscription is rebuilt. `dropped` counts refusals shed at
+    /// the adapter's bound of [`SUBSCRIPTION_REFUSAL_AUDIT_MAX_ENTRIES`]
+    /// distinct entries. The relay's reason text is never recorded.
+    ///
+    /// Unlike [`AuditEventKind::SubscriptionRebuild`]'s `relay_results`, which
+    /// only say the relay client registered a REQ, these rows say the relay
+    /// answered it with a refusal. v5 only.
+    SubscriptionRefused {
+        refusals: Vec<SubscriptionRefusalEntry>,
+        dropped: u64,
+    },
 }
 
 impl AuditEventKind {
@@ -1428,6 +1472,7 @@ impl AuditEventKind {
             AuditEventKind::RecoveryObligationReassessed { .. } => "recovery_obligation_reassessed",
             AuditEventKind::TransportCursorAdvanced { .. } => "transport_cursor_advanced",
             AuditEventKind::SubscriptionEoseRepaired { .. } => "subscription_eose_repaired",
+            AuditEventKind::SubscriptionRefused { .. } => "subscription_refused",
         }
     }
 
@@ -1442,6 +1487,7 @@ impl AuditEventKind {
                 | AuditEventKind::RecoveryObligationReassessed { .. }
                 | AuditEventKind::TransportCursorAdvanced { .. }
                 | AuditEventKind::SubscriptionEoseRepaired { .. }
+                | AuditEventKind::SubscriptionRefused { .. }
         )
     }
 }

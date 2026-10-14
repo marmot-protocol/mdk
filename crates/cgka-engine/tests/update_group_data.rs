@@ -1781,7 +1781,7 @@ async fn convergence_refreshes_recipient_marmot_record_name_and_description() {
 }
 
 #[tokio::test]
-async fn convergence_emits_unattributed_profile_change_events() {
+async fn convergence_emits_attributed_profile_change_events() {
     let (mut alice, _alice_storage) = build_with_storage(b"alice");
     let (mut bob, _bob_storage) = build_with_storage(b"bob");
     let bob_kp = bob.fresh_key_package().await.unwrap();
@@ -1831,23 +1831,22 @@ async fn convergence_emits_unattributed_profile_change_events() {
     bob.drain_events();
     converge_buffered_commit(&mut bob, &gid);
 
-    // The reorg seam must surface the same profile diff the direct seam
-    // emits, unattributed — otherwise the rename never becomes a kind-1210
-    // row for members that applied the commit through convergence.
+    // Convergence preserves the authenticated committer and source-state diff,
+    // so every member derives the same reaction target.
     let events = bob.drain_events();
     assert!(
         events.iter().any(|event| matches!(
             event,
             cgka_traits::engine::GroupEvent::GroupStateChanged {
-                actor: None,
+                actor: Some(actor),
                 change: cgka_traits::engine::GroupStateChange::GroupRenamed {
                     name,
                     previous_name: Some(previous_name),
                 },
                 ..
-            } if name == "new-renamed" && previous_name == "original-name"
+            } if actor == &alice.self_id() && name == "new-renamed" && previous_name == "original-name"
         )),
-        "convergence apply must emit an unattributed GroupRenamed, got: {events:?}",
+        "convergence apply must emit an attributed GroupRenamed, got: {events:?}",
     );
 }
 
@@ -4107,4 +4106,107 @@ async fn moderation_authority_distinguishes_same_epoch_sibling_branches() {
     }
     assert_eq!(contexts[0].0, contexts[1].0);
     assert_ne!(contexts[0].1, contexts[1].1);
+}
+
+/// Catch-up must retain intermediate activities even when the final values cancel.
+#[tokio::test]
+async fn batched_group_changes_preserve_each_members_reaction_targets() {
+    use cgka_traits::engine::{GroupEvent, GroupStateChange};
+    let (mut alice, mut bob, gid) = create_pair().await;
+    let mut charlie = build(b"charlie");
+    let kp = charlie.fresh_key_package().await.unwrap();
+    alice.drain_events();
+    bob.drain_events();
+    let intents = vec![
+        SendIntent::UpdateGroupData {
+            group_id: gid.clone(),
+            name: Some("middle".into()),
+            description: None,
+        },
+        SendIntent::UpdateGroupData {
+            group_id: gid.clone(),
+            name: Some("original".into()),
+            description: None,
+        },
+        SendIntent::Invite {
+            group_id: gid.clone(),
+            key_packages: vec![kp],
+            initial_admins: vec![charlie.self_id()],
+        },
+        SendIntent::RemoveMembers {
+            group_id: gid.clone(),
+            members: vec![charlie.self_id()],
+        },
+    ];
+    let mut commits = Vec::new();
+    for intent in intents {
+        let SendResult::GroupEvolution { msg, pending, .. } = alice.send(intent).await.unwrap()
+        else {
+            panic!("expected group evolution")
+        };
+        alice.confirm_published(pending).await.unwrap();
+        commits.push(msg);
+    }
+    let target_ids = |events: Vec<GroupEvent>| {
+        let mut targets = events
+            .into_iter()
+            .filter_map(|event| {
+                if let GroupEvent::GroupStateChanged {
+                    group_id,
+                    epoch,
+                    actor,
+                    change,
+                    origin_commit_id,
+                } = event
+                {
+                    assert!(actor.is_some());
+                    assert!(origin_commit_id.is_some());
+                    Some((
+                        epoch,
+                        change.clone(),
+                        cgka_traits::app_event::group_system_canonical_id(
+                            &group_id,
+                            epoch.0,
+                            actor.as_ref(),
+                            &change,
+                        )
+                        .unwrap(),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        targets.sort_by(|left, right| left.2.cmp(&right.2));
+        targets
+    };
+    let expected = target_ids(alice.drain_events());
+    assert_eq!(expected.len(), 6);
+    for wanted in [
+        "member_added",
+        "member_removed",
+        "admin_added",
+        "admin_removed",
+    ] {
+        assert!(expected.iter().any(|(_, change, _)| matches!(
+            (wanted, change),
+            ("member_added", GroupStateChange::MemberAdded { .. })
+                | ("member_removed", GroupStateChange::MemberRemoved { .. })
+                | ("admin_added", GroupStateChange::AdminAdded { .. })
+                | ("admin_removed", GroupStateChange::AdminRemoved { .. })
+        )));
+    }
+    for commit in &commits {
+        bob.ingest(route_to_group(commit, &gid)).await.unwrap();
+    }
+    converge_buffered_commit(&mut bob, &gid);
+    assert_eq!(target_ids(bob.drain_events()), expected);
+    for commit in &commits {
+        bob.ingest(route_to_group(commit, &gid)).await.unwrap();
+    }
+    converge_buffered_commit(&mut bob, &gid);
+    assert!(
+        target_ids(bob.drain_events()).is_empty(),
+        "duplicate delivery must not mint new targets"
+    );
 }

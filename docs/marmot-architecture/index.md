@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-09-27
+updated: 2026-09-30
 tags: [marmot, architecture, index]
 ---
 
@@ -58,8 +58,8 @@ Written to be readable in 5 minutes each, shareable as a package.
     bundle), and the sequencing to real carrier swaps.
 
 - **Doc:** [`overview/app-core-boundary.md`](./overview/app-core-boundary.md)
-  - **What it covers:** The boundary between `wn`, `marmot-app`, `marmot-account`, sessions, and future Swift/TUI
-    bindings.
+  - **What it covers:** The MDK/host-app ownership contract, including Android as a minimal display/platform layer,
+    shared runtime rules, bindings and storage boundaries.
 
 - **Doc:** [`overview/marmot-app-runtime.md`](./overview/marmot-app-runtime.md)
   - **What it covers:** The implemented first slice of the multi-account `marmot-app` runtime, its shared Nostr relay
@@ -157,6 +157,11 @@ These are longer working documents. Go here when you need depth, not orientation
 - **Doc:** [`audit-logging.md`](./audit-logging.md)
   - **What it covers:** Current implementation inventory for opt-in forensic JSONL logs, file identity, every event
     kind and metadata field, upload/tracker behavior, and downstream tooling guidance.
+
+- **Doc:** [`moderation-reports.md`](./moderation-reports.md)
+  - **What it covers:** Private NIP-56 reports to the deployment's moderation team, gift-wrapped per NIP-59: event
+    layers, labels, reader steps, and client durability, idempotency and privacy behavior. Additive to in-group
+    moderation.
 
 - **Doc:** [`runtime-state-bounds.md`](./runtime-state-bounds.md)
   - **What it covers:** Inventory of long-lived daemon/broker runtime structures (maps, counters, handle sets, temp

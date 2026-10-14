@@ -725,7 +725,7 @@ async fn initial_subscription_is_attached_before_a_concurrent_storage_commit() {
 #[tokio::test]
 async fn authoritative_worker_acceptance_preserves_archive_and_rejoin_restores_owner_state() {
     let dir = tempfile::tempdir().unwrap();
-    let account = AccountHome::open(dir.path())
+    AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
@@ -753,7 +753,6 @@ async fn authoritative_worker_acceptance_preserves_archive_and_rejoin_restores_o
                 welcomer: None,
                 explicitly_confirmed: false,
             },
-            &account.account_id_hex,
             &mut summary,
         )
         .unwrap();
@@ -774,7 +773,6 @@ async fn authoritative_worker_acceptance_preserves_archive_and_rejoin_restores_o
                 welcomer: None,
                 explicitly_confirmed: false,
             },
-            &account.account_id_hex,
             &mut summary,
         )
         .unwrap();

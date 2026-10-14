@@ -16,6 +16,7 @@
 //! block.
 
 use crate::attachment_access::MarmotAttachmentLocalBytes;
+use crate::types::MarmotNativeStartupSnapshot;
 use crate::types::avatar::{MarmotAvatarAssetList, MarmotAvatarBytesList};
 use crate::types::presentation::{MarmotPresentedChatListSnapshot, MarmotPresentedChatRow};
 use std::ffi::c_char;
@@ -50,10 +51,11 @@ use crate::types::group::{
     MarmotAppBlobEndpoint, MarmotAppGroupMemberIdsList, MarmotAppGroupMemberRecordList,
     MarmotAppGroupMlsState, MarmotAppGroupRecord, MarmotAppQuarantinedGroupList,
     MarmotCreateGroupOptions, MarmotCreatedGroup, MarmotDisbandRequest, MarmotGroupAppComponent,
-    MarmotGroupConversationSnapshot, MarmotGroupDetails, MarmotGroupInviteDeclineResult,
-    MarmotGroupManagementState, MarmotGroupMutationResult, MarmotGroupRecoveryStatus,
-    MarmotGroupRoster, MarmotInitialGroupImage, MarmotMemberKeyPackagePrewarmSummary,
-    MarmotMemberRef, MarmotPreparedGroupImageUpload, MarmotPreparedGroupImageUploadList,
+    MarmotGroupCommitDelivery, MarmotGroupConversationSnapshot, MarmotGroupDetails,
+    MarmotGroupInviteDeclineResult, MarmotGroupManagementState, MarmotGroupMutationResult,
+    MarmotGroupRecoveryStatus, MarmotGroupRoster, MarmotInitialGroupImage,
+    MarmotMemberKeyPackagePrewarmSummary, MarmotMemberRef, MarmotPreparedGroupImageUpload,
+    MarmotPreparedGroupImageUploadList,
 };
 use crate::types::history_notice::MarmotHistoryNoticeList;
 use crate::types::local_submissions::{
@@ -88,7 +90,7 @@ use crate::types::telemetry::{
 };
 use crate::types::timeline::{
     MarmotPollType, MarmotPollVotePage, MarmotTimelineMessageQuery, MarmotTimelineMessageRecord,
-    MarmotTimelinePage,
+    MarmotTimelinePage, MarmotTimelineUserReactionList,
 };
 use crate::types::user_blocks::MarmotBlockedUserList;
 use crate::{MarmotClient, client_ref, ffi_guard, write_out};
@@ -522,6 +524,11 @@ macro_rules! c_cmd {
 }
 
 c_cmd! {
+    /// Read every effective sender/emoji pair for one visible message, off the UI thread.
+    /// Local snapshot; re-read on conversation changes. Missing/hidden/deleted/invalidated
+    /// targets yield an empty list. Free with `marmot_timeline_user_reaction_list_free`.
+    sync fn marmot_message_reactions(account_ref: str, group_id_hex: str, message_id_hex: str) -> rec(MarmotTimelineUserReactionList) = message_reactions;
+
     /// Read a bounded range (1..=1048576 bytes) from a local reference. No network fallback.
     /// Rechecks source visibility/expiry on every call. Offset at/beyond EOF returns
     /// available=true and empty bytes. An obsolete or wrong-account reference is unavailable.
@@ -719,6 +726,26 @@ c_cmd! {
     /// protocol space and are rejected. Refresh on group events. Free with
     /// `marmot_group_app_component_free`.
     async fn marmot_group_app_component(account_ref: str, group_id_hex: str, component_id: val u16) -> opt_rec(MarmotGroupAppComponent) = group_app_component;
+
+    /// After a group change returns `MARMOT_STATUS_GROUP_CATCHING_UP`, record
+    /// that the user accepts the risk of splitting the group, then retry the
+    /// change. Admits one attempt at the current epoch, consumed even if it
+    /// fails; not persisted. Writes false when the group is not catching up.
+    async fn marmot_acknowledge_group_catching_up(account_ref: str, group_id_hex: str) -> scalar(bool) = acknowledge_group_catching_up;
+
+    /// After a group change returns `MARMOT_STATUS_GROUP_COMMIT_UNDELIVERED`,
+    /// record that the user accepts that members on relays still owed the
+    /// group's last change may not follow, then retry the change. Admits one
+    /// attempt, consumed even if it fails; not persisted. Writes false when no
+    /// relay is owed the group's last change.
+    async fn marmot_acknowledge_group_commit_undelivered(account_ref: str, group_id_hex: str) -> scalar(bool) = acknowledge_group_commit_undelivered;
+
+    /// The group's oldest change that some group relays have not accepted yet,
+    /// or NULL once every relay has accepted or definitively rejected it.
+    /// Non-NULL is not a refusal: group changes return
+    /// `MARMOT_STATUS_GROUP_COMMIT_UNDELIVERED` only once `since` is two minutes
+    /// old. Poll while showing it. Free with `marmot_group_commit_delivery_free`.
+    async fn marmot_group_commit_delivery(account_ref: str, group_id_hex: str) -> opt_rec(MarmotGroupCommitDelivery) = group_commit_delivery;
 
     /// Query advisory membership health and pending rejoin offers.
     /// Free with `marmot_group_recovery_status_free`.
@@ -1523,6 +1550,52 @@ pub unsafe extern "C" fn marmot_publish_user_profile(
     })
 }
 
+/// Create a fresh identity whose first public kind-0 is `profile`, returning
+/// at durable local readiness. Use this instead of
+/// `marmot_create_identity_with_profile` followed by
+/// `marmot_publish_user_profile` when onboarding collects a name, so
+/// contacts never see the generated default. Free with
+/// `marmot_identity_creation_result_free`.
+///
+/// # Safety
+/// `client` must be a live handle; `profile` a valid borrowed struct (never
+/// freed by the library); relay arrays must hold `len` valid strings (or be
+/// NULL with len 0); `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_create_identity_with_initial_profile(
+    client: *const MarmotClient,
+    profile: *const MarmotUserProfileMetadata,
+    default_relays: *const *const c_char,
+    default_relays_len: usize,
+    bootstrap_relays: *const *const c_char,
+    bootstrap_relays_len: usize,
+    inbox_relays: *const *const c_char,
+    inbox_relays_len: usize,
+    out: *mut *mut MarmotIdentityCreationResult,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let profile = try_arg!(unsafe { borrowed(profile) });
+        let profile = try_arg!(unsafe { profile.to_ffi() });
+        let default_relays = try_arg!(unsafe { str_array(default_relays, default_relays_len) });
+        let bootstrap_relays =
+            try_arg!(unsafe { str_array(bootstrap_relays, bootstrap_relays_len) });
+        let inbox_relays = try_arg!(unsafe { str_array(inbox_relays, inbox_relays_len) });
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.create_identity_with_initial_profile(
+                    profile,
+                    default_relays,
+                    bootstrap_relays,
+                    inbox_relays,
+                )),
+                out,
+            )
+        }
+    })
+}
+
 /// Replace the group's encrypted-media default blob endpoints as a full
 /// component update. Requires admin. Free with
 /// `marmot_send_summary_free`.
@@ -1591,6 +1664,54 @@ pub unsafe extern "C" fn marmot_send_media_attachments(
                     group_id_hex,
                     attachments,
                     caption,
+                )),
+                out,
+            )
+        }
+    })
+}
+
+/// Admit a captured ordinary-media payload with its stable token. Consume the supplied
+/// draft only if its exact revision remains current; NULL requests no draft consumption.
+/// Free the result with marmot_local_send_acceptance_free.
+///
+/// # Safety
+/// Client and required strings must be valid; attachments must be readable for their
+/// length (NULL allowed at zero); an optional revision must remain live; out writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_send_prepared_media_with_client_token(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    group_id_hex: *const c_char,
+    attachments: *const MarmotMediaAttachmentReference,
+    attachments_len: usize,
+    caption: *const c_char,
+    client_token: *const c_char,
+    consuming_draft: *const crate::types::conversation_window::MarmotMessageDraftRevision,
+    out: *mut *mut crate::types::local_submissions::MarmotLocalSendAcceptance,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let group_id_hex = try_arg!(unsafe { required_str(group_id_hex) });
+        let attachments = try_arg!(unsafe {
+            struct_array(attachments, attachments_len, |attachment| {
+                attachment.to_ffi()
+            })
+        });
+        let caption = try_arg!(unsafe { crate::memory::optional_str(caption) });
+        let client_token = try_arg!(unsafe { required_str(client_token) });
+        let consuming_draft = unsafe { consuming_draft.as_ref() }.map(|draft| draft.inner.clone());
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.send_prepared_media_with_client_token(
+                    account_ref,
+                    group_id_hex,
+                    attachments,
+                    caption,
+                    client_token,
+                    consuming_draft,
                 )),
                 out,
             )
@@ -2516,7 +2637,7 @@ pub unsafe extern "C" fn marmot_send_custom_event(
     })
 }
 
-/// Create an encrypted NIP-88 poll in a group conversation. Option ids use `"0"`
+/// Create an encrypted NIP-88 poll in a direct or group conversation. Option ids use `"0"`
 /// through `"9"`. Free `out` with `marmot_send_summary_free`.
 ///
 /// # Safety
@@ -2993,6 +3114,41 @@ pub unsafe extern "C" fn marmot_propose_onboarding_relays(
         }
     })
 }
+/// Preview an exact minimal relay repair without signing or publishing. Manual-review
+/// previews cannot be approved. `step` is a MarmotOnboardingStep discriminant;
+/// out-of-range values return MARMOT_STATUS_INVALID_ARGUMENT.
+/// Free the returned snapshot with `marmot_onboarding_snapshot_free`.
+///
+/// # Safety
+/// The client must be live, input pointers valid and borrowed, and out writable.
+/// Relay-repair content, tag fields and non-NULL tag/change endpoints are JSON
+/// string literals. Decode once preserving embedded NULs and UTF-8 lengths
+/// before displaying consent or prefilling an editor. Read/write route lists
+/// and event identifiers retain their ordinary-string contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_propose_onboarding_relay_repair(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    step: u32,
+    out: *mut *mut MarmotOnboardingSnapshot,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account_ref = try_arg!(unsafe { required_str(account_ref) });
+        let step = try_arg!(MarmotOnboardingStep::from_c(step)).to_ffi();
+        unsafe {
+            deliver(
+                client.block_on(
+                    client
+                        .marmot
+                        .propose_onboarding_relay_repair(account_ref, step),
+                ),
+                out,
+            )
+        }
+    })
+}
 /// Prepare profile edits without publishing; NULL fields preserve existing values and empty strings clear them. Free the returned snapshot with `marmot_onboarding_snapshot_free`.
 ///
 /// # Safety
@@ -3373,7 +3529,8 @@ mod identity_pointer_tests {
 }
 
 use crate::types::moderation::{
-    MarmotContentReportPage, MarmotReportDismissalPage, MarmotReportReason,
+    MarmotContentReportPage, MarmotModerationReportOrigin, MarmotModerationReportOutcome,
+    MarmotReportDismissalPage, MarmotReportReason,
 };
 c_cmd! {
     async fn marmot_dismiss_reports(account_ref: str, group_id_hex: str, report_ids/report_ids_len: str_arr, explanation: str) -> rec(MarmotSendSummary) = dismiss_reports;
@@ -3414,6 +3571,87 @@ pub unsafe extern "C" fn marmot_report_message(
                 out,
             )
         }
+    })
+}
+
+/// Privately report a user to the configured moderation team (NIP-56 report,
+/// NIP-59 gift-wrapped). Additive to marmot_report_message, which is unchanged.
+/// `reason` is a MarmotReportReason and `origin` a MarmotModerationReportOrigin
+/// discriminant. Release `*out` with marmot_moderation_report_outcome_free.
+/// # Safety
+/// Client, strings and output pointer must be valid. Inputs are borrowed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_submit_moderation_report(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    reported_pubkey: *const c_char,
+    reason: u32,
+    explanation: *const c_char,
+    origin: u32,
+    out: *mut *mut MarmotModerationReportOutcome,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out_ptr(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let reported = try_arg!(unsafe { required_str(reported_pubkey) });
+        let reason = try_arg!(MarmotReportReason::from_c(reason));
+        let explanation = try_arg!(unsafe { required_str(explanation) });
+        let origin = try_arg!(MarmotModerationReportOrigin::from_c(origin));
+        unsafe {
+            deliver(
+                client.block_on(client.marmot.submit_moderation_report(
+                    account,
+                    reported,
+                    reason.to_ffi(),
+                    explanation,
+                    origin.to_ffi(),
+                )),
+                out,
+            )
+        }
+    })
+}
+
+/// Write whether a valid moderation-report destination is installed.
+/// # Safety
+/// `client` must be a live handle and `out` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_moderation_reporting_available(
+    client: *const MarmotClient,
+    out: *mut bool,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out(out) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        unsafe { deliver_scalar(Ok(client.marmot.moderation_reporting_available()), out) }
+    })
+}
+
+/// Install the moderation-report destination, or clear it when
+/// `recipient_pubkey` is NULL (`relays` is then ignored). An invalid
+/// destination is rejected whole and leaves reporting unconfigured.
+/// # Safety
+/// `client` must be a live handle; `recipient_pubkey` NULL or a valid string;
+/// `relays` must hold `relays_len` valid strings. Inputs are borrowed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_configure_moderation_reporting(
+    client: *const MarmotClient,
+    recipient_pubkey: *const c_char,
+    relays: *const *const c_char,
+    relays_len: usize,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        let client = try_arg!(unsafe { client_ref(client) });
+        let recipient = try_arg!(unsafe { crate::optional_str(recipient_pubkey) });
+        let config = match recipient {
+            Some(recipient_pubkey) => Some(marmot_uniffi::ModerationReportConfigFfi {
+                recipient_pubkey,
+                relays: try_arg!(unsafe { str_array(relays, relays_len) }),
+            }),
+            None => None,
+        };
+        deliver_unit(client.marmot.configure_moderation_reporting(config))
     })
 }
 
@@ -3489,4 +3727,9 @@ mod nostr_verification_tests {
         );
         assert_eq!(out, 0);
     }
+}
+
+c_cmd! {
+    sync fn marmot_set_startup_diagnostics_enabled(enabled: flag) -> unit = set_startup_diagnostics_enabled;
+    sync fn marmot_startup_diagnostics_snapshot() -> rec(MarmotNativeStartupSnapshot) = startup_diagnostics_snapshot;
 }

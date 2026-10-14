@@ -115,6 +115,37 @@ original token before uploading again. Media references remain epoch-bound and
 can be rejected if the group changes before engine acceptance. A rejected media
 submission needs freshly prepared references and a new token.
 
+## Captured ordinary-media drafts
+
+Use `send_prepared_media_with_client_token` for an uploaded ordinary-media
+snapshot. Pass its captured caption, ordered references, stable client token and
+optional original draft revision. The method has no reply target; use revisioned
+draft admission for replied media.
+
+If that revision is still current, admission validates the caption, reply,
+ordered name/type descriptors and each attachment's plaintext SHA-256, then
+consumes the draft in the same transaction as the retained send and projection.
+A newer, cleared or absent draft is preserved and never replaces the payload.
+Caption whitespace is normalized for the consumption check.
+
+Keep the original token and revision for live retries. Replaying an owned token
+returns its identity before inspecting the current draft and preserves later
+drafts. After interruption or restart, query `local_send_status` before uploading
+or admitting again. A null revision means no draft consumption; a failed draft
+read does not establish that no draft exists. Use matching generated bindings,
+header and native library. Acceptance is local ownership, not peer receipt.
+
+`upload_media_files_with_client_token` has the same admission contract for
+file-backed attachments (`source_path` instead of a plaintext byte array). Every
+attachment is snapshotted, encrypted and uploaded before admission. Its
+`MediaFileTransferControlFfi` is the only cancellation input. Cancellation
+observed before admission starts returns an error and admits nothing; an upload
+that already completed is left unreferenced on the server. Dropping the host's
+wait is not cancellation. Once admission starts it is not interruptible, even
+before durable acceptance returns; use `local_send_status` and timeline delivery
+as for any token-bound send. File-backed uploads have no fixed worker-response
+timeout; per-endpoint network deadlines still apply.
+
 ## Conversation windows and draft cost
 
 Return-to-latest can consume a coherent pre-publication checkpoint, including an

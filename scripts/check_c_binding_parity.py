@@ -10,7 +10,8 @@ This compares every method exported from a `#[uniffi::export]` block —
 `marmot-c` actually calls, and fails on any difference the allowlist below
 does not explain. Subscription methods are matched by name, not per
 handle type: a new method whose name another handle already mirrors slips
-through, everything else is caught.
+through, everything else is caught. `new` constructors require a type-qualified
+call, so another handle's constructor cannot cover them.
 
 Usage:
     scripts/check_c_binding_parity.py            # gate (exit 1 on drift)
@@ -108,7 +109,12 @@ def subscription_coverage() -> set[str]:
     strict form would need per-handle typing for no added drift signal.
     """
     src = _c_source()
-    return set(re.findall(r"\.(\w+)\(", src)) | set(re.findall(r"read(\w+),", src))
+    return (set(re.findall(r"\.(\w+)\(", src))
+            | set(re.findall(r"read(\w+),", src))
+            # Handle constructors are static calls, not .new() methods.
+            # Keep the type qualifier so another type's new cannot hide drift.
+            | {f"{handle}::{method}" for handle, method in
+               re.findall(r"\b(\w+)::(\w+)\(", src)})
 
 
 def main() -> int:
@@ -117,7 +123,11 @@ def main() -> int:
     sub_covered = subscription_coverage()
     def mirrored(name: str) -> bool:
         handle, sep, method = name.rpartition("::")
-        return method in sub_covered if sep else name in covered
+        if not sep:
+            return name in covered
+        if method == "new":
+            return name in sub_covered
+        return name in sub_covered or method in sub_covered
 
     missing = sorted(n for n in exports if not mirrored(n))
 

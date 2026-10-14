@@ -1,0 +1,7 @@
+# Every relay and HTTP client must follow the process SOCKS5 policy.
+# Build them through `transport_nostr_adapter::network_proxy` instead.
+disallowed-methods = [
+    { path = "nostr_sdk::client::Client::builder", reason = "use transport_nostr_adapter::network_proxy::nostr_builder()" },
+    { path = "nostr_sdk::client::Client::new", reason = "use transport_nostr_adapter::network_proxy::nostr_builder()" },
+    { path = "nostr_sdk::client::ClientBuilder::new", reason = "use transport_nostr_adapter::network_proxy::nostr_builder()" },
+]

@@ -2,6 +2,359 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- `AppError` adds `GroupCatchingUp` and `GroupCommitUndelivered`; update exhaustive matches.
+- `AttachmentTransferState` adds `StorageBlocked`: free disk cannot cover the
+  publication reserve for the body. Update exhaustive matches; the job keeps
+  its checkpoint and readmits once space frees or on explicit Retry.
+
+### Added
+
+- Account-wide local attachment pages expose bounded typed metadata, group/sender/date selection, continuation cursors and retention deadlines. Reads start no acquisition or relay activity.
+
+- `MarmotAppRuntime::submit_prepared_media_snapshot` admits the captured ordinary-media payload with a stable token and consumes only its unchanged captured draft in the same transaction. Newer or cleared drafts cannot replace the payload or block admission.
+
+- `MarmotAppRuntime::acknowledge_group_catching_up` records that the user accepts the fork risk of changing a group that is still catching up, so the next group change at the current epoch proceeds.
+
+- `MarmotAppRuntime::group_commit_delivery` returns the relays still owed the group's last change (`GroupCommitDelivery`), and `acknowledge_group_commit_undelivered` lets the next group change through after `GroupCommitUndelivered`.
+
+### Fixed
+
+- Group changes fail with `AppError::GroupCatchingUp` while unresolved epoch-gap recovery (pending, parked or with its notice dismissed) covers the group's current local epoch. Before, a device that knew the group had moved on could still commit from its stale epoch and fork the group (mdk#2258). The check is advisory: after the user accepts the risk, `acknowledge_group_catching_up` lets the change through. Due self-updates wait up to 24 hours for the gap to close. Messages and leave are not affected.
+- A failed or cancelled transport activation no longer leaves untracked REQs
+  live on the relay. They used to stay open until disconnect, be re-sent on
+  every reconnect, and use up the relay's per-connection subscription limit
+  until the account's own subscriptions were refused (#2262).
+- A live replay that a relay cut short at its default page (500 events on
+  strfry) no longer counts as complete coverage. The relay's stored history is
+  paged backwards before its end-of-stored-events counts, so older events in
+  the replay window are no longer skipped (#2263).
+- An explicit attachment download the device lacks room to publish no longer
+  retries forever. The publication reserve (disk reserve plus four times the
+  plaintext) is checked as soon as a response declares the size, as a body
+  grows, and before the completed-body receipt, counting the staging,
+  checkpoint and decrypted-file bytes the attempt itself still has to write.
+  A shortage, or a database that reports it is full while publishing, parks
+  the job as `AttachmentTransferState::StorageBlocked` with its ciphertext
+  checkpoint instead of scheduling a timer, recording the free space it needs
+  in the worker's own frame. The worker readmits it once free space exceeds
+  that by 4 MiB and admission would pass; a job that parks again waits out its
+  park streak (15 s doubling to an hour), and explicit Retry readmits at once.
+  With a strong validator the in-memory sink publishes a checkpointed body
+  without another request and the file sink re-requests at most its unsaved
+  tail; without one both start over. A full database records at least the free
+  space seen at the refusal plus the body and withdraws the completed-body
+  receipt. If even the park write fails, the error is returned and the lease
+  recovers the job. Parked checkpoints keep their quota reservation for at
+  most seven days after the latest park. Explicit bodies between the transfer
+  limit and 512 MiB now take the file sink and need the reserve plus five
+  bodies free (six with a strong validator) instead of about four, because
+  their staging and checkpoint copies are counted (#2239).
+- Receiving an attachment no longer holds several copies of it in native
+  memory. The body buffer is reserved once from the declared length (an
+  undeclared length grows geometrically to half the transfer limit and then
+  once to the limit, so the buffer never exceeds the limit and the copy while
+  it grows holds at most 1.5 times it; a failed reservation is a transient
+  failure, not an abort), decrypted in place, explicit downloads above the
+  automatic transfer limit stream through the existing private file sink, and
+  in-memory publication stores a body larger than one 64 KiB staging chunk as
+  chunk rows, so SQLite keeps no bind, record or trigger-rewrite copy of it.
+  Integrity checks, resume and retention behavior are unchanged (#2241).
+- Self-update maintenance commits now publish through the same durable frozen fanout as every other commit. They still confirm on the first relay acknowledgement, and the app's fanout retry schedule keeps retrying every group relay that missed them. Self-updates staged before upgrading finish on their legacy record, which no longer stops retrying when its post-confirmation marker write fails.
+- Every publish pass, including secondary retries after a commit confirmed, writes `publish_attempt` and `publish_outcome` audit rows with the endpoints attempted, accepted and failed in that pass.
+- A relay still pending when a multi-relay signed publish meets quorum is now reported as `publish acknowledgement unknown` instead of being dropped from the outcome.
+- Group changes fail with `AppError::GroupCommitUndelivered` once the group's last confirmed change has been owed to a group relay for two minutes. Before, a device could keep building on a change that members reading only the other relays never received (mdk#2255). The check is advisory: after the user accepts the risk, `acknowledge_group_commit_undelivered` lets one change through. Both advisory checks are evaluated together, so a change refused by both can be acknowledged past each in turn. Due self-updates wait up to an hour for delivery. Messages and leave are not affected.
+
+## 0.13.0 - 2026-10-12
+
+### Breaking changes
+
+- External-signer accounts move their device-local SQLCipher key from the
+  plaintext `.external-sqlcipher-secret` file into the configured `SecretStore`
+  (`.external-sqlcipher/<account label>`) on first open, then scrub and remove the
+  file. Older binaries cannot open these databases; downgrade is unsupported.
+  Opening a database with neither credential fails instead of generating a key.
+
+- `PresentedChatRow` adds `draft_version: Option<ChatListDraftVersion>`; struct
+  literals must set it. `MessageDraftRevision::includes_chat_list_version`
+  compares the two. An identical-text draft save now advances the revision.
+
+- `GroupEvent` adds `LocalGroupCopyTerminated`, `LocalGroupCopyRestored` and
+  `GroupMemberLeavesRemoved`; update exhaustive matches. See Fixed for their
+  semantics.
+
+- `AppError` adds `ModerationReportingNotConfigured`, `InvalidModerationReportConfig`,
+  `InvalidReportedPublicKey`, `CannotReportSelf` and `ModerationReportRateLimited`;
+  update exhaustive matches. `MarmotAppConfig` adds `moderation_report_config`;
+  struct literals that do not use `..Default::default()` must set it.
+
+- Attachment history adds `AttachmentRole` and the required `AttachmentEntry.role`
+  field. Update Rust struct literals; gallery consumers can exclude `InlineEmoji`
+  without changing original slots, parser verdicts or acquisition references.
+  See [the attachment-history handoff](../marmot-uniffi/ATTACHMENT-HISTORY.md).
+
+- `RelaySyncSnapshot` adds `refusals: Vec<RelayRefusalStats>`. Struct literals
+  must set it (`Vec::new()` keeps the old meaning); serialized snapshots omit it
+  when empty and older ones still deserialize.
+
+### Added
+
+- `MarmotApp::set_startup_diagnostics_enabled` and `startup_diagnostics_snapshot`
+  (`NativeStartupSnapshot`, `NativeStartupStage`, `NativeStartupOutcome`,
+  `NativeStartupObservation`) report opt-in, in-memory account, store and
+  key-opening phases, migration progress and async completion, with bounded
+  history and drop counters. Snapshotting does not query storage or the keystore,
+  and ordinary construction keeps capture disabled.
+
+- Relay refusals of live subscriptions are no longer dropped silently (#2247).
+  When a relay answers an inbox, group or maintenance REQ with `CLOSED`, the
+  account's v5 audit records a `subscription_refused` row: per relay (hashed)
+  and route kind, the reason category, whether the relay client kept the REQ
+  for a later AUTH or dropped it, and how often. `RelaySyncSnapshot.refusals`
+  (and `wn relay-stats`) counts refusals by opaque relay index, route kind,
+  category and disposition. `RelayRefusalStats`, `SubscriptionRouteKind` and
+  `SubscriptionRefusalDisposition` are re-exported.
+
+- Opt-in SOCKS5 routing. Set `WN_SOCKS5_PROXY` (a numeric `ip:port`) and,
+  optionally, both `WN_SOCKS5_USERNAME` and `WN_SOCKS5_PASSWORD` before the
+  runtime starts. Relay publishing, account receive and history pools,
+  directory reads, moderation reports, Blossom media, Open Ranking and
+  collector/audit uploads then connect through the proxy. Relay hostnames
+  resolve at the proxy; HTTP still sends the locally validated IP. The policy
+  is read once per process, ignores `ALL_PROXY`/`NO_PROXY`, and never falls
+  back to a direct connection. With all three variables unset, routing is
+  unchanged. See [SOCKS5 routing](README.md#socks5-routing).
+  - `MarmotApp::try_with_relays_and_account_home_and_config` now fails with an
+    `InvalidInput` I/O error when the `WN_SOCKS5_*` settings are invalid
+    (partial credentials, a hostname or a zero port). The infallible dev
+    constructors open, but every relay and HTTP connection is refused.
+  - `MarmotAppRuntime` agent preview publishing and watching return an
+    `Unsupported` I/O error while SOCKS5 is on, because the proxy cannot carry
+    QUIC.
+
+- `MarmotAppRuntime::submit_moderation_report` privately reports an account to
+  the deployment's moderation team. It sends a NIP-56 kind-1984 rumor, sealed by
+  the account key and gift-wrapped per NIP-59 (through the shared Welcome wrap
+  path) to the configured reports key, and publishes only to the configured
+  relays without account AUTH. This is additive: `report_message`,
+  `content_reports` and `dismiss_reports` are unchanged. Reports never carry
+  message, group or relay identifiers. Signed wraps are staged before publishing,
+  retried after `catch_up_accounts` and purged on sign-out and wipe. Repeats
+  within 10 minutes return the existing outcome, and each account may send 20
+  reports per hour. The new
+  `moderation_reporting_available`, `retry_pending_moderation_reports` and
+  `MarmotApp::set_moderation_report_config` complete the surface. See
+  `docs/marmot-architecture/moderation-reports.md`.
+
+- Opt-in relay telemetry exports `relay_reconciliation_attempts` and
+  `relay_reconciliation_order_unproven_passes`: device-wide, unlabeled counts
+  of NIP-77 history-repair passes, and of group passes that returned nothing
+  because no time order covered the missing history (#2086). Repeated, those
+  passes end in a "history may be incomplete" notice.
+  `NostrAdapterMetrics` gains `reconciliation_order_unproven_passes` and
+  `NostrReconciliationSummary` gains `order_unproven`; struct literals need
+  the field or `..Default::default()`.
+
+- `MarmotAppRuntime::create_identity_local_ready_with_initial_profile` makes a
+  caller-selected profile the first public kind-0 of a generated account, so
+  contacts never see the key-derived default name. A setup resumed past
+  its first local step ignores the profile and returns what its bootstrap
+  publishes.
+- `AccountManager::propose_onboarding_relay_repair` previews exact ordered
+  tags, content and minimal relay changes without signing or publishing.
+  Approval retains the existing revision and source-event checks; typed
+  previews require checkpoint version 6.
+
+- `MarmotAppRuntime::message_reactions` returns complete local reaction details for one exact
+  account/group/message, with one effective entry per sender/emoji and no
+  conversation-preview cap. Missing, hidden, deleted, invalidated and
+  retention-pruned targets return no participants; blocked reactors are excluded.
+  The read performs no network work or conversation-history scan.
+- `MarmotAppRuntime::upload_media_files` and
+  `upload_media_files_with_client_token` upload file-backed attachments
+  (`MediaFileUploadRequest`, `MediaFileTransferControl`) without whole-file
+  byte arrays: sources are snapshotted and encrypted into owner-only files
+  under the account's `media-staging/` before the first PUT, with the existing
+  wire format, ordered server fallback on identical ciphertext and the
+  existing publication and local-send admission. Optional retention streams
+  into SQLCipher through `stage_attachment_upload_files` and stays bounded by
+  the file-backed 900 MiB ceiling while preserving the account quota.
+  Explicit large acquisitions use private file sinks, bounded authenticated
+  decryption and ciphertext Range checkpoints. Legacy arrays retain their
+  smaller limits. Cancellation observed before admission starts publishes
+  nothing; admission itself is not interruptible. File uploads wait for their
+  size-bounded endpoint attempts without the legacy 16-minute response timeout.
+  File uploads require the server descriptor's `sha256` and `size`. (#2175)
+
+### Changed
+
+- Polls can be created in direct conversations as well as groups. Renaming or
+  reclassifying a conversation does not disable an existing open poll.
+
+- A sync drain stops waiting once every relay has answered its history REQs,
+  counting a relay that refused one for good as answered, instead of running
+  to `SDK_FIRST_SYNC_WAIT` / `SDK_DRAIN_WAIT`. A refusal is not evidence of
+  served history, so live cursor promotion and incremental activation reuse
+  still require end-of-stored-events from every relay.
+
+- `relay.damus.io` is no longer on the retired-relay denylist; the relay is
+  still operating. `retired_relay_hosts()` now returns only
+  `relay.nostr.band`. Members whose kind-10050 inbox list names only
+  `relay.damus.io` can be invited again.
+
+### Fixed
+
+- Invites recover a member's KeyPackage from up to eight discovery relays when
+  their advertised outboxes have no usable one, checking signed deletions and
+  newer slot replacements before using it. Lookup stays within the existing
+  50-second deadline and incomplete coverage stays retryable (#2200).
+- Durably accepted sends no longer wait behind startup recovery, automatic push
+  gossip, a pending retry deadline or an older publication's secondary-relay
+  retry once required acknowledgements and MLS confirmation complete.
+
+- Catch-up downloads a large group backlog oldest first. When more history
+  is missing than one comparison pass fetches, the pass narrows to the oldest
+  part that fits, so commits no longer arrive ahead of older messages and move
+  a member's epoch past messages it can then never read (#2086).
+- Catch-up downloads missed group history in far fewer round trips. Each
+  comparison pass now fetches up to 256 events (1 MiB), across all relays, in
+  batched requests instead of 16 one-at-a-time requests, so a backlog of a few hundred
+  messages arrives in a couple of passes instead of dozens. A long drip gave
+  commits time to move a member's epoch past older messages it had not
+  downloaded yet (#2086).
+- Profile, follow-list and relay-list saves still return on the first relay
+  acknowledgement, but relays the quorum cancelled now receive the identical
+  signed record in a bounded background send. Previously those relays kept
+  serving the older version, such as a generated signup name (#2216).
+
+- Explicit onboarding relay edits now preview and publish the selected endpoint
+  changes without rebuilding untouched tags: mixed NIP-65 roles, duplicate
+  occurrences, tag extensions, unrelated tags and event content survive, including
+  when a host supplies an equivalent URL spelling. No-op selections cannot publish. Approval revalidates the exact preview and current
+  endpoint policy; restart retries the same persisted signed event. Manual edit
+  checkpoints use version 7, which older readers reject; no database migration
+  or binding signature change is required. Follow-up to #1979.
+
+
+- File acquisition enforces disk reserve with or without resumable validators,
+  saves interrupted ciphertext tails, retries a rejected resumed representation
+  from zero without consuming redirect hops, and discards responses exceeding
+  their advertised total. Completed files keep progress in ciphertext units.
+  Cancelled file upload completion releases staging even when `send` is false.
+- Lossless relay repairs accept case-insensitive NIP-65 read/write markers,
+  matching relay-list inspection while preserving their original spelling
+  and extension fields through approval and publication.
+
+- Commands and maintenance retain committed activity before subscription waits.
+  Manual and scheduled convergence keep subscriber updates owned through route,
+  checkpoint, notification and invitation waits, including cancellation.
+- Maintenance deadline write failures preserve committed effects. Quiet ticks
+  and reopen repair missing deadlines and partial completion without another
+  MLS commit or reuse of terminal obligation IDs. Deadline collision repair
+  keeps the 24–36-day period; ordinary epoch activity does not postpone an
+  overdue periodic rotation.
+- Test-only conformance progress distinguishes bounded confirmation replay
+  through unchanged opaque rows from a stalled convergence drain.
+
+- Historical canonical replay clears stale removal metadata when the selected
+  local MLS leaf remains active, without emitting a false restoration event.
+  Activity from commits preceding a disband survives a later terminal-cleanup
+  failure. Confirmation replay retries share the normal background row and time
+  budget and resume beyond an unchanged deferred prefix. An admitted slice makes
+  progress even when storage preparation consumes its wall-time allowance.
+- Quiet projection repair releases the accepted delivery's cursor pin. Resumed
+  chat and poll publications wake recipients after source revival and checkpoint;
+  projection or checkpoint failures retain that session's notification obligation.
+  Sent wake ownership lasts through partial fanout acceptance and acknowledgement
+  retry, preventing duplicate wakes from resumed publications or direct-send cleanup.
+
+- Identical same-actor fork activity retains its reaction target when a fresh
+  canonical commit replaces a withdrawn origin; adoption and revival are atomic.
+  Canonical removal and membership cleanup commit together; their native events
+  survive later candidate-cleanup failures. Retained-history restoration resumes
+  enrolled periodic maintenance without reusing failed work IDs.
+- Projection retry retains bookkeeping and failed-message updates as well as
+  native events. Live receive keeps the owning client until projection and its
+  checkpoint finish. Outbound sends reconcile retained route changes and retry
+  failed subscription rebuilds. Comparison admission/checkpoint failures preserve
+  repaired subscriber updates.
+  A second local deletion discards obsolete retained projections. Terminal groups
+  that never reached app projection do not stall later batches. Queues remain
+  session-local; this does not claim crash-durable activity replay.
+
+- The HPKE dependency now uses `libcrux-kem` 0.0.10, fixing malformed hybrid-key
+  and short-seed panics (RUSTSEC-2026-0330 and RUSTSEC-2026-0331). A documented
+  compatibility patch preserves the existing HPKE and OpenMLS versions.
+
+- Group-activity reaction targets retain each accepted commit's authenticated
+  actor, source-state delta and fork-withdrawal origin. Authors and recipients
+  use the same activity derivation. Account membership rows describe first-leaf
+  arrival and last-leaf departure; sibling-only changes create no misleading
+  account invitation or departure. Display-component decoding no longer blocks
+  otherwise valid legacy MLS evolution. Valid profile repairs retain rename
+  activity with an unknown previous name; unreadable resulting components
+  produce no invented display values.
+  Device-local termination/restoration effects drive participation and pending-send
+  cleanup independently of timeline activity. Push cleanup follows actual leaf
+  transitions, preserves surviving destinations and clears tombstones only for
+  departed accounts. Restoration preserves archive choices and outstanding leave
+  intent; reopen repairs terminal projections from durable removal markers.
+  Manual convergence retries observe the same native effects as scheduled
+  convergence, including reportless membership changes and leaf-token cleanup.
+  Group commands and maintenance also observe native membership decisions
+  produced while settling retained commits. Secondary projection or route-refresh
+  failures preserve the canonical publish result. Failed projection batches
+  retain their source identity/time in a session queue; later delivery, drain and
+  convergence observations cannot overtake them. Successful-prefix subscriber
+  updates survive a later write failure, including an older blocked batch.
+  Retries resume completed native and activity-row phases instead of repeating
+  old termination cleanup over newer sends. Repaired updates precede newer
+  deltas and are returned once by quiet direct-client sync and event reads;
+  cancelled drain checkpoints, receive waits and explicit-sync recovery waits
+  retain progress and pending notifications. Completed pending-send cleanup retains its exact storage update
+  across chat-list conversion failures; message and Welcome notifications wait
+  for acknowledgement completion, and retries re-stage removed acknowledgements.
+  Push gossip never enters partial host-message summaries. Route rebuilds and
+  failed hydration token sweeps use bounded worker retries; one group's failed
+  sweep does not block other groups or route refresh. These retry queues are not durable.
+  Local termination preserves peer push records and tombstones. Late gossip
+  cannot re-add an absent account/leaf pair; hydrated open reconciles missed leaf
+  cleanup without treating unreadable groups as empty rosters.
+  A pass ending in disband retains preceding commits' activity before the terminal
+  row, without emitting the closing commit's incidental member removals.
+  Drained and retried batches retain committed activity even when an unrelated
+  publication fails. Publish confirmation commits retained anchors and native
+  membership cleanup before consuming its retry handle, preserving author
+  activity after transient storage failures. Inbound replay failure after confirmed
+  publication retains a session retry without changing the publish result.
+  Replay-only work remains visible to the convergence scheduler after its
+  one-shot notification is consumed, respecting terminal, unrecoverable and
+  pending-publication gates and the worker's existing error backoff.
+  Eviction realization commits its
+  marker, roster and queued-work cleanup together before emitting events.
+  Forgetting a group removes its queued projection work without blocking other
+  groups. Manual and scheduled retries preserve finalized subscriber updates
+  when later route, retention or checkpoint work fails. Maintenance reconciles
+  the final canonical local leaf when a batch terminates and then restores a copy,
+  without reviving previously failed obligations.
+  Rust consumers must handle the three new non-timeline `GroupEvent` variants.
+  Existing row IDs and correctly attributed stored rows remain unchanged;
+  no account reset or destructive history migration is required.
+
+- When a member lookup does not complete and the member's known inbox relay
+  list has no usable relays, the invite now fails with "known member inbox
+  relay list has no usable relays and its refresh did not complete" instead
+  of "relay-list absence was not authoritatively established". The error is
+  still retryable. A completed lookup still returns
+  `AppError::MissingMemberInboxRoute`.
+
+- A sent message the engine queued while the group was converging is no longer
+  marked failed when an unrelated publish in the same batch fails, and a sent
+  row already marked failed revives once a relay accepts its fanout. Before,
+  other members received the message while the sender's row stayed failed
+  forever, and a sender's poll showed no projection.
+
 ## 0.12.0 - 2026-10-02
 
 ### Added

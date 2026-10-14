@@ -2013,6 +2013,7 @@ async fn superseded_self_removal_clears_removed_marker_and_restores_send() {
         .unwrap();
     let (rename_commit, rename_pending) = evolution(rename_res);
     renamer.confirm_published(rename_pending).await.unwrap();
+    let author_target = rename_activity_target(&renamer.drain_events(), &group_id);
     let remove_commit = route(remove_commit, &group_id);
     let rename_commit = route(rename_commit, &group_id);
 
@@ -2134,23 +2135,21 @@ async fn superseded_self_removal_clears_removed_marker_and_restores_send() {
         )),
         "the accepted rename must not be withdrawn, got {events:?}"
     );
-    // Roster correction: the reorg diff re-announces our membership relative
-    // to the previously presented (removed) roster, attributed to the
-    // accepted commit that drove the pass.
+    // The withdrawal above restores membership without inventing an invite
+    // attributed to a rename that did not add anyone.
     assert!(
-        events.iter().any(|event| matches!(
+        !events.iter().any(|event| matches!(
             event,
             GroupEvent::GroupStateChanged {
                 group_id: g,
                 change: cgka_traits::engine::GroupStateChange::MemberAdded { member },
-                origin_commit_id: Some(origin),
                 ..
-            } if g == &group_id
-                && *member == carol.self_id()
-                && *origin == content_id(&rename_commit)
+            } if g == &group_id && *member == carol.self_id()
         )),
-        "expected roster-correction MemberAdded for self, got {events:?}"
+        "a superseded removal must not create a new invitation: {events:?}"
     );
+    assert!(events.iter().any(|event| matches!(event, GroupEvent::LocalGroupCopyRestored { group_id: g } if g == &group_id)));
+    assert_eq!(rename_activity_target(&events, &group_id), author_target);
 
     // Send eligibility is restored: the intent the removed-copy gate rejected
     // above now succeeds.
@@ -2250,6 +2249,71 @@ async fn convergence_apply_clears_removed_marker_without_canonical_evidence() {
     assert_eq!(group.name, "healed");
     assert!(group.members.iter().any(|m| m.id == carol.self_id()));
     send_app(&mut carol, &group_id, b"send after healing".to_vec()).await;
+    assert_eq!(
+        carol
+            .drain_events()
+            .iter()
+            .filter(|event| matches!(event, GroupEvent::LocalGroupCopyRestored { .. }))
+            .count(),
+        1,
+    );
+
+    // Bob still holds the founding epoch. Its longer branch forces Carol to
+    // replay the retained anchor captured while her metadata said removed.
+    // Her current source tree is already live, so selection must clear the
+    // historical marker without announcing a second restoration.
+    assert_eq!(bob.epoch(&group_id).unwrap(), EpochId(1));
+    let mut bob_commits = Vec::new();
+    for name in ["bob branch", "bob longer branch"] {
+        let (commit, pending) = evolution(
+            bob.send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some(name.into()),
+                description: None,
+            })
+            .await
+            .unwrap(),
+        );
+        bob.confirm_published(pending).await.unwrap();
+        bob_commits.push(route(commit, &group_id));
+    }
+    for commit in &bob_commits {
+        carol
+            .buffer_openmls_convergence_message_at(&group_id, commit.clone(), 2_000_000)
+            .unwrap();
+    }
+    let selected = carol
+        .converge_stored_openmls_messages_at(&group_id, 3_000_000)
+        .unwrap();
+    assert_eq!(selected.convergence_status, ConvergenceStatus::Settled);
+    assert_eq!(
+        selected.accepted_commits,
+        bob_commits.iter().map(content_hex).collect::<Vec<_>>(),
+    );
+    let group = carol_storage.get_group(&group_id).unwrap();
+    assert_eq!(group.name, "bob longer branch");
+    assert!(
+        !group.removed,
+        "historical metadata must not undo the earlier heal"
+    );
+    assert!(
+        carol
+            .canonical_group_membership(&group_id)
+            .unwrap()
+            .local_leaf_active
+    );
+    assert!(
+        !carol
+            .drain_events()
+            .iter()
+            .any(|event| matches!(event, GroupEvent::LocalGroupCopyRestored { .. }))
+    );
+    send_app(
+        &mut carol,
+        &group_id,
+        b"send after historical replay".to_vec(),
+    )
+    .await;
 }
 
 /// Sibling of the test above with the FULL post-`realize_self_eviction`
@@ -2326,6 +2390,7 @@ async fn convergence_apply_heals_fully_evicted_shaped_record() {
         .unwrap();
     let (rename_commit, rename_pending) = evolution(rename_res);
     alice.confirm_published(rename_pending).await.unwrap();
+    let author_target = rename_activity_target(&alice.drain_events(), &group_id);
     let rename_commit = route(rename_commit, &group_id);
     carol
         .buffer_openmls_convergence_message_at(&group_id, rename_commit.clone(), 1_000)
@@ -2346,11 +2411,11 @@ async fn convergence_apply_heals_fully_evicted_shaped_record() {
         group.members.iter().any(|m| m.id == carol.self_id()),
         "replay must rebuild the roster from canonical MLS state"
     );
-    // The stale record presented us as absent, so the apply re-announces our
-    // membership as a roster-correction row.
+    // Healing a local stale marker restores the roster without fabricating
+    // an invitation. Only the authenticated accepted rename is activity.
     let events = carol.drain_events();
     assert!(
-        events.iter().any(|event| matches!(
+        !events.iter().any(|event| matches!(
             event,
             GroupEvent::GroupStateChanged {
                 group_id: g,
@@ -2358,8 +2423,9 @@ async fn convergence_apply_heals_fully_evicted_shaped_record() {
                 ..
             } if g == &group_id && *member == carol.self_id()
         )),
-        "expected roster-correction MemberAdded for self, got {events:?}"
+        "healing a stale record must not invent an invitation: {events:?}"
     );
+    assert_eq!(rename_activity_target(&events, &group_id), author_target);
     send_app(
         &mut carol,
         &group_id,
@@ -10118,6 +10184,42 @@ fn route(msg: TransportMessage, group_id: &GroupId) -> TransportMessage {
             ..msg
         },
     }
+}
+
+/// Shared reaction identity of the one authenticated rename in this event window.
+fn rename_activity_target(events: &[GroupEvent], group_id: &GroupId) -> String {
+    let targets: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            GroupEvent::GroupStateChanged {
+                epoch,
+                actor,
+                change,
+                origin_commit_id,
+                ..
+            } if matches!(
+                change,
+                cgka_traits::engine::GroupStateChange::GroupRenamed { .. }
+            ) =>
+            {
+                assert!(actor.is_some(), "rename has authenticated attribution");
+                assert!(origin_commit_id.is_some(), "rename has a withdrawal origin");
+                Some(
+                    cgka_traits::app_event::group_system_event_material(
+                        group_id,
+                        epoch.0,
+                        actor.as_ref(),
+                        change,
+                    )
+                    .unwrap()
+                    .message_id_hex,
+                )
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(targets.len(), 1, "exactly one accepted rename: {events:?}");
+    targets.into_iter().next().unwrap()
 }
 
 /// Content-derived dedup id of a group message (#238). Inbound / buffered

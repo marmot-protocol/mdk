@@ -101,6 +101,21 @@ pub(crate) fn relay_stats_plain(snapshot: &RelayTelemetrySnapshot) -> String {
         lines.push("per-relay (opaque device-local index):".to_owned());
         lines.extend(per_relay);
     }
+    if !sync.refusals.is_empty() {
+        lines.push("subscription refusals (relay CLOSED):".to_owned());
+        lines.extend(sync.refusals.iter().map(|refusal| {
+            format!(
+                "  relay#{} {} {} {} x{}",
+                refusal.relay_index,
+                refusal.route_kind.as_str(),
+                refusal
+                    .category
+                    .map_or("unclassified", |category| category.as_str()),
+                refusal.disposition.as_str(),
+                refusal.count,
+            )
+        }));
+    }
 
     lines.push(format!(
         "relay health: sdk_backed={} total={} connected={} connecting={} disconnected={} attempts={} successes={}",

@@ -328,7 +328,8 @@ platforms plus adapter/harness install assets: the Hermes Marmot plugin + `insta
 Marmot channel plugin + `install-openclaw-marmot.sh`, the `wn-claude` harness +
 `install-claude-marmot.sh`, the `wn-codex` harness +
 `install-codex-marmot.sh`, the `wn-opencode` harness +
-`install-opencode-marmot.sh`, and the `wn-pi` harness + `install-pi-marmot.sh`.
+`install-opencode-marmot.sh`, the `wn-pi` harness + `install-pi-marmot.sh`, and the `wn-goose` harness +
+`install-goose-marmot.sh`.
 
 The workflow lives at:
 
@@ -349,6 +350,7 @@ cargo test -p wn-claude
 cargo test -p wn-codex
 cargo test -p wn-opencode
 cargo test -p wn-pi
+cargo test -p wn-goose
 sender_hex="$(awk 'BEGIN { for (i = 0; i < 32; i++) printf "11" }')"
 bash scripts/install-hermes-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --allow-user "$sender_hex"
 bash scripts/install-openclaw-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex"
@@ -356,6 +358,7 @@ bash scripts/install-claude-marmot.sh --dry-run --yes --allow-welcomer "$sender_
 bash scripts/install-codex-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --codex-bin /bin/echo
 bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --opencode-bin /bin/echo
 bash scripts/install-pi-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --pi-bin /bin/echo
+bash scripts/install-goose-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --goose-bin /bin/echo
 ```
 
 Bridge and control logs for all terminal harnesses use the
@@ -428,6 +431,14 @@ The release job creates these assets:
 - `wn-pi-darwin-aarch64-<version>.tar.gz.sha256`
 - `wn-pi-darwin-x86_64-<version>.tar.gz`
 - `wn-pi-darwin-x86_64-<version>.tar.gz.sha256`
+- `wn-goose-linux-x86_64-<version>.tar.gz`
+- `wn-goose-linux-x86_64-<version>.tar.gz.sha256`
+- `wn-goose-linux-aarch64-<version>.tar.gz`
+- `wn-goose-linux-aarch64-<version>.tar.gz.sha256`
+- `wn-goose-darwin-aarch64-<version>.tar.gz`
+- `wn-goose-darwin-aarch64-<version>.tar.gz.sha256`
+- `wn-goose-darwin-x86_64-<version>.tar.gz`
+- `wn-goose-darwin-x86_64-<version>.tar.gz.sha256`
 - `hermes-marmot-plugin-<version>.tar.gz`
 - `hermes-marmot-plugin-<version>.tar.gz.sha256`
 - `openclaw-marmot-plugin-<version>.tgz`
@@ -444,6 +455,8 @@ The release job creates these assets:
 - `install-opencode-marmot.sh.sha256`
 - `install-pi-marmot.sh`
 - `install-pi-marmot.sh.sha256`
+- `install-goose-marmot.sh`
+- `install-goose-marmot.sh.sha256`
 
 Each binary/plugin tarball carries a `manifest.json` recording the release tag, artifact version, source commit, and
 workspace version (the OpenClaw tarball's `package.json` version is also stamped to the cohort version at release time).
@@ -455,7 +468,7 @@ not create or update a mutable latest alias. A verified install for the current 
 ```sh
 (
 set -eu
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.12.0"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.13.0"
 
 install_verified() (
   set -eu
@@ -490,6 +503,8 @@ install_verified "$base_url/install-codex-marmot.sh" "$base_url/install-codex-ma
 install_verified "$base_url/install-opencode-marmot.sh" "$base_url/install-opencode-marmot.sh.sha256"
 # Pi terminal harness
 install_verified "$base_url/install-pi-marmot.sh" "$base_url/install-pi-marmot.sh.sha256"
+# Goose terminal harness
+install_verified "$base_url/install-goose-marmot.sh" "$base_url/install-goose-marmot.sh.sha256"
 )
 ```
 
@@ -501,7 +516,7 @@ plugin or harness binary, start same-user services where supported, bootstrap or
 Marmot agent home, and patch only the Marmot-specific gateway config when a gateway is involved. Use `--no-service`,
 `--no-start-wn-agent`, `--no-configure-hermes`, `--no-configure-openclaw`, or `--no-start-wn-opencode` when you need a
 partial/manual install. Terminal-harness installers also accept the matching
-`--no-start-wn-claude`, `--no-start-wn-codex`, or `--no-start-wn-pi` option.
+`--no-start-wn-claude`, `--no-start-wn-codex`, `--no-start-wn-pi`, or `--no-start-wn-goose` option.
 
 ## MarmotKit Binding Release
 
@@ -557,11 +572,10 @@ run on `master` can deliberately warm the per-input caches without publishing.
 Cache keys separate input targets and include the builder scripts/profile/defaults;
 the cache action also keys the Rust toolchain and Cargo dependency inputs.
 
-Avoid overlapping snapshot rehearsals and cohort releases when macOS capacity is
-limited. The three-job Apple bound is per workflow, not an organization-wide
-reservation; separate workflows and repositories can still compete for runners.
-In cold rehearsal 35506538221, this cap queued the fourth Apple input for roughly
-12 minutes; raising it to four trades that delay for one fewer slot for WN Agent.
+Apple jobs run on Blacksmith macOS runners (`blacksmith-6vcpu-macos-*`), which
+are provisioned on demand rather than drawn from the organization's shared
+GitHub-hosted macOS slots, so the Apple input matrix runs unbounded. Only the
+WN Agent `darwin-intel-smoke` job still uses a GitHub-hosted Intel runner.
 Local no-argument scripts also use `--locked` for reproducibility and `--timings`
 to write compiler reports under `target/cargo-timings/`. Refresh a stale lockfile
 before building bindings.

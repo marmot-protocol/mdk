@@ -32,6 +32,7 @@ impl CFree for MarmotAttachmentHistoryVersion {
     unsafe fn free_in_place(&mut self) {}
 }
 c_enum! { MarmotAttachmentCategory from AttachmentCategoryFfi { Image, Video, Audio, File, Rejected, } }
+c_enum! { MarmotAttachmentRole from AttachmentRoleFfi { Shared, InlineEmoji, } }
 c_enum! { MarmotAttachmentHistoryChange from AttachmentHistoryChangeFfi { Unchanged, Additions, RestartRequired, } }
 c_mirror! { MarmotAttachmentEntry from AttachmentEntryFfi {
     str message_id_hex,
@@ -41,6 +42,7 @@ c_mirror! { MarmotAttachmentEntry from AttachmentEntryFfi {
     copy received_at: u64,
     opt_copy has_source_epoch/source_epoch: u64,
     copy category: MarmotAttachmentCategory,
+    copy role: MarmotAttachmentRole,
     rec attachment: MarmotMediaAttachmentOutcome,
 } }
 /// All fields, including opaque handles, are owned by this page's result.
@@ -250,6 +252,7 @@ mod tests {
             Ok(())
         }
     }
+    /// C results preserve slot metadata while page and cloned-version ownership remain independent.
     #[test]
     fn attachment_c_handles_preflight_borrowing_and_deep_free() {
         let _guard = crate::memory::audit::test_lock();
@@ -313,6 +316,108 @@ mod tests {
                 None,
             ))
             .unwrap();
+        // Exercise the account-level ABI on populated data, including borrowed continuation
+        // and a cloned baseline that outlives both root page results.
+        {
+            use crate::account_attachment_history::*;
+            let account_ref = CString::new(account.clone()).unwrap();
+            let query = MarmotAccountAttachmentQuery {
+                groups: ptr::null(),
+                groups_len: 0,
+                senders: ptr::null(),
+                senders_len: 0,
+                has_min_timeline_at: 0,
+                min_timeline_at: 0,
+                has_max_timeline_at: 0,
+                max_timeline_at: 0,
+            };
+            unsafe {
+                let mut first = ptr::null_mut();
+                assert_eq!(
+                    marmot_account_attachment_history_page(
+                        &client,
+                        account_ref.as_ptr(),
+                        &query,
+                        1,
+                        ptr::null(),
+                        &mut first
+                    ),
+                    MarmotStatus::Ok
+                );
+                let MarmotAccountAttachmentPageRead::Page { page } = &*first else {
+                    panic!("account page");
+                };
+                assert_eq!(page.entries_len, 1);
+                assert!(!page.next_cursor.is_null());
+                assert_eq!(
+                    std::ffi::CStr::from_ptr((*page.entries).group_id_hex)
+                        .to_str()
+                        .unwrap(),
+                    group
+                );
+                let mut baseline = ptr::null_mut();
+                assert_eq!(
+                    marmot_account_attachment_version_clone(page.version, &mut baseline),
+                    MarmotStatus::Ok
+                );
+                let mut second = ptr::null_mut();
+                assert_eq!(
+                    marmot_account_attachment_history_page(
+                        &client,
+                        account_ref.as_ptr(),
+                        &query,
+                        1,
+                        page.next_cursor,
+                        &mut second
+                    ),
+                    MarmotStatus::Ok
+                );
+                marmot_account_attachment_page_read_free(first);
+                let MarmotAccountAttachmentPageRead::Page { page } = &*second else {
+                    panic!("account continuation");
+                };
+                assert_eq!(page.entries_len, 1);
+                assert!(page.next_cursor.is_null());
+                let mut change = u32::MAX;
+                assert_eq!(
+                    marmot_account_attachment_version_change_since(
+                        page.version,
+                        baseline,
+                        &mut change
+                    ),
+                    MarmotStatus::Ok
+                );
+                assert_eq!(change, MarmotAttachmentHistoryChange::Unchanged as u32);
+                marmot_account_attachment_page_read_free(second);
+                let mut current = ptr::null_mut();
+                assert_eq!(
+                    marmot_account_attachment_history_version(
+                        &client,
+                        account_ref.as_ptr(),
+                        &mut current
+                    ),
+                    MarmotStatus::Ok
+                );
+                assert_eq!(
+                    marmot_account_attachment_version_change_since(current, baseline, &mut change),
+                    MarmotStatus::Ok
+                );
+                assert_eq!(change, MarmotAttachmentHistoryChange::Unchanged as u32);
+                marmot_account_attachment_version_free(current);
+                marmot_account_attachment_version_free(baseline);
+                // Typed non-page results own no page allocations; freeing each is harmless.
+                for result in [
+                    AccountAttachmentPageReadFfi::RestartRequired,
+                    AccountAttachmentPageReadFfi::CursorMismatch,
+                    AccountAttachmentPageReadFfi::InvalidQuery,
+                    AccountAttachmentPageReadFfi::InvalidLimit,
+                ] {
+                    marmot_account_attachment_page_read_free(boxed(
+                        MarmotAccountAttachmentPageRead::from(result),
+                    ));
+                }
+            }
+        }
         let account = CString::new(account).unwrap();
         let group = CString::new(group).unwrap();
         unsafe {
@@ -438,6 +543,7 @@ mod tests {
                 received_at: 2,
                 source_epoch: None,
                 category: AttachmentCategoryFfi::Rejected,
+                role: AttachmentRoleFfi::Shared,
                 attachment: MediaAttachmentOutcomeFfi::Rejected {
                     attachment_index: 3,
                     rejection: MediaAttachmentRejectionFfi {

@@ -52,6 +52,7 @@ pub use markdown::{
     MarkdownAlignmentFfi, MarkdownAutolinkKindFfi, MarkdownBlockFfi, MarkdownCodeBlockKindFfi,
     MarkdownDocumentFfi, MarkdownInlineFfi, MarkdownLinkDestinationKindFfi, MarkdownListItemFfi,
     MarkdownListKindFfi, MarkdownNostrEntityFfi, MarkdownNostrHrpFfi, MarkdownTableCellFfi,
+    MarkdownTimestampStyleFfi,
 };
 pub use secret_store::SecretStore;
 pub use subscriptions::ConversationWindowSubscription;
@@ -92,6 +93,7 @@ pub use conversions::{
     LocalPushRegistrationDebugFfi, MaintenanceObligationFfi, MaintenancePhaseFfi,
     MaintenanceTriggerFfi, MediaAttachmentOutcomeFfi, MediaAttachmentReferenceFfi,
     MediaAttachmentRejectionFfi, MediaAttachmentRejectionKindFfi, MediaDownloadResultFfi,
+    MediaFileTransferControlFfi, MediaFileUploadAttachmentRequestFfi, MediaFileUploadRequestFfi,
     MediaLocatorFfi, MediaRecordFfi, MediaUploadAttachmentRequestFfi,
     MediaUploadAttachmentResultFfi, MediaUploadRequestFfi, MediaUploadResultFfi,
     MessageDraftAttachmentFfi, MessageDraftAttachmentSummaryFfi, MessageDraftFfi,
@@ -99,23 +101,25 @@ pub use conversions::{
     NotificationSettingsFfi, NotificationTrafficClassFfi, NotificationTriggerFfi,
     NotificationUpdateFfi, NotificationUserFfi, NotificationWakeSourceFfi, OnboardingActionFfi,
     OnboardingDeviceDiscoveryFfi, OnboardingDevicePackageFfi, OnboardingFindingFfi,
-    OnboardingIssueFfi, OnboardingOptionsFfi, OnboardingRepairProposalFfi,
-    OnboardingSingleDeviceNoticeFfi, OnboardingSnapshotFfi, OnboardingStatusFfi, OnboardingStepFfi,
-    OnboardingStepStateFfi, PeriodicMaintenancePolicyFfi, PollOptionResultFfi, PollProjectionFfi,
-    PollTypeFfi, PollVoteFfi, PollVotePageFfi, ProductAnalyticsActivityFfi,
-    ProductAnalyticsMetadataFfi, ProductAnalyticsRuntimeConfigFfi, ProductEventFfi,
-    ProductEventModeFfi, ProductEventPropertyFfi, ProductEventSchemaFfi, ProductPropertyKindFfi,
-    ProductPropertySchemaFfi, ProductRecordResultFfi, PushPlatformFfi, PushRegistrationFfi,
-    PushRegistrationShareOutcomeFfi, PushRegistrationShareStatusFfi, PushRegistrationSyncResultFfi,
-    RelayEndpointClassificationFfi, RelayEndpointPolicyFfi, RelayTelemetryResourceFfi,
-    RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi, RetentionSweepGroupOutcomeFfi,
-    RetentionSweepReportFfi, RetentionSweepStatusFfi, RuntimeProjectionUpdateFfi,
-    SecureDeleteExpiredResultFfi, TimelineMessageChangeFfi, TimelineMessageQueryFfi,
-    TimelineMessageRecordFfi, TimelinePageFfi, TimelineProjectionUpdateFfi,
-    TimelineReactionEmojiFfi, TimelineReactionSummaryFfi, TimelineRemoveReasonFfi,
-    TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi, TimelineUserReactionFfi,
-    TransportFanoutStatusFfi, UsageDiagnosticsDecisionFfi, UsageDiagnosticsSettingsFfi,
-    UsageDiagnosticsStatusFfi,
+    OnboardingIssueFfi, OnboardingOptionsFfi, OnboardingRelayCapabilityFfi,
+    OnboardingRelayRepairFfi, OnboardingRelayRepairModeFfi, OnboardingRelayTagChangeFfi,
+    OnboardingRelayTagDispositionFfi, OnboardingRelayTagFfi, OnboardingRelayTagRoleFfi,
+    OnboardingRepairProposalFfi, OnboardingSingleDeviceNoticeFfi, OnboardingSnapshotFfi,
+    OnboardingStatusFfi, OnboardingStepFfi, OnboardingStepStateFfi, PeriodicMaintenancePolicyFfi,
+    PollOptionResultFfi, PollProjectionFfi, PollTypeFfi, PollVoteFfi, PollVotePageFfi,
+    ProductAnalyticsActivityFfi, ProductAnalyticsMetadataFfi, ProductAnalyticsRuntimeConfigFfi,
+    ProductEventFfi, ProductEventModeFfi, ProductEventPropertyFfi, ProductEventSchemaFfi,
+    ProductPropertyKindFfi, ProductPropertySchemaFfi, ProductRecordResultFfi, PushPlatformFfi,
+    PushRegistrationFfi, PushRegistrationShareOutcomeFfi, PushRegistrationShareStatusFfi,
+    PushRegistrationSyncResultFfi, RelayEndpointClassificationFfi, RelayEndpointPolicyFfi,
+    RelayTelemetryResourceFfi, RelayTelemetryRuntimeConfigFfi, RelayTelemetrySettingsFfi,
+    RetentionSweepGroupOutcomeFfi, RetentionSweepReportFfi, RetentionSweepStatusFfi,
+    RuntimeProjectionUpdateFfi, SecureDeleteExpiredResultFfi, TimelineMessageChangeFfi,
+    TimelineMessageQueryFfi, TimelineMessageRecordFfi, TimelinePageFfi,
+    TimelineProjectionUpdateFfi, TimelineReactionEmojiFfi, TimelineReactionSummaryFfi,
+    TimelineRemoveReasonFfi, TimelineSubscriptionUpdateFfi, TimelineUpdateTriggerFfi,
+    TimelineUserReactionFfi, TransportFanoutStatusFfi, UsageDiagnosticsDecisionFfi,
+    UsageDiagnosticsSettingsFfi, UsageDiagnosticsStatusFfi,
 };
 
 /// Convenience: turn an FFI string list of relay URLs into the engine's
@@ -202,6 +206,11 @@ pub struct MarmotOptions {
     pub secret_store: Option<Arc<dyn SecretStore>>,
     #[uniffi(default = None)]
     pub attachment_acquisition_mode: Option<AttachmentAcquisitionModeFfi>,
+    /// Destination for private moderation reports (`submit_moderation_report`). Set per
+    /// build flavor. Invalid values leave reporting unconfigured; `configure_moderation_reporting`
+    /// reports why.
+    #[uniffi(default = None)]
+    pub moderation_report_config: Option<ModerationReportConfigFfi>,
 }
 
 impl MarmotOptions {
@@ -225,6 +234,7 @@ impl MarmotOptions {
                     .into(),
             )
             .with_key_package_client_name(self.client_name.clone())
+            .with_moderation_report_config(self.moderation_report_config.clone().map(Into::into))
     }
 }
 

@@ -678,6 +678,24 @@ fn app_error_json(err: &AppError) -> Value {
                 "status": "wn groups disband-status <group-hex>",
             },
         }),
+        // Retryable, unlike the terminal arms above: the group moved past
+        // this device and recovery has not caught it up, so a commit now
+        // would fork it (mdk#2258).
+        AppError::GroupCatchingUp(group_id) => json!({
+            "code": "group_catching_up",
+            "message": err.to_string(),
+            "group_id": group_id,
+        }),
+        // Retryable: the group's last change has not reached every relay yet
+        // and is still being retried (mdk#2255).
+        AppError::GroupCommitUndelivered(group_id) => json!({
+            "code": "group_commit_undelivered",
+            "message": err.to_string(),
+            "group_id": group_id,
+            "next_commands": {
+                "status": "wn groups commit-delivery <group-hex>",
+            },
+        }),
         AppError::GroupInviteNotPending => json!({
             "code": "group_invite_not_pending",
             "message": err.to_string(),

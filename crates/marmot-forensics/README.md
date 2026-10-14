@@ -36,6 +36,12 @@ files; historical v4 files and their legacy upload contract remain separate.
 
 See [V5-WELCOME.md](V5-WELCOME.md) for the Welcome-specific boundaries.
 
+Application sends use a stable, domain-separated operation identity derived from their validated inner event and group.
+The existing protected `operation_ref` connects initial queue admission, later preparation of a real wire artifact,
+publication, and retained retries across restart. Individual attempts remain separate rows with their own sequence and
+time. A queued outcome has no outbound wire reference until preparation actually produces one. Older captures may lack
+this correlation; the absence of a linked row does not prove that publication never happened.
+
 ## Run the tests
 
 ```sh

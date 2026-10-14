@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 pub struct RecoveryComparisonPlan {
     pub fence: RecoveryRevisionFence,
     /// The activation floor the retired inline executor re-subscribed at.
-    /// Kept for the stored plan format; recovery no longer reads it.
+    /// Accepted from legacy stored plans for compatibility; recovery ignores it
+    /// and new writes omit it.
+    #[serde(skip_serializing)]
     pub live_since_seconds: Option<u64>,
     pub routes: Vec<RecoveryScopePlan>,
     /// Only transiently failed selected routes survive settlement. Empty after
@@ -434,6 +436,131 @@ mod tests {
             .unwrap()
         );
         (revision, attempt, fence)
+    }
+
+    fn stored_comparison_plan(s: &SqliteAccountStorage) -> serde_json::Value {
+        let conn = s.lock().unwrap();
+        let (format, payload): (i64, Vec<u8>) = conn
+            .query_row_cached(
+                "SELECT plan_format,plan_payload FROM account_recovery_comparison WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(format, 1);
+        serde_json::from_slice(&payload).unwrap()
+    }
+
+    fn replace_comparison_plan(s: &SqliteAccountStorage, payload: &serde_json::Value) {
+        s.lock()
+            .unwrap()
+            .execute_cached(
+                "UPDATE account_recovery_comparison SET plan_payload=?1 WHERE singleton=1",
+                [serde_json::to_vec(payload).unwrap()],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn legacy_comparison_plans_rewrite_without_retired_live_floor() {
+        for live_floor in [serde_json::Value::Null, serde_json::json!(90)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("comparison.sqlite");
+            let key = crate::SqlCipherKey::new("legacy comparison plan").unwrap();
+            let s = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+            s.join_recovery_comparison(&[1; 16], 100_000, &[scope()])
+                .unwrap();
+            let (revision, attempt, fence) = reserve(&s, 100_000, vec![scope()]);
+            let cost = s.recovery_retry_state().unwrap();
+            let debt = s.pending_recovery_demands().unwrap()[0].ticket.id;
+            let fresh = stored_comparison_plan(&s);
+            assert!(
+                fresh.get("live_since_seconds").is_none(),
+                "new frozen plans must omit the retired live floor"
+            );
+
+            // Pre-change format-1 writers included either null or an integer.
+            // Keep their other fields exactly as installed by the real ledger.
+            let mut legacy = fresh.clone();
+            legacy["live_since_seconds"] = live_floor.clone();
+            replace_comparison_plan(&s, &legacy);
+            let decoded = s.recovery_comparison().unwrap().plan.unwrap();
+            assert_eq!(decoded.live_since_seconds, live_floor.as_u64());
+            assert_eq!(decoded.fence, fence);
+            assert_eq!(decoded.retry_routes, vec![0]);
+            s.close().unwrap();
+
+            let s = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+            let reopened = s.recovery_comparison().unwrap();
+            assert!(reopened.pending());
+            assert_eq!(reopened.revision, revision);
+            assert_eq!(reopened.attempt_serial, attempt);
+            assert_eq!(
+                reopened.plan.unwrap().live_since_seconds,
+                live_floor.as_u64()
+            );
+            assert_eq!(s.recovery_retry_state().unwrap(), cost);
+            assert_eq!(s.pending_recovery_demands().unwrap()[0].ticket.id, debt);
+
+            // Tolerating the retired field must not relax its legacy type or
+            // the strict format-1 decoder's treatment of other unknown keys.
+            for bad_floor in [
+                serde_json::json!(-1),
+                serde_json::json!("90"),
+                serde_json::json!(1.5),
+                serde_json::json!(true),
+                serde_json::json!({}),
+            ] {
+                let mut malformed = legacy.clone();
+                malformed["live_since_seconds"] = bad_floor;
+                replace_comparison_plan(&s, &malformed);
+                assert!(matches!(
+                    s.recovery_comparison(),
+                    Err(StorageError::Serialization(_))
+                ));
+            }
+            let mut unknown = legacy.clone();
+            unknown["future_comparison_field"] = serde_json::Value::Null;
+            replace_comparison_plan(&s, &unknown);
+            assert!(matches!(
+                s.recovery_comparison(),
+                Err(StorageError::Serialization(_))
+            ));
+            replace_comparison_plan(&s, &legacy);
+
+            assert!(
+                s.settle_recovery_comparison(
+                    revision,
+                    attempt,
+                    &[(0, RecoveryComparisonOutcome::ServicedPartial)],
+                    None,
+                )
+                .unwrap()
+            );
+            let rewritten = stored_comparison_plan(&s);
+            assert!(rewritten.get("live_since_seconds").is_none());
+            assert_eq!(rewritten["fence"], fresh["fence"]);
+            assert_eq!(rewritten["routes"], fresh["routes"]);
+            assert_eq!(rewritten["retry_routes"], serde_json::json!([]));
+            assert_eq!(s.recovery_retry_state().unwrap(), cost);
+            assert_eq!(s.pending_recovery_demands().unwrap().len(), 1);
+            assert_eq!(s.pending_recovery_demands().unwrap()[0].ticket.id, debt);
+            s.close().unwrap();
+
+            let s = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+            let settled = s.recovery_comparison().unwrap();
+            assert!(!settled.pending());
+            assert_eq!(settled.settled_revision, revision);
+            assert_eq!(settled.plan.unwrap().fence, fence);
+            assert_eq!(s.recovery_retry_state().unwrap(), cost);
+            assert_eq!(s.pending_recovery_demands().unwrap()[0].ticket.id, debt);
+            assert!(
+                stored_comparison_plan(&s)
+                    .get("live_since_seconds")
+                    .is_none()
+            );
+            s.close().unwrap();
+        }
     }
 
     #[test]

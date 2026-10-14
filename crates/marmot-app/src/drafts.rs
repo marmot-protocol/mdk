@@ -190,8 +190,8 @@ impl From<StoredMessageDraftSummary> for MessageDraftSummary {
 }
 
 pub use storage_sqlite::{
-    MessageDraftRevision, SelectedMessageDraft, SelectedMessageDraftAttachment,
-    SelectedMessageDraftContent,
+    ChatListDraftVersion, MessageDraftRevision, SelectedMessageDraft,
+    SelectedMessageDraftAttachment, SelectedMessageDraftContent,
 };
 
 /// Wakeup scoped to one account/group; reload the selected durable revision.

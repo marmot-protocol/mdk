@@ -1057,6 +1057,7 @@ async fn three_client_message_exchange_vector_is_stable() {
                     },
                     received_payloads: vec!["bob:hello".into(), "carol:hello".into()],
                     added_members: vec![],
+                    withdrawn_added_members: vec![],
                     removed_members: vec![],
                     epoch_changes: vec![],
                     app_invalidations: vec![],
@@ -1077,6 +1078,7 @@ async fn three_client_message_exchange_vector_is_stable() {
                     },
                     received_payloads: vec!["alice:hello".into(), "carol:hello".into()],
                     added_members: vec![],
+                    withdrawn_added_members: vec![],
                     removed_members: vec![],
                     epoch_changes: vec![],
                     app_invalidations: vec![],
@@ -1097,6 +1099,7 @@ async fn three_client_message_exchange_vector_is_stable() {
                     },
                     received_payloads: vec!["alice:hello".into(), "bob:hello".into()],
                     added_members: vec![],
+                    withdrawn_added_members: vec![],
                     removed_members: vec![],
                     epoch_changes: vec![],
                     app_invalidations: vec![],
@@ -3477,23 +3480,26 @@ fn assert_real_peeler_convergence_trace(trace: &ScenarioTrace) {
             ],
             "{observation:?}"
         );
-        // Whether the rival branch was adopted first is a delivery-order
-        // detail, so the membership claim is the net diff: anything withdrawn
-        // must be something this client had adopted, and what survives is
-        // exactly the selected branch's addition.
-        for removed in &observation.removed_members {
-            assert!(
-                observation.added_members.contains(removed),
-                "{observation:?}"
-            );
-        }
-        let net_added: Vec<&str> = observation
+        // Losing-branch activity is withdrawn by its origin commit, not by
+        // inventing a removal on the selected branch. The selected commits
+        // contain only David's and Grace's invitations.
+        assert!(observation.removed_members.is_empty(), "{observation:?}");
+        assert_eq!(
+            observation.withdrawn_added_members,
+            if observation.added_members.contains(&"eve".into()) {
+                vec!["eve".to_string()]
+            } else {
+                vec![]
+            },
+            "{observation:?}"
+        );
+        let active_added: Vec<&str> = observation
             .added_members
             .iter()
-            .filter(|member| !observation.removed_members.contains(member))
+            .filter(|member| !observation.withdrawn_added_members.contains(member))
             .map(String::as_str)
             .collect();
-        assert_eq!(net_added, vec!["david", "grace"], "{observation:?}");
+        assert_eq!(active_added, vec!["david", "grace"], "{observation:?}");
         // The rival branch forks inside the rewind horizon, so it stays
         // adoptable and its payload is parked with its commits. Retracting a
         // payload this client was never shown would announce a withdrawal of

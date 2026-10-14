@@ -18,10 +18,9 @@ use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessa
 use cgka_traits::types::{GroupId, MemberId};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
-use nostr::nips::nip59::GiftWrapBuilder;
 use nostr::prelude::{
-    EventBuilder, FinalizeEvent, FinalizeEventAsync, FinalizeUnsignedEvent, Keys, Kind, PublicKey,
-    RelayUrl, Tag, Timestamp as NostrTimestamp, UnsignedEvent,
+    EventBuilder, FinalizeEvent, FinalizeUnsignedEvent, Keys, Kind, PublicKey, RelayUrl, Tag,
+    Timestamp as NostrTimestamp, UnsignedEvent,
 };
 use rand::RngCore;
 use std::sync::Arc;
@@ -400,10 +399,7 @@ impl TransportPeeler for NostrMlsPeeler {
             ),
         ])
         .finalize_unsigned(sender_pubkey);
-        let gift_wrap = GiftWrapBuilder::new(recipient_pubkey, rumor)
-            .finalize_async(&SdkSigner(signer.clone()))
-            .await
-            .map_err(|e| PeelerError::WrapFailed(format!("NIP-59 gift wrap: {e}")))?;
+        let gift_wrap = crate::gift_wrap_rumor(signer.clone(), recipient_pubkey, rumor).await?;
         let event = NostrTransportEvent::from_nostr_event(&gift_wrap).map_err(to_peeler_error)?;
         event.to_transport_message().map_err(to_peeler_error)
     }
@@ -547,6 +543,7 @@ mod tests {
     use cgka_traits::group_context::GroupContextSnapshot;
     use cgka_traits::ingest::PeeledContent;
     use cgka_traits::types::{EpochId, MessageId};
+    use nostr::nips::nip59::GiftWrapBuilder;
     use std::collections::HashMap;
 
     #[tokio::test]

@@ -1,0 +1,14 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "GroupEvent::LocalGroupCopyRestored { group_id: gid() }"
+---
+{
+  "LocalGroupCopyRestored": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ]
+  }
+}

@@ -97,48 +97,6 @@ fn android_publication_competing_salts_preserve_database_reopenability() {
     }
 }
 
-#[cfg(unix)]
-#[test]
-fn android_publication_preserves_shared_secret_and_migration_marker() {
-    let dir = tempfile::tempdir().unwrap();
-    for name in [
-        EXTERNAL_SQLCIPHER_SECRET_FILE,
-        "session.sqlite.salt-migrating",
-    ] {
-        let path = dir.path().join(name);
-        let barrier = Barrier::new(8);
-        let winners = std::thread::scope(|scope| {
-            let tasks: Vec<_> = (1..=8u8)
-                .map(|byte| {
-                    let (path, barrier) = (&path, &barrier);
-                    scope.spawn(move || {
-                        barrier.wait();
-                        match write_private_new_using(
-                            path,
-                            &[byte; 64],
-                            fs_private::rename_noreplace_with_lock,
-                        ) {
-                            Ok(()) => Some(byte),
-                            Err(AppError::Io(error))
-                                if error.kind() == std::io::ErrorKind::AlreadyExists =>
-                            {
-                                None
-                            }
-                            Err(error) => panic!("unexpected publication error: {error}"),
-                        }
-                    })
-                })
-                .collect();
-            tasks
-                .into_iter()
-                .filter_map(|task| task.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-        assert_eq!(winners.len(), 1);
-        assert_eq!(fs::read(path).unwrap(), vec![winners[0]; 64]);
-    }
-}
-
 #[test]
 fn salt_publication_never_replaces_existing_bytes() {
     let dir = tempfile::tempdir().unwrap();

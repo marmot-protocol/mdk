@@ -235,6 +235,7 @@ async fn every_attempt_resolves_fresh_and_checks_host_and_port() {
 }
 
 struct ForbiddenDns(Arc<AtomicUsize>);
+
 impl reqwest::dns::Resolve for ForbiddenDns {
     fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
         self.0.fetch_add(1, Ordering::SeqCst);
@@ -243,6 +244,7 @@ impl reqwest::dns::Resolve for ForbiddenDns {
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)]
 async fn reqwest_uses_only_pinned_addresses_and_ignores_proxies() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

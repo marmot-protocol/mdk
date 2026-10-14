@@ -1,6 +1,18 @@
 package dev.ipf.marmotkit
 
+/** Exercise generated record layout and enum discriminants, including presentation roles. */
 fun main() {
+    for (query in listOf(
+        AccountAttachmentQueryFfi(emptyList(), emptyList(), null, null),
+        AccountAttachmentQueryFfi(listOf("aa"), listOf("sender"), 0uL, ULong.MAX_VALUE),
+    )) {
+        check(FfiConverterTypeAccountAttachmentQueryFfi.lift(FfiConverterTypeAccountAttachmentQueryFfi.lower(query)) == query)
+    }
+    for (role in AttachmentRoleFfi.entries) {
+        val entry = AttachmentEntryFfi("m", "s", "a", 1u, 2u, null, AttachmentCategoryFfi.REJECTED, role,
+            MediaAttachmentOutcomeFfi.Rejected(7u, MediaAttachmentRejectionFfi(MediaAttachmentRejectionKindFfi.UNSUPPORTED_FORMAT, "unsupported")))
+        check(FfiConverterTypeAttachmentEntryFfi.lift(FfiConverterTypeAttachmentEntryFfi.lower(entry)) == entry)
+    }
     val options = MarmotOptions(attachmentAcquisitionMode = AttachmentAcquisitionModeFfi.HOST_MANAGED)
     check(FfiConverterTypeMarmotOptions.lift(FfiConverterTypeMarmotOptions.lower(options)) == options)
     val permission = AttachmentAutomaticPermissionFfi(false, true, false, true)

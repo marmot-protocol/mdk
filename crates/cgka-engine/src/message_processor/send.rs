@@ -9,7 +9,7 @@ use crate::group_lifecycle::{self};
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID;
-use cgka_traits::engine::{GroupStateChange, SendIntent, SendResult};
+use cgka_traits::engine::{SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::error::EngineError;
 use cgka_traits::message::OwnApplicationConvergenceStamp;
@@ -229,7 +229,6 @@ impl<S: StorageProvider> Engine<S> {
             parsed_kps.push(parsed);
         }
 
-        let mut current_admins = Vec::new();
         let mut resulting_admins = Vec::new();
         let mut granted_admin_ids = Vec::new();
         if !initial_admins.is_empty() {
@@ -237,7 +236,7 @@ impl<S: StorageProvider> Engine<S> {
                 .iter()
                 .map(|kp| crate::identity::validated_member_id_of_leaf(kp.leaf_node()))
                 .collect::<Result<Vec<_>, _>>()?;
-            current_admins = crate::app_components::admins_of_group(&mls_group)?;
+            let current_admins = crate::app_components::admins_of_group(&mls_group)?;
             resulting_admins = current_admins.clone();
             let mut seen_grants = HashSet::new();
             for admin in &initial_admins {
@@ -430,29 +429,6 @@ impl<S: StorageProvider> Engine<S> {
             ),
         );
         self.track_pending_origin_commit(pending_ref, commit_msg.id.clone());
-        // Buffer the additions so confirm_published emits an attributed
-        // GroupStateChanged (and the app a kind-1210 row) once the commit merges.
-        let actor = Some(self.identity.self_id().clone());
-        let mut pending_changes = parsed_kps
-            .iter()
-            .filter_map(|kp| crate::identity::validated_member_id_of_leaf(kp.leaf_node()).ok())
-            .map(|member| crate::engine::PendingGroupStateChange {
-                actor: actor.clone(),
-                change: GroupStateChange::MemberAdded { member },
-            })
-            .collect::<Vec<_>>();
-        if !granted_admin_ids.is_empty() {
-            pending_changes.extend(
-                crate::group_state_changes::admin_changes(&current_admins, &resulting_admins)
-                    .into_iter()
-                    .map(|change| crate::engine::PendingGroupStateChange {
-                        actor: actor.clone(),
-                        change,
-                    }),
-            );
-        }
-        self.pending_state_changes
-            .insert(pending_ref, pending_changes);
         pending_commit_guard.disarm();
 
         Ok(SendResult::GroupEvolution {
@@ -684,26 +660,6 @@ impl<S: StorageProvider> Engine<S> {
             ),
         );
         self.track_pending_origin_commit(pending_ref, commit_msg.id.clone());
-        let mut removed_changes: Vec<crate::engine::PendingGroupStateChange> = unique_targets
-            .iter()
-            .cloned()
-            .map(|member| crate::engine::PendingGroupStateChange {
-                actor: Some(self.identity.self_id().clone()),
-                change: GroupStateChange::MemberRemoved { member },
-            })
-            .collect();
-        // Mirror what receivers derive from their before/after admin snapshot:
-        // the coupled admin-policy update also revokes admin status, so the
-        // author's confirm-published events must carry the same AdminRemoved
-        // rows (attributed to self, as UpdateAppComponents does).
-        for change in crate::group_state_changes::admin_changes(&admins, &resulting_admins) {
-            removed_changes.push(crate::engine::PendingGroupStateChange {
-                actor: Some(self.identity.self_id().clone()),
-                change,
-            });
-        }
-        self.pending_state_changes
-            .insert(pending_ref, removed_changes);
         pending_commit_guard.disarm();
 
         Ok(SendResult::GroupEvolution {

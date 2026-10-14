@@ -9,6 +9,8 @@ use transport_nostr_peeler::NostrTransportEvent;
 
 mod cancellation;
 mod recovery;
+mod relay_edits;
+mod relay_repair;
 mod single_device;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,9 +81,14 @@ enum OnboardingPersist {
 // v3 forbids older v2 cancellation/restart semantics. Recovered attempts use
 // v4 because a v3 reader cannot enforce epoch-scoped approvals. v5 protects
 // append semantics from v3/v4 readers, with or without a recovery epoch.
+// v6 fences typed lossless relay previews from v3/v4/v5 readers that would
+// silently discard the preview and publish a destructive replacement.
 const ONBOARDING_VERSION: u32 = 3;
 const RECOVERED_ONBOARDING_VERSION: u32 = 4;
 const APPEND_ONBOARDING_VERSION: u32 = 5;
+const LOSSLESS_RELAY_REPAIR_ONBOARDING_VERSION: u32 = 6;
+// Earlier readers recompute all typed previews as automatic repairs.
+const MANUAL_RELAY_EDIT_ONBOARDING_VERSION: u32 = 7;
 const ONBOARDING_V2: u32 = 2;
 const STEP_COUNT: usize = 6;
 const MAX_RELAYS: usize = 16;
@@ -188,6 +195,80 @@ pub struct OnboardingStepState {
     pub actions: Vec<OnboardingAction>,
     pub checked_at: Option<u64>,
 }
+/// How a relay entry's original NIP-65 marker or inbox tag is interpreted.
+/// `Other` covers unrelated tags and malformed/future relay markers; callers
+/// must keep `fields` rather than reconstructing an event from this enum.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OnboardingRelayTagRole {
+    Other,
+    Unmarked,
+    Read,
+    Write,
+    Inbox,
+}
+
+/// A single tag in its exact event order, including duplicate and non-relay tags.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OnboardingRelayTag {
+    pub fields: Vec<String>,
+    pub endpoint: Option<String>,
+    pub role: OnboardingRelayTagRole,
+}
+
+/// Whether a consent-gated minimal proposal changes an exact tag occurrence.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OnboardingRelayTagDisposition {
+    Retained,
+    Removed,
+    Added,
+}
+
+/// The missing route capability supplied by an added tag.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OnboardingRelayCapability {
+    None,
+    Read,
+    Write,
+    ReadAndWrite,
+    Inbox,
+}
+
+/// One exact before/after tag occurrence and its effect on route capability.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OnboardingRelayTagChange {
+    pub disposition: OnboardingRelayTagDisposition,
+    pub before_index: Option<u64>,
+    pub after_index: Option<u64>,
+    pub fields: Vec<String>,
+    pub endpoint: Option<String>,
+    pub role: OnboardingRelayTagRole,
+    pub restores: OnboardingRelayCapability,
+}
+
+/// A lossless, non-publishing preview. `ManualReview` is intentionally not
+/// approvable; hosts may prefill an editor from `before_tags` but cannot sign
+/// an empty or guessed replacement through this preview.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OnboardingRelayRepairMode {
+    ManualReview,
+    RemovalOnly,
+    Additive,
+    RemovalAndAdditive,
+}
+
+/// Exact signed-declaration source and proposed replacement for user review.
+/// Both tag arrays include unrelated fields in order; content is never edited.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OnboardingRelayRepair {
+    pub mode: OnboardingRelayRepairMode,
+    pub original_event_id: Option<String>,
+    pub original_content: String,
+    pub proposed_content: String,
+    pub before_tags: Vec<OnboardingRelayTag>,
+    pub after_tags: Vec<OnboardingRelayTag>,
+    pub changes: Vec<OnboardingRelayTagChange>,
+}
+
 /// The relay declarations that approval will publish. Unknown non-relay tags
 /// and the original event content are retained internally.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -199,6 +280,8 @@ pub struct OnboardingRepairProposal {
     pub write_relays: Vec<String>,
     pub profile: Option<UserProfileMetadata>,
     pub follows: Option<Vec<String>>,
+    #[serde(default)]
+    pub relay_repair: Option<OnboardingRelayRepair>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OnboardingSnapshot {
@@ -251,6 +334,8 @@ struct OnboardingCheckpoint {
     signed_repair: Option<NostrTransportEvent>,
     #[serde(default)]
     append_relays: bool,
+    #[serde(default)]
+    manual_relay_edit: bool,
     #[serde(default)]
     single_device_acknowledged: bool,
     #[serde(default)]
@@ -347,6 +432,7 @@ impl OnboardingCheckpoint {
             approved: false,
             signed_repair: None,
             append_relays: false,
+            manual_relay_edit: false,
             single_device_acknowledged: false,
             setup_cleanup_pending: false,
             attempt_start_revision: 0,
@@ -549,6 +635,8 @@ fn decode_onboarding_checkpoint(
         (ONBOARDING_VERSION, None)
             | (RECOVERED_ONBOARDING_VERSION, Some(_))
             | (APPEND_ONBOARDING_VERSION, _)
+            | (LOSSLESS_RELAY_REPAIR_ONBOARDING_VERSION, _)
+            | (MANUAL_RELAY_EDIT_ONBOARDING_VERSION, _)
     ) || checkpoint
         .snapshot
         .recovery_epoch
@@ -557,6 +645,8 @@ fn decode_onboarding_checkpoint(
         || checkpoint.snapshot.account_id_hex != account_id_hex
         || checkpoint.snapshot.steps.len() != STEP_COUNT
         || checkpoint.records.len() != STEP_COUNT
+        || (checkpoint.manual_relay_edit
+            && checkpoint.version != MANUAL_RELAY_EDIT_ONBOARDING_VERSION)
     {
         return Err(onboarding_error());
     }
@@ -994,7 +1084,19 @@ impl AccountManager {
                 };
             }
         }
-        if checkpoint.append_relays {
+        if checkpoint.manual_relay_edit
+            || checkpoint.version == MANUAL_RELAY_EDIT_ONBOARDING_VERSION
+        {
+            checkpoint.version = MANUAL_RELAY_EDIT_ONBOARDING_VERSION;
+        } else if checkpoint
+            .snapshot
+            .proposal
+            .as_ref()
+            .is_some_and(|proposal| proposal.relay_repair.is_some())
+            || checkpoint.version == LOSSLESS_RELAY_REPAIR_ONBOARDING_VERSION
+        {
+            checkpoint.version = LOSSLESS_RELAY_REPAIR_ONBOARDING_VERSION;
+        } else if checkpoint.append_relays {
             checkpoint.version = APPEND_ONBOARDING_VERSION;
         }
         checkpoint.snapshot.revision = checkpoint
@@ -1148,6 +1250,15 @@ impl AccountManager {
                 return Err(onboarding_error());
             }
             if account.signed_out && existing.snapshot.ready {
+                // A completed checkpoint can carry an optional unsigned cleanup.
+                // Fresh checks must not stop at its now-stale preview revision.
+                // Never discard an approved or signed publication on this path.
+                if existing.approved || existing.signed_repair.is_some() {
+                    return Err(onboarding_error());
+                }
+                existing.snapshot.proposal = None;
+                existing.append_relays = false;
+                existing.manual_relay_edit = false;
                 existing.single_device_acknowledged = false;
                 existing.snapshot.single_device_notice = None;
                 for index in 0..STEP_COUNT {
@@ -1971,6 +2082,10 @@ impl AccountManager {
     /// Prepare a relay replacement without signing or publishing it. Passing
     /// None appends the recommended defaults to the observed list, preserving
     /// existing tags and read/write roles, independently of local dial policy.
+    /// An explicit selection edits known endpoint roles while preserving retained
+    /// tags verbatim (including duplicates, order and extension fields), unrelated
+    /// tags and event content. The typed preview is inert until approved; an
+    /// unchanged selection produces a manual-review preview without approval.
     /// For inbox lists use read_relays; write_relays must be empty.
     pub async fn propose_onboarding_relays(
         &self,
@@ -1992,6 +2107,7 @@ impl AccountManager {
             return Err(onboarding_error());
         }
         c.append_relays = selection.is_none();
+        c.manual_relay_edit = selection.is_some();
         let (read_relays, write_relays) = if let Some(selection) = selection {
             selection
         } else {
@@ -2035,12 +2151,64 @@ impl AccountManager {
             }
             (reads, writes)
         };
+        self.validate_onboarding_relay_selection(
+            step,
+            &read_relays,
+            &write_relays,
+            c.append_relays,
+        )?;
+        let relay_repair = c.manual_relay_edit.then(|| {
+            relay_edits::manual_relay_edit(
+                step,
+                c.records[step.index()].as_ref(),
+                &read_relays,
+                &write_relays,
+            )
+        });
+        let manual_review = relay_repair
+            .as_ref()
+            .is_some_and(|repair| repair.mode == OnboardingRelayRepairMode::ManualReview);
+        c.snapshot.proposal = Some(OnboardingRepairProposal {
+            step,
+            revision: c
+                .snapshot
+                .revision
+                .checked_add(1)
+                .ok_or_else(onboarding_error)?,
+            previous_event_id: c.records[step.index()].as_ref().map(|e| e.id.clone()),
+            read_relays,
+            write_relays,
+            profile: None,
+            follows: None,
+            relay_repair,
+        });
+        c.snapshot.steps[step.index()].actions = if manual_review {
+            vec![OnboardingAction::EditRelays, OnboardingAction::CancelRepair]
+        } else {
+            vec![
+                OnboardingAction::ApproveRepair,
+                OnboardingAction::CancelRepair,
+            ]
+        };
+        self.save_onboarding(&mut c)?;
+        Ok(c.snapshot)
+    }
+    fn validate_onboarding_relay_selection(
+        &self,
+        step: OnboardingStep,
+        read_relays: &[String],
+        write_relays: &[String],
+        append_relays: bool,
+    ) -> Result<(), AppError> {
+        if !step.relay() {
+            return Err(onboarding_error());
+        }
         let all = read_relays
             .iter()
-            .chain(&write_relays)
+            .chain(write_relays)
             .cloned()
             .collect::<Vec<_>>();
-        let invalid_selection = !c.append_relays
+        let invalid_selection = !append_relays
             && (all.iter().collect::<HashSet<_>>().len() > MAX_RELAYS
                 || all
                     .iter()
@@ -2054,38 +2222,20 @@ impl AccountManager {
         let invalid_roles = (step == OnboardingStep::Relays && write_relays.is_empty())
             || (step == OnboardingStep::InboxRelays && !write_relays.is_empty());
         let routes = if step == OnboardingStep::Relays {
-            &write_relays
+            write_relays
         } else {
-            &read_relays
+            read_relays
         };
         let has_route = self
             .app
             .relay_plane
-            .classify_relay_endpoints(routes.clone())
+            .classify_relay_endpoints(routes.to_vec())
             .iter()
             .any(|v| v.policy == RelayEndpointPolicy::Allowed);
         if all.is_empty() || invalid_selection || invalid_roles || !has_route {
             return Err(onboarding_error());
         }
-        c.snapshot.proposal = Some(OnboardingRepairProposal {
-            step,
-            revision: c
-                .snapshot
-                .revision
-                .checked_add(1)
-                .ok_or_else(onboarding_error)?,
-            previous_event_id: c.records[step.index()].as_ref().map(|e| e.id.clone()),
-            read_relays,
-            write_relays,
-            profile: None,
-            follows: None,
-        });
-        c.snapshot.steps[step.index()].actions = vec![
-            OnboardingAction::ApproveRepair,
-            OnboardingAction::CancelRepair,
-        ];
-        self.save_onboarding(&mut c)?;
-        Ok(c.snapshot)
+        Ok(())
     }
     pub async fn propose_onboarding_profile(
         &self,
@@ -2131,6 +2281,7 @@ impl AccountManager {
         if c.approved || c.snapshot.steps[step.index()].status != OnboardingStatus::NeedsInput {
             return Err(onboarding_error());
         }
+        c.manual_relay_edit = false;
         c.snapshot.proposal = Some(OnboardingRepairProposal {
             step,
             revision: c
@@ -2143,6 +2294,7 @@ impl AccountManager {
             write_relays: Vec::new(),
             profile,
             follows,
+            relay_repair: None,
         });
         c.snapshot.steps[step.index()].actions = vec![
             OnboardingAction::ApproveRepair,
@@ -2166,8 +2318,15 @@ impl AccountManager {
             return Err(onboarding_error());
         }
         let proposal = c.snapshot.proposal.take().ok_or_else(onboarding_error)?;
+        // A typed preview changes actions, not the retained inspection result.
+        // Preserve the existing cancellation contract for other proposal kinds.
+        let status = if proposal.relay_repair.is_some() {
+            c.snapshot.steps[proposal.step.index()].status
+        } else {
+            OnboardingStatus::NeedsInput
+        };
         let findings = c.snapshot.steps[proposal.step.index()].findings.clone();
-        c.set(proposal.step, OnboardingStatus::NeedsInput, findings);
+        c.set(proposal.step, status, findings);
         self.save_onboarding(&mut c)?;
         Ok(c.snapshot)
     }
@@ -2212,6 +2371,7 @@ impl AccountManager {
         if c.approved || c.snapshot.revision != revision || proposal.revision != revision {
             return Err(onboarding_error());
         }
+        self.validate_typed_onboarding_repair(&c, &proposal)?;
         let sources = self
             .await_while_onboarding_live(
                 &account_id,
@@ -2273,11 +2433,73 @@ impl AccountManager {
         }
         Ok(c.snapshot)
     }
+    // Validate persisted approved previews again before their first signature, including after restart.
+    fn validate_typed_onboarding_repair(
+        &self,
+        c: &OnboardingCheckpoint,
+        proposal: &OnboardingRepairProposal,
+    ) -> Result<(), AppError> {
+        if c.manual_relay_edit && (c.append_relays || proposal.relay_repair.is_none()) {
+            return Err(onboarding_error());
+        }
+        if let Some(repair) = &proposal.relay_repair {
+            if c.manual_relay_edit {
+                self.validate_onboarding_relay_selection(
+                    proposal.step,
+                    &proposal.read_relays,
+                    &proposal.write_relays,
+                    false,
+                )?;
+                let expected = relay_edits::manual_relay_edit(
+                    proposal.step,
+                    c.records[proposal.step.index()].as_ref(),
+                    &proposal.read_relays,
+                    &proposal.write_relays,
+                );
+                if expected.mode == OnboardingRelayRepairMode::ManualReview
+                    || *repair != expected
+                    || repair.original_event_id != proposal.previous_event_id
+                {
+                    return Err(onboarding_error());
+                }
+                return Ok(());
+            }
+            let (expected, read_relays, write_relays) = self.minimal_relay_repair(
+                proposal.step,
+                c.records[proposal.step.index()].as_ref(),
+                c.options.defaults_for(proposal.step),
+            );
+            if (repair.mode == OnboardingRelayRepairMode::RemovalOnly
+                && c.snapshot.steps[proposal.step.index()]
+                    .findings
+                    .iter()
+                    .any(|finding| finding.issue == OnboardingIssue::NoUsableRoute))
+                || expected.mode == OnboardingRelayRepairMode::ManualReview
+                || *repair != expected
+                || proposal.read_relays != read_relays
+                || proposal.write_relays != write_relays
+                || repair.original_event_id != proposal.previous_event_id
+            {
+                return Err(onboarding_error());
+            }
+        }
+        Ok(())
+    }
     async fn publish_onboarding_repair(
         &self,
         c: &mut OnboardingCheckpoint,
     ) -> Result<bool, AppError> {
         let proposal = c.snapshot.proposal.clone().ok_or_else(onboarding_error)?;
+        // Unsigned manual previews must reach validation below so a stale or
+        // modified checkpoint loses approval and can be inspected again.
+        if c.signed_repair.is_some()
+            && proposal
+                .relay_repair
+                .as_ref()
+                .is_some_and(|repair| repair.mode == OnboardingRelayRepairMode::ManualReview)
+        {
+            return Err(onboarding_error());
+        }
         let account = self.resolve(&c.snapshot.account_id_hex)?;
         let signer = match self.app.account_signer_for_summary(&account) {
             Ok(signer) => signer.as_nostr_signer(),
@@ -2288,6 +2510,21 @@ impl AccountManager {
             }
         };
         if c.signed_repair.is_none() {
+            if let Err(error) = self.validate_typed_onboarding_repair(c, &proposal) {
+                // Policy or persisted preview changes invalidate approval. Keep
+                // the error fail-closed, but allow a new inspection/preview.
+                c.approved = false;
+                c.snapshot.proposal = None;
+                c.append_relays = false;
+                c.manual_relay_edit = false;
+                c.set(
+                    proposal.step,
+                    OnboardingStatus::RetryableFailure,
+                    vec![finding(OnboardingIssue::RecordChanged)],
+                );
+                self.save_onboarding(c)?;
+                return Err(error);
+            }
             self.require_live_onboarding_attempt(c)?;
             if account.external_signing {
                 c.set(
@@ -2547,6 +2784,17 @@ fn relay_repair_event(
     proposal: &OnboardingRepairProposal,
 ) -> (Vec<Vec<String>>, String, u64) {
     let previous = c.records[proposal.step.index()].as_ref();
+    if let Some(repair) = &proposal.relay_repair {
+        return (
+            repair
+                .after_tags
+                .iter()
+                .map(|tag| tag.fields.clone())
+                .collect(),
+            repair.proposed_content.clone(),
+            unix_now_seconds().max(previous.map_or(0, |event| event.created_at.saturating_add(1))),
+        );
+    }
     if let Some(profile) = &proposal.profile {
         let mut content = previous
             .and_then(|e| serde_json::from_str::<serde_json::Value>(&e.content).ok())

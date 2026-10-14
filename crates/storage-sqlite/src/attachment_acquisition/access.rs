@@ -21,7 +21,7 @@ impl SqliteAccountStorage {
         let conn = self.lock()?;
         conn.query_row(
             &format!(
-                "SELECT q.token,length(b.bytes),
+                "SELECT q.token,coalesce((SELECT byte_len FROM retained_attachment_files f WHERE f.token=q.token AND f.completed=1),length(b.bytes)),
                         (SELECT store_epoch FROM chat_presentation_meta WHERE id=1)
                  FROM attachment_acquisition q
                  JOIN retained_attachment_bytes b USING(token)

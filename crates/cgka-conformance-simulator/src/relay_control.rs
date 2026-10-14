@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use nostr_relay_builder::prelude::{
     Backend, BoxedFuture, DatabaseError, DatabaseEventStatus, Event, EventId, Events, Filter, Kind,
-    MemoryDatabase, MemoryDatabaseOptions, NostrDatabase, RelayBuilder, SaveEventStatus,
+    MemoryDatabase, MemoryDatabaseOptions, NostrDatabase, RateLimit, RelayBuilder, SaveEventStatus,
 };
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant, sleep};
@@ -18,6 +18,21 @@ use tokio::time::{Duration, Instant, sleep};
 use crate::ScenarioMessageSelectorV2;
 
 pub(crate) const RELAY_ACTION_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Local relay builder for harness relays, without the mock's write limiter.
+///
+/// `nostr-relay-builder` defaults to 60 events per minute per connection, and
+/// refills only after a full second without an admitted event, so a socket
+/// under steady load gets about 60 events in total. Clients keep their
+/// publishing sockets open, so scenario workloads exceed that budget and the
+/// relay answers `rate-limited`. That throttles every journey and is not a
+/// behavior these harnesses model; rate-limit handling has its own tests.
+pub fn harness_relay_builder() -> RelayBuilder {
+    RelayBuilder::default().rate_limit(RateLimit {
+        notes_per_minute: u32::MAX,
+        ..RateLimit::default()
+    })
+}
 
 #[derive(Clone, Debug)]
 struct RecordingRelayDatabase {
@@ -136,7 +151,7 @@ impl RelayControl {
     }
 
     pub fn relay_builder(&self) -> RelayBuilder {
-        RelayBuilder::default().database(RecordingRelayDatabase {
+        harness_relay_builder().database(RecordingRelayDatabase {
             inner: MemoryDatabase::with_opts(MemoryDatabaseOptions {
                 events: true,
                 max_events: Some(75_000),
@@ -386,6 +401,33 @@ impl RelayControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn harness_relay_admits_sustained_writes_on_one_connection() {
+        use nostr::event::FinalizeEvent;
+        use nostr_sdk::prelude::{Client, EventBuilder, Keys, Kind as SdkKind};
+
+        // Clients keep publishing sockets open; the mock's default limiter
+        // refuses the 61st event on one busy connection.
+        let relay = nostr_relay_builder::LocalRelay::new(harness_relay_builder());
+        relay.run().await.unwrap();
+        let url = relay.url().await.to_string();
+        let client = Client::default();
+        client.add_relay(&url).await.unwrap();
+        client.connect().await;
+        let keys = Keys::generate();
+        for index in 0..200 {
+            let event = EventBuilder::new(SdkKind::TextNote, format!("sustained {index}"))
+                .finalize(&keys)
+                .unwrap();
+            let output = client.send_event(&event).to([&url]).await.unwrap();
+            assert!(
+                output.failed.is_empty(),
+                "event {index} was refused: {:?}",
+                output.failed
+            );
+        }
+    }
 
     #[tokio::test]
     async fn recording_database_preserves_successful_relay_admission_order() {

@@ -49,6 +49,7 @@ include = [
     "MarmotSecretStoreStatus",
     "MarmotHostPerformanceOperation",
     "MarmotHostPerformanceOutcome",
+    "MarmotModerationReportOrigin",
 ]
 
 [enum]

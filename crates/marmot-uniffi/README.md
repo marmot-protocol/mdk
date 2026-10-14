@@ -21,9 +21,13 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [bounded chat screens](#bounded-chat-screens), [prepared conversation windows](#prepared-conversation-windows),
   [live timeline updates](#live-timeline-updates), [durable avatar access](#durable-avatar-access)
 - Messages and moderation: [deletion provenance and custom events](#deletion-provenance-and-custom-events),
-  [group-system previews](#group-system-previews), [group reporting](#group-reporting),
+  [group-system previews](#group-system-previews),
+  [device-local membership events](#device-local-membership-events), [group reporting](#group-reporting),
+  [moderation reports to the operator](#moderation-reports-to-the-operator),
   [history may be incomplete notices](#history-may-be-incomplete-notices)
-- Media: [bounded attachment history](#bounded-attachment-history), [local attachment access](#local-attachment-access)
+- Media: [file-backed media upload](#file-backed-media-upload),
+  [account attachment history](#account-attachment-history),
+  [bounded attachment history](#bounded-attachment-history), [local attachment access](#local-attachment-access)
 - Audit logs: [audit v5 recording and delivery](#audit-v5-recording-and-delivery),
   [legacy audit v4 upload](#legacy-audit-v4-upload)
 - Building and packaging: [building local bindings](#building-local-bindings), [build phases](#build-phases),
@@ -43,7 +47,7 @@ This is the current integration entry point for Swift/iOS, Swift/macOS and Kotli
 | [Chat lists](../../docs/marmot-architecture/further-context/chat-projections-native.md) | Bounded list windows, account attention, navigation and sequence handling. |
 | [Chat-list rows](CHAT-LIST-ROWS.md) | Selected previews, per-message expiry handling, live draft updates and row-action availability. |
 | [Conversation windows](CONVERSATION-WINDOW.md) | Initial unread/latest positioning, live snapshots, paging, drafts and cancellation. |
-| [Durable local sends](LOCAL-SENDS.md) | Early local acceptance, exact optimistic-bubble correlation and durable edits of pending local sends. |
+| [Durable local sends](LOCAL-SENDS.md) | Early local acceptance, exact optimistic-bubble correlation, captured-media draft consumption and durable edits of pending local sends. |
 | [Polls](POLLS.md) | Encrypted NIP-88 creation, replacement votes, bounded validation and deterministic timeline results. |
 | [Attachment history](ATTACHMENT-HISTORY.md) / [attachment access](ATTACHMENT-ACCESS.md) | Media discovery, local bytes, atomic interactive promotion, genuine outgoing retention, progress, policy and ownership, including [host-managed automatic downloads](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104) and Android WorkManager migration. |
 
@@ -80,6 +84,7 @@ screen API exists. The method reference marks explicit alternatives individually
 | One chat row | `presentedChatListRow` | `chatListRow` when raw fields are specifically required. Avoid account-wide reads for one row. |
 | Account badges | `subscribeAccountAttention` | `accountUnreadSummary` remains a one-shot lower-level unread query, not a substitute for the prepared attention contract. |
 | Conversation screen | `openConversationWindow` | `timelineMessages` / `subscribeTimelineMessages` for a custom timeline; `messages` / `subscribeMessages` for raw stored messages. |
+| Reaction details | `messageReactions` for complete effective participants | Window references contain bounded previews only. See [complete reaction details](CONVERSATION-WINDOW.md#complete-reaction-details). |
 | Composer | `selectedMessageDraft`, revision-conditional save/clear/attachment reads, `sendMessageDraft` | Unconditional `messageDraft` / `saveMessageDraft` / `deleteMessageDraft` for older single-owner flows; new concurrent composers should use revisions. `sendText` and other direct send methods remain supported. |
 | Visible avatars | `requestAvatarAssets` then `readAvatarAssets` using screen metadata | `downloadProfileImage` / `downloadGroupBlossomImage` for explicit low-level downloads; new screens should use MDK's durable cache. |
 | Media library | `attachmentHistoryPage` / `attachmentHistoryVersion` | `listMedia` is the older accepted-only listing; it omits rejected source slots and lacks the new cursor/version contract. |
@@ -154,6 +159,8 @@ never free handles during concurrent use. Returned plaintext and copies made by 
 remain the host's responsibility, including removal of downstream copies after local deletion.
 
 ### Localization, privacy and diagnostics
+Native startup investigation can explicitly call `set_startup_diagnostics_enabled(true)` before the first account query, then read `startup_diagnostics_snapshot()` while a call remains unfinished. The snapshot uses independent bounded memory and fixed phases, including key lookup, database-open waiting and migration numbers; it contains no paths, account identifiers or error text. Keep normal builds disabled, bound host serialization separately, and revoke capture with `false` when it is no longer needed. Neither method changes upload consent or database state. See the [API reference](API-REFERENCE.md).
+
 
 `record_host_performance` accepts 28 shared host stages for runtime/UI initialization,
 accounts, lists, profiles, timelines, sending/search, media and preferences, plus
@@ -179,6 +186,37 @@ Configure consent-gated analytics, audit uploads and relay telemetry deliberatel
 are not credentials. Never log message bodies, asset references, keys, account/group identifiers,
 raw DTO stringification or relay URLs as performance labels. Use bounded performance operations
 and aggregate snapshots; keep secrets out of diagnostics and host callback errors.
+
+### Markdown rendering
+
+Render the typed Markdown tokens on message, timeline and reply-preview records.
+`parseMarkdown` returns the same AST for draft previews and custom renderers.
+`MarkdownInlineFfi.Timestamp` carries signed `unixSeconds` (Swift `Int64`, Kotlin
+`Long`) and a `MarkdownTimestampStyleFfi`, with no formatted text. Timestamp syntax
+is `<t:UNIX_SECONDS>` or `<t:UNIX_SECONDS:STYLE>`; the parser resolves an omitted
+style to `ShortDateTime`. Invalid timestamp syntax remains literal text.
+
+| Style token | Enum variant | Display |
+| --- | --- | --- |
+| `t` | `ShortTime` | Time without seconds |
+| `T` | `LongTime` | Time including seconds |
+| `d` | `ShortDate` | Short date |
+| `D` | `LongDate` | Long date |
+| `f` (default) | `ShortDateTime` | Long date and time without seconds |
+| `F` | `LongDateTime` | Weekday, long date and time without seconds |
+| `s` | `CompactDateTime` | Short date and time without seconds |
+| `S` | `CompactDateTimeSeconds` | Short date and time including seconds |
+| `R` | `Relative` | Time relative to the current clock |
+
+Use native date/time formatters with the device's current locale and timezone at
+render time, including its date order and 12/24-hour preference. The parser and
+bindings do not own a clock, timezone, formatter or refresh task. Refresh displayed
+timestamps when locale, timezone or system clock changes and when the app resumes;
+visible `Relative` nodes also need time-driven refresh even if the message tokens
+are unchanged. A host may provide a localized absolute-time tooltip or accessibility
+description. Keep the timestamp and typed style in display caches rather than
+persisting formatted strings. The native renderer is supplied by the host app,
+not this crate.
 
 ### Compatibility
 
@@ -295,7 +333,15 @@ Imported identities can use the durable preflight API instead of `login`:
 3. Localize the typed status, findings, and actions. A healthy account advances
    automatically until the single-device acknowledgment. `NeedsInput` offers a repair or, for profile/follows, an
    explicit `continue_onboarding_without`. Empty follow lists are valid.
-4. `propose_onboarding_recommended_relays`, `propose_onboarding_relays`,
+4. `propose_onboarding_relay_repair` previews the smallest safe change to a
+   general or inbox relay declaration, preserving the original ordered tags,
+   duplicate/custom entries, direction markers, and content. NIP-65 read/write
+   markers are interpreted case-insensitively; their spelling and trailing
+   extension fields remain unchanged in the preview and published event. Show its typed
+   before/after diff and repair mode. `ManualReview` cannot be approved; prefill
+   a manual editor from the original tags or offer a separately labeled reset.
+   No proposal signs or publishes until explicit approval. The older
+   `propose_onboarding_recommended_relays`, `propose_onboarding_relays`,
    `propose_onboarding_profile`, and `propose_onboarding_follows` only prepare
    a proposal. Recommended relays append missing defaults to the observed list,
    preserving every original relay tag, including private-network, `ws://` and `wss://` onion,
@@ -306,8 +352,9 @@ Imported identities can use the durable preflight API instead of `login`:
    offers explicit editing instead of recommending an append that cannot add a write route.
    Relay findings are advisory once a usable outbox/inbox route is
    confirmed. Proposals require a policy-allowed write route (or inbox route);
-   reachability is checked after publication. Explicit relay selections replace
-   the list and require every selected endpoint to pass dial policy. Approval
+   reachability is checked after publication. Explicit relay selections edit known
+   endpoint roles, preserving retained tag occurrences and unrelated fields in a
+   typed preview, and require every selected endpoint to pass dial policy. Approval
    requires every configured discovery source to complete; failures from additional
    user-declared sources are tolerated only when the previous record is found.
    This bounded check cannot rule out newer records on unreachable or unqueried sources.
@@ -360,8 +407,17 @@ version 3 reader cannot validate epoch-scoped approvals. Completed recovery
 leaves a version 4 cancellation tombstone even before a new begin, so older
 readers fail closed. Preparing an additive relay proposal upgrades its checkpoint
 to version 5, with or without a recovery epoch. This prevents older readers from
-resuming an approved, unsigned proposal as a destructive replacement.
-Downgrading once either format is used is unsupported; use a build that supports
+resuming an approved, unsigned proposal as a destructive replacement. Preparing
+an exact lossless relay repair upgrades the checkpoint to version 6, preserving
+that version through approval, signing and completion. Version 3/4/5 readers
+reject it rather than discard the typed preview and publish replacement tags.
+Explicit relay edits return the same typed before/after preview. Retained
+endpoint roles keep their original tag occurrences, order and extension fields,
+even when selected with equivalent URL spelling; unrelated tags and content remain unchanged. An unchanged selection returns
+`ManualReview` without an approval action. These manual previews use checkpoint
+version 7 because version 6 readers can only revalidate automatic minimal repairs.
+No binding signature changes are required. Downgrading once any of these formats
+is used is unsupported; use a build that supports
 the checkpoint version. Do not relabel versions or delete checkpoints to
 force a downgrade. Restore/upgrade to a supporting build, or explicitly recover
 unsupported evidence with this API.
@@ -699,6 +755,17 @@ raw events. Deleted rows expose no raw tags in timeline reads, moderation reads,
 MDK-owned kinds continue to use prepared fields and references there. Custom-event tag changes invalidate
 the conversion cache. Custom events do not change chat-list activity or notification policy.
 
+
+## Device-local membership events
+
+The group-event firehose distinguishes account-level timeline activity from
+`LocalGroupCopyTerminated`, `LocalGroupCopyRestored`, and
+`GroupMemberLeavesRemoved`. MDK applies their membership, pending-send and
+notification effects before host delivery; these events create no system row.
+Use them to refresh presentation, and handle the new variants when regenerating
+Swift/Kotlin bindings. Retained-history engine rollback is separate from automatic
+terminal-copy recovery through the managed scheduler.
+
 ## Group-system previews
 
 `ChatListMessagePreviewFfi.groupSystem` and timeline `groupSystem` carry
@@ -749,6 +816,30 @@ or winning review decision is imposed on hosts.
 Pages are capped at 100 and cursors are exclusive. `reported_message` uses the ordinary
 timeline record. Use existing projection subscriptions to refresh client review views.
 
+## Moderation reports to the operator
+
+`submit_moderation_report` privately reports an account to the deployment's
+moderation team, in addition to in-group reporting. Group reporting is unchanged
+and remains the primary path. The report is a NIP-56 kind-1984 rumor, sealed by
+the account key and gift-wrapped per NIP-59 to the configured reports key. It
+carries only the reported key, the report type from `ReportReasonFfi`, the
+`ModerationReportOriginFfi` label and the trimmed explanation (at most 1,000
+characters). It never carries message or group identifiers. "Block and Report"
+sends `BlockAndReport` with `Other` unless the user chose a reason, and still calls
+`block_user` separately.
+
+Set `MarmotOptions.moderation_report_config` per build flavor, or call
+`configure_moderation_reporting` to see why a destination was rejected. Show the
+report-to-operator action only when `moderation_reporting_available()` is true;
+otherwise the call fails with `ModerationReportingNotConfigured`.
+`ModerationReportOutcomeFfi.accept_disposition` uses the send-summary
+vocabulary. Treat `AcceptedPending` and `CompletionUnknown` as submitted, because
+`catch_up_accounts` retries them, and never resubmit them. A repeat within 10
+minutes returns the same `report_id`. Each account may send 20 reports per hour
+(`ModerationReportRateLimited`). Sign-out and wipe delete the account's queued
+reports. The C ABI mirrors these calls. See the
+[wire format](../../docs/marmot-architecture/moderation-reports.md).
+
 ## History may be incomplete notices
 
 Automatic recovery stops retrying an obligation after a fixed budget of attempts that
@@ -778,6 +869,70 @@ epoch, a later startup's incremental comparison, or a new explicit repair. Expli
 full-history repair remains available and can still complete parked history that its
 comparison of the retained window certifies. Notices carry no relay, message or key identities; keep them out of
 analytics. C callers: see the [C guide](../marmot-c/README.md#history-may-be-incomplete-notices).
+
+While unresolved epoch-gap recovery covers a group's current local epoch, the group may
+have moved past this device. Group changes (invite, remove, admin changes, profile, image,
+retention, disbanding and app components) then fail with `MarmotKitError::GroupCatchingUp`:
+a change committed from a stale epoch can split the group for everyone. Messages and
+leaving are not affected.
+
+The check is advisory, because the evidence behind it cannot be authenticated. Ask the
+user, for example: "This chat may be out of date on this device. Changing the group now
+could split it for everyone. Wait for it to sync, or continue anyway?" To continue, call
+`acknowledge_group_catching_up(account_ref, group_id_hex)` and retry the change. The
+acknowledgement admits one change attempt at the device's current epoch, is consumed even
+if that attempt fails, and is not persisted. Use the
+strongest wording for invites: a member invited onto a branch that later loses is left
+with a Welcome that no longer works. Without an acknowledgement, the check lifts once
+recovery catches the group up or the device moves past that epoch. Dismissing the group's
+history notice does not lift it. Scheduled self-updates wait up to a day for the group to
+catch up, then proceed.
+
+A group change counts as published once one group relay accepts it, and MDK keeps
+retrying the other group relays with the same event. Until they accept it, members who
+read only those relays cannot follow the group. Once a change has been owed to a relay for
+two minutes (a healthy slower relay is retried after 30 seconds), group changes fail with
+`MarmotKitError::GroupCommitUndelivered` (mdk#2255). `group_commit_delivery(account_ref,
+group_id_hex)` returns the oldest change still owed to a relay, with the relays owing it and
+`since` (when the first relay accepted it), or `None`. It is reported immediately, so a host
+can show "not delivered to every relay yet" before the user tries a change; a `Some` result
+alone does not mean the next change fails. No event announces delivery completing, so poll
+while showing it. This check is advisory too, because groups
+often list a relay that is gone for good: once the user accepts that members on those
+relays may not follow, call `acknowledge_group_commit_undelivered(account_ref,
+group_id_hex)` and retry. Like the catching-up acknowledgement, it admits one change
+attempt and is not persisted. A change can need both acknowledgements; each survives the
+other check refusing the attempt. Scheduled self-updates wait up to an hour for delivery,
+then proceed.
+
+## File-backed media upload
+
+Use `uploadMediaFiles` for private regular-file inputs instead of sending a
+whole-file byte array across the binding. `uploadMediaFilesWithClientToken`
+preserves durable local-send admission; probe `localSendStatus` after an unknown
+outcome before another upload. Keep the host source valid until return, use one
+`MediaFileTransferControlFfi` per operation, and explicitly cancel it rather than
+only dropping the host's wait. All sources are privately snapshotted before PUT.
+The counter is monotonic processed bytes, not a percentage.
+
+Cancellation observed before message admission starts prevents publication.
+Admission is not interruptible once started, including while durable acceptance
+is pending. File-backed uploads have no fixed worker-response timeout;
+per-endpoint network deadlines still apply.
+
+`maxFileMediaCiphertextBytes` includes a 16-byte AEAD tag for each attachment in
+the batch. This is a finite implementation bound, not a claimed server maximum.
+Uploads try policy endpoints in order; ordinary rejection or invalid descriptors
+fall through, while signer denial and cancellation stop the operation. An
+explicit endpoint override intentionally selects only that endpoint. Receiver
+acquisition streams large bodies into private files, resumes protected ciphertext
+where valid, and authenticates before publishing bounded readable local assets.
+Automatic transfer policy and account retention quotas remain separate. Preview
+limits and the legacy byte-array API bounds are not increased.
+
+See [the upload reference](API-REFERENCE.md#marmotupload_media_files) and
+[local-send ownership](LOCAL-SENDS.md). C hosts use the
+[file-backed C inputs and control](../marmot-c/README.md#file-backed-media-upload).
 
 ## Bounded attachment history
 
@@ -969,7 +1124,11 @@ check, not a comparison benchmark. It builds Kotlin/Swift generation and every
 Android or Apple native target once in parallel, transfers those inputs only
 within the current workflow run, verifies their source, builder, toolchain,
 profile, feature and run provenance, then assembles and validates the Android,
-iOS and macOS candidate packages. Pull requests restore the trusted release
+iOS and macOS candidate packages. Pull requests build the Apple inputs and
+packages only when they change `crates/marmot-uniffi/` (other than Markdown) or a
+MarmotKit bindings workflow, because macOS minutes are expensive; every other pull
+request still builds and validates the Android package, and `master` pushes always
+build the complete matrix. Pull requests restore the trusted release
 cache read-only; only runs using the workflow from `master` may update it. A
 weekly scheduled exact-head run on `master` provides drift detection and
 refreshes those trusted cache seeds; it intentionally executes the complete
@@ -1013,3 +1172,7 @@ python3 crates/marmot-uniffi/measure-release-profile.py \
 Apple exporters use raw static-library slices and publish a matching privacy manifest for the consuming Swift target.
 See the [privacy audit and adoption guide](apple-privacy/README.md) for declarations, archive validation, host
 integration changes, and unresolved release questions.
+
+## Account attachment history
+
+`account_attachment_history_page` reads bounded indexed attachment candidates across one local account. Original album slots retain source identity and shared-parser metadata; group/sender selections and inclusive dates bind the cursor. Empty filtered pages may still continue, and destructive source changes require replacing loaded rows; additions offer a separate head refresh. Reads perform no acquisition or decryption. See [Account attachment history](ACCOUNT-ATTACHMENT-HISTORY.md) for integration and bounds.

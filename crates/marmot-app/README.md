@@ -8,6 +8,7 @@ the generic account, session, and engine crates. Read this if you are building a
 ## Contents
 
 - [Runtime overview](#runtime-overview)
+- [SOCKS5 routing](#socks5-routing)
 - [Local storage](#local-storage)
 - [Account bootstrap and KeyPackages](#account-bootstrap-and-keypackages)
 - [User directory and search](#user-directory-and-search)
@@ -19,10 +20,13 @@ the generic account, session, and engine crates. Read this if you are building a
 - [History may be incomplete notices](#history-may-be-incomplete-notices)
 - [User blocking](#user-blocking)
 - [Group reports and admin deletion](#group-reports-and-admin-deletion)
+- [Moderation reports to the operator](#moderation-reports-to-the-operator)
 - [Audit v5 Welcome evidence](#audit-v5-welcome-evidence)
 - [Run the tests](#run-the-tests)
 
 ## Runtime overview
+The opt-in native startup recorder distinguishes task dispatch, account/key lookup, store-opening waits, SQLCipher phases, schema inspection and each migration transaction. `set_startup_diagnostics_enabled` and `startup_diagnostics_snapshot` change only bounded process-local diagnostic memory. Snapshots use their own short lock and remain readable while an account open is blocked; they do not open storage or query the keystore. Successful cached attachment reads and account-store lookups omit history events so ordinary reads preserve first-open evidence. An attachment read shares one active scope across queueing, account opening and result delivery; cache/admission waits remain visible, and misses, failures or unwinds retain evidence. Dropping its host future leaves running native work observable until the worker exits. Normal construction leaves capture disabled. Host exports must be explicitly requested and serialized within a separate size bound.
+
 
 `MarmotAppRuntime` owns restored signing accounts, a shared relay plane, live per-account workers, runtime event hubs,
 and the shared agent stream watch manager. The relay plane also owns shared directory discovery fetches for relay lists,
@@ -36,7 +40,37 @@ so CLI, TUI, and native surfaces never open the databases directly.
 worker-routed local reads are available. Relay activation, group-subscription registration, shared-directory
 synchronization, and initial catch-up continue asynchronously. Hosts should render local chat projections at that
 point, show network progress separately, and let later relay events refresh or reorder rows. Mutating worker commands
-received during initial catch-up are deferred and replayed in order once the live client is ready.
+received during initial catch-up are deferred and replayed in order once the live client is ready. While an owned
+comparison's network request runs outside the worker, an empty deferred queue permits both direct sends and durable
+local submissions to use the live client. Durable submissions retain the same completion, retry and projection path
+as steady-state sends; they do not bypass an earlier deferred command. Automatic push-registration gossip after startup
+or a receive/recovery pass arms the durable retry timer rather than awaiting the gossip batch before servicing sends.
+Inline activation, KeyPackage maintenance, explicit push commands and a running scheduled push retry can still delay
+sends.
+
+Engine-queued sends receive an ordinary worker wakeup when their group's required publication acknowledgements and
+MLS confirmation are complete, even if a secondary relay still has a later replication retry scheduled. The runtime
+keeps the original relay event and retry deadline. Unmet required acknowledgements and pending MLS confirmation keep
+their publication barrier.
+
+A new same-account durable admission also lets the managed worker yield a scheduled secondary retry that is already
+waiting on a relay. This applies only after required acknowledgements and MLS confirmation are complete. Unfinished
+attempts remain conservatively recorded as possibly exposed and retry their exact saved bytes after backoff. The
+worker finishes its current local effects before servicing the new send; required publication and confirmation work
+is not cancelled. After a yielded pass, one durable submission receives service ahead of overdue secondary retry
+passes once the finite backlog of deferred and buffered worker commands has drained. Earlier blocked commands keep
+their ordering, and a temporarily unavailable submission keeps its existing retry deadline. This does not prioritize
+durable sends over an indefinitely replenished command stream.
+
+For new durable admissions in the current runtime, `send_queue` and `outbound_message_queue_wait` measure the interval
+from the committed admission to its first worker execution. Execution and publication remain separate measurements.
+Repeated tokens and completion retries do not restart that observation. The private correlation map is bounded to
+1,024 observations per runtime; capacity omissions and shutdown cancellation count as cancelled observations, without
+a successful queue-duration sample. A retained admission can remain observed across sign-out within the same runtime.
+Permanent account removal cancels its remaining observations. Admission and selection use per-account gates;
+observing a send does not add a cross-account database lock.
+Rows restored in a new runtime have no original monotonic admission instant and produce no fabricated queue-duration
+sample. These measurements do not include host rendering or every subsequent engine/retry wait.
 
 **Per-account worker isolation.** A failed account open does not discard a sibling that reached local readiness.
 
@@ -55,6 +89,33 @@ database and releases file locks; `shutdown` alone does not. See
 
 For where the code lives (`src/runtime/`, `src/client/`, `src/directory/`, `src/media/`, and so on) see
 [`AGENTS.md`](AGENTS.md).
+
+## SOCKS5 routing
+
+Set the process environment before the first network-policy use (including runtime or NIP-46 client construction):
+
+| Variable | Value |
+| --- | --- |
+| `WN_SOCKS5_PROXY` | Numeric IP address and nonzero port, such as `127.0.0.1:9050` or `[::1]:9050`. |
+| `WN_SOCKS5_USERNAME` | Optional SOCKS5 username. |
+| `WN_SOCKS5_PASSWORD` | Optional SOCKS5 password. |
+
+Unset or empty values select direct routing when all three variables are empty. With a proxy endpoint, leave both
+credential variables empty for anonymous SOCKS5, or supply both for RFC 1929 username/password authentication. Each
+credential must contain 1 to 255 UTF-8 bytes without NUL. Partial credentials, credentials without an endpoint,
+hostnames, URL-form endpoints, and zero ports are rejected. The first use snapshots the policy for the entire process,
+including invalid configuration. Later environment changes, including clearing these variables, do not change routing
+or unblock an invalid policy. Restart the process to apply a different configuration.
+
+The policy covers relay publishing, account receive/history pools, directory relay clients (including completion-aware
+reads), C NIP-46 signer sessions, and the shared HTTP clients for media, Open Ranking, and collectors (including audit
+uploads). Completion-aware reads retain pre-admission wire-event counts under the proxy transport. Relay hostnames are
+resolved by the proxy. HTTP clients still resolve and validate destinations locally, then send the pinned IP through
+SOCKS5 while retaining the original HTTP Host header and TLS identity. The proxy is an explicitly trusted egress.
+
+`ALL_PROXY` cannot replace this policy and `NO_PROXY` cannot bypass it. Invalid configuration, connection failure,
+and authentication rejection do not fall back to direct connections. QUIC agent preview publishing and watching
+are unavailable with SOCKS5 enabled because this TCP proxy path cannot carry QUIC.
 
 ## Local storage
 
@@ -190,6 +251,20 @@ the MLS add.
 - Directory diagnostics (such as `wn keys check` / `keys fetch`) may still describe cached public packages. Their availability
   result is advisory and does not guarantee a fresh relay lookup or acceptance by the create/invite admission policy.
 
+When advertised outboxes have no usable invitation package, lookup makes one supplementary pass over up to eight
+safe configured discovery endpoints that were not already searched. Explicit bootstrap endpoints supply this set for
+direct directory lookups. Successful advertised lookups skip the supplementary pass. Recovery keeps observed
+replacement barriers and requires complete package coverage and completed deletion queries for each usable candidate
+across the searched routes. Separate exact-event and timestamp-scoped coordinate filters ask for one signed deletion;
+unrelated deleted posts cannot fill their limits. Any verified matching deletion rejects the candidate, even when
+another route is incomplete. Accepting a candidate requires complete empty queries on every required route; unknown
+coverage and the twelve-candidate budget remain retryable. Signed deletions cannot revive an older slot version.
+For direct diagnostics, the existing future-record cache fallback also requires this proof for its cached public
+metadata. Incomplete recovery refuses that fallback; a revoked or superseded cache entry is never returned.
+Cached entries without a usable public event identifier are ineligible for this fallback.
+Member resolution and direct lookup each have a 50-second overall deadline. Relay visibility still cannot prove that
+the recipient retains the private package, or that every relay disclosed all replacements and deletions.
+
 **Routing.** New Nostr-routed groups generate `marmot.transport.nostr.routing.v1` at creation, store the component bytes
 in signed MLS app data, and project the decoded `nostr_group_id` plus relay list into group subscriptions and publish
 targets.
@@ -197,6 +272,12 @@ targets.
 **Welcomes.** Incoming welcomes are joined automatically at the MLS/session layer, then projected as pending local
 chats. Clients render accept/decline UI from the group record: accept clears `pending_confirmation`; decline publishes a
 leave, clears the pending flag, and archives the local projection so normal chat lists hide it.
+
+**Committed group activity.** Commands and maintenance retain native cleanup and commit activity before subscription
+work can suspend. Manual and scheduled convergence retain subscriber deltas through route refresh, checkpoints,
+notifications and invitation recovery. Quiet observations return repaired deltas once without republishing the accepted
+MLS commit. Cancellation preserves the owning client's pending work; these queues are session-local, not a crash-durable
+event journal.
 
 ## Conversations
 
@@ -378,6 +459,23 @@ deletion while retained.
 
 See [the implementation contract](../../docs/marmot-architecture/overview/content-moderation.md) for source-state
 authorization, durable recovery, retention, and client compatibility.
+
+## Moderation reports to the operator
+
+`MarmotAppRuntime::submit_moderation_report` privately reports an account to the deployment's moderation team. It
+sends a kind-1984 NIP-56 rumor, sealed by the account key and gift-wrapped per NIP-59 to the configured reports key.
+The rumor carries the reported key, its report type, a `chat.whitenoise.report` origin label (`report` or `block`) and
+the optional explanation. It never carries conversation identifiers. This channel is additive: `report_message` and
+the rest of group moderation are unchanged.
+
+The destination is `MarmotAppConfig::moderation_report_config` or `MarmotApp::set_moderation_report_config`. An
+invalid key or any unsafe relay rejects it whole. Wraps go only to the configured relays, through a publisher that
+never authenticates as the account. The signed wrap is staged in the account database first. `AcceptedPending` and
+`CompletionUnknown` outcomes are retried in the background after `catch_up_accounts`, or on demand with
+`retry_pending_moderation_reports`. Repeats within 10 minutes return the existing outcome. Each account may send 20
+reports per hour. Sign-out and wipe delete the account's queued reports.
+
+See [moderation reports](../../docs/marmot-architecture/moderation-reports.md) for the wire format and reader steps.
 
 ## Audit v5 Welcome evidence
 

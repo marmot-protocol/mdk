@@ -755,8 +755,8 @@ async fn run_four_party_cross_route_app_runtime_trial() -> AppRuntimeCrossRouteT
     // branch rolls the commit back and `GroupStateInvalidated` withdraws that
     // row. The retained tombstone is therefore each participant's own evidence
     // that it once held the losing branch, so the rule below is per participant
-    // and never compares ids across them — a reorged peer's row is unattributed
-    // where Alpha's names itself, so the two are not even the same canonical id.
+    // rather than requiring every participant to have applied the losing commit.
+    // Participants that did apply it derive the same authenticated row id.
     //
     // Alpha published and confirmed the commit, so it always holds the row and
     // owes a withdrawal exactly when it ends off that branch. Zeta is the rival

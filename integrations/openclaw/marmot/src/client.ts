@@ -824,6 +824,33 @@ export class MarmotAgentControlClient {
     })) as unknown as GroupInfoResponse;
   }
 
+  /** Publish one admin profile commit. Never retry a failed/uncertain call. */
+  async groupProfileUpdate(
+    accountIdHex: string,
+    groupIdHex: string,
+    patch: { name?: string; description?: string },
+  ): Promise<{ type: "group_profile_updated"; group_id_hex: string; message_ids_hex: string[] }> {
+    const group = normalizeHex(groupIdHex, "group_id_hex");
+    if ((patch.name === undefined && patch.description === undefined) ||
+        (patch.name !== undefined && (typeof patch.name !== "string" || Buffer.byteLength(patch.name, "utf8") > 256)) ||
+        (patch.description !== undefined && (typeof patch.description !== "string" || Buffer.byteLength(patch.description, "utf8") > 4096))) {
+      throw new AgentControlError("invalid group profile patch", { code: "invalid_group_profile_input" });
+    }
+    const response = await this.request({
+      type: "group_profile_update",
+      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
+      group_id_hex: group,
+      ...(patch.name !== undefined ? { name: patch.name } : {}),
+      ...(patch.description !== undefined ? { description: patch.description } : {}),
+    });
+    if (response.type !== "group_profile_updated" || response.group_id_hex !== group ||
+        !Array.isArray(response.message_ids_hex) || response.message_ids_hex.length === 0 ||
+        response.message_ids_hex.some((id) => typeof id !== "string" || !/^[0-9a-fA-F]{64}$/.test(id))) {
+      throw new AgentControlError("invalid group profile response", { code: "invalid_group_profile_response" });
+    }
+    return response as unknown as { type: "group_profile_updated"; group_id_hex: string; message_ids_hex: string[] };
+  }
+
   async allowlistAdd(
     accountIdHex: string,
     welcomerAccountIdHex: string,

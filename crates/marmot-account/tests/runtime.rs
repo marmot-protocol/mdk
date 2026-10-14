@@ -390,6 +390,7 @@ struct RecordingAdapterInner {
     accept_policy: Mutex<Option<Vec<TransportEndpoint>>>,
     error_endpoints: Mutex<Vec<TransportEndpoint>>,
     error_kind: Mutex<Option<TransportEndpointFailureKind>>,
+    error_reasons: Mutex<Vec<(TransportEndpoint, String)>>,
     publish_errors: Mutex<VecDeque<bool>>,
     reported_message_ids: Mutex<VecDeque<MessageId>>,
     welcome_gate: Mutex<Option<Arc<WelcomePublishGate>>>,
@@ -452,6 +453,27 @@ impl RecordingAdapter {
     ) {
         *self.inner.error_endpoints.lock().unwrap() = endpoints;
         *self.inner.error_kind.lock().unwrap() = Some(kind);
+        self.inner.error_reasons.lock().unwrap().clear();
+    }
+
+    /// Like [`Self::fail_endpoints_as`], with a fixed adapter reason phrase
+    /// per endpoint.
+    fn fail_endpoints_with_reasons(
+        &self,
+        kind: TransportEndpointFailureKind,
+        reasons: Vec<(TransportEndpoint, &str)>,
+    ) {
+        self.fail_endpoints_as(
+            reasons
+                .iter()
+                .map(|(endpoint, _)| endpoint.clone())
+                .collect(),
+            kind,
+        );
+        *self.inner.error_reasons.lock().unwrap() = reasons
+            .into_iter()
+            .map(|(endpoint, reason)| (endpoint, reason.to_owned()))
+            .collect();
     }
 
     fn report_message_id_next(&self, message_id: MessageId) {
@@ -546,14 +568,21 @@ impl TransportAdapter for RecordingAdapter {
                     .all(|endpoint| error_endpoints.contains(endpoint))
             {
                 if let Some(kind) = *self.inner.error_kind.lock().unwrap() {
+                    let reasons = self.inner.error_reasons.lock().unwrap().clone();
                     let failures = request
                         .target
                         .endpoints()
                         .iter()
                         .cloned()
                         .map(|endpoint| TransportEndpointFailure {
+                            reason: reasons
+                                .iter()
+                                .find(|(reasoned, _)| reasoned == &endpoint)
+                                .map_or_else(
+                                    || "injected typed endpoint failure".into(),
+                                    |(_, reason)| reason.clone(),
+                                ),
                             endpoint,
-                            reason: "injected typed endpoint failure".into(),
                             kind,
                             rejection_category: None,
                         })
@@ -2595,6 +2624,116 @@ fn obligation_phase(
         .phase
 }
 
+/// Lifecycle announcements describe intermediate states; maintenance follows the
+/// final canonical local leaf, including a restoration without an epoch event.
+#[tokio::test]
+async fn maintenance_reconciles_restored_copy_from_final_canonical_membership() {
+    for terminated_first in [true, false] {
+        for leaf_rotated in [false, true] {
+            let (_dir, mut runtime, group_id, _) =
+                manual_only_group_runtime(MaintenanceTiming::default()).await;
+            let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
+            let mut obligation = runtime
+                .session()
+                .maintenance_obligation(&obligation_id)
+                .unwrap()
+                .unwrap();
+            if leaf_rotated {
+                // Model an obligation captured before the selected branch's leaf.
+                obligation.own_leaf_baseline_hash = Some(vec![0; 32]);
+                assert_ne!(
+                    obligation.own_leaf_baseline_hash.as_ref().unwrap(),
+                    &runtime.session().own_leaf_hash(&group_id).unwrap()
+                );
+                runtime
+                    .session()
+                    .put_maintenance_obligation(&obligation)
+                    .unwrap();
+            }
+            let mut failed = obligation.clone();
+            failed.id = MessageId::new(vec![0x77; 32]);
+            failed.phase = cgka_traits::MaintenancePhase::Failed;
+            failed.last_failure_code = Some("local_member_removed".into());
+            runtime
+                .session()
+                .put_maintenance_obligation(&failed)
+                .unwrap();
+            let mut enrolled = runtime
+                .session()
+                .group_maintenance(&group_id)
+                .unwrap()
+                .unwrap();
+            enrolled.periodic_enrolled = true;
+            enrolled.next_periodic_rotation_at = Some(Timestamp(200_000));
+            runtime.session().put_group_maintenance(&enrolled).unwrap();
+            assert!(
+                runtime
+                    .session()
+                    .canonical_group_membership(&group_id)
+                    .unwrap()
+                    .local_leaf_active
+            );
+
+            let mut events = Vec::new();
+            if terminated_first {
+                events.push(GroupEvent::LocalGroupCopyTerminated {
+                    group_id: group_id.clone(),
+                    voluntary: false,
+                });
+            }
+            events.push(GroupEvent::LocalGroupCopyRestored {
+                group_id: group_id.clone(),
+            });
+            runtime
+                .publish_session_effects(cgka_session::SessionEffects {
+                    events,
+                    publish: Vec::new(),
+                    queued: Vec::new(),
+                    pending_convergence: Vec::new(),
+                })
+                .await
+                .unwrap();
+
+            let after = runtime
+                .session()
+                .maintenance_obligation(&obligation_id)
+                .unwrap()
+                .unwrap();
+            if leaf_rotated {
+                assert_eq!(after.phase, cgka_traits::MaintenancePhase::Complete);
+                assert_eq!(after.last_failure_code, None);
+            } else {
+                assert_eq!(
+                    after, obligation,
+                    "an unchanged active leaf still owes its rotation"
+                );
+            }
+            let state = runtime
+                .session()
+                .group_maintenance(&group_id)
+                .unwrap()
+                .unwrap();
+            assert!(
+                state.periodic_enrolled,
+                "intermediate termination must not disenroll the restored copy"
+            );
+            assert!(state.next_periodic_rotation_at.is_some());
+            if !leaf_rotated {
+                assert_eq!(state, enrolled);
+            }
+            assert_eq!(
+                runtime
+                    .session()
+                    .maintenance_obligation(&failed.id)
+                    .unwrap()
+                    .unwrap(),
+                failed,
+                "a previously terminal failure must never be revived by restoration"
+            );
+        }
+    }
+}
+
 /// The obligation leg mints its work while the copy is live, and disenrollment
 /// is event-driven only. A removal this device never saw as an event therefore
 /// leaves a non-terminal obligation against a copy whose durable record is
@@ -2882,10 +3021,42 @@ async fn maintenance_waits_on_an_obligation_while_a_disband_is_in_progress() {
     );
 }
 
+fn v5_audit_recorder(path: &std::path::Path) -> Box<marmot_forensics::JsonlRecorder> {
+    Box::new(
+        marmot_forensics::JsonlRecorder::open_v5_with_account_ref(
+            path,
+            "11".repeat(16),
+            Some("22".repeat(16)),
+            marmot_forensics::v5::Producer {
+                mdk_revision: None,
+                build_profile: marmot_forensics::v5::BuildProfile::Debug,
+                platform: marmot_forensics::v5::Platform::Other,
+                host_build: None,
+            },
+        )
+        .unwrap(),
+    )
+}
+
+fn v5_audit_rows(path: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            marmot_forensics::v5::Record::from_json(line.as_bytes()).expect("strict v5 row");
+            serde_json::from_str::<serde_json::Value>(line).unwrap()
+        })
+        .collect()
+}
+
+/// mdk#2255: a self-update commit confirms on its first relay acknowledgement,
+/// then keeps retrying every group relay that missed it through the same
+/// durable frozen fanout as every other commit, auditing each retry pass.
 #[tokio::test]
-async fn manual_self_update_confirms_on_first_ack_and_finishes_exact_event_fanout() {
+async fn manual_self_update_confirms_on_first_ack_and_retries_unacked_relays_audibly() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("alice.sqlite");
+    let audit_path = dir.path().join("alice-audit.jsonl");
     let key = SqlCipherKey::new("marmot manual maintenance key").unwrap();
     let initial_runtime = AccountDeviceRuntime::new(
         current_session(database.clone(), &key, b"alice"),
@@ -2920,23 +3091,24 @@ async fn manual_self_update_confirms_on_first_ack_and_finishes_exact_event_fanou
     let source_epoch = initial_runtime.session().epoch(&group_id).unwrap();
     drop(initial_runtime);
 
+    let relay_a = TransportEndpoint("wss://group-a.example".into());
+    let relay_b = TransportEndpoint("wss://group-b.example".into());
     let adapter = RecordingAdapter::default();
-    adapter.accept_only_next(1);
+    // Relay B is unreachable for the first pass: the adapter cannot say
+    // whether it saw the event, as in the mdk#2254 incident.
+    adapter.error_for_endpoints(vec![relay_b.clone()]);
     let wall = Arc::new(TestWallClock::new(100_000));
     let monotonic = Arc::new(TestMonotonicClock::default());
+    let mut session = current_session(database, &key, b"alice");
+    session.set_audit_recorder(v5_audit_recorder(&audit_path));
     let mut runtime = AccountDeviceRuntime::new(
-        current_session(database, &key, b"alice"),
+        session,
         adapter.clone(),
-        StaticTransportRouting::new(vec![])
-            .required_acks(2)
-            .with_group_route(
-                group_id.clone(),
-                group_id.as_slice().to_vec(),
-                vec![
-                    TransportEndpoint("wss://group-a.example".into()),
-                    TransportEndpoint("wss://group-b.example".into()),
-                ],
-            ),
+        StaticTransportRouting::new(vec![]).with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![relay_a.clone(), relay_b.clone()],
+        ),
         RecordingKeyPackages::default(),
     )
     .with_maintenance_sources(
@@ -2989,7 +3161,8 @@ async fn manual_self_update_confirms_on_first_ack_and_finishes_exact_event_fanou
         effects
             .pending
             .iter()
-            .any(|resolution| matches!(resolution, PendingResolution::Confirmed { .. }))
+            .any(|resolution| matches!(resolution, PendingResolution::Confirmed { .. })),
+        "the first relay acknowledgement confirms the self-update"
     );
     assert_eq!(
         runtime.session().epoch(&group_id).unwrap().0,
@@ -3013,28 +3186,651 @@ async fn manual_self_update_confirms_on_first_ack_and_finishes_exact_event_fanou
             .periodic_enrolled,
         "manual success must not enroll an existing/manual-only group"
     );
-
-    wall.set(wall.now().0.saturating_add(30));
-    runtime.run_due_maintenance().await.unwrap();
     let publishes = adapter.publishes();
-    assert_eq!(publishes.len(), 2);
-    assert_eq!(publishes[0].message, publishes[1].message);
-    assert_eq!(publishes[0].target.endpoints().len(), 2);
-    assert_eq!(publishes[1].target.endpoints().len(), 1);
+    assert_eq!(publishes.len(), 2, "one single-endpoint publish per relay");
+    let commit = publishes[0].message.clone();
+    assert!(
+        runtime.session().transport_fanouts().unwrap().is_empty(),
+        "self-update commits no longer use the legacy transport fanout"
+    );
     let fanout = runtime
         .session()
-        .transport_fanouts()
+        .outbound_fanouts_for_group(&group_id)
         .unwrap()
         .into_iter()
-        .find(|fanout| fanout.id == publishes[0].message.id)
+        .find(|fanout| fanout.message_id() == &commit.id)
+        .expect("self-update commit is a durable frozen fanout");
+    assert!(matches!(
+        fanout.mls_state(),
+        cgka_traits::FanoutMlsState::Confirmed
+    ));
+    assert_eq!(fanout.outcome().accepted_targets, 1);
+    assert_eq!(
+        fanout.outcome().outstanding_targets,
+        1,
+        "relay B stays owed after confirmation"
+    );
+
+    // Relay B recovers. The exact commit is retried once its backoff expires.
+    adapter.error_for_endpoints(Vec::new());
+    runtime.drain().await.unwrap();
+    assert_eq!(
+        adapter.publishes().len(),
+        2,
+        "the ambiguous relay waits out its backoff"
+    );
+    wall.set(wall.now().0.saturating_add(30));
+    runtime.drain().await.unwrap();
+    let publishes = adapter.publishes();
+    assert_eq!(publishes.len(), 3);
+    assert_eq!(publishes[2].message, commit);
+    assert_eq!(
+        publishes[2].target.endpoints(),
+        std::slice::from_ref(&relay_b)
+    );
+    assert!(
+        runtime
+            .session()
+            .outbound_fanouts_for_group(&group_id)
+            .unwrap()
+            .into_iter()
+            .all(|fanout| fanout.message_id() != &commit.id),
+        "a fully delivered confirmed commit retires its fanout"
+    );
+
+    drop(runtime);
+    let rows = v5_audit_rows(&audit_path);
+    let attempts = rows
+        .iter()
+        .filter(|row| row["event"]["type"] == "publish_attempt")
+        .collect::<Vec<_>>();
+    let outcomes = rows
+        .iter()
+        .filter(|row| row["event"]["type"] == "publish_outcome")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        attempts.len(),
+        2,
+        "first pass and secondary retry: {rows:#?}"
+    );
+    assert_eq!(
+        outcomes.len(),
+        2,
+        "first pass and secondary retry: {rows:#?}"
+    );
+    let endpoint_refs = |row: &serde_json::Value, field: &str| {
+        row["event"][field]
+            .as_array()
+            .map(|refs| refs.len())
+            .unwrap_or(0)
+    };
+    assert_eq!(endpoint_refs(attempts[0], "endpoint_refs"), 2);
+    assert_eq!(endpoint_refs(attempts[1], "endpoint_refs"), 1);
+    assert_eq!(endpoint_refs(outcomes[0], "accepted_endpoint_refs"), 1);
+    assert_eq!(endpoint_refs(outcomes[0], "failed_relays"), 1);
+    assert_eq!(endpoint_refs(outcomes[1], "accepted_endpoint_refs"), 1);
+    assert_eq!(endpoint_refs(outcomes[1], "failed_relays"), 0);
+}
+
+/// mdk#2255: a confirmed commit some group relay still owes is reported, and
+/// holds the next automatic rotation for at most an hour while retries run.
+#[tokio::test]
+async fn undelivered_commit_is_reported_and_holds_the_next_self_update_for_an_hour() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("marmot undelivered commit key").unwrap();
+    let mut initial = current_session(database.clone(), &key, b"alice");
+    let group_id = initial
+        .create_group(CreateGroupRequest {
+            name: "undelivered commit".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .group_id;
+    drop(initial);
+
+    let relay_a = TransportEndpoint("wss://group-a.example".into());
+    let relay_b = TransportEndpoint("wss://group-b.example".into());
+    let adapter = RecordingAdapter::default();
+    adapter.error_for_endpoints(vec![relay_b.clone()]);
+    let wall = Arc::new(TestWallClock::new(100_000));
+    let mut runtime = AccountDeviceRuntime::new(
+        current_session(database, &key, b"alice"),
+        adapter.clone(),
+        StaticTransportRouting::new(vec![]).with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![relay_a.clone(), relay_b.clone()],
+        ),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    )
+    .with_maintenance_timing(MaintenanceTiming::immediate());
+    assert_eq!(runtime.undelivered_commit(&group_id).unwrap(), None);
+
+    let first = runtime.schedule_manual_self_update(&group_id).unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    let phase = |runtime: &SelfUpdateRuntime, id| {
+        runtime
+            .session()
+            .maintenance_obligation(id)
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(
+        phase(&runtime, &first).phase,
+        cgka_traits::MaintenancePhase::Complete
+    );
+    let commit = adapter.publishes()[0].message.clone();
+    let undelivered = runtime
+        .undelivered_commit(&group_id)
+        .unwrap()
+        .expect("relay B still owes the confirmed commit");
+    assert_eq!(undelivered.message_id, commit.id);
+    assert_eq!(undelivered.owed_endpoints, vec![relay_b.clone()]);
+    assert_eq!(undelivered.endpoint_count, 2);
+    assert_eq!(undelivered.since, cgka_traits::Timestamp(100_000));
+
+    // The next rotation waits while the previous commit is still owed.
+    let second = runtime.schedule_manual_self_update(&group_id).unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    let held = phase(&runtime, &second);
+    assert_eq!(held.phase, cgka_traits::MaintenancePhase::Retry);
+    assert_eq!(
+        held.last_failure_code.as_deref(),
+        Some("commit_delivery_hold")
+    );
+    assert!(
+        adapter
+            .publishes()
+            .iter()
+            .all(|publish| publish.message == commit),
+        "no new commit is authored while the last one is owed"
+    );
+
+    // A relay that never answers must not suppress rotation: after an hour
+    // the rotation proceeds, and the owed relay keeps being retried.
+    wall.set(100_000 + 60 * 60);
+    runtime.run_due_maintenance().await.unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        phase(&runtime, &second).phase,
+        cgka_traits::MaintenancePhase::Complete
+    );
+    assert!(
+        adapter
+            .publishes()
+            .iter()
+            .any(|publish| publish.message != commit),
+        "the held rotation proceeds after the bound"
+    );
+
+    // Once every relay accepts, nothing is owed.
+    adapter.error_for_endpoints(Vec::new());
+    wall.set(wall.now().0 + 2 * 60 * 60);
+    runtime.drain().await.unwrap();
+    assert_eq!(runtime.undelivered_commit(&group_id).unwrap(), None);
+}
+
+/// mdk#2255 review: the delivery grace and the self-update hold run from the
+/// first relay acknowledgement, not from staging. A commit that waited hours
+/// for its first acknowledgement still gives the other relays their retry.
+#[tokio::test]
+async fn undelivered_commit_is_measured_from_its_first_acknowledgement() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("marmot late first ack key").unwrap();
+    let mut initial = current_session(database.clone(), &key, b"alice");
+    let group_id = initial
+        .create_group(CreateGroupRequest {
+            name: "late first ack".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .group_id;
+    drop(initial);
+
+    let relay_a = TransportEndpoint("wss://group-a.example".into());
+    let relay_b = TransportEndpoint("wss://group-b.example".into());
+    let adapter = RecordingAdapter::default();
+    adapter.error_for_endpoints(vec![relay_a.clone(), relay_b.clone()]);
+    let wall = Arc::new(TestWallClock::new(100_000));
+    let mut runtime = AccountDeviceRuntime::new(
+        current_session(database, &key, b"alice"),
+        adapter.clone(),
+        StaticTransportRouting::new(vec![]).with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![relay_a.clone(), relay_b.clone()],
+        ),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    )
+    .with_maintenance_timing(MaintenanceTiming::immediate());
+    let first = runtime.schedule_manual_self_update(&group_id).unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(runtime.undelivered_commit(&group_id).unwrap(), None);
+
+    // Two hours later relay A finally accepts; relay B is still unreachable.
+    let accepted_at = 100_000 + 2 * 60 * 60;
+    wall.set(accepted_at);
+    adapter.error_for_endpoints(vec![relay_b.clone()]);
+    runtime.drain().await.unwrap();
+    let undelivered = runtime
+        .undelivered_commit(&group_id)
+        .unwrap()
+        .expect("relay B owes the commit A just accepted");
+    assert_eq!(undelivered.since, cgka_traits::Timestamp(accepted_at));
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        runtime
+            .session()
+            .maintenance_obligation(&first)
+            .unwrap()
+            .unwrap()
+            .phase,
+        cgka_traits::MaintenancePhase::Complete
+    );
+
+    // The next rotation is held from the acknowledgement, not from staging.
+    let second = runtime.schedule_manual_self_update(&group_id).unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        runtime
+            .session()
+            .maintenance_obligation(&second)
+            .unwrap()
+            .unwrap()
+            .last_failure_code
+            .as_deref(),
+        Some("commit_delivery_hold")
+    );
+}
+
+/// mdk#2255 review: the delivery query answers for a stored group the engine
+/// has not hydrated yet instead of failing with `GroupNotHydrated`.
+#[tokio::test]
+async fn undelivered_commit_answers_for_an_unhydrated_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("marmot unhydrated delivery key").unwrap();
+    let mut initial = current_session(database.clone(), &key, b"alice-unhydrated-delivery");
+    initial
+        .create_group(CreateGroupRequest {
+            name: "unhydrated delivery".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
         .unwrap();
-    assert!(fanout.evolution_confirmed);
+    drop(initial);
+
+    let reopened = deferred_current_session(&database, &key, b"alice-unhydrated-delivery");
+    let group_id = reopened.live_group_ids().unwrap().remove(0);
+    assert_eq!(reopened.unhydrated_group_ids(), vec![group_id.clone()]);
+    let runtime = AccountDeviceRuntime::new(
+        reopened,
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![]),
+        RecordingKeyPackages::default(),
+    );
+    assert_eq!(runtime.undelivered_commit(&group_id).unwrap(), None);
+}
+
+/// mdk#2255 review: a commit convergence withdrew no longer gates the group,
+/// even while a relay still owes it, including after a restart.
+#[tokio::test]
+async fn withdrawn_commit_is_not_reported_as_undelivered() {
+    use cgka_traits::MessageStorage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("marmot withdrawn owed commit key").unwrap();
+    let mut initial = current_session(database.clone(), &key, b"alice");
+    let group_id = initial
+        .create_group(CreateGroupRequest {
+            name: "withdrawn owed commit".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .group_id;
+    drop(initial);
+
+    let relay_a = TransportEndpoint("wss://group-a.example".into());
+    let relay_b = TransportEndpoint("wss://group-b.example".into());
+    let adapter = RecordingAdapter::default();
+    adapter.error_for_endpoints(vec![relay_b.clone()]);
+    let routing = StaticTransportRouting::new(vec![]).with_group_route(
+        group_id.clone(),
+        group_id.as_slice().to_vec(),
+        vec![relay_a, relay_b],
+    );
+    let open = |database: std::path::PathBuf| {
+        AccountDeviceRuntime::new(
+            current_session(database, &key, b"alice"),
+            adapter.clone(),
+            routing.clone(),
+            RecordingKeyPackages::default(),
+        )
+        .with_maintenance_sources(
+            Arc::new(TestWallClock::new(100_000)),
+            Arc::new(TestMonotonicClock::default()),
+            Arc::new(TestRandom::new(0)),
+        )
+        .with_maintenance_timing(MaintenanceTiming::immediate())
+    };
+    let mut runtime = open(database.clone());
+    runtime.schedule_manual_self_update(&group_id).unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    let commit_id = runtime
+        .undelivered_commit(&group_id)
+        .unwrap()
+        .expect("relay B owes the confirmed commit")
+        .message_id;
+    drop(runtime);
+
+    // Convergence parked the commit off the selected branch.
+    SqliteAccountStorage::open_encrypted(&database, &key)
+        .unwrap()
+        .update_message_state(&commit_id, cgka_traits::MessageState::ConvergenceDeferred)
+        .unwrap();
+    let runtime = open(database);
+    assert_eq!(runtime.undelivered_commit(&group_id).unwrap(), None);
+}
+
+/// mdk#2255: a self-update staged before the frozen-fanout migration keeps
+/// its legacy record. If the best-effort `evolution_confirmed` write failed
+/// after confirmation, the remaining relays must still be retried (and
+/// audited) instead of waiting out the 24 h retention window.
+#[tokio::test]
+async fn legacy_self_update_fanout_retries_after_lost_confirmation_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let audit_path = dir.path().join("alice-audit.jsonl");
+    let key = SqlCipherKey::new("marmot legacy marker key").unwrap();
+    let mut initial = current_session(database.clone(), &key, b"alice");
+    let group_id = initial
+        .create_group(CreateGroupRequest {
+            name: "legacy marker".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .group_id;
+    drop(initial);
+
+    let relay_a = TransportEndpoint("wss://group-a.example".into());
+    let relay_b = TransportEndpoint("wss://group-b.example".into());
+    let adapter = RecordingAdapter::default();
+    let mut session = current_session(database, &key, b"alice");
+    session.set_audit_recorder(v5_audit_recorder(&audit_path));
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        adapter.clone(),
+        StaticTransportRouting::new(vec![]).with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![relay_a.clone(), relay_b.clone()],
+        ),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        Arc::new(TestWallClock::new(100_000)),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    )
+    .with_maintenance_timing(MaintenanceTiming::immediate());
+    runtime.schedule_manual_self_update(&group_id).unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    let evolution = runtime
+        .session()
+        .group_evolutions_for_group(&group_id)
+        .unwrap()
+        .into_iter()
+        .find(|evolution| evolution.phase == cgka_traits::GroupEvolutionPhase::Confirmed)
+        .expect("confirmed self-update evolution");
+    let commit = adapter.publishes()[0].message.clone();
+    assert_eq!(evolution.signed_message_id.as_ref(), Some(&commit.id));
+
+    // The pre-migration shape: relay A acknowledged, relay B failed, and the
+    // post-confirmation marker write was lost.
+    let target = |endpoint: TransportEndpoint, state| cgka_traits::TransportFanoutTarget {
+        endpoint,
+        state,
+        attempt_count: 1,
+        last_attempt_at: Some(cgka_traits::Timestamp(1)),
+        failure_code: None,
+    };
+    runtime
+        .session()
+        .put_transport_fanout(&cgka_traits::DurableTransportFanout {
+            id: commit.id.clone(),
+            group_id: Some(group_id.clone()),
+            evolution_id: Some(evolution.id.clone()),
+            exact_message: commit.clone(),
+            target: TransportPublishTarget::Group {
+                group_id: group_id.clone(),
+                transport_group_id: group_id.as_slice().to_vec(),
+                endpoints: vec![relay_a.clone(), relay_b.clone()],
+            },
+            targets: vec![
+                target(relay_a, cgka_traits::TransportFanoutAttemptState::Accepted),
+                target(
+                    relay_b.clone(),
+                    cgka_traits::TransportFanoutAttemptState::AttemptedFailed,
+                ),
+            ],
+            required_acks: 1,
+            evolution_confirmed: false,
+            possible_exposure: true,
+            created_at: cgka_traits::Timestamp(1),
+            bounded_until: Some(cgka_traits::Timestamp(200_000)),
+        })
+        .unwrap();
+    let before = adapter.publishes().len();
+
+    runtime.run_due_maintenance().await.unwrap();
+    let publishes = adapter.publishes();
+    assert_eq!(publishes.len(), before + 1, "relay B is retried");
+    let retry = publishes.last().unwrap();
+    assert_eq!(retry.message, commit);
+    assert_eq!(retry.target.endpoints(), std::slice::from_ref(&relay_b));
+    let fanout = runtime
+        .session()
+        .transport_fanout(&commit.id)
+        .unwrap()
+        .unwrap();
+    assert!(fanout.evolution_confirmed, "the marker is repaired");
     assert!(
         fanout
             .targets
             .iter()
-            .all(|target| { target.state == cgka_traits::TransportFanoutAttemptState::Accepted })
+            .all(|target| target.state == cgka_traits::TransportFanoutAttemptState::Accepted)
     );
+
+    drop(runtime);
+    let rows = v5_audit_rows(&audit_path);
+    let last_attempt = rows
+        .iter()
+        .rfind(|row| row["event"]["type"] == "publish_attempt")
+        .expect("secondary retry attempt is audited");
+    let last_outcome = rows
+        .iter()
+        .rfind(|row| row["event"]["type"] == "publish_outcome")
+        .expect("secondary retry outcome is audited");
+    assert_eq!(last_attempt["event"]["target_kind"], "group");
+    assert_eq!(
+        last_attempt["event"]["endpoint_refs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(last_outcome["event"]["target_kind"], "group");
+    assert_eq!(
+        last_outcome["event"]["accepted_endpoint_refs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// mdk#2264: a legacy publish that fails on every relay must keep each relay's
+/// cause in the audit log and on the durable fanout, instead of one
+/// `unclassified` adapter row with no relay detail. Founding Welcomes still
+/// publish through the legacy path; self-update commits moved to the frozen
+/// fanout (mdk#2255), which records per-relay causes in its own outcome rows.
+#[tokio::test]
+async fn adapter_publish_failure_records_per_relay_causes() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot adapter failure cause key").unwrap();
+    let audit_path = dir.path().join("audit.jsonl");
+    let mut bob_session = current_session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let bob_kp = bob_session.fresh_key_package().await.unwrap();
+    let bob_id = bob_session.self_id();
+
+    let mut session = current_session(dir.path().join("alice.sqlite"), &key, b"alice");
+    session.set_audit_recorder(Box::new(
+        marmot_forensics::JsonlRecorder::open_v5_with_account_ref(
+            &audit_path,
+            "11".repeat(16),
+            Some("22".repeat(16)),
+            marmot_forensics::v5::Producer {
+                mdk_revision: None,
+                build_profile: marmot_forensics::v5::BuildProfile::Debug,
+                platform: marmot_forensics::v5::Platform::Other,
+                host_build: None,
+            },
+        )
+        .unwrap(),
+    ));
+    let timed_out = TransportEndpoint("wss://bob-timed-out.example".into());
+    let refused = TransportEndpoint("wss://bob-refused.example".into());
+    let adapter = RecordingAdapter::default();
+    adapter.fail_endpoints_with_reasons(
+        TransportEndpointFailureKind::RetryableUnavailable,
+        vec![
+            (timed_out.clone(), "connect relay timed out"),
+            (refused.clone(), "connect relay failed"),
+        ],
+    );
+    let routing =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://alice-inbox.example".into())])
+            .with_inbox_route(bob_id, vec![timed_out.clone(), refused.clone()]);
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        adapter.clone(),
+        routing,
+        RecordingKeyPackages::default(),
+    );
+
+    runtime
+        .create_group(CreateGroupRequest {
+            name: "adapter failure causes".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(adapter.publishes().len(), 1);
+    assert!(matches!(
+        adapter.publishes()[0].message.envelope,
+        TransportEnvelope::Welcome { .. }
+    ));
+
+    let fanout = runtime.session().transport_fanouts().unwrap().remove(0);
+    assert_eq!(fanout.targets.len(), 2);
+    for target in &fanout.targets {
+        assert_eq!(
+            target.state,
+            cgka_traits::TransportFanoutAttemptState::AttemptedFailed
+        );
+        assert_eq!(target.attempt_count, 1);
+        assert_ne!(
+            target.failure_code.as_deref(),
+            Some("adapter_error"),
+            "each relay's reported failure must reach its fanout target"
+        );
+    }
+    drop(runtime);
+
+    let audit = std::fs::read_to_string(&audit_path).unwrap();
+    assert!(!audit.contains("wss://"));
+    let rows = audit
+        .lines()
+        .map(|line| {
+            marmot_forensics::v5::Record::from_json(line.as_bytes()).expect("strict v5 row");
+            serde_json::from_str::<serde_json::Value>(line).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let failure = rows
+        .iter()
+        .find(|row| row["event"]["type"] == "publish_failure")
+        .expect("adapter publish failure row");
+    assert_eq!(failure["event"]["stage"], "adapter");
+    assert_eq!(
+        failure["event"]["reason"], "insufficient_publish_acknowledgements",
+        "the adapter failure reason must survive the v5 allowlist"
+    );
+    let outcome = rows
+        .iter()
+        .find(|row| row["event"]["type"] == "publish_outcome")
+        .expect("per-relay publish outcome row");
+    assert_eq!(outcome["event"]["met_required_acks"], false);
+    let failed_relays = outcome["event"]["failed_relays"].as_array().unwrap();
+    assert_eq!(failed_relays.len(), 2);
+    for (endpoint, reason) in [
+        (&timed_out, "connect_relay_timed_out"),
+        (&refused, "connect_relay_failed"),
+    ] {
+        let endpoint_ref =
+            marmot_forensics::v5::EndpointRef::from_normalized_url(&endpoint.0).unwrap();
+        let relay = failed_relays
+            .iter()
+            .find(|relay| relay["endpoint_ref"] == endpoint_ref.as_str())
+            .unwrap_or_else(|| panic!("missing relay row: {failed_relays:?}"));
+        assert_eq!(relay["reason"], reason, "{failed_relays:?}");
+    }
 }
 
 #[tokio::test]
@@ -3095,12 +3891,20 @@ async fn ambiguous_self_update_exposure_survives_restart_and_respects_retry_back
     let effects = runtime.run_due_maintenance().await.unwrap();
 
     assert_eq!(adapter.publishes().len(), 1);
-    let fanout = runtime.session().transport_fanouts().unwrap().remove(0);
-    assert!(fanout.possible_exposure);
-    assert!(!fanout.evolution_confirmed);
+    assert!(runtime.session().transport_fanouts().unwrap().is_empty());
+    let fanout = runtime
+        .session()
+        .outbound_fanouts_for_group(&group_id)
+        .unwrap()
+        .remove(0);
+    assert!(fanout.possible_exposure());
+    assert!(matches!(
+        fanout.mls_state(),
+        cgka_traits::FanoutMlsState::Pending(_)
+    ));
     assert_eq!(
-        fanout.targets[0].state,
-        cgka_traits::TransportFanoutAttemptState::AttemptedFailed
+        fanout.target_status(0),
+        Some(cgka_traits::FanoutTargetStatus::PossiblyExposed)
     );
     assert_eq!(
         runtime
@@ -3143,11 +3947,19 @@ async fn ambiguous_self_update_exposure_survives_restart_and_respects_retry_back
     assert_eq!(
         adapter.publishes().len(),
         1,
-        "persisted backoff must prevent an immediate restart retry"
+        "persisted backoff must prevent an immediate restart retry, and the \
+         pending exact commit must not be replaced by a fresh rotation"
     );
-    let fanout = restarted.session().transport_fanouts().unwrap().remove(0);
-    assert!(fanout.possible_exposure);
-    assert!(!fanout.evolution_confirmed);
+    let fanout = restarted
+        .session()
+        .outbound_fanouts_for_group(&group_id)
+        .unwrap()
+        .remove(0);
+    assert!(fanout.possible_exposure());
+    assert!(matches!(
+        fanout.mls_state(),
+        cgka_traits::FanoutMlsState::Pending(_)
+    ));
 
     wall.set(wall.now().0.saturating_add(30));
     restarted.run_due_maintenance().await.unwrap();
@@ -3166,6 +3978,236 @@ async fn ambiguous_self_update_exposure_survives_restart_and_respects_retry_back
             .unwrap()
             .phase,
         cgka_traits::MaintenancePhase::Complete
+    );
+}
+
+/// mdk#2255/mdk#2264: a self-update commit that fails on every group relay
+/// keeps each relay's own cause on its frozen fanout target and in the
+/// `publish_outcome` audit row. The frozen fanout sends one single-endpoint
+/// request per relay, and each failed relay waits out its backoff before the
+/// exact commit is retried.
+#[tokio::test]
+async fn frozen_self_update_publish_failure_records_per_relay_causes() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot frozen failure cause key").unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let audit_path = dir.path().join("audit.jsonl");
+    let mut initial = current_session(database.clone(), &key, b"alice");
+    let created = initial
+        .create_group(CreateGroupRequest {
+            name: "frozen failure causes".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id;
+    drop(initial);
+
+    let mut session = current_session(database, &key, b"alice");
+    session.set_audit_recorder(Box::new(
+        marmot_forensics::JsonlRecorder::open_v5_with_account_ref(
+            &audit_path,
+            "11".repeat(16),
+            Some("22".repeat(16)),
+            marmot_forensics::v5::Producer {
+                mdk_revision: None,
+                build_profile: marmot_forensics::v5::BuildProfile::Debug,
+                platform: marmot_forensics::v5::Platform::Other,
+                host_build: None,
+            },
+        )
+        .unwrap(),
+    ));
+    let timed_out = TransportEndpoint("wss://group-timed-out.example".into());
+    let refused = TransportEndpoint("wss://group-refused.example".into());
+    let adapter = RecordingAdapter::default();
+    adapter.fail_endpoints_with_reasons(
+        TransportEndpointFailureKind::RetryableUnavailable,
+        vec![
+            (timed_out.clone(), "connect relay timed out"),
+            (refused.clone(), "connect relay failed"),
+        ],
+    );
+    let routing =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())])
+            .with_group_route(
+                group_id.clone(),
+                group_id.as_slice().to_vec(),
+                vec![timed_out.clone(), refused.clone()],
+            );
+    let wall = Arc::new(TestWallClock::new(120_000));
+    let monotonic = Arc::new(TestMonotonicClock::default());
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        adapter.clone(),
+        routing,
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        monotonic.clone(),
+        Arc::new(TestRandom::new(0)),
+    );
+
+    let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    monotonic.set_millis(60_000);
+    wall.set(120_060);
+    runtime.run_due_maintenance().await.unwrap();
+    let jittered = runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+    wall.set(jittered.not_before.unwrap().0);
+    runtime.run_due_maintenance().await.unwrap();
+
+    // One pass: the exact commit goes to each relay as its own request.
+    let single_endpoints = |publishes: &[TransportPublishRequest]| {
+        let mut endpoints = publishes
+            .iter()
+            .map(|publish| {
+                assert_eq!(publish.required_acks, 1);
+                let [endpoint] = publish.target.endpoints() else {
+                    panic!("one endpoint per request: {:?}", publish.target);
+                };
+                endpoint.clone()
+            })
+            .collect::<Vec<_>>();
+        endpoints.sort_by(|left, right| left.0.cmp(&right.0));
+        endpoints
+    };
+    let publishes = adapter.publishes();
+    assert_eq!(publishes.len(), 2);
+    assert_eq!(publishes[0].message, publishes[1].message);
+    assert_eq!(
+        single_endpoints(&publishes),
+        vec![refused.clone(), timed_out.clone()]
+    );
+
+    assert!(runtime.session().transport_fanouts().unwrap().is_empty());
+    let fanout = runtime
+        .session()
+        .outbound_fanouts_for_group(&group_id)
+        .unwrap()
+        .remove(0);
+    let endpoints = fanout.request().target.endpoints().to_vec();
+    assert_eq!(endpoints.len(), 2);
+    for (index, endpoint) in endpoints.iter().enumerate() {
+        assert_eq!(
+            fanout.target_status(index),
+            Some(cgka_traits::FanoutTargetStatus::RetryableUnavailable)
+        );
+        assert_eq!(fanout.target_attempt_count(index), 1);
+        let expected = if endpoint == &timed_out {
+            "connect relay timed out"
+        } else {
+            "connect relay failed"
+        };
+        assert_eq!(
+            fanout
+                .target_failure(index)
+                .map(|failure| failure.reason.as_str()),
+            Some(expected),
+            "each relay's reported failure must reach its fanout target"
+        );
+    }
+    assert!(matches!(
+        fanout.mls_state(),
+        cgka_traits::FanoutMlsState::Pending(_)
+    ));
+    assert_eq!(
+        runtime
+            .session()
+            .maintenance_obligation(&obligation_id)
+            .unwrap()
+            .unwrap()
+            .phase,
+        cgka_traits::MaintenancePhase::PendingPublication
+    );
+
+    // A relay that just failed waits for its backoff before the exact retry.
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(adapter.publishes().len(), 2);
+    let failed_at = wall.now().0;
+    wall.set(failed_at + 4);
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(adapter.publishes().len(), 2, "backoff has not elapsed");
+    wall.set(failed_at + 5);
+    runtime.run_due_maintenance().await.unwrap();
+    let publishes = adapter.publishes();
+    assert_eq!(
+        publishes.len(),
+        4,
+        "the exact retry runs once backoff elapses"
+    );
+    assert!(
+        publishes
+            .iter()
+            .all(|publish| publish.message == publishes[0].message)
+    );
+    assert_eq!(
+        single_endpoints(&publishes[2..]),
+        vec![refused.clone(), timed_out.clone()],
+        "the retry reaches every failed relay"
+    );
+    drop(runtime);
+
+    let audit = std::fs::read_to_string(&audit_path).unwrap();
+    assert!(!audit.contains("wss://"));
+    let rows = audit
+        .lines()
+        .map(|line| {
+            marmot_forensics::v5::Record::from_json(line.as_bytes()).expect("strict v5 row");
+            serde_json::from_str::<serde_json::Value>(line).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let attempts = rows
+        .iter()
+        .filter(|row| row["event"]["type"] == "publish_attempt")
+        .collect::<Vec<_>>();
+    assert_eq!(attempts.len(), 2, "both passes are audited");
+    assert_eq!(
+        attempts[0]["event"]["endpoint_refs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let outcomes = rows
+        .iter()
+        .filter(|row| row["event"]["type"] == "publish_outcome")
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes.len(), 2, "both passes are audited");
+    let outcome = outcomes[0];
+    assert_eq!(outcome["event"]["met_required_acks"], false);
+    assert!(
+        outcome["event"]["accepted_endpoint_refs"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+    );
+    let failed_relays = outcome["event"]["failed_relays"].as_array().unwrap();
+    assert_eq!(failed_relays.len(), 2);
+    for (endpoint, reason) in [
+        (&timed_out, "connect_relay_timed_out"),
+        (&refused, "connect_relay_failed"),
+    ] {
+        let endpoint_ref =
+            marmot_forensics::v5::EndpointRef::from_normalized_url(&endpoint.0).unwrap();
+        let relay = failed_relays
+            .iter()
+            .find(|relay| relay["endpoint_ref"] == endpoint_ref.as_str())
+            .unwrap_or_else(|| panic!("missing relay row: {failed_relays:?}"));
+        assert_eq!(relay["reason"], reason, "{failed_relays:?}");
+    }
+    assert!(
+        rows.iter()
+            .all(|row| row["event"]["reason"] != "unclassified"),
+        "no publish row may fall back to an unclassified cause"
     );
 }
 
@@ -4569,9 +5611,10 @@ async fn rejected_self_update_publication_rolls_back_instead_of_holding_pending_
     drop(initial);
 
     let adapter = RecordingAdapter::default();
-    // Every endpoint rejects: an `Ok` report with zero acknowledgements, which
-    // is precisely what a relay refusal looks like to the account runtime.
-    adapter.accept_next(0);
+    // Every endpoint rejects: an `Ok` report whose only endpoint answered with
+    // an explicit terminal `OK false`. An endpoint missing from both lists is
+    // an unknown acknowledgement, not a rejection.
+    adapter.accept_only_endpoints(Vec::new());
     let routing =
         StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())])
             .with_group_route(
@@ -4607,10 +5650,14 @@ async fn rejected_self_update_publication_rolls_back_instead_of_holding_pending_
     let effects = runtime.run_due_maintenance().await.unwrap();
 
     assert_eq!(adapter.publishes().len(), 1);
-    let fanout = runtime.session().transport_fanouts().unwrap().remove(0);
+    assert!(runtime.session().transport_fanouts().unwrap().is_empty());
     assert!(
-        !fanout.possible_exposure,
-        "a rejection is a definite non-delivery, not an ambiguous exposure"
+        runtime
+            .session()
+            .outbound_fanouts_for_group(&group_id)
+            .unwrap()
+            .is_empty(),
+        "a rejection is a definite non-delivery, so the rolled-back fanout retires"
     );
     assert!(
         effects
@@ -4640,7 +5687,7 @@ async fn rejected_self_update_publication_rolls_back_instead_of_holding_pending_
     // to measure from. Pinning the immediate re-stage means any future backoff
     // introduced here fails loudly instead of hiding behind a clock the test
     // advanced for it.
-    adapter.accept_next(1);
+    adapter.accept_only_endpoints(vec![TransportEndpoint("wss://group.example".into())]);
     runtime.run_due_maintenance().await.unwrap();
     assert_eq!(
         runtime.session().epoch(&group_id).unwrap().0,
@@ -5276,6 +6323,44 @@ async fn immediate_maintenance_timing_publishes_a_manual_self_update_without_wai
     );
 }
 
+/// mdk#2258: a self-update authored from an epoch the group already left forks
+/// the group. A caller that knows the group is behind holds it; the rotation
+/// stays owed and publishes once the hold lifts.
+#[tokio::test]
+async fn held_group_defers_a_due_self_update_until_the_hold_lifts() {
+    let (_dir, mut runtime, group_id, source_epoch) =
+        manual_only_group_runtime(MaintenanceTiming::immediate()).await;
+    let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
+    let held = [group_id.clone()];
+    for _ in 0..3 {
+        runtime.run_due_maintenance_holding(&held).await.unwrap();
+    }
+    let obligation = runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(obligation.phase, cgka_traits::MaintenancePhase::Retry);
+    assert_eq!(
+        obligation.last_failure_code.as_deref(),
+        Some("epoch_gap_hold")
+    );
+    assert_eq!(runtime.session().epoch(&group_id).unwrap(), source_epoch);
+
+    let effects = runtime.run_due_maintenance().await.unwrap();
+    assert!(
+        effects
+            .pending
+            .iter()
+            .any(|resolution| matches!(resolution, PendingResolution::Confirmed { .. })),
+        "{effects:?}"
+    );
+    assert_eq!(
+        runtime.session().epoch(&group_id).unwrap().0,
+        source_epoch.0 + 1
+    );
+}
+
 #[tokio::test]
 async fn default_maintenance_timing_holds_a_manual_self_update_in_its_quiet_window() {
     let (_dir, mut runtime, group_id, source_epoch) =
@@ -5364,4 +6449,591 @@ async fn immediate_maintenance_timing_walks_a_post_join_obligation_without_waiti
         runtime.session().epoch(&group_id).unwrap().0,
         source_epoch.0 + 1
     );
+}
+
+/// A later retained-history restoration resumes policy without reviving failed work.
+#[tokio::test]
+async fn later_restoration_reschedules_periodic_maintenance_without_reviving_failed_ids() {
+    use cgka_traits::GroupStorage;
+    for enrolled in [false, true] {
+        for last_rotation in [None, Some(Timestamp(10))] {
+            let (dir, runtime, group, _) =
+                manual_only_group_runtime(MaintenanceTiming::default()).await;
+            let wall = Arc::new(TestWallClock::new(100_000));
+            let mut runtime = runtime.with_maintenance_sources(
+                wall.clone(),
+                Arc::new(TestMonotonicClock::default()),
+                Arc::new(TestRandom::new(0)),
+            );
+            let storage = SqliteAccountStorage::open_encrypted(
+                dir.path().join("alice.sqlite"),
+                &SqlCipherKey::new("marmot maintenance timing group key").unwrap(),
+            )
+            .unwrap();
+            let mut state = runtime
+                .session()
+                .group_maintenance(&group)
+                .unwrap()
+                .unwrap();
+            state.periodic_enrolled = enrolled;
+            state.last_own_leaf_rotation_at = last_rotation;
+            state.next_periodic_rotation_at = Some(Timestamp(100_000));
+            runtime.session().put_group_maintenance(&state).unwrap();
+            let failed_id = runtime.schedule_manual_self_update(&group).unwrap();
+            let live = storage.get_group(&group).unwrap();
+            let mut removed = live.clone();
+            removed.removed = true;
+            storage.put_group(&removed).unwrap();
+            let effects = |event| cgka_session::SessionEffects {
+                events: vec![event],
+                publish: vec![],
+                queued: vec![],
+                pending_convergence: vec![],
+            };
+            runtime
+                .publish_session_effects(effects(GroupEvent::LocalGroupCopyTerminated {
+                    group_id: group.clone(),
+                    voluntary: false,
+                }))
+                .await
+                .unwrap();
+            let failed = runtime
+                .session()
+                .maintenance_obligation(&failed_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(failed.phase, cgka_traits::MaintenancePhase::Failed);
+            let terminal_state = runtime
+                .session()
+                .group_maintenance(&group)
+                .unwrap()
+                .unwrap();
+            assert_eq!(terminal_state.periodic_enrolled, enrolled);
+            assert_eq!(terminal_state.next_periodic_rotation_at, None);
+            runtime.run_due_maintenance().await.unwrap();
+            assert_eq!(
+                runtime
+                    .session()
+                    .maintenance_obligations_for_group(&group)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            // Retained-history repair has restored canonical membership before
+            // its notification reaches this account runtime, in a later batch.
+            storage.put_group(&live).unwrap();
+            runtime = runtime.with_maintenance_sources(
+                wall.clone(),
+                Arc::new(TestMonotonicClock::default()),
+                Arc::new(TestRandom::new(0)),
+            );
+            runtime
+                .publish_session_effects(effects(GroupEvent::LocalGroupCopyRestored {
+                    group_id: group.clone(),
+                }))
+                .await
+                .unwrap();
+            let mut restored = runtime
+                .session()
+                .group_maintenance(&group)
+                .unwrap()
+                .unwrap();
+            let failed_periodic = if let Some(deadline) = restored.next_periodic_rotation_at {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(b"marmot-periodic-self-update-v1");
+                hasher.update((group.as_slice().len() as u64).to_be_bytes());
+                hasher.update(group.as_slice());
+                hasher.update(deadline.0.to_be_bytes());
+                let mut periodic = failed.clone();
+                periodic.id = cgka_traits::MessageId::new(hasher.finalize().to_vec());
+                periodic.trigger = cgka_traits::MaintenanceTrigger::Periodic;
+                runtime
+                    .session()
+                    .put_maintenance_obligation(&periodic)
+                    .unwrap();
+                storage.put_group(&removed).unwrap();
+                runtime
+                    .publish_session_effects(effects(GroupEvent::LocalGroupCopyTerminated {
+                        group_id: group.clone(),
+                        voluntary: false,
+                    }))
+                    .await
+                    .unwrap();
+                storage.put_group(&live).unwrap();
+                // Repeat the same sampled deadline: its failed ID cannot be reused.
+                runtime = runtime.with_maintenance_sources(
+                    wall.clone(),
+                    Arc::new(TestMonotonicClock::default()),
+                    Arc::new(TestRandom::new(0)),
+                );
+                runtime
+                    .publish_session_effects(effects(GroupEvent::LocalGroupCopyRestored {
+                        group_id: group.clone(),
+                    }))
+                    .await
+                    .unwrap();
+                restored = runtime
+                    .session()
+                    .group_maintenance(&group)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    restored.next_periodic_rotation_at,
+                    Some(Timestamp(deadline.0 + 1))
+                );
+                Some(periodic)
+            } else {
+                None
+            };
+            assert_eq!(restored.periodic_enrolled, enrolled);
+            assert_eq!(restored.next_periodic_rotation_at.is_some(), enrolled);
+            if let Some(deadline) = restored.next_periodic_rotation_at {
+                assert!(deadline.0 > 100_000);
+                wall.set(deadline.0);
+                runtime.run_due_maintenance().await.unwrap();
+                let obligations = runtime
+                    .session()
+                    .maintenance_obligations_for_group(&group)
+                    .unwrap();
+                assert!(obligations.iter().any(|item| item.id != failed_id
+                    && item.trigger == cgka_traits::MaintenanceTrigger::Periodic
+                    && item.phase != cgka_traits::MaintenancePhase::Failed));
+            }
+            if let Some(periodic) = failed_periodic {
+                assert_eq!(
+                    runtime
+                        .session()
+                        .maintenance_obligation(&periodic.id)
+                        .unwrap(),
+                    Some(periodic)
+                );
+            }
+            assert_eq!(
+                runtime
+                    .session()
+                    .maintenance_obligation(&failed_id)
+                    .unwrap()
+                    .unwrap(),
+                failed
+            );
+        }
+    }
+}
+
+/// A committed restoration is not rolled back by its secondary deadline write.
+/// Quiet recovery must also work after losing both the announcement and runtime.
+#[tokio::test]
+async fn restore_fault_keeps_effects() {
+    use cgka_traits::GroupStorage;
+    use sha2::{Digest, Sha256};
+
+    const MIN_PERIOD_SECS: u64 = 24 * 24 * 60 * 60;
+    const MAX_PERIOD_SECS: u64 = 36 * 24 * 60 * 60;
+
+    for (announce, reopen) in [(true, false), (true, true), (false, true)] {
+        for (last_rotation, period_offset) in [
+            (None, 0),
+            (Some(Timestamp(10)), 0),
+            (None, MAX_PERIOD_SECS - MIN_PERIOD_SECS),
+            (Some(Timestamp(10)), MAX_PERIOD_SECS - MIN_PERIOD_SECS),
+        ] {
+            let (dir, mut runtime, group, epoch) =
+                manual_only_group_runtime(MaintenanceTiming::default()).await;
+            let database = dir.path().join("alice.sqlite");
+            let key_text = "marmot maintenance timing group key";
+            let key = SqlCipherKey::new(key_text).unwrap();
+            let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+            let wall = Arc::new(TestWallClock::new(100_000));
+            runtime = runtime.with_maintenance_sources(
+                wall.clone(),
+                Arc::new(TestMonotonicClock::default()),
+                Arc::new(TestRandom::new(period_offset)),
+            );
+
+            let candidate = 100_000u64 + MIN_PERIOD_SECS + period_offset;
+            let mut state = runtime
+                .session()
+                .group_maintenance(&group)
+                .unwrap()
+                .unwrap();
+            state.periodic_enrolled = true;
+            state.last_own_leaf_rotation_at = last_rotation;
+            state.next_periodic_rotation_at = Some(Timestamp(candidate));
+            runtime.session().put_group_maintenance(&state).unwrap();
+            let manual_id = runtime.schedule_manual_self_update(&group).unwrap();
+            let mut periodic = runtime
+                .session()
+                .maintenance_obligation(&manual_id)
+                .unwrap()
+                .unwrap();
+            let mut hasher = Sha256::new();
+            hasher.update(b"marmot-periodic-self-update-v1");
+            hasher.update((group.as_slice().len() as u64).to_be_bytes());
+            hasher.update(group.as_slice());
+            hasher.update(candidate.to_be_bytes());
+            periodic.id = MessageId::new(hasher.finalize().to_vec());
+            periodic.trigger = cgka_traits::MaintenanceTrigger::Periodic;
+            runtime
+                .session()
+                .put_maintenance_obligation(&periodic)
+                .unwrap();
+
+            let live = storage.get_group(&group).unwrap();
+            let mut removed = live.clone();
+            removed.removed = true;
+            storage.put_group(&removed).unwrap();
+            runtime
+                .publish_session_effects(cgka_session::SessionEffects {
+                    events: vec![GroupEvent::LocalGroupCopyTerminated {
+                        group_id: group.clone(),
+                        voluntary: false,
+                    }],
+                    publish: vec![],
+                    queued: vec![],
+                    pending_convergence: vec![],
+                })
+                .await
+                .unwrap();
+            let failed = runtime
+                .session()
+                .maintenance_obligations_for_group(&group)
+                .unwrap();
+            assert_eq!(failed.len(), 2);
+            assert!(
+                failed
+                    .iter()
+                    .all(|item| item.phase == cgka_traits::MaintenancePhase::Failed)
+            );
+            assert_eq!(
+                runtime
+                    .session()
+                    .group_maintenance(&group)
+                    .unwrap()
+                    .unwrap()
+                    .next_periodic_rotation_at,
+                None
+            );
+
+            // Existing retained-history fixture: the durable marker has already
+            // restored membership before the runtime observes the announcement.
+            storage.put_group(&live).unwrap();
+            runtime = runtime.with_maintenance_sources(
+                wall.clone(),
+                Arc::new(TestMonotonicClock::default()),
+                Arc::new(TestRandom::new(period_offset)),
+            );
+            if announce {
+                let connection = rusqlite::Connection::open(&database).unwrap();
+                connection.pragma_update(None, "key", key_text).unwrap();
+                connection
+                    .execute_batch(
+                        "CREATE TRIGGER fail_restoration_deadline
+                     BEFORE INSERT ON cgka_group_maintenance
+                     BEGIN SELECT RAISE(FAIL, 'injected restoration deadline fault'); END;",
+                    )
+                    .unwrap();
+
+                // Carry a real accepted rename through the same batch so this
+                // proves consumer-visible committed effects, not just an echo.
+                let mut effects = runtime
+                    .session_mut()
+                    .send(SendIntent::UpdateGroupData {
+                        group_id: group.clone(),
+                        name: Some("restored committed name".into()),
+                        description: None,
+                    })
+                    .await
+                    .unwrap();
+                effects.events.push(GroupEvent::LocalGroupCopyRestored {
+                    group_id: group.clone(),
+                });
+                let published = runtime.publish_session_effects(effects).await.unwrap();
+                assert!(
+                    published
+                        .pending
+                        .iter()
+                        .any(|item| matches!(item, PendingResolution::Confirmed { .. }))
+                );
+                assert!(published.events.iter().any(|event| matches!(event,
+                    GroupEvent::LocalGroupCopyRestored { group_id } if group_id == &group)));
+                assert_eq!(
+                    runtime.group_record(&group).unwrap().name,
+                    "restored committed name"
+                );
+                assert_eq!(runtime.session().epoch(&group).unwrap().0, epoch.0 + 1);
+                assert!(!runtime.group_record(&group).unwrap().removed);
+                assert!(
+                    runtime
+                        .session()
+                        .canonical_group_membership(&group)
+                        .unwrap()
+                        .local_leaf_active
+                );
+                assert_eq!(
+                    runtime
+                        .session()
+                        .group_maintenance(&group)
+                        .unwrap()
+                        .unwrap()
+                        .next_periodic_rotation_at,
+                    None
+                );
+
+                // While the fault remains, the owned secondary action does not
+                // undo membership or allow new maintenance work for this group.
+                runtime.run_due_maintenance().await.unwrap();
+                assert_eq!(
+                    runtime
+                        .session()
+                        .maintenance_obligations_for_group(&group)
+                        .unwrap(),
+                    failed
+                );
+                connection
+                    .execute_batch("DROP TRIGGER fail_restoration_deadline;")
+                    .unwrap();
+            }
+
+            // Repeat the old periodic deadline exactly; collision avoidance,
+            // rather than a different random sample, must give it a fresh ID.
+            runtime = runtime.with_maintenance_sources(
+                wall.clone(),
+                Arc::new(TestMonotonicClock::default()),
+                Arc::new(TestRandom::new(period_offset)),
+            );
+            if reopen {
+                drop(runtime);
+                runtime = AccountDeviceRuntime::new(
+                    current_session(&database, &key, b"alice"),
+                    RecordingAdapter::default(),
+                    StaticTransportRouting::new(vec![]).with_group_route(
+                        group.clone(),
+                        group.as_slice().to_vec(),
+                        vec![TransportEndpoint("wss://group-a.example".into())],
+                    ),
+                    RecordingKeyPackages::default(),
+                )
+                .with_maintenance_sources(
+                    wall.clone(),
+                    Arc::new(TestMonotonicClock::default()),
+                    Arc::new(TestRandom::new(period_offset)),
+                );
+            }
+            runtime.run_due_maintenance().await.unwrap();
+            let restored = runtime
+                .session()
+                .group_maintenance(&group)
+                .unwrap()
+                .unwrap();
+            assert!(restored.periodic_enrolled);
+            assert_eq!(restored.last_own_leaf_rotation_at, last_rotation);
+            let deadline = restored
+                .next_periodic_rotation_at
+                .expect("restored enrollment must have a deadline")
+                .0;
+            assert!((100_000 + MIN_PERIOD_SECS..=100_000 + MAX_PERIOD_SECS).contains(&deadline));
+            assert_eq!(
+                runtime
+                    .session()
+                    .maintenance_obligations_for_group(&group)
+                    .unwrap(),
+                failed
+            );
+
+            wall.set(deadline);
+            runtime.run_due_maintenance().await.unwrap();
+            let obligations = runtime
+                .session()
+                .maintenance_obligations_for_group(&group)
+                .unwrap();
+            assert!(obligations.iter().any(|item| item.trigger
+                == cgka_traits::MaintenanceTrigger::Periodic
+                && item.phase != cgka_traits::MaintenancePhase::Failed
+                && item.id != periodic.id));
+            for original in failed {
+                assert_eq!(
+                    runtime
+                        .session()
+                        .maintenance_obligation(&original.id)
+                        .unwrap(),
+                    Some(original)
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn epoch_keeps_periodic_baseline() {
+    let (_dir, mut runtime, group, _) =
+        manual_only_group_runtime(MaintenanceTiming::default()).await;
+    let deadline = 10u64 + 24 * 24 * 60 * 60;
+    let wall = Arc::new(TestWallClock::new(deadline + 100));
+    runtime = runtime.with_maintenance_sources(
+        wall,
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+    let mut state = runtime
+        .session()
+        .group_maintenance(&group)
+        .unwrap()
+        .unwrap();
+    state.periodic_enrolled = true;
+    state.last_own_leaf_rotation_at = Some(Timestamp(10));
+    state.next_periodic_rotation_at = None;
+    runtime.session().put_group_maintenance(&state).unwrap();
+
+    let effects = runtime
+        .send(SendIntent::UpdateGroupData {
+            group_id: group.clone(),
+            name: Some("ordinary committed rename".into()),
+            description: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        effects
+            .pending
+            .iter()
+            .any(|resolution| matches!(resolution, PendingResolution::Confirmed { .. }))
+    );
+    assert_eq!(
+        runtime.group_record(&group).unwrap().name,
+        "ordinary committed rename"
+    );
+    assert_eq!(
+        runtime
+            .session()
+            .group_maintenance(&group)
+            .unwrap()
+            .unwrap()
+            .next_periodic_rotation_at,
+        Some(Timestamp(deadline))
+    );
+
+    runtime.run_due_maintenance().await.unwrap();
+    assert!(
+        runtime
+            .session()
+            .maintenance_obligations_for_group(&group)
+            .unwrap()
+            .iter()
+            .any(
+                |obligation| obligation.trigger == cgka_traits::MaintenanceTrigger::Periodic
+                    && obligation.phase == cgka_traits::MaintenancePhase::Quiet
+            )
+    );
+}
+
+#[tokio::test]
+async fn periodic_fault_keeps_effects() {
+    for reopen in [false, true] {
+        let (dir, mut runtime, group, epoch) =
+            manual_only_group_runtime(MaintenanceTiming::immediate()).await;
+        let database = dir.path().join("alice.sqlite");
+        let key_text = "marmot maintenance timing group key";
+        let key = SqlCipherKey::new(key_text).unwrap();
+        let wall = Arc::new(TestWallClock::new(100_000));
+        runtime = runtime.with_maintenance_sources(
+            wall.clone(),
+            Arc::new(TestMonotonicClock::default()),
+            Arc::new(TestRandom::new(0)),
+        );
+        let mut state = runtime
+            .session()
+            .group_maintenance(&group)
+            .unwrap()
+            .unwrap();
+        state.periodic_enrolled = true;
+        state.last_own_leaf_rotation_at = Some(Timestamp(10));
+        state.next_periodic_rotation_at = Some(Timestamp(100_000));
+        runtime.session().put_group_maintenance(&state).unwrap();
+        runtime.run_due_maintenance().await.unwrap();
+        let before = runtime
+            .session()
+            .maintenance_obligations_for_group(&group)
+            .unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].phase, cgka_traits::MaintenancePhase::Jitter);
+        let id = before[0].id.clone();
+        let confirmed_at = before[0].not_before.unwrap();
+        wall.set(confirmed_at.0);
+
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection.pragma_update(None, "key", key_text).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_completed_rotation
+             BEFORE INSERT ON cgka_group_maintenance
+             BEGIN SELECT RAISE(FAIL, 'injected completion state fault'); END;",
+            )
+            .unwrap();
+        let effects = runtime.run_due_maintenance().await.unwrap();
+        assert!(
+            effects
+                .pending
+                .iter()
+                .any(|resolution| matches!(resolution, PendingResolution::Confirmed { .. }))
+        );
+        assert_eq!(runtime.session().epoch(&group).unwrap().0, epoch.0 + 1);
+        assert_ne!(
+            runtime
+                .session()
+                .maintenance_obligation(&id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            cgka_traits::MaintenancePhase::Complete
+        );
+        connection
+            .execute_batch("DROP TRIGGER fail_completed_rotation;")
+            .unwrap();
+
+        if reopen {
+            drop(runtime);
+            runtime = AccountDeviceRuntime::new(
+                current_session(&database, &key, b"alice"),
+                RecordingAdapter::default(),
+                StaticTransportRouting::new(vec![]).with_group_route(
+                    group.clone(),
+                    group.as_slice().to_vec(),
+                    vec![TransportEndpoint("wss://group-a.example".into())],
+                ),
+                RecordingKeyPackages::default(),
+            )
+            .with_maintenance_sources(
+                wall.clone(),
+                Arc::new(TestMonotonicClock::default()),
+                Arc::new(TestRandom::new(0)),
+            )
+            .with_maintenance_timing(MaintenanceTiming::immediate());
+        }
+        runtime.run_due_maintenance().await.unwrap();
+        let complete = runtime
+            .session()
+            .maintenance_obligation(&id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(complete.phase, cgka_traits::MaintenancePhase::Complete);
+        let repaired = runtime
+            .session()
+            .group_maintenance(&group)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired.last_own_leaf_rotation_at, Some(confirmed_at));
+        let deadline = repaired.next_periodic_rotation_at.unwrap();
+        assert!(deadline.0 >= confirmed_at.0 + 24 * 24 * 60 * 60);
+        assert!(deadline.0 <= confirmed_at.0 + 36 * 24 * 60 * 60);
+        runtime.run_due_maintenance().await.unwrap();
+        assert_eq!(runtime.session().epoch(&group).unwrap().0, epoch.0 + 1);
+        assert_eq!(
+            runtime
+                .session()
+                .maintenance_obligations_for_group(&group)
+                .unwrap(),
+            vec![complete]
+        );
+    }
 }

@@ -3695,3 +3695,183 @@ async fn current_invite_to_unknown_group_fails_on_missing_record() {
         "expected missing-record error, got {error:?}"
     );
 }
+
+/// A recipient replays both authenticated commits in one pass, including the
+/// earlier activity after the closing disband deletes live MLS state.
+#[tokio::test]
+async fn one_convergence_pass_preserves_rename_before_disband() {
+    use cgka_traits::engine::{GroupEvent, GroupStateChange};
+    use cgka_traits::types::EpochId;
+    use sha2::{Digest, Sha256};
+
+    let clock = ManualConvergenceClock::new(0, 10_000);
+    let build = |seed: &[u8]| {
+        EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+            .identity(pad32(seed))
+            .account_identity_proof_signer(proof_signer(seed))
+            .protocol_profile(ProtocolProfile::Current)
+            .peeler(Box::new(MockPeeler::default()))
+    };
+    let mut alice = build(b"alice-one-pass-disband")
+        .convergence_clock(Arc::new(clock.clone()))
+        .build()
+        .unwrap();
+    let mut bob = build(b"bob-one-pass-disband").build().unwrap();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "before rename".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome = match created {
+        SendResult::FoundingGroupCreated { mut welcomes } => welcomes.remove(0),
+        other => panic!("expected founding Welcome, got {other:?}"),
+    };
+    assert_eq!(bob.join_welcome(welcome).await.unwrap(), group_id);
+    alice.drain_events();
+    bob.drain_events();
+    let (mut rename, pending) = match alice
+        .send(SendIntent::UpdateGroupData {
+            group_id: group_id.clone(),
+            name: Some("after rename".into()),
+            description: None,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => (msg, pending),
+        other => panic!("expected rename, got {other:?}"),
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let author_events = alice.drain_events();
+    let author_rename = author_events
+        .iter()
+        .find_map(|event| match event {
+            GroupEvent::GroupStateChanged {
+                group_id,
+                epoch,
+                actor,
+                change,
+                ..
+            } if matches!(change, GroupStateChange::GroupRenamed { .. }) => Some(
+                cgka_traits::app_event::group_system_event_material(
+                    group_id,
+                    epoch.0,
+                    actor.as_ref(),
+                    change,
+                )
+                .unwrap()
+                .message_id_hex,
+            ),
+            _ => None,
+        })
+        .unwrap();
+    alice
+        .send(SendIntent::Disband {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    let mut prepared = None;
+    for _ in 0..8 {
+        let sends = alice.advance_convergence(&group_id).await.unwrap();
+        match sends.as_slice() {
+            [] => clock.advance_ms(1_000),
+            [
+                SendResult::GroupEvolution {
+                    msg,
+                    pending,
+                    welcomes,
+                },
+            ] => {
+                assert!(welcomes.is_empty());
+                prepared = Some((msg.clone(), *pending));
+                break;
+            }
+            other => panic!("unexpected sends: {other:?}"),
+        }
+    }
+    let (mut disband, pending) = prepared.expect("scheduler prepared disband");
+    alice.confirm_published(pending).await.unwrap();
+    for msg in [&mut rename, &mut disband] {
+        msg.envelope = TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        };
+    }
+    let rename_id = MessageId::new(Sha256::digest(&rename.payload).to_vec());
+    let disband_id = MessageId::new(Sha256::digest(&disband.payload).to_vec());
+    bob.buffer_openmls_convergence_message_at(&group_id, disband, 1_000)
+        .unwrap();
+    bob.buffer_openmls_convergence_message_at(&group_id, rename, 1_000)
+        .unwrap();
+    assert_eq!(bob.epoch(&group_id).unwrap(), EpochId(1));
+    assert!(bob.drain_events().is_empty());
+    let result = bob
+        .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+        .unwrap();
+    assert_eq!(
+        result.accepted_commits,
+        vec![
+            hex::encode(rename_id.as_slice()),
+            hex::encode(disband_id.as_slice())
+        ]
+    );
+    let events = bob.drain_events();
+    let changes = events
+        .iter()
+        .filter_map(|event| match event {
+            GroupEvent::GroupStateChanged {
+                group_id,
+                epoch,
+                actor,
+                change,
+                origin_commit_id,
+            } => Some((group_id, epoch, actor, change, origin_commit_id)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(changes.len(), 2, "unexpected activity: {events:?}");
+    for (index, (group, epoch, actor, change, origin)) in changes.iter().enumerate() {
+        assert_eq!(*group, &group_id);
+        assert_eq!(**epoch, EpochId(2 + index as u64));
+        assert_eq!(actor.as_ref(), Some(&alice.self_id()));
+        assert_eq!(
+            origin.as_ref(),
+            Some(if index == 0 { &rename_id } else { &disband_id })
+        );
+        if index == 0 {
+            assert!(matches!(change, GroupStateChange::GroupRenamed { .. }));
+            assert_eq!(
+                cgka_traits::app_event::group_system_event_material(
+                    group,
+                    epoch.0,
+                    actor.as_ref(),
+                    change
+                )
+                .unwrap()
+                .message_id_hex,
+                author_rename
+            );
+        } else {
+            assert_eq!(**change, GroupStateChange::GroupDisbanded);
+        }
+    }
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        GroupEvent::LocalGroupCopyTerminated { .. }
+            | GroupEvent::LocalGroupCopyRestored { .. }
+            | GroupEvent::GroupMemberLeavesRemoved { .. }
+    )));
+    let terminal = bob.group_record(&group_id).unwrap();
+    assert_eq!(terminal.name, "after rename");
+    assert!(terminal.disbanded.is_some());
+    assert!(!terminal.removed);
+    assert_eq!(terminal.members.len(), 2);
+    assert!(bob.advance_convergence(&group_id).await.unwrap().is_empty());
+    assert!(bob.drain_events().is_empty());
+}

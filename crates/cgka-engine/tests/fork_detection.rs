@@ -4047,12 +4047,20 @@ async fn convergence_pass_that_replaces_the_own_commit_withdraws_it_exactly_once
     // confirmed commit. Spec (convergence.md "Applying the selected branch"):
     // superseding a previously applied commit — including the device's own —
     // MUST withdraw the state notifications attributed to it, exactly once.
-    let (f, local) = router_flip_fixture_arranged("u4-replace", true).await;
+    let (f, local, mut creator) =
+        router_flip_fixture_arranged_with_creator("u4-replace", true).await;
     assert!(
         f.sibling_wins,
         "fixture must make the inbound sibling commit the ordering winner"
     );
     let competing_id = MessageId::new(Sha256::digest(&f.competing.payload).to_vec());
+    let departed_leaf = local
+        .canonical_group_membership(&f.group_id)
+        .unwrap()
+        .member_leaves
+        .into_iter()
+        .find(|leaf| leaf.member == f.own_invitee)
+        .expect("the abandoned invitee has an authenticated leaf");
     drop(local);
     let mut local = reopen_legacy_client(&f.local_seed, f.local_storage.clone());
 
@@ -4070,11 +4078,10 @@ async fn convergence_pass_that_replaces_the_own_commit_withdraws_it_exactly_once
     assert_eq!(settled_branch(&local, &f), Branch::Sibling);
     assert_eq!(local.epoch(&f.group_id).unwrap(), EpochId(2));
 
-    // The exact application-visible output of the settling pass: the reorg's
-    // membership diff (the sibling's invitee replaces the own invitee — both
-    // unattributed, stamped with the winning commit as origin), then the own
-    // commit's withdrawal pair. Same-numbered epochs on both branches, so no
-    // EpochChanged.
+    // Replay announces the winning commit's authenticated invitation and
+    // withdraws the losing invitation by its own origin. The winning commit
+    // never removed the losing branch's invitee, so it must not invent a
+    // MemberRemoved activity. Same-numbered epochs mean no EpochChanged.
     let events = local.drain_events();
     let state_changes: Vec<_> = events
         .iter()
@@ -4084,20 +4091,21 @@ async fn convergence_pass_that_replaces_the_own_commit_withdraws_it_exactly_once
                 epoch,
                 actor,
                 change,
-                ..
-            } if group_id == &f.group_id => Some((epoch, actor, change)),
+                origin_commit_id,
+            } if group_id == &f.group_id => Some((epoch, actor, change, origin_commit_id)),
             _ => None,
         })
         .collect();
     assert_eq!(
         state_changes.len(),
-        2,
-        "the reorg must announce exactly the two membership deltas: {events:?}"
+        1,
+        "the selected commit made exactly one membership change: {events:?}"
     );
     assert!(
-        state_changes.iter().any(|(epoch, actor, change)| {
+        state_changes.iter().any(|(epoch, actor, change, origin)| {
             **epoch == EpochId(2)
-                && actor.is_none()
+                && actor.as_ref() == Some(&creator.self_id())
+                && origin.as_ref() == Some(&competing_id)
                 && matches!(
                     change,
                     cgka_traits::engine::GroupStateChange::MemberAdded { member }
@@ -4106,17 +4114,22 @@ async fn convergence_pass_that_replaces_the_own_commit_withdraws_it_exactly_once
         }),
         "the winning branch's invitee must be announced: {events:?}"
     );
-    assert!(
-        state_changes.iter().any(|(epoch, actor, change)| {
-            **epoch == EpochId(2)
-                && actor.is_none()
-                && matches!(
-                    change,
-                    cgka_traits::engine::GroupStateChange::MemberRemoved { member }
-                        if member == &f.own_invitee
-                )
-        }),
-        "the abandoned own branch's invitee must be withdrawn from membership: {events:?}"
+    let target = |events: &[GroupEvent]| {
+        events.iter().find_map(|event| match event {
+            GroupEvent::GroupStateChanged { epoch, actor, change, .. }
+                if matches!(change, cgka_traits::engine::GroupStateChange::MemberAdded { member } if member == &f.sibling_invitee) =>
+            {
+                Some(cgka_traits::app_event::group_system_event_material(
+                    &f.group_id, epoch.0, actor.as_ref(), change,
+                ).unwrap().message_id_hex)
+            }
+            _ => None,
+        }).expect("winning invitation activity exists")
+    };
+    assert_eq!(
+        target(&events),
+        target(&creator.drain_events()),
+        "the canonical invitation must share its author's reaction target"
     );
     let withdrawals: Vec<_> = events
         .iter()
@@ -4151,10 +4164,19 @@ async fn convergence_pass_that_replaces_the_own_commit_withdraws_it_exactly_once
         ),
         "the withdrawal must name the own commit at its source epoch: {events:?}"
     );
+    assert!(
+        events.iter().any(|event| matches!(event,
+            GroupEvent::GroupMemberLeavesRemoved { group_id, epoch, leaves, departed_members }
+                if group_id == &f.group_id && *epoch == EpochId(2)
+                    && leaves == &vec![departed_leaf.clone()]
+                    && departed_members == &vec![f.own_invitee.clone()]
+        )),
+        "the abandoned branch's invitee loses its leaf without a fake removal activity: {events:?}"
+    );
     assert_eq!(
         events.len(),
         4,
-        "the settling pass must emit exactly the membership diff plus the own-commit withdrawal pair: {events:?}"
+        "the settling pass must emit the authenticated invitation, native leaf cleanup and own-commit withdrawal pair: {events:?}"
     );
 
     // Dispositions: the winning sibling becomes canonical; the displaced own

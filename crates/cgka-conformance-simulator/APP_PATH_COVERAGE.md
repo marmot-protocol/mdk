@@ -20,11 +20,16 @@ pretty-printed file bytes.
 
 This is a public workload companion to the pinned 1,024-message engine input. It preserves all original sends and
 16 profile-update rounds, with a founding recipient offline throughout. The real local Nostr relay chooses query
-order; this does **not** reproduce the engine fixture's forced reverse delivery. Initial group creation uses public
+order; this does **not** reproduce the engine fixture's forced reverse delivery. The harness relay does not apply the
+mock's per-connection write limiter (`harness_relay_builder`); with retained publisher sockets, that limiter otherwise
+refuses each member's 61st event and stalls setup. Initial group creation uses public
 app acknowledgement semantics. Private MLS assertions and simulated relay steps are not presented as app coverage.
 
 The reproduction repeats explicit full-history repairs with two seconds between passes, allowing up to three recipient
-reopens after six unchanged transitions. A 900-second watchdog bounds the whole journey; there is no separate pass-count
+reopens after six unchanged transitions. A transition is a change in the recipient's epoch, visible messages, or
+distinct backlog events the relay delivered on its post-reconnect connections. Comparison fetches a bounded batch per
+pass in event-id order, so the commits a recipient needs can arrive after most messages; acquisition is bounded by the
+backlog, so a recipient that holds every event must still decrypt it. A 900-second watchdog bounds the whole journey; there is no separate pass-count
 cutoff because production time-bounded slices guarantee no minimum message throughput per call. Success additionally checks
 every participant's exact payload multiset, then fresh bidirectional messaging and recipient restart persistence.
 These latter checks strengthen the earlier private diagnostic driver and run only after full recovery.

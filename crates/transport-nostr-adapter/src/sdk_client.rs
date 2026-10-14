@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,13 +30,14 @@ use transport_nostr_peeler::{
     KIND_MARMOT_GROUP_MESSAGE, MarmotNostrSigner, NostrTransportEvent, SdkSigner,
 };
 
+use crate::network_proxy as process_proxy;
 use crate::{
     NostrAcquisitionCancellation, NostrAcquisitionEnd, NostrAcquisitionEndpoint,
     NostrAcquisitionError, NostrAcquisitionLimits, NostrAcquisitionRequest, NostrAcquisitionResult,
     NostrAcquisitionScope, NostrAcquisitionStats, NostrEventPublishRequest, NostrNotificationLoss,
     NostrNotificationLossFloor, NostrNotificationLossScope, NostrPublishBatch, NostrPublishOutcome,
     NostrRelayClient, NostrRelayEvent, NostrSubscription, NostrTransportAdapter, RelayReissue,
-    SubscriptionReissue,
+    SubscriptionRefusal, SubscriptionRefusalDisposition, SubscriptionReissue,
 };
 
 const SDK_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
@@ -80,12 +81,16 @@ const SDK_RECONCILIATION_WAIT: Duration = Duration::from_secs(2);
 const SDK_RECONCILIATION_NEGOTIATION_WAIT: Duration = Duration::from_millis(500);
 /// Fetch a bounded rotating portion of the remote-only set. Durable admission
 /// removes accepted ids; rotation reaches dependencies beyond refused ids.
-const SDK_RECONCILIATION_REPLAY_BATCH: usize = 128;
+const SDK_RECONCILIATION_REPLAY_BATCH: usize = 512;
 /// An exact-ID request may return a large event or duplicate copies. Spend a
 /// finite aggregate budget across all request-local acquisitions in one pass.
 const SDK_RECONCILIATION_MAX_ID_REQUESTS: usize = 16;
-const SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT: usize = 16;
-const SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT: usize = 128 * 1024;
+/// IDs one exact-ID request names after a pass's first request. Each request
+/// is a round trip inside the route deadline, so batching is what lets a pass
+/// carry more than a handful of ordinary events (mdk#2086).
+const SDK_RECONCILIATION_MAX_IDS_PER_REQUEST: usize = 64;
+const SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT: usize = 256;
+const SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT: usize = 1024 * 1024;
 // A single supported event can exceed the ordinary pass allowance. The pinned
 // SDK's default normalized-message ceiling is 5 MiB; one otherwise-empty pass
 // may return one such object, then stops. This is an MDK acquisition ceiling,
@@ -96,6 +101,190 @@ const SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES: usize = 5 * 1024 * 1024;
 /// inventory. A relay set that fills it may be truncated; a set within the
 /// ceiling, including one sitting exactly on it, is the whole window.
 const SDK_RECONCILIATION_SET_LIMIT: usize = 16_384 + 1;
+/// Rounds a group route's pass may spend finding the oldest window of a gap
+/// larger than one pass, within half of what is left of its deadline. Each
+/// round runs `SDK_RECONCILIATION_WINDOW_PROBES` dry-run comparisons over
+/// candidate window bounds at once. The previous pass's window, or a search it
+/// left unfinished, seeds the first round, so a backlog being worked through
+/// usually needs one.
+const SDK_RECONCILIATION_WINDOW_ROUNDS: usize = 6;
+const SDK_RECONCILIATION_WINDOW_PROBES: usize = 8;
+/// Routes whose advisory acquisition memory one client keeps.
+const SDK_RECONCILIATION_MEMORY_ROUTES: usize = 1024;
+/// IDs one route keeps set aside per relay it compares with, fetched, refused
+/// or withheld without admission: as many as one relay's comparison can name,
+/// so the list fills only past what every relay's inventory could hold.
+const SDK_RECONCILIATION_SET_ASIDE_IDS: usize = SDK_RECONCILIATION_SET_LIMIT;
+/// Set-aside IDs across all routes, and the most one route keeps; past it the
+/// least recently used route's memory is dropped, and that route sets its IDs
+/// aside again.
+const SDK_RECONCILIATION_SET_ASIDE_TOTAL: usize = 65_536;
+
+/// Memory-only hints for fetching one group route's gap oldest-first. Losing
+/// them costs at most extra narrowing or one more fetch of an event the
+/// account never admits; what is fetched and certified never depends on them.
+#[derive(Default)]
+struct AcquisitionRouteMemory {
+    /// The last bound a window search found to fit one pass. Admission and
+    /// setting aside only shrink a window, so it still fits on later passes.
+    window_until: Option<u64>,
+    /// How far past `window_until` the next window should reach: from the
+    /// density of the events the last window returned, or the distance to
+    /// the nearest bound found too large.
+    window_step: Option<u64>,
+    /// The upper bound of a search that did not finish: the next pass probes
+    /// between `window_until` and it first.
+    search_high: Option<u64>,
+    /// Passes in a row whose search did not finish.
+    unfinished_passes: u8,
+    /// When this route's memory was last used, for eviction.
+    last_used: u64,
+    /// The average event size this route returned last, so a window fits the
+    /// byte allowance as well as the item count.
+    event_bytes: Option<usize>,
+    /// IDs a pass fetched, or asked for and was answered without, that the
+    /// account has not admitted since, in the order they were set aside. They
+    /// yield to history not tried yet, so events that can never be admitted
+    /// cannot hold the oldest window.
+    set_aside: VecDeque<EventId>,
+}
+
+#[derive(Default)]
+struct AcquisitionMemory {
+    routes: HashMap<AcquisitionRouteKey, AcquisitionRouteMemory>,
+    tick: u64,
+}
+
+/// What a pass reads from its route's memory.
+#[derive(Default)]
+struct AcquisitionHints {
+    seed: Option<WindowSeed>,
+    event_bytes: Option<usize>,
+    unfinished_passes: u8,
+    set_aside: Vec<EventId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct AcquisitionRouteKey {
+    account_id: MemberId,
+    transport_group_id: Vec<u8>,
+}
+
+/// What a window search found.
+enum WindowSearch {
+    /// A non-empty window of at most one pass: `[since, until]` holds `ids`.
+    Fits {
+        until: u64,
+        ids: HashSet<EventId>,
+        over_until: Option<u64>,
+    },
+    /// No such window in the rounds and time allowed. The window up to `low`
+    /// fits; the one up to `high` holds more than a pass, all of `over_ids`
+    /// when every relay asked answered that probe.
+    Unfinished {
+        low: u64,
+        high: u64,
+        over_ids: Option<HashSet<EventId>>,
+    },
+}
+
+/// Where an earlier pass left the window search: a bound whose window still
+/// fits one pass, how far past it to probe first, and the upper bound of a
+/// search it did not finish.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowSeed {
+    low: u64,
+    step: Option<u64>,
+    high: Option<u64>,
+}
+
+/// How a pass leaves a route's window search.
+enum AcquisitionUpdate {
+    Fits {
+        until: u64,
+        step: Option<u64>,
+    },
+    /// `skipped`: the pass fetched nothing to let the next one resume.
+    Unfinished {
+        low: u64,
+        high: u64,
+        skipped: bool,
+    },
+    None,
+}
+
+/// IDs one pass can fetch when events average `event_bytes`.
+/// The most IDs a route compared with `relays` relays keeps set aside: the
+/// union of their inventories can name as many as each names alone, summed.
+fn set_aside_cap(relays: usize) -> usize {
+    SDK_RECONCILIATION_SET_ASIDE_IDS
+        .saturating_mul(relays.max(1))
+        .min(SDK_RECONCILIATION_SET_ASIDE_TOTAL)
+}
+
+/// Drop the least recently used route's memory.
+fn evict_least_recent(routes: &mut HashMap<AcquisitionRouteKey, AcquisitionRouteMemory>) {
+    if let Some(evicted) = routes
+        .iter()
+        .min_by_key(|(_, route)| route.last_used)
+        .map(|(key, _)| key.clone())
+    {
+        routes.remove(&evicted);
+    }
+}
+
+fn window_target(event_bytes: Option<usize>) -> usize {
+    event_bytes.map_or(SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT, |bytes| {
+        (SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT * 4 / 5 / bytes.max(1))
+            .clamp(1, SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT)
+    })
+}
+
+/// Candidate upper bounds for one round of the window search, within
+/// `(low, high)` where the window up to `low` holds `low_count` IDs and up to
+/// `high` holds `high_count`.
+///
+/// A first round seeded with a step probes around `low + step`. An unseeded
+/// first round starts at the recent end, where a catch-up gap sits, at
+/// distances shrinking by powers of two, so one round brackets the gap's
+/// oldest edge across many scales. Later rounds spread evenly within the
+/// bracket, plus one probe where `target` would fall if the IDs between the
+/// bounds were spread evenly in time.
+fn window_probes(
+    (low, low_count): (u64, usize),
+    (high, high_count): (u64, usize),
+    target: usize,
+    first_round_step: Option<Option<u64>>,
+) -> Vec<u64> {
+    // `Some(Some(step))`: seeded first round; `Some(None)`: unseeded first
+    // round; `None`: a later round, or a first round resuming a bracket.
+    let width = high.saturating_sub(low);
+    let probes_wanted = SDK_RECONCILIATION_WINDOW_PROBES as u64;
+    let mut probes = match first_round_step {
+        Some(Some(step)) => [0.25, 0.5, 0.75, 0.9, 1.0, 1.15, 2.0, 4.0]
+            .into_iter()
+            .map(|share| low.saturating_add(((step as f64 * share) as u64).max(1)))
+            .collect::<Vec<_>>(),
+        Some(None) => (1..=probes_wanted)
+            .map(|power| high - width / (1u64 << (power * 3 / 2).min(62)).max(1))
+            .collect(),
+        // A bracket narrower than a round probes every second in it.
+        None if width <= probes_wanted => (low + 1..high).collect(),
+        None => {
+            let wanted = target.saturating_sub(low_count) as f64;
+            let between = high_count.saturating_sub(low_count).max(1) as f64;
+            let fraction = (wanted / between).clamp(0.0, 1.0);
+            (1..probes_wanted)
+                .map(|index| low + width / probes_wanted * index)
+                .chain(std::iter::once(low + (width as f64 * fraction) as u64))
+                .collect()
+        }
+    };
+    probes.retain(|probe| *probe > low && *probe < high);
+    probes.sort_unstable();
+    probes.dedup();
+    probes
+}
 
 /// Account-owned advisory replay progress, independent of admitted event inventory.
 /// The host must preserve this across routine subscription rebuilds and serialize
@@ -104,6 +293,54 @@ const SDK_RECONCILIATION_SET_LIMIT: usize = 16_384 + 1;
 pub trait NostrReconciliationProgress: Send + Sync {
     fn load_cursor(&self) -> Result<Option<[u8; 32]>, TransportAdapterError>;
     fn save_cursor(&self, cursor: Option<[u8; 32]>) -> Result<(), TransportAdapterError>;
+}
+
+/// Serialized JSON length of a returned event, as the SDK budgets count it.
+fn event_json_bytes(event: &NostrTransportEvent) -> usize {
+    serde_json::to_string(event).map_or(0, |json| json.len())
+}
+
+/// One oldest-first pass's selection: the window's IDs, then IDs set aside by
+/// earlier passes with whatever room is left. The window keeps the durable
+/// cursor's rotation, which matters only when it holds more than one pass.
+/// The rotation's first ID leads, whichever relays claim it: a budget cut
+/// leaves the cursor just before the ID it deferred, which must be the next
+/// pass's first request. The rest of each part is grouped, stably, by the
+/// relays that claimed its IDs, so exact-ID requests batch fully; the pass
+/// returns its events in time order whatever order it fetched them in.
+fn oldest_first_remote_ids(
+    window: &HashSet<EventId>,
+    set_aside: &[EventId],
+    claimants: impl Fn(&EventId) -> Vec<usize>,
+    progress: &dyn NostrReconciliationProgress,
+) -> Result<Vec<EventId>, TransportAdapterError> {
+    let after = progress.load_cursor()?.map(EventId::from_byte_array);
+    let mut fresh = bounded_reconciliation_remote_ids(window, after);
+    if let Some((_, rest)) = fresh.split_first_mut() {
+        rest.sort_by_cached_key(&claimants);
+    }
+    let mut retry = set_aside
+        .iter()
+        .filter(|id| !window.contains(id))
+        .copied()
+        .collect::<Vec<_>>();
+    retry.sort_by_cached_key(&claimants);
+    let mut ids = fresh.into_iter().chain(retry).collect::<Vec<_>>();
+    ids.truncate(SDK_RECONCILIATION_REPLAY_BATCH);
+    Ok(ids)
+}
+
+/// The cursor that makes `id` the first ID of the next pass's rotation: the
+/// ID just before it in `remote`'s ID order, wrapping. In ID-order selection
+/// that is the ID attempted before it; in oldest-first selection, which groups
+/// IDs by claimants, it may be one this pass never reached.
+fn cursor_before(remote: &HashSet<EventId>, id: &EventId) -> Option<[u8; 32]> {
+    remote
+        .iter()
+        .filter(|other| *other < id)
+        .max()
+        .or_else(|| remote.iter().filter(|other| *other != id).max())
+        .map(|before| before.to_bytes())
 }
 
 fn select_reconciliation_remote_ids(
@@ -156,6 +393,12 @@ pub struct NostrReconciliationSummary {
     pub incomplete_endpoints: Vec<TransportEndpoint>,
     pub remote_items: usize,
     pub received_items: usize,
+    /// This group pass returned nothing because no time order covered what it
+    /// was missing: no relay answered its window probes, its delivery boundary
+    /// was unknown or excluded everything it fetched, or more history was set
+    /// aside than its relays' comparisons name. A pass that waits one round
+    /// for an unfinished search does not count. Diagnostic only.
+    pub order_unproven: bool,
 }
 
 /// Planned SDK subscription derived from a transport-adapter subscription.
@@ -440,6 +683,12 @@ pub struct NostrSdkRelayClient {
     /// the adapter drives during activation and the clone the app holds observe
     /// the same log.
     registration_log: Arc<Mutex<HashMap<MemberId, HashMap<RelayUrl, bool>>>>,
+    /// Advisory per-route hints for oldest-first acquisition. A std lock,
+    /// never held across an await.
+    acquisition_memory: Arc<StdMutex<AcquisitionMemory>>,
+    /// Test-only: select every route in ID order, to exercise the cursor alone.
+    #[cfg(test)]
+    id_order_only: bool,
 }
 
 /// An aborted public forwarder must not detach a blocked delivery child. It
@@ -471,6 +720,7 @@ enum SdkPublication {
     /// the SDK pool's read lock across a relay acknowledgement.
     OwnedRelay {
         gossip: Option<Arc<dyn NostrGossip>>,
+        authenticator_available: bool,
     },
 }
 
@@ -670,6 +920,9 @@ impl NostrSdkRelayClient {
             #[cfg(test)]
             publish_relay_pin_failure_stage: Arc::new(AtomicU8::new(0)),
             registration_log: Arc::new(Mutex::new(HashMap::new())),
+            acquisition_memory: Arc::default(),
+            #[cfg(test)]
+            id_order_only: false,
         }
     }
 
@@ -677,7 +930,8 @@ impl NostrSdkRelayClient {
     /// a registered immutable client; the root's anonymous client never
     /// inherits credentials or handles account traffic.
     pub fn multi_account() -> Self {
-        let mut this = Self::new(Client::builder().build());
+        let mut this =
+            Self::new(process_proxy::nostr_builder(process_proxy::socks5_proxy()).build());
         this.require_account_context = true;
         this
     }
@@ -729,7 +983,11 @@ impl NostrSdkRelayClient {
                 "account signer changed without removing prior context".to_owned(),
             ));
         }
-        let builder = Client::builder().authenticator(
+        // Account receive/history pools are independent SDK clients, so they
+        // must carry the explicit process routing policy as well.
+        let proxy = process_proxy::socks5_proxy()
+            .map_err(|detail| TransportAdapterError::Subscription(detail.to_owned()))?;
+        let builder = process_proxy::nostr_builder(Ok(proxy)).authenticator(
             nostr_sdk::authenticator::SignerAuthenticator::new(SdkSigner(signer.clone())),
         );
         let mut context = Self::from_builder(builder);
@@ -797,8 +1055,12 @@ impl NostrSdkRelayClient {
     /// policy and gossip callback. Use [`Self::new`] for an already-built custom client.
     pub fn from_builder(builder: ClientBuilder) -> Self {
         let gossip = builder.gossip.clone();
+        let authenticator_available = builder.authenticator.is_some();
         let mut client = Self::new(builder.build());
-        client.publication = SdkPublication::OwnedRelay { gossip };
+        client.publication = SdkPublication::OwnedRelay {
+            gossip,
+            authenticator_available,
+        };
         client
     }
 
@@ -1028,23 +1290,207 @@ impl NostrSdkRelayClient {
         }
         // Compare without SDK-managed downloads. An exact-ID acquisition owns
         // each partial result and has finite per-endpoint item/byte budgets.
-        // One ID per REQ prevents a relay's fixed response order from repeating
-        // the same affordable prefix when a later event exceeds the budget.
-        // The durable cursor rotates refused and oversized IDs on later passes.
+        // A pass's first request names one ID, so a lone event up to the
+        // single-object ceiling stays reachable. Later requests batch
+        // consecutive IDs the same endpoints claimed. When a budget cuts a
+        // batch short, the first ID it left unreturned leads the next pass, so
+        // a relay's fixed response order cannot keep returning the same
+        // affordable prefix. The durable cursor rotates refused and oversized
+        // IDs on later passes.
         let remote_item_count = remote.len();
-        let remote_ids = select_reconciliation_remote_ids(&remote, progress)?;
-        drop(remote);
+        // A group route's gap larger than one pass is fetched from its oldest
+        // end. MLS applies commits in order, and IDs picked in ID order could
+        // let commits carry the epoch more than the retained-epoch window past
+        // older messages still missing, which can then never be read (#2086).
+        #[cfg(test)]
+        let id_order_only = self.id_order_only;
+        #[cfg(not(test))]
+        let id_order_only = false;
+        let route_key = match &subscription {
+            _ if id_order_only => None,
+            NostrSubscription::Group {
+                account_id,
+                transport_group_id,
+                ..
+            } => Some(AcquisitionRouteKey {
+                account_id: account_id.clone(),
+                transport_group_id: transport_group_id.clone(),
+            }),
+            _ => None,
+        };
+        let AcquisitionHints {
+            seed: window_seed,
+            event_bytes,
+            unfinished_passes,
+            set_aside,
+        } = route_key
+            .as_ref()
+            .map(|key| self.acquisition_memory_for(key, &remote))
+            .unwrap_or_default();
+        let skip = set_aside.iter().copied().collect::<HashSet<_>>();
+        let target = window_target(event_bytes);
+        let answering = remote_by_endpoint.keys().cloned().collect::<Vec<_>>();
+        let mut acquisition_update = AcquisitionUpdate::None;
+        let mut skip_pass = false;
+        // Why this pass returns nothing for want of a proven order, if it does.
+        let mut order_unproven: Option<&'static str> = None;
+        // The fresh IDs this pass fetches oldest-first, when it does.
+        let window: Option<HashSet<EventId>> = match &route_key {
+            // More never-admitted IDs than every relay's inventory could hold
+            // set aside: a window would keep finding the ones it could not
+            // record, and ID-order selection has no order to keep. The route
+            // stays quiet, and recovery parks it with its notice.
+            Some(_) if set_aside.len() >= set_aside_cap(answering.len()) => {
+                skip_pass = true;
+                order_unproven = Some("set_aside_full");
+                None
+            }
+            // A gap within one pass by count is still one window: its bytes
+            // may not fit, and then only a time prefix may be returned.
+            Some(_) if remote.len() - remote.intersection(&skip).count() <= target => {
+                Some(remote.difference(&skip).copied().collect())
+            }
+            Some(_) => {
+                // Narrowing may spend half of what is left; fetching keeps the rest.
+                let now = tokio::time::Instant::now();
+                let narrowing_deadline = now + deadline.saturating_duration_since(now) / 2;
+                match self
+                    .oldest_window(
+                        &plan.filter,
+                        &answering,
+                        &items,
+                        &options,
+                        (reconcile_since, reconcile_until),
+                        &remote,
+                        &set_aside,
+                        target,
+                        window_seed,
+                        narrowing_deadline,
+                    )
+                    .await
+                {
+                    // No relay answered a probe: the gap's order is unknown,
+                    // so this pass fetches nothing rather than an ID-order
+                    // slice. Its IDs stay fetchable for the next.
+                    None => {
+                        skip_pass = true;
+                        order_unproven = Some("search_unanswered");
+                        None
+                    }
+                    Some(WindowSearch::Fits {
+                        until,
+                        ids,
+                        over_until,
+                    }) => {
+                        acquisition_update = AcquisitionUpdate::Fits {
+                            until,
+                            step: over_until.map(|over| over.saturating_sub(until)),
+                        };
+                        Some(ids)
+                    }
+                    // Fetching a window that holds more than a pass would
+                    // return part of it in ID order, the race of #2086. Wait
+                    // one pass for the search to finish from where it
+                    // stopped, unless its bracket can no longer shrink, or the
+                    // previous pass already waited.
+                    Some(WindowSearch::Unfinished {
+                        low,
+                        high,
+                        over_ids,
+                    }) => {
+                        let fetch_anyway = high.saturating_sub(low) <= 1 || unfinished_passes >= 1;
+                        acquisition_update = AcquisitionUpdate::Unfinished {
+                            low,
+                            high,
+                            skipped: !fetch_anyway,
+                        };
+                        skip_pass = !fetch_anyway;
+                        // Still an ordered pass: the narrowest window a
+                        // complete probe measured, or else the whole gap, with
+                        // its delivery held to a time prefix like any other.
+                        fetch_anyway.then(|| {
+                            over_ids
+                                .filter(|ids| !ids.is_empty())
+                                .unwrap_or_else(|| remote.difference(&skip).copied().collect())
+                        })
+                    }
+                }
+            }
+            None => None,
+        };
+        let remote_ids = match &window {
+            _ if skip_pass => Vec::new(),
+            Some(window) => oldest_first_remote_ids(
+                window,
+                &set_aside,
+                |id| {
+                    endpoints
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, endpoint)| {
+                            remote_by_endpoint
+                                .get(*endpoint)
+                                .is_some_and(|ids: &HashSet<EventId>| ids.contains(id))
+                        })
+                        .map(|(index, _)| index)
+                        .collect()
+                },
+                progress,
+            )?,
+            None => select_reconciliation_remote_ids(&remote, progress)?,
+        };
+        // An oldest-first pass keeps a little time to work out which part of
+        // a window cut short it may return.
+        let fetch_deadline = match &window {
+            Some(_) => {
+                let reserve = deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .div_f32(5.0)
+                    .min(Duration::from_millis(400));
+                deadline.checked_sub(reserve).unwrap_or(deadline)
+            }
+            None => deadline,
+        };
+        // Requested IDs every claimant answered without.
+        let mut withheld = HashSet::new();
+        // IDs whose events can never fit the single-object ceiling.
+        let mut over_ceiling = HashSet::new();
         let mut sdk_events = Vec::new();
         let mut spent_items = 0usize;
         let mut spent_bytes = 0usize;
+        // The distinct events this pass returns. With several IDs per request,
+        // different relays can each return a different event within their own
+        // limits, so the union is bounded by the same pass allowance.
+        let mut returned_items = 0usize;
+        let mut returned_bytes = 0usize;
         let mut returned_ids = HashSet::new();
         let mut requests = 0usize;
+        // The largest event JSON this pass has returned. A relay streams every
+        // event a request names before our byte limit can stop it, so batches
+        // are sized to the room left at this size.
+        let mut largest_event_bytes = 0usize;
+        // Until the pass has seen an event, batches start at one ID and double
+        // after each request that returned none, so IDs relays never serve
+        // cannot spend every request one at a time.
+        let mut unsized_batch = 1usize;
         // A pass that stops early leaves the unreturned IDs' claimants
         // incomplete, or failed when it ran out of time; an endpoint that
         // claimed nothing left behind still succeeds.
         let mut out_of_time = false;
-        for event_id in remote_ids {
-            if tokio::time::Instant::now() >= deadline {
+        let claimants_of = |event_id: &EventId| {
+            endpoints
+                .iter()
+                .filter(|endpoint| {
+                    remote_by_endpoint
+                        .get(*endpoint)
+                        .is_some_and(|ids: &HashSet<EventId>| ids.contains(event_id))
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let mut remote_ids = remote_ids.into_iter().peekable();
+        while let Some(event_id) = remote_ids.next() {
+            if tokio::time::Instant::now() >= fetch_deadline {
                 out_of_time = true;
                 break;
             }
@@ -1073,16 +1519,21 @@ impl NostrSdkRelayClient {
                         // This object can never fit the pass allowance. Rotate
                         // past it so smaller missing IDs remain reachable;
                         // durable inventory still keeps it eligible on wrap.
+                        over_ceiling.insert(event_id);
                         progress.save_cursor(Some(event_id.to_bytes()))?;
                         continue;
                     }
                     // A fitting object deferred by earlier results must be
                     // the first candidate on the next pass.
+                    progress.save_cursor(cursor_before(&remote, &event_id))?;
                     break;
                 }
                 progress.save_cursor(Some(event_id.to_bytes()))?;
                 spent_items += 1;
                 spent_bytes += event_bytes;
+                returned_items += 1;
+                returned_bytes += event_bytes;
+                largest_event_bytes = largest_event_bytes.max(event_bytes);
                 returned_ids.insert(event_id.to_hex());
                 sdk_events.push((
                     replay_endpoint.clone(),
@@ -1105,14 +1556,17 @@ impl NostrSdkRelayClient {
                 SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT.saturating_sub(spent_items);
             // The first request must offer enough room to discover the size of
             // a single event before the SDK can accept or reject it. All later
-            // requests share the ordinary aggregate allowance.
-            let byte_allowance = if sdk_events.is_empty() && spent_bytes == 0 {
+            // requests share the ordinary aggregate allowance, even when the
+            // first returned nothing: a lone large event they cut short leads
+            // the next pass, as its first request.
+            let byte_allowance = if requests == 0 && sdk_events.is_empty() && spent_bytes == 0 {
                 SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES
             } else {
                 SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT
             };
             let remaining_bytes = byte_allowance.saturating_sub(spent_bytes);
-            let remaining_time = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining_time =
+                fetch_deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining_items == 0 || remaining_bytes == 0 || remaining_time.is_zero() {
                 out_of_time |= remaining_time.is_zero();
                 break;
@@ -1120,37 +1574,65 @@ impl NostrSdkRelayClient {
             // Do not advance past an ID merely because this pass ran out of
             // capacity. A dispatched request saves progress before its I/O;
             // only worker admission removes the ID from later comparisons.
-            let prior_cursor = progress.load_cursor()?;
             let single_object_request = byte_allowance == SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES;
             // Ask only the endpoints that claimed this ID. An endpoint that
             // lacks it has nothing to return, and a silent one must not spend
             // the budget of IDs it never claimed.
-            let claimants = endpoints
-                .iter()
-                .filter(|endpoint| {
-                    remote_by_endpoint
-                        .get(*endpoint)
-                        .is_some_and(|ids: &HashSet<EventId>| ids.contains(&event_id))
-                })
-                .cloned()
-                .collect::<Vec<_>>();
+            let claimants = claimants_of(&event_id);
             if claimants.is_empty() {
                 continue;
             }
+            let mut batch = vec![event_id];
+            if !single_object_request {
+                let sized = match largest_event_bytes {
+                    0 => unsized_batch,
+                    largest => (remaining_bytes / largest).max(1),
+                };
+                let room = SDK_RECONCILIATION_MAX_IDS_PER_REQUEST
+                    .min(remaining_items)
+                    .min(sized);
+                while batch.len() < room {
+                    let Some(next) = remote_ids.peek().copied() else {
+                        break;
+                    };
+                    // A cached event is returned from the SDK database on its
+                    // own turn, not requested again.
+                    let cached = self
+                        .client
+                        .database()
+                        .event_by_id(&next)
+                        .await
+                        .map_err(|_| {
+                            TransportAdapterError::Subscription(
+                                "read reconciled event from SDK database failed".to_owned(),
+                            )
+                        })?
+                        .is_some();
+                    if cached || claimants_of(&next) != claimants {
+                        break;
+                    }
+                    batch.push(next);
+                    remote_ids.next();
+                }
+            }
+            // Save only the first ID before I/O, as a one-ID request did; the
+            // response decides how far past it the cursor moves.
             progress.save_cursor(Some(event_id.to_bytes()))?;
             requests += 1;
             let result = self
                 .acquire_history(
                     NostrAcquisitionRequest {
                         account_id: subscription.account_id().clone(),
-                        scope: NostrAcquisitionScope::KnownEventIds(vec![event_id.to_bytes()]),
+                        scope: NostrAcquisitionScope::KnownEventIds(
+                            batch.iter().map(|id| id.to_bytes()).collect(),
+                        ),
                         endpoints: claimants
                             .iter()
                             .map(|endpoint| TransportEndpoint(endpoint.to_string()))
                             .collect(),
                         limits: NostrAcquisitionLimits {
                             max_endpoints: claimants.len(),
-                            max_requested_event_ids: 1,
+                            max_requested_event_ids: batch.len(),
                             max_received_items_per_endpoint: remaining_items,
                             max_serialized_event_bytes_per_endpoint: remaining_bytes,
                             max_duration: remaining_time,
@@ -1170,16 +1652,25 @@ impl NostrSdkRelayClient {
             // except for the one event observed at the rejection boundary.
             let mut request_items = 0usize;
             let mut request_bytes = 0usize;
-            let mut byte_limited = false;
-            let wanted_id = event_id.to_hex();
+            let mut limited = false;
+            let mut answered_by_any = false;
+            let mut every_claimant_satisfied = true;
+            let wanted_ids = batch.iter().map(|id| id.to_hex()).collect::<HashSet<_>>();
             for (endpoint, outcome) in claimants.iter().zip(result.endpoints) {
                 request_items = request_items.max(outcome.stats.received_items);
                 request_bytes = request_bytes.max(outcome.stats.serialized_event_bytes);
-                byte_limited |= outcome.end == NostrAcquisitionEnd::ByteLimitReached;
-                let claimed_id_missing = !outcome.events.iter().any(|event| event.id == wanted_id);
+                limited |= matches!(
+                    outcome.end,
+                    NostrAcquisitionEnd::ByteLimitReached | NostrAcquisitionEnd::ItemLimitReached
+                );
+                every_claimant_satisfied &=
+                    outcome.end == NostrAcquisitionEnd::RequestPolicySatisfied;
+                let claimed_id_missing = wanted_ids
+                    .iter()
+                    .any(|wanted| !outcome.events.iter().any(|event| &event.id == wanted));
                 // A relay that served the request to EOSE or to our limits
                 // answered. It stays incomplete unless it reached EOSE with
-                // the ID it claimed: a request our limits cut short proves
+                // every ID it claimed: a request our limits cut short proves
                 // nothing about what that relay still had to send.
                 let answered = matches!(
                     outcome.end,
@@ -1187,6 +1678,7 @@ impl NostrSdkRelayClient {
                         | NostrAcquisitionEnd::ItemLimitReached
                         | NostrAcquisitionEnd::ByteLimitReached
                 );
+                answered_by_any |= answered;
                 if !answered {
                     failed_endpoints.insert(endpoint.clone());
                 } else if claimed_id_missing
@@ -1195,40 +1687,141 @@ impl NostrSdkRelayClient {
                     incomplete_endpoints.insert(endpoint.clone());
                 }
                 for event in outcome.events {
-                    if event.id != wanted_id {
+                    if !wanted_ids.contains(&event.id) {
                         failed_endpoints.insert(endpoint.clone());
                         continue;
                     }
                     if returned_ids.contains(&event.id) {
                         continue;
                     }
-                    // SDK stats charge every received EVENT before accepting
-                    // it, using the same event JSON length. The maximum
-                    // endpoint cost therefore dominates this deduped batch.
+                    // Each endpoint stayed within its own limits, but relays
+                    // can return different events; the union must fit the
+                    // pass allowance too. An event it cannot fit stays
+                    // unreturned and leads the next pass.
+                    let event_bytes = event_json_bytes(&event);
+                    if returned_items >= SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT
+                        || returned_bytes.saturating_add(event_bytes) > byte_allowance
+                    {
+                        limited = true;
+                        continue;
+                    }
+                    returned_items += 1;
+                    returned_bytes += event_bytes;
+                    largest_event_bytes = largest_event_bytes.max(event_bytes);
                     returned_ids.insert(event.id.clone());
                     sdk_events.push((endpoint.clone(), event));
                 }
             }
-            spent_items = spent_items.saturating_add(request_items);
-            spent_bytes = spent_bytes.saturating_add(request_bytes);
-            if !single_object_request
-                && byte_limited
-                && !returned_ids.contains(&wanted_id)
-                && request_bytes <= SDK_RECONCILIATION_MAX_SINGLE_EVENT_BYTES
-            {
-                // This ID was dispatched with only the bytes left after an
-                // earlier result. Keep the pre-I/O save for cancellation, but
-                // after a completed bounded rejection let this ID lead the
-                // next pass, even if that earlier result stays unadmitted.
-                // An object beyond the single-event ceiling still rotates.
-                progress.save_cursor(prior_cursor)?;
-                break;
+            spent_items = spent_items
+                .saturating_add(request_items)
+                .max(returned_items);
+            spent_bytes = spent_bytes
+                .saturating_add(request_bytes)
+                .max(returned_bytes);
+            if largest_event_bytes == 0 {
+                unsized_batch = (unsized_batch * 2).min(SDK_RECONCILIATION_MAX_IDS_PER_REQUEST);
+            }
+            // Withheld only when every relay answered without the ID and this
+            // pass's own allowance did not drop it from what a relay served.
+            if every_claimant_satisfied && !limited {
+                withheld.extend(
+                    batch
+                        .iter()
+                        .filter(|id| !returned_ids.contains(&id.to_hex()))
+                        .copied(),
+                );
+            }
+            if limited && single_object_request && !returned_ids.contains(&event_id.to_hex()) {
+                over_ceiling.insert(event_id);
+            }
+            let first_unreturned = batch
+                .iter()
+                .position(|id| !returned_ids.contains(&id.to_hex()));
+            match first_unreturned {
+                None => progress.save_cursor(batch.last().map(|id| id.to_bytes()))?,
+                // A budget cut this request short: the first ID it left
+                // unreturned leads the next pass, where it is the one-ID first
+                // request with the single-object allowance, even if an earlier
+                // result stays unadmitted. A one-ID first request that is cut
+                // short is over that ceiling and rotates.
+                Some(position) if limited && !single_object_request => {
+                    progress.save_cursor(cursor_before(&remote, &batch[position]))?;
+                    break;
+                }
+                // No relay answered: advance through what returned, at least
+                // the first ID, and leave the rest of the batch to the next
+                // pass, as one-ID requests did after a timeout.
+                Some(position) if !answered_by_any => {
+                    if position > 0 {
+                        progress.save_cursor(Some(batch[position - 1].to_bytes()))?;
+                    }
+                    break;
+                }
+                // Relays answered without some IDs: those rotate, as a withheld
+                // one-ID request did.
+                Some(_) => progress.save_cursor(batch.last().map(|id| id.to_bytes()))?,
             }
             if spent_bytes > SDK_RECONCILIATION_MAX_BYTES_PER_ENDPOINT {
                 // A first oversized result, or expensive duplicate/boundary
                 // traffic, consumes this pass. Failed endpoints remain marked
                 // while the unattempted suffix stays retryable.
                 break;
+            }
+        }
+        drop(remote);
+        // A window the budget or deadline cut short returns only a time
+        // prefix: no event newer than one it left behind, or the older one
+        // could arrive after commits that carry the epoch past it. Events held
+        // back are fetched again; the cursor already leads with what was left.
+        let fetched_event_bytes =
+            (!sdk_events.is_empty()).then(|| returned_bytes / sdk_events.len().max(1));
+        if let Some(window) = &window {
+            // Everything in the window not returned holds delivery back,
+            // including IDs a request timed out on or a relay failed to serve:
+            // they may still arrive. Only an event every claimant answered
+            // without, or one over the single-object ceiling, does not.
+            let left_behind = window
+                .iter()
+                .filter(|id| {
+                    !returned_ids.contains(&id.to_hex())
+                        && !withheld.contains(*id)
+                        && !over_ceiling.contains(*id)
+                })
+                .copied()
+                .collect::<HashSet<_>>();
+            if !left_behind.is_empty() && !sdk_events.is_empty() {
+                let boundary = self
+                    .delivery_boundary(
+                        &plan.filter,
+                        &answering,
+                        &items,
+                        &options,
+                        reconcile_since,
+                        sdk_events.iter().map(|(_, event)| event.created_at),
+                        &left_behind,
+                        deadline,
+                    )
+                    .await;
+                // An unknown boundary is not permission. A route that cannot
+                // prove an order returns nothing; its events stay fetchable,
+                // and recovery parks it with its notice if that persists,
+                // rather than admit newer commits ahead of older messages.
+                let boundary_known = boundary.is_some();
+                let boundary = boundary.unwrap_or(0);
+                sdk_events.retain(|(_, event)| {
+                    let keep = event.created_at <= boundary;
+                    if !keep {
+                        returned_ids.remove(&event.id);
+                    }
+                    keep
+                });
+                if sdk_events.is_empty() {
+                    order_unproven = Some(if boundary_known {
+                        "boundary_excludes_fetched"
+                    } else {
+                        "boundary_unknown"
+                    });
+                }
             }
         }
         // An ID an endpoint claimed but this pass did not return is still debt
@@ -1251,6 +1844,36 @@ impl NostrSdkRelayClient {
         }
         incomplete_endpoints.retain(|endpoint| !failed_endpoints.contains(endpoint));
         failed_endpoints.extend(incomplete_endpoints.iter().cloned());
+        if let Some(key) = route_key {
+            // Whatever the account admits leaves the gap before the next pass;
+            // what it does not, and what relays withheld, yields next time.
+            let tried = returned_ids
+                .iter()
+                .filter_map(|id| EventId::from_hex(id).ok())
+                .chain(withheld)
+                .chain(over_ceiling)
+                .collect::<Vec<_>>();
+            // Step past this window by what reaches a pass at the density of
+            // the events it returned, or else by the distance to the nearest
+            // bound found too large.
+            let density_step = sdk_events
+                .iter()
+                .map(|(_, event)| event.created_at)
+                .min()
+                .zip(sdk_events.iter().map(|(_, event)| event.created_at).max())
+                .map(|(oldest, newest)| {
+                    ((newest - oldest).max(1) as f64 * target as f64 / sdk_events.len() as f64)
+                        as u64
+                });
+            let update = match acquisition_update {
+                AcquisitionUpdate::Fits { until, step } => AcquisitionUpdate::Fits {
+                    until,
+                    step: density_step.or(step),
+                },
+                other => other,
+            };
+            self.remember_acquisition(key, update, fetched_event_bytes, answering.len(), tried);
+        }
         // Negentropy reports a set. MLS input is sequential, so replay the
         // materialized difference in the same authored-time/id order used by
         // stored-event catch-up instead of HashSet iteration order.
@@ -1274,6 +1897,15 @@ impl NostrSdkRelayClient {
             sorted.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
             sorted
         };
+        if let Some(reason) = order_unproven {
+            tracing::debug!(
+                target: "transport_nostr_adapter::sdk_client",
+                method = "reconcile_subscription",
+                reason,
+                remote_item_count,
+                "group reconciliation pass held back without a proven order"
+            );
+        }
         let summary = NostrReconciliationSummary {
             relays_succeeded: endpoints.len().saturating_sub(failed_endpoints.len()),
             relays_failed: failed_endpoints.len(),
@@ -1281,8 +1913,341 @@ impl NostrSdkRelayClient {
             incomplete_endpoints: sorted(&incomplete_endpoints),
             remote_items: remote_item_count,
             received_items: remote_events.len(),
+            order_unproven: order_unproven.is_some(),
         };
         Ok((summary, remote_events))
+    }
+
+    /// Where the route's window search left off, its typical event size, the
+    /// passes in a row its search did not finish or it returned nothing, and
+    /// the IDs still in `remote` that earlier passes set aside, pruning the
+    /// ones since admitted.
+    fn acquisition_memory_for(
+        &self,
+        key: &AcquisitionRouteKey,
+        remote: &HashSet<EventId>,
+    ) -> AcquisitionHints {
+        let mut memory = self
+            .acquisition_memory
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        memory.tick += 1;
+        let tick = memory.tick;
+        let Some(route) = memory.routes.get_mut(key) else {
+            return AcquisitionHints::default();
+        };
+        route.last_used = tick;
+        route.set_aside.retain(|id| remote.contains(id));
+        AcquisitionHints {
+            seed: route.window_until.map(|low| WindowSeed {
+                low,
+                step: route.window_step,
+                high: route.search_high,
+            }),
+            event_bytes: route.event_bytes,
+            unfinished_passes: route.unfinished_passes,
+            set_aside: route.set_aside.iter().copied().collect(),
+        }
+    }
+
+    fn remember_acquisition(
+        &self,
+        key: AcquisitionRouteKey,
+        update: AcquisitionUpdate,
+        event_bytes: Option<usize>,
+        relays: usize,
+        tried: Vec<EventId>,
+    ) {
+        let mut memory = self
+            .acquisition_memory
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        memory.tick += 1;
+        let tick = memory.tick;
+        if !memory.routes.contains_key(&key)
+            && memory.routes.len() >= SDK_RECONCILIATION_MEMORY_ROUTES
+        {
+            evict_least_recent(&mut memory.routes);
+        }
+        let route = memory.routes.entry(key.clone()).or_default();
+        route.last_used = tick;
+        match update {
+            AcquisitionUpdate::Fits { until, step } => {
+                route.window_until = Some(until);
+                route.window_step = step.or(route.window_step);
+                route.search_high = None;
+                route.unfinished_passes = 0;
+            }
+            AcquisitionUpdate::Unfinished { low, high, skipped } => {
+                route.window_until = Some(low);
+                route.search_high = Some(high);
+                route.unfinished_passes = if skipped {
+                    route.unfinished_passes.saturating_add(1)
+                } else {
+                    0
+                };
+            }
+            AcquisitionUpdate::None => {}
+        }
+        if event_bytes.is_some() {
+            route.event_bytes = event_bytes;
+        }
+        let cap = set_aside_cap(relays);
+        for id in tried {
+            if route.set_aside.len() < cap && !route.set_aside.contains(&id) {
+                route.set_aside.push_back(id);
+            }
+        }
+        // Bound memory across routes by dropping whole routes, least recently
+        // used first; a dropped route sets its IDs aside again as it meets them.
+        while memory
+            .routes
+            .values()
+            .map(|route| route.set_aside.len())
+            .sum::<usize>()
+            > SDK_RECONCILIATION_SET_ASIDE_TOTAL
+            && memory.routes.len() > 1
+        {
+            let Some(evicted) = memory
+                .routes
+                .iter()
+                .filter(|(other, _)| **other != key)
+                .min_by_key(|(_, route)| route.last_used)
+                .map(|(other, _)| other.clone())
+            else {
+                break;
+            };
+            memory.routes.remove(&evicted);
+        }
+    }
+
+    /// The newest second a pass may return up to when `left_behind` IDs of
+    /// its window were not fetched: the largest of the returned events'
+    /// timestamps with none of those IDs at or before it, or one second
+    /// before the oldest returned event when there is none. Returns `None`
+    /// when no probe gets a complete answer and the boundary is unknown.
+    #[allow(clippy::too_many_arguments)]
+    async fn delivery_boundary(
+        &self,
+        filter: &Filter,
+        endpoints: &[RelayUrl],
+        items: &[(EventId, NostrTimestamp)],
+        options: &SyncOptions,
+        since: u64,
+        returned_at: impl Iterator<Item = u64>,
+        left_behind: &HashSet<EventId>,
+        deadline: tokio::time::Instant,
+    ) -> Option<u64> {
+        let mut times = returned_at.collect::<Vec<_>>();
+        times.sort_unstable();
+        times.dedup();
+        let oldest = *times.first()?;
+        let probes = SDK_RECONCILIATION_WINDOW_PROBES;
+        let mut candidates = (0..probes)
+            .map(|index| times[index * (times.len() - 1) / (probes - 1).max(1)])
+            .collect::<Vec<_>>();
+        candidates.dedup();
+        let answers = futures::future::join_all(candidates.iter().map(|at| async move {
+            // Nothing in scope is older than the window's floor.
+            if *at < since {
+                return Some((HashSet::new(), true));
+            }
+            // Whole seconds: a left-behind event sharing a second with
+            // returned ones holds that second back too.
+            self.window_remote_ids(filter, endpoints, items, options, (since, *at), deadline)
+                .await
+        }))
+        .await;
+        let mut answered = false;
+        let mut boundary = None;
+        for (at, answer) in candidates.into_iter().zip(answers) {
+            let Some((ids, complete)) = answer else {
+                continue;
+            };
+            answered |= complete;
+            if complete && ids.is_disjoint(left_behind) {
+                boundary = Some(at);
+            }
+        }
+        // Every complete probe saw something left behind at or before the
+        // oldest returned event: nothing is safe to return.
+        answered.then(|| boundary.unwrap_or(oldest.saturating_sub(1)))
+    }
+
+    /// Find the oldest window `[since, bound]` of a group route's gap that one
+    /// pass can fetch, `target` IDs at most, with dry-run comparisons over
+    /// candidate bounds. IDs set aside by earlier passes do not count toward
+    /// it. A probe counts as fitting only when every relay asked answered it:
+    /// a relay that missed a probe may hold older history the others lack.
+    /// Returns `None` when no relay answers at all.
+    #[allow(clippy::too_many_arguments)]
+    async fn oldest_window(
+        &self,
+        filter: &Filter,
+        endpoints: &[RelayUrl],
+        items: &[(EventId, NostrTimestamp)],
+        options: &SyncOptions,
+        (since, until): (u64, u64),
+        remote: &HashSet<EventId>,
+        set_aside: &[EventId],
+        target: usize,
+        seed: Option<WindowSeed>,
+        deadline: tokio::time::Instant,
+    ) -> Option<WindowSearch> {
+        let skip = set_aside.iter().copied().collect::<HashSet<_>>();
+        // The largest probed bound whose window fits a pass, and the smallest
+        // that does not. The whole comparison window is already known not to.
+        let mut fits: Option<(u64, HashSet<EventId>)> = None;
+        // The smallest bound found too large, its IDs, and whether every relay
+        // answered that probe.
+        let mut over: Option<(u64, HashSet<EventId>, bool)> = None;
+        // A relay rejects events dated far in the future, so a probe past
+        // shortly after now would only measure the whole remaining gap.
+        let until = until.min(crate::unix_now_seconds().saturating_add(15 * 60));
+        let gap = remote.iter().filter(|id| !skip.contains(id)).count();
+        let mut ever_answered = false;
+        let seed = seed.filter(|seed| since <= seed.low && seed.low < until);
+        let resume_high = seed
+            .and_then(|seed| seed.high)
+            .filter(|high| seed.is_some_and(|seed| seed.low < *high) && *high <= until);
+        // A resumed bracket spreads its first round within it; a seed without
+        // one steps past the previous window; no seed starts at the recent end.
+        let mut first_round_step = match (seed, resume_high) {
+            (_, Some(_)) => None,
+            (Some(seed), None) => Some(seed.step),
+            (None, None) => Some(None),
+        };
+        let (mut search_low, mut search_high) = (
+            seed.map_or(since, |seed| seed.low),
+            resume_high.unwrap_or(until),
+        );
+        for _ in 0..SDK_RECONCILIATION_WINDOW_ROUNDS {
+            let low = fits
+                .as_ref()
+                .map_or((search_low, 0), |(bound, ids)| (*bound, ids.len()));
+            let high = over
+                .as_ref()
+                .map_or((search_high, gap), |(bound, ids, _)| (*bound, ids.len()));
+            let probes = window_probes(low, high, target, first_round_step.take());
+            (search_low, search_high) = (low.0, high.0);
+            if probes.is_empty() {
+                // Nothing left to probe is a finished bracket, not a silence.
+                ever_answered = true;
+                break;
+            }
+            let rounds = futures::future::join_all(probes.iter().map(|probe| {
+                self.window_remote_ids(filter, endpoints, items, options, (since, *probe), deadline)
+            }))
+            .await;
+            let mut answered = false;
+            for (probe, result) in probes.into_iter().zip(rounds) {
+                let Some((ids, complete)) = result else {
+                    continue;
+                };
+                answered = true;
+                let ids = ids
+                    .into_iter()
+                    .filter(|id| remote.contains(id) && !skip.contains(id))
+                    .collect::<HashSet<_>>();
+                // A partial answer can show a window is too large, never
+                // that it fits.
+                if ids.len() > target {
+                    if over.as_ref().is_none_or(|(bound, _, _)| probe < *bound) {
+                        over = Some((probe, ids, complete));
+                    }
+                } else if complete && fits.as_ref().is_none_or(|(bound, _)| probe > *bound) {
+                    fits = Some((probe, ids));
+                }
+            }
+            if !answered {
+                // Out of time or no relay answered: keep what earlier rounds found.
+                break;
+            }
+            ever_answered = true;
+            // Older history can appear below the seed, for example from a relay
+            // that was down. If every probe above the seed already holds more
+            // than a pass, look below it too. Likewise, a resumed bracket's top
+            // may no longer hold too much once its history was admitted.
+            if fits.is_none() && search_low > since {
+                search_low = since;
+            }
+            if over.is_none() && search_high < until {
+                search_high = until;
+            }
+            // At least half a pass is enough.
+            if fits
+                .as_ref()
+                .is_some_and(|(_, ids)| ids.len() * 2 >= target)
+            {
+                break;
+            }
+        }
+        if !ever_answered {
+            return None;
+        }
+        let over_until = over.as_ref().map(|(bound, _, _)| *bound);
+        Some(match fits {
+            Some((until, ids)) if !ids.is_empty() => WindowSearch::Fits {
+                until,
+                ids,
+                over_until,
+            },
+            fits => WindowSearch::Unfinished {
+                low: fits.map_or(search_low, |(bound, _)| bound),
+                high: over_until.unwrap_or(until),
+                over_ids: over.and_then(|(_, ids, complete)| complete.then_some(ids)),
+            },
+        })
+    }
+
+    /// Remote-only IDs within `[since, until]` across the endpoints that
+    /// answer a dry-run comparison by `deadline`, and whether every endpoint
+    /// answered, or `None` if none does.
+    async fn window_remote_ids(
+        &self,
+        filter: &Filter,
+        endpoints: &[RelayUrl],
+        items: &[(EventId, NostrTimestamp)],
+        options: &SyncOptions,
+        (since, until): (u64, u64),
+        deadline: tokio::time::Instant,
+    ) -> Option<(HashSet<EventId>, bool)> {
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        let filter = filter
+            .clone()
+            .since(NostrTimestamp::from_secs(since))
+            .until(NostrTimestamp::from_secs(until));
+        let items = items
+            .iter()
+            .filter(|(_, at)| (since..=until).contains(&at.as_secs()))
+            .copied()
+            .collect::<Vec<_>>();
+        let syncs = endpoints.iter().cloned().map(|endpoint| {
+            let client = self.client.clone();
+            let filter = filter.clone();
+            let items = items.clone();
+            let options = options.clone();
+            async move {
+                timeout_at(deadline, async {
+                    match client.relay(&endpoint).await {
+                        Ok(Some(relay)) => relay.sync(filter).items(items).opts(options).await.ok(),
+                        Ok(None) | Err(_) => None,
+                    }
+                })
+                .await
+                .ok()
+                .flatten()
+            }
+        });
+        let mut answered = 0usize;
+        let mut ids = HashSet::new();
+        for summary in futures::future::join_all(syncs).await.into_iter().flatten() {
+            answered += 1;
+            ids.extend(summary.remote);
+        }
+        (answered > 0).then_some((ids, answered == endpoints.len()))
     }
 
     /// Summarize SDK-owned relay health without exposing relay URLs.
@@ -1348,6 +2313,21 @@ impl NostrSdkRelayClient {
         outcomes
     }
 
+    /// Classify a relay's `CLOSED` reason as this client's SDK settles the REQ
+    /// (see [`sdk_subscription_refusal`]). A client built with
+    /// [`Self::from_builder`] knows whether it has an authenticator; an opaque
+    /// client does not.
+    pub fn subscription_refusal(&self, reason: &str) -> SubscriptionRefusal {
+        let authenticator = match &self.publication {
+            SdkPublication::OwnedRelay {
+                authenticator_available,
+                ..
+            } => Some(*authenticator_available),
+            SdkPublication::OpaqueClient => None,
+        };
+        sdk_subscription_refusal(reason, authenticator)
+    }
+
     /// Start forwarding `nostr-sdk` notifications into the adapter's delivery
     /// queue. The task exits when the relay pool shuts down.
     pub fn spawn_notification_forwarder(&self, adapter: NostrTransportAdapter) -> JoinHandle<()> {
@@ -1361,6 +2341,7 @@ impl NostrSdkRelayClient {
             let worker_pending = pending.clone();
             #[cfg(test)]
             let forwarder_event_entered = loss.forwarder_event_entered.clone();
+            let classifier = loss.clone();
             let mut worker = tokio::spawn(async move {
                 while let Some(notification) = event_rx.recv().await {
                     #[cfg(test)]
@@ -1393,16 +2374,29 @@ impl NostrSdkRelayClient {
                                 subscription_id,
                                 event,
                             } => {
-                                // Every relay copy is telemetry only; delivery uses
-                                // the SDK's deduplicated Event notification above.
-                                if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
-                                    adapter
-                                        .observe_relay_event(NostrRelayEvent {
-                                            endpoint: TransportEndpoint(relay_url.to_string()),
-                                            subscription_id: Some(subscription_id.to_string()),
-                                            event,
-                                        })
-                                        .await;
+                                // Every relay copy feeds telemetry and replay-page
+                                // accounting, in order with that relay's EOSE;
+                                // delivery uses the SDK's deduplicated Event
+                                // notification above.
+                                match NostrTransportEvent::from_nostr_event(&event) {
+                                    Ok(event) => {
+                                        adapter
+                                            .observe_relay_event(NostrRelayEvent {
+                                                endpoint: TransportEndpoint(relay_url.to_string()),
+                                                subscription_id: Some(subscription_id.to_string()),
+                                                event,
+                                            })
+                                            .await;
+                                    }
+                                    Err(_) => {
+                                        adapter
+                                            .observe_unconvertible_relay_event(
+                                                TransportEndpoint(relay_url.to_string()),
+                                                subscription_id.to_string(),
+                                                event.created_at.as_secs(),
+                                            )
+                                            .await;
+                                    }
                                 }
                             }
                             RelayMessage::EndOfStoredEvents(subscription_id) => {
@@ -1410,6 +2404,18 @@ impl NostrSdkRelayClient {
                                     .handle_relay_eose(
                                         TransportEndpoint(relay_url.to_string()),
                                         subscription_id.to_string(),
+                                    )
+                                    .await;
+                            }
+                            RelayMessage::Closed {
+                                subscription_id,
+                                message,
+                            } => {
+                                adapter
+                                    .handle_relay_closed(
+                                        TransportEndpoint(relay_url.to_string()),
+                                        subscription_id.to_string(),
+                                        classifier.subscription_refusal(&message),
                                     )
                                     .await;
                             }
@@ -1652,7 +2658,20 @@ impl NostrSdkRelayClient {
         // connection attempt.
         self.client.connect().await;
 
-        let output = self
+        // Track the id before nostr-sdk can register it. The SDK registers the
+        // REQ and queues it before this task resumes, and the caller may abort
+        // the task at any await after that (a sibling's failure, or a dropped
+        // activation). An id tracked only after the SDK call would then be a
+        // live REQ that `unsubscribe_account` never closes and every reconnect
+        // re-sends. A tracked id the SDK never registered costs one CLOSE.
+        self.account_subscriptions
+            .write()
+            .await
+            .entry(plan.account_id.clone())
+            .or_default()
+            .push_unique(plan.subscription_id.clone());
+
+        let output = match self
             .client
             .subscribe(ReqTarget::manual(
                 plan.endpoints
@@ -1662,14 +2681,24 @@ impl NostrSdkRelayClient {
             ))
             .with_id(plan.subscription_id.clone())
             .await
-            .map_err(|_| TransportAdapterError::Subscription("subscribe failed".to_owned()))?;
-
-        if output.success.is_empty() {
-            return Err(TransportAdapterError::Subscription(format!(
-                "subscribe registered on 0 of {} relays",
-                plan.endpoints.len()
-            )));
-        }
+        {
+            Ok(output) if !output.success.is_empty() => output,
+            // A failed call registered nothing of its own: nostr-sdk reports
+            // each relay's failure, including an id another live REQ already
+            // holds, without registering it there. So it closes nothing. A
+            // group sync reuses its activation's ids, and closing one here
+            // would end the REQ that holds it. The early-tracked id stays
+            // tracked; a sweep's CLOSE for it is harmless.
+            result => {
+                return Err(TransportAdapterError::Subscription(match result {
+                    Ok(_) => format!(
+                        "subscribe registered on 0 of {} relays",
+                        plan.endpoints.len()
+                    ),
+                    Err(_) => "subscribe failed".to_owned(),
+                }));
+            }
+        };
 
         if !output.failed.is_empty() {
             tracing::warn!(
@@ -1705,13 +2734,6 @@ impl NostrSdkRelayClient {
                 .or_default(),
             outcomes,
         );
-
-        self.account_subscriptions
-            .write()
-            .await
-            .entry(plan.account_id)
-            .or_default()
-            .push_unique(plan.subscription_id);
         Ok(())
     }
 
@@ -1746,13 +2768,15 @@ impl NostrSdkRelayClient {
         // immediately.
         // Own the relay before awaiting its handshake. The pool helper keeps
         // a read lock that blocks registering other concurrent publish targets.
+        // `Err(true)` is a handshake that outlived the connect budget, kept
+        // apart from immediate dial errors so audit can tell them apart.
         let connected = match self.client.relay(endpoint.clone()).await {
             Ok(Some(relay)) => relay
                 .try_connect()
                 .timeout(SDK_RELAY_CONNECT_WAIT)
                 .await
-                .map_err(|_| ()),
-            Ok(None) | Err(_) => Err(()),
+                .map_err(|error| error.kind() == SdkErrorKind::Timeout),
+            Ok(None) | Err(_) => Err(false),
         };
         match connected {
             Ok(()) => Ok(endpoint),
@@ -1761,9 +2785,14 @@ impl NostrSdkRelayClient {
             // `TransportAdapterError::Publish` Display (see
             // `finish_publish_outcome`), which upper layers may log. The
             // endpoint stays available on the structured failure record.
-            Err(_) => Err(TransportEndpointFailure {
+            Err(timed_out) => Err(TransportEndpointFailure {
                 endpoint: transport_endpoint,
-                reason: "connect relay failed".to_owned(),
+                reason: if timed_out {
+                    "connect relay timed out"
+                } else {
+                    "connect relay failed"
+                }
+                .to_owned(),
                 kind: TransportEndpointFailureKind::RetryableUnavailable,
                 rejection_category: None,
             }),
@@ -1802,7 +2831,7 @@ impl NostrSdkRelayClient {
                     Err(local_failure("relay did not acknowledge event"))
                 }
             }
-            SdkPublication::OwnedRelay { gossip } => {
+            SdkPublication::OwnedRelay { gossip, .. } => {
                 // Match the fork's Client::send_event storage-before-callback
                 // order. The attempt timeout covers this entire sequence.
                 self.client
@@ -1872,7 +2901,26 @@ impl NostrSdkRelayClient {
                         ack_kind,
                     });
                 }
-                Ok(Err(failure)) => last_failure = failure,
+                Ok(Err(failure)) => {
+                    // An anonymous connection cannot satisfy NIP-42 by waiting
+                    // and resending. Return its explicit rejection so the
+                    // account owner can perform its authenticated fallback.
+                    // Opaque clients and all configured authenticators retain
+                    // retries because their authentication may be in flight.
+                    if failure.rejection_category
+                        == Some(TransportEndpointRejectionCategory::AuthRequired)
+                        && matches!(
+                            self.publication,
+                            SdkPublication::OwnedRelay {
+                                authenticator_available: false,
+                                ..
+                            }
+                        )
+                    {
+                        return Err(failure);
+                    }
+                    last_failure = failure;
+                }
                 Err(_) => {
                     last_failure.reason = "send event timed out".to_owned();
                     last_failure.kind = TransportEndpointFailureKind::PossiblyExposed;
@@ -2823,9 +3871,10 @@ impl NostrRelayClient for NostrSdkRelayClient {
         self.registration_log.lock().await.remove(account_id);
         let ids = self
             .account_subscriptions
-            .write()
+            .read()
             .await
-            .remove(account_id)
+            .get(account_id)
+            .cloned()
             .unwrap_or_default();
         tracing::debug!(
             target: "transport_nostr_adapter::sdk_client",
@@ -2833,27 +3882,36 @@ impl NostrRelayClient for NostrSdkRelayClient {
             subscription_count = ids.len(),
             "unsubscribing SDK account subscriptions"
         );
+        // Untrack each REQ only once its CLOSE went out. Removing every id up
+        // front would orphan the not-yet-closed REQs if the caller is dropped
+        // mid-sweep (a cancelled activation): still live on the relay, and
+        // re-sent on every reconnect, with nothing left to close them.
         let mut failed = Vec::new();
         for id in ids {
             if self.client.unsubscribe(&id).await.is_err() {
                 failed.push(id);
+                continue;
+            }
+            if let Some(tracked) = self.account_subscriptions.write().await.get_mut(account_id) {
+                tracked.retain(|tracked| tracked != &id);
+            }
+            if let Some(mut floors) = self.account_subscription_floors() {
+                floors.close(&id);
             }
         }
         if let Some(mut floors) = self.account_subscription_floors() {
             floors.close_all_except(&failed);
         }
-        if !failed.is_empty() {
-            self.account_subscriptions
-                .write()
-                .await
-                .entry(account_id.clone())
-                .or_default()
-                .extend(failed);
-            return Err(TransportAdapterError::Subscription(
-                "unsubscribe account failed".to_owned(),
-            ));
+        if failed.is_empty() {
+            let mut tracked = self.account_subscriptions.write().await;
+            if tracked.get(account_id).is_some_and(Vec::is_empty) {
+                tracked.remove(account_id);
+            }
+            return Ok(());
         }
-        Ok(())
+        Err(TransportAdapterError::Subscription(
+            "unsubscribe account failed".to_owned(),
+        ))
     }
 
     async fn publish_event(
@@ -3083,7 +4141,11 @@ async fn event_for_publish_with_signer(
         .custom_created_at(NostrTimestamp::from_secs(event.created_at))
         .finalize_async(signer)
         .await
-        .map_err(|_| TransportAdapterError::Publish("sign event failed".to_owned()))
+        // Signer text can carry relay URLs or remote detail, and this Display
+        // reaches upper-layer logs.
+        .map_err(|_| {
+            TransportAdapterError::Publish(format!("sign event failed for kind {}", event.kind))
+        })
 }
 
 fn parse_endpoints(
@@ -3228,6 +4290,42 @@ fn map_relay_rejection_category(
     }
 }
 
+/// The category of a relay's `CLOSED` reason. Unlike a publish rejection, an
+/// unknown prefix is unclassified (`None`) rather than `error`: the relay did
+/// not say why it refused.
+fn subscription_refusal_category(reason: &str) -> Option<TransportEndpointRejectionCategory> {
+    match nostr::message::MachineReadablePrefix::parse(reason)? {
+        nostr::message::MachineReadablePrefix::Custom(_) => None,
+        prefix => Some(map_relay_rejection_category(prefix)),
+    }
+}
+
+/// Classify a relay's `CLOSED` the way nostr-sdk settles that one REQ: it keeps
+/// a `rate-limited:` REQ, and an `auth-required:` one when the client has an
+/// authenticator, to send again later; it drops everything else.
+///
+/// Decided from this message alone, never from the SDK's registry, which a
+/// later re-send and close of the same id may already have changed by the time
+/// a queued notification is handled. `authenticator` is `None` when unknown;
+/// that keeps an `auth-required:` close pending, so it never settles coverage
+/// the relay may still serve after AUTH.
+pub fn sdk_subscription_refusal(reason: &str, authenticator: Option<bool>) -> SubscriptionRefusal {
+    let category = subscription_refusal_category(reason);
+    let kept = match category {
+        Some(TransportEndpointRejectionCategory::RateLimited) => true,
+        Some(TransportEndpointRejectionCategory::AuthRequired) => authenticator.unwrap_or(true),
+        _ => false,
+    };
+    SubscriptionRefusal {
+        category,
+        disposition: if kept {
+            SubscriptionRefusalDisposition::Pending
+        } else {
+            SubscriptionRefusalDisposition::Dropped
+        },
+    }
+}
+
 fn relay_rejection_endpoint_failure(
     endpoint: TransportEndpoint,
     relay_message: &str,
@@ -3281,6 +4379,8 @@ fn relay_rejection_endpoint_failure(
 }
 
 #[cfg(test)]
+// Test fixtures dial local relays directly.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::{NostrKeyPackagePublication, SubscriptionAttempt};
@@ -4604,6 +5704,192 @@ mod tests {
         root.shutdown_accounts().await;
     }
 
+    /// A relay that answers every REQ with `CLOSED` and `reason`, on every
+    /// connection.
+    async fn closing_relay(
+        reason: &'static str,
+    ) -> (TransportEndpoint, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    while let Some(Ok(message)) = socket.next().await {
+                        let Ok(text) = message.into_text() else {
+                            continue;
+                        };
+                        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                            continue;
+                        };
+                        if value[0] != "REQ" {
+                            continue;
+                        }
+                        let closed = serde_json::json!(["CLOSED", value[1], reason]);
+                        if socket.send(closed.to_string().into()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (endpoint, server)
+    }
+
+    /// The forwarder hands a relay's `CLOSED` to the adapter, classified per
+    /// message by its prefix and the client's authenticator. For a client that
+    /// knows whether it has one, the classification must match what the SDK
+    /// actually did with the REQ: still registered when pending, removed when
+    /// dropped. A dropped inbox refusal settles the replay without completing
+    /// it.
+    #[tokio::test]
+    async fn forwarder_reports_relay_closed_with_the_sdk_disposition() {
+        use crate::{SubscriptionRefusalDisposition, SubscriptionRouteKind};
+        use SubscriptionRefusalDisposition::{Dropped, Pending};
+        use TransportEndpointRejectionCategory::{AuthRequired, RateLimited, Restricted};
+
+        #[derive(Clone, Copy, Debug)]
+        enum Auth {
+            Anonymous,
+            Authenticator,
+            Opaque,
+        }
+        let cases = [
+            (
+                "auth-required: sign in",
+                Auth::Anonymous,
+                Some(AuthRequired),
+                Dropped,
+            ),
+            (
+                "auth-required: sign in",
+                Auth::Authenticator,
+                Some(AuthRequired),
+                Pending,
+            ),
+            // Unknown authenticator: kept pending, so coverage keeps waiting.
+            (
+                "auth-required: sign in",
+                Auth::Opaque,
+                Some(AuthRequired),
+                Pending,
+            ),
+            (
+                "rate-limited: slow down",
+                Auth::Anonymous,
+                Some(RateLimited),
+                Pending,
+            ),
+            (
+                "restricted: members only",
+                Auth::Authenticator,
+                Some(Restricted),
+                Dropped,
+            ),
+            ("not today", Auth::Anonymous, None, Dropped),
+        ];
+        for (reason, auth, category, disposition) in cases {
+            let (endpoint, server) = closing_relay(reason).await;
+            let keys = Keys::generate();
+            let account = MemberId::new(keys.public_key().to_bytes().to_vec());
+            let sdk = match auth {
+                Auth::Anonymous => NostrSdkRelayClient::from_builder(Client::builder()),
+                Auth::Authenticator => {
+                    NostrSdkRelayClient::from_builder(Client::builder().authenticator(
+                        nostr_sdk::authenticator::SignerAuthenticator::new(SdkSigner(Arc::new(
+                            keys.clone(),
+                        ))),
+                    ))
+                }
+                Auth::Opaque => NostrSdkRelayClient::new(Client::default()),
+            };
+            let adapter = NostrTransportAdapter::new(Arc::new(sdk.clone()));
+            let forwarder = sdk.spawn_notification_forwarder(adapter.clone());
+            adapter
+                .activate_account(crate::TransportAccountActivation {
+                    account_id: account.clone(),
+                    inbox_endpoints: vec![endpoint.clone()],
+                    group_subscriptions: Vec::new(),
+                    since: None,
+                })
+                .await
+                .unwrap();
+            let case = format!("{reason:?} {auth:?}");
+            let reports = timeout(Duration::from_secs(5), async {
+                loop {
+                    let reports = adapter.take_subscription_refusals(&account);
+                    if !reports.reports.is_empty() {
+                        return reports;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("the forwarder reports {case}"));
+            let report = &reports.reports[0];
+            assert_eq!(report.route_kind, SubscriptionRouteKind::Inbox, "{case}");
+            assert_eq!(report.endpoint, endpoint, "{case}");
+            assert_eq!(report.category, category, "{case}");
+            assert_eq!(report.disposition, disposition, "{case}");
+            if !matches!(auth, Auth::Opaque) {
+                let relay = sdk
+                    .client()
+                    .relay(endpoint.as_str())
+                    .await
+                    .unwrap()
+                    .expect("the relay is in the pool");
+                let wire_id = SubscriptionId::new(
+                    NostrSubscription::AccountInbox {
+                        account_id: account.clone(),
+                        endpoints: vec![endpoint.clone()],
+                        since: None,
+                        attempt: adapter
+                            .account_subscription_attempt(&account)
+                            .await
+                            .unwrap(),
+                    }
+                    .subscription_id(),
+                );
+                assert_eq!(
+                    relay.subscription(&wire_id).await.is_some(),
+                    disposition == Pending,
+                    "the SDK agrees: {case}"
+                );
+            }
+            let progress = adapter.account_subscription_eose(&account).await;
+            assert_eq!(progress.settled(), disposition == Dropped, "{case}");
+            assert!(!progress.complete());
+            sdk.client().shutdown().await;
+            forwarder.abort();
+            server.abort();
+        }
+    }
+
+    /// Each `CLOSED` is classified from its own reason, so a kept refusal
+    /// stays pending even when a later close of the same id, after AUTH and a
+    /// re-send, drops the REQ before the first notification is handled.
+    #[test]
+    fn sdk_subscription_refusal_classifies_each_close_on_its_own() {
+        use SubscriptionRefusalDisposition::{Dropped, Pending};
+        let pending = sdk_subscription_refusal("auth-required: sign in", Some(true));
+        let dropped = sdk_subscription_refusal("restricted: members only", Some(true));
+        assert_eq!(pending.disposition, Pending);
+        assert_eq!(dropped.disposition, Dropped);
+        assert_eq!(
+            sdk_subscription_refusal("auth-required: sign in", Some(false)).disposition,
+            Dropped
+        );
+        assert_eq!(
+            sdk_subscription_refusal("auth-required: sign in", None).disposition,
+            Pending
+        );
+        let custom = sdk_subscription_refusal("paywall: subscribe first", Some(true));
+        assert_eq!(custom.category, None);
+        assert_eq!(custom.disposition, Dropped);
+    }
+
     #[tokio::test]
     async fn public_forwarder_reports_loss_while_delivery_is_blocked() {
         let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
@@ -5019,9 +6305,11 @@ mod tests {
             },
         );
         let mut published = Vec::new();
+        // One shared timestamp: no time window can split this set.
         for index in 0..SDK_RECONCILIATION_REPLAY_BATCH + 9 {
             let event = EventBuilder::new(Kind::MlsGroupMessage, format!("synthetic-{index}"))
                 .tags([Tag::custom("h", ["c3".repeat(32)])])
+                .custom_created_at(NostrTimestamp::from_secs(1_700_000_000))
                 .finalize(&Keys::generate())
                 .unwrap();
             nostr_relay_builder::prelude::NostrDatabase::save_event(
@@ -5046,7 +6334,11 @@ mod tests {
             LocalRelay::new(nostr_relay_builder::RelayBuilder::default().database(database));
         relay.run().await.unwrap();
         let endpoint = RelayUrl::parse(&relay.url().await.to_string()).unwrap();
-        let sdk = NostrSdkRelayClient::new(Client::builder().build());
+        // This exercises the durable cursor's ID-order rotation, which
+        // oldest-first acquisition falls back to; the integration tests cover
+        // the ordering itself.
+        let mut sdk = NostrSdkRelayClient::new(Client::builder().build());
+        sdk.id_order_only = true;
         let progress = TestReconciliationProgress::default();
         sdk.client.add_relay(endpoint.clone()).await.unwrap();
         sdk.client.connect().await;
@@ -5102,7 +6394,7 @@ mod tests {
         let expected_next = expected_next
             .into_iter()
             .filter(|id| id.to_bytes() > after_cancel)
-            .take(SDK_RECONCILIATION_MAX_ID_REQUESTS)
+            .take(SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT)
             .collect::<HashSet<_>>();
         assert_eq!(resumed_ids, expected_next);
         progress.save_cursor(None).unwrap();
@@ -5111,7 +6403,7 @@ mod tests {
             .reconcile_subscription(subscription.clone(), &[], 0, u64::MAX, &progress)
             .await
             .unwrap();
-        assert_eq!(first.len(), SDK_RECONCILIATION_MAX_ID_REQUESTS);
+        assert_eq!(first.len(), SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT);
         while let Some(notification) =
             tokio::time::timeout(Duration::from_millis(10), notifications.next())
                 .await
@@ -5166,6 +6458,35 @@ mod tests {
         assert_eq!(second[0].event.id, published[0].id.to_hex());
         sdk.client.shutdown().await;
         relay.shutdown();
+    }
+
+    #[test]
+    fn set_aside_cap_covers_the_union_of_relay_inventories() {
+        // Each relay's comparison names at most the set limit, but the union
+        // across relays can name that many per relay.
+        assert_eq!(set_aside_cap(0), SDK_RECONCILIATION_SET_ASIDE_IDS);
+        assert_eq!(set_aside_cap(1), SDK_RECONCILIATION_SET_ASIDE_IDS);
+        assert_eq!(set_aside_cap(2), 2 * SDK_RECONCILIATION_SET_ASIDE_IDS);
+        assert_eq!(set_aside_cap(8), SDK_RECONCILIATION_SET_ASIDE_TOTAL);
+        let client = NostrSdkRelayClient::new(Client::builder().build());
+        let key = AcquisitionRouteKey {
+            account_id: MemberId::new(vec![0xa1; 32]),
+            transport_group_id: vec![0xc3; 32],
+        };
+        let ids = (0..SDK_RECONCILIATION_SET_ASIDE_IDS + 1_000)
+            .map(|value| {
+                let mut bytes = [0u8; 32];
+                bytes[24..].copy_from_slice(&(value as u64).to_be_bytes());
+                EventId::from_byte_array(bytes)
+            })
+            .collect::<Vec<_>>();
+        client.remember_acquisition(key.clone(), AcquisitionUpdate::None, None, 2, ids.clone());
+        let remote = ids.iter().copied().collect::<HashSet<_>>();
+        assert_eq!(
+            client.acquisition_memory_for(&key, &remote).set_aside.len(),
+            ids.len(),
+            "two relays' inventories fit"
+        );
     }
 
     #[test]
@@ -6135,7 +7456,35 @@ mod tests {
             TransportEndpointFailureKind::RetryableUnavailable,
             "a failed connection proves the event was never exposed to the relay",
         );
+        assert_eq!(failures[0].reason, "connect relay failed");
         assert_eq!(sdk.relay_health().await.total_relays, 0);
+    }
+
+    /// mdk#2264: a handshake that outlives `SDK_RELAY_CONNECT_WAIT` must be
+    /// distinguishable from an immediate dial error in the per-relay reason.
+    #[tokio::test(start_paused = true)]
+    async fn publish_connect_timeout_is_reported_separately_from_dial_errors() {
+        // Bound and listening, but never accepted: the kernel completes TCP
+        // while the WebSocket handshake waits forever.
+        let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", silent.local_addr().unwrap()));
+        let sdk = signed_sdk(Keys::generate());
+        let dto = signed_group_event_dto();
+
+        let error = sdk
+            .publish_event(std::slice::from_ref(&endpoint), &dto, 1)
+            .await
+            .expect_err("an event cannot be published without a relay connection");
+
+        let failures = error.publish_endpoint_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].reason, "connect relay timed out");
+        assert_eq!(
+            failures[0].kind,
+            TransportEndpointFailureKind::RetryableUnavailable,
+            "a connect timeout proves the event was never sent",
+        );
+        drop(silent);
     }
 
     #[tokio::test(start_paused = true)]
@@ -7278,9 +8627,142 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_publish_batch_cleans_write_only_relay() {
+        assert_cancelled_publish_cleans_write_only_relay(signed_sdk(Keys::generate())).await;
+    }
+
+    /// Account fallbacks use builder-owned authenticated clients. Cancel only
+    /// after NIP-42 succeeds and the exact signed EVENT is waiting for its ACK.
+    #[tokio::test]
+    async fn cancelled_owned_authenticated_publish_cleans_write_only_relay() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+        let relay_url = RelayUrl::parse(endpoint.as_str()).unwrap();
+        let keys = Keys::generate();
+        let expected_auth_pubkey = keys.public_key();
+        let sdk = NostrSdkRelayClient::from_builder(Client::builder().authenticator(
+            nostr_sdk::authenticator::SignerAuthenticator::new(SdkSigner(Arc::new(keys))),
+        ));
+        let event = signed_group_event_dto();
+        let expected_event = serde_json::to_value(&event).unwrap();
+        let expected_relay_url = relay_url.to_string();
+        let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let challenge = "held-authenticated-publication";
+            socket
+                .send(serde_json::json!(["AUTH", challenge]).to_string().into())
+                .await
+                .unwrap();
+            let mut authenticated = false;
+            let mut received_tx = Some(received_tx);
+            while let Some(Ok(message)) = socket.next().await {
+                if message.is_close() {
+                    break;
+                }
+                let Ok(text) = message.into_text() else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                match value[0].as_str() {
+                    Some("AUTH") => {
+                        let auth: Event = serde_json::from_value(value[1].clone()).unwrap();
+                        auth.verify().unwrap();
+                        assert_eq!(auth.pubkey, expected_auth_pubkey);
+                        assert_eq!(value[1]["kind"], 22242);
+                        let tags = value[1]["tags"].as_array().unwrap();
+                        assert!(tags.contains(&serde_json::json!(["challenge", challenge])));
+                        assert!(tags.contains(&serde_json::json!(["relay", expected_relay_url])));
+                        socket
+                            .send(
+                                serde_json::json!(["OK", auth.id.to_hex(), true, ""])
+                                    .to_string()
+                                    .into(),
+                            )
+                            .await
+                            .unwrap();
+                        authenticated = true;
+                    }
+                    Some("EVENT") if !authenticated => {
+                        socket
+                            .send(
+                                serde_json::json!([
+                                    "OK",
+                                    value[1]["id"],
+                                    false,
+                                    "auth-required: authenticate"
+                                ])
+                                .to_string()
+                                .into(),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    Some("EVENT") => {
+                        assert_eq!(value[1], expected_event);
+                        received_tx
+                            .take()
+                            .expect("only one authenticated EVENT")
+                            .send(())
+                            .unwrap();
+                        // Deliberately withhold this EVENT's OK. The test may
+                        // now cancel an authenticated wire send, not setup.
+                    }
+                    _ => {}
+                }
+            }
+            assert!(authenticated);
+            assert!(received_tx.is_none());
+        });
+        let publish_sdk = sdk.clone();
+        let publish = tokio::spawn(async move {
+            publish_sdk
+                .publish_events(&[NostrEventPublishRequest {
+                    endpoints: vec![endpoint],
+                    event,
+                    required_acks: 1,
+                }])
+                .await
+        });
+        timeout(Duration::from_secs(3), received_rx)
+            .await
+            .expect("relay must receive the authenticated EVENT")
+            .unwrap();
+        let relay = sdk
+            .client()
+            .relay(relay_url.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(relay.capabilities().has_write());
+        assert!(!relay.capabilities().has_read());
+        assert!(!publish.is_finished(), "no ACK must not become success");
+        publish.abort();
+        assert!(publish.await.unwrap_err().is_cancelled());
+        timeout(Duration::from_secs(2), async {
+            while sdk.relay_health().await.total_relays != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation must release the authenticated WRITE relay");
+        assert_eq!(
+            sdk.publish_release_attempts.lock().await.get(&relay_url),
+            Some(&1)
+        );
+        assert_eq!(sdk.relay_health().await.total_relays, 0);
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("cancelled publication must close its socket")
+            .unwrap();
+        sdk.client().shutdown().await;
+    }
+
+    async fn assert_cancelled_publish_cleans_write_only_relay(sdk: NostrSdkRelayClient) {
         let endpoint = TransportEndpoint(silent_relay_url().await);
         let relay_url = RelayUrl::parse(endpoint.as_str()).unwrap();
-        let sdk = signed_sdk(Keys::generate());
         let publish_sdk = sdk.clone();
         let publish = tokio::spawn(async move {
             publish_sdk
@@ -7292,17 +8774,18 @@ mod tests {
                 .await
         });
 
-        for _ in 0..100 {
-            if sdk
+        timeout(Duration::from_secs(2), async {
+            while !sdk
                 .publish_connect_attempts
                 .lock()
                 .await
                 .contains_key(&relay_url)
             {
-                break;
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .expect("wire publication must start before cancellation");
         let relay = sdk
             .client()
             .relays()
@@ -7318,12 +8801,13 @@ mod tests {
 
         publish.abort();
         let _ = publish.await;
-        for _ in 0..100 {
-            if sdk.relay_health().await.total_relays == 0 {
-                break;
+        timeout(Duration::from_secs(2), async {
+            while sdk.relay_health().await.total_relays != 0 {
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .expect("cancelled publication must release its transient relay");
 
         assert_eq!(
             sdk.publish_release_attempts.lock().await.get(&relay_url),
@@ -7573,6 +9057,152 @@ mod tests {
 
         assert_eq!(outcome.accepted.len(), 1);
         assert!(outcome.failed.is_empty());
+    }
+
+    /// A known anonymous publisher must hand authentication-required evidence
+    /// back to its owner after one wire attempt, including on a reused socket.
+    #[tokio::test]
+    async fn anonymous_auth_required_does_not_retry_before_account_fallback() {
+        let (endpoint, attempts, server) = auth_required_publish_relay().await;
+        let sdk = NostrSdkRelayClient::from_builder(Client::builder());
+        let keys = Keys::generate();
+        let mut expected = Vec::new();
+        for content in [
+            "first anonymous publication",
+            "second anonymous publication",
+        ] {
+            let signed = EventBuilder::new(Kind::TextNote, content)
+                .finalize(&keys)
+                .unwrap();
+            expected.push(signed.id.to_hex());
+            let event = NostrTransportEvent::from_nostr_event(&signed).unwrap();
+            let error = timeout(
+                Duration::from_secs(5),
+                sdk.publish_event(std::slice::from_ref(&endpoint), &event, 1),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert_eq!(
+                error.publish_message_id(),
+                Some(&cgka_traits::MessageId::new(signed.id.to_bytes().to_vec()))
+            );
+            let failures = error.publish_endpoint_failures();
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].endpoint, endpoint);
+            assert_eq!(
+                failures[0].rejection_category,
+                Some(TransportEndpointRejectionCategory::AuthRequired)
+            );
+            assert_eq!(
+                failures[0].kind,
+                TransportEndpointFailureKind::RetryableUnavailable
+            );
+        }
+        sdk.client().shutdown().await;
+        server.abort();
+        let _ = server.await;
+        assert_eq!(
+            *attempts.lock().await,
+            expected,
+            "anonymous retries cannot authenticate; return the first rejection for account fallback"
+        );
+    }
+
+    /// An opaque client's authenticator is unknown, so it keeps its existing
+    /// retry opportunity even when this test client happens to be anonymous.
+    #[tokio::test]
+    async fn opaque_auth_required_preserves_existing_retry_attempts() {
+        let (endpoint, attempts, server) = auth_required_publish_relay().await;
+        let sdk = NostrSdkRelayClient::new(Client::builder().build());
+        let signed = EventBuilder::new(Kind::TextNote, "opaque authentication")
+            .finalize(&Keys::generate())
+            .unwrap();
+        let event = NostrTransportEvent::from_nostr_event(&signed).unwrap();
+        let error = timeout(
+            Duration::from_secs(5),
+            sdk.publish_event(&[endpoint], &event, 1),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        sdk.client().shutdown().await;
+        server.abort();
+        let _ = server.await;
+        assert_eq!(
+            error.publish_endpoint_failures()[0].rejection_category,
+            Some(TransportEndpointRejectionCategory::AuthRequired)
+        );
+        assert_eq!(
+            *attempts.lock().await,
+            vec![signed.id.to_hex(); SDK_RELAY_PUBLISH_ATTEMPTS]
+        );
+    }
+
+    /// A builder authenticator works even without an adapter account signer;
+    /// signer absence must never classify this client as anonymous.
+    #[tokio::test]
+    async fn owned_authenticator_publishes_without_adapter_signer() {
+        use nostr_relay_builder::builder::{RelayBuilderNip42, RelayBuilderNip42Mode};
+        use nostr_relay_builder::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default().nip42(RelayBuilderNip42 {
+            mode: RelayBuilderNip42Mode::Write,
+        }));
+        relay.run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let keys = Keys::generate();
+        let sdk = NostrSdkRelayClient::from_builder(Client::builder().authenticator(
+            nostr_sdk::authenticator::SignerAuthenticator::new(SdkSigner(Arc::new(keys.clone()))),
+        ));
+        let signed = EventBuilder::new(Kind::TextNote, "builder authentication")
+            .finalize(&keys)
+            .unwrap();
+        let event = NostrTransportEvent::from_nostr_event(&signed).unwrap();
+        let outcome = sdk
+            .publish_event(std::slice::from_ref(&endpoint), &event, 1)
+            .await
+            .unwrap();
+        sdk.client().shutdown().await;
+        relay.shutdown();
+        assert_eq!(outcome.accepted.len(), 1);
+        assert_eq!(outcome.accepted[0].endpoint, endpoint);
+        assert!(outcome.failed.is_empty());
+    }
+
+    /// Real SDK EVENT/OK traffic, without an authenticator or an accepting path.
+    async fn auth_required_publish_relay() -> (
+        TransportEndpoint,
+        Arc<Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let observed = attempts.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                let Ok(text) = message.into_text() else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                if value[0] != "EVENT" {
+                    continue;
+                }
+                let event_id = value[1]["id"].as_str().unwrap().to_owned();
+                observed.lock().await.push(event_id.clone());
+                let response =
+                    serde_json::json!(["OK", event_id, false, "auth-required: authenticate"]);
+                if socket.send(response.to_string().into()).await.is_err() {
+                    return;
+                }
+            }
+        });
+        (endpoint, attempts, server)
     }
 
     #[tokio::test]

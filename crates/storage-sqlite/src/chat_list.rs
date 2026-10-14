@@ -1,5 +1,6 @@
 mod attention;
 mod pages;
+mod selection;
 mod window;
 use crate::account_projection::chat_mute_is_effective;
 use crate::connection::CachedSql;
@@ -26,6 +27,7 @@ pub use pages::{
     ChatListView,
 };
 use rusqlite::{Connection, OptionalExtension, Params, params};
+pub use selection::{ChatListSelectionError, ChatListSelectionSnapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 pub use window::{ChatListWindowQuery, ChatListWindowRead};

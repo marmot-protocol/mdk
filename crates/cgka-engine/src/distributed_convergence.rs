@@ -34,8 +34,9 @@ use crate::convergence_input::{
 };
 use crate::engine::Engine;
 use crate::openmls_projection::{
-    OpenMlsContentKind, OpenMlsProjectionError, OpenMlsReplayObservation, ReplayProfilePolicy,
-    StoredCanonicalizationOptions, apply_openmls_canonicalization_result_with_profile_policy,
+    AppliedGroupChanges, OpenMlsContentKind, OpenMlsProjectionError, OpenMlsReplayObservation,
+    ReplayProfilePolicy, StoredCanonicalizationOptions,
+    apply_openmls_canonicalization_result_with_profile_policy,
     canonicalize_stored_openmls_messages_with_profile_policy,
     openmls_canonicalization_dispositions, project_mls_message,
     retain_current_group_epoch_snapshot, retire_stale_convergence_deferred_commits,
@@ -45,9 +46,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use cgka_traits::convergence_pass::{
     ConvergenceCutoffCause, ConvergencePassMember, ConvergencePassPhase, DurableConvergencePass,
 };
-use cgka_traits::engine::{
-    AppMessageInvalidationReason, GroupEvent, GroupStateChange, GroupStateInvalidationReason,
-};
+use cgka_traits::engine::{AppMessageInvalidationReason, GroupEvent, GroupStateInvalidationReason};
 use cgka_traits::engine_state::EpochState;
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
@@ -160,10 +159,6 @@ pub(crate) fn normalize_convergence_pass_for_runtime(
     true
 }
 
-/// Admin pubkeys, avatar component bytes, and message retention snapshotted on
-/// either side of a convergence apply, for unattributed group-state-change diffs.
-type ReorgComponentSnapshot = (Vec<[u8; 32]>, [Option<Vec<u8>>; 2], Option<u64>);
-
 enum FrozenPassVerificationError {
     Storage(StorageError),
     Integrity,
@@ -220,6 +215,24 @@ impl<S: StorageProvider> Engine<S> {
                 Some(pass.cutoff_monotonic_ms().saturating_sub(now.monotonic_ms))
             }
             Some(pass) if pass.is_active() => Some(0),
+            // RawTransport applications do not open a convergence pass. A
+            // failed post-confirmation replay still needs a scheduler edge,
+            // after existing pass deadlines and pending-publication gates.
+            _ if self.pending_confirmation_replays.contains(group_id)
+                && self
+                    .epoch_manager
+                    .state(group_id)
+                    .is_none_or(|state| matches!(state, EpochState::Stable { .. }))
+                && {
+                    let group = self
+                        .storage
+                        .get_group(group_id)
+                        .map_err(|error| OpenMlsProjectionError::Storage(format!("{error:?}")))?;
+                    !group.is_terminal() && !group.unrecoverable
+                } =>
+            {
+                Some(0)
+            }
             _ if self
                 .has_pending_canonical_applications(group_id)
                 .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))? =>
@@ -364,9 +377,7 @@ impl<S: StorageProvider> Engine<S> {
             group_id,
             policy.convergence.max_rewind_commits,
         )
-        .map_err(|error| {
-            cgka_traits::error::EngineError::Backend(format!("retain anchor: {error}"))
-        })
+        .map_err(cgka_traits::error::EngineError::Storage)
     }
 
     pub(crate) fn convergence_policy_for_group(
@@ -405,7 +416,7 @@ impl<S: StorageProvider> Engine<S> {
             group_id,
             policy.convergence.max_rewind_commits,
         )
-        .map_err(|e| cgka_traits::error::EngineError::Backend(format!("retain anchor: {e}")))
+        .map_err(cgka_traits::error::EngineError::Storage)
     }
 
     #[doc(hidden)]
@@ -1261,21 +1272,6 @@ impl<S: StorageProvider> Engine<S> {
         if pass.phase == ConvergencePassPhase::Completed {
             return Ok(settled_empty_result(previous_tip.0));
         }
-        // Pre-apply captures for the reorg diff, taken only once a pass is
-        // actually resolving. Capturing them before the Collecting/no-input
-        // early returns above paid a group-record read plus a full
-        // `MlsGroup::load` (via `reorg_component_snapshot`) on every scheduler
-        // poll of a not-yet-frozen pass, for a result those returns discard.
-        let previous_group = self
-            .storage
-            .get_group(group_id)
-            .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-        // Pre-apply admin/avatar component snapshot, mirroring the direct
-        // inbound seam's before-state capture so the reorg path can emit the
-        // same profile/admin state-change events. Best-effort: a group whose
-        // MLS state isn't loadable just skips those diffs.
-        let previous_components = self.reorg_component_snapshot(group_id);
-        let previous_name = previous_group.name.clone();
         let max_retained_anchor_rewind = policy.convergence.max_rewind_commits;
         let retained_anchor_epoch = previous_tip
             .0
@@ -1533,23 +1529,73 @@ impl<S: StorageProvider> Engine<S> {
             Vec::new()
         };
         let pre_apply_commit_states = self.pre_apply_commit_states(&result)?;
-        let (observations, application_events) = self.storage.with_transaction(|storage| {
-            let observations = apply_openmls_canonicalization_result_with_profile_policy(
-                storage,
-                group_id,
-                &result,
-                max_retained_anchor_rewind,
-                replay_profile_policy,
-            )?;
-            storage.put_convergence_pass(&completed_pass)?;
-            let application_events = Self::application_replay_events(group_id, &observations)?;
-            for event in &application_events {
-                storage
-                    .put_pending_application_event(event)
-                    .map_err(storage_projection_error)?;
-            }
-            Ok::<_, OpenMlsProjectionError>((observations, application_events))
-        })?;
+        // Capture the actual source tree only after selection finishes. Yielded,
+        // rejected and app-only passes must not pay for a membership snapshot.
+        let previous_membership = if result.selected_tip.is_some() {
+            Some(
+                self.canonical_membership_snapshot(group_id)
+                    .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let (group_changes, application_events, membership_effects) =
+            self.storage.with_transaction(|storage| {
+                let output = apply_openmls_canonicalization_result_with_profile_policy(
+                    storage,
+                    group_id,
+                    &result,
+                    max_retained_anchor_rewind,
+                    replay_profile_policy,
+                )?;
+                // Membership cleanup belongs to canonical apply: a failed queue or
+                // leave-request write must roll back MLS and the completed pass too.
+                let membership_effects = if let Some(before) = previous_membership.as_ref() {
+                    let group = openmls::group::MlsGroup::load(
+                        storage.mls_storage(),
+                        &openmls::group::GroupId::from_slice(group_id.as_slice()),
+                    )
+                    .map_err(|error| OpenMlsProjectionError::Storage(format!("{error:?}")))?
+                    .ok_or_else(|| {
+                        OpenMlsProjectionError::Replay("selected group missing".into())
+                    })?;
+                    // Disband owns its terminal cleanup and must not announce an
+                    // intermediate local restoration from its replayed source tree.
+                    if crate::app_components::lifecycle_of_group(&group)
+                        .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?
+                        == Some(cgka_traits::app_components::GroupLifecycleV1::Disbanded)
+                    {
+                        None
+                    } else {
+                        let after = crate::membership_effects::MembershipSnapshot::capture(
+                            &group,
+                            self.identity.self_id(),
+                            storage.get_group(group_id)?.removed,
+                        );
+                        Some(
+                            self.prepare_canonical_membership_effects_on_storage(
+                                storage, group_id, before, &after,
+                            )
+                            .map_err(|error| OpenMlsProjectionError::Storage(error.to_string()))?,
+                        )
+                    }
+                } else {
+                    None
+                };
+                storage.put_convergence_pass(&completed_pass)?;
+                let application_events =
+                    Self::application_replay_events(group_id, &output.observations)?;
+                for event in &application_events {
+                    storage
+                        .put_pending_application_event(event)
+                        .map_err(storage_projection_error)?;
+                }
+                Ok::<_, OpenMlsProjectionError>((
+                    output.group_changes,
+                    application_events,
+                    membership_effects,
+                ))
+            })?;
         // mdk#1472: completing the pass opens the gate that held queued
         // outbound intents. A drain that ran before the settle consumed the
         // one-shot schedule edge without releasing them, so completion must
@@ -1587,8 +1633,6 @@ impl<S: StorageProvider> Engine<S> {
         // (prior id retained for the overlap window).
         self.reindex_transport_group_id(group_id);
         let origin_commit_id = single_accepted_commit_id(&result);
-        let origin_commit_actor =
-            single_accepted_commit_actor(&observations, origin_commit_id.as_ref());
 
         let terminalized = if let Some(selected_tip) = result.selected_tip {
             let selected_tip = EpochId(selected_tip);
@@ -1613,26 +1657,34 @@ impl<S: StorageProvider> Engine<S> {
                     now_ms,
                 );
             }
-            let terminalized = self
-                .settle_disband_after_convergence(
-                    group_id,
-                    &result.accepted_commits,
-                    origin_commit_id.as_ref(),
-                )
-                .map_err(|error| OpenMlsProjectionError::Storage(error.to_string()))?;
-            if !terminalized {
+            // The canonical transaction already committed these non-disband
+            // effects. Publish them before unrelated, fallible candidate cleanup
+            // can return: a removed copy cannot reconstruct its old membership.
+            if let Some(membership_effects) = membership_effects {
                 self.emit_convergence_events(
                     group_id,
-                    previous_group.members,
-                    &previous_name,
-                    previous_components,
+                    membership_effects,
                     previous_tip,
                     selected_tip,
-                    origin_commit_id,
-                    origin_commit_actor,
+                    &group_changes,
                 )?;
+            } else {
+                // These earlier commits are already canonical even if the
+                // closing disband's tombstone cleanup fails. Their deltas are
+                // local to this apply and cannot be reconstructed on retry.
+                self.emit_applied_group_changes(
+                    group_id,
+                    group_changes
+                        .iter()
+                        .filter(|commit| commit.resulting_epoch < selected_tip),
+                );
             }
-            terminalized
+            self.settle_disband_after_convergence(
+                group_id,
+                &result.accepted_commits,
+                origin_commit_id.as_ref(),
+            )
+            .map_err(|error| OpenMlsProjectionError::Storage(error.to_string()))?
         } else {
             self.settle_disband_after_convergence(
                 group_id,
@@ -1686,80 +1738,38 @@ impl<S: StorageProvider> Engine<S> {
         Ok(result)
     }
 
-    /// Best-effort load of the live MlsGroup's admin set, avatar component
-    /// bytes, and message-retention seconds for before/after diffing around a
-    /// convergence apply. `None` when the MLS state isn't materialized; the
-    /// caller skips those diffs rather than failing convergence over missing
-    /// presentation components.
-    fn reorg_component_snapshot(&self, group_id: &GroupId) -> Option<ReorgComponentSnapshot> {
-        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
-            &self.crypto,
-            self.storage.mls_storage(),
-        );
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let mls_group = openmls::group::MlsGroup::load(
-            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
-                &provider,
-            ),
-            &mls_gid,
-        )
-        .ok()
-        .flatten()?;
-        let admins = crate::app_components::admins_of_group(&mls_group).unwrap_or_default();
-        let message_retention =
-            crate::app_components::message_retention_seconds_of_group(&mls_group)
-                .ok()
-                .flatten();
-        Some((
-            admins,
-            crate::message_processor::avatar_component_snapshot(&mls_group),
-            message_retention,
-        ))
-    }
-
-    /// Whether the live OpenMLS group state records the local member as an
-    /// active member: the group loads, is active, and its own leaf carries
-    /// the engine's identity. Fail-closed (`false`) on any missing or
-    /// unreadable state, so callers gating a safety-relevant transition on
-    /// canonical membership never act on a copy MLS itself would refuse.
-    fn self_leaf_is_active_in_mls(&self, group_id: &GroupId) -> bool {
-        let provider = crate::provider::EngineOpenMlsProvider::<S>::new(
-            &self.crypto,
-            self.storage.mls_storage(),
-        );
-        let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());
-        let Ok(Some(mls_group)) = openmls::group::MlsGroup::load(
-            <crate::provider::EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
-                &provider,
-            ),
-            &mls_gid,
-        ) else {
-            return false;
-        };
-        if !mls_group.is_active() {
-            return false;
+    /// Emit immutable commit deltas without reading live MLS state, including
+    /// earlier commits in a pass whose closing commit deleted that state.
+    pub(super) fn emit_applied_group_changes<'a>(
+        &mut self,
+        group_id: &GroupId,
+        group_changes: impl IntoIterator<Item = &'a AppliedGroupChanges>,
+    ) {
+        // Each accepted replayed commit retains its own source-state delta.
+        // A net previous-tip -> final-tip diff loses intermediate changes and
+        // cannot supply either a shared target id or a fork-withdrawal link.
+        for commit in group_changes {
+            for (actor, change) in &commit.changes {
+                self.push_group_state_change(
+                    group_id,
+                    commit.resulting_epoch,
+                    Some(actor.clone()),
+                    change.clone(),
+                    Some(commit.commit_id.clone()),
+                );
+            }
         }
-        let Some(leaf) = mls_group.own_leaf_node() else {
-            return false;
-        };
-        let Ok(credential) = openmls::prelude::BasicCredential::try_from(leaf.credential().clone())
-        else {
-            return false;
-        };
-        credential.identity() == self.identity.self_id().as_slice()
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Emit authenticated per-commit activity and reconcile local removal state.
+    /// Roster repairs change membership/send eligibility without fabricating invitations.
     fn emit_convergence_events(
         &mut self,
         group_id: &GroupId,
-        previous_members: Vec<cgka_traits::group::Member>,
-        previous_name: &str,
-        previous_components: Option<ReorgComponentSnapshot>,
+        membership_effects: crate::membership_effects::CanonicalMembershipEffects,
         previous_tip: EpochId,
         selected_tip: EpochId,
-        origin_commit_id: Option<MessageId>,
-        origin_commit_actor: Option<MemberId>,
+        group_changes: &[AppliedGroupChanges],
     ) -> Result<(), OpenMlsProjectionError> {
         if previous_tip != selected_tip {
             self.events_buf.push_back(GroupEvent::EpochChanged {
@@ -1769,161 +1779,17 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
 
-        let current_group = self
-            .storage
-            .get_group(group_id)
-            .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-        // `origin_commit_id` is populated only when this convergence pass applied
-        // a single accepted commit, so the entire previous-tip → selected-tip
-        // component diff can be tombstoned with that commit if it later loses a
-        // fork (see `single_accepted_commit_id` + `emit_rolled_back_commits`).
-        // Message-retention rows also use `origin_commit_actor` in that same
-        // single-commit case so peers render the actor that changed the timer.
-        // When several commits were applied in one pass the delta cannot be
-        // split per-commit, so rows fall back to no origin commit and no actor.
-        // The previous-tip → selected-tip diff is net of commits the direct seam
-        // already applied (their effects are part of the "previous" snapshot),
-        // so changes already emitted there do not re-emit here as duplicates.
-        if let (
-            Some((before_admins, before_avatar, before_message_retention)),
-            Some((after_admins, after_avatar, after_message_retention)),
-        ) = (previous_components, self.reorg_component_snapshot(group_id))
+        self.emit_applied_group_changes(group_id, group_changes);
+        self.finish_canonical_membership_effects(group_id, membership_effects);
+        if self
+            .with_mls_group(group_id, |group| {
+                Ok(crate::identity::local_leaf_is_active(
+                    group,
+                    self.identity.self_id(),
+                ))
+            })
+            .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?
         {
-            for change in crate::group_state_changes::admin_changes(&before_admins, &after_admins) {
-                self.push_group_state_change(
-                    group_id,
-                    selected_tip,
-                    None,
-                    change,
-                    origin_commit_id.clone(),
-                );
-            }
-            for change in crate::group_state_changes::profile_changes(
-                Some(previous_name),
-                Some(current_group.name.as_str()),
-                &before_avatar,
-                &after_avatar,
-            ) {
-                self.push_group_state_change(
-                    group_id,
-                    selected_tip,
-                    None,
-                    change,
-                    origin_commit_id.clone(),
-                );
-            }
-            for change in crate::group_state_changes::message_retention_changes(
-                before_message_retention,
-                after_message_retention,
-            ) {
-                self.push_group_state_change(
-                    group_id,
-                    selected_tip,
-                    origin_commit_actor.clone(),
-                    change,
-                    origin_commit_id.clone(),
-                );
-            }
-        }
-        // Captured before `current_group.members` is consumed below: gates the
-        // removed-marker reconciliation so the common (not-removed) path pays
-        // no extra storage read.
-        let group_record_was_removed = current_group.removed;
-        let previous_ids: HashSet<MemberId> = previous_members
-            .iter()
-            .map(|member| member.id.clone())
-            .collect();
-        let current_ids: HashSet<MemberId> = current_group
-            .members
-            .iter()
-            .map(|member| member.id.clone())
-            .collect();
-
-        // Convergence reorg: we reach the canonical branch by replaying stored
-        // commits, so the committer that effected each membership delta is not
-        // resolved cheaply here. Emit the change unattributed (`actor: None`);
-        // the row still renders ("X was added") without a "by Y". The
-        // `origin_commit_id` link (when a single commit drove this pass) is
-        // independent of `actor` — it ties the row to its origin commit for
-        // fork-recovery tombstoning, not to a renderable committer.
-        for member in current_group.members {
-            if !previous_ids.contains(&member.id) {
-                self.push_group_state_change(
-                    group_id,
-                    selected_tip,
-                    None,
-                    GroupStateChange::MemberAdded { member: member.id },
-                    origin_commit_id.clone(),
-                );
-            }
-        }
-        for member_id in previous_ids.difference(&current_ids) {
-            if member_id == self.identity.self_id() {
-                self.clear_leave_request_state(group_id)
-                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-                // The canonical branch removed our own leaf: mark the local
-                // copy removed (member-departure.md, "Realizing removal") in
-                // the same pass that emits the self-removed notification
-                // below, so the marker and the notification stay coupled and
-                // later `SelfEvicted` input does not re-emit it.
-                let mut group = self
-                    .storage
-                    .get_group(group_id)
-                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-                if !group.removed {
-                    group.removed = true;
-                    self.storage
-                        .put_group(&group)
-                        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-                }
-                // The copy just became removed: purge queued outbound intents
-                // so later drains do not re-fail them forever against the
-                // removed-copy send gate.
-                self.discard_queued_outbound_intents_for_removed_group(group_id)
-                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-                // Same for retained inbound rows: see
-                // `retire_deferred_peel_rows_for_terminal_group` for why no
-                // later sweep can reach them.
-                self.retire_deferred_peel_rows_for_terminal_group(group_id)
-                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-            }
-            self.push_group_state_change(
-                group_id,
-                selected_tip,
-                None,
-                GroupStateChange::MemberRemoved {
-                    member: member_id.clone(),
-                },
-                origin_commit_id.clone(),
-            );
-        }
-        if current_ids.contains(self.identity.self_id()) {
-            // The selected canonical branch records our membership, so a
-            // surviving `removed` marker must clear (module docs, "Removed-
-            // marker lifecycle"; marmot-protocol/marmot#220). Gated on the
-            // record snapshot loaded above (no extra read on the common
-            // not-removed path) AND on the live MLS state carrying our
-            // active leaf, so the heal stays derivable from canonical MLS
-            // state even if the record roster were ever stale.
-            if group_record_was_removed && self.self_leaf_is_active_in_mls(group_id) {
-                let mut group = self
-                    .storage
-                    .get_group(group_id)
-                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-                if group.removed {
-                    group.removed = false;
-                    self.storage
-                        .put_group(&group)
-                        .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-                    // Privacy-safe breadcrumb: aggregate signal only, no
-                    // group/member ids (observability.md).
-                    tracing::info!(
-                        target: "cgka_engine::distributed_convergence",
-                        method = "emit_convergence_events",
-                        "cleared removed marker: selected canonical branch records local membership"
-                    );
-                }
-            }
             if self
                 .load_leave_request_state(group_id)
                 .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?
@@ -2377,34 +2243,13 @@ fn invalidated_app_is_retryable(
 
 /// The single commit id this convergence pass applied, hex-decoded to a
 /// [`MessageId`], or `None` when the pass applied zero or several commits.
-///
-/// Convergence-synthesized group-state-change rows can only be attributed to a
-/// concrete origin commit when exactly one commit was accepted this pass — then
-/// the entire previous-tip → selected-tip diff is that commit's effect. With
-/// multiple accepted commits the per-commit attribution is ambiguous (the diff
-/// is their combined effect), so the rows use no origin commit and no actor.
+/// A terminal disband may use the sole accepted commit as its origin.
+/// Ordinary activity rows instead retain their per-commit replay provenance.
 fn single_accepted_commit_id(result: &CanonicalizationResult) -> Option<MessageId> {
     let [only_commit] = result.accepted_commits.as_slice() else {
         return None;
     };
     hex::decode(only_commit).ok().map(MessageId::new)
-}
-
-fn single_accepted_commit_actor(
-    observations: &[OpenMlsReplayObservation],
-    origin_commit_id: Option<&MessageId>,
-) -> Option<MemberId> {
-    let origin_commit_hex = hex::encode(origin_commit_id?.as_slice());
-    observations
-        .iter()
-        .find_map(|observation| match observation {
-            OpenMlsReplayObservation::CommitStaged {
-                message_id,
-                committer,
-                ..
-            } if message_id == &origin_commit_hex => Some(MemberId::new(committer.clone())),
-            _ => None,
-        })
 }
 
 /// Result returned for a group already in `Unrecoverable`: no canonical

@@ -5,6 +5,7 @@ import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 
 import { createMarmotChannelPlugin, MARMOT_CHANNEL_ID } from "./src/channel.js";
 import { registerMarmotHistoryTool } from "./src/history-tool.js";
+import { registerMarmotGroupProfileTool } from "./src/group-profile-tool.js";
 
 export default defineChannelPluginEntry({
   id: MARMOT_CHANNEL_ID,
@@ -14,5 +15,8 @@ export default defineChannelPluginEntry({
   // 2026.7.2-beta's channel-core and core barrels currently name structurally
   // equivalent OpenClawPluginApi types from different generated declaration
   // bundles. Keep the runtime handoff explicit until those barrels converge.
-  registerFull: (api) => registerMarmotHistoryTool(api as never),
+  registerFull: (api) => {
+    registerMarmotHistoryTool(api as never);
+    registerMarmotGroupProfileTool(api as never);
+  },
 });

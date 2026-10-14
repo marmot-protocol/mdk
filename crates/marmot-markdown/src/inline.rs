@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use crate::ast::{
     AutolinkKind, Block, Document, Inline, ListItem, NostrEntity, NostrHrp, TableCell,
+    TimestampStyle,
 };
 use crate::block::LinkRef;
 use crate::destination::{classify_autolink_destination, classify_link_destination};
@@ -413,7 +414,11 @@ pub(crate) fn tokenize(raw: &str, refs: &HashMap<String, LinkRef>) -> Vec<Inline
                 }
             }
             b'<' => {
-                if let Some((url, end)) = try_uri_autolink(bytes, i) {
+                if let Some((timestamp, end)) = try_timestamp(bytes, i) {
+                    flush_text(&mut out, &mut buf, &delims);
+                    out.push(timestamp);
+                    i = end;
+                } else if let Some((url, end)) = try_uri_autolink(bytes, i) {
                     flush_text(&mut out, &mut buf, &delims);
                     let classification = classify_autolink_destination(&url, AutolinkKind::Uri);
                     out.push(Inline::Autolink {
@@ -1080,6 +1085,62 @@ fn absorb_link(
 // ---------------------------------------------------------------------------
 // Autolinks + raw HTML
 // ---------------------------------------------------------------------------
+
+/// Recognize source syntax before entity decoding. No locale, timezone or
+/// clock is captured: clients format the immutable instant at render time.
+fn try_timestamp(bytes: &[u8], i: usize) -> Option<(Inline, usize)> {
+    if !bytes[i..].starts_with(b"<t:") {
+        return None;
+    }
+
+    let start = i + 3;
+    let mut end = start;
+    if bytes.get(end) == Some(&b'-') {
+        end += 1;
+    }
+    let digits = end;
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+    }
+    if end == digits {
+        return None;
+    }
+    let unix_seconds = std::str::from_utf8(&bytes[start..end])
+        .ok()?
+        .parse::<i64>()
+        .ok()?;
+
+    let style = if bytes.get(end) == Some(&b':') {
+        end += 1;
+        let style = match bytes.get(end)? {
+            b't' => TimestampStyle::ShortTime,
+            b'T' => TimestampStyle::LongTime,
+            b'd' => TimestampStyle::ShortDate,
+            b'D' => TimestampStyle::LongDate,
+            b'f' => TimestampStyle::ShortDateTime,
+            b'F' => TimestampStyle::LongDateTime,
+            b's' => TimestampStyle::CompactDateTime,
+            b'S' => TimestampStyle::CompactDateTimeSeconds,
+            b'R' => TimestampStyle::Relative,
+            _ => return None,
+        };
+        end += 1;
+        style
+    } else {
+        TimestampStyle::ShortDateTime
+    };
+    if bytes.get(end) != Some(&b'>') {
+        return None;
+    }
+
+    Some((
+        Inline::Timestamp {
+            unix_seconds,
+            style,
+        },
+        end + 1,
+    ))
+}
 
 /// Prefixes recognized as bare (unbracketed) URLs.
 ///

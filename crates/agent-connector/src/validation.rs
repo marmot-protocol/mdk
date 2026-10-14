@@ -159,6 +159,9 @@ pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'sta
         AgentControlRequest::AccountPublishKeyPackage { .. } => "account_publish_key_package",
         AgentControlRequest::AccountPublishProfile { .. } => "account_publish_profile",
         AgentControlRequest::AccountProfileLookup { .. } => "account_profile_lookup",
+        AgentControlRequest::AccountRelayLists { .. } => "account_relay_lists",
+        AgentControlRequest::AccountRelayListAdd { .. } => "account_relay_list_add",
+        AgentControlRequest::AccountRelayListRemove { .. } => "account_relay_list_remove",
         AgentControlRequest::SendAgentActivity { .. } => "send_agent_activity",
         AgentControlRequest::SendAgentOperationEvent { .. } => "send_agent_operation_event",
         AgentControlRequest::SendGroupSystemEvent { .. } => "send_group_system_event",
@@ -298,6 +301,41 @@ pub(crate) fn validate_profile_field(
         return Err(ConnectorError::InvalidProfileField(field, "too_long"));
     }
     Ok(Some(value))
+}
+
+/// Validate one relay URL a control request wants to publish in an account
+/// relay list.
+///
+/// Mirrors `wn relays`' rule: parse the URL, require a host, and admit `wss://`
+/// anywhere but `ws://` only for a literal loopback host while the connector's
+/// dev gate is set. Validation runs before any network work, so a hostile or
+/// unusable URL cannot trigger a relay read. Retired and unsafe hosts are
+/// rejected later by the relay-plane safety chokepoint, which stays the single
+/// authority on the endpoints an account may adopt.
+pub(crate) fn validate_relay_url(
+    value: &str,
+    allow_loopback_relays: bool,
+) -> Result<String, ConnectorError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ConnectorError::InvalidRelayUrl("empty"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(ConnectorError::InvalidRelayUrl("control_characters"));
+    }
+    if value.chars().count() > crate::MAX_RELAY_URL_CHARS {
+        return Err(ConnectorError::InvalidRelayUrl("too_long"));
+    }
+    let parsed =
+        url::Url::parse(value).map_err(|_| ConnectorError::InvalidRelayUrl("malformed"))?;
+    let Some(host) = parsed.host() else {
+        return Err(ConnectorError::InvalidRelayUrl("missing_host"));
+    };
+    let loopback = cgka_traits::app_components::is_loopback_host(host);
+    if parsed.scheme() != "wss" && !(parsed.scheme() == "ws" && allow_loopback_relays && loopback) {
+        return Err(ConnectorError::InvalidRelayUrl("unsupported_scheme"));
+    }
+    Ok(value.to_owned())
 }
 
 pub(crate) fn transcript_hash_from_hex(value: &str) -> Result<[u8; 32], ConnectorError> {

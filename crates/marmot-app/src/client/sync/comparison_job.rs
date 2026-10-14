@@ -830,16 +830,18 @@ impl AppClient {
         &mut self,
         grant: AttemptGrant,
         execution: ComparisonExecution,
-        admission: Option<&ComparisonAdmission>,
+        admission: Option<&mut ComparisonAdmission>,
         error: AppError,
     ) -> AppError {
         let mut execution = *execution.execution;
+        let mut failure = comparison_failure(error);
         if let Some(admission) = admission {
             execution
                 .tally
                 .observe_unsettled_routes(admission.unsettled_routes());
+            failure.partial_summary = std::mem::take(&mut admission.summary);
         }
-        match self.finish_recovery_execution(&grant, execution, Err(comparison_failure(error))) {
+        match self.finish_recovery_execution(&grant, execution, Err(failure)) {
             Ok(_) => unreachable!("a failed recovery cannot complete"),
             Err(failure) => {
                 self.pending_failed_sync_summary
@@ -855,10 +857,18 @@ impl AppClient {
         execution: &mut RecoveryExecutionState,
         admission: ComparisonAdmission,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        let mut summary = admission.summary;
+        let mut failure = |error| {
+            ClassifiedSyncFailure::at_stage(
+                std::mem::take(&mut summary),
+                error,
+                SyncFailureStage::Unknown,
+            )
+        };
         let storage = self
             .app
             .account_storage(&self.state.label)
-            .map_err(comparison_failure)?;
+            .map_err(&mut failure)?;
         let mut outcomes = Vec::with_capacity(admission.routes.len());
         for route in admission.routes {
             // A route whose batch was not fully admitted keeps its old cursor,
@@ -866,7 +876,7 @@ impl AppClient {
             if route.admitted && route.cursor != route.initial_cursor {
                 storage
                     .advance_transport_reconciliation_replay_cursor(&route.route, route.cursor)
-                    .map_err(|error| comparison_failure(error.into()))?;
+                    .map_err(|error| failure(error.into()))?;
             }
             outcomes.push(super::RouteComparison {
                 route: route.route,
@@ -889,7 +899,7 @@ impl AppClient {
             &mut execution.counts,
             &mut execution.tally,
             outcomes,
-            admission.summary,
+            summary,
         )
         .await
     }
@@ -2019,5 +2029,101 @@ mod tests {
             .find(|row| row["event"]["attempt_serial"] == serial)
             .unwrap();
         assert_eq!(finished["event"]["outcome"], "unserved");
+    }
+    /// A real admission repairs retained projection work before a later grant
+    /// failure. Both the worker and inline checkpoint must deliver that prefix.
+    #[tokio::test]
+    async fn failed_comparison_retains_repaired_admission_prefix() {
+        for checkpoint in [false, true] {
+            let mut fixture = fixture().await;
+            let app = fixture.client.app.clone();
+            let connection =
+                super::super::runtime_group_subscription_refresh_tests::projection_fault_connection(
+                    &app,
+                );
+            connection.execute_batch("CREATE TRIGGER fail_repaired_activity BEFORE INSERT ON app_events WHEN NEW.kind = 1210 BEGIN SELECT RAISE(FAIL, 'injected activity'); END;").unwrap();
+            let effects = marmot_account::AccountDeviceEffects {
+                events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
+                    group_id: fixture.group_id.clone(),
+                    epoch: cgka_traits::EpochId(1),
+                    actor: Some(fixture.client.runtime.session().self_id()),
+                    change: cgka_traits::engine::GroupStateChange::GroupRenamed {
+                        name: "admitted repair".into(),
+                        previous_name: None,
+                    },
+                    origin_commit_id: None,
+                }],
+                ..Default::default()
+            };
+            assert!(
+                fixture
+                    .client
+                    .observe_drained_session_events(&effects)
+                    .await
+                    .is_err()
+            );
+            connection
+                .execute_batch("DROP TRIGGER fail_repaired_activity")
+                .unwrap();
+            let (grant, mut execution, route, group_route) = group_route_grant(&mut fixture).await;
+            let candidates = (0..MAX_COMPARISON_ADMISSION_PER_TURN + 1)
+                .map(|_| candidate_for_route(group_route))
+                .collect();
+            let mut admission = fixture
+                .client
+                .accept_comparison_network(&grant, &mut execution, fetched(route, candidates))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !fixture
+                    .client
+                    .admit_comparison_turn(&grant, &mut execution, &mut admission)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(admission.summary.projection_updates.len(), 1);
+            if checkpoint {
+                fixture
+                    .client
+                    .admit_comparison_turn(&grant, &mut execution, &mut admission)
+                    .await
+                    .unwrap();
+                // Unreadable candidates may withhold route admission. The
+                // admitted cursor is the checkpoint whose write we fail here.
+                admission.routes[0].admitted = true;
+                connection.execute_batch("CREATE TRIGGER fail_repair_cursor BEFORE UPDATE OF replay_after ON transport_reconciliation_route_state BEGIN SELECT RAISE(FAIL, 'injected cursor'); END;").unwrap();
+                assert!(
+                    fixture
+                        .client
+                        .finish_comparison_grant(grant, execution, Some(admission))
+                        .await
+                        .is_err()
+                );
+            } else {
+                fixture.client.released_backfill_reload_pending = true;
+                fixture.client.fail_next_released_backfill_reload = true;
+                let error = fixture
+                    .client
+                    .admit_comparison_turn(&grant, &mut execution, &mut admission)
+                    .await
+                    .unwrap_err();
+                fixture
+                    .client
+                    .fail_comparison_grant(grant, execution, Some(&mut admission), error);
+                assert!(admission.summary.projection_updates.is_empty());
+            }
+            assert_eq!(
+                std::mem::take(&mut fixture.client.pending_failed_sync_summary)
+                    .projection_updates
+                    .len(),
+                1
+            );
+            assert!(
+                std::mem::take(&mut fixture.client.pending_failed_sync_summary)
+                    .projection_updates
+                    .is_empty()
+            );
+        }
     }
 }

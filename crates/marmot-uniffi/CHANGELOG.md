@@ -2,6 +2,135 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- `MarmotKitError` adds `GroupCatchingUp`: a group change was refused because the group may have moved past this device and recovery has not caught it up yet (mdk#2258). Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
+- `AttachmentTransferStateFfi` adds `StorageBlocked`: free disk cannot cover
+  the publication reserve for the body, checkpoints are kept, and the job
+  readmits once space frees or on explicit Retry. Update exhaustive
+  Swift/Kotlin handling and regenerate bindings with the matching native
+  library; render a storage prompt rather than a retry timer. See
+  [the attachment access contract](ATTACHMENT-ACCESS.md).
+- `MarmotKitError` adds `GroupCommitUndelivered`: a group change was refused because the group's last change has not reached every group relay yet (mdk#2255). Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
+
+### Added
+
+- Account-wide attachment candidate pages, group/sender/date queries and opaque account/query-bound cursor/version handles. Filtered empty pages can continue; source changes require restart. Existing group history and acquisition primitives are unchanged.
+
+- `Marmot::send_prepared_media_with_client_token` exposes captured ordinary-media admission with transactional conditional draft consumption. Use the original token and revision for live retries, recover ownership by token after interruption, and pair regenerated Swift/Kotlin bindings with the matching library. See [local sends](LOCAL-SENDS.md).
+
+- `Marmot::acknowledge_group_catching_up`: after `GroupCatchingUp`, call it once the user accepts that the change may split the group, then retry. See [the epoch-gap notes](README.md#history-may-be-incomplete-notices).
+
+- `Marmot::group_commit_delivery` returns the relays still owed the group's last change (`GroupCommitDeliveryFfi`), and `Marmot::acknowledge_group_commit_undelivered` lets one change through after `GroupCommitUndelivered` once the user accepts the risk. See [the delivery notes](README.md#history-may-be-incomplete-notices).
+
+## 0.13.0 - 2026-10-12
+
+Regenerate Swift/Kotlin bindings with the matching native library. See the
+[release notes](../../docs/release/0.13.0.md) and the
+[client upgrade guide](../../docs/integration/0.13.0.md).
+
+### Breaking changes
+
+- External-signer accounts move their device-local SQLCipher key from the
+  plaintext `.external-sqlcipher-secret` file into the configured `SecretStore`
+  (`.external-sqlcipher/<account label>`) on first open, then scrub and remove the
+  file. Older binaries cannot open these databases; downgrade is unsupported.
+  Opening a database with neither credential fails instead of generating a key.
+
+- `MarmotKitError` adds `ModerationReportingNotConfigured`,
+  `InvalidModerationReportConfig`, `InvalidReportedPublicKey`, `CannotReportSelf`
+  and `ModerationReportRateLimited`. Regenerate bindings with the matching
+  library and update exhaustive Swift `switch` / Kotlin `when` handling.
+
+- `OnboardingRepairProposalFfi.relay_repair` is a new optional field without
+  a binding default. Regenerate matching Swift/Kotlin bindings and pass `nil`
+  (Swift) or `null` (Kotlin) in host record initializers without a typed preview.
+- Native lifecycle events add `LocalGroupCopyTerminated`, `LocalGroupCopyRestored`,
+  and `GroupMemberLeavesRemoved`. Update exhaustive Swift/Kotlin event handling
+  and regenerate bindings with the matching native library. Restoration describes
+  retained-history repair, not automatic scheduler restoration of removed copies.
+- The optional opaque `ChatListDraftVersionFfi` object in
+  `PresentedChatRowFfi.draft_version` correlates the presented row's draft
+  metadata with a captured composer revision through
+  `MessageDraftRevisionFfi::includes_chat_list_version`. Regenerate Swift/Kotlin
+  bindings with the matching library. Host-constructed row records must pass
+  `nil` (Swift), `null` (Kotlin), or a version for the new optional field. Keep
+  these opaque versions device-local and use revision-checked draft cleanup
+  after local send acceptance. Identical-text saves advance the draft revision
+  and emit a complete replacement presented-list snapshot.
+- Attachment history adds `AttachmentRoleFfi` and the required, defaultless
+  `AttachmentEntryFfi.role` field. Regenerate Swift/Kotlin bindings with the
+  matching native library and update host record constructors and fixtures.
+  Gallery clients can exclude `InlineEmoji`; preserve slots and continue paging
+  after filtered pages as described in [the handoff](ATTACHMENT-HISTORY.md).
+
+### Added
+
+- `set_startup_diagnostics_enabled` and `startup_diagnostics_snapshot`
+  (`NativeStartupSnapshotFfi`) report fixed startup phases, outcomes and
+  migration progress. Local capture is off by default and changes no upload
+  consent or database state.
+
+- The runtime follows the opt-in `WN_SOCKS5_*` proxy settings described in
+  the marmot-app [SOCKS5 routing](../marmot-app/README.md#socks5-routing)
+  section. With the variables unset, nothing changes. When they are invalid,
+  `Marmot::new` and `Marmot::new_with_options` return an error instead of
+  connecting directly. Agent preview publishing and watching are unavailable
+  while SOCKS5 is on.
+
+- `submit_moderation_report`, `moderation_reporting_available` and
+  `configure_moderation_reporting` add private, NIP-59 gift-wrapped NIP-56
+  reports to the deployment's moderation team (`ModerationReportOriginFfi`,
+  `ModerationReportOutcomeFfi`). `MarmotOptions.moderation_report_config` is
+  optional, defaults to unset, and is set per build flavor. This is additive:
+  `report_message`, `content_reports` and `dismiss_reports` are unchanged.
+
+- `create_identity_with_initial_profile` creates a generated identity whose
+  first public kind-0 is the onboarding-selected profile. Prefer it over
+  `create_identity_with_profile` followed by `publish_user_profile`, which
+  exposes the generated default to contacts first.
+- `Marmot::propose_onboarding_relay_repair` previews a lossless relay-list repair
+  without signing or publishing. `OnboardingRepairProposalFfi.relay_repair` carries
+  the typed before/after tags, exact diff, restored capabilities and ManualReview
+  mode. Optional passed-step previews retain readiness when dismissed
+  before approval.
+- Markdown tokens expose local-time timestamps through
+  `MarkdownInlineFfi::Timestamp { unix_seconds, style }` and all nine typed
+  `MarkdownTimestampStyleFfi` variants. Seconds remain signed and unformatted;
+  native renderers own locale/timezone formatting and visible relative-time
+  refresh. Update exhaustive inline switches with matching generated bindings.
+- `Marmot::message_reactions` returns complete local reaction details for one exact
+  account/group/message, with one effective entry per sender/emoji and no
+  conversation-preview cap. Missing, hidden, deleted, invalidated and
+  retention-pruned targets return no participants; blocked reactors are excluded.
+  The read performs no network work or conversation-history scan.
+  Regenerate matching Swift/Kotlin bindings to call `messageReactions`.
+- `Marmot::upload_media_files` and `upload_media_files_with_client_token`
+  take `MediaFileUploadRequestFfi` (`source_path`, optional `expected_size`)
+  and a `MediaFileTransferControlFfi` for cancellation and monotonic
+  progress, so large attachments no longer cross the FFI as byte arrays.
+  `max_file_media_ciphertext_bytes()` reports the batch bound. Existing
+  `upload_media` APIs are unchanged. File-backed download is not yet
+  exposed. (#2175)
+
+### Changed
+
+- Polls can be created in direct conversations as well as groups.
+
+- `retired_relay_hosts()` no longer includes `relay.damus.io`, and
+  `classify_relay_endpoints` now reports it as `Allowed`.
+
+### Fixed
+
+- File-transfer cancellation documentation identifies admission start as the
+  last interruptible boundary, not the later durable acceptance.
+- Android build preflight drains `rustup` output before accepting an installed
+  target, avoiding false missing-target errors from a broken pipe.
+
+- Group activity uses shared per-commit reaction targets for authors and peers,
+  including commits preceding a disband. See `marmot-app`'s 0.13.0 fixes
+  for projection and push-token behavior.
+
 ## 0.12.0 - 2026-10-02
 
 Regenerate Swift/Kotlin bindings with the matching native library. See the

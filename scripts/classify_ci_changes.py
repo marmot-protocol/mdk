@@ -131,6 +131,9 @@ PLUGIN_ONLY_PATHS = HERMES_PATHS | {"scripts/install-openclaw-marmot.sh"}
 
 
 def _is_documentation(path: str) -> bool:
+    if path.startswith("vendor/"):
+        return False
+
     executable_markdown = path in EXECUTABLE_MARKDOWN or path.startswith(
         EXECUTABLE_MARKDOWN_PREFIXES
     )
@@ -253,6 +256,7 @@ def classify(paths: list[str], *, force_all: bool = False) -> dict[str, bool]:
             path.startswith((
                 "integrations/terminal-harness/", "integrations/claude/",
                 "integrations/codex/", "integrations/pi/", "integrations/opencode/",
+                "integrations/goose/",
             ))
             for path in normalized
         ),

@@ -127,6 +127,36 @@ pub enum Inline {
     Math(String),
     NostrMention(NostrEntity),
     NostrUri(NostrEntity),
+    /// A device-local display timestamp; never preformatted by the parser.
+    Timestamp {
+        /// Signed seconds since the Unix epoch, not milliseconds.
+        unix_seconds: i64,
+        style: TimestampStyle,
+    },
+}
+
+/// Timestamp styles, formatted using the renderer's current locale,
+/// timezone and clock. Relative displays must refresh as time passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TimestampStyle {
+    /// `t`: hours and minutes.
+    ShortTime,
+    /// `T`: hours, minutes and seconds.
+    LongTime,
+    /// `d`: numeric date.
+    ShortDate,
+    /// `D`: date with a spelled-out month.
+    LongDate,
+    /// `f` (also the omitted-style default): long date and short time.
+    ShortDateTime,
+    /// `F`: weekday, long date and short time.
+    LongDateTime,
+    /// `s`: numeric date and short time.
+    CompactDateTime,
+    /// `S`: numeric date and time including seconds.
+    CompactDateTimeSeconds,
+    /// `R`: live relative time, such as "in 30 minutes" or "2 hours ago".
+    Relative,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

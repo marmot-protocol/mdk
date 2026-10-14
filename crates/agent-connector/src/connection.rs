@@ -9,6 +9,7 @@ use tokio::net::UnixStream;
 
 use crate::account::ProfileUpdateFields;
 use crate::error::ConnectorError;
+use crate::relays::RelayListEdit;
 use crate::socket::current_effective_uid;
 use crate::validation::{auth_token_matches, unsupported_request_message};
 use crate::{
@@ -182,6 +183,7 @@ impl AgentConnector {
             | AgentControlRequest::TimelineMessageGet { .. }
             | AgentControlRequest::TimelineList { .. }
             | AgentControlRequest::AccountProfileLookup { .. }
+            | AgentControlRequest::AccountRelayLists { .. }
             | AgentControlRequest::DiagnosticStatus { .. }
             | AgentControlRequest::GroupInfo { .. }
             | AgentControlRequest::MaintenanceStatus { .. }
@@ -199,6 +201,8 @@ impl AgentConnector {
             | AgentControlRequest::RemoveReaction { .. }
             | AgentControlRequest::AccountPublishKeyPackage { .. }
             | AgentControlRequest::AccountPublishProfile { .. }
+            | AgentControlRequest::AccountRelayListAdd { .. }
+            | AgentControlRequest::AccountRelayListRemove { .. }
             | AgentControlRequest::GroupProfileUpdate { .. }
             | AgentControlRequest::SendMedia { .. }
             | AgentControlRequest::DownloadMedia { .. }
@@ -564,6 +568,39 @@ impl AgentConnector {
             }
             AgentControlRequest::AccountProfileLookup { account_id_hex } => {
                 self.profile_lookup_response(&account_id_hex).await
+            }
+            AgentControlRequest::AccountRelayLists { account_id_hex } => {
+                self.relay_lists_response(&account_id_hex)
+            }
+            AgentControlRequest::AccountRelayListAdd {
+                account_id_hex,
+                relay_type,
+                url,
+                direction,
+            } => {
+                self.relay_list_edit_response(RelayListEdit {
+                    account_id_hex,
+                    relay_type,
+                    url,
+                    direction,
+                    add: true,
+                })
+                .await
+            }
+            AgentControlRequest::AccountRelayListRemove {
+                account_id_hex,
+                relay_type,
+                url,
+                direction,
+            } => {
+                self.relay_list_edit_response(RelayListEdit {
+                    account_id_hex,
+                    relay_type,
+                    url,
+                    direction,
+                    add: false,
+                })
+                .await
             }
             AgentControlRequest::SendAgentActivity {
                 account_id_hex,

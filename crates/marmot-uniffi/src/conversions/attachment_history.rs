@@ -53,6 +53,21 @@ impl From<app::AttachmentCategory> for AttachmentCategoryFfi {
         }
     }
 }
+/// Shared-library presentation eligibility; does not gate artwork acquisition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum AttachmentRoleFfi {
+    Shared,
+    InlineEmoji,
+}
+impl From<app::AttachmentRole> for AttachmentRoleFfi {
+    /// Preserve the native presentation role across the binding boundary.
+    fn from(value: app::AttachmentRole) -> Self {
+        match value {
+            app::AttachmentRole::Shared => Self::Shared,
+            app::AttachmentRole::InlineEmoji => Self::InlineEmoji,
+        }
+    }
+}
 #[derive(Clone, uniffi::Record)]
 pub struct AttachmentEntryFfi {
     pub message_id_hex: String,
@@ -62,6 +77,8 @@ pub struct AttachmentEntryFfi {
     pub received_at: u64,
     pub source_epoch: Option<u64>,
     pub category: AttachmentCategoryFfi,
+    /// Exclude InlineEmoji from shared galleries; keep original slots and acquisition intact.
+    pub role: AttachmentRoleFfi,
     /// Accepted or rejected in original album order, with its original attachment index.
     pub attachment: MediaAttachmentOutcomeFfi,
 }
@@ -71,6 +88,7 @@ impl std::fmt::Debug for AttachmentEntryFfi {
     }
 }
 impl From<app::AttachmentEntry> for AttachmentEntryFfi {
+    /// Copy the source slot, parser verdict and native role without host-side inference.
     fn from(value: app::AttachmentEntry) -> Self {
         Self {
             message_id_hex: value.message_id_hex,
@@ -80,6 +98,7 @@ impl From<app::AttachmentEntry> for AttachmentEntryFfi {
             received_at: value.received_at,
             source_epoch: value.source_epoch,
             category: value.category.into(),
+            role: value.role.into(),
             attachment: value.attachment.into(),
         }
     }
@@ -116,6 +135,50 @@ impl From<app::AttachmentPageRead> for AttachmentPageReadFfi {
             app::AttachmentPageRead::RestartRequired => Self::RestartRequired,
             app::AttachmentPageRead::CursorMismatch => Self::CursorMismatch,
             app::AttachmentPageRead::InvalidLimit => Self::InvalidLimit,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both roles survive record conversion without renumbering a rejected slot.
+    #[test]
+    fn attachment_role_survives_binding_conversion() {
+        for (role, expected) in [
+            (app::AttachmentRole::Shared, AttachmentRoleFfi::Shared),
+            (
+                app::AttachmentRole::InlineEmoji,
+                AttachmentRoleFfi::InlineEmoji,
+            ),
+        ] {
+            let entry = AttachmentEntryFfi::from(app::AttachmentEntry {
+                message_id_hex: "private-message".into(),
+                source_message_id_hex: "private-source".into(),
+                sender: "private-sender".into(),
+                timeline_at: 1,
+                received_at: 2,
+                source_epoch: Some(3),
+                category: app::AttachmentCategory::Rejected,
+                role,
+                attachment: app::MediaAttachmentOutcome::Rejected {
+                    attachment_index: 7,
+                    rejection: app::MediaAttachmentRejection {
+                        kind: app::MediaAttachmentRejectionKind::UnsupportedFormat,
+                        detail: "unsupported".into(),
+                    },
+                },
+            });
+            assert_eq!(entry.role, expected);
+            assert!(matches!(
+                entry.attachment,
+                MediaAttachmentOutcomeFfi::Rejected {
+                    attachment_index: 7,
+                    ..
+                }
+            ));
+            assert!(!format!("{entry:?}").contains("private"));
         }
     }
 }

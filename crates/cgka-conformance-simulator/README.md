@@ -313,6 +313,11 @@ publication acknowledgement, transport backlog, scenario-input work, or terminal
 diagnostic only. Iteration, virtual-time, and work budgets produce serializable quiescent, blocked, or watchdog-timeout
 evidence and never redefine unfinished work as quiescent.
 
+The bounded-drain guard also observes `confirmation_replay_completed_rows`: eligible retained rows already visited by
+a pending confirmation-replay sweep. This test-only aggregate distinguishes progress through unchanged opaque rows from
+a stalled drain, without exposing row identities or payloads. The cursor is process-local and resets on restart or sweep
+completion; an unchanged full progress key still fails the stalled-drain guard.
+
 ### Active decryptability
 
 `probe_bidirectional_decryptability` is the active cryptographic-reachability check. Each named client sends one uniquely

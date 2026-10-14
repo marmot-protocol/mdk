@@ -2465,6 +2465,7 @@ async fn empty_response_records_first_byte_failure_without_body_transfer_timing(
 }
 
 #[tokio::test]
+#[allow(clippy::disallowed_methods)]
 async fn limited_body_reader_rejects_chunked_body_over_cap() {
     let server = spawn_http_response(
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n6\r\nabcdef\r\n0\r\n\r\n"
@@ -3130,6 +3131,7 @@ async fn policy_refused_and_attempted_candidates_classify_as_a_download_failure(
 
 /// Drive the bounded-redirect loop with a client factory that refuses the
 /// hop at `refused_hop` the way DNS destination-policy validation does.
+#[allow(clippy::disallowed_methods)]
 async fn redirect_loop_with_policy_refusal_at(refused_hop: usize) -> AppError {
     let hash = valid_hash();
     let redirecting = spawn_http_response(http_redirect_response(&format!(
@@ -3359,4 +3361,45 @@ async fn automatic_attachment_stops_only_when_every_locator_reports_the_blob_mis
             other => panic!("unexpected classification: {other:?}"),
         }
     }
+}
+
+#[test]
+fn large_file_upload_deadline_allows_progress_at_mobile_upload_rates() {
+    assert_eq!(
+        super::blossom::file_upload_timeout(1024),
+        Duration::from_secs(15 * 60)
+    );
+    assert_eq!(
+        super::blossom::file_upload_timeout(758_000_016),
+        Duration::from_secs(2892)
+    );
+    assert!(super::blossom::file_upload_timeout(900 * 1024 * 1024) >= Duration::from_secs(3600));
+}
+
+#[tokio::test(start_paused = true)]
+async fn file_upload_idle_watchdog_allows_setup_then_rejects_a_stalled_body() {
+    let (progress, observer) = tokio::sync::watch::channel(());
+    let watchdog = tokio::spawn(super::blossom::file_upload_idle_timeout(observer));
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(31)).await;
+    assert!(
+        !watchdog.is_finished(),
+        "setup must use the request deadline"
+    );
+    progress.send_replace(());
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(29)).await;
+    assert!(!watchdog.is_finished());
+    progress.send_replace(());
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(29)).await;
+    assert!(
+        !watchdog.is_finished(),
+        "body progress resets the idle clock"
+    );
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(matches!(
+        watchdog.await.unwrap(),
+        AppError::MediaUploadTimedOut
+    ));
 }

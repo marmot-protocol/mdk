@@ -38,6 +38,8 @@ pub(crate) struct PinnedCollector {
 }
 
 impl PinnedCollector {
+    // `build_client_from` applies the process proxy policy.
+    #[allow(clippy::disallowed_methods)]
     pub(crate) fn build_client(&self) -> Result<reqwest::Client, CollectorRequestError> {
         self.build_client_from(reqwest::Client::builder())
     }
@@ -46,10 +48,8 @@ impl PinnedCollector {
         &self,
         builder: reqwest::ClientBuilder,
     ) -> Result<reqwest::Client, CollectorRequestError> {
-        builder
-            // Proxies can resolve the original hostname themselves, bypassing
-            // the validated addresses. This exporter always dials directly.
-            .no_proxy()
+        crate::network_proxy::http_builder(builder)
+            .map_err(|_| CollectorRequestError)?
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
@@ -113,3 +113,6 @@ where
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod proxy_tests;

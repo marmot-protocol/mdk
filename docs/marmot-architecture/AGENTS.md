@@ -5,7 +5,7 @@ order and the roles agents most often need.
 
 ## Read order
 
-1. `index.md`
+1. `index.md` and `overview/app-core-boundary.md` (MDK/host ownership)
 2. `overview/executive-summary.md`
 3. `overview/target-architecture.md`
 4. `overview/current-state.md`
@@ -24,6 +24,9 @@ order and the roles agents most often need.
 - **Path:** `overview/`
   - **Role:** Current short orientation docs. Keep these readable in one sitting.
 
+- **Path:** `overview/app-core-boundary.md`
+  - **Role:** Canonical MDK/host-app ownership contract linked by agent guides.
+
 - **Path:** `overview/cgka-engine-quality-and-vectors.md`
   - **Role:** Current near-term engine quality and vector plan.
 
@@ -33,7 +36,7 @@ order and the roles agents most often need.
 - **Path:** `overview/whitenoise-integration-map.md`
   - **Role:** Current shim map and engine API friction list for whitenoise-rs integration.
 
-- **Path:** `overview/marmot-app-runtime.md`, `overview/app-core-boundary.md`
+- **Path:** `overview/marmot-app-runtime.md`
   - **Role:** `marmot-app` runtime boundary for client applications and the app-core layer under `wn`.
 
 - **Path:** `overview/observability.md`
@@ -52,7 +55,8 @@ order and the roles agents most often need.
 
 - **Path:** `further-context/dial-safety-collector-inventory.md`
   - **Role:** Per-attempt collector and forensic-audit HTTP inventory: structural URL gates, resolve/validate/pin,
-    disabled redirects and proxies, timeout budgets, retired-host rejection, and context-free errors.
+    disabled redirects and system proxies, explicit SOCKS5 pin preservation, timeout budgets, retired-host rejection,
+    and context-free errors.
 
 - **Path:** `overview/multi-step-state-changes.md`
   - **Role:** No-torn-writes convention for multi-step state changes: validation/mutation ordering, compensation,
@@ -79,6 +83,9 @@ order and the roles agents most often need.
 
 - **Path:** `invitation-recovery.md`
   - **Role:** Recovery of invites whose Welcome landed on a losing branch (durable intent, re-invite, `Conflict`).
+
+- **Path:** `moderation-reports.md`
+  - **Role:** Wire contract for private gift-wrapped NIP-56 reports to the deployment operator and the operator's reader.
 
 - **Path:** `distributed-convergence.md`
   - **Role:** Branch selection, retained anchors, and convergence model.

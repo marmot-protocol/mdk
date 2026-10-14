@@ -30,8 +30,9 @@ On a hydrated account open or a live audit enable, at most 64 stored groups rece
 eligible, selected, omitted by that cap, and unreadable; these are read counts, not durable-write
 claims. A failed group enumeration leaves all four counts unknown.
 
-Account recovery and transport-cursor rows exist only in v5 (see
-[Account recovery owner rows](#account-recovery-owner-rows-v5-only)); a v4 recorder drops them.
+Account recovery, transport-cursor and subscription-refusal rows exist only in v5 (see
+[Account recovery owner rows](#account-recovery-owner-rows-v5-only) and
+[`subscription_refused`](#subscription_refused-v5-only)); a v4 recorder drops them.
 
 The host can configure a dedicated v5 OTLP `/v1/logs` sender in memory through
 `MarmotAppRuntime::set_audit_otlp_sender(Some(sender))`, or through the additive
@@ -242,7 +243,8 @@ This catalogue is not yet complete. These event kinds have no section here yet â
 `group_hydration_quarantined`, `group_hydration_recovered`,
 `pending_commit_recovered_on_open`, `recipient_expectation`, `source_context`, `subscription_rebuild`,
 `sync_drain`, and `transport_received`. The v5-only recovery kinds are written up under
-[Account recovery owner rows](#account-recovery-owner-rows-v5-only).
+[Account recovery owner rows](#account-recovery-owner-rows-v5-only), and the v5-only refusal row under
+[`subscription_refused`](#subscription_refused-v5-only).
 
 The authoritative catalogue is the `AuditEventKind` enum together with
 [`audit-log-event.v4.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v4.schema.json); the
@@ -539,30 +541,35 @@ Emitted after `do_create_group()` returns `Err(err)`.
 
 ### `publish_attempt`
 
-Emitted by the account runtime before calling the transport adapter for one outbound transport message.
+Emitted by the account runtime before each publish pass for one outbound transport message: the first pass and
+every later retry of the same exact event, including retries to endpoints that missed a commit after its first
+acknowledgement confirmed it.
 
 | Field | Meaning |
 | --- | --- |
 | `msg_id` | Hex id of the outbound transport message. |
-| `target_kind` | `group` or `inbox`. |
-| `relay_urls` | Full endpoint strings selected by routing. For Nostr these are relay URLs. |
+| `target_kind` | `group`, `inbox`, or `frozen_group_fanout` for durable frozen fanouts (commits, including self-updates, and application messages). |
+| `relay_urls` | Endpoint strings attempted in this pass. For Nostr these are relay URLs. |
 | `required_acks` | Adapter quorum target for this publish attempt. |
 
 Metadata notes:
 
 - Group publishes have `group_ref`; inbox publishes do not.
-- The event context includes `operation_id = "publish-<msg_id>"`.
+- `group` and `inbox` publishes carry `operation_id = "publish-<msg_id>"`. `frozen_group_fanout` publishes carry the
+  caller's operation context; application messages use their application send operation.
 
 ### `publish_outcome`
 
-Emitted after the transport adapter returns endpoint-level results.
+Emitted after the transport adapter returns endpoint-level results for one publish pass. A legacy publish whose
+adapter error carries per-endpoint failures also emits this row, with empty `accepted_relay_urls`, before its
+`adapter`-stage `publish_failure`.
 
 | Field | Meaning |
 | --- | --- |
 | `msg_id` | Hex id of the published transport message. |
-| `target_kind` | `group` or `inbox`. |
-| `accepted_relay_urls` | Endpoints that accepted the message. |
-| `failed_relays` | Endpoint failure objects with `relay_url` and `reason`. |
+| `target_kind` | `group`, `inbox`, or `frozen_group_fanout`. |
+| `accepted_relay_urls` | Endpoints that accepted the message in this pass. |
+| `failed_relays` | Endpoint failure objects with `relay_url` and `reason` for this pass. An endpoint whose result is unknown, such as one cancelled once quorum was met, reports `publish acknowledgement unknown` and stays owed for retry. |
 | `required_acks` | Adapter quorum target. |
 | `met_required_acks` | Whether accepted endpoint count satisfied `required_acks`. |
 
@@ -576,7 +583,10 @@ Emitted when publish cannot complete or does not satisfy the required acknowledg
 | `stage` | `routing`, `adapter`, or `required_acks`. |
 | `target_kind` | `unknown`, `group`, or `inbox`. |
 | `relay_urls` | Routed endpoint strings when known. |
-| `reason` | Human-readable failure reason. |
+| `reason` | Failure category. `adapter`-stage rows use `TransportAdapterError::privacy_safe_kind`, never its `Display`. |
+
+Nostr per-relay `reason` phrases separate `connect relay timed out` (the 5 s connect budget elapsed) from
+`connect relay failed` (an immediate dial error such as refused, DNS, TLS, or proxy).
 
 ### `epoch_confirmed`
 
@@ -1159,6 +1169,33 @@ Notes:
   reports for an account that records them.
 - Counts only: no subscription ids, relay URLs, filters or lag marks.
 
+### `subscription_refused` (v5 only)
+
+Relays ended live subscriptions of this account with `CLOSED` (#2247). The Nostr adapter classifies each refusal as it
+arrives and queues it per account; the account worker records what it holds as one row at its publication seam
+(`publish_history_notice_changes`). Account-scoped, so `group_ref` is `None`.
+
+| Field | Meaning |
+| --- | --- |
+| `refusals` | One entry per distinct refusal since the previous row, in arrival order (at most 32). |
+| `refusals[].route_kind` | `inbox` (gift-wrapped Welcomes), `group` (a current or retained group route) or `maintenance` (post-join or recovery maintenance). |
+| `refusals[].endpoint_ref` | The refusing relay, as a hashed endpoint reference. |
+| `refusals[].refusal_category` | The reason's machine-readable prefix (`auth_required`, `restricted`, `blocked`, `rate_limited`, ...), or `unclassified` when it had none or an unknown one. The reason text is never recorded. |
+| `refusals[].disposition` | `pending`: the relay client kept the REQ to send again after AUTH or a reconnect. `dropped`: it gave the REQ up, and the relay serves nothing for that route until the subscription is rebuilt. |
+| `refusals[].count` | How many times the relay sent this refusal since the previous row. |
+| `dropped` | Refusals shed because 32 distinct entries were already queued. Non-zero only on a full row. |
+
+Notes:
+
+- `subscription_rebuild`'s `relay_results[].accepted` only says the relay client registered the REQ. A relay that
+  refused it right away still shows `accepted: true` there; this row is where the refusal appears.
+- A `dropped` refusal before EOSE settles that relay's share of the activation's replay coverage: the drain stops
+  waiting for it. It never completes the replay, so the live transport cursor is not promoted past the refused relay
+  and an incremental activation is not reused. A `pending` refusal still awaits EOSE.
+- Only live inbox, group and maintenance REQs are reported. A `CLOSED` for a superseded attempt's REQ or a one-shot
+  fetch is ignored here; one-shot fetches report their closes through acquisition.
+- An account without a v5 recorder still drains its reports at the seam and discards them.
+
 ### `auto_commit_decision`
 
 Emitted after `LowestIndexAutoCommitter::decide` returns a decision for a queued proposal.
@@ -1240,8 +1277,10 @@ Metadata notes:
 
 - Some events have `group_ref` (`persist`, fork/publish/peeler paths). The generic `state_update` helper emits without
   group attribution only when the existing message record cannot be read; otherwise it uses that record's `group_id`.
-- Re-persisting a message with the same `group_id`, `epoch`, and `MessageState` does not emit another
-  `message_state_changed` row; this keeps repeated deferred-peel retries from producing duplicate diagnostics.
+- Re-persisting a message in the `MessageState` it already has does not emit another `message_state_changed` row, even
+  when the row is rewritten under a new `epoch` or payload. A deferred-peel retry that still cannot peel restamps its
+  row at the current epoch on every epoch advance; without this rule each retained row would log a
+  `peel_deferred -> peel_deferred` row per advance.
 - The reasons above are the `MessageDisposition` tags in `crates/cgka-engine/src/message_disposition.rs` plus the
   literal call-site reasons. v5 keeps each one verbatim on `reason` (here and on `rejection`); the engine test
   `every_disposition_tag_survives_v5_recording` fails if a new tag is missing from the v5 allowlist. v5 rows written
@@ -1311,6 +1350,9 @@ metadata keys for indexing.
 | `TransportCursorTrigger` | `drain_checkpoint`, `live_promotion`, `loss_settled`, `notice_retired` |
 | `EoseRepairReceiver` | `account`, `shared` |
 | `EoseRepairTrigger` | `notification_lag`, `follow_up` |
+| `SubscriptionRefusalRoute` | `inbox`, `group`, `maintenance` |
+| `SubscriptionRefusalCategory` | `duplicate`, `pow`, `blocked`, `rate_limited`, `invalid`, `error`, `unsupported`, `auth_required`, `restricted`, `unclassified` |
+| `SubscriptionRefusalOutcome` | `pending`, `dropped` |
 
 ## Upload and tracker path
 
@@ -1616,6 +1658,7 @@ let server-side tooling collate multiple devices into group-level analytics.
 | When was "history may be incomplete" shown, dismissed or resolved? | `recovery_need_changed` with `notice_shown`, `notice_dismissed`, `resumed`, or `closed`, joined by `obligation_ref`. |
 | Why did the transport cursor move, and did live promotion push arrivals into the spill? | `transport_cursor_advanced`: trigger, before/after cursor, lookback, and spill and queue-loss placement counts. `sync_drain` keeps per-drain cursors. |
 | Did a notification lag cost subscriptions their end-of-stored-events, and were they repaired? | `subscription_eose_repaired` per repair pass: relays awaiting EOSE, completed without traffic, re-issued, re-issued earlier and failed, and whether a follow-up was scheduled. |
+| Did a relay refuse this account's inbox or group subscriptions, and why? | `subscription_refused`: per relay and route kind, the refusal category, whether the relay client kept or dropped the REQ, and how often. |
 | Can a dashboard correlate the same member across client files? | `group_state_changed.actor_member_ref` and `subject_member_ref` are stable 16-byte hashes of member identity bytes. A producing engine's optional `source_context.local_member_ref` uses that same member-ref domain so a removal/leave subject can be joined to the producer. Absence is not a removal. This is not a membership interval or Goggles classification. |
 
 Intentional non-goals / limits:

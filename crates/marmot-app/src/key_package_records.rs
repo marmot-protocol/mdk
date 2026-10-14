@@ -29,6 +29,139 @@ use crate::{
     UserDirectoryRecord, push_unique_strings, relay_list_state_from_event, sort_directory_records,
 };
 
+/// Evidence from a complete supplementary lookup, used only to restrict the
+/// direct diagnostic API's existing future-record cache fallback.
+pub(crate) struct KeyPackageRecoveryEvidence {
+    account: String,
+    winners: Vec<NostrTransportEvent>,
+    deletions: Vec<NostrTransportEvent>,
+}
+
+/// Public lookup target metadata; deliberately excludes KeyPackage bytes.
+#[derive(Clone)]
+pub(crate) struct KeyPackageRecoveryTarget {
+    pub(crate) event_id: String,
+    pub(crate) slot: String,
+    pub(crate) created_at: u64,
+}
+
+impl KeyPackageRecoveryTarget {
+    pub(crate) fn from_fetched(fetched: &FetchedKeyPackage) -> Self {
+        Self {
+            event_id: fetched.key_package_event_id.clone(),
+            slot: fetched.key_package_id.clone(),
+            created_at: fetched.created_at,
+        }
+    }
+    pub(crate) fn from_cached(cached: &DirectoryKeyPackage) -> Self {
+        Self {
+            event_id: cached.key_package_event_id.trim().to_ascii_lowercase(),
+            slot: cached.key_package_id.clone(),
+            created_at: cached.created_at,
+        }
+    }
+}
+
+impl KeyPackageRecoveryEvidence {
+    pub(crate) fn allows_cached(&self, cached: &DirectoryKeyPackage) -> bool {
+        self.allows_target(&KeyPackageRecoveryTarget::from_cached(cached))
+    }
+    pub(crate) fn allows_target(&self, target: &KeyPackageRecoveryTarget) -> bool {
+        !package_is_deleted(
+            &self.account,
+            &target.event_id,
+            &target.slot,
+            target.created_at,
+            &self.deletions,
+        ) && !self.winners.iter().any(|winner| {
+            winner.tag_value("d") == Some(target.slot.as_str())
+                && (winner.created_at, winner.id.as_str())
+                    > (target.created_at, target.event_id.as_str())
+        })
+    }
+}
+
+/// Collapse fresh slot winners before applying deletions, retaining invalid,
+/// obsolete and incompatible replacements as barriers against older material.
+pub(crate) fn without_revoked_slot_winners(
+    account: &str,
+    mut records: Vec<RelayEventRecord>,
+    deletions: &[RelayEventRecord],
+    freshness: DirectoryFreshness,
+) -> (Vec<RelayEventRecord>, KeyPackageRecoveryEvidence) {
+    records.sort_by(|a, b| {
+        b.event
+            .created_at
+            .cmp(&a.event.created_at)
+            .then_with(|| b.event.id.cmp(&a.event.id))
+    });
+    let deletions = deletions
+        .iter()
+        .filter(|record| {
+            record.event.kind == 5
+                && record.event.pubkey == account
+                && record.event.to_verified_nostr_event().is_ok()
+        })
+        .map(|record| record.event.clone())
+        .collect::<Vec<_>>();
+    let mut slots = BTreeSet::new();
+    let mut winners = Vec::new();
+    records.retain(|record| {
+        let event = &record.event;
+        if event.kind != KIND_MARMOT_KEY_PACKAGE || event.pubkey != account {
+            return false;
+        }
+        if freshness.accepts(record) {
+            if let Some(slot) = event.tag_value("d").filter(|slot| !slot.is_empty())
+                && !slots.insert(slot.to_owned())
+            {
+                return false;
+            }
+            winners.push(event.clone());
+        }
+        !package_is_deleted(
+            account,
+            &event.id,
+            event.tag_value("d").unwrap_or_default(),
+            event.created_at,
+            &deletions,
+        )
+    });
+    (
+        records,
+        KeyPackageRecoveryEvidence {
+            account: account.to_owned(),
+            winners,
+            deletions,
+        },
+    )
+}
+
+fn package_is_deleted(
+    account: &str,
+    event_id: &str,
+    slot: &str,
+    created_at: u64,
+    deletions: &[NostrTransportEvent],
+) -> bool {
+    deletions.iter().any(|deletion| {
+        deletion
+            .tag_values("e")
+            .iter()
+            .any(|reference| !event_id.is_empty() && reference.eq_ignore_ascii_case(event_id))
+            || (created_at <= deletion.created_at
+                && deletion.tag_values("a").iter().any(|reference| {
+                    let mut parts = reference.splitn(3, ':');
+                    parts.next().and_then(|kind| kind.parse::<u16>().ok())
+                        == Some(KIND_MARMOT_KEY_PACKAGE as u16)
+                        && parts
+                            .next()
+                            .is_some_and(|author| author.eq_ignore_ascii_case(account))
+                        && parts.next() == Some(slot)
+                }))
+    })
+}
+
 pub(crate) fn merge_relay_list_status(
     mut current: AccountRelayListStatus,
     candidate: AccountRelayListStatus,

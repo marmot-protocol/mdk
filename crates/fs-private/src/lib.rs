@@ -1067,6 +1067,24 @@ pub fn socket_staging_dir(final_path: &Path) -> std::path::PathBuf {
     ))
 }
 
+/// Check the final and staging addresses before creating or removing artifacts.
+/// Use the standard library's platform-specific pathname validation.
+#[cfg(unix)]
+pub fn validate_private_unix_socket_path(final_path: &Path) -> io::Result<()> {
+    use std::os::unix::net::SocketAddr;
+
+    let staged = socket_staging_dir(final_path).join(final_path.file_name().unwrap_or_default());
+    SocketAddr::from_pathname(final_path)
+        .and_then(|_| SocketAddr::from_pathname(staged))
+        .map(|_| ())
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private Unix socket path is invalid; use a shorter socket path",
+            )
+        })
+}
+
 /// Bind a Unix listener so the socket is never reachable at default
 /// permissions: bind inside a fresh 0700 staging directory next to
 /// `final_path`, chmod the socket to `mode`, then hard-link it into place
@@ -1096,6 +1114,7 @@ pub fn bind_unix_listener_private_tracked(
     let name = final_path.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "socket path has no file name")
     })?;
+    validate_private_unix_socket_path(final_path)?;
     let staging_dir = socket_staging_dir(final_path);
     // A leftover staging dir can only be ours (pid-suffixed, 0700) from a
     // crashed previous run; clear it so the atomic 0700 create succeeds.
@@ -1140,6 +1159,67 @@ pub fn bind_unix_listener_private_tracked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn private_socket_staging_path_accepts_the_platform_boundary_and_rejects_overflow() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::net::UnixStream;
+
+        // Keep the test's root short even on macOS, where the default temp
+        // directory can itself consume nearly the entire socket address budget.
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let probe = root.path().join("x").join("s");
+        let limit = (1..=256)
+            .take_while(|bytes| {
+                std::os::unix::net::SocketAddr::from_pathname("x".repeat(*bytes)).is_ok()
+            })
+            .last()
+            .unwrap();
+        let probe_len = socket_staging_dir(&probe)
+            .join("s")
+            .as_os_str()
+            .as_bytes()
+            .len();
+        let parent_len = 1 + limit - probe_len;
+        let socket = root.path().join("x".repeat(parent_len)).join("s");
+        std::fs::create_dir(socket.parent().unwrap()).unwrap();
+        let listener = bind_unix_listener_private(&socket, 0o600).unwrap();
+        let client = UnixStream::connect(&socket).unwrap();
+        assert!(listener.accept().is_ok());
+        drop(client);
+        assert!(!socket_staging_dir(&socket).exists());
+
+        let too_long = root.path().join("x".repeat(parent_len + 1)).join("s");
+        let error = validate_private_unix_socket_path(&too_long).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            socket_staging_dir(&too_long)
+                .join("s")
+                .as_os_str()
+                .as_bytes()
+                .len(),
+            limit + 1
+        );
+        assert!(too_long.as_os_str().as_bytes().len() <= limit);
+        let error = bind_unix_listener_private(&too_long, 0o600).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("use a shorter socket path"));
+        assert!(!error.to_string().contains(root.path().to_str().unwrap()));
+        assert!(!too_long.parent().unwrap().exists());
+
+        // A rejected path must not delete existing staging state.
+        let staging = socket_staging_dir(&too_long);
+        std::fs::create_dir_all(&staging).unwrap();
+        let sentinel = staging.join("sentinel");
+        std::fs::write(&sentinel, b"keep").unwrap();
+        assert!(bind_unix_listener_private(&too_long, 0o600).is_err());
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"keep");
+
+        // Same character count, larger encoded byte length.
+        let multibyte = root.path().join("é".repeat(parent_len)).join("s");
+        assert!(validate_private_unix_socket_path(&multibyte).is_err());
+    }
 
     #[test]
     fn parse_octal_mode_accepts_0600_00600_600_and_0o600() {

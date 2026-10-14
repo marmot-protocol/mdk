@@ -1050,6 +1050,16 @@ fn sample_v5_only_kinds() -> Vec<AuditEventKind> {
             follow_up_scheduled: true,
             dropped_before: 0,
         },
+        AuditEventKind::SubscriptionRefused {
+            refusals: vec![SubscriptionRefusalEntry {
+                route_kind: SubscriptionRefusalRoute::Inbox,
+                relay_url: "wss://relay.example".into(),
+                refusal_category: SubscriptionRefusalCategory::AuthRequired,
+                disposition: SubscriptionRefusalOutcome::Dropped,
+                count: 2,
+            }],
+            dropped: 0,
+        },
         AuditEventKind::TransportCursorAdvanced {
             trigger: TransportCursorTrigger::LivePromotion,
             cursor_before_secs: Some(1_700_000_000),
@@ -2512,7 +2522,7 @@ fn v5_recorder_covers_every_existing_operational_kind_with_strict_typed_rows() {
         operational,
         expected.into_iter().map(str::to_owned).collect()
     );
-    assert_eq!(operational.len(), 50);
+    assert_eq!(operational.len(), 51);
 }
 
 #[test]
@@ -2863,4 +2873,106 @@ fn v5_rejected_record_conversion_reports_a_known_drop_without_echoing_input() {
     assert_eq!(loss["event"]["serialization_failed_attempts"], "1");
     assert_eq!(loss["event"]["write_failed_attempts"], "0");
     assert_eq!(loss["event"]["extent"], "unknown");
+}
+
+/// Logical send correlation stays in the existing operation-reference field,
+/// survives retries, and cannot alias a different event or destination group.
+#[test]
+fn application_send_operation_survives_v5_export_without_wire_schema_changes() {
+    let group = b"private-group";
+    let event_id = "ab".repeat(32);
+    let operation = application_send_operation_id(group, &event_id);
+    assert_eq!(operation, application_send_operation_id(group, &event_id));
+    assert_ne!(
+        operation,
+        application_send_operation_id(b"other-group", &event_id)
+    );
+    assert_ne!(
+        operation,
+        application_send_operation_id(group, &"cd".repeat(32))
+    );
+    assert!(!operation.contains(&event_id));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit-v5.jsonl");
+    let recorder = JsonlRecorder::open_v5_with_account_ref(
+        &path,
+        "11".repeat(16),
+        Some("22".repeat(16)),
+        v5_test_producer(),
+    )
+    .unwrap();
+    let context = AuditEventContext {
+        operation_id: Some(operation.clone()),
+        ..Default::default()
+    };
+    recorder.record(
+        AuditRecord::new(
+            Some(hex::encode(group)),
+            AuditEventKind::SendOutcome {
+                intent_kind: "app_message".into(),
+                result_kind: "queued".into(),
+                outbound_messages: vec![],
+            },
+        )
+        .with_context(context.clone()),
+    );
+    let message_id = "ef".repeat(32);
+    recorder.record(
+        AuditRecord::new(
+            Some(hex::encode(group)),
+            AuditEventKind::SendOutcome {
+                intent_kind: "app_message".into(),
+                result_kind: "application_message".into(),
+                outbound_messages: vec![OutboundMessage {
+                    msg_id: message_id.clone(),
+                    artifact_kind: MessageArtifactKind::ApplicationMessage,
+                    transport: None,
+                    recipient_expectation: None,
+                }],
+            },
+        )
+        .with_context(context.clone()),
+    );
+    for _ in 0..2 {
+        recorder.record(
+            AuditRecord::new(
+                Some(hex::encode(group)),
+                AuditEventKind::PublishOutcome {
+                    msg_id: message_id.clone(),
+                    artifact_kind: Some(MessageArtifactKind::ApplicationMessage),
+                    target_kind: "frozen_group_fanout".into(),
+                    relay_url: None,
+                    accepted_relay_urls: vec![],
+                    failed_relays: vec![],
+                    required_acks: 1,
+                    met_required_acks: true,
+                    transport: None,
+                },
+            )
+            .with_context(context.clone()),
+        );
+    }
+    drop(recorder);
+    // Check every row against both Rust and the unchanged strict schema, then
+    // exclude recorder lifecycle rows from the operation-join assertions.
+    let rows: Vec<_> = v5_rows(&path)
+        .into_iter()
+        .filter(|row| {
+            matches!(
+                row["event"]["type"].as_str(),
+                Some("send_outcome" | "publish_outcome")
+            )
+        })
+        .collect();
+    let expected = &rows[0]["event"]["record_context"]["operation_ref"];
+    assert!(expected.as_str().is_some());
+    assert_eq!(rows.len(), 4);
+    for row in &rows {
+        assert_eq!(&row["event"]["record_context"]["operation_ref"], expected);
+    }
+    let contents = fs::read_to_string(&path).unwrap();
+    for sensitive in [event_id, message_id, hex::encode(group), operation] {
+        assert!(!contents.contains(&sensitive));
+    }
 }

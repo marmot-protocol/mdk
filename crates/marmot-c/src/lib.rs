@@ -22,11 +22,14 @@ use std::sync::Arc;
 
 use marmot_uniffi::Marmot;
 
+pub mod account_attachment_history;
 pub mod attachment_access;
 pub mod attachment_history;
 pub mod commands;
+pub mod file_media;
 pub(crate) mod macros;
 pub mod memory;
+pub mod nip46;
 pub mod publisher;
 pub mod secret_store;
 pub mod status;
@@ -476,6 +479,7 @@ pub unsafe extern "C" fn marmot_client_new_with_configuration(
                             cursor_persistence: Some(cursor.into()),
                             client_name: name,
                             secret_store: store,
+                            moderation_report_config: None,
                         },
                     )
                 }

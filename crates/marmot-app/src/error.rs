@@ -160,6 +160,21 @@ pub enum AppError {
     /// "disbanding" for it tells the user something false.
     #[error("this device was removed from the group; outbound work is blocked")]
     GroupRemoved(String),
+    /// The group may have moved past this device's local epoch and recovery has
+    /// not caught it up yet. A commit authored now could fork the group
+    /// (mdk#2258). Retryable once recovery clears the gap or the local epoch
+    /// moves past it. Or, after the user accepts that risk,
+    /// `acknowledge_group_catching_up` and retry. Dismissing the group's
+    /// history notice does not release it.
+    #[error("group is still catching up on missed changes; try again once it has synced")]
+    GroupCatchingUp(String),
+    /// The group's last change has been owed to a group relay for over two
+    /// minutes, so members who read only that relay cannot follow it
+    /// (mdk#2255). MDK keeps retrying the owed relays. Retryable once they accept the change.
+    /// Or, after the user accepts that some members may miss changes,
+    /// `acknowledge_group_commit_undelivered` and retry.
+    #[error("the group's last change has not reached every relay yet; try again shortly")]
+    GroupCommitUndelivered(String),
     /// Host-supplied draft attachment metadata failed validation before storage.
     #[error("invalid message draft: {0}")]
     InvalidMessageDraft(String),
@@ -204,6 +219,19 @@ pub enum AppError {
     BlockListUnavailable,
     #[error("block list publication outcome is uncertain; retry to reconcile")]
     BlockPublicationUncertain,
+    /// No valid moderation-report destination is installed; nothing was published.
+    #[error("moderation reporting is not configured")]
+    ModerationReportingNotConfigured,
+    /// The host's moderation-report destination was rejected as a whole.
+    #[error("invalid moderation report configuration: {0}")]
+    InvalidModerationReportConfig(String),
+    #[error("reported user public key is invalid")]
+    InvalidReportedPublicKey,
+    #[error("an account cannot report itself")]
+    CannotReportSelf,
+    /// The local per-account cap; it guards against runaway clients only.
+    #[error("too many moderation reports; try again later")]
+    ModerationReportRateLimited,
     #[error("relay directory fetch failed: {0}")]
     RelayDirectory(String),
     /// An account worker's transport catch-up failed (sync error or timeout).
@@ -437,6 +465,8 @@ impl AppError {
             Self::InvalidChatPin(_) => "invalid_chat_pin",
             Self::GroupDisbanding(_) => "group_disbanding",
             Self::GroupRemoved(_) => "group_removed",
+            Self::GroupCatchingUp(_) => "group_catching_up",
+            Self::GroupCommitUndelivered(_) => "group_commit_undelivered",
             Self::InvalidMessageDraft(_) => "invalid_message_draft",
             Self::MessageDraftRevisionConflict => "message_draft_revision_conflict",
             Self::AgentStreamMissingStart => "agent_stream_missing_start",
@@ -453,6 +483,11 @@ impl AppError {
             Self::UserBlocked => "user_blocked",
             Self::BlockListUnavailable => "block_list_unavailable",
             Self::BlockPublicationUncertain => "block_publication_uncertain",
+            Self::ModerationReportingNotConfigured => "moderation_reporting_not_configured",
+            Self::InvalidModerationReportConfig(_) => "invalid_moderation_report_config",
+            Self::InvalidReportedPublicKey => "invalid_reported_public_key",
+            Self::CannotReportSelf => "cannot_report_self",
+            Self::ModerationReportRateLimited => "moderation_report_rate_limited",
             Self::FollowListUnavailable => "follow_list_unavailable",
             Self::RelayDirectory(_) => "relay_directory",
             Self::AccountCatchUp(_) => "account_catch_up",
@@ -713,6 +748,7 @@ fn storage_error_kind(error: &StorageError) -> &'static str {
         StorageError::Capacity(_) => "storage_capacity",
         StorageError::Closed(_) => "storage_closed",
         StorageError::UnsupportedSchemaVersion { .. } => "storage_unsupported_schema_version",
+        StorageError::InvalidAttachmentBody(_) => "storage_invalid_attachment_body",
         StorageError::Backend(_) => "storage_backend",
         StorageError::Serialization(_) => "storage_serialization",
     }

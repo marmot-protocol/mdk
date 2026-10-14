@@ -15,7 +15,10 @@ use super::timeline::RuntimeProjectionUpdateFfi;
 /// firehose can surface it without re-listing all variants at the call site.
 fn group_id_from_event(event: &GroupEvent) -> &GroupId {
     match event {
-        GroupEvent::GroupCreated { group_id }
+        GroupEvent::LocalGroupCopyTerminated { group_id, .. }
+        | GroupEvent::LocalGroupCopyRestored { group_id }
+        | GroupEvent::GroupMemberLeavesRemoved { group_id, .. }
+        | GroupEvent::GroupCreated { group_id }
         | GroupEvent::GroupJoined { group_id, .. }
         | GroupEvent::TransportObjectResourceRefused { group_id, .. }
         | GroupEvent::MessageReceived { group_id, .. }
@@ -196,6 +199,13 @@ pub enum GroupEventKindFfi {
     GroupHydrationRecovered {
         recovered_epoch: u64,
     },
+    LocalGroupCopyTerminated {
+        voluntary: bool,
+    },
+    LocalGroupCopyRestored,
+    GroupMemberLeavesRemoved {
+        epoch: u64,
+    },
 }
 
 /// Stable, low-cardinality tag for a [`GroupStateChange`] — surfaced to FFI in
@@ -251,6 +261,13 @@ fn inbound_resource_limit_tag(resource: &InboundResourceLimit) -> &'static str {
 impl From<GroupEvent> for GroupEventKindFfi {
     fn from(event: GroupEvent) -> Self {
         match event {
+            GroupEvent::LocalGroupCopyTerminated { voluntary, .. } => {
+                Self::LocalGroupCopyTerminated { voluntary }
+            }
+            GroupEvent::LocalGroupCopyRestored { .. } => Self::LocalGroupCopyRestored,
+            GroupEvent::GroupMemberLeavesRemoved { epoch, .. } => {
+                Self::GroupMemberLeavesRemoved { epoch: epoch.0 }
+            }
             GroupEvent::GroupCreated { .. } => Self::GroupCreated,
             GroupEvent::GroupJoined {
                 via_welcome,
@@ -549,6 +566,53 @@ mod tests {
                 assert_eq!(arms, 3);
             }
             other => panic!("unexpected FFI event: {other:?}"),
+        }
+    }
+    #[test]
+    fn native_membership_events_preserve_account_group_and_payload() {
+        let group_id = cgka_traits::GroupId::new(vec![0x31; 16]);
+        for (index, event) in [
+            GroupEvent::LocalGroupCopyTerminated {
+                group_id: group_id.clone(),
+                voluntary: true,
+            },
+            GroupEvent::LocalGroupCopyRestored {
+                group_id: group_id.clone(),
+            },
+            GroupEvent::GroupMemberLeavesRemoved {
+                group_id,
+                epoch: cgka_traits::EpochId(42),
+                leaves: vec![],
+                departed_members: vec![],
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let converted =
+                MarmotEventFfi::from(MarmotAppEvent::GroupEvent(marmot_app::RuntimeGroupEvent {
+                    account_id_hex: "account".into(),
+                    account_label: "alice".into(),
+                    event,
+                }));
+            let MarmotEventFfi::GroupEvent {
+                account_id_hex,
+                account_label,
+                group_id_hex,
+                event,
+            } = converted
+            else {
+                panic!("group event");
+            };
+            assert_eq!(account_id_hex, "account");
+            assert_eq!(account_label, "alice");
+            assert_eq!(group_id_hex, "31".repeat(16));
+            match (index, event) {
+                (0, GroupEventKindFfi::LocalGroupCopyTerminated { voluntary: true })
+                | (1, GroupEventKindFfi::LocalGroupCopyRestored)
+                | (2, GroupEventKindFfi::GroupMemberLeavesRemoved { epoch: 42 }) => {}
+                other => panic!("incorrect membership mapping: {other:?}"),
+            }
         }
     }
 }

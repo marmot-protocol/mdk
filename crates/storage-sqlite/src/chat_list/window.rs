@@ -118,26 +118,6 @@ impl SqliteAccountStorage {
                 before.rows.extend(page.rows);
                 page.rows = before.rows;
             }
-            let mut pending_presentations = Vec::new();
-            let mut rows = Vec::with_capacity(page.rows.len());
-            let mut statement = conn.prepare_cached("SELECT presentation_json, presentation_applied_source_revision != presentation_source_revision FROM chat_list_rows WHERE group_id_hex=?1").storage()?;
-            for row in &page.rows {
-                let (bytes, dirty): (Option<Vec<u8>>, bool) = statement
-                    .query_row([&row.group_id_hex], |r| Ok((r.get(0)?, r.get(1)?)))
-                    .storage()?;
-                if let Some(bytes) = bytes {
-                    let presentation = crate::chat_presentation::decode_retained(&bytes, dirty)?.presentation;
-                    let avatar_asset = crate::avatar_cache::access::target_presentation(conn, &row.group_id_hex, None, &presentation.avatar, crate::codec::unix_now_seconds())?;
-                    rows.push(PresentedChatRow {
-                        preview: crate::chat_presentation::row_contract::selected_preview_tx(conn, row)?,
-                        actions: crate::ChatListRowActions::for_row(row),
-                        row: row.clone(), presentation, avatar_asset
-                    });
-                } else {
-                    pending_presentations.push(row.group_id_hex.clone());
-                }
-            }
-            drop(statement);
             let presentation_version = conn
                 .query_row_cached(
                     "SELECT store_epoch, revision FROM chat_presentation_meta WHERE id=1",
@@ -150,6 +130,27 @@ impl SqliteAccountStorage {
                     },
                 )
                 .storage()?;
+            let mut pending_presentations = Vec::new();
+            let mut rows = Vec::with_capacity(page.rows.len());
+            let mut statement = conn.prepare_cached("SELECT presentation_json, presentation_applied_source_revision != presentation_source_revision FROM chat_list_rows WHERE group_id_hex=?1").storage()?;
+            for row in &page.rows {
+                let (bytes, dirty): (Option<Vec<u8>>, bool) = statement
+                    .query_row([&row.group_id_hex], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .storage()?;
+                if let Some(bytes) = bytes {
+                    let presentation = crate::chat_presentation::decode_retained(&bytes, dirty)?.presentation;
+                    let avatar_asset = crate::avatar_cache::access::target_presentation(conn, &row.group_id_hex, None, &presentation.avatar, crate::codec::unix_now_seconds())?;
+                    rows.push(PresentedChatRow {
+                        draft_version: crate::message_drafts::revisioned::chat_list_version_tx(conn, &row.group_id_hex, &presentation_version.store_epoch)?,
+                        preview: crate::chat_presentation::row_contract::selected_preview_tx(conn, row)?,
+                        actions: crate::ChatListRowActions::for_row(row),
+                        row: row.clone(), presentation, avatar_asset
+                    });
+                } else {
+                    pending_presentations.push(row.group_id_hex.clone());
+                }
+            }
+            drop(statement);
             let snapshot = pending_presentations
                 .is_empty()
                 .then_some(PresentedChatListSnapshot {

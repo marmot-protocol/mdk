@@ -19,6 +19,8 @@ pub enum ConnectorError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error("control socket path exceeds platform byte limit; shorten --home or --socket")]
+    SocketPathTooLong,
     #[error("debug controls are disabled")]
     DebugControlsDisabled,
     #[error("agent control request is unauthorized")]
@@ -33,6 +35,12 @@ pub enum ConnectorError {
     InvalidProfileName(&'static str),
     #[error("invalid profile {0}: {1}")]
     InvalidProfileField(&'static str, &'static str),
+    #[error("invalid relay URL: {0}")]
+    InvalidRelayUrl(&'static str),
+    #[error("invalid relay list edit: {0}")]
+    InvalidRelayListEdit(&'static str),
+    #[error("the published relay list could not be confirmed: {0}")]
+    RelayListInconclusive(&'static str),
     #[error("connector operation timed out: {0}")]
     OperationTimedOut(&'static str),
     #[error("matching send is still in progress")]
@@ -76,6 +84,7 @@ impl ConnectorError {
             Self::Hex(_) => "invalid_hex",
             Self::Json(_) => "json_error",
             Self::Io(_) => "io_error",
+            Self::SocketPathTooLong => "socket_path_too_long",
             Self::DebugControlsDisabled => "debug_controls_disabled",
             Self::Unauthorized => "unauthorized",
             Self::UnsafeControlPlaneConfig(_) => "unsafe_control_plane_config",
@@ -83,6 +92,9 @@ impl ConnectorError {
             Self::InvalidGroupCreate(_) => "invalid_group_create",
             Self::InvalidProfileName(_) => "invalid_profile_name",
             Self::InvalidProfileField(_, _) => "invalid_profile_field",
+            Self::InvalidRelayUrl(_) => "invalid_relay_url",
+            Self::InvalidRelayListEdit(_) => "invalid_relay_list_edit",
+            Self::RelayListInconclusive(_) => "relay_list_inconclusive",
             Self::OperationTimedOut(_) => "operation_timed_out",
             Self::SendInProgress => "send_in_progress",
             Self::MediaPathDenied(_) => "media_path_denied",
@@ -98,6 +110,9 @@ impl ConnectorError {
     pub fn client_message(&self) -> &'static str {
         match self {
             Self::DebugControlsDisabled => "debug controls are disabled",
+            Self::SocketPathTooLong => {
+                "control socket path exceeds platform byte limit; shorten --home or --socket"
+            }
             Self::Unauthorized => "agent control request is unauthorized",
             Self::UnsafeControlPlaneConfig(_) => "unsafe agent control plane configuration",
             Self::Hex(_) => "invalid hex value",
@@ -123,6 +138,11 @@ impl ConnectorError {
             Self::InvalidGroupCreate(_) => "invalid group create request",
             Self::InvalidProfileName(_) => "invalid profile name",
             Self::InvalidProfileField(_, _) => "invalid profile field",
+            Self::InvalidRelayUrl(_) => "invalid relay URL",
+            Self::InvalidRelayListEdit(_) => "invalid relay list edit",
+            Self::RelayListInconclusive(_) => {
+                "the published relay list could not be confirmed; nothing was published"
+            }
             Self::OperationTimedOut(_) => "connector operation timed out",
             Self::SendInProgress => {
                 "matching send is still in progress; retry with the same idempotency key"
@@ -149,6 +169,7 @@ impl ConnectorError {
         matches!(
             self,
             Self::SendInProgress
+                | Self::RelayListInconclusive(_)
                 | Self::App(AppError::MediaUploadTimedOut | AppError::AgentStreamSendFailed(_))
         )
     }

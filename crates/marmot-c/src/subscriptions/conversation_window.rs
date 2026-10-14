@@ -1,6 +1,7 @@
 //! Fallible replacement streams use blocking next; paging has independent ownership.
 use super::*;
 use crate::types::conversation_window::*;
+use crate::types::presentation::MarmotChatListDraftVersion;
 
 /// Free before its client. Concurrent next and commands are supported; never free during a call.
 pub struct MarmotConversationWindowSubscription {
@@ -259,6 +260,31 @@ pub unsafe extern "C" fn marmot_selected_message_draft(
         unsafe { deliver(client.marmot.selected_message_draft(account, group), out) }
     })
 }
+/// Compare an opaque chat-list draft version with a selected revision.
+/// Returns zero for a foreign store/group or a newer draft.
+/// # Safety
+/// revision's owning draft/snapshot and version's owning row remain live;
+/// out is writable. Inputs are borrowed for this call only.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_message_draft_revision_includes_chat_list_version(
+    revision: *const MarmotMessageDraftRevision,
+    version: *const MarmotChatListDraftVersion,
+    out: *mut u8,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { crate::preflight_out(out) });
+        let revision = try_arg!(unsafe { revision.as_ref() }.ok_or(MarmotStatus::NullPointer));
+        let version = try_arg!(unsafe { version.as_ref() }.ok_or(MarmotStatus::NullPointer));
+        unsafe {
+            *out = u8::from(
+                revision
+                    .inner
+                    .includes_chat_list_version(version.inner.clone()),
+            )
+        };
+        MarmotStatus::Ok
+    })
+}
 /// Clear only this selected revision; later edits are preserved.
 /// # Safety
 /// client, account and revision valid; revision's owning snapshot/draft must remain live; out writable.
@@ -430,4 +456,204 @@ pub unsafe extern "C" fn marmot_send_message_draft_with_client_token(
             )
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::{
+        marmot_create_group, marmot_create_identity, marmot_presented_chat_list_row,
+        marmot_save_message_draft,
+    };
+    use crate::memory::audit;
+    use crate::types::account::marmot_account_summary_free;
+    use crate::types::draft::marmot_message_draft_free;
+    use crate::types::presentation::marmot_presented_chat_row_free;
+    use crate::{
+        MarmotRelayPolicy, marmot_client_free, marmot_client_new_with_options,
+        marmot_client_shutdown, marmot_client_start, marmot_string_free,
+    };
+    use std::ffi::CString;
+    use std::ptr;
+
+    #[test]
+    fn draft_version_comparison_preflights_output_and_both_borrows() {
+        let mut covered = 9;
+        unsafe {
+            assert_eq!(
+                marmot_message_draft_revision_includes_chat_list_version(
+                    ptr::null(),
+                    ptr::null(),
+                    &raw mut covered
+                ),
+                MarmotStatus::NullPointer
+            );
+            assert_eq!(covered, 0);
+            // A NULL output must be refused before either input is dereferenced.
+            assert_eq!(
+                marmot_message_draft_revision_includes_chat_list_version(
+                    ptr::dangling(),
+                    ptr::dangling(),
+                    ptr::null_mut()
+                ),
+                MarmotStatus::NullPointer
+            );
+        }
+    }
+
+    #[test]
+    fn row_owned_draft_version_compares_and_deep_frees() {
+        let _guard = audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let before = audit::live_allocations();
+        keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let relay = runtime
+            .block_on(nostr_relay_builder::MockRelay::run())
+            .unwrap();
+        let relay_url = CString::new(runtime.block_on(relay.url()).to_string()).unwrap();
+        let relays = [relay_url.as_ptr()];
+        let home = tempfile::tempdir().unwrap();
+        let root = CString::new(home.path().to_str().unwrap()).unwrap();
+        unsafe {
+            let mut client = ptr::null_mut();
+            assert_eq!(
+                marmot_client_new_with_options(
+                    root.as_ptr(),
+                    relays.as_ptr(),
+                    1,
+                    MarmotRelayPolicy::AllowLoopback as u32,
+                    ptr::null(),
+                    &mut client
+                ),
+                MarmotStatus::Ok
+            );
+            assert_eq!(marmot_client_start(client), MarmotStatus::Ok);
+            let mut account = ptr::null_mut();
+            assert_eq!(
+                marmot_create_identity(
+                    client,
+                    relays.as_ptr(),
+                    1,
+                    relays.as_ptr(),
+                    1,
+                    ptr::null(),
+                    0,
+                    &mut account
+                ),
+                MarmotStatus::Ok
+            );
+            let mut group = ptr::null_mut();
+            assert_eq!(
+                marmot_create_group(
+                    client,
+                    (*account).account_id_hex,
+                    c"draft version test".as_ptr(),
+                    ptr::null(),
+                    0,
+                    ptr::null(),
+                    &mut group
+                ),
+                MarmotStatus::Ok
+            );
+            let mut draft = ptr::null_mut();
+            assert_eq!(
+                marmot_save_message_draft(
+                    client,
+                    (*account).account_id_hex,
+                    group,
+                    c"same".as_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    0,
+                    &mut draft
+                ),
+                MarmotStatus::Ok
+            );
+            marmot_message_draft_free(draft);
+            let mut selected = ptr::null_mut();
+            assert_eq!(
+                marmot_selected_message_draft(
+                    client,
+                    (*account).account_id_hex,
+                    group,
+                    &mut selected
+                ),
+                MarmotStatus::Ok
+            );
+            let mut row = ptr::null_mut();
+            assert_eq!(
+                marmot_presented_chat_list_row(client, (*account).account_id_hex, group, &mut row),
+                MarmotStatus::Ok
+            );
+            assert!(!row.is_null() && !(*row).draft_version.is_null());
+            let mut covered = 9;
+            assert_eq!(
+                marmot_message_draft_revision_includes_chat_list_version(
+                    (*selected).revision,
+                    (*row).draft_version,
+                    &mut covered
+                ),
+                MarmotStatus::Ok
+            );
+            assert_eq!(covered, 1);
+            assert_eq!(
+                marmot_message_draft_revision_includes_chat_list_version(
+                    (*selected).revision,
+                    ptr::null(),
+                    &mut covered
+                ),
+                MarmotStatus::NullPointer
+            );
+            assert_eq!(covered, 0);
+            covered = 9;
+            assert_eq!(
+                marmot_message_draft_revision_includes_chat_list_version(
+                    ptr::null(),
+                    (*row).draft_version,
+                    &mut covered
+                ),
+                MarmotStatus::NullPointer
+            );
+            assert_eq!(covered, 0);
+            marmot_presented_chat_row_free(row);
+            // Same text saved again must not be covered by the older captured revision.
+            assert_eq!(
+                marmot_save_message_draft(
+                    client,
+                    (*account).account_id_hex,
+                    group,
+                    c"same".as_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    0,
+                    &mut draft
+                ),
+                MarmotStatus::Ok
+            );
+            marmot_message_draft_free(draft);
+            assert_eq!(
+                marmot_presented_chat_list_row(client, (*account).account_id_hex, group, &mut row),
+                MarmotStatus::Ok
+            );
+            assert!(!row.is_null() && !(*row).draft_version.is_null());
+            assert_eq!(
+                marmot_message_draft_revision_includes_chat_list_version(
+                    (*selected).revision,
+                    (*row).draft_version,
+                    &mut covered
+                ),
+                MarmotStatus::Ok
+            );
+            assert_eq!(covered, 0);
+            marmot_presented_chat_row_free(row);
+            crate::types::conversation_window::marmot_selected_message_draft_free(selected);
+            marmot_string_free(group);
+            marmot_account_summary_free(account);
+            assert_eq!(marmot_client_shutdown(client), MarmotStatus::Ok);
+            marmot_client_free(client);
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(audit::live_allocations(), before);
+    }
 }

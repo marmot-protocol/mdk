@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, Once};
 
 use marmot_account::{
     AccountHome, AccountHomeError, AccountHomeResult, AccountSecretStore, AccountSetupKind,
-    AccountSetupPhase, AccountSetupState, AccountSummary, KeychainSecretStore,
+    AccountSetupPhase, AccountSetupState, AccountSummary, ExternalSecretMode, KeychainSecretStore,
 };
 use nostr::nips::nip19::FromBech32;
 use nostr::nips::nip49::{EncryptedSecretKey, KeySecurity};
@@ -516,6 +516,86 @@ fn account_home_upgrades_public_identity_to_external_signer_identity() {
     assert!(!external.local_signing);
     assert!(external.external_signing);
     assert_eq!(home.accounts().unwrap(), vec![external]);
+}
+
+#[test]
+fn external_db_key_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemorySecretStore::default());
+    let home = AccountHome::open_with_secret_store(dir.path(), store.clone());
+    let user = nostr::prelude::Keys::parse(&"01".repeat(32)).unwrap();
+    let account = home
+        .add_external_signer_account(&user.public_key().to_hex())
+        .unwrap();
+    let secret = home
+        .external_database_secret(&account.label, ExternalSecretMode::Create)
+        .unwrap();
+    assert_ne!(&*secret, user.secret_key().as_secret_bytes());
+    assert_eq!(home.accounts().unwrap(), vec![account.clone()]);
+    assert!(matches!(
+        home.load_signing_keys(&account.label),
+        Err(AccountHomeError::SecretNotFound(_))
+    ));
+    assert!(
+        !home
+            .account_dir(&account.label)
+            .join(marmot_account::EXTERNAL_SQLCIPHER_SECRET_FILE)
+            .exists()
+    );
+    let reopened = AccountHome::open_with_secret_store(dir.path(), store.clone());
+    assert_eq!(
+        *reopened
+            .external_database_secret(&account.label, ExternalSecretMode::Existing)
+            .unwrap(),
+        *secret
+    );
+    reopened.remove_account(&account.label).unwrap();
+    assert!(store.keys.lock().unwrap().is_empty());
+}
+
+#[test]
+fn external_db_key_migration() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemorySecretStore::default());
+    let home = AccountHome::open_with_secret_store(dir.path(), store.clone());
+    let user = nostr::prelude::Keys::parse(&"01".repeat(32)).unwrap();
+    let account = home
+        .add_external_signer_account(&user.public_key().to_hex())
+        .unwrap();
+    let legacy = home
+        .account_dir(&account.label)
+        .join(marmot_account::EXTERNAL_SQLCIPHER_SECRET_FILE);
+    std::fs::write(&legacy, "02".repeat(32)).unwrap();
+    assert_eq!(
+        *home
+            .external_database_secret(&account.label, ExternalSecretMode::Existing)
+            .unwrap(),
+        [2; 32]
+    );
+    assert!(!legacy.exists());
+    let reopened = AccountHome::open_with_secret_store(dir.path(), store);
+    assert_eq!(
+        *reopened
+            .external_database_secret(&account.label, ExternalSecretMode::Existing)
+            .unwrap(),
+        [2; 32]
+    );
+}
+
+#[test]
+fn external_db_key_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemorySecretStore::default());
+    let home = AccountHome::open_with_secret_store(dir.path(), store.clone());
+    let user = nostr::prelude::Keys::parse(&"01".repeat(32)).unwrap();
+    let account = home
+        .add_external_signer_account(&user.public_key().to_hex())
+        .unwrap();
+    assert!(matches!(
+        home.external_database_secret(&account.label, ExternalSecretMode::Existing),
+        Err(AccountHomeError::SecretNotFound(_))
+    ));
+    assert!(store.keys.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -1134,5 +1214,43 @@ fn onboarding_latest_evidence_and_recovery_journal_are_private() {
                 0o600
             );
         }
+    }
+}
+
+#[test]
+fn replaceable_record_floors_only_advance_and_survive_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(root.path());
+    let account = home.create_nostr_account().unwrap();
+    assert!(
+        home.replaceable_record_floors(&account.label)
+            .unwrap()
+            .is_empty()
+    );
+
+    home.advance_replaceable_record_floor(&account.label, 3, 20)
+        .unwrap();
+    home.advance_replaceable_record_floor(&account.label, 3, 10)
+        .unwrap();
+    home.advance_replaceable_record_floor(&account.label, 0, 5)
+        .unwrap();
+
+    let reopened = AccountHome::open(root.path());
+    let floors = reopened
+        .replaceable_record_floors(&account.account_id_hex)
+        .unwrap();
+    assert_eq!(floors.get(&3), Some(&20), "a floor never moves backwards");
+    assert_eq!(floors.get(&0), Some(&5));
+    #[cfg(unix)]
+    {
+        let mode = std::fs::metadata(
+            reopened
+                .account_dir(&account.label)
+                .join("replaceable-floors.json"),
+        )
+        .unwrap()
+        .permissions()
+        .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

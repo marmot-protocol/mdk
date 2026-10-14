@@ -332,6 +332,15 @@ impl From<app::ConversationOpenAnchorOutcome> for ConversationAnchorOutcomeFfi {
 pub struct MessageDraftRevisionFfi {
     pub(crate) inner: app::MessageDraftRevision,
 }
+
+#[uniffi::export]
+impl MessageDraftRevisionFfi {
+    /// Compare opaque chat-list draft metadata without exposing revision internals.
+    /// False for a newer version or another account store/group.
+    pub fn includes_chat_list_version(&self, version: Arc<ChatListDraftVersionFfi>) -> bool {
+        self.inner.includes_chat_list_version(&version.inner)
+    }
+}
 #[derive(Clone, uniffi::Record)]
 pub struct SelectedMessageDraftFfi {
     pub revision: Arc<MessageDraftRevisionFfi>,

@@ -15,6 +15,15 @@ pub enum AttachmentCategory {
     Rejected,
 }
 
+/// Presentation role, independent of MIME category and acquisition eligibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachmentRole {
+    /// A normal shared attachment, or a rejected slot whose role cannot be validated.
+    Shared,
+    /// A validated image referenced by a well-formed NIP-30 emoji tag on its message.
+    InlineEmoji,
+}
+
 #[derive(Clone)]
 pub struct AttachmentEntry {
     pub message_id_hex: String,
@@ -25,6 +34,7 @@ pub struct AttachmentEntry {
     /// None for retained legacy rows. Never treat the parser's epoch fallback as authoritative.
     pub source_epoch: Option<u64>,
     pub category: AttachmentCategory,
+    pub role: AttachmentRole,
     pub attachment: MediaAttachmentOutcome,
 }
 impl std::fmt::Debug for AttachmentEntry {
@@ -55,7 +65,8 @@ pub(crate) fn category(media_type: &str) -> AttachmentCategory {
     }
 }
 
-fn present(
+/// Preserve the parser verdict and derive presentation role from source-owned emoji metadata.
+pub(super) fn present(
     entry: storage_sqlite::AttachmentHistoryEntry,
     allow_loopback: bool,
 ) -> Result<AttachmentEntry, AppError> {
@@ -88,6 +99,7 @@ fn present(
             AttachmentCategory::Rejected
         }
     };
+    let role = attachment_role(&attachment, &entry.emoji_tags);
     Ok(AttachmentEntry {
         message_id_hex: entry.message_id_hex,
         source_message_id_hex: entry.source_message_id_hex,
@@ -96,10 +108,47 @@ fn present(
         received_at: entry.received_at,
         source_epoch: entry.source_epoch,
         category,
+        role,
         attachment,
     })
 }
+/// First well-formed definition wins for each case-sensitive shortcode, even if unmatched.
+/// Every accepted image slot using that artwork locator has the inline role; acquisition is unchanged.
+fn attachment_role(attachment: &MediaAttachmentOutcome, tags: &[Vec<String>]) -> AttachmentRole {
+    let MediaAttachmentOutcome::Accepted { reference, .. } = attachment else {
+        return AttachmentRole::Shared;
+    };
+    if category(&reference.media_type) != AttachmentCategory::Image {
+        return AttachmentRole::Shared;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for tag in tags {
+        if !(3..=4).contains(&tag.len())
+            || tag[0] != "emoji"
+            || tag[1].is_empty()
+            || tag[1].len() > 64
+            || !tag[1]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            || tag[2].trim().is_empty()
+            || !seen.insert(&tag[1])
+        {
+            continue;
+        }
+        if reference
+            .locators
+            .iter()
+            .any(|locator| locator.value == tag[2])
+        {
+            return AttachmentRole::InlineEmoji;
+        }
+    }
+    AttachmentRole::Shared
+}
+
 impl MarmotAppRuntime {
+    /// Share one pending scope across task queueing, account opening, local reads and successful result delivery.
+    /// Cached successes stay out of history; a dropped future leaves running work observable until its last owner exits.
     pub(super) async fn attachment_read<T: Send + 'static>(
         &self,
         account_ref: &str,
@@ -111,21 +160,43 @@ impl MarmotAppRuntime {
         let app = self.accounts.app.clone();
         let account_ref = account_ref.to_owned();
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
+        let probe = std::sync::Arc::new(
+            app.startup_diagnostics
+                .observe_pending_open(crate::NativeStartupStage::AttachmentTaskQueued),
+        );
+        let worker_probe = probe.clone();
         let work = blocking_app_task(move || {
-            // Account resolution, store opening, SQL and parser work all stay off the caller thread.
-            let account = app.account_home().account(&account_ref)?;
-            let storage = app.account_storage(&account.label)?;
-            if app.account_home().account(&account.label)?.account_id_hex != account.account_id_hex
-            {
-                return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
+            let result = (|| {
+                worker_probe.phase(crate::NativeStartupStage::AccountResolution);
+                // Account resolution, store opening, SQL and parser work all stay off the caller thread.
+                let account = app.account_home().account(&account_ref)?;
+                let storage = app.account_storage_observed(&account.label, &worker_probe)?;
+                worker_probe.phase(crate::NativeStartupStage::AccountResolution);
+                if app.account_home().account(&account.label)?.account_id_hex
+                    != account.account_id_hex
+                {
+                    return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
+                }
+                worker_probe.phase(crate::NativeStartupStage::AttachmentLocalRead);
+                read(storage, app.allow_loopback_blob_endpoints())
+            })();
+            // Keep a failed native phase/version intact until retirement.
+            if result.is_ok() {
+                worker_probe.phase(crate::NativeStartupStage::AttachmentFutureWait);
             }
-            read(storage, app.allow_loopback_blob_endpoints())
+            result
         });
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut stopping) => Err(AppError::RuntimeStopping),
             result = work => result,
+        };
+        // On shutdown/cancellation the worker may still own this scope. Its eventual last drop
+        // records abandonment; do not hide the blocked native work when its caller stops waiting.
+        if let Ok(probe) = std::sync::Arc::try_unwrap(probe) {
+            probe.finish(result.is_ok());
         }
+        result
     }
     /// Read bounded original slots in canonical order, including rejected attachments.
     /// Categories support client-side per-page filtering; continue while next_cursor

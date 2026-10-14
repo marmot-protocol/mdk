@@ -70,5 +70,7 @@ OPENCLAW_HOST_COMPAT_EXPECT_FLUSH_PAIR=1 pnpm vitest run \
   test/sender-policy.test.ts \
   test/sender-policy-entrypoint.test.ts \
   test/client.test.ts \
+  test/group-profile-tool.test.ts \
+  test/history-tool.test.ts \
   test/inbound.test.ts \
   test/config.test.ts

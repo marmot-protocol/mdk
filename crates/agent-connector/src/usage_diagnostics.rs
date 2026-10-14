@@ -223,8 +223,9 @@ mod tests {
 
     #[tokio::test]
     async fn owner_socket_updates_the_active_consent_without_starting_collectors() {
+        // Leave room for the private staging address and long process IDs.
         let home = tempfile::Builder::new()
-            .prefix(".mdk-usage-test-")
+            .prefix(".mu-")
             .tempdir_in(std::env::var_os("HOME").expect("test home"))
             .unwrap();
         let app = MarmotApp::try_with_relays_and_account_home_and_config(

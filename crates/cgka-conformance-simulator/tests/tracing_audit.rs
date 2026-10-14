@@ -205,8 +205,9 @@ fn is_cli_binary(path: &Path) -> bool {
         return true;
     }
 
+    // Cargo builds `bin/` and `examples/` targets as standalone executables.
     path.components()
-        .any(|component| matches!(component.as_os_str().to_str(), Some("bin")))
+        .any(|component| matches!(component.as_os_str().to_str(), Some("bin" | "examples")))
 }
 
 fn workspace_root() -> PathBuf {

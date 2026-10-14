@@ -1,0 +1,23 @@
+[workspace]
+
+[package]
+name = "hpke-rs-libcrux-security-regression"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+hpke-rs = { version = "=0.7.0", default-features = false, features = ["hazmat", "serialization", "experimental"] }
+hpke-rs-crypto = "=0.7.0"
+hpke-rs-rust-crypto = { version = "=0.7.0", features = ["experimental"] }
+hpke-rs-libcrux = { version = "=0.7.0", features = ["std"] }
+
+[dev-dependencies]
+libcrux-kem = { version = "=0.0.10", default-features = false }
+
+[features]
+mlkem = ["hpke-rs-libcrux/draft-connolly-cfrg-hpke-mlkem"]
+
+[patch.crates-io]
+hpke-rs-libcrux = { path = ".." }
+hax-lib-macros = { git = "https://github.com/cryspen/hax.git", rev = "8f9cb576e58f6cc7e9ed249a7d4439b0f7ed0da7" }

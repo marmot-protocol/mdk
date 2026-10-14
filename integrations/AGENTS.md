@@ -14,12 +14,13 @@ systems to Marmot through `wn-agent`.
 - `codex/marmot` - `wn-codex` Codex harness binary.
 - `opencode/marmot` - `wn-opencode` OpenCode harness binary.
 - `pi/marmot` - `wn-pi` Pi harness binary.
+- `goose/marmot` - `wn-goose` Goose harness binary.
 - `terminal-harness` - shared terminal-harness control/runtime library
   (`marmot-terminal-harness`).
 - `test_installer_systemd_service.sh` - shared systemd-service installer check
   invoked by the Hermes and OpenClaw dev-script tests.
 
-Installer scripts live in `scripts/install-*-marmot.sh`; the four terminal
+Installer scripts live in `scripts/install-*-marmot.sh`; the five terminal
 harness installers are thin wrappers over `scripts/install-terminal-harness-marmot.sh`.
 
 The shared boundary is the `marmot.agent-control.v2` NDJSON protocol over a
@@ -35,7 +36,7 @@ deletes, invite policy, and local storage.
 - Treat `MARMOT_HOME`, `MARMOT_AGENT_SOCKET`, `MARMOT_AGENT_AUTH_TOKEN_FILE`,
   `MARMOT_AGENT_AUTH_TOKEN`, and `MARMOT_ACCOUNT_ID_HEX` as the common connector
   vocabulary. Use integration-specific prefixes only for integration-specific
-  behavior, for example `WN_OPENCODE_*` and `WN_PI_*`.
+  behavior, for example `WN_OPENCODE_*`, `WN_PI_*`, and `WN_GOOSE_*`.
 - Prefer explicit account ids in production configuration. Auto-select only the
   sole local-signing account; fail closed when multiple local-signing accounts
   are available.
@@ -60,7 +61,7 @@ runtime to Marmot and may own activation policy, message-tool routing, live
 preview adaptation, media staging policy, profile onboarding, and gateway
 session behavior.
 
-`wn-claude`, `wn-codex`, `wn-opencode`, and `wn-pi` are pure terminal harnesses. They subscribe to allowed
+`wn-claude`, `wn-codex`, `wn-opencode`, `wn-pi`, and `wn-goose` are pure terminal harnesses. They subscribe to allowed
 Marmot prompts and invoke their respective binaries; they should stay narrower than the
 gateway integrations unless there is a concrete product reason to broaden it.
 
@@ -132,11 +133,12 @@ Installer expectations:
 The default Hermes, OpenClaw, and terminal-harness service names are
 connector-specific
 (`wn-agent-hermes.service`, `wn-agent-openclaw.service`, `wn-agent-claude.service`,
-`wn-agent-codex.service`, `wn-agent-harnesses.service`, `wn-agent-pi.service`,
+`wn-agent-codex.service`, `wn-agent-harnesses.service`, `wn-agent-pi.service`, `wn-agent-goose.service`,
 `org.marmot.wn-agent.hermes`, `org.marmot.wn-agent.openclaw`,
 `org.marmot.wn-agent.claude`, `org.marmot.wn-agent.codex`,
-`org.marmot.wn-agent.harnesses`, and `org.marmot.wn-agent.pi`). Harness services
-are also connector-specific (`wn-claude`, `wn-codex`, `wn-opencode`, and `wn-pi`). If you add a new
+`org.marmot.wn-agent.harnesses`, `org.marmot.wn-agent.pi`, and
+`org.marmot.wn-agent.goose`). Harness services are also connector-specific
+(`wn-claude`, `wn-codex`, `wn-opencode`, `wn-pi`, and `wn-goose`). If you add a new
 production installer, choose names that can coexist with the existing
 integrations on the same login.
 
@@ -171,14 +173,24 @@ cargo test -p marmot-terminal-harness
 cargo test -p wn-pi
 just pi-dev-e2e-connector
 just pi-installer-test
+
+cargo test -p wn-goose
+just goose-dev-e2e-connector
+just goose-installer-test
 ```
 
 When editing install examples in any integration README, `integrations/README.md`,
 or `release.md`, also run the doc gates. They count `install_verified` calls per
-file, require download -> `.sha256` -> verify -> execute ordering, require a
-"same shell" note before dependent fences, and pin exactly one current-release
-`base_url` in `integrations/README.md`. Edit prose around installer fences, not
-the fences themselves.
+file, require download -> `.sha256` -> verify -> execute ordering and a
+"same shell" note before dependent fences. The quickstart defines the verified
+installer helper once; runtime READMEs link to it and pin the documented release.
+The optional latest-cohort lookup lives only in the quickstart and clears the
+selected URL on failure. Each install uses one immutable release for installer,
+checksum and assets.
+`release.md` and release notes retain their exact-version provenance. Do not
+replace these checks with a mutable download alias or mix release cohorts.
+Minimum runtime versions and pinned compatibility evidence are distinct from
+the documented install default.
 
 ```sh
 just install-example-sha256-gate
@@ -200,5 +212,40 @@ New integrations should follow the existing shape:
 - share installer/release conventions with the existing scripts;
 - document whether the integration is a gateway/channel plugin or a pure
   harness;
-- document coexistence with Hermes, OpenClaw, Claude Code, Codex, OpenCode, and Pi before landing
+- document coexistence with Hermes, OpenClaw, Claude Code, Codex, OpenCode, Pi, and Goose before landing
   production install support.
+
+## Installation policy
+
+Use answers already supplied in the installation prompt; ask only for missing
+choices. A supplied npub is public authorization information, not a secret
+identity import. Summarize the concrete setup plan for the prompt's approval
+step. Do not repeatedly ask for choices that have already been made.
+
+## Suggested agent chat instructions
+
+The following is a suggested instruction block to add to the selected agent's
+normal profile/project instructions. It is not installed automatically by the
+connector, and a terminal session's `/goal` alone cannot expose missing tools:
+
+Work in the current White Noise conversation. Keep its title a short,
+findable description of the accepted task, optionally with one project emoji.
+Rename only on a real topic change; keep the title during status questions,
+retries and completion. Read the current title first, preserve the current
+chat binding, and read back an update. Never put secrets or personal details
+in a title. After an uncertain write, inspect before retrying.
+
+Use real message reactions for progress: 👀 when an actionable request is
+accepted, ✅ after the requested result is completed and verified, ⏸️ when a
+real user decision is required, and ❌ on terminal failure. Replace your own
+earlier progress reaction rather than stacking it; do not send the emoji as
+a separate chat message. React to the triggering message in this chat. A
+planned change, queued build or draft is not a completed result. Emoji-only
+user messages are context, not blanket approval for a destructive action.
+
+Read the selected connector's setup and capability guide. Use only tools and
+file paths authorized for this deployment. Keep follow-up messages attached
+to the unfinished task unless the user changes it. Report the verified result
+concisely, with a link or delivered file when appropriate. If a required
+title, reaction or file tool is missing, explain that limitation rather than
+pretending the action worked.

@@ -40,6 +40,7 @@ impl WritePolicy for RejectFirstPush {
     }
 }
 
+#[allow(clippy::disallowed_methods)]
 async fn push_batch_case(
     tokens: usize,
     mode: PushRelay,

@@ -6,10 +6,11 @@ use std::time::Duration;
 
 use agent_connector::{
     AgentConnectorConfig, BootstrapOptions, BootstrapResult, ConnectorError,
-    DEFAULT_BOOTSTRAP_LABEL, MAX_CONTROL_CONNECTIONS, MAX_IDENTITY_BYTES, default_socket_path,
-    import_existing_identity_file, import_existing_identity_secret, read_bootstrap_auth_token,
-    resolve_bootstrap_home, resolve_bootstrap_quic_candidates, resolve_bootstrap_relays,
-    resolve_bootstrap_socket, run_bootstrap, serve_socket,
+    DEFAULT_BOOTSTRAP_LABEL, GroupProfileToolConfig, MAX_CONTROL_CONNECTIONS, MAX_IDENTITY_BYTES,
+    default_socket_path, import_existing_identity_file, import_existing_identity_secret,
+    read_bootstrap_auth_token, resolve_bootstrap_home, resolve_bootstrap_quic_candidates,
+    resolve_bootstrap_relays, resolve_bootstrap_socket, run_bootstrap, run_group_profile_tool,
+    serve_socket,
 };
 use agent_control::AgentControlInvitePolicy;
 use clap::{Args, Parser, Subcommand};
@@ -30,6 +31,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Update the current group's name/description from a JSON object on stdin.
+    /// Requires current group admin authority; never retries an uncertain update.
+    GroupProfile,
     /// Inspect or change the local Share usage and diagnostics permission.
     UsageDiagnostics {
         #[command(subcommand)]
@@ -282,9 +286,43 @@ fn main() -> ExitCode {
                 }
             }
         }),
+        Some(Commands::GroupProfile) => run_async(run_group_profile_command()),
         Some(Commands::Bootstrap(args)) => run_async(run_bootstrap_command(args)),
         Some(Commands::ImportIdentity(args)) => run_import_identity_command(args),
         None => run_async(run_serve_command(cli.serve)),
+    }
+}
+
+async fn run_group_profile_command() -> ExitCode {
+    let home = resolve_bootstrap_home(None);
+    let mut input = Vec::new();
+    let config = (|| {
+        std::io::stdin().take(8193).read_to_end(&mut input).ok()?;
+        let timeout = std::env::var("MARMOT_GROUP_PROFILE_TIMEOUT_SECS")
+            .unwrap_or_else(|_| "30".into())
+            .parse::<u64>()
+            .ok()?;
+        if !(1..=300).contains(&timeout) {
+            return None;
+        }
+        Some(GroupProfileToolConfig {
+            // Require the turn's explicit socket; do not guess a different home.
+            socket: PathBuf::from(std::env::var_os("MARMOT_AGENT_SOCKET")?),
+            auth_token: read_bootstrap_auth_token(None, None, &home).ok()?,
+            account_id_hex: std::env::var("MARMOT_ACCOUNT_ID_HEX").ok()?,
+            group_id_hex: std::env::var("MARMOT_GROUP_ID_HEX").ok()?,
+            request_timeout: Duration::from_secs(timeout),
+        })
+    })();
+    let result = match config {
+        Some(config) => run_group_profile_tool(config, &input).await,
+        None => serde_json::json!({"ok": false, "error": "group_profile_configuration_invalid"}),
+    };
+    println!("{result}");
+    if result["ok"] == true {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
@@ -698,6 +736,11 @@ fn which_qrencode() -> Option<String> {
 
 fn safe_error_message(err: &ConnectorError) -> String {
     match err {
+        ConnectorError::SocketPathTooLong => format!(
+            "startup failed code={} detail={}",
+            err.privacy_safe_code(),
+            err.client_message()
+        ),
         ConnectorError::Io(io) => {
             format!(
                 "startup failed code={} io_kind={:?}",

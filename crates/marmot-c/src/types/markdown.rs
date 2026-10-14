@@ -12,6 +12,7 @@ use marmot_uniffi::{
     MarkdownAlignmentFfi, MarkdownAutolinkKindFfi, MarkdownBlockFfi, MarkdownCodeBlockKindFfi,
     MarkdownDocumentFfi, MarkdownInlineFfi, MarkdownLinkDestinationKindFfi, MarkdownListItemFfi,
     MarkdownListKindFfi, MarkdownNostrEntityFfi, MarkdownNostrHrpFfi, MarkdownTableCellFfi,
+    MarkdownTimestampStyleFfi,
 };
 
 use crate::macros::{c_enum, c_mirror};
@@ -82,6 +83,21 @@ c_mirror! {
     }
 }
 
+c_enum! {
+    /// Timestamp presentation style; hosts format using the device locale and time zone.
+    MarmotMarkdownTimestampStyle from MarkdownTimestampStyleFfi {
+        ShortTime,
+        LongTime,
+        ShortDate,
+        LongDate,
+        ShortDateTime,
+        LongDateTime,
+        CompactDateTime,
+        CompactDateTimeSeconds,
+        Relative,
+    }
+}
+
 /// One inline Markdown node. Child arrays are owned by the parent; free
 /// only the document root.
 #[repr(C)]
@@ -135,6 +151,11 @@ pub enum MarmotMarkdownInline {
     },
     NostrUri {
         entity: MarmotMarkdownNostrEntity,
+    },
+    /// Signed Unix seconds and presentation style, without an allocated label.
+    Timestamp {
+        unix_seconds: i64,
+        style: MarmotMarkdownTimestampStyle,
     },
 }
 
@@ -222,6 +243,13 @@ impl From<MarkdownInlineFfi> for MarmotMarkdownInline {
             MarkdownInlineFfi::NostrUri { entity } => Self::NostrUri {
                 entity: entity.into(),
             },
+            MarkdownInlineFfi::Timestamp {
+                unix_seconds,
+                style,
+            } => Self::Timestamp {
+                unix_seconds,
+                style: style.into(),
+            },
         }
     }
 }
@@ -233,7 +261,7 @@ impl CFree for MarmotMarkdownInline {
                 Self::Text { content } | Self::Code { content } | Self::Math { content } => {
                     free_c_string(*content)
                 }
-                Self::SoftBreak | Self::HardBreak => {}
+                Self::SoftBreak | Self::HardBreak | Self::Timestamp { .. } => {}
                 Self::Emph {
                     children,
                     children_len,

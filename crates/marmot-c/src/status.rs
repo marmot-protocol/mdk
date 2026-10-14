@@ -136,6 +136,20 @@ pub enum MarmotStatus {
     /// A signed-out account cannot grant automatic network permission.
     AttachmentAccountSignedOut = 94,
     InvalidAppComponent = 95,
+    /// No valid moderation-report destination is installed; nothing was published.
+    ModerationReportingNotConfigured = 96,
+    /// The moderation-report destination was rejected as a whole.
+    InvalidModerationReportConfig = 97,
+    InvalidReportedPublicKey = 98,
+    CannotReportSelf = 99,
+    /// Local per-account moderation-report cap; retry later.
+    ModerationReportRateLimited = 100,
+    /// The group moved past this device and recovery has not caught it up;
+    /// group changes would fork it. Retry once it has synced (mdk#2258).
+    GroupCatchingUp = 101,
+    /// The group's last change has not reached every group relay yet; group
+    /// changes wait while MDK retries them (mdk#2255).
+    GroupCommitUndelivered = 102,
 }
 
 thread_local! {
@@ -183,6 +197,15 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::UserBlocked => MarmotStatus::UserBlocked,
         MarmotKitError::BlockListUnavailable => MarmotStatus::BlockListUnavailable,
         MarmotKitError::BlockPublicationUncertain => MarmotStatus::BlockPublicationUncertain,
+        MarmotKitError::ModerationReportingNotConfigured => {
+            MarmotStatus::ModerationReportingNotConfigured
+        }
+        MarmotKitError::InvalidModerationReportConfig { .. } => {
+            MarmotStatus::InvalidModerationReportConfig
+        }
+        MarmotKitError::InvalidReportedPublicKey => MarmotStatus::InvalidReportedPublicKey,
+        MarmotKitError::CannotReportSelf => MarmotStatus::CannotReportSelf,
+        MarmotKitError::ModerationReportRateLimited => MarmotStatus::ModerationReportRateLimited,
         MarmotKitError::ChatWindowInvalidLimit => MarmotStatus::ChatWindowInvalidLimit,
         MarmotKitError::ChatWindowStale => MarmotStatus::ChatWindowStale,
         MarmotKitError::ChatWindowAnchorOutside => MarmotStatus::ChatWindowAnchorOutside,
@@ -255,6 +278,8 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::DisbandingNotEnabled { .. } => MarmotStatus::DisbandingNotEnabled,
         MarmotKitError::GroupDisbanding { .. } => MarmotStatus::GroupDisbanding,
         MarmotKitError::GroupRemoved { .. } => MarmotStatus::GroupRemoved,
+        MarmotKitError::GroupCatchingUp { .. } => MarmotStatus::GroupCatchingUp,
+        MarmotKitError::GroupCommitUndelivered { .. } => MarmotStatus::GroupCommitUndelivered,
         MarmotKitError::StorageClosed { .. } => MarmotStatus::StorageClosed,
         MarmotKitError::GroupSendQueueFull { .. } => MarmotStatus::GroupSendQueueFull,
         MarmotKitError::CreatedGroupProjectionUnavailable { .. } => {
@@ -329,6 +354,13 @@ mod tests {
             MarmotKitError::UserBlocked,
             MarmotKitError::BlockListUnavailable,
             MarmotKitError::BlockPublicationUncertain,
+            MarmotKitError::ModerationReportingNotConfigured,
+            MarmotKitError::InvalidModerationReportConfig {
+                details: "relay 0 is unsafe".into(),
+            },
+            MarmotKitError::InvalidReportedPublicKey,
+            MarmotKitError::CannotReportSelf,
+            MarmotKitError::ModerationReportRateLimited,
             MarmotKitError::ChatWindowInvalidLimit,
             MarmotKitError::ChatWindowStale,
             MarmotKitError::ChatWindowAnchorOutside,
@@ -435,6 +467,12 @@ mod tests {
             MarmotKitError::GroupRemoved {
                 group_id_hex: "aa".into(),
             },
+            MarmotKitError::GroupCatchingUp {
+                group_id_hex: "aa".into(),
+            },
+            MarmotKitError::GroupCommitUndelivered {
+                group_id_hex: "aa".into(),
+            },
             MarmotKitError::MemberNotInGroup {
                 group_id_hex: "aa".into(),
                 member_id_hex: "bb".into(),
@@ -485,10 +523,18 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            86,
+            93,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
+        assert_eq!(
+            status_from_error(&MarmotKitError::ModerationReportingNotConfigured) as i32,
+            96
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::ModerationReportRateLimited) as i32,
+            100
+        );
         assert_eq!(
             status_from_error(&MarmotKitError::BlockListUnavailable) as i32,
             79

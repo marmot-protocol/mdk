@@ -86,6 +86,10 @@ impl Default for AttachmentAcquisitionPolicy {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarmotAppConfig {
+    /// Destination for private moderation reports to the deployment's moderation team.
+    /// `None` leaves reporting unconfigured. An invalid value is rejected whole at first use
+    /// and also leaves reporting unconfigured; see `MarmotApp::set_moderation_report_config`.
+    pub moderation_report_config: Option<crate::ModerationReportConfig>,
     /// Optional public client label for newly prepared KeyPackage events.
     /// None leaves publications untagged; signed retries retain their original tags.
     pub key_package_client_name: Option<String>,
@@ -267,6 +271,7 @@ impl Default for MarmotAppConfig {
             key_package_client_name: None,
             attachment_acquisition: Some(AttachmentAcquisitionPolicy::default()),
             attachment_acquisition_mode: AttachmentAcquisitionMode::default(),
+            moderation_report_config: None,
             usage_diagnostics_silent: false,
             directory_max_future_skew: DEFAULT_DIRECTORY_MAX_FUTURE_SKEW,
             directory_relay_urls: Vec::new(),
@@ -354,6 +359,15 @@ impl MarmotAppConfig {
     /// must leave this unset.
     pub fn with_allow_loopback_relay_endpoints(mut self, allow: bool) -> Self {
         self.allow_loopback_relay_endpoints = allow;
+        self
+    }
+
+    /// Configure the private moderation-report destination (per build flavor).
+    pub fn with_moderation_report_config(
+        mut self,
+        config: Option<crate::ModerationReportConfig>,
+    ) -> Self {
+        self.moderation_report_config = config;
         self
     }
 

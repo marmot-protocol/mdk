@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use url::{Host, Url};
 
 const MAX_RELAY_ENDPOINTS_PER_ROUTE: usize = 16;
-const RETIRED_RELAY_HOSTS: &[&str] = &["relay.damus.io", "relay.nostr.band"];
+const RETIRED_RELAY_HOSTS: &[&str] = &["relay.nostr.band"];
 
 /// The policy decision for one caller-supplied Nostr relay endpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -459,11 +459,7 @@ mod tests {
     #[test]
     fn retired_relay_hosts_are_rejected_at_the_relay_plane_boundary() {
         let policy = RelaySafetyPolicy::default();
-        for endpoint in [
-            "wss://relay.damus.io",
-            "wss://relay.nostr.band",
-            "wss://RELAY.DAMUS.IO./path",
-        ] {
+        for endpoint in ["wss://relay.nostr.band", "wss://RELAY.NOSTR.BAND./path"] {
             let offered = endpoints(&[endpoint, "wss://good.example"]);
             assert!(
                 policy.sanitize_endpoints(offered.clone(), "test").is_err(),
@@ -482,7 +478,7 @@ mod tests {
         let policy = RelaySafetyPolicy::default();
         let classified = policy.classify_endpoints(vec![
             " wss://relay.example ".to_owned(),
-            "wss://RELAY.DAMUS.IO./path".to_owned(),
+            "wss://RELAY.NOSTR.BAND./path".to_owned(),
             "not a relay".to_owned(),
             "ws://relay.example".to_owned(),
             "wss://127.0.0.1".to_owned(),
@@ -517,10 +513,7 @@ mod tests {
 
     #[test]
     fn retired_relay_host_list_is_stable_and_scheme_free() {
-        assert_eq!(
-            retired_relay_hosts(),
-            vec!["relay.damus.io", "relay.nostr.band"]
-        );
+        assert_eq!(retired_relay_hosts(), vec!["relay.nostr.band"]);
     }
 
     /// A published list of only unsafe hosts yields nothing, rather than

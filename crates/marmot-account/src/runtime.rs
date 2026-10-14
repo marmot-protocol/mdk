@@ -70,6 +70,11 @@ const MAINTENANCE_QUIET_SECS: u64 = 60;
 const PERIODIC_MIN_SECS: u64 = 24 * 24 * 60 * 60;
 const PERIODIC_MAX_SECS: u64 = 36 * 24 * 60 * 60;
 const TRANSPORT_FANOUT_RETENTION_SECS: u64 = 24 * 60 * 60;
+/// How long a due self-update waits for the group's previous commit to reach
+/// every group relay (mdk#2255). The owed relays keep being retried, backing
+/// off to once an hour, so the bound gives an unreachable relay several
+/// retries without letting a dead one suppress key rotation.
+const COMMIT_DELIVERY_SELF_UPDATE_HOLD_SECS: u64 = 60 * 60;
 const FROZEN_FANOUT_AMBIGUOUS_RETRY_BASE_MS: u64 = 30 * 1_000;
 const FROZEN_FANOUT_AMBIGUOUS_RETRY_MAX_MS: u64 = 60 * 60 * 1_000;
 /// A relay that proved it never accepted the event can be retried promptly.
@@ -391,6 +396,28 @@ impl MaintenanceActivity {
             .saturating_add(previous.failed_transitions);
     }
 }
+type PublicationProgressObserver =
+    Arc<dyn Fn(&AccountDeviceSession, &PublishedApplicationMessage) + Send + Sync>;
+type SecondaryRetryYield = futures::future::Shared<futures::future::BoxFuture<'static, ()>>;
+#[derive(Clone)]
+struct PublicationProgress {
+    observe: PublicationProgressObserver,
+    secondary_retry_yield: SecondaryRetryYield,
+}
+type PublicationProgressSlot = Arc<std::sync::Mutex<Option<PublicationProgress>>>;
+
+/// Restore the previous observer even when the owning convergence future is dropped.
+struct PublicationProgressGuard {
+    slot: PublicationProgressSlot,
+    previous: Option<PublicationProgress>,
+}
+
+impl Drop for PublicationProgressGuard {
+    fn drop(&mut self) {
+        *self.slot.lock().unwrap_or_else(|error| error.into_inner()) = self.previous.take();
+    }
+}
+
 pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackagePublisher> {
     session: AccountDeviceSession,
     adapter: A,
@@ -403,6 +430,9 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     maintenance_paused: bool,
     maintenance_activity: std::sync::Mutex<MaintenanceActivity>,
     maintenance_quiet_monotonic: HashMap<cgka_traits::MessageId, Duration>,
+    /// Secondary maintenance writes must not discard committed session effects.
+    /// Keep their group-scoped reconciliation owned until a quiet retry succeeds.
+    pending_leaf_reconciliations: HashMap<GroupId, Option<Timestamp>>,
     /// Exact Welcome events whose relay-only publish phase currently runs
     /// outside the serialized account owner. Other maintenance/manual retry
     /// paths skip these ids until their results are reconciled, preventing two
@@ -412,6 +442,7 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     /// legacy publish for this message id fails with a transient storage
     /// error. Never set by production code.
     finish_stage_failure: Option<cgka_traits::MessageId>,
+    publication_progress: PublicationProgressSlot,
 }
 
 impl<A, R, K> AccountDeviceRuntime<A, R, K>
@@ -433,8 +464,10 @@ where
             maintenance_paused: false,
             maintenance_activity: std::sync::Mutex::new(MaintenanceActivity::default()),
             maintenance_quiet_monotonic: HashMap::new(),
+            pending_leaf_reconciliations: HashMap::new(),
             detached_welcome_publishes: HashSet::new(),
             finish_stage_failure: None,
+            publication_progress: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -479,7 +512,9 @@ where
 
     /// Abandon a group locally without sending a leave or disband.
     pub fn forget_group_local(&mut self, group_id: &GroupId) -> AccountResult<bool> {
-        Ok(self.session.forget_group_local(group_id)?)
+        let forgotten = self.session.forget_group_local(group_id)?;
+        self.pending_leaf_reconciliations.remove(group_id);
+        Ok(forgotten)
     }
 
     pub fn group_record(&self, group_id: &GroupId) -> AccountResult<Group> {
@@ -1501,9 +1536,22 @@ where
     /// have elapsed. Callers may invoke this from any timer cadence; all
     /// deadlines and sampled jitter are persisted.
     pub async fn run_due_maintenance(&mut self) -> AccountResult<AccountDeviceEffects> {
+        self.run_due_maintenance_holding(&[]).await
+    }
+
+    /// [`Self::run_due_maintenance`], but no new self-update commit is
+    /// authored for a `held` group. The caller holds a group it knows has
+    /// moved past this device's local epoch: a commit from that epoch forks the
+    /// group (mdk#2258). A held obligation stays owed and retries on a later
+    /// sweep; publication of an already-staged commit is not held.
+    pub async fn run_due_maintenance_holding(
+        &mut self,
+        held: &[GroupId],
+    ) -> AccountResult<AccountDeviceEffects> {
         use sha2::{Digest, Sha256};
 
         self.sweep_expired_key_package_private_material()?;
+        self.reconcile_confirmed_own_leaf_rotations(&[]);
         let mut output = AccountDeviceEffects::default();
         // Hydration recreates the publication edge for a surviving staged
         // evolution. Consume that edge before consulting the semantic
@@ -1587,6 +1635,9 @@ where
         } else {
             self.session.live_group_ids()?
         } {
+            if self.pending_leaf_reconciliations.contains_key(&group_id) {
+                continue;
+            }
             let Some(Some(mut state)) =
                 skips_group_this_tick(self.session.group_maintenance(&group_id))?
             else {
@@ -1605,15 +1656,10 @@ where
             if has_active {
                 continue;
             }
-            if state.next_periodic_rotation_at.is_none()
-                && let Some(last_rotation) = state.last_own_leaf_rotation_at
-            {
-                state.next_periodic_rotation_at = Some(Timestamp(
-                    last_rotation.0.saturating_add(
-                        self.maintenance_random
-                            .sample_inclusive(PERIODIC_MIN_SECS, PERIODIC_MAX_SECS),
-                    ),
-                ));
+            if state.next_periodic_rotation_at.is_none() {
+                let baseline = Self::periodic_baseline(&state, &active_obligations, None, now);
+                state.next_periodic_rotation_at =
+                    Some(self.fresh_periodic_deadline(&group_id, baseline)?);
                 self.session.put_group_maintenance(&state)?;
             }
             if state
@@ -1659,6 +1705,12 @@ where
         let mut obligations = self.session.maintenance_obligations()?;
         obligations.sort_by_key(|obligation| obligation.created_at);
         for mut obligation in obligations {
+            if self
+                .pending_leaf_reconciliations
+                .contains_key(&obligation.group_id)
+            {
+                continue;
+            }
             if matches!(
                 obligation.phase,
                 MaintenancePhase::Complete | MaintenancePhase::Failed
@@ -1691,6 +1743,18 @@ where
             if self.session.leave_in_progress(&obligation.group_id)?
                 || self.session.disbanding_in_progress(&obligation.group_id)?
             {
+                continue;
+            }
+            if let Some(baseline) = &obligation.own_leaf_baseline_hash
+                && baseline.as_slice()
+                    != self.session.own_leaf_hash(&obligation.group_id)?.as_slice()
+            {
+                // A reopen can lose the event, but not the live obligation's
+                // evidence that the selected local leaf already rotated.
+                self.pending_leaf_reconciliations
+                    .entry(obligation.group_id.clone())
+                    .or_insert(None);
+                self.reconcile_confirmed_own_leaf_rotations(&[]);
                 continue;
             }
             let original_obligation = obligation.clone();
@@ -1827,6 +1891,66 @@ where
                             self.complete_maintenance_obligation(&mut obligation, now)?;
                             continue;
                         }
+                        // The exact commit is a pending frozen fanout. Resume it
+                        // rather than staging a second rotation over it.
+                        if let Some(message_id) = evolution.signed_message_id.as_ref()
+                            && self
+                                .session
+                                .outbound_fanouts_for_group(&obligation.group_id)?
+                                .iter()
+                                .any(|fanout| {
+                                    fanout.message_id() == message_id
+                                        && matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+                                })
+                        {
+                            self.maintenance_activity
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .self_update_attempts += 1;
+                            let started = self.monotonic_clock.elapsed();
+                            let resumed = self
+                                .resume_outbound_fanouts_for_group(Some(&obligation.group_id))
+                                .await
+                                .map(|(effects, _blocked_groups)| effects);
+                            let confirmed = resumed.as_ref().is_ok_and(|effects| {
+                                effects
+                                    .pending
+                                    .iter()
+                                    .any(|r| matches!(r, PendingResolution::Confirmed { .. }))
+                            });
+                            self.note_maintenance_duration(
+                                started,
+                                false,
+                                resumed
+                                    .as_ref()
+                                    .map_or(true, |e| !e.failures.is_empty() && !confirmed),
+                            );
+                            let resumed = resumed.inspect_err(|_error| {
+                                self.maintenance_activity
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .failed_attempts += 1;
+                            })?;
+                            if !confirmed && !resumed.failures.is_empty() {
+                                let mut activity = self
+                                    .maintenance_activity
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                activity.failed_attempts =
+                                    activity.failed_attempts.saturating_add(1);
+                            }
+                            output.absorb_account_effects(resumed);
+                            if confirmed {
+                                self.complete_maintenance_obligation(&mut obligation, now)?;
+                            } else {
+                                obligation.phase = MaintenancePhase::PendingPublication;
+                                self.put_maintenance_obligation_if_changed(
+                                    &original_obligation,
+                                    &obligation,
+                                )?;
+                            }
+                            continue;
+                        }
                         if let (Some(pending), Some(message_id)) =
                             (evolution.pending_ref, evolution.signed_message_id)
                             && let Some(fanout) = self.session.transport_fanout(&message_id)?
@@ -1878,9 +2002,7 @@ where
                                     activity.failed_attempts.saturating_add(1);
                             }
                             output.absorb_account_effects(retried);
-                            if confirmed {
-                                self.complete_maintenance_obligation(&mut obligation, now)?;
-                            } else {
+                            if !confirmed {
                                 obligation.phase = MaintenancePhase::PendingPublication;
                                 obligation.attempt_count =
                                     obligation.attempt_count.saturating_add(1);
@@ -1915,6 +2037,23 @@ where
             {
                 obligation.phase = MaintenancePhase::Retry;
                 obligation.last_failure_code = Some("safety_gate".into());
+                self.put_maintenance_obligation_if_changed(&original_obligation, &obligation)?;
+                continue;
+            }
+            if held.contains(&obligation.group_id) {
+                obligation.phase = MaintenancePhase::Retry;
+                obligation.last_failure_code = Some("epoch_gap_hold".into());
+                self.put_maintenance_obligation_if_changed(&original_obligation, &obligation)?;
+                continue;
+            }
+            if self
+                .undelivered_commit(&obligation.group_id)?
+                .is_some_and(|commit| {
+                    now.0.saturating_sub(commit.since.0) < COMMIT_DELIVERY_SELF_UPDATE_HOLD_SECS
+                })
+            {
+                obligation.phase = MaintenancePhase::Retry;
+                obligation.last_failure_code = Some("commit_delivery_hold".into());
                 self.put_maintenance_obligation_if_changed(&original_obligation, &obligation)?;
                 continue;
             }
@@ -1954,9 +2093,7 @@ where
                         activity.failed_attempts = activity.failed_attempts.saturating_add(1);
                     }
                     output.absorb_account_effects(effects);
-                    if confirmed {
-                        self.complete_maintenance_obligation(&mut obligation, now)?;
-                    } else {
+                    if !confirmed {
                         obligation.phase = MaintenancePhase::PendingPublication;
                         obligation.attempt_count = obligation.attempt_count.saturating_add(1);
                         self.put_maintenance_obligation_if_changed(
@@ -2083,10 +2220,27 @@ where
                     .as_ref()
                     .is_some_and(|state| state.pending_replacement.is_some()),
             );
+        // Self-update commits publish through frozen fanouts (mdk#2255);
+        // legacy records only finish rotations staged before that change.
+        let evolution_commits = self
+            .session
+            .group_evolutions()?
+            .into_iter()
+            .filter_map(|evolution| evolution.signed_message_id)
+            .collect::<HashSet<_>>();
+        let frozen_ambiguous = self
+            .session
+            .outbound_fanouts()?
+            .iter()
+            .filter(|fanout| {
+                evolution_commits.contains(fanout.message_id()) && fanout.possible_exposure()
+            })
+            .count();
         let ambiguous_exposure = fanouts
             .iter()
             .filter(|fanout| fanout.possible_exposure)
             .count()
+            + frozen_ambiguous
             + usize::from(lifecycle.as_ref().is_some_and(|state| {
                 state.pending_replacement.as_ref().is_some_and(|pending| {
                     pending.last_failure_code.as_deref() == Some("ambiguous_exposure")
@@ -2115,22 +2269,20 @@ where
         obligation: &mut MaintenanceObligation,
         completed_at: Timestamp,
     ) -> AccountResult<()> {
+        if let Some(mut state) = self.session.group_maintenance(&obligation.group_id)? {
+            state.last_own_leaf_rotation_at = Some(completed_at);
+            state.next_periodic_rotation_at = if state.periodic_enrolled {
+                Some(self.fresh_periodic_deadline(&obligation.group_id, completed_at)?)
+            } else {
+                None
+            };
+            self.session.put_group_maintenance(&state)?;
+        }
+        // Keep a live retry owner until the deadline write has succeeded.
         obligation.phase = MaintenancePhase::Complete;
         obligation.last_failure_code = None;
         self.persist_maintenance_obligation(obligation)?;
         self.maintenance_quiet_monotonic.remove(&obligation.id);
-        if let Some(mut state) = self.session.group_maintenance(&obligation.group_id)? {
-            state.last_own_leaf_rotation_at = Some(completed_at);
-            state.next_periodic_rotation_at = state.periodic_enrolled.then(|| {
-                Timestamp(
-                    completed_at.0.saturating_add(
-                        self.maintenance_random
-                            .sample_inclusive(PERIODIC_MIN_SECS, PERIODIC_MAX_SECS),
-                    ),
-                )
-            });
-            self.session.put_group_maintenance(&state)?;
-        }
         Ok(())
     }
 
@@ -2309,7 +2461,7 @@ where
             .push(PendingResolution::RolledBack { pending });
         output.absorb_session_effects(rollback_effects, &mut queue);
         self.publish_queue(&mut output, &mut queue, None).await?;
-        self.reconcile_confirmed_own_leaf_rotations(&output.events)?;
+        self.reconcile_confirmed_own_leaf_rotations(&output.events);
         let superseded = self.reconcile_superseded_maintenance(&output.events)?;
         output.superseded_intents.extend(superseded);
         Ok(output)
@@ -2472,6 +2624,51 @@ where
             }))
     }
 
+    /// Advance convergence while observing each durable accepted application
+    /// publication before waiting for later publications in the same batch.
+    ///
+    /// The synchronous observer receives the live session at the completed
+    /// engine boundary. It must not panic or perform network work. Its
+    /// notification uses the same acceptance rule as `published_app_messages`;
+    /// it does not change quorum, MLS confirmation, or acknowledge projection
+    /// persistence. Observers should handle local failures without interrupting
+    /// the remaining batch. Dropping this future removes its observer; durable
+    /// fanouts remain available to the ordinary recovery path.
+    pub async fn advance_convergence_with_publication_progress(
+        &mut self,
+        group_id: &GroupId,
+        observe: PublicationProgressObserver,
+    ) -> AccountResult<AccountDeviceEffects> {
+        self.advance_convergence_with_publication_progress_and_yield(
+            group_id,
+            observe,
+            std::future::pending(),
+        )
+        .await
+    }
+
+    /// Yield only dispensable secondary relay waits when the owner has foreground work.
+    /// The signal is latched for this pass. Below-quorum publications and pending MLS
+    /// confirmation remain mandatory; cancelled secondary attempts retain exact bytes
+    /// and conservative exposure evidence through the ordinary durable retry path.
+    pub async fn advance_convergence_with_publication_progress_and_yield(
+        &mut self,
+        group_id: &GroupId,
+        observe: PublicationProgressObserver,
+        yield_requested: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> AccountResult<AccountDeviceEffects> {
+        let slot = self.publication_progress.clone();
+        let previous = slot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .replace(PublicationProgress {
+                observe,
+                secondary_retry_yield: yield_requested.boxed().shared(),
+            });
+        let _guard = PublicationProgressGuard { slot, previous };
+        self.advance_convergence(group_id).await
+    }
+
     pub async fn advance_convergence(
         &mut self,
         group_id: &GroupId,
@@ -2487,13 +2684,16 @@ where
         let (mut output, blocked_groups) = self
             .resume_outbound_fanouts_for_group(Some(group_id))
             .await?;
-        // An older deferred transport fanout blocks only newly queued
-        // outbound intents. Convergence inputs must still settle: otherwise a
-        // permanently unavailable relay can wedge epoch progression and fork
-        // healing forever. Any protocol effects produced by settlement remain
-        // observable while the queued-intent drain stays ordered behind the
-        // frozen fanout.
-        let effects = if blocked_groups.contains(group_id) {
+        // Keep exact-event retries in their original order, but do not make
+        // engine-queued sends wait for secondary replication after quorum and
+        // MLS confirmation. Foreground sends already use that same boundary.
+        // Inspect the remaining durable state, including newer fanouts skipped
+        // behind the oldest retry, so an unresolved publication stays a barrier.
+        let queued_intents_blocked = blocked_groups.contains(group_id)
+            && self.queued_outbound_intents_blocked_by_fanouts(group_id)?;
+        // Required publication barriers must not prevent inbound convergence
+        // from settling, even while the corresponding relay is unavailable.
+        let effects = if queued_intents_blocked {
             self.session.advance_convergence_inputs(group_id).await?
         } else {
             self.session.advance_convergence(group_id).await?
@@ -2508,6 +2708,154 @@ where
 
     pub fn has_queued_outbound_intents(&self, group_id: &GroupId) -> AccountResult<bool> {
         Ok(self.session.has_queued_outbound_intents(group_id)?)
+    }
+
+    /// The oldest confirmed commit in `group_id` that some group relay still
+    /// owes (mdk#2255). A commit confirms on its first acknowledgement, so
+    /// members who read only the other relays cannot follow the group until
+    /// they accept it. Owed relays keep being retried with the exact event; a
+    /// relay that definitively rejected it is not owed. A commit convergence
+    /// withdrew from the selected branch no longer gates the group.
+    pub fn undelivered_commit(
+        &self,
+        group_id: &GroupId,
+    ) -> AccountResult<Option<UndeliveredCommit>> {
+        let mut oldest: Option<UndeliveredCommit> = None;
+        let mut consider = |commit: UndeliveredCommit| {
+            if oldest
+                .as_ref()
+                .is_none_or(|current| commit.since < current.since)
+            {
+                oldest = Some(commit);
+            }
+        };
+        for fanout in self.session.outbound_fanouts_for_group(group_id)? {
+            // Application messages have no MLS state; Welcomes go to inboxes.
+            if !matches!(
+                fanout.request().message.envelope,
+                TransportEnvelope::GroupMessage { .. }
+            ) || fanout.mls_state() != FanoutMlsState::Confirmed
+                || self.commit_withdrawn(
+                    fanout
+                        .pending_origin_message_id()
+                        .unwrap_or_else(|| fanout.message_id()),
+                )?
+            {
+                continue;
+            }
+            let endpoints = fanout.request().target.endpoints();
+            let owed_endpoints = endpoints
+                .iter()
+                .zip(fanout.target_statuses())
+                .filter(|(_, status)| status.is_outstanding())
+                .map(|(endpoint, _)| endpoint.clone())
+                .collect::<Vec<_>>();
+            if !owed_endpoints.is_empty() {
+                // Measured from the first acknowledgement: the accepting
+                // attempt's start, not staging, which can be hours earlier.
+                let first_accepted_ms = (0..endpoints.len())
+                    .filter(|&index| {
+                        fanout.target_status(index)
+                            == Some(cgka_traits::FanoutTargetStatus::Accepted)
+                    })
+                    .filter_map(|index| fanout.target_last_attempt_at_ms(index))
+                    .min()
+                    .unwrap_or_else(|| fanout.created_at_ms());
+                consider(UndeliveredCommit {
+                    message_id: fanout.message_id().clone(),
+                    since: Timestamp(first_accepted_ms / 1_000),
+                    owed_endpoints,
+                    endpoint_count: endpoints.len(),
+                });
+            }
+        }
+        // Self-updates staged before the frozen-fanout migration.
+        let now = self.wall_clock.now();
+        // The ungated list: the group-scoped lookup fails for a stored group
+        // the engine has not hydrated yet, which has nothing owed to report.
+        let confirmed_evolutions = self
+            .session
+            .group_evolutions()?
+            .into_iter()
+            .filter(|evolution| {
+                &evolution.group_id == group_id && evolution.phase == GroupEvolutionPhase::Confirmed
+            })
+            .map(|evolution| evolution.id)
+            .collect::<HashSet<_>>();
+        for fanout in self.session.transport_fanouts()? {
+            let Some(evolution_id) = fanout.evolution_id.as_ref() else {
+                continue;
+            };
+            if fanout.group_id.as_ref() != Some(group_id)
+                || fanout.bounded_until.is_some_and(|until| until <= now)
+                || !(fanout.evolution_confirmed || confirmed_evolutions.contains(evolution_id))
+                || self.commit_withdrawn(&fanout.id)?
+            {
+                continue;
+            }
+            let owed_endpoints = fanout
+                .targets
+                .iter()
+                .filter(|target| {
+                    !matches!(
+                        target.state,
+                        TransportFanoutAttemptState::Accepted
+                            | TransportFanoutAttemptState::PolicyProhibited
+                    )
+                })
+                .map(|target| target.endpoint.clone())
+                .collect::<Vec<_>>();
+            if !owed_endpoints.is_empty() {
+                let first_accepted = fanout
+                    .targets
+                    .iter()
+                    .filter(|target| target.state == TransportFanoutAttemptState::Accepted)
+                    .filter_map(|target| target.last_attempt_at)
+                    .min()
+                    .unwrap_or(fanout.created_at);
+                consider(UndeliveredCommit {
+                    message_id: fanout.id.clone(),
+                    since: first_accepted,
+                    owed_endpoints,
+                    endpoint_count: fanout.targets.len(),
+                });
+            }
+        }
+        Ok(oldest)
+    }
+
+    /// Whether convergence withdrew this own commit from the selected branch:
+    /// the same stored dispositions `reconcile_superseded_maintenance_from_state`
+    /// reads, so the answer survives a lost announcement and a restart.
+    fn commit_withdrawn(&self, commit_id: &cgka_traits::MessageId) -> AccountResult<bool> {
+        Ok(matches!(
+            self.session.stored_message_state(commit_id)?,
+            Some(MessageState::ConvergenceDeferred | MessageState::EpochInvalidated)
+        ))
+    }
+
+    /// Whether retained publications still prevent staging queued sends.
+    ///
+    /// Pending MLS confirmation and outstanding targets below required quorum
+    /// are barriers; secondary replication after quorum is not. This inspects
+    /// every retained fanout, including newer work behind an older retry. It
+    /// does not establish that convergence inputs or other engine gates cleared.
+    /// Unhydrated or unavailable group state is an error, never an empty outbox.
+    pub fn queued_outbound_intents_blocked_by_fanouts(
+        &self,
+        group_id: &GroupId,
+    ) -> AccountResult<bool> {
+        self.session.group_record(group_id)?;
+        Ok(self
+            .session
+            .outbound_fanouts_for_group(group_id)?
+            .iter()
+            .any(|fanout| {
+                let outcome = fanout.outcome();
+                matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+                    || (outcome.outstanding_targets > 0
+                        && outcome.accepted_targets < fanout.request().required_acks.max(1))
+            }))
     }
 
     pub fn has_pending_outbound_fanouts(&self, group_id: &GroupId) -> AccountResult<bool> {
@@ -2691,7 +3039,7 @@ where
         let mut queue = VecDeque::new();
         output.absorb_session_effects(effects, &mut queue);
         self.publish_queue(&mut output, &mut queue, context).await?;
-        self.reconcile_confirmed_own_leaf_rotations(&output.events)?;
+        self.reconcile_confirmed_own_leaf_rotations(&output.events);
         let superseded = self.reconcile_superseded_maintenance(&output.events)?;
         output.superseded_intents.extend(superseded);
         Ok(output)
@@ -2782,6 +3130,33 @@ where
             .map(|(effects, _blocked_groups)| effects)
     }
 
+    /// Notify only after the ordinary durable-fanout path records acceptance.
+    fn record_published_application_fanout(
+        &self,
+        fanout: &OutboundFanout,
+        output: &mut AccountDeviceEffects,
+    ) {
+        let previous_count = output.published_app_messages.len();
+        record_published_application_fanout(fanout, output);
+        if output.published_app_messages.len() == previous_count {
+            return;
+        }
+        let observer = self
+            .publication_progress
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(observer) = observer {
+            (observer.observe)(
+                &self.session,
+                output
+                    .published_app_messages
+                    .last()
+                    .expect("recorded publication"),
+            );
+        }
+    }
+
     /// Retire terminal accepted application fanouts only after the app has
     /// durably finalized their optimistic projections.
     ///
@@ -2851,7 +3226,7 @@ where
                     blocked_groups.insert(fanout_group);
                 }
             } else if outcome.accepted_targets > 0 && fanout.application_message().is_some() {
-                record_published_application_fanout(&fanout, &mut output);
+                self.record_published_application_fanout(&fanout, &mut output);
                 output.fanout.push(outcome);
             } else {
                 let reason = "insufficient publish acknowledgements".to_owned();
@@ -2868,74 +3243,167 @@ where
             }
         }
         self.publish_queue(&mut output, &mut queue, None).await?;
-        self.reconcile_confirmed_own_leaf_rotations(&output.events)?;
+        self.reconcile_confirmed_own_leaf_rotations(&output.events);
         let superseded = self.reconcile_superseded_maintenance(&output.events)?;
         output.superseded_intents.extend(superseded);
         Ok((output, blocked_groups))
     }
 
-    fn reconcile_confirmed_own_leaf_rotations(
+    /// Reconcile against the final canonical local leaf after all batch effects,
+    /// since branch selection can restore a copy terminated earlier in the batch.
+    fn reconcile_confirmed_own_leaf_rotations(&mut self, events: &[GroupEvent]) {
+        for event in events {
+            let (group_id, restored_at) = match event {
+                GroupEvent::EpochChanged { group_id, .. }
+                | GroupEvent::LocalGroupCopyTerminated { group_id, .. } => (group_id, None),
+                GroupEvent::LocalGroupCopyRestored { group_id } => {
+                    (group_id, Some(self.wall_clock.now()))
+                }
+                _ => continue,
+            };
+            if let Some(owned) = self.pending_leaf_reconciliations.get_mut(group_id) {
+                if restored_at.is_some() {
+                    *owned = restored_at;
+                }
+            } else {
+                self.pending_leaf_reconciliations
+                    .insert(group_id.clone(), restored_at);
+            }
+        }
+        let mut pending = std::mem::take(&mut self.pending_leaf_reconciliations);
+        pending.retain(|group_id, restored_at| {
+            if self
+                .reconcile_own_leaf_group(group_id, *restored_at)
+                .is_err()
+            {
+                tracing::warn!(target: TRACE_TARGET,
+                    method = "reconcile_confirmed_own_leaf_rotations",
+                    error_kind = "maintenance_reconciliation_retry",
+                    "committed group maintenance reconciliation remains owned for retry");
+                return true;
+            }
+            false
+        });
+        self.pending_leaf_reconciliations = pending;
+    }
+
+    fn reconcile_own_leaf_group(
         &mut self,
-        events: &[GroupEvent],
+        group_id: &GroupId,
+        restored_at: Option<Timestamp>,
     ) -> AccountResult<()> {
-        let changed_groups = events
-            .iter()
-            .filter_map(|event| match event {
-                GroupEvent::EpochChanged { group_id, .. } => Some(group_id.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let mut unique_changed_groups = Vec::new();
         let now = self.wall_clock.now();
-        for group_id in changed_groups {
-            if unique_changed_groups.contains(&group_id) {
-                continue;
-            }
-            unique_changed_groups.push(group_id.clone());
-            let self_id = self.session.self_id();
-            let local_member_present = self
+        // A surviving sibling keeps the account in the roster, but it
+        // cannot supply this copy's removed local leaf for rotation.
+        let local_member_present = !self.session.group_record(group_id)?.is_terminal()
+            && self
                 .session
-                .members(&group_id)?
-                .iter()
-                .any(|member| member.id == self_id);
-            if !local_member_present {
-                for mut obligation in self.session.maintenance_obligations_for_group(&group_id)? {
-                    if matches!(
-                        obligation.phase,
-                        MaintenancePhase::Complete | MaintenancePhase::Failed
-                    ) {
-                        continue;
-                    }
-                    obligation.phase = MaintenancePhase::Failed;
-                    obligation.last_failure_code = Some("local_member_removed".into());
-                    self.persist_maintenance_obligation(&obligation)?;
-                    self.maintenance_quiet_monotonic.remove(&obligation.id);
-                }
-                if let Some(mut state) = self.session.group_maintenance(&group_id)? {
-                    state.periodic_enrolled = false;
-                    state.next_periodic_rotation_at = None;
-                    self.session.put_group_maintenance(&state)?;
-                }
-                continue;
-            }
-            let current = self.session.own_leaf_hash(&group_id)?;
-            for mut obligation in self.session.maintenance_obligations_for_group(&group_id)? {
+                .canonical_group_membership(group_id)?
+                .local_leaf_active;
+        if !local_member_present {
+            for mut obligation in self.session.maintenance_obligations_for_group(group_id)? {
                 if matches!(
                     obligation.phase,
                     MaintenancePhase::Complete | MaintenancePhase::Failed
                 ) {
                     continue;
                 }
-                if obligation
-                    .own_leaf_baseline_hash
-                    .as_ref()
-                    .is_some_and(|baseline| baseline.as_slice() != current.as_slice())
-                {
-                    self.complete_maintenance_obligation(&mut obligation, now)?;
-                }
+                obligation.phase = MaintenancePhase::Failed;
+                obligation.last_failure_code = Some("local_member_removed".into());
+                self.persist_maintenance_obligation(&obligation)?;
+                self.maintenance_quiet_monotonic.remove(&obligation.id);
+            }
+            if let Some(mut state) = self.session.group_maintenance(group_id)? {
+                // Enrollment is policy, not current membership. Preserve it
+                // for a later canonical restoration; terminal groups are
+                // excluded from the maintenance tick's live group set.
+                state.next_periodic_rotation_at = None;
+                self.session.put_group_maintenance(&state)?;
+            }
+            return Ok(());
+        }
+        let obligations = self.session.maintenance_obligations_for_group(group_id)?;
+        if let Some(mut state) = self.session.group_maintenance(group_id)?
+            && state.periodic_enrolled
+            && state.next_periodic_rotation_at.is_none()
+        {
+            let baseline = Self::periodic_baseline(&state, &obligations, restored_at, now);
+            state.next_periodic_rotation_at =
+                Some(self.fresh_periodic_deadline(group_id, baseline)?);
+            self.session.put_group_maintenance(&state)?;
+        }
+        let current = self.session.own_leaf_hash(group_id)?;
+        for mut obligation in obligations {
+            if matches!(
+                obligation.phase,
+                MaintenancePhase::Complete | MaintenancePhase::Failed
+            ) {
+                continue;
+            }
+            if obligation
+                .own_leaf_baseline_hash
+                .as_ref()
+                .is_some_and(|baseline| baseline.as_slice() != current.as_slice())
+            {
+                self.complete_maintenance_obligation(&mut obligation, now)?;
             }
         }
         Ok(())
+    }
+
+    fn periodic_baseline(
+        state: &cgka_traits::maintenance::GroupMaintenanceState,
+        obligations: &[MaintenanceObligation],
+        restored_at: Option<Timestamp>,
+        now: Timestamp,
+    ) -> Timestamp {
+        if let Some(restored_at) = restored_at {
+            return restored_at;
+        }
+        if obligations.iter().any(|obligation| {
+            obligation.group_id == state.group_id
+                && obligation.phase == MaintenancePhase::Failed
+                && obligation.last_failure_code.as_deref() == Some("local_member_removed")
+        }) {
+            return now;
+        }
+        state.last_own_leaf_rotation_at.unwrap_or(now)
+    }
+
+    fn fresh_periodic_deadline(
+        &mut self,
+        group_id: &GroupId,
+        baseline: Timestamp,
+    ) -> AccountResult<Timestamp> {
+        let earliest = baseline.0.saturating_add(PERIODIC_MIN_SECS);
+        let latest = baseline.0.saturating_add(PERIODIC_MAX_SECS);
+        let first = baseline.0.saturating_add(
+            self.maintenance_random
+                .sample_inclusive(PERIODIC_MIN_SECS, PERIODIC_MAX_SECS),
+        );
+        let mut deadline = first;
+        loop {
+            let mut hasher = Sha256::new();
+            hasher.update(b"marmot-periodic-self-update-v1");
+            hasher.update((group_id.as_slice().len() as u64).to_be_bytes());
+            hasher.update(group_id.as_slice());
+            hasher.update(deadline.to_be_bytes());
+            let id = cgka_traits::MessageId::new(hasher.finalize().to_vec());
+            if self.session.maintenance_obligation(&id)?.is_none() {
+                return Ok(Timestamp(deadline));
+            }
+            deadline = if deadline < latest {
+                deadline + 1
+            } else {
+                earliest
+            };
+            if deadline == first {
+                return Err(cgka_traits::EngineError::Backend(
+                    "periodic deadline exhausted".into(),
+                )
+                .into());
+            }
+        }
     }
 
     /// Retire the evolutions behind commits this batch announced as
@@ -3229,15 +3697,10 @@ where
         queue: &mut VecDeque<PublishWork>,
         context: Option<AuditEventContext>,
     ) -> AccountResult<()> {
-        let maintenance_evolution = messages.len() == 1
-            && self
-                .session
-                .group_evolutions()?
-                .into_iter()
-                .any(|evolution| {
-                    evolution.signed_message_id.as_ref()
-                        == messages.first().map(|message| &message.id)
-                });
+        let maintenance_evolution = match messages.as_slice() {
+            [message] => self.has_legacy_evolution_fanout(&message.id)?,
+            _ => false,
+        };
         if maintenance_evolution {
             // A crash can land after the first relay acknowledgement and its
             // durable maintenance-fanout write but before local MLS
@@ -3488,18 +3951,7 @@ where
         context: Option<AuditEventContext>,
     ) -> AccountResult<()> {
         let commit_id = commit.id.clone();
-        let maintenance_evolution = self
-            .session
-            .group_evolutions()?
-            .into_iter()
-            .any(|evolution| {
-                evolution.signed_message_id.as_ref() == Some(&commit_id)
-                    && matches!(
-                        evolution.semantic,
-                        GroupEvolutionSemantic::SelfUpdate { .. }
-                    )
-            });
-        if maintenance_evolution {
+        if self.has_legacy_evolution_fanout(&commit_id)? {
             let commit_status = self
                 .publish_legacy_one(commit, output, context.clone())
                 .await?;
@@ -3540,6 +3992,20 @@ where
         Ok(())
     }
 
+    /// Self-update commits staged before mdk#2255 were published through the
+    /// legacy `DurableTransportFanout`. Those exact events finish on the path
+    /// that already holds their attempt and exposure history. Every new group
+    /// evolution uses the frozen `OutboundFanout`, like every other commit.
+    fn has_legacy_evolution_fanout(
+        &self,
+        message_id: &cgka_traits::MessageId,
+    ) -> AccountResult<bool> {
+        Ok(self
+            .session
+            .transport_fanout(message_id)?
+            .is_some_and(|fanout| fanout.evolution_id.is_some()))
+    }
+
     fn mark_transport_fanout_evolution_confirmed(&self, message_id: &cgka_traits::MessageId) {
         let Ok(Some(mut fanout)) = self.session.transport_fanout(message_id) else {
             return;
@@ -3568,8 +4034,24 @@ where
                 self.session.delete_transport_fanout(&fanout.id)?;
                 continue;
             }
-            if fanout.evolution_id.is_some() && !fanout.evolution_confirmed {
-                continue;
+            if let Some(evolution_id) = fanout.evolution_id.as_ref()
+                && !fanout.evolution_confirmed
+            {
+                // The marker write after confirmation is best-effort. Re-derive
+                // it from the evolution the confirm transaction itself wrote,
+                // so a failed marker cannot strand the remaining relays.
+                let confirmed = self
+                    .session
+                    .group_evolutions()?
+                    .into_iter()
+                    .any(|evolution| {
+                        &evolution.id == evolution_id
+                            && evolution.phase == GroupEvolutionPhase::Confirmed
+                    });
+                if !confirmed {
+                    continue;
+                }
+                self.mark_transport_fanout_evolution_confirmed(&fanout.id);
             }
             self.finish_transport_fanout(&fanout.id, output).await?;
         }
@@ -3599,6 +4081,37 @@ where
             .map(|target| target.endpoint.clone())
             .collect::<Vec<_>>();
         if !remaining.is_empty() {
+            // Secondary retries are audited like the first pass, so a relay
+            // that never received the exact event is visible (mdk#2255).
+            let msg_id_hex = hex::encode(message_id.as_slice());
+            let wire = publish_wire_metadata(&fanout.exact_message);
+            let artifact_kind = match &fanout.exact_message.envelope {
+                TransportEnvelope::Welcome { .. } => Some(MessageArtifactKind::Welcome),
+                TransportEnvelope::GroupMessage { .. } => None,
+            };
+            let target_kind = publish_target_kind(&fanout.target).to_string();
+            let publish_context = AuditEventContext {
+                operation_id: Some(format!("publish-{msg_id_hex}")),
+                ..AuditEventContext::default()
+            };
+            self.session.record_audit_event(
+                fanout.group_id.as_ref(),
+                Some(publish_context.clone()),
+                AuditEventKind::PublishAttempt {
+                    msg_id: msg_id_hex.clone(),
+                    artifact_kind,
+                    target_kind: target_kind.clone(),
+                    relay_url: None,
+                    relay_urls: remaining
+                        .iter()
+                        .map(|endpoint| endpoint.0.clone())
+                        .collect(),
+                    required_acks: fanout.required_acks as u64,
+                    transport: Some(wire.clone()),
+                },
+            );
+            let mut pass_accepted = Vec::new();
+            let mut pass_failed = Vec::new();
             // Concurrent single-endpoint publishes with `required_acks: 1`,
             // the per-endpoint contract the old sequential loop used; see
             // `drive_outbound_fanout` for why a multi-endpoint batch would
@@ -3617,6 +4130,25 @@ where
             for (endpoint, result) in futures::future::join_all(attempts).await {
                 match result {
                     Ok(report) => {
+                        if report
+                            .accepted
+                            .iter()
+                            .any(|receipt| receipt.endpoint == endpoint)
+                        {
+                            pass_accepted.push(endpoint.0.clone());
+                        } else {
+                            pass_failed.push(PublishRelayFailure {
+                                relay_url: endpoint.0.clone(),
+                                reason: report
+                                    .failed
+                                    .iter()
+                                    .find(|failure| failure.endpoint == endpoint)
+                                    .map_or_else(
+                                        || "publish acknowledgement unknown".to_owned(),
+                                        |failure| failure.reason.clone(),
+                                    ),
+                            });
+                        }
                         apply_report_to_fanout(
                             &mut fanout,
                             std::slice::from_ref(&endpoint),
@@ -3631,7 +4163,11 @@ where
                         }
                         output.reports.push(report);
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        pass_failed.push(PublishRelayFailure {
+                            relay_url: endpoint.0.clone(),
+                            reason: error.to_string(),
+                        });
                         fanout.possible_exposure = true;
                         if let Some(target) = fanout
                             .targets
@@ -3651,6 +4187,26 @@ where
                 }
             }
             self.session.put_transport_fanout(&fanout)?;
+            let accepted_total = fanout
+                .targets
+                .iter()
+                .filter(|target| target.state == TransportFanoutAttemptState::Accepted)
+                .count();
+            self.session.record_audit_event(
+                fanout.group_id.as_ref(),
+                Some(publish_context),
+                AuditEventKind::PublishOutcome {
+                    msg_id: msg_id_hex,
+                    artifact_kind,
+                    target_kind,
+                    relay_url: None,
+                    accepted_relay_urls: pass_accepted,
+                    failed_relays: pass_failed,
+                    required_acks: fanout.required_acks as u64,
+                    met_required_acks: accepted_total >= fanout.required_acks.max(1),
+                    transport: Some(wire),
+                },
+            );
         }
         Ok(())
     }
@@ -3906,8 +4462,17 @@ where
         mut fanout: OutboundFanout,
         output: &mut AccountDeviceEffects,
         queue: &mut VecDeque<PublishWork>,
-        context: Option<AuditEventContext>,
+        mut context: Option<AuditEventContext>,
     ) -> AccountResult<PublishStatus> {
+        // Durable application identity connects first publication and exact
+        // retries to the same logical send, including after process restart.
+        if let Some(application) = fanout.application_message() {
+            context.get_or_insert_with(Default::default).operation_id =
+                Some(marmot_forensics::application_send_operation_id(
+                    application.group_id.as_slice(),
+                    &application.app_event_id,
+                ));
+        }
         let outcome = fanout.outcome();
         // A receipt persisted before cancellation can still be below quorum.
         // Finish that pass before releasing its Welcome continuation. Once a
@@ -3922,10 +4487,26 @@ where
         }
         let endpoints = fanout.request().target.endpoints().to_vec();
         let now_ms = self.wall_clock.now().0.saturating_mul(1_000);
+        let secondary_retry_yield = (fanout.outcome().accepted_targets
+            >= fanout.request().required_acks.max(1)
+            && !matches!(fanout.mls_state(), FanoutMlsState::Pending(_)))
+        .then(|| {
+            self.publication_progress
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .map(|progress| progress.secondary_retry_yield.clone())
+        })
+        .flatten();
+        let yield_before_attempt = secondary_retry_yield
+            .as_ref()
+            .is_some_and(|signal| signal.clone().now_or_never().is_some());
         let due = fanout
             .outstanding_target_indexes()
             .into_iter()
-            .filter(|&index| frozen_fanout_target_retry_due(&fanout, index, now_ms))
+            .filter(|&index| {
+                !yield_before_attempt && frozen_fanout_target_retry_due(&fanout, index, now_ms)
+            })
             .collect::<Vec<_>>();
         let attempted_any = !due.is_empty();
         if !due.is_empty() {
@@ -3933,6 +4514,24 @@ where
                 fanout.mark_attempt_started_at(index, now_ms)?;
             }
             self.session.put_outbound_fanout(&fanout)?;
+            // Every pass is audited, including secondary retries after the
+            // first acknowledgement confirmed the pending MLS state (mdk#2255).
+            self.session.record_audit_event(
+                fanout.group_id(),
+                context.clone(),
+                AuditEventKind::PublishAttempt {
+                    msg_id: hex::encode(fanout.message_id().as_slice()),
+                    artifact_kind: None,
+                    target_kind: "frozen_group_fanout".into(),
+                    relay_url: None,
+                    relay_urls: due
+                        .iter()
+                        .map(|&index| endpoints[index].0.clone())
+                        .collect(),
+                    required_acks: fanout.request().required_acks as u64,
+                    transport: Some(publish_wire_metadata(&fanout.request().message)),
+                },
+            );
 
             // Publish every outstanding endpoint concurrently as
             // single-endpoint requests with `required_acks: 1`, the same
@@ -3948,9 +4547,11 @@ where
             let account_id = fanout.request().account_id.clone();
             let mut accepted = fanout.outcome().accepted_targets;
             let ack_goal = fanout.request().required_acks.max(1);
-            // A retry after confirmation must finish its outstanding attempts;
-            // otherwise an already-met quorum would cancel every retry.
+            // An already-met quorum alone must not cancel every retry. Only
+            // explicit foreground pressure may interrupt this secondary tail.
             let finish_retries = accepted >= ack_goal;
+            let mut pass_accepted = Vec::new();
+            let mut pass_failed = Vec::new();
             let mut attempts = due
                 .iter()
                 .map(|&index| {
@@ -3973,6 +4574,16 @@ where
                 // exact-event retry, including after cancellation or restart.
                 let next = if accepted >= ack_goal && !finish_retries {
                     attempts.next().now_or_never().flatten()
+                } else if let Some(signal) = &secondary_retry_yield {
+                    // Only relay futures are cancelled. No engine transaction or
+                    // confirmation future is dropped, and ready receipts win ties.
+                    let next = attempts.next().fuse();
+                    let requested = signal.clone().fuse();
+                    futures::pin_mut!(next, requested);
+                    futures::select_biased! {
+                        result = next => result,
+                        () = requested => None,
+                    }
                 } else {
                     attempts.next().await
                 };
@@ -4015,8 +4626,15 @@ where
                         )
                     }
                 };
-                if let Some(failure) = failure {
-                    fanout.record_target_failure(index, failure)?;
+                match failure {
+                    Some(failure) => {
+                        pass_failed.push(PublishRelayFailure {
+                            relay_url: failure.endpoint.0.clone(),
+                            reason: failure.reason.clone(),
+                        });
+                        fanout.record_target_failure(index, failure)?;
+                    }
+                    None => pass_accepted.push(endpoints[index].0.clone()),
                 }
                 self.session.put_outbound_fanout(&fanout)?;
             }
@@ -4027,10 +4645,12 @@ where
                     if fanout.target_status(index)
                         == Some(cgka_traits::FanoutTargetStatus::Attempting)
                     {
-                        fanout.record_target_failure(
-                            index,
-                            ambiguous_endpoint_failure(endpoints[index].clone()),
-                        )?;
+                        let failure = ambiguous_endpoint_failure(endpoints[index].clone());
+                        pass_failed.push(PublishRelayFailure {
+                            relay_url: failure.endpoint.0.clone(),
+                            reason: failure.reason.clone(),
+                        });
+                        fanout.record_target_failure(index, failure)?;
                     }
                 }
                 self.session.put_outbound_fanout(&fanout)?;
@@ -4048,8 +4668,8 @@ where
                     artifact_kind: None,
                     target_kind: "frozen_group_fanout".into(),
                     relay_url: None,
-                    accepted_relay_urls: Vec::new(),
-                    failed_relays: Vec::new(),
+                    accepted_relay_urls: pass_accepted,
+                    failed_relays: pass_failed,
                     required_acks: report.required_acks as u64,
                     met_required_acks: report.met_required_acks(),
                     transport: Some(publish_wire_metadata(&fanout.request().message)),
@@ -4113,7 +4733,7 @@ where
             }
         }
         if status.accepted_by_any_endpoint {
-            record_published_application_fanout(&fanout, output);
+            self.record_published_application_fanout(&fanout, output);
         } else if let Some(reason) = publish_failure_reason {
             record_failed_application_fanout(&fanout, reason, output);
         } else if let Some(application) = fanout.application_message()
@@ -4547,24 +5167,70 @@ where
             Ok(report) => report,
             Err(error) => {
                 fanout.possible_exposure = true;
-                for target in &mut fanout.targets {
-                    if retry_endpoints.contains(&target.endpoint)
-                        && target.state != TransportFanoutAttemptState::Accepted
-                    {
-                        target.attempt_count = target.attempt_count.saturating_add(1);
-                        target.last_attempt_at = Some(self.wall_clock.now());
-                        target.state = TransportFanoutAttemptState::AttemptedFailed;
-                        target.failure_code = Some("adapter_error".into());
+                // Keep each endpoint's typed cause when the adapter reported
+                // one (mdk#2264); only whole-call errors stay coarse.
+                let endpoint_report = (!error.publish_endpoint_failures().is_empty()).then(|| {
+                    TransportPublishReport {
+                        message_id: error
+                            .publish_message_id()
+                            .cloned()
+                            .unwrap_or_else(|| message_id.clone()),
+                        accepted: Vec::new(),
+                        failed: error.publish_endpoint_failures().to_vec(),
+                        required_acks,
+                    }
+                });
+                if let Some(report) = &endpoint_report {
+                    apply_report_to_fanout(
+                        &mut fanout,
+                        &retry_endpoints,
+                        report,
+                        self.wall_clock.now(),
+                    );
+                } else {
+                    for target in &mut fanout.targets {
+                        if retry_endpoints.contains(&target.endpoint)
+                            && target.state != TransportFanoutAttemptState::Accepted
+                        {
+                            target.attempt_count = target.attempt_count.saturating_add(1);
+                            target.last_attempt_at = Some(self.wall_clock.now());
+                            target.state = TransportFanoutAttemptState::AttemptedFailed;
+                            target.failure_code = Some("adapter_error".into());
+                        }
                     }
                 }
                 self.session.put_transport_fanout(&fanout)?;
                 self.record_v5_welcome_publish_finished(
                     &v5_welcome,
-                    None,
+                    endpoint_report.as_ref(),
                     &retry_endpoints,
                     accepted_before,
                     required_acks,
                 );
+                if let Some(report) = &endpoint_report {
+                    self.session.record_audit_event(
+                        target_group_id.as_ref(),
+                        Some(publish_context.clone()),
+                        AuditEventKind::PublishOutcome {
+                            msg_id: msg_id_hex.clone(),
+                            artifact_kind,
+                            target_kind: target_kind.clone(),
+                            relay_url: None,
+                            accepted_relay_urls: Vec::new(),
+                            failed_relays: report
+                                .failed
+                                .iter()
+                                .map(|failure| PublishRelayFailure {
+                                    relay_url: failure.endpoint.0.clone(),
+                                    reason: failure.reason.clone(),
+                                })
+                                .collect(),
+                            required_acks: required_acks as u64,
+                            met_required_acks: accepted_before >= required_acks.max(1),
+                            transport: Some(wire.clone()),
+                        },
+                    );
+                }
                 self.session.record_audit_event(
                     target_group_id.as_ref(),
                     Some(publish_context),
@@ -4576,7 +5242,9 @@ where
                         relay_url: None,
                         relay_urls,
                         required_acks: Some(required_acks as u64),
-                        reason: error.to_string(),
+                        // `Display` always reads "publish failed: ..." and
+                        // never passes the audit category allowlist.
+                        reason: error.privacy_safe_kind().into(),
                         detail: None,
                         transport: Some(wire),
                     },
@@ -5327,6 +5995,19 @@ pub struct AccountIngestEffects {
     /// Carried verbatim from [`IngestEffects::left_object_unpersisted`].
     pub left_object_unpersisted: bool,
     pub effects: AccountDeviceEffects,
+}
+
+/// A confirmed commit that some of its group relays have not accepted yet
+/// (mdk#2255). See [`AccountDeviceRuntime::undelivered_commit`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UndeliveredCommit {
+    pub message_id: cgka_traits::MessageId,
+    /// When the first relay accepted the commit, which confirmed it.
+    pub since: Timestamp,
+    /// Relays still owed the exact commit.
+    pub owed_endpoints: Vec<TransportEndpoint>,
+    /// Relays the commit was published to.
+    pub endpoint_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

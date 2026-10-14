@@ -935,6 +935,7 @@ mod tests {
             event_counts: ClientEventCounts::default(),
             received_payloads: Vec::new(),
             added_members: Vec::new(),
+            withdrawn_added_members: Vec::new(),
             removed_members: Vec::new(),
             epoch_changes: Vec::new(),
             app_invalidations: Vec::new(),

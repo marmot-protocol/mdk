@@ -1,18 +1,37 @@
 ---
 title: "App Core Boundary"
 created: 2026-05-15
-updated: 2026-09-04
-tags: [marmot, app-core, cli, tui, swift]
+updated: 2026-10-01
+tags: [marmot, app-core, android, swift, cli, tui]
 status: overview
 ---
 
 # App Core Boundary
 
-The first app surface is `wn`, but the durable product boundary is the app-core layer underneath it.
+MDK is the shared product runtime for White Noise Android, iOS, macOS and the
+`wn` CLI/TUI. Host apps render its state and integrate platform services.
+Shared product policy and protocol state must remain behind the app-core API.
 
-`wn` should stay a CLI/TUI-friendly presentation surface. It is useful because it exercises real account setup, relay
-lists, KeyPackage publication, directory lookup, group operations, message projection, and sync. It should not become the
-place where app policy or protocol state secretly lives.
+## Host-app boundary
+
+Each host is a **minimal display and platform layer**:
+
+| Owner | Responsibilities |
+| --- | --- |
+| MDK runtime/bindings | Protocol, account/group/message rules, validation/parsing, persistence, durable drafts, queries/projections, unread/delivery state, retention, relay/media operations, retry/recovery and shared diagnostics/consent |
+| Host UI | Rendering, navigation, accessibility, formatting, transient editing/optimistic display and subscription lifecycle |
+| Platform adapters | Permissions, notifications/background execution, file pickers/sharing, device/network signals and secure-store/external-signer access |
+
+Adapters supply platform inputs; MDK applies shared rules and owns outcomes.
+Do not add a host database/cache of protocol records or projections to hide slow
+reads: improve MDK queries/indexes/bindings and keep blocking calls off the UI thread.
+Existing compatibility adapters remain until native release and adoption are validated.
+
+Implement, review and test missing shared capabilities in MDK first where possible;
+expose them through bindings and link the prerequisite in the host PR. Adopt a
+published, immutable MarmotKit artifact and validate compatibility. Never fork
+generated bindings or fill gaps with client business logic; keep API references
+and affected host agent guidance aligned.
 
 ## Ownership
 
@@ -56,9 +75,9 @@ For `N` active signing accounts whose stores have been opened, the current layou
 authoritative SQLCipher `session.sqlite` and a derived SQLCipher `app-cache.sqlite3` per account, plus the
 installation-wide `shared.sqlite3` public-directory and settings store.
 
-Only the session database currently has a numbered migration ledger. The auxiliary stores need independent migration
-histories before non-additive schema changes. Their authority, reconciliation, durability, and legacy-import contracts
-are detailed in [App SQLite Storage Boundaries](../further-context/app-sqlite-storage-boundaries.md).
+All three categories have independent numbered migration histories: `cgka_schema_migrations`,
+`app_cache_schema_migrations`, and `shared_schema_migrations`. Their authority, reconciliation, durability and
+legacy-import contracts are detailed in [App SQLite Storage Boundaries](../further-context/app-sqlite-storage-boundaries.md).
 
 ## CLI Contract
 
@@ -87,9 +106,9 @@ member list should reflect the post-removal group state, but the group is not au
 Archiving is a local user decision. An archived group can be hidden from normal lists while remaining available by id for
 history, members, and messages.
 
-## Swift and TUI Direction
+## Native Host and TUI Integration
 
-A Swift app should bind to `marmot-app`/`marmot-account` shaped APIs rather than the CLI text layer:
+Android and Apple apps should use the `marmot-app` runtime bindings rather than the CLI text layer:
 
 - open an account home;
 - create/import accounts;

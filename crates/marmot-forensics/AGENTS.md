@@ -20,9 +20,10 @@ Shared JSONL forensic audit schema for Marmot incident capture.
   digests, lengths, counts, and typed outcomes only. Never add decrypted content, cleartext group values, full account
   or member identities, bearer/upload tokens, auth headers, private keys, ciphertext, or raw MLS bytes.
 - New opt-in app audit sessions record v5 into separate files. Keep `schema/audit-log-event.v5.schema.json`, the Rust
-  types/semantic validator, and `tests/audit_v5.rs` in lockstep, including the 50 typed operational kinds and Welcome
-  evidence. Six of those kinds are v5-only (`AuditEventKind::is_v5_only`: the recovery-owner, transport-cursor and
-  lag-lost EOSE repair rows in `src/audit/recovery.rs`); a v4 recorder drops them, and the frozen v4 schema and its
+  types/semantic validator, and `tests/audit_v5.rs` in lockstep, including the 51 typed operational kinds and Welcome
+  evidence. Seven of those kinds are v5-only (`AuditEventKind::is_v5_only`: the recovery-owner, transport-cursor and
+  lag-lost EOSE repair rows in `src/audit/recovery.rs`, and the subscription refusal row in `src/audit/refusal.rs`); a
+  v4 recorder drops them, and the frozen v4 schema and its
   catalog tests exclude them. A new string field on an operational kind needs an explicit `protect` classification in
   `src/v5/operational.rs` (category, diagnostic reference, or hash), or v5 refuses to write the row. The v5
   local-delivery path sends original validated bodies; v4 files and the v4-only whole-file Goggles contract remain
@@ -44,7 +45,8 @@ Shared JSONL forensic audit schema for Marmot incident capture.
 
 - `src/audit.rs` — v4 `AuditEvent`/`AuditEventKind` catalog, `JsonlRecorder`/`NoopRecorder`, segment rotation,
   `AUDIT_LOG_SCHEMA_VERSION`, and `is_v5_only`. `src/audit/recovery.rs` — closed vocabularies for the v5-only
-  recovery-owner, transport-cursor, and EOSE-repair rows. `src/audit/tests.rs` — catalog/schema lockstep tests.
+  recovery-owner, transport-cursor, and EOSE-repair rows. `src/audit/refusal.rs` — vocabularies for the v5-only
+  `subscription_refused` row. `src/audit/tests.rs` — catalog/schema lockstep tests.
 - `src/v5/` — v5 record contract: `types.rs` (candidate DTOs), `validation.rs` (semantic validation behind `Record`),
   `operational.rs` (operational kinds and per-field `protect` classification), `primitives.rs`, `strict_json.rs`
   (duplicate-key rejection).

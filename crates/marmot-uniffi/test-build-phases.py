@@ -252,6 +252,11 @@ class BuildPhases(unittest.TestCase):
         self.assertIn("below 16 KB", result.stderr)
         self.assertNotIn("Done.", result.stdout)
 
+    def test_installed_target_survives_long_rustup_output(self):
+        targets = "aarch64-linux-android " + "armv7-unknown-linux-gnueabihf " * 2048
+        self.run_phase("kotlin-bindings.sh", "native", ANDROID_ABIS="arm64-v8a",
+            BUILD_TEST_TARGETS=targets)
+
     def test_default_commands_still_build_complete_bundles(self):
         for script in ["xcframework.sh", "xcframework-macos.sh", "kotlin-bindings.sh"]:
             self.run_phase(script)

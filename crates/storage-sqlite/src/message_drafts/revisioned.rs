@@ -8,7 +8,39 @@ pub struct MessageDraftRevision {
     revision: i64,
 }
 
+/// Read-only chat-row metadata. It cannot authorize a draft mutation.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChatListDraftVersion {
+    store_epoch: Vec<u8>,
+    group_id_hex: String,
+    revision: i64,
+}
+
+impl std::fmt::Debug for ChatListDraftVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatListDraftVersion")
+            .finish_non_exhaustive()
+    }
+}
+
 impl MessageDraftRevision {
+    /// Whether this read-only version belongs to the same store/group and is
+    /// no newer than this selected revision. This comparison never clears a draft.
+    pub fn includes_chat_list_version(&self, version: &ChatListDraftVersion) -> bool {
+        version.store_epoch == self.store_epoch
+            && version.group_id_hex == self.group_id_hex
+            && version.revision <= self.revision
+    }
+
+    #[cfg(test)]
+    fn chat_list_version(&self) -> ChatListDraftVersion {
+        ChatListDraftVersion {
+            store_epoch: self.store_epoch.clone(),
+            group_id_hex: self.group_id_hex.clone(),
+            revision: self.revision,
+        }
+    }
+
     pub fn group_id_hex(&self) -> &str {
         &self.group_id_hex
     }
@@ -67,6 +99,37 @@ impl SqliteAccountStorage {
     pub fn selected_message_draft(&self, group: &str) -> StorageResult<SelectedMessageDraft> {
         self.connection
             .with_deferred_read(|conn| selected_tx(conn, group))
+    }
+
+    /// Hash ordered plaintext in the caller's draft-admission snapshot. Ordinary
+    /// selected-draft reads remain metadata-only; attachment bytes are borrowed
+    /// one row at a time and never copied into a hydrated draft.
+    #[doc(hidden)]
+    pub fn message_draft_plaintext_hashes(
+        &self,
+        expected: &MessageDraftRevision,
+    ) -> Result<Vec<[u8; 32]>, MessageDraftRevisionError> {
+        use sha2::{Digest, Sha256};
+        self.connection.with_deferred_read(|conn| {
+            check_revision_tx(conn, expected)?;
+            let mut statement = conn
+                .prepare_cached(
+                    "SELECT plaintext FROM message_draft_attachments
+                     WHERE group_id_hex = ?1 ORDER BY position ASC",
+                )
+                .storage()?;
+            let mut rows = statement.query([&expected.group_id_hex]).storage()?;
+            let mut hashes = Vec::new();
+            while let Some(row) = rows.next().storage()? {
+                let plaintext = row.get_ref(0).storage()?;
+                let plaintext = plaintext
+                    .as_blob()
+                    .map_err(rusqlite::Error::from)
+                    .storage()?;
+                hashes.push(Sha256::digest(plaintext).into());
+            }
+            Ok(hashes)
+        })
     }
 
     pub fn save_message_draft_if_revision(
@@ -219,6 +282,28 @@ fn revision_tx(conn: &Connection, group: &str) -> StorageResult<MessageDraftRevi
     .optional()
     .storage()?
     .ok_or(StorageError::NotFound)
+}
+
+/// Read only revision metadata in the row's existing read transaction. Does
+/// not hydrate draft text, attachment metadata or attachment plaintext.
+pub(crate) fn chat_list_version_tx(
+    conn: &Connection,
+    group: &str,
+    store_epoch: &[u8],
+) -> StorageResult<Option<ChatListDraftVersion>> {
+    let revision = conn
+        .query_row_cached(
+            "SELECT revision FROM message_draft_revisions WHERE group_id_hex = ?1",
+            [group],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .storage()?;
+    Ok(revision.map(|revision| ChatListDraftVersion {
+        store_epoch: store_epoch.to_vec(),
+        group_id_hex: group.to_owned(),
+        revision,
+    }))
 }
 
 fn check_revision_tx(

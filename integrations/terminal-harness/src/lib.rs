@@ -6,6 +6,7 @@ mod commands;
 mod config;
 mod control;
 mod error;
+mod group_profile;
 mod output_limits;
 pub mod process;
 mod repo_picker;
@@ -29,6 +30,7 @@ pub use artifacts::{
 pub use bridge::run;
 pub use config::{ConfigSpec, ExecutionProfile, LoadedConfig, load_config_with};
 pub use error::{HarnessError, Result};
+pub use group_profile::{GroupProfileContext, with_group_profile_context};
 pub use output_limits::{OutputLimitKind, OutputLimitSettings, OutputLimits, TurnOutputControl};
 pub use process::{ParsedEvent, PromptTransport};
 

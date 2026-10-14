@@ -24,6 +24,7 @@ storage. Keep those in adapters or the app layer above this crate.
 | `src/lib.rs` | Public exports and Nostr/Marmot constants. |
 | `src/event.rs` | `NostrTransportEvent` DTO and `TransportMessage` conversion. |
 | `src/peeler.rs` | `TransportPeeler` implementation for Nostr/MLS group messages. |
+| `src/nip59.rs` | `gift_wrap_rumor`: the one NIP-59 wrap construction shared by Welcomes and moderation reports. |
 | `src/signer.rs` | `MarmotNostrSigner` account signer boundary and `SdkSigner` adapter over rust-nostr's signer traits. |
 | `src/error.rs` | Nostr boundary error vocabulary. |
 
@@ -54,6 +55,7 @@ skips content validation is a contract violation, not a style choice.
 - Kind `445` content is `base64(nonce || ciphertext)` of a single ChaCha20-Poly1305 sealing under the empty AAD. Do not
   add a source-epoch hint: an undecryptable message returns `DecryptFailed`, and the engine falls back to retained-epoch
   snapshots / deferred-peel retry.
+- Build every outbound NIP-59 wrap with `gift_wrap_rumor`; do not add a second wrap implementation.
 - Welcomes wrap/peel through NIP-59 only with a caller-injected signer/decrypter; this crate must not decide where that
   signer comes from. The kind `444` rumor carries base64 content plus the required `["e", <keypackage event id>]` and
   `["relays", ...]` tags supplied through `wrap_welcome_with_metadata`.

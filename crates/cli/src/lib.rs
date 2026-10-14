@@ -402,7 +402,7 @@ pub(crate) fn resolve_relative_paths(cli: &mut Cli, base: &Path) {
     }
     let base_dir = || base.to_string_lossy().into_owned();
     match &mut cli.command {
-        Command::Groups { command } => match command {
+        Command::Groups { command, .. } => match command {
             GroupsCommand::Create {
                 image: Some(image), ..
             } => resolve(base, image),
@@ -474,6 +474,7 @@ fn is_group_state_subscribe(cli: &Cli) -> bool {
         &cli.command,
         Command::Groups {
             command: GroupsCommand::SubscribeState { .. },
+            ..
         }
     )
 }
@@ -666,11 +667,39 @@ async fn execute_inner(
         Command::Media { command } => {
             commands::media::media_command(&account_home, &app, command, account_flag).await
         }
-        Command::Group { command } => {
-            commands::groups::group_command(&account_home, &app, command, account_flag).await
+        Command::Group {
+            command,
+            accept_stale,
+            accept_undelivered,
+        } => {
+            commands::groups::group_command(
+                &account_home,
+                &app,
+                command,
+                account_flag,
+                crate::commands::groups::AcceptedGroupChangeRisks {
+                    stale: accept_stale,
+                    undelivered: accept_undelivered,
+                },
+            )
+            .await
         }
-        Command::Groups { command } => {
-            commands::groups::groups_command(&account_home, &app, command, account_flag).await
+        Command::Groups {
+            command,
+            accept_stale,
+            accept_undelivered,
+        } => {
+            commands::groups::groups_command(
+                &account_home,
+                &app,
+                command,
+                account_flag,
+                crate::commands::groups::AcceptedGroupChangeRisks {
+                    stale: accept_stale,
+                    undelivered: accept_undelivered,
+                },
+            )
+            .await
         }
         Command::Message { command } => {
             commands::messages::message_command(&account_home, &app, command, account_flag).await
@@ -1584,7 +1613,8 @@ mod tests {
     use marmot_app::{
         AppMessageRecord, DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics,
         RelayDeliverySpread, RelayDeliveryStats, RelayLatencyStats, RelayPlaneHealth,
-        RelaySyncSnapshot, RelayTelemetrySnapshot,
+        RelayRefusalStats, RelaySyncSnapshot, RelayTelemetrySnapshot,
+        SubscriptionRefusalDisposition, SubscriptionRouteKind,
     };
 
     fn one_sample_histogram(upper_bound_ms: u64) -> DurationHistogramSnapshot {
@@ -1630,6 +1660,13 @@ mod tests {
                     relay_index: 0,
                     first_event: one_sample_histogram(20),
                     eose: one_sample_histogram(100),
+                }],
+                refusals: vec![RelayRefusalStats {
+                    relay_index: 0,
+                    route_kind: SubscriptionRouteKind::Inbox,
+                    category: Some(cgka_traits::TransportEndpointRejectionCategory::AuthRequired),
+                    disposition: SubscriptionRefusalDisposition::Dropped,
+                    count: 2,
                 }],
             },
             health: RelayPlaneHealth {
@@ -1943,6 +1980,7 @@ mod tests {
         assert!(plain.contains("relay#0"));
         assert!(plain.contains("first_deliverer=75%"));
         assert!(plain.contains("eose_p50=100ms"));
+        assert!(plain.contains("relay#0 inbox auth-required dropped x2"));
         assert!(
             !plain.contains("wss://") && !plain.contains("ws://"),
             "local relay stats must not surface relay URLs: {plain}"
@@ -1958,6 +1996,11 @@ mod tests {
             0
         );
         assert_eq!(output.json["sync"]["synced_subscriptions"], 1);
+        assert_eq!(
+            output.json["sync"]["refusals"][0]["category"],
+            "auth-required"
+        );
+        assert_eq!(output.json["sync"]["refusals"][0]["route_kind"], "inbox");
         assert_eq!(output.json["health"]["connected"], 1);
     }
 
@@ -2425,6 +2468,7 @@ mod tests {
         match &cli.command {
             Command::Groups {
                 command: crate::GroupsCommand::SetImage { file_path, .. },
+                ..
             } => assert_eq!(file_path, "/callers/cwd/avatar.png"),
             other => panic!("expected groups set-image, got {other:?}"),
         }
@@ -2436,6 +2480,7 @@ mod tests {
         match &cli.command {
             Command::Groups {
                 command: crate::GroupsCommand::Create { image, .. },
+                ..
             } => assert_eq!(image.as_deref(), Some("/callers/cwd/founding.png")),
             other => panic!("expected groups create, got {other:?}"),
         }
@@ -2448,6 +2493,7 @@ mod tests {
         match &cli.command {
             Command::Groups {
                 command: crate::GroupsCommand::DownloadImage { output, .. },
+                ..
             } => assert_eq!(output.as_deref(), Some("/callers/cwd")),
             other => panic!("expected groups download-image, got {other:?}"),
         }
@@ -2519,6 +2565,75 @@ mod tests {
         }
     }
 
+    /// mdk#2258: `--accept-stale` is opt-in and parses on either side of the
+    /// group subcommand.
+    #[test]
+    fn groups_accept_stale_flag_parses() {
+        for args in [
+            &["wn", "groups", "rename", "GROUP", "NAME"][..],
+            &["wn", "groups", "rename", "GROUP", "NAME", "--accept-stale"][..],
+            &["wn", "groups", "--accept-stale", "rename", "GROUP", "NAME"][..],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("rename parses");
+            match cli.command {
+                Command::Groups {
+                    command: crate::GroupsCommand::Rename { .. },
+                    accept_stale,
+                    ..
+                } => assert_eq!(accept_stale, args.contains(&"--accept-stale")),
+                other => panic!("expected a groups rename command, got {other:?}"),
+            }
+        }
+    }
+
+    /// mdk#2255: `--accept-undelivered` is opt-in, parses on either side of the
+    /// group subcommand, and combines with `--accept-stale`.
+    #[test]
+    fn groups_accept_undelivered_flag_parses() {
+        for args in [
+            &["wn", "groups", "rename", "GROUP", "NAME"][..],
+            &[
+                "wn",
+                "groups",
+                "rename",
+                "GROUP",
+                "NAME",
+                "--accept-undelivered",
+            ][..],
+            &[
+                "wn",
+                "groups",
+                "--accept-undelivered",
+                "--accept-stale",
+                "rename",
+                "GROUP",
+                "NAME",
+            ][..],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("rename parses");
+            match cli.command {
+                Command::Groups {
+                    command: crate::GroupsCommand::Rename { .. },
+                    accept_stale,
+                    accept_undelivered,
+                } => {
+                    assert_eq!(accept_stale, args.contains(&"--accept-stale"));
+                    assert_eq!(accept_undelivered, args.contains(&"--accept-undelivered"));
+                }
+                other => panic!("expected a groups rename command, got {other:?}"),
+            }
+        }
+        let cli = Cli::try_parse_from(["wn", "groups", "commit-delivery", "GROUP"])
+            .expect("commit-delivery parses");
+        assert!(matches!(
+            cli.command,
+            Command::Groups {
+                command: crate::GroupsCommand::CommitDelivery { .. },
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn groups_retention_disband_and_admin_flags_parse() {
         let cli = Cli::try_parse_from(["wn", "groups", "retention", "GROUP", "--set", "1h"])
@@ -2526,6 +2641,7 @@ mod tests {
         match cli.command {
             Command::Groups {
                 command: crate::GroupsCommand::Retention { group_id, set },
+                ..
             } => {
                 assert_eq!(group_id, "GROUP");
                 assert_eq!(set.as_deref(), Some("1h"));
@@ -2537,6 +2653,7 @@ mod tests {
         match cli.command {
             Command::Groups {
                 command: crate::GroupsCommand::Disband { confirm, .. },
+                ..
             } => assert!(
                 !confirm,
                 "confirmation is an explicit flag, never a default"
@@ -2560,6 +2677,7 @@ mod tests {
                     crate::GroupsCommand::AddMembers {
                         members, admins, ..
                     },
+                ..
             } => {
                 assert_eq!(members, vec!["carol".to_owned(), "dave".to_owned()]);
                 assert_eq!(admins, vec!["carol".to_owned()]);
@@ -2583,6 +2701,7 @@ mod tests {
                     crate::GroupsCommand::Create {
                         retention, image, ..
                     },
+                ..
             } => {
                 assert_eq!(retention.as_deref(), Some("1d"));
                 assert_eq!(image.as_deref(), Some("avatar.png"));

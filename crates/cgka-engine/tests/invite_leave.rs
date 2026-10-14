@@ -51,10 +51,8 @@ async fn advance_selfremove_auto_commit<E: CgkaEngine>(engine: &mut E, group_id:
 }
 
 /// True if `events` contains a `GroupStateChanged` departure (removed or left)
-/// for `member`. Accepts either variant because the leave/removed distinction
-/// is path-dependent: the direct inbound seam classifies a SelfRemove as
-/// `MemberLeft`, while a convergence reorg surfaces it as an unattributed
-/// `MemberRemoved`.
+/// for `member` across generic removal/recovery flows. SelfRemove attribution
+/// and target parity are checked strictly in `selfremove_full_flow_with_auto_commit`.
 fn emits_departure_of(events: &[cgka_traits::engine::GroupEvent], member: &MemberId) -> bool {
     events.iter().any(|event| {
         matches!(
@@ -577,6 +575,186 @@ fn converge_buffered_commit(engine: &mut Engine<SqliteAccountStorage>, group_id:
 }
 
 // ── Invite ──────────────────────────────────────────────────────────────────
+
+/// Account activity ignores sibling-only changes; device effects still terminate the departing copy.
+#[tokio::test]
+async fn sibling_device_membership_preserves_activity_targets() {
+    use cgka_traits::engine::{GroupEvent, GroupStateChange};
+
+    for voluntary_leave in [false, true] {
+        // Use current-profile proofs and independent stores: duplicate signature
+        // keys are forbidden, but distinct devices may authenticate the same account.
+        let current_device = |label: &[u8]| {
+            EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+                .identity(pad32(label))
+                .account_identity_proof_signer(proof_signer(label))
+                .feature_registry(selfremove_registry())
+                .peeler(Box::new(MockPeeler))
+                .build()
+                .unwrap()
+        };
+        let mut alice = current_device(b"alice");
+        let mut bob = current_device(b"bob");
+        let mut bob_sibling = current_device(b"bob");
+        assert_eq!(bob.self_id(), bob_sibling.self_id());
+        let bob_kp = bob.fresh_key_package().await.unwrap();
+        let (group_id, created) = alice
+            .create_group(CreateGroupRequest {
+                name: "siblings".into(),
+                description: "".into(),
+                members: vec![bob_kp],
+                required_features: vec![],
+                app_components: vec![],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+            panic!("current-profile founding group")
+        };
+        bob.join_welcome(welcomes.remove(0)).await.unwrap();
+        alice.drain_events();
+        bob.drain_events();
+
+        let target = |events: Vec<GroupEvent>, expected: &GroupStateChange, actor: &MemberId| {
+            let rows: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    GroupEvent::GroupStateChanged {
+                        group_id: event_group,
+                        epoch,
+                        actor: event_actor,
+                        change,
+                        origin_commit_id,
+                    } if change == expected => {
+                        assert_eq!(event_group, &group_id);
+                        assert_eq!(event_actor.as_ref(), Some(actor));
+                        assert!(origin_commit_id.is_some());
+                        Some(
+                            cgka_traits::app_event::group_system_canonical_id(
+                                event_group,
+                                epoch.0,
+                                event_actor.as_ref(),
+                                change,
+                            )
+                            .unwrap(),
+                        )
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(rows.len(), 1, "one shared activity: {events:?}");
+            rows.into_iter().next().unwrap()
+        };
+        let kp = bob_sibling.fresh_key_package().await.unwrap();
+        let SendResult::GroupEvolution {
+            msg,
+            pending,
+            mut welcomes,
+        } = alice
+            .send(SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![kp],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("sibling-device invitation")
+        };
+        alice.confirm_published(pending).await.unwrap();
+        bob_sibling.join_welcome(welcomes.remove(0)).await.unwrap();
+        bob.ingest(route_group_commit(msg, &group_id))
+            .await
+            .unwrap();
+        converge_buffered_commit(&mut bob, &group_id);
+        let added = GroupStateChange::MemberAdded {
+            member: bob.self_id(),
+        };
+        for events in [alice.drain_events(), bob.drain_events()] {
+            assert!(!events.iter().any(|event| matches!(event, GroupEvent::GroupStateChanged { change, .. } if change == &added)), "a sibling invitation is not an account arrival: {events:?}");
+        }
+
+        if !voluntary_leave {
+            let SendResult::GroupEvolution { msg, pending, .. } = alice
+                .send(SendIntent::RemoveMembers {
+                    group_id: group_id.clone(),
+                    members: vec![bob.self_id()],
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("remove both account leaves")
+            };
+            alice.confirm_published(pending).await.unwrap();
+            bob.ingest(route_group_commit(msg, &group_id))
+                .await
+                .unwrap();
+            converge_buffered_commit(&mut bob, &group_id);
+            let removed = GroupStateChange::MemberRemoved {
+                member: bob.self_id(),
+            };
+            assert_eq!(
+                target(alice.drain_events(), &removed, &alice.self_id()),
+                target(bob.drain_events(), &removed, &alice.self_id()),
+            );
+            continue;
+        }
+
+        bob_sibling.drain_events();
+        let SendResult::Proposal { msg } = bob_sibling
+            .send(SendIntent::Leave {
+                group_id: group_id.clone(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("sibling-device SelfRemove")
+        };
+        let proposal = route_group_commit(msg, &group_id);
+        bob.ingest(proposal.clone()).await.unwrap();
+        alice.ingest(proposal).await.unwrap();
+        advance_selfremove_auto_commit(&mut alice, &group_id).await;
+        let mut publications = alice.drain_auto_publish();
+        assert_eq!(publications.len(), 1);
+        let publication = publications.remove(0);
+        assert!(
+            alice
+                .members(&group_id)
+                .unwrap()
+                .iter()
+                .any(|member| member.id == bob.self_id()),
+            "pending sibling SelfRemove keeps the account's surviving leaf"
+        );
+        alice.confirm_published(publication.pending).await.unwrap();
+        bob_sibling
+            .ingest(route_group_commit(publication.msg.clone(), &group_id))
+            .await
+            .unwrap();
+        converge_buffered_commit(&mut bob_sibling, &group_id);
+        assert!(bob_sibling.group_record(&group_id).unwrap().removed);
+        assert!(
+            bob_sibling
+                .drain_events()
+                .iter()
+                .any(|event| matches!(event, GroupEvent::LocalGroupCopyTerminated { .. }))
+        );
+        bob.ingest(route_group_commit(publication.msg, &group_id))
+            .await
+            .unwrap();
+        converge_buffered_commit(&mut bob, &group_id);
+        let left = GroupStateChange::MemberLeft {
+            member: bob.self_id(),
+        };
+        for events in [alice.drain_events(), bob.drain_events()] {
+            assert!(!events.iter().any(|event| matches!(event, GroupEvent::GroupStateChanged { change, .. } if change == &left)), "a sibling departure is not an account departure: {events:?}");
+        }
+        // The departure names the account, while its other device remains a member.
+        let members = bob.members(&group_id).unwrap();
+        assert_eq!(members.len(), 2);
+        assert!(members.iter().any(|member| member.id == bob.self_id()));
+    }
+}
 
 #[tokio::test]
 async fn invite_adds_third_member_and_advances_epoch() {
@@ -3258,6 +3436,7 @@ async fn selfremove_full_flow_with_auto_commit() {
         },
         ..proposal
     };
+    carol.ingest(routed.clone()).await.unwrap();
     let outcome = alice.ingest(routed).await.unwrap();
     assert!(matches!(outcome, IngestOutcome::Processed));
     let alice_events = alice.drain_events();
@@ -3328,6 +3507,56 @@ async fn selfremove_full_flow_with_auto_commit() {
         "alice should emit a departure for bob after confirm; got {alice_events:?}"
     );
 
+    // Own publication and both recipient seams must identify the same
+    // authenticated voluntary departure, including its reaction target.
+    let leaver = bob.self_id();
+    let departure_target = |events: &[cgka_traits::engine::GroupEvent]| {
+        let departures: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                cgka_traits::engine::GroupEvent::GroupStateChanged {
+                    epoch,
+                    actor,
+                    change,
+                    origin_commit_id,
+                    ..
+                } if matches!(change,
+                    cgka_traits::engine::GroupStateChange::MemberLeft { member }
+                    | cgka_traits::engine::GroupStateChange::MemberRemoved { member }
+                    if member == &leaver
+                ) =>
+                {
+                    assert_eq!(actor.as_ref(), Some(&leaver));
+                    assert_eq!(
+                        change,
+                        &cgka_traits::engine::GroupStateChange::MemberLeft {
+                            member: leaver.clone()
+                        }
+                    );
+                    let material = cgka_traits::app_event::group_system_event_material(
+                        &group_id,
+                        epoch.0,
+                        actor.as_ref(),
+                        change,
+                    )
+                    .unwrap();
+                    Some((
+                        material.message_id_hex,
+                        origin_commit_id.clone().expect("departure origin"),
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            departures.len(),
+            1,
+            "one authenticated departure: {events:?}"
+        );
+        departures.into_iter().next().unwrap()
+    };
+    let author_target = departure_target(&alice_events);
+
     // Bob ingests alice's commit — his epoch advances and he sees himself
     // removed. The engine retains his (tombstoned) local group state on removal
     // so the convergence artifacts needed to invalidate a losing removal branch
@@ -3340,6 +3569,15 @@ async fn selfremove_full_flow_with_auto_commit() {
         },
         ..commit
     };
+    carol.ingest(routed.clone()).await.unwrap();
+    converge_buffered_commit(&mut carol, &group_id);
+    // Publication uses the transport alias; canonical recipient replay uses
+    // the content alias. Neither alias participates in the reaction target ID.
+    assert_eq!(author_target.1, routed.id);
+    let recipient_origin = content_id(&routed);
+    let carol_target = departure_target(&carol.drain_events());
+    assert_eq!(carol_target.0, author_target.0);
+    assert_eq!(carol_target.1, recipient_origin);
     let outcome = bob.ingest(routed).await.unwrap();
     assert!(matches!(outcome, IngestOutcome::Buffered { .. }));
     converge_buffered_commit(&mut bob, &group_id);
@@ -3349,6 +3587,9 @@ async fn selfremove_full_flow_with_auto_commit() {
         emits_departure_of(&bob_events, &bob.self_id()),
         "bob should emit a departure for himself; got {bob_events:?}"
     );
+    let bob_target = departure_target(&bob_events);
+    assert_eq!(bob_target.0, author_target.0);
+    assert_eq!(bob_target.1, recipient_origin);
 }
 
 #[tokio::test]

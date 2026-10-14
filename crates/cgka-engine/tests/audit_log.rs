@@ -408,3 +408,190 @@ async fn audit_log_records_transport_received_before_ingest_entry() {
         _ => unreachable!(),
     }
 }
+
+/// Queued logical sends retain their audit identity when a fresh engine prepares
+/// their wire artifacts, without representing queue IDs as published messages.
+#[tokio::test]
+async fn queued_application_audit_correlates_preparation_after_restart() {
+    use cgka_traits::{MarmotAppEvent, SendIntent};
+    use marmot_forensics::v5::{BuildProfile, Platform, Producer, Record};
+    use storage_sqlite::SqlCipherKey;
+    use support::epoch_sealed_peeler::EpochSealedPeeler;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("account.sqlite");
+    let audit_path = dir.path().join("audit.jsonl");
+    let key = SqlCipherKey::new("audit-correlation-fixture-key").unwrap();
+    let identity = valid_identity(b"queued-audit");
+    let build = || {
+        let recorder = JsonlRecorder::open_v5_with_account_ref(
+            &audit_path,
+            "11".repeat(16),
+            Some("22".repeat(16)),
+            Producer {
+                mdk_revision: None,
+                build_profile: BuildProfile::Debug,
+                platform: Platform::Other,
+                host_build: None,
+            },
+        )
+        .unwrap();
+        EngineBuilder::new(SqliteAccountStorage::open_encrypted(&db_path, &key).unwrap())
+            .legacy_compatibility_profile()
+            .identity(identity.clone())
+            .account_identity_proof_signer(proof_signer(b"queued-audit"))
+            .peeler(Box::new(EpochSealedPeeler))
+            .recorder(Box::new(recorder))
+            .build()
+            .unwrap()
+    };
+    let mut engine = build();
+    let (group_id, created) = engine
+        .create_group(CreateGroupRequest {
+            name: "audit fixture".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, .. } = created else {
+        panic!("expected legacy group creation");
+    };
+    engine.confirm_published(pending).await.unwrap();
+    let first = MarmotAppEvent::new(hex::encode(&identity), 1, 9, vec![], "private-first");
+    let second = MarmotAppEvent::new(hex::encode(&identity), 2, 9, vec![], "private-second");
+    for event in [&first, &second] {
+        assert!(matches!(
+            engine
+                .queue_app_message(group_id.clone(), event.encode().unwrap())
+                .await
+                .unwrap(),
+            SendResult::Queued { .. }
+        ));
+    }
+    drop(engine);
+    let mut engine = build();
+    engine.hydrate_all_stored_groups().unwrap();
+    let prepared = engine
+        .converge_and_drain_queued_outbound_intents(&group_id, u64::MAX / 2)
+        .await
+        .unwrap();
+    assert_eq!(prepared.len(), 2, "both retained sends must prepare");
+    let wire_ids: Vec<_> = prepared
+        .iter()
+        .map(|result| match result {
+            SendResult::ApplicationMessage { msg, .. } => hex::encode(msg.id.as_slice()),
+            _ => panic!("expected application message"),
+        })
+        .collect();
+    // A separate direct send in the fresh engine cannot alias the earlier
+    // process's first send, even though its operation counter starts over.
+    let third = MarmotAppEvent::new(hex::encode(&identity), 3, 9, vec![], "private-third");
+    engine
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: third.encode().unwrap(),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        engine
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: b"malformed-private-fixture".to_vec(),
+                expected_epoch: None,
+            })
+            .await,
+        Err(cgka_traits::EngineError::InvalidAppMessagePayload(_))
+    ));
+    drop(engine);
+
+    let contents = std::fs::read_to_string(&audit_path).unwrap();
+    for sensitive in [
+        first.id.as_str(),
+        second.id.as_str(),
+        third.id.as_str(),
+        "private-first",
+        "private-second",
+        "private-third",
+        "malformed-private-fixture",
+        &hex::encode(&identity),
+        &hex::encode(group_id.as_slice()),
+    ] {
+        assert!(
+            !contents.contains(sensitive),
+            "audit must redact fixture identities/content"
+        );
+    }
+    let rows: Vec<serde_json::Value> = contents
+        .lines()
+        .map(|line| {
+            Record::from_json(line.as_bytes()).expect("strict v5 record");
+            serde_json::from_str(line).unwrap()
+        })
+        .collect();
+    let outcomes: Vec<_> = rows
+        .iter()
+        .filter(|row| row["event"]["type"] == "send_outcome")
+        .collect();
+    let queued: Vec<_> = outcomes
+        .iter()
+        .filter(|row| row["event"]["result_kind"] == "queued")
+        .collect();
+    let application: Vec<_> = outcomes
+        .iter()
+        .filter(|row| row["event"]["result_kind"] == "application_message")
+        .collect();
+    assert_eq!(queued.len(), 2);
+    assert_eq!(
+        application.len(),
+        3,
+        "queued regeneration must emit a preparation outcome"
+    );
+    let operation = |row: &serde_json::Value| {
+        row["event"]["record_context"]["operation_ref"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert_ne!(operation(queued[0]), operation(queued[1]));
+    let entries: Vec<_> = rows
+        .iter()
+        .filter(|row| row["event"]["type"] == "send_entry")
+        .collect();
+    assert_eq!(operation(entries[0]), operation(queued[0]));
+    assert_eq!(operation(entries[1]), operation(queued[1]));
+    for index in 0..2 {
+        assert_eq!(operation(queued[index]), operation(application[index]));
+        assert!(
+            queued[index]["event"]["outbound_messages"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+        );
+        assert_eq!(
+            application[index]["event"]["outbound_messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let expected_ref = marmot_forensics::v5::EngineMessageRef::from_message_id(
+            &hex::decode(&wire_ids[index]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            application[index]["event"]["outbound_messages"][0]["message_ref"],
+            expected_ref.as_str()
+        );
+        assert!(
+            !contents.contains(&wire_ids[index]),
+            "wire IDs must remain opaque"
+        );
+    }
+    assert_ne!(operation(queued[0]), operation(application[2]));
+    assert_ne!(operation(queued[1]), operation(application[2]));
+}

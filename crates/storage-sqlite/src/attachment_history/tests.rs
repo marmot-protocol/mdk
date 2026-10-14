@@ -285,6 +285,11 @@ fn production_projection_rebuild_invalidation_expiry_and_encrypted_reopen() {
         tags: vec![
             vec!["imeta".into(), "url https://example.com/a".into()],
             vec!["imeta".into(), "url https://example.com/b".into()],
+            vec![
+                "emoji".into(),
+                "wave".into(),
+                "https://example.com/a".into(),
+            ],
         ],
         recorded_at: 10,
         received_at: 10,
@@ -314,7 +319,23 @@ fn production_projection_rebuild_invalidation_expiry_and_encrypted_reopen() {
             .attachment_index,
         1
     );
+    // Change the retained event without touching the materialized timeline. Rebuild
+    // uses DELETE + INSERT, so the emoji UPDATE trigger cannot supply this fence.
+    assert_eq!(page(&store).entries[0].emoji_tags.len(), 1);
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE app_events SET tags_json=?1 WHERE group_id_hex='aa' AND message_id_hex='message'",
+            [serde_json::to_string(&event.tags[..2]).unwrap()],
+        )
+        .unwrap();
+    assert_eq!(page(&store).version, initial.version);
+    assert_eq!(page(&store).entries[0].emoji_tags.len(), 1);
     store.rebuild_message_timeline_for_group("aa").unwrap();
+    let rebuilt = page(&store);
+    assert!(rebuilt.entries[0].emoji_tags.is_empty());
+    assert!(rebuilt.version.requires_restart_since(&initial.version));
     assert_eq!(
         store
             .attachment_history_page("aa", 100, None)
@@ -639,5 +660,55 @@ fn destructive_changes_still_require_restart_after_safe_additions() {
             store.attachment_history_page("aa", 1, initial.next_cursor.as_ref()),
             Err(AttachmentHistoryError::StaleCursor)
         ));
+    }
+}
+
+/// Emoji-only metadata changes must invalidate already displayed attachment roles.
+#[test]
+fn emoji_tag_changes_invalidate_attachment_history() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, 1, 2);
+    let first = page(&store);
+    sql(
+        &store,
+        "UPDATE message_timeline SET tags_json='[[\"emoji\",\"wave\",\"https://media.example/emoji\"]]' WHERE message_id_hex='000001'",
+    );
+    assert!(
+        store
+            .attachment_history_version("aa")
+            .unwrap()
+            .requires_restart_since(&first.version)
+    );
+    assert!(matches!(
+        store.attachment_history_page("aa", 1, first.next_cursor.as_ref()),
+        Err(AttachmentHistoryError::StaleCursor)
+    ));
+}
+
+/// Discovery projects only source emoji arrays, tolerating malformed unrelated metadata.
+#[test]
+fn attachment_history_metadata_is_source_scoped_and_not_an_album_copy() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, 1, 2);
+    for (tags, expected) in [
+        (
+            r#"[["imeta","large album metadata"],["emoji","wave","https://example.com/a"],["emoji",null,"bad"],"emoji",{"a":"b"}]"#,
+            1,
+        ),
+        (r#"{"tag":["emoji","wave","https://example.com/a"]}"#, 0),
+        ("corrupt", 0),
+    ] {
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE message_timeline SET tags_json=?1 WHERE message_id_hex='000001'",
+                [tags],
+            )
+            .unwrap();
+        let result = page(&store);
+        assert_eq!(result.entries[0].emoji_tags.len(), expected);
+        assert_eq!(result.entries[0].attachment_index, 0);
+        assert!(result.next_cursor.is_some());
     }
 }

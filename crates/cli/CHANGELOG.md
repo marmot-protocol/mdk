@@ -11,8 +11,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
-- `wn-claude`, `wn-codex`, `wn-opencode`, and `wn-pi` now bound each backend
-  turn's output. They cap single JSONL records, raw stdout, framed events,
+- `wn-claude`, `wn-codex`, `wn-goose`, `wn-opencode`, and `wn-pi` now bound each
+  backend turn's output. They cap single JSONL records, raw stdout, framed events,
   assistant text, artifact captions and counts, staged reply chunks, and
   durable send attempts (including retries and status notices). Each cap has a
   finite default and hard maximum, configurable through
@@ -31,6 +31,80 @@ versioning through the workspace version in the root `Cargo.toml`.
   limited turn receives one notice naming the recovery command instead of
   waiting silently. See the
   [terminal harness output limits](../../integrations/terminal-harness/README.md#output-limits).
+- Group changes on a group that may have moved past this device now fail with the JSON error code
+  `group_catching_up` (carrying `group_id`) instead of committing from the stale epoch and forking
+  the group (mdk#2258). Retry once the group has synced, or pass `--accept-stale` to `wn groups` to
+  make the change anyway. MarmotKit reports it as `GroupCatchingUp`.
+- Group changes while the group's last change has not reached every group relay now fail with the
+  JSON error code `group_commit_undelivered` (carrying `group_id`), instead of building on a change
+  that members on those relays cannot see (mdk#2255). MDK keeps retrying those relays. Retry once
+  they accept it, or pass `--accept-undelivered` to `wn groups` to make the change anyway.
+  `wn groups commit-delivery <group-hex>` lists the relays still owed the change. MarmotKit reports
+  it as `GroupCommitUndelivered`.
+
+## [0.13.0] - 2026-10-12
+
+Update generated Swift/Kotlin bindings, native libraries and C headers together. Account storage advances through
+migration 107; back up before upgrade because downgrade is unsupported. See the
+[release notes](../../docs/release/0.13.0.md) and the
+[client upgrade guide](../../docs/integration/0.13.0.md).
+
+### Added
+
+- `wn-agent group-profile` reads `{name?, description?}` JSON on stdin and updates
+  the current group's profile through `group_profile_update`
+  (`MARMOT_GROUP_PROFILE_TIMEOUT_SECS`, default 30). Claude Code, Codex, OpenCode
+  and Pi turns get the route automatically, and OpenClaw adds a
+  `marmot_group_profile` tool. Unconfirmed outcomes are reported as unknown and
+  never retried.
+
+- Agent control adds `account_relay_lists`, `account_relay_list_add` and
+  `account_relay_list_remove` (optional `direction`: read, write or both) and a
+  `relay_lists` response. Edits read, merge and republish kinds 10002/10050 and
+  refuse unconfirmed reads with `relay_list_inconclusive`. Rust `agent-control`
+  matches must handle the new variants.
+
+- `wn` and `wn-agent` follow the opt-in `WN_SOCKS5_*` proxy settings described in
+  the marmot-app [SOCKS5 routing](../marmot-app/README.md#socks5-routing)
+  section. Invalid settings refuse connections instead of dialing directly, and
+  live QUIC previews are unavailable while SOCKS5 is on.
+
+- `wn relay-stats` reports relay refusals of live subscriptions under
+  `sync.refusals`: counts by opaque relay index, route kind (`inbox`, `group`,
+  `maintenance`), reason category and whether the relay client kept or dropped
+  the REQ. No relay URLs or reason text. (#2247)
+
+- WN Agent releases now include the `wn-goose` terminal-harness connector and
+  `install-goose-marmot.sh` for [Goose](https://github.com/aaif-goose/goose)
+  1.53.0 or newer. It runs one `goose run` per prompt under a connector-generated
+  session name and supports the `inherit` and `unrestricted` execution
+  profiles. It refuses `autonomous`, because no Goose mode skips approval
+  prompts while still enforcing configured tool denies.
+
+### Changed
+
+- Terminal-harness installers show the full agent npub to verify, dry runs say no
+  identity was created, and setup ends with a phone round-trip check instead of
+  "Install complete".
+
+- `relay.damus.io` is no longer a retired relay host. The relay is still
+  operating, so relay lists, invites and `wn` commands accept it again.
+  `relay.nostr.band` remains retired.
+
+### Fixed
+
+- `wn-agent` reports `socket_path_too_long` before binding an oversized control
+  socket path, and control keeps running if the optional usage-diagnostics
+  socket cannot bind.
+
+- All binaries use `libcrux-kem` 0.0.10, fixing malformed hybrid-key and
+  short-seed panics (RUSTSEC-2026-0330 and RUSTSEC-2026-0331).
+
+- A sent message the engine queued while the group was converging is no longer
+  marked failed when an unrelated publish in the same batch fails, and a sent
+  row already marked failed revives once a relay accepts its fanout. Before,
+  other members received the message while the sender's row stayed failed
+  forever, and a sender's poll showed no projection.
 
 ## [0.12.0] - 2026-10-02
 
@@ -2744,7 +2818,8 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/marmot-protocol/mdk/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/marmot-protocol/mdk/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/marmot-protocol/mdk/compare/v0.10.4...v0.11.0
 [0.10.4]: https://github.com/marmot-protocol/mdk/compare/v0.10.3...v0.10.4

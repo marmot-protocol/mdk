@@ -1,5 +1,6 @@
 //! Persistent account home: local Nostr account records and signing credentials.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,6 +19,7 @@ use crate::secret_store::{
 };
 
 const ACCOUNT_RECORD_FILE: &str = "account.json";
+const EXTERNAL_DATABASE_CREDENTIAL_PREFIX: &str = ".external-sqlcipher/";
 const ACCOUNT_SETUP_STATE_FILE: &str = ".account-setup.json";
 const ACCOUNT_SETUP_CONTEXT_FILE: &str = ".account-setup-context.json";
 /// Per-account NIP-49 KEY_SECURITY_BYTE status record. Records only a status
@@ -86,6 +88,13 @@ pub struct AccountSummary {
     /// clears this flag.
     #[serde(default)]
     pub signed_out: bool,
+}
+
+/// Whether a missing external device key may be created before any database exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExternalSecretMode {
+    Existing,
+    Create,
 }
 
 /// Provenance for a strict Nostr private-key import used by account setup.
@@ -178,6 +187,19 @@ struct StoredKeySecurity {
     /// raw form), 0x01 = not known to have been handled insecurely, 0x02 =
     /// unknown/untracked. We only ever transition toward 0x00.
     key_security_byte: u8,
+}
+
+fn external_database_credential(account: &AccountSummary) -> AccountSummary {
+    use sha2::{Digest, Sha256};
+    let label = format!("{EXTERNAL_DATABASE_CREDENTIAL_PREFIX}{}", account.label);
+    let account_id_hex = hex::encode(Sha256::digest(label.as_bytes()));
+    AccountSummary {
+        label,
+        account_id_hex,
+        local_signing: false,
+        external_signing: false,
+        signed_out: false,
+    }
 }
 
 impl AccountHome {
@@ -662,6 +684,43 @@ impl AccountHome {
         }
     }
 
+    /// Newest timestamp this device authored per replaceable record kind.
+    /// Kinds are opaque to this layer; callers record a floor before signing
+    /// so a later version is never authored behind one already published,
+    /// even after a restart.
+    pub fn replaceable_record_floors(
+        &self,
+        account_ref: &str,
+    ) -> AccountHomeResult<BTreeMap<u64, u64>> {
+        let account = self.account(account_ref)?;
+        match read_json(self.replaceable_record_floors_path(&account.label)) {
+            Ok(floors) => Ok(floors),
+            Err(AccountHomeError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                Ok(BTreeMap::new())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Raise one kind's floor to `created_at`; a lower value leaves it unchanged.
+    /// The owner-only file is atomically replaced.
+    pub fn advance_replaceable_record_floor(
+        &self,
+        account_ref: &str,
+        kind: u64,
+        created_at: u64,
+    ) -> AccountHomeResult<()> {
+        let _guard = self.mutation_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let account = self.account(account_ref)?;
+        let mut floors = self.replaceable_record_floors(&account.label)?;
+        let floor = floors.entry(kind).or_insert(0);
+        if *floor >= created_at {
+            return Ok(());
+        }
+        *floor = created_at;
+        write_private_json(self.replaceable_record_floors_path(&account.label), &floors)
+    }
+
     /// Retain the last cancelled checkpoint while removing its active gate.
     /// The caller must first durably sign out and retain any setup journal.
     /// A later cancellation replaces this evidence even if publication is uncertain.
@@ -867,6 +926,80 @@ impl AccountHome {
         self.read_accounts(false)
     }
 
+    /// Load device-local database key material for an external account through
+    /// the configured secret store. The synthetic credential is not an account
+    /// signing key and never produces an account record. Host vault and default
+    /// keychain stores keep it encrypted; the development file store retains its
+    /// explicit file-backed policy. Existing plaintext keys are migrated before
+    /// their legacy inode is scrubbed, preserving already-encrypted databases.
+    /// Use `Create` only before the account's first database is created.
+    pub fn external_database_secret(
+        &self,
+        account_ref: &str,
+        mode: ExternalSecretMode,
+    ) -> AccountHomeResult<Zeroizing<[u8; 32]>> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let account = self.account(account_ref)?;
+        if !account.external_signing || account.local_signing {
+            return Err(AccountHomeError::InvalidSecretKey);
+        }
+        let credential = external_database_credential(&account);
+        let legacy_path = self
+            .account_dir(&account.label)
+            .join(EXTERNAL_SQLCIPHER_SECRET_FILE);
+        let legacy = match fs::read_to_string(&legacy_path) {
+            Ok(raw) => {
+                let raw = Zeroizing::new(raw);
+                Some(nostr::prelude::Keys::new(
+                    nostr::prelude::SecretKey::from_hex(raw.trim())
+                        .map_err(|_| AccountHomeError::InvalidSecretKey)?,
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let exists = self.secret_store.has_secret_for_label(&credential.label)?
+            || self
+                .secret_store
+                .has_secret_for_account_id(&credential.account_id_hex)?;
+        let keys = if exists {
+            let keys = self.secret_store.load_secret(&credential)?;
+            if legacy
+                .as_ref()
+                .is_some_and(|legacy| legacy.secret_key() != keys.secret_key())
+            {
+                return Err(AccountHomeError::AccountIdMismatch);
+            }
+            keys
+        } else {
+            let keys = match legacy.as_ref() {
+                Some(keys) => keys.clone(),
+                None if mode == ExternalSecretMode::Create => nostr::prelude::Keys::generate(),
+                None => return Err(AccountHomeError::SecretNotFound(credential.label)),
+            };
+            // A durable write and verified read precede every first DB open.
+            // Never substitute the user key or NIP-46 client transport key.
+            self.secret_store.write_secret(&credential, &keys)?;
+            let stored = self.secret_store.load_secret(&credential)?;
+            if stored.secret_key() != keys.secret_key() {
+                return Err(AccountHomeError::AccountIdMismatch);
+            }
+            stored
+        };
+        if legacy.is_some() {
+            scrub_and_remove_local_secret_file(&legacy_path)?;
+        }
+        let secret = keys
+            .secret_key()
+            .as_secret_bytes()
+            .try_into()
+            .map_err(|_| AccountHomeError::InvalidSecretKey)?;
+        Ok(Zeroizing::new(secret))
+    }
+
     /// List the complete account catalog or report a read error. Unlike `accounts`,
     /// this never hides an account whose record cannot be read or decoded.
     /// Metadata-probe errors also propagate: an inaccessible directory is not an
@@ -1031,6 +1164,21 @@ impl AccountHome {
         // missing directory is treated as already-removed (idempotent).
         let live_dir = self.account_dir(&account.label);
         let tombstone = self.move_account_dir_to_tombstone(&account.label, &live_dir)?;
+
+        // The wipe already committed. An early return would report a completed
+        // removal as failed and skip the secret scrub below, so warn and continue.
+        if account.external_signing
+            && self
+                .secret_store
+                .remove_secret(&external_database_credential(&account))
+                .is_err()
+        {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                method = "remove_account",
+                "failed to remove external database credential after wipe commit"
+            );
+        }
 
         // Drop the signing secret unless a twin record still depends on a
         // shared (account-id-keyed) credential. For the local-file store the
@@ -1319,6 +1467,10 @@ impl AccountHome {
 
     fn account_record_path(&self, label: &str) -> PathBuf {
         self.account_dir(label).join(ACCOUNT_RECORD_FILE)
+    }
+
+    fn replaceable_record_floors_path(&self, label: &str) -> PathBuf {
+        self.account_dir(label).join("replaceable-floors.json")
     }
 
     fn account_setup_state_path(&self, label: &str) -> PathBuf {

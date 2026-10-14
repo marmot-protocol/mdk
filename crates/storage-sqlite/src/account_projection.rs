@@ -554,6 +554,35 @@ impl SqliteAccountStorage {
             .collect()
     }
 
+    /// When unresolved epoch-gap recovery first said this group moved past
+    /// `local_epoch` without this device (mdk#2258), in wall-clock
+    /// milliseconds, or `None` when no such gap is open. Pending, parked and
+    /// user-retired obligations all count: none of them has caught the device
+    /// up, and retiring a "history may be incomplete" notice changes no MLS
+    /// state. Only recovery that clears the gap, or a local epoch above the
+    /// stalled one, closes it.
+    ///
+    /// The time is when the group's obligation row was first armed. Re-arming
+    /// it at a higher stalled epoch does not restart it, and nor does any
+    /// later revision (several of which, such as capacity deferral, flooding
+    /// can drive). A bound measured from it can end early, never be extended.
+    pub fn epoch_gap_recovery_open_since(
+        &self,
+        group_id: &[u8],
+        local_epoch: u64,
+    ) -> StorageResult<Option<u64>> {
+        let since: Option<i64> = self
+            .lock()?
+            .query_row_cached(
+                "SELECT MIN(created_at_ms) FROM account_recovery_obligations
+                 WHERE cause = 1 AND state IN (0, 2) AND group_id = ?1 AND stalled_epoch >= ?2",
+                params![group_id, u64_to_i64(local_epoch)?],
+                |row| row.get(0),
+            )
+            .storage()?;
+        since.map(i64_to_u64).transpose()
+    }
+
     /// Consume only the exact epochs one completed replay served. A newer arm
     /// written concurrently remains pending.
     pub fn clear_epoch_backfill_intents(
@@ -3224,6 +3253,64 @@ impl SqliteAccountStorage {
             .storage()?;
             Ok(())
         })
+    }
+
+    /// Remove destinations for departed device leaves in one transaction. A
+    /// surviving sibling keeps the account's anti-resurrection tombstones.
+    pub fn remove_group_push_tokens_for_leaves(
+        &self,
+        group_id_hex: &str,
+        leaves: &[(String, u32)],
+        departed_members: &[String],
+    ) -> StorageResult<()> {
+        self.connection.with_transaction(|| -> StorageResult<()> {
+            let conn = self.lock()?;
+            for (member, index) in leaves {
+                conn.execute_cached("DELETE FROM group_push_tokens WHERE group_id_hex = ?1 AND member_id_hex = ?2 AND leaf_index = ?3", params![group_id_hex, member, i64::from(*index)]).storage()?;
+            }
+            for member in departed_members {
+                conn.execute_cached("DELETE FROM group_push_tokens WHERE group_id_hex = ?1 AND member_id_hex = ?2", params![group_id_hex, member]).storage()?;
+                conn.execute_cached("DELETE FROM group_push_token_tombstones WHERE group_id_hex = ?1 AND member_id_hex = ?2", params![group_id_hex, member]).storage()?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Repair missed leaf-departure cleanup from a hydrated canonical roster.
+    /// Retain account-scoped anti-resurrection tombstones while any sibling lives.
+    pub fn reconcile_group_push_token_leaves(
+        &self,
+        group_id_hex: &str,
+        active_leaves: &[(String, u32)],
+    ) -> StorageResult<usize> {
+        // Materialize one scalar lookup set per statement. Correlated JSON
+        // scans (and row-value NOT IN null checks) grow quadratically. Member
+        // plus ':' plus a non-null u32 leaf is an unambiguous identity key.
+        let roster = serde_json::to_string(active_leaves)
+            .map_err(|error| StorageError::Serialization(error.to_string()))?;
+        self.connection
+            .with_transaction(|| -> StorageResult<usize> {
+                let conn = self.lock()?;
+                let removed = conn
+                    .execute_cached(
+                        "DELETE FROM group_push_tokens
+                 WHERE group_id_hex = ?1 AND (member_id_hex || ':' || leaf_index) NOT IN (
+                     SELECT json_extract(leaf.value, '$[0]') || ':' || json_extract(leaf.value, '$[1]')
+                     FROM json_each(?2) AS leaf
+                 )",
+                        params![group_id_hex, roster],
+                    )
+                    .storage()?;
+                conn.execute_cached(
+                    "DELETE FROM group_push_token_tombstones
+                 WHERE group_id_hex = ?1 AND member_id_hex NOT IN (
+                     SELECT json_extract(leaf.value, '$[0]') FROM json_each(?2) AS leaf
+                 )",
+                    params![group_id_hex, roster],
+                )
+                .storage()?;
+                Ok(removed)
+            })
     }
 
     pub fn remove_stale_group_push_tokens(

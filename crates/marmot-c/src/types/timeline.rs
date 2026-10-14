@@ -191,7 +191,8 @@ c_mirror! {
 
 c_mirror! {
     /// One individual authenticated reaction.
-    MarmotTimelineUserReaction from TimelineUserReactionFfi {
+    MarmotTimelineUserReaction from TimelineUserReactionFfi,
+    list(MarmotTimelineUserReactionList, marmot_timeline_user_reaction_list_free) {
         str reaction_message_id_hex,
         str target_message_id_hex,
         str sender,
@@ -445,6 +446,43 @@ c_mirror! {
 #[cfg(test)]
 mod edit_tests {
     use super::*;
+    /// The complete participant list owns and deep-frees every nested field, including empty lists.
+    #[test]
+    fn complete_reaction_list_deep_frees_all_participants() {
+        #[cfg(feature = "alloc-audit")]
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let before = crate::memory::audit::live_allocations();
+        let reactions = (0..4)
+            .map(|index| TimelineUserReactionFfi {
+                reaction_message_id_hex: format!("reaction-{index}"),
+                target_message_id_hex: "target".into(),
+                sender: format!("sender-{index}"),
+                emoji: if index == 3 { "🔥" } else { "👍" }.into(),
+                reacted_at: index,
+            })
+            .collect::<Vec<_>>();
+        let list = MarmotTimelineUserReactionList::from(reactions);
+        assert_eq!(list.len, 4);
+        unsafe {
+            assert_eq!(
+                std::ffi::CStr::from_ptr((*list.items.add(2)).sender).to_str(),
+                Ok("sender-2")
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr((*list.items.add(3)).emoji).to_str(),
+                Ok("🔥")
+            );
+            marmot_timeline_user_reaction_list_free(crate::memory::boxed(list));
+            marmot_timeline_user_reaction_list_free(crate::memory::boxed(
+                MarmotTimelineUserReactionList::from(Vec::new()),
+            ));
+            marmot_timeline_user_reaction_list_free(std::ptr::null_mut());
+        }
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), before);
+    }
+
     #[test]
     fn accepted_edit_records_preserve_metadata_and_deep_free() {
         #[cfg(feature = "alloc-audit")]
