@@ -3684,6 +3684,224 @@ async fn ambiguous_self_update_exposure_survives_restart_and_respects_retry_back
     );
 }
 
+/// mdk#2255/mdk#2264: a self-update commit that fails on every group relay
+/// keeps each relay's own cause on its frozen fanout target and in the
+/// `publish_outcome` audit row. The frozen fanout sends one single-endpoint
+/// request per relay, and each failed relay waits out its backoff before the
+/// exact commit is retried.
+#[tokio::test]
+async fn frozen_self_update_publish_failure_records_per_relay_causes() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot frozen failure cause key").unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let audit_path = dir.path().join("audit.jsonl");
+    let mut initial = current_session(database.clone(), &key, b"alice");
+    let created = initial
+        .create_group(CreateGroupRequest {
+            name: "frozen failure causes".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id;
+    drop(initial);
+
+    let mut session = current_session(database, &key, b"alice");
+    session.set_audit_recorder(Box::new(
+        marmot_forensics::JsonlRecorder::open_v5_with_account_ref(
+            &audit_path,
+            "11".repeat(16),
+            Some("22".repeat(16)),
+            marmot_forensics::v5::Producer {
+                mdk_revision: None,
+                build_profile: marmot_forensics::v5::BuildProfile::Debug,
+                platform: marmot_forensics::v5::Platform::Other,
+                host_build: None,
+            },
+        )
+        .unwrap(),
+    ));
+    let timed_out = TransportEndpoint("wss://group-timed-out.example".into());
+    let refused = TransportEndpoint("wss://group-refused.example".into());
+    let adapter = RecordingAdapter::default();
+    adapter.fail_endpoints_with_reasons(
+        TransportEndpointFailureKind::RetryableUnavailable,
+        vec![
+            (timed_out.clone(), "connect relay timed out"),
+            (refused.clone(), "connect relay failed"),
+        ],
+    );
+    let routing =
+        StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())])
+            .with_group_route(
+                group_id.clone(),
+                group_id.as_slice().to_vec(),
+                vec![timed_out.clone(), refused.clone()],
+            );
+    let wall = Arc::new(TestWallClock::new(120_000));
+    let monotonic = Arc::new(TestMonotonicClock::default());
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        adapter.clone(),
+        routing,
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        monotonic.clone(),
+        Arc::new(TestRandom::new(0)),
+    );
+
+    let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    monotonic.set_millis(60_000);
+    wall.set(120_060);
+    runtime.run_due_maintenance().await.unwrap();
+    let jittered = runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+    wall.set(jittered.not_before.unwrap().0);
+    runtime.run_due_maintenance().await.unwrap();
+
+    // One pass: the exact commit goes to each relay as its own request.
+    let publishes = adapter.publishes();
+    assert_eq!(publishes.len(), 2);
+    assert_eq!(publishes[0].message, publishes[1].message);
+    let mut published_endpoints = publishes
+        .iter()
+        .map(|publish| {
+            assert_eq!(publish.required_acks, 1);
+            let [endpoint] = publish.target.endpoints() else {
+                panic!("one endpoint per request: {:?}", publish.target);
+            };
+            endpoint.clone()
+        })
+        .collect::<Vec<_>>();
+    published_endpoints.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(
+        published_endpoints,
+        vec![refused.clone(), timed_out.clone()]
+    );
+
+    assert!(runtime.session().transport_fanouts().unwrap().is_empty());
+    let fanout = runtime
+        .session()
+        .outbound_fanouts_for_group(&group_id)
+        .unwrap()
+        .remove(0);
+    let endpoints = fanout.request().target.endpoints().to_vec();
+    assert_eq!(endpoints.len(), 2);
+    for (index, endpoint) in endpoints.iter().enumerate() {
+        assert_eq!(
+            fanout.target_status(index),
+            Some(cgka_traits::FanoutTargetStatus::RetryableUnavailable)
+        );
+        assert_eq!(fanout.target_attempt_count(index), 1);
+        let expected = if endpoint == &timed_out {
+            "connect relay timed out"
+        } else {
+            "connect relay failed"
+        };
+        assert_eq!(
+            fanout
+                .target_failure(index)
+                .map(|failure| failure.reason.as_str()),
+            Some(expected),
+            "each relay's reported failure must reach its fanout target"
+        );
+    }
+    assert!(matches!(
+        fanout.mls_state(),
+        cgka_traits::FanoutMlsState::Pending(_)
+    ));
+    assert_eq!(
+        runtime
+            .session()
+            .maintenance_obligation(&obligation_id)
+            .unwrap()
+            .unwrap()
+            .phase,
+        cgka_traits::MaintenancePhase::PendingPublication
+    );
+
+    // A relay that just failed waits for its backoff before the exact retry.
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(adapter.publishes().len(), 2);
+    wall.set(wall.now().0.saturating_add(5));
+    runtime.run_due_maintenance().await.unwrap();
+    let publishes = adapter.publishes();
+    assert_eq!(
+        publishes.len(),
+        4,
+        "the exact retry runs once backoff elapses"
+    );
+    assert!(
+        publishes
+            .iter()
+            .all(|publish| publish.message == publishes[0].message)
+    );
+    drop(runtime);
+
+    let audit = std::fs::read_to_string(&audit_path).unwrap();
+    assert!(!audit.contains("wss://"));
+    let rows = audit
+        .lines()
+        .map(|line| {
+            marmot_forensics::v5::Record::from_json(line.as_bytes()).expect("strict v5 row");
+            serde_json::from_str::<serde_json::Value>(line).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let attempts = rows
+        .iter()
+        .filter(|row| row["event"]["type"] == "publish_attempt")
+        .collect::<Vec<_>>();
+    assert_eq!(attempts.len(), 2, "both passes are audited");
+    assert_eq!(
+        attempts[0]["event"]["endpoint_refs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let outcomes = rows
+        .iter()
+        .filter(|row| row["event"]["type"] == "publish_outcome")
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes.len(), 2, "both passes are audited");
+    let outcome = outcomes[0];
+    assert_eq!(outcome["event"]["met_required_acks"], false);
+    assert!(
+        outcome["event"]["accepted_endpoint_refs"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+    );
+    let failed_relays = outcome["event"]["failed_relays"].as_array().unwrap();
+    assert_eq!(failed_relays.len(), 2);
+    for (endpoint, reason) in [
+        (&timed_out, "connect_relay_timed_out"),
+        (&refused, "connect_relay_failed"),
+    ] {
+        let endpoint_ref =
+            marmot_forensics::v5::EndpointRef::from_normalized_url(&endpoint.0).unwrap();
+        let relay = failed_relays
+            .iter()
+            .find(|relay| relay["endpoint_ref"] == endpoint_ref.as_str())
+            .unwrap_or_else(|| panic!("missing relay row: {failed_relays:?}"));
+        assert_eq!(relay["reason"], reason, "{failed_relays:?}");
+    }
+    assert!(
+        rows.iter()
+            .all(|row| row["event"]["reason"] != "unclassified"),
+        "no publish row may fall back to an unclassified cause"
+    );
+}
+
 #[tokio::test]
 async fn create_group_rolls_back_pending_when_publish_acks_are_insufficient() {
     let dir = tempfile::tempdir().unwrap();
