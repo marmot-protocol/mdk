@@ -31,7 +31,7 @@ use transport_nostr_adapter::{
     NostrPublishOutcome, NostrReconciliationItem, NostrReconciliationSummary, NostrRelayClient,
     NostrSdkRelayClient, NostrSdkRelayHealth, NostrSubscription, NostrTransportAdapter,
     NotificationLagMark, RelayExportConsent, RelayLabelResolution, RelayRegistrationOutcome,
-    SubscriptionAttempt,
+    SubscriptionAttempt, SubscriptionRefusalShape,
 };
 
 use crate::config::RelayTelemetryExportConfig;
@@ -218,6 +218,21 @@ struct IncrementalActivation {
     since: Timestamp,
 }
 
+/// What the last successful activation call left for the next to reuse.
+#[derive(Default)]
+struct ActivationReuse {
+    /// The incremental activation the live REQs serve, if any.
+    activation: Option<IncrementalActivation>,
+    /// The refusals that call saw end its predecessor's coverage, when every
+    /// REQ had answered but some were refused. If the REQs it issued meet
+    /// the same refusals, re-issuing them meets them again.
+    refusals: Option<SubscriptionRefusalShape>,
+    /// The group routes the live replay coverage was issued for: the last
+    /// full activation's. A reuse syncs routes without re-measuring them, so
+    /// refusals only speak for this set.
+    groups: Option<Vec<TransportGroupSubscription>>,
+}
+
 #[derive(Clone)]
 pub struct MarmotRelayPlaneAccountAdapter {
     account_id: MemberId,
@@ -228,7 +243,7 @@ pub struct MarmotRelayPlaneAccountAdapter {
     delivery_overflow: Arc<AccountDeliveryOverflowState>,
     /// The queue generation `delivery_rx` belongs to.
     delivery_epoch: u64,
-    incremental_activation: Arc<Mutex<Option<IncrementalActivation>>>,
+    incremental_activation: Arc<Mutex<ActivationReuse>>,
 }
 
 #[derive(Clone)]
@@ -1432,7 +1447,7 @@ impl MarmotRelayPlane {
             delivery_rx: Arc::new(Mutex::new(delivery_rx)),
             delivery_overflow,
             delivery_epoch,
-            incremental_activation: Arc::new(Mutex::new(None)),
+            incremental_activation: Arc::new(Mutex::new(ActivationReuse::default())),
         }
     }
 
@@ -3464,7 +3479,7 @@ impl MarmotRelayPlaneAccountAdapter {
     /// Explicit catch-up must reissue even settled, matching subscriptions.
     /// Cancellation leaves reuse disabled until an activation succeeds.
     pub(crate) async fn require_fresh_activation(&self) {
-        *self.incremental_activation.lock().await = None;
+        *self.incremental_activation.lock().await = ActivationReuse::default();
     }
 
     /// The account this adapter is bound to — the `MemberId` every subscription
@@ -4012,13 +4027,40 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
             since,
         });
         let mut previous = self.incremental_activation.lock().await;
+        let adapter = &self.relay_plane.inner.transport.adapter;
+        let eose = self.account_subscription_eose().await;
+        // Every REQ answered and some were refused. Under pending delivery
+        // loss the fence holds EOSE back, so nothing counts as known.
+        let refusals =
+            if eose.settled() && !eose.complete() && !self.delivery_overflow.blocks_ordinary_eose()
+            {
+                Some(
+                    adapter
+                        .account_subscription_refusal_shape(&self.account_id)
+                        .await,
+                )
+            } else {
+                None
+            };
+        // Reuse needs every REQ served, or the same refusals the previous
+        // call saw before it re-issued them: sending them all again would
+        // only meet those once more (#2266). Refusals speak only for the
+        // routes the coverage was issued for. A group joined since has never
+        // been answered, and a refused group left since keeps that coverage
+        // from ever completing, so any change of routes activates afresh.
+        let same_routes = previous.groups.as_ref() == Some(&activation.group_subscriptions);
         let reuse = incremental.is_some()
-            && *previous == incremental
-            && self.account_subscription_eose().await.complete();
+            && previous.activation == incremental
+            && (eose.complete()
+                || (same_routes && refusals.is_some() && previous.refusals == refusals));
+        let groups = if reuse {
+            previous.groups.take()
+        } else {
+            Some(activation.group_subscriptions.clone())
+        };
         // Cancellation or failure must force the next call through activation's
         // unconditional orphan-REQ cleanup. None always requests full history.
-        *previous = None;
-        let adapter = &self.relay_plane.inner.transport.adapter;
+        *previous = ActivationReuse::default();
         if reuse {
             adapter
                 .sync_account_groups(TransportGroupSync {
@@ -4030,7 +4072,11 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         } else {
             adapter.activate_account(activation).await?;
         }
-        *previous = incremental;
+        *previous = ActivationReuse {
+            activation: incremental,
+            refusals,
+            groups,
+        };
         Ok(())
     }
 
@@ -4060,7 +4106,7 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
             return Err(TransportAdapterError::AccountNotActive(account_id.clone()));
         }
         let mut activation = self.incremental_activation.lock().await;
-        *activation = None;
+        *activation = ActivationReuse::default();
         self.relay_plane
             .deactivate_account_context(account_id)
             .await

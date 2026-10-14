@@ -10,7 +10,7 @@
 //! the adapter testable while preserving the production boundary where a
 //! `nostr-sdk` client can plug in.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -522,8 +522,10 @@ impl AccountSubscriptionEose {
     /// dropped refusal, so waiting longer brings no more stored history.
     ///
     /// Weaker than [`Self::complete`] on purpose: a refusal is not evidence
-    /// that the refused relay's history was served. Use this only to stop
-    /// waiting; never gate live cursor promotion or activation reuse on it.
+    /// that the refused relay's history was served. Use this to stop waiting,
+    /// never to gate live cursor promotion. Activation reuse may follow it
+    /// only once a re-activation met the same refusals (see
+    /// [`SubscriptionRefusalShape`]).
     pub fn settled(&self) -> bool {
         self.relay_subscription_attempts > 0
             && self.relay_subscription_attempts_with_eose + self.relay_subscription_attempts_refused
@@ -537,6 +539,15 @@ impl AccountSubscriptionEose {
         self.relay_subscription_attempts_with_eose > 0
     }
 }
+
+/// Which of an account activation's endpoint-scoped REQs ended refused: each
+/// route (the inbox, or a group's routing id) and relay, from
+/// [`NostrTransportAdapter::account_subscription_refusal_shape`]. Routes and
+/// relays outlive activation attempts, so two activations of the same routes
+/// with equal shapes met the same refusals, and sending every REQ again
+/// would only meet them once more.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubscriptionRefusalShape(BTreeSet<(Option<[u8; 32]>, RelayIndex)>);
 
 /// Which of an account's live subscriptions a relay refused.
 #[derive(
@@ -1386,6 +1397,18 @@ impl NostrTransportAdapter {
             .read()
             .await
             .account_subscription_eose(account_id)
+    }
+
+    /// Which of the account activation's REQs ended refused, per route and
+    /// relay. See [`SubscriptionRefusalShape`].
+    pub async fn account_subscription_refusal_shape(
+        &self,
+        account_id: &MemberId,
+    ) -> SubscriptionRefusalShape {
+        self.state
+            .read()
+            .await
+            .account_subscription_refusal_shape(account_id)
     }
 
     /// The activation attempt an account's live subscriptions were issued
@@ -2619,6 +2642,22 @@ impl AccountReplayCoverage {
         progress
     }
 
+    fn refusal_shape(&self) -> SubscriptionRefusalShape {
+        let mut shape = BTreeSet::new();
+        for (id, relays) in &self.subscriptions {
+            let route = match self.windows.get(id).map(|window| window.scope) {
+                Some(ReplayScope::Group(transport_group_id)) => Some(transport_group_id),
+                _ => None,
+            };
+            for (relay, replay) in relays {
+                if *replay == RelayReplay::Refused {
+                    shape.insert((route, *relay));
+                }
+            }
+        }
+        SubscriptionRefusalShape(shape)
+    }
+
     /// Count one stored event a relay sent for a REQ still awaiting its EOSE.
     fn record_stored_event(&mut self, subscription_id: &str, relay: RelayIndex, created_at: u64) {
         if self
@@ -3241,6 +3280,16 @@ impl AdapterState {
         self.account_replay_coverage
             .get(account_id)
             .map(AccountReplayCoverage::snapshot)
+            .unwrap_or_default()
+    }
+
+    fn account_subscription_refusal_shape(
+        &self,
+        account_id: &MemberId,
+    ) -> SubscriptionRefusalShape {
+        self.account_replay_coverage
+            .get(account_id)
+            .map(AccountReplayCoverage::refusal_shape)
             .unwrap_or_default()
     }
 

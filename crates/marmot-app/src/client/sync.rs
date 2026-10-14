@@ -2986,7 +2986,7 @@ impl AppClient {
                         // good will never report EOSE, so waiting longer brings
                         // nothing. Ending the drain early ends it exactly as a
                         // timeout would, checkpoint included; live promotion
-                        // and activation reuse still require EOSE.
+                        // still requires EOSE.
                         Err(_) if self.adapter.account_subscription_eose().await.settled() => {
                             return Ok(None);
                         }

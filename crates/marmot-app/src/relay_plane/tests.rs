@@ -1152,6 +1152,128 @@ async fn notification_lag_reissues_reqs_whose_eose_it_may_have_lost() {
     relay_plane.shutdown().await;
 }
 
+/// Answer every REQ of the account's latest activation: EOSE, except a
+/// dropped refusal for the groups in `refused`.
+async fn settle_activation(
+    relay_plane: &MarmotRelayPlane,
+    relay: &RecordingRelayClient,
+    refused: &[&TransportGroupSubscription],
+) {
+    let issued = relay.subscriptions.lock().unwrap().clone();
+    let attempt = issued.last().map(NostrSubscription::attempt);
+    for subscription in issued
+        .iter()
+        .filter(|subscription| Some(subscription.attempt()) == attempt)
+    {
+        let refuse = matches!(
+            subscription,
+            NostrSubscription::Group { group_id, .. }
+                if refused.iter().any(|group| &group.group_id == group_id)
+        );
+        for endpoint in subscription.endpoints() {
+            if refuse {
+                relay_plane
+                    .handle_relay_closed_for_test(
+                        endpoint.clone(),
+                        subscription.subscription_id(),
+                        transport_nostr_adapter::SubscriptionRefusal {
+                            category: Some(
+                                cgka_traits::TransportEndpointRejectionCategory::Restricted,
+                            ),
+                            disposition:
+                                transport_nostr_adapter::SubscriptionRefusalDisposition::Dropped,
+                        },
+                    )
+                    .await;
+            } else {
+                relay_plane
+                    .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+                    .await;
+            }
+        }
+    }
+}
+
+/// A refusal leaves replay coverage incomplete, so the next activation sends
+/// every REQ again in case the relay now serves it. When that activation
+/// meets the same refusal, sending them all again is only cost: activation
+/// reuses the live REQs until the refusals change.
+#[tokio::test]
+async fn activation_reuses_live_reqs_once_a_refusal_repeats() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account = MemberId::new(vec![0xA1; 32]);
+    let endpoint = TransportEndpoint("wss://relay.example".into());
+    let group = |byte: u8| TransportGroupSubscription {
+        group_id: GroupId::new(vec![byte; 16]),
+        transport_group_id: vec![byte; 32],
+        endpoints: vec![endpoint.clone()],
+        retained_since: None,
+    };
+    let (served, refused, newly_refused) = (group(0xC1), group(0xC2), group(0xC3));
+    let adapter = relay_plane.account_adapter(account.clone(), relay.clone());
+    let activation = TransportAccountActivation {
+        account_id: account.clone(),
+        inbox_endpoints: vec![endpoint.clone()],
+        group_subscriptions: vec![served.clone(), refused.clone(), newly_refused.clone()],
+        since: Some(Timestamp(1_699_999_000)),
+    };
+    let full_activations = || relay.unsubscribed_accounts.lock().unwrap().len();
+
+    adapter.activate_account(activation.clone()).await.unwrap();
+    settle_activation(&relay_plane, &relay, &[&refused]).await;
+    adapter.activate_account(activation.clone()).await.unwrap();
+    assert_eq!(full_activations(), 2, "a first refusal is retried");
+
+    // The retry served that group but refused another on the same relay:
+    // the same count, a different refusal, so it is retried too.
+    settle_activation(&relay_plane, &relay, &[&newly_refused]).await;
+    adapter.activate_account(activation.clone()).await.unwrap();
+    assert_eq!(full_activations(), 3, "a different refusal is retried");
+
+    // A third refused group is a changed refusal as well.
+    settle_activation(&relay_plane, &relay, &[&refused, &newly_refused]).await;
+    adapter.activate_account(activation.clone()).await.unwrap();
+    assert_eq!(full_activations(), 4, "a changed refusal is retried");
+
+    settle_activation(&relay_plane, &relay, &[&refused, &newly_refused]).await;
+    let subscribed = relay.subscriptions.lock().unwrap().len();
+    adapter.activate_account(activation.clone()).await.unwrap();
+    adapter.activate_account(activation.clone()).await.unwrap();
+    assert_eq!(full_activations(), 4, "a repeated refusal is reused");
+    assert_eq!(relay.subscriptions.lock().unwrap().len(), subscribed);
+
+    // A group joined since the refusals were measured has not met them: its
+    // own REQ's answer is unknown, so the next call activates afresh.
+    let mut joined = activation.clone();
+    joined.group_subscriptions.push(group(0xC4));
+    adapter.activate_account(joined.clone()).await.unwrap();
+    assert_eq!(full_activations(), 5, "a joined group is subscribed afresh");
+
+    // The joined group was served and the same routes were refused again:
+    // those refusals repeat, so the new group set is reused.
+    settle_activation(&relay_plane, &relay, &[&refused, &newly_refused]).await;
+    adapter.activate_account(joined.clone()).await.unwrap();
+    assert_eq!(
+        full_activations(),
+        5,
+        "repeated refusals on the new set are reused"
+    );
+
+    // Leaving a refused group: a fresh activation drops it from coverage, so
+    // the rest can complete and the cursor can advance again.
+    let mut left = joined;
+    left.group_subscriptions
+        .retain(|group| group.group_id != refused.group_id);
+    adapter.activate_account(left).await.unwrap();
+    assert_eq!(
+        full_activations(),
+        6,
+        "leaving a refused group re-activates"
+    );
+    relay_plane.shutdown().await;
+}
+
 /// The lag marks the moment it happened. A REQ issued after it, while the
 /// receiver settles, is still replaying and keeps its replay.
 #[tokio::test(start_paused = true)]
