@@ -232,17 +232,26 @@ const DEFAULT_CRASH_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const CRASH_READY_TIMEOUT_ENV: &str = "MDK_CGKA_CRASH_READY_TIMEOUT_SECS";
 
 fn crash_ready_timeout() -> Duration {
-    match std::env::var(CRASH_READY_TIMEOUT_ENV) {
-        Ok(value) => Duration::from_secs(value.trim().parse().unwrap_or_else(|_| {
-            panic!("{CRASH_READY_TIMEOUT_ENV} must be whole seconds, got {value:?}")
-        })),
-        Err(_) => DEFAULT_CRASH_READY_TIMEOUT,
-    }
+    let Ok(value) = std::env::var(CRASH_READY_TIMEOUT_ENV) else {
+        return DEFAULT_CRASH_READY_TIMEOUT;
+    };
+    let timeout = value
+        .trim()
+        .parse()
+        .ok()
+        .map(Duration::from_secs)
+        // The wait adds the bound to `Instant::now()`; reject one that
+        // cannot be represented rather than overflow there.
+        .filter(|timeout| Instant::now().checked_add(*timeout).is_some());
+    timeout.unwrap_or_else(|| {
+        panic!("{CRASH_READY_TIMEOUT_ENV} must be a representable number of seconds, got {value:?}")
+    })
 }
 
 /// A child test process running toward one crash point.
 struct CrashChild {
     point: String,
+    ready_timeout: Duration,
     /// The point plus any extra child environment, for failure messages.
     label: String,
     child: Child,
@@ -252,6 +261,9 @@ struct CrashChild {
 }
 
 fn spawn_crash_child(database: &Path, point: &str, extra_env: &[(&str, &str)]) -> CrashChild {
+    // Resolve the bound first: a bad override must not panic with a child
+    // already running.
+    let ready_timeout = crash_ready_timeout();
     let mut child = Command::new(std::env::current_exe().expect("current test executable"))
         .args([
             "--ignored",
@@ -294,6 +306,7 @@ fn spawn_crash_child(database: &Path, point: &str, extra_env: &[(&str, &str)]) -
         .join(" ");
     CrashChild {
         point: point.to_owned(),
+        ready_timeout,
         label,
         child,
         lines,
@@ -309,6 +322,7 @@ impl CrashChild {
     fn kill_when_ready(self) -> String {
         let Self {
             point,
+            ready_timeout: timeout,
             label,
             mut child,
             lines,
@@ -316,24 +330,32 @@ impl CrashChild {
             stderr_reader,
         } = self;
         let expected_ready = format!("{READY_PREFIX}{point}");
-        let timeout = crash_ready_timeout();
         let started = Instant::now();
         let deadline = started + timeout;
         let mut stdout = Vec::new();
         let mut stdout_closed = false;
+        let timed_out =
+            || format!("ready bound {timeout:?} passed (override with {CRASH_READY_TIMEOUT_ENV})");
         let failure = loop {
             match lines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 Ok(Ok(line)) if line == expected_ready => break None,
-                Ok(Ok(line)) => stdout.push(line),
+                Ok(Ok(line)) => {
+                    stdout.push(line);
+                    // `recv_timeout` still returns queued output once no time
+                    // remains, so a child that keeps printing would outrun
+                    // the bound without this check. Checking after the
+                    // marker test keeps a marker that arrives at the edge.
+                    if Instant::now() >= deadline {
+                        break Some(timed_out());
+                    }
+                }
                 Ok(Err(error)) => break Some(format!("stdout read failed: {error}")),
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     stdout_closed = true;
                     break Some("child closed stdout without the ready marker".to_owned());
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    break Some(format!(
-                        "ready bound {timeout:?} passed (override with {CRASH_READY_TIMEOUT_ENV})"
-                    ));
+                    break Some(timed_out());
                 }
             }
         };
