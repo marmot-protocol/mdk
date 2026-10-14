@@ -543,6 +543,38 @@ describe("createMarmotMessageActionAdapter", () => {
     expect(editMessage).toHaveBeenCalledWith(HEX32("aa"), HEX32("cc"), HEX32("98"), "status: done");
   });
 
+  it("does not let a blank or non-Marmot `to` hide the bound group", async () => {
+    const editMessage = vi.fn(async () => undefined);
+    const cache = new Map([[HEX32("99"), { marmotAccountIdHex: HEX32("ab"), groupIdHex: HEX32("bb") }]]);
+    const adapter = createMarmotMessageActionAdapter({
+      deleteByMessageId: async () => false,
+      sentTargetFor: (id) => cache.get(id),
+      resolveTarget: async () => ({
+        client: messageActionClient({ editMessage }),
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+    });
+    const bound = { currentChannelId: HEX32("cc") };
+
+    for (const to of ["", "   "]) {
+      const crossConversation = await adapter.handleAction!(
+        editCtx({ messageId: HEX32("99"), message: "x", to }, bound),
+      );
+      expect(resultError(crossConversation)).toMatch(/different conversation/);
+    }
+    const notMarmot = await adapter.handleAction!(
+      editCtx({ messageId: HEX32("99"), message: "x", to: "telegram:12345" }, bound),
+    );
+    expect(resultError(notMarmot)).toMatch(/not a Marmot conversation/);
+    expect(editMessage).not.toHaveBeenCalled();
+
+    const blankOnCacheMiss = await adapter.handleAction!(
+      editCtx({ messageId: HEX32("98"), message: "status: done", to: "" }, bound),
+    );
+    expect(resultOk(blankOnCacheMiss)).toBe(true);
+    expect(editMessage).toHaveBeenCalledWith(HEX32("aa"), HEX32("cc"), HEX32("98"), "status: done");
+  });
+
   it("edits a cached message when it matches the authorized target", async () => {
     const editMessage = vi.fn(async () => undefined);
     const adapter = createMarmotMessageActionAdapter({

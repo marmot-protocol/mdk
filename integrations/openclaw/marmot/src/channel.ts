@@ -322,11 +322,18 @@ async function handleEditAction(
   }
   // A bound Marmot turn carries its group on `currentChannelId`: Marmot has no
   // threading hook, so the host never sets `currentMessagingTarget` for it.
-  const rawTo =
-    typeof ctx.params.to === "string"
-      ? ctx.params.to
-      : (ctx.toolContext?.currentMessagingTarget ?? ctx.toolContext?.currentChannelId);
-  const authorized = normalizeMarmotTarget(rawTo ?? "");
+  // The host treats a blank `to` as absent, so skip blanks rather than let one
+  // hide the binding. A present target that is not a Marmot group is refused,
+  // never replaced by the cache.
+  const rawTo = [
+    ctx.params.to,
+    ctx.toolContext?.currentMessagingTarget,
+    ctx.toolContext?.currentChannelId,
+  ].find((value): value is string => typeof value === "string" && value.trim().length > 0);
+  const authorized = rawTo === undefined ? undefined : normalizeMarmotTarget(rawTo);
+  if (rawTo !== undefined && !authorized) {
+    return jsonResult({ ok: false, error: "edit target is not a Marmot conversation" });
+  }
   const cached = deps.sentTargetFor?.(messageId);
   if (authorized && cached && cached.groupIdHex.toLowerCase() !== authorized) {
     return jsonResult({
