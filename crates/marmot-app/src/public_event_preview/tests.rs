@@ -138,6 +138,36 @@ fn event_id_admission_requires_exact_match_and_author_deletion() {
 }
 
 #[test]
+fn full_unattributed_deletion_answers_trigger_an_author_query() {
+    let keys = Keys::generate();
+    let note = signed(&keys, 1, 10, "note", Vec::new());
+    let e = || vec![tag(&["e", &note.id.to_hex()])];
+    let spam = (0..EVENT_DELETION_QUERY_LIMIT)
+        .map(|index| signed(&Keys::generate(), 5, 20 + index as u64, "", e()))
+        .collect::<Vec<_>>();
+    let mut fetched = spam.clone();
+    fetched.push(note.clone());
+    assert_eq!(
+        crowded_deletion_author(&note.id, None, &fetched),
+        Some(keys.public_key())
+    );
+    // The author already answered, the answer was not full, or the event is
+    // unknown: no follow-up.
+    let mut answered = fetched.clone();
+    answered.push(signed(&keys, 5, 50, "", e()));
+    assert_eq!(crowded_deletion_author(&note.id, None, &answered), None);
+    assert_eq!(
+        crowded_deletion_author(&note.id, None, &[note.clone(), spam[0].clone()]),
+        None
+    );
+    assert_eq!(crowded_deletion_author(&note.id, None, &spam), None);
+    assert_eq!(
+        crowded_deletion_author(&note.id, Some(&note), &spam),
+        Some(keys.public_key())
+    );
+}
+
+#[test]
 fn deletions_apply_in_either_tag_form() {
     let keys = Keys::generate();
     let d = || vec![tag(&["d", "entry"])];

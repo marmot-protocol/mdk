@@ -37,7 +37,7 @@ use marmot_account::AccountSummary;
 use nostr::event::Event;
 use nostr::nips::nip01::Coordinate;
 use nostr::nips::nip19::{FromBech32, Nip19};
-use nostr::prelude::{EventId, Filter, Kind, RelayUrl};
+use nostr::prelude::{EventId, Filter, Kind, PublicKey, RelayUrl};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::{AppError, MarmotApp, blocking_app_task, unix_now_seconds};
@@ -62,6 +62,9 @@ const TOUCH_INTERVAL_SECONDS: u64 = 60 * 60;
 const MAX_HINT_RELAYS: usize = 2;
 const MAX_QUERY_RELAYS: usize = 6;
 const MAX_FETCHED_EVENTS: usize = 64;
+/// Limit on the unattributed kind-5 query for an event ID. A full answer may
+/// hide the author's deletion behind other keys' requests.
+const EVENT_DELETION_QUERY_LIMIT: usize = 16;
 
 /// Local state of one referenced public event.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -193,7 +196,7 @@ impl Target {
         let mut filters = match self {
             Self::EventId(id) => vec![
                 Filter::new().id(*id).limit(1),
-                deletions().event(*id).limit(16),
+                deletions().event(*id).limit(EVENT_DELETION_QUERY_LIMIT),
             ],
             Self::Coordinate(coordinate) => {
                 let mut versions = Filter::new()
@@ -261,6 +264,29 @@ fn deletion_time(event: &Event, deletions: &[&Event]) -> Option<u64> {
         })
         .map(|deletion| deletion.created_at.as_secs())
         .max()
+}
+
+/// The author to ask again when an event-ID lookup's unattributed kind-5
+/// query came back full without that author's deletion: requests signed by
+/// other keys may have crowded it out.
+fn crowded_deletion_author(
+    id: &EventId,
+    stored: Option<&Event>,
+    fetched: &[Event],
+) -> Option<PublicKey> {
+    let author = fetched
+        .iter()
+        .find(|event| event.id == *id)
+        .or(stored)?
+        .pubkey;
+    let id = id.to_hex();
+    let deletions = fetched
+        .iter()
+        .filter(|event| event.kind == Kind::EventDeletion && has_tag(event, "e", &id))
+        .collect::<Vec<_>>();
+    (deletions.len() >= EVENT_DELETION_QUERY_LIMIT
+        && !deletions.iter().any(|deletion| deletion.pubkey == author))
+    .then_some(author)
 }
 
 /// What the cache holds for one key: the shown event, if any, and the newest
@@ -628,14 +654,39 @@ impl MarmotApp {
         let stored_event = stored
             .as_ref()
             .and_then(|stored| stored.row.event.as_deref());
+        let relays = self.public_event_query_relays(parsed.relay_hints);
         let fetched = self
             .relay_plane
             .fetch_public_events(
-                self.public_event_query_relays(parsed.relay_hints),
+                relays.clone(),
                 parsed.target.filters(stored_event),
                 MAX_FETCHED_EVENTS,
             )
             .await;
+        let fetched = match (fetched, &parsed.target) {
+            (Ok(mut fetched), Target::EventId(id)) => {
+                if let Some(author) = crowded_deletion_author(id, stored_event, &fetched.events) {
+                    let filter = Filter::new()
+                        .kind(Kind::EventDeletion)
+                        .author(author)
+                        .event(*id)
+                        .limit(4);
+                    match self
+                        .relay_plane
+                        .fetch_public_events(relays, vec![filter], MAX_FETCHED_EVENTS)
+                        .await
+                    {
+                        Ok(more) => {
+                            fetched.events.extend(more.events);
+                            fetched.complete &= more.complete;
+                        }
+                        Err(_) => fetched.complete = false,
+                    }
+                }
+                Ok(fetched)
+            }
+            (fetched, _) => fetched,
+        };
         // Start the cooldown only once a fetch finished, so a cancelled
         // refresh can be retried at once.
         self.start_public_event_refresh_cooldown(cooldown_key);
