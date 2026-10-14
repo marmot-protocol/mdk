@@ -1055,7 +1055,7 @@ One finished pass of a started attempt. Account-scoped; recorded on every exit o
 | `events_retained` | Deliveries durably retained. |
 | `events_refused` | Deliveries refused under a local resource bound (counted among ingested deliveries, not among retained). |
 | `relays_required` / `relays_admitted` | Distinct required and admitted relays over the frozen plan. |
-| `relays_failed` / `relays_incomplete` | Distinct relays that failed any compared route, and those among them that answered but withheld a claimed event on some route. A failure the comparison backend did not attribute to a relay counts once per route. Rows before mdk#2265 summed both per compared route, so they could exceed `relays_required`. |
+| `relays_failed` / `relays_incomplete` | Distinct relays that failed any compared route, and those among them that answered but left some IDs they claimed unreturned on some route: the relay withheld them, or the pass's own item, byte, request or ordering limits left them for a later pass. `relay_outcomes.failure` tells the two apart (`withheld` or `pass_limit`). A failure the comparison backend did not attribute to a relay counts once per route. Rows before mdk#2265 summed both per compared route, so they could exceed `relays_required`. |
 | `relay_outcomes` | Why each failed relay failed, at most 16, each once: its `endpoint_ref`, the `failure` class of the first route it failed, the `refusal_category` of a NEG-ERR reason, and the `routes` it failed. Omitted when no relay failed; absent from rows before mdk#2265. |
 
 Relay failure classes (`failure`), each naming the stage that failed the relay:

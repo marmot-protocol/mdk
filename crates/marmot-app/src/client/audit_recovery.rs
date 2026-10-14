@@ -54,7 +54,8 @@ pub(crate) struct FailedRelay {
     pub(crate) endpoint: String,
     pub(crate) failure: RecoveryRelayFailure,
     pub(crate) refusal_category: Option<SubscriptionRefusalCategory>,
-    /// It answered but withheld a claimed event.
+    /// It answered but left claimed events unreturned: withheld, or left by
+    /// the pass's own limits.
     pub(crate) incomplete: bool,
 }
 
@@ -207,8 +208,8 @@ impl RecoveryPassTally {
         count(self.failed_relays.len()).saturating_add(self.unattributed_failures)
     }
 
-    /// Distinct failed relays that answered but withheld a claimed event on
-    /// some route.
+    /// Distinct failed relays that answered but left claimed events
+    /// unreturned on some route.
     fn relays_incomplete(&self) -> u64 {
         count(
             self.failed_relays

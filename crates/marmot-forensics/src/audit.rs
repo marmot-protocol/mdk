@@ -1283,15 +1283,16 @@ pub enum AuditEventKind {
     ///
     /// Relay counts are distinct endpoints: over the frozen plan
     /// (`relays_required`, `relays_admitted`) and over the compared routes
-    /// (`relays_failed`, and its subset `relays_incomplete`: answered but
-    /// withheld a claimed event). Rows before mdk#2265 summed the last two per
-    /// compared route. `relay_outcomes` says why each failed relay failed, at
-    /// most [`RECOVERY_AUDIT_MAX_ENDPOINTS`] of them, each once; a failure the
-    /// comparison backend did not attribute to a relay is counted but not
-    /// listed. v5 writes each relay as a hashed `endpoint_ref`. It is empty when no relay
-    /// failed, and absent from rows before mdk#2265, so absence alone is
-    /// ambiguous. A route the pass gave up on before its relays answered
-    /// attributes no relay. v5 only.
+    /// (`relays_failed`, and its subset `relays_incomplete`: answered but left
+    /// claimed events unreturned, withheld by the relay or left by the pass's
+    /// own limits; `relay_outcomes` tells which). Rows before mdk#2265 summed
+    /// the last two per compared route. `relay_outcomes` says why each failed
+    /// relay failed, at most [`RECOVERY_AUDIT_MAX_ENDPOINTS`] of them, each
+    /// once; a failure the comparison backend did not attribute to a relay is
+    /// counted but not listed. v5 writes each relay as a hashed `endpoint_ref`.
+    /// It is empty when no relay failed, and absent from rows before mdk#2265,
+    /// so absence alone is ambiguous. A route the pass gave up on before its
+    /// relays answered attributes no relay. v5 only.
     RecoveryAttemptFinished {
         attempt_serial: u64,
         duration_ms: u64,
