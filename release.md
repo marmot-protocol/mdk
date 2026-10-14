@@ -572,10 +572,11 @@ run on `master` can deliberately warm the per-input caches without publishing.
 Cache keys separate input targets and include the builder scripts/profile/defaults;
 the cache action also keys the Rust toolchain and Cargo dependency inputs.
 
-Apple jobs run on Blacksmith macOS runners (`blacksmith-6vcpu-macos-*`), which
-are provisioned on demand rather than drawn from the organization's shared
-GitHub-hosted macOS slots, so the Apple input matrix runs unbounded. Only the
-WN Agent `darwin-intel-smoke` job still uses a GitHub-hosted Intel runner.
+Avoid overlapping snapshot rehearsals and cohort releases when macOS capacity is
+limited. The three-job Apple bound is per workflow, not an organization-wide
+reservation; separate workflows and repositories can still compete for runners.
+In cold rehearsal 35506538221, this cap queued the fourth Apple input for roughly
+12 minutes; raising it to four trades that delay for one fewer slot for WN Agent.
 Local no-argument scripts also use `--locked` for reproducibility and `--timings`
 to write compiler reports under `target/cargo-timings/`. Refresh a stale lockfile
 before building bindings.

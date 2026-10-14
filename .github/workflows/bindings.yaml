@@ -117,11 +117,15 @@ jobs:
 
   apple-build:
     name: Build Apple input (${{ matrix.part }})
-    runs-on: blacksmith-6vcpu-macos-latest
+    runs-on: macos-latest
     needs: metadata
     timeout-minutes: 60
     strategy:
       fail-fast: false
+      # Leave capacity for WN Agent on a five-slot macOS plan. This bounds this
+      # run only; avoid overlapping snapshot and cohort builds during releases.
+      # Cold rehearsal 35506538221 queued the fourth input for ~12 minutes.
+      max-parallel: 3
       matrix:
         include:
           - part: swift
@@ -210,7 +214,7 @@ jobs:
 
   ios-bindings:
     name: Assemble and validate iOS bindings
-    runs-on: blacksmith-6vcpu-macos-latest
+    runs-on: macos-latest
     needs: [metadata, apple-build]
     timeout-minutes: 60
 
@@ -333,7 +337,7 @@ jobs:
 
   macos-bindings:
     name: Assemble and validate macOS bindings
-    runs-on: blacksmith-6vcpu-macos-latest
+    runs-on: macos-latest
     needs: [metadata, apple-build]
     timeout-minutes: 60
 
@@ -993,7 +997,7 @@ jobs:
 
   validate-published-ios:
     name: Validate published iOS SwiftPM consumer
-    runs-on: blacksmith-6vcpu-macos-latest
+    runs-on: macos-latest
     needs:
       - metadata
       - release
@@ -1038,7 +1042,7 @@ jobs:
 
   validate-published-macos:
     name: Validate published macOS SwiftPM consumer
-    runs-on: blacksmith-6vcpu-macos-latest
+    runs-on: macos-latest
     needs:
       - metadata
       - release
