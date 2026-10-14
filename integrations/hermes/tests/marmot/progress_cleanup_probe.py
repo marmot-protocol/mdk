@@ -278,7 +278,7 @@ class RecordingControlServer:
                 return {
                     "marmot_agent_control": PROTOCOL,
                     "id": request_id,
-                    "type": "app_event_sent",
+                    "type": "final_sent",
                     "message_ids_hex": [],
                 }
             if request_type == "account_list":

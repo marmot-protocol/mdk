@@ -28,7 +28,7 @@ _EXPECTED_RESPONSE_TYPES = {
     "account_relay_list_add": frozenset({"relay_lists"}),
     "account_relay_list_remove": frozenset({"relay_lists"}),
     "send_final": frozenset({"final_sent"}),
-    "delete_message": frozenset({"app_event_sent"}),
+    "delete_message": frozenset({"final_sent"}),
     "send_reaction": frozenset({"app_event_sent"}),
     "remove_reaction": frozenset({"app_event_sent"}),
     "group_info": frozenset({"group_info"}),

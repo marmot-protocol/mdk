@@ -346,7 +346,7 @@ impl ComparisonAdmission {
         self.routes.iter().map(|route| {
             (
                 route.answered && route.outcome != Outcome::Unsupported,
-                route.acquisition,
+                route.acquisition.clone(),
             )
         })
     }

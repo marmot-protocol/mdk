@@ -22,6 +22,9 @@ before changing this crate.
   distinct command, and reject backend observations from older generations.
 - On Unix, spawn each backend in a dedicated process group and preserve the
   cancellation guard that kills the group before the direct child is reaped.
+- Keep backend stdout framed by the bounded `RecordFramer`, and charge every
+  assistant text event against the per-turn text and reply-chunk limits before
+  it is staged, sent or buffered. After a breach, send nothing more from the turn.
 - Preserve privacy-safe diagnostics and never log identifiers, paths, prompts,
   model output, or transport data.
 - Keep artifact export opt-in and grant-scoped: disabled unless

@@ -383,6 +383,36 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("emoji", requests[0])
         self.assertEqual(requests[1]["emoji"], "👀")
 
+    async def test_delete_message_accepts_connector_final_sent_response(self):
+        # wn-agent answers delete_message with final_sent (the kind-5 deletion
+        # event's durable ids), not app_event_sent like reactions do.
+        requests = []
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "final_sent",
+                    "message_ids_hex": ["44" * 32],
+                    "maintenance_disposition": "not_required",
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+
+        response = await client.delete_message("11" * 32, "22" * 32, "33" * 32)
+
+        self.assertEqual(response["type"], "final_sent")
+        self.assertEqual(response["message_ids_hex"], ["44" * 32])
+        self.assertEqual(requests[0]["type"], "delete_message")
+        self.assertEqual(requests[0]["target_message_id_hex"], "33" * 32)
+
     async def test_send_media_includes_idempotency_key_only_when_supplied(self):
         requests = []
 

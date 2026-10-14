@@ -37,7 +37,7 @@ pub use recovery::{
     EoseRepairReceiver, EoseRepairTrigger, RECOVERY_AUDIT_MAX_ENDPOINTS,
     RECOVERY_AUDIT_MAX_OBLIGATIONS, RecoveryAttemptScope, RecoveryGoalBound, RecoveryNeedChange,
     RecoveryNextAttempt, RecoveryObligationCause, RecoveryObligationVerdict, RecoveryPassOutcome,
-    RecoveryScopeProgress, TransportCursorTrigger,
+    RecoveryRelayFailure, RecoveryRelayOutcome, RecoveryScopeProgress, TransportCursorTrigger,
 };
 pub use refusal::{
     SUBSCRIPTION_REFUSAL_AUDIT_MAX_ENTRIES, SubscriptionRefusalCategory, SubscriptionRefusalEntry,
@@ -1281,10 +1281,18 @@ pub enum AuditEventKind {
     /// not proof of complete history: only `routes_certified` routes carry a
     /// comparison certificate for the frozen window.
     ///
-    /// Relay counts are distinct endpoints over the frozen plan
-    /// (`relays_required`, `relays_admitted`) and summed per compared route
-    /// (`relays_failed`, `relays_incomplete`: answered but withheld a claimed
-    /// event). v5 only.
+    /// Relay counts are distinct endpoints: over the frozen plan
+    /// (`relays_required`, `relays_admitted`) and over the compared routes
+    /// (`relays_failed`, and its subset `relays_incomplete`: answered but left
+    /// claimed events unreturned, withheld by the relay or left by the pass's
+    /// own limits; `relay_outcomes` tells which). Rows before mdk#2265 summed
+    /// the last two per compared route. `relay_outcomes` says why each failed
+    /// relay failed, at most [`RECOVERY_AUDIT_MAX_ENDPOINTS`] of them, each
+    /// once; a failure the comparison backend did not attribute to a relay is
+    /// counted but not listed. v5 writes each relay as a hashed `endpoint_ref`.
+    /// It is empty when no relay failed, and absent from rows before mdk#2265,
+    /// so absence alone is ambiguous. A route the pass gave up on before its
+    /// relays answered attributes no relay. v5 only.
     RecoveryAttemptFinished {
         attempt_serial: u64,
         duration_ms: u64,
@@ -1304,6 +1312,8 @@ pub enum AuditEventKind {
         relays_admitted: u64,
         relays_failed: u64,
         relays_incomplete: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        relay_outcomes: Vec<RecoveryRelayOutcome>,
     },
     /// The owner's verdict on one obligation after a pass it settled, read
     /// back from storage after the checkpoint committed. Group-scoped demand

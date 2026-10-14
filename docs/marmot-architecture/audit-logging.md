@@ -1055,7 +1055,26 @@ One finished pass of a started attempt. Account-scoped; recorded on every exit o
 | `events_retained` | Deliveries durably retained. |
 | `events_refused` | Deliveries refused under a local resource bound (counted among ingested deliveries, not among retained). |
 | `relays_required` / `relays_admitted` | Distinct required and admitted relays over the frozen plan. |
-| `relays_failed` / `relays_incomplete` | Failed relays summed per compared route, and those among them that answered but withheld a claimed event. |
+| `relays_failed` / `relays_incomplete` | Distinct relays that failed any compared route, and those among them that answered but left some IDs they claimed unreturned on some route: the relay withheld them, or the pass's own item, byte, request or ordering limits left them for a later pass. `relay_outcomes.failure` tells the two apart (`withheld` or `pass_limit`). A failure the comparison backend did not attribute to a relay counts once per route. Rows before mdk#2265 summed both per compared route, so they could exceed `relays_required`. |
+| `relay_outcomes` | Why each failed relay failed, at most 16, each once: its `endpoint_ref`, the `failure` class of the first route it failed, the `refusal_category` of a NEG-ERR reason, and the `routes` it failed. Omitted when no relay failed; absent from rows before mdk#2265. |
+
+Relay failure classes (`failure`), each naming the stage that failed the relay:
+
+| Class | Meaning |
+| --- | --- |
+| `neg_err` | The relay answered NEG-OPEN with NEG-ERR. `refusal_category` is the reason's NIP-01 prefix (`unclassified` when it has none). The reason text is never recorded. |
+| `neg_cap_notice` | The relay sent its concurrent-negentropy cap NOTICE (strfry: `too many concurrent NEG requests`) while the NEG-OPEN waited for its first reply, which never came. The NOTICE names no session, so it is attributed to the comparison it left unanswered. |
+| `negentropy_unsupported` | The relay does not support negentropy, or broke its protocol. |
+| `first_reply_timeout` | No first negentropy reply in time. |
+| `route_timeout` | The pass deadline ended the comparison, a window probe, or its exact-ID fetches. |
+| `not_in_pool` | The account's relay pool does not hold the relay. |
+| `not_operational` | The relay was not connected or not usable. |
+| `limit_reached` | The relay's matching set filled the comparison limit, so it cannot vouch for the whole window. |
+| `id_fetch_refused` | The relay rejected or closed an exact-ID fetch for events it claimed. |
+| `unrequested_event` | The relay returned an event the pass did not ask for. |
+| `withheld` | The relay reached end-of-stored-events on an exact-ID fetch without an event it claimed. |
+| `pass_limit` | The pass's own item, byte, request or ordering limits left some of the relay's claimed events for a later pass, unasked or cut short. Ordinary bounded catch-up; not the relay's fault. |
+| `local_error` | A local fault, not attributable to the relay. |
 
 Outcomes:
 
@@ -1654,6 +1673,7 @@ let server-side tooling collate multiple devices into group-level analytics.
 | What recovery debt did this device take on, and how bounded was it? | `recovery_need_changed` rows: cause, `recorded` / `joined` / `resumed`, goal `bound` and `floor_secs`, and the count charged. Epoch gaps keep `epoch_stall_backfill_armed`. |
 | Which obligations did one recovery attempt serve, over which relays, within which budgets? | `recovery_attempt_started`, joined to its other rows by `record_context.operation_ref`. |
 | What did the relays return, and what did processing keep? | `recovery_attempt_finished`: routes compared and certified, events retrieved / duplicate / rejected / retained / refused, relay counts, and the pass `outcome`. Engine application stays on `ingest_outcome`. |
+| Why did history recovery fail on a relay? | `recovery_attempt_finished.relay_outcomes`: per failed relay, the failure class (NEG-ERR and its category, the negentropy-cap NOTICE, a timeout, a relay outside the pool or not usable, a refused fetch) and how many routes it failed. |
 | Why did recovery stop, retry, wait or park, and is another attempt permitted? | `recovery_obligation_reassessed` per settled obligation: `verdict`, `next_attempt`, progress, certified scopes and the quiet streak against the parking budget. |
 | When was "history may be incomplete" shown, dismissed or resolved? | `recovery_need_changed` with `notice_shown`, `notice_dismissed`, `resumed`, or `closed`, joined by `obligation_ref`. |
 | Why did the transport cursor move, and did live promotion push arrivals into the spill? | `transport_cursor_advanced`: trigger, before/after cursor, lookback, and spill and queue-loss placement counts. `sync_drain` keeps per-drain cursors. |
