@@ -1,19 +1,25 @@
 //! Attachment uploads in flight per group (mdk#2158). An upload's media key is
 //! bound to the epoch it was encrypted under, so while one is in flight this
-//! device holds its own due self-update for that group: a rotation would leave
-//! the finished upload unsendable after its last byte.
+//! device holds its own due periodic self-update for that group: a rotation
+//! would leave the finished upload unsendable after its last byte.
 
 use cgka_traits::GroupId;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// How long one upload may hold its group's self-update, measured on the
-/// monotonic clock so a wall-clock change cannot stretch it. Automatic rotation
-/// has nobody to ask, so a stuck or very long upload can delay it but never
-/// suppress it.
-pub(crate) const UPLOAD_SELF_UPDATE_HOLD: Duration = Duration::from_secs(60 * 60);
+/// How long a group may stay held from the moment its hold began, measured on
+/// the monotonic clock so a wall-clock change cannot stretch it. Automatic
+/// rotation has nobody to ask, so stuck, very long or back-to-back uploads can
+/// delay it but never suppress it.
+pub(crate) const UPLOAD_SELF_UPDATE_HOLD: Duration = Duration::from_secs(2 * 60 * 60);
 
-/// Uploads in flight, each with the group it belongs to and when it started.
+/// How long a finished upload that is not sent with it keeps holding its
+/// group: long enough for token admission, or a host's immediate send, to
+/// reference it from the epoch it was encrypted under.
+pub(crate) const UPLOAD_ADMISSION_GRACE: Duration = Duration::from_secs(60);
+
+/// Uploads holding their groups' self-updates. Each [`crate::AppClient`] keeps
+/// its own, and its maintenance sweep consults only that one.
 #[derive(Clone, Default)]
 pub(crate) struct UploadEpochHolds {
     inner: Arc<Mutex<Uploads>>,
@@ -22,44 +28,86 @@ pub(crate) struct UploadEpochHolds {
 #[derive(Default)]
 struct Uploads {
     next_id: u64,
-    in_flight: Vec<(u64, GroupId, Instant)>,
+    /// Uploads in flight, each with its group.
+    in_flight: Vec<(u64, GroupId)>,
+    /// Finished uploads waiting to be sent, each holding its group until the
+    /// instant given.
+    lingering: Vec<(GroupId, Instant)>,
+    /// When each held group's hold began. It lasts while uploads for the group
+    /// overlap or follow within their grace, and ends once nothing holds it.
+    episodes: Vec<(GroupId, Instant)>,
+}
+
+impl Uploads {
+    /// Forget lapsed graces and the episodes of groups nothing holds any more.
+    fn prune(&mut self, now: Instant) {
+        self.lingering.retain(|(_, until)| *until > now);
+        let Self {
+            in_flight,
+            lingering,
+            episodes,
+            ..
+        } = self;
+        episodes.retain(|(group, _)| {
+            in_flight.iter().any(|(_, held)| held == group)
+                || lingering.iter().any(|(held, _)| held == group)
+        });
+    }
 }
 
 impl UploadEpochHolds {
-    /// Record an upload for `group` that started at `started`. It holds the
-    /// group's self-update until the returned guard drops.
-    pub(crate) fn hold(&self, group: GroupId, started: Instant) -> UploadEpochHold {
+    /// Record an upload for `group` starting at `now`. It holds the group's
+    /// self-update until the returned guard drops or lingers.
+    pub(crate) fn hold(&self, group: GroupId, now: Instant) -> UploadEpochHold {
         let mut uploads = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        uploads.prune(now);
         let id = uploads.next_id;
         uploads.next_id = uploads.next_id.wrapping_add(1);
-        uploads.in_flight.push((id, group, started));
+        if !uploads.episodes.iter().any(|(held, _)| held == &group) {
+            uploads.episodes.push((group.clone(), now));
+        }
+        uploads.in_flight.push((id, group));
         UploadEpochHold {
             uploads: Arc::clone(&self.inner),
             id,
         }
     }
 
-    /// Groups with an upload in flight that started less than
-    /// [`UPLOAD_SELF_UPDATE_HOLD`] before `now`, each once.
+    /// Groups an upload holds at `now`, each once: those with an upload in
+    /// flight or within its grace whose hold began less than
+    /// [`UPLOAD_SELF_UPDATE_HOLD`] before `now`.
     pub(crate) fn held_groups(&self, now: Instant) -> Vec<GroupId> {
-        let uploads = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let mut held: Vec<GroupId> = Vec::new();
-        for (_, group, started) in &uploads.in_flight {
-            if now.saturating_duration_since(*started) < UPLOAD_SELF_UPDATE_HOLD
-                && !held.contains(group)
-            {
-                held.push(group.clone());
-            }
-        }
-        held
+        let mut uploads = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        uploads.prune(now);
+        uploads
+            .episodes
+            .iter()
+            .filter(|(_, began)| now.saturating_duration_since(*began) < UPLOAD_SELF_UPDATE_HOLD)
+            .map(|(group, _)| group.clone())
+            .collect()
     }
 }
 
 /// One upload's hold on its group's self-update, released when it drops:
-/// after the upload is sent or admitted, fails, is cancelled or is abandoned.
+/// after the upload is sent, fails, is cancelled or is abandoned.
 pub(crate) struct UploadEpochHold {
     uploads: Arc<Mutex<Uploads>>,
     id: u64,
+}
+
+impl UploadEpochHold {
+    /// Keep holding the group for [`UPLOAD_ADMISSION_GRACE`] after `now`: the
+    /// upload finished but is sent separately.
+    pub(crate) fn linger(self, now: Instant) {
+        let mut uploads = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = uploads.in_flight.iter().position(|(id, _)| *id == self.id) {
+            let (_, group) = uploads.in_flight.remove(index);
+            uploads
+                .lingering
+                .push((group, now + UPLOAD_ADMISSION_GRACE));
+        }
+        drop(uploads);
+    }
 }
 
 impl Drop for UploadEpochHold {
@@ -68,7 +116,7 @@ impl Drop for UploadEpochHold {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .in_flight
-            .retain(|(id, _, _)| *id != self.id);
+            .retain(|(id, _)| *id != self.id);
     }
 }
 
@@ -100,9 +148,9 @@ mod tests {
         assert!(holds.held_groups(at(30)).is_empty());
     }
 
-    /// An upload holds its group for at most the bound of elapsed monotonic
-    /// time, so a stuck upload can delay rotation but never suppress it, and a
-    /// wall-clock change cannot stretch the hold.
+    /// A group is held for at most the bound from when its hold began, so a
+    /// stuck upload can delay rotation but never suppress it, and a wall-clock
+    /// change cannot stretch the hold.
     #[test]
     fn an_upload_holds_its_group_only_within_the_bound() {
         let started = Instant::now();
@@ -120,5 +168,58 @@ mod tests {
         // A reading before the start (never produced by a monotonic clock, but
         // harmless) holds rather than panics.
         assert_eq!(holds.held_groups(started), vec![group(1)]);
+    }
+
+    /// Uploads that overlap one another share one bound, so back-to-back
+    /// uploads cannot hold a group indefinitely. Once nothing holds the group,
+    /// the next upload starts a new hold.
+    #[test]
+    fn overlapping_uploads_share_one_bound() {
+        let started = Instant::now();
+        let hour = Duration::from_secs(60 * 60);
+        let holds = UploadEpochHolds::default();
+        let first = holds.hold(group(1), started);
+        let second = holds.hold(group(1), started + hour);
+        drop(first);
+        assert_eq!(
+            holds.held_groups(started + UPLOAD_SELF_UPDATE_HOLD - Duration::from_millis(1)),
+            vec![group(1)]
+        );
+        assert!(
+            holds
+                .held_groups(started + UPLOAD_SELF_UPDATE_HOLD)
+                .is_empty()
+        );
+        drop(second);
+        let later = started + UPLOAD_SELF_UPDATE_HOLD + hour;
+        let _third = holds.hold(group(1), later);
+        assert_eq!(holds.held_groups(later), vec![group(1)]);
+    }
+
+    /// A finished upload sent separately keeps its group held through the
+    /// grace, and an upload that starts within it continues the same hold.
+    #[test]
+    fn a_lingering_upload_holds_its_group_through_the_grace() {
+        let started = Instant::now();
+        let holds = UploadEpochHolds::default();
+        holds.hold(group(1), started).linger(started);
+        assert_eq!(
+            holds.held_groups(started + UPLOAD_ADMISSION_GRACE - Duration::from_millis(1)),
+            vec![group(1)]
+        );
+        assert!(
+            holds
+                .held_groups(started + UPLOAD_ADMISSION_GRACE)
+                .is_empty()
+        );
+
+        let again = started + UPLOAD_SELF_UPDATE_HOLD;
+        holds.hold(group(2), again).linger(again);
+        let _next = holds.hold(group(2), again + Duration::from_secs(1));
+        assert!(
+            holds
+                .held_groups(again + UPLOAD_SELF_UPDATE_HOLD)
+                .is_empty()
+        );
     }
 }

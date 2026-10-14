@@ -4481,7 +4481,7 @@ See [local sends](LOCAL-SENDS.md) for cancellation and epoch-bound media handlin
 pub async fn upload_media_files_with_client_token( &self, account_ref: String, group_id_hex: String, request: MediaFileUploadRequestFfi, control: Arc<MediaFileTransferControlFfi>, client_token: String, ) -> Result<MediaUploadSubmissionFfi, MarmotKitError>
 ```
 
-File-backed `upload_media_with_client_token`: every attachment is prepared and uploaded before durable token admission. Cancellation observed before admission starts returns an error and admits nothing. Once admission starts it is not interruptible, even before durable acceptance returns; follow `local_send_status` and timeline delivery, including uncertain-delivery handling. Admission rejects references from a source epoch that is no longer current. There is no fixed worker-response timeout; per-endpoint network deadlines still apply.
+File-backed `upload_media_with_client_token`: every attachment is prepared and uploaded before durable token admission. Cancellation observed before admission starts returns an error and admits nothing. Once admission starts it is not interruptible, even before durable acceptance returns; follow `local_send_status` and timeline delivery, including uncertain-delivery handling. Admission rejects references from a source epoch that is no longer current with `MediaReferenceStaleEpoch` (upload again), and refuses while the group's epoch is unsettled with `MediaReferenceEpochUnsettled` (sync and send again). There is no fixed worker-response timeout; per-endpoint network deadlines still apply.
 
 [Source](src/commands/local_submissions.rs#L177)
 
