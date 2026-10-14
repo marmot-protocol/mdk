@@ -269,7 +269,7 @@ async fn invite_recovery_unknown_coverage_is_retryable_and_can_recover_after_rou
     assert!(matches!(
         app.resolve_member_key_packages(&[&accounts[0].account_id_hex])
             .await,
-        Err(AppError::RelayDirectory(_))
+        Err(AppError::DirectoryLookupIncomplete(_))
     ));
     *fetcher.incomplete_endpoint.lock().unwrap() = None;
     app.resolve_member_key_packages(&[&accounts[0].account_id_hex])
@@ -444,11 +444,39 @@ async fn invite_recovery_direct_lookup_and_membership_share_bounded_waits() {
         tokio::time::advance(Duration::from_secs(51)).await;
         assert!(matches!(
             task.await.unwrap(),
-            Err(AppError::RelayDirectory(_))
+            Err(AppError::DirectoryLookupIncomplete(_))
         ));
         release.notify_one();
         tokio::time::resume();
     }
+}
+
+#[tokio::test]
+async fn resolution_deadline_names_the_member_whose_lookup_did_not_finish() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, true).await;
+    // Only the first KeyPackage fetch holds; split relays order accounts[0]'s
+    // relay first, so the member listed first finishes and the second stalls.
+    let (entered, release) = fetcher.hold_fetches_for_kind(KIND_MARMOT_KEY_PACKAGE);
+    tokio::time::pause();
+    let members = [
+        accounts[1].account_id_hex.clone(),
+        accounts[0].account_id_hex.clone(),
+    ];
+    let task = tokio::spawn(async move {
+        app.resolve_member_key_packages(&[&members[0], &members[1]])
+            .await
+            .map(|_| ())
+    });
+    entered.notified().await;
+    tokio::time::advance(Duration::from_secs(51)).await;
+    let error = task.await.unwrap().unwrap_err();
+    assert!(
+        matches!(&error, AppError::DirectoryLookupIncomplete(id) if *id == accounts[0].account_id_hex),
+        "the finished member must not be blamed: {error:?}"
+    );
+    assert!(!error.to_string().contains(&accounts[0].account_id_hex));
+    release.notify_one();
+    tokio::time::resume();
 }
 
 #[tokio::test]
@@ -734,7 +762,7 @@ async fn invite_recovery_incomplete_supplement_cannot_authorize_a_usable_copy() 
     assert!(matches!(
         app.resolve_member_key_packages(&[&accounts[0].account_id_hex])
             .await,
-        Err(AppError::RelayDirectory(_))
+        Err(AppError::DirectoryLookupIncomplete(_))
     ));
 }
 
@@ -810,7 +838,7 @@ async fn invite_recovery_future_only_cache_requires_its_own_completed_deletion_p
     assert!(matches!(
         app.fetch_latest_key_package_for_account_id(&account.account_id_hex, vec![])
             .await,
-        Err(AppError::RelayDirectory(_))
+        Err(AppError::DirectoryLookupIncomplete(_))
     ));
     *fetcher.incomplete_endpoint.lock().unwrap() = None;
     assert_eq!(
@@ -860,7 +888,7 @@ async fn invite_recovery_incomplete_negative_without_new_routes_is_unknown() {
     assert!(matches!(
         app.fetch_latest_key_package_for_account_id(id, vec![])
             .await,
-        Err(AppError::RelayDirectory(_))
+        Err(AppError::DirectoryLookupIncomplete(_))
     ));
 }
 
@@ -912,7 +940,7 @@ async fn invite_recovery_candidate_budget_does_not_accept_an_unchecked_survivor(
     assert!(matches!(
         app.resolve_member_key_packages(&[&account.account_id_hex])
             .await,
-        Err(AppError::RelayDirectory(_))
+        Err(AppError::DirectoryLookupIncomplete(_))
     ));
 }
 

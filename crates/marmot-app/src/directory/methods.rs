@@ -305,9 +305,7 @@ impl MarmotApp {
         let uncertain_absence =
             !complete && (status.nip65.relays.is_empty() || status.inbox.relays.is_empty());
         if uncertain_absence {
-            return Err(AppError::RelayDirectory(
-                "relay-list absence was not authoritatively established".to_owned(),
-            ));
+            return Err(AppError::DirectoryLookupIncomplete(account_id_hex));
         }
         if explicit_empty {
             return Err(AppError::MissingRelayLists(status.missing.clone()));
@@ -548,12 +546,14 @@ impl MarmotApp {
         account_id_hex: &str,
         bootstrap_relays: Vec<TransportEndpoint>,
     ) -> Result<(FetchedKeyPackage, &'static str), AppError> {
+        // The incomplete outcome names the canonical account, even for an npub.
+        let account_id_hex = parse_account_id_hex(account_id_hex)?;
         tokio::time::timeout(
             std::time::Duration::from_secs(50),
-            self.fetch_latest_key_package_for_account_id_bounded(account_id_hex, bootstrap_relays),
+            self.fetch_latest_key_package_for_account_id_bounded(&account_id_hex, bootstrap_relays),
         )
         .await
-        .map_err(|_| AppError::RelayDirectory("KeyPackage lookup deadline exceeded".into()))?
+        .map_err(|_| AppError::DirectoryLookupIncomplete(account_id_hex))?
     }
 
     async fn fetch_latest_key_package_for_account_id_bounded(

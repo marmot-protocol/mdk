@@ -16,6 +16,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
 - Accounts and identity: [interactive account onboarding](#interactive-account-onboarding),
   [identity references and profiles](#identity-references-and-profiles),
   [KeyPackage inventory](#keypackage-inventory), [KeyPackage client preference](#keypackage-client-preference),
+  [invitation lookup outcomes](#invitation-lookup-outcomes),
   [public Nostr event verification](#public-nostr-event-verification),
   [public event previews](#public-event-previews)
 - Screens: [selected chat-list presentation](#selected-chat-list-presentation),
@@ -634,6 +635,21 @@ and does not guarantee capability compatibility. Final creation/invitation check
 the actual group's requirements. Device-aware delivery in
 [MDK #1696](https://github.com/marmot-protocol/mdk/issues/1696) is the intended
 replacement for this temporary client ranking.
+
+
+## Invitation lookup outcomes
+
+Creating or inviting looks up each recipient's relay lists and KeyPackage. The
+first recipient that cannot be used ends the call, in request order:
+
+- `MissingKeyPackage { account, reason }`: the lookup completed and found nothing
+  invitable. `reason` is `NotFound`, or `ObsoleteOnly` when the recipient has only
+  outdated KeyPackages and must update their app.
+- `DirectoryLookupIncomplete { account }`: the lookup for `account` ran out of time
+  or relay coverage, so nothing is known to be missing. Offer retry.
+  `fetch_latest_key_package_for_account_id` and relay-list lookups report the same
+  outcome.
+- `MissingMemberInboxRoute { account }`: the recipient has no usable inbox relay.
 
 ## Public Nostr event verification
 

@@ -152,9 +152,12 @@ pub enum MarmotStatus {
     GroupCommitUndelivered = 102,
     /// A cached public event preview read named more than 16 references.
     InvalidPublicEventReferences = 103,
+    /// Relay-list or KeyPackage lookup for an account did not complete;
+    /// nothing is known to be missing. Retry.
+    DirectoryLookupIncomplete = 104,
     /// The edit target is missing, not a chat message, sent by another
     /// account, deleted, or withdrawn by convergence; nothing was published.
-    InvalidEditTarget = 104,
+    InvalidEditTarget = 105,
 }
 
 thread_local! {
@@ -230,6 +233,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::InvalidIdentity { .. } => MarmotStatus::InvalidIdentity,
         MarmotKitError::MissingKeyPackage { .. } => MarmotStatus::MissingKeyPackage,
         MarmotKitError::MissingMemberInboxRoute { .. } => MarmotStatus::MissingMemberInboxRoute,
+        MarmotKitError::DirectoryLookupIncomplete { .. } => MarmotStatus::DirectoryLookupIncomplete,
         MarmotKitError::Publish { .. } => MarmotStatus::Publish,
         MarmotKitError::TransportClosed => MarmotStatus::TransportClosed,
         MarmotKitError::RuntimeStopping => MarmotStatus::RuntimeStopping,
@@ -437,6 +441,9 @@ mod tests {
             MarmotKitError::MissingMemberInboxRoute {
                 account: "a".into(),
             },
+            MarmotKitError::DirectoryLookupIncomplete {
+                account: "a".into(),
+            },
             MarmotKitError::Publish {
                 details: "d".into(),
             },
@@ -535,7 +542,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            95,
+            96,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
@@ -547,9 +554,17 @@ mod tests {
             status_from_error(&MarmotKitError::ModerationReportRateLimited) as i32,
             100
         );
+        let account = "33".repeat(32);
+        assert_eq!(
+            status_from_error(&MarmotKitError::DirectoryLookupIncomplete {
+                account: account.clone()
+            }) as i32,
+            104
+        );
+        assert!(!take_last_error().unwrap().contains(&account));
         assert_eq!(
             status_from_error(&MarmotKitError::InvalidEditTarget) as i32,
-            104
+            105
         );
         assert_eq!(
             status_from_error(&MarmotKitError::BlockListUnavailable) as i32,

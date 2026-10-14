@@ -316,17 +316,10 @@ impl MarmotApp {
             "lookup",
             crate::ProductUnit::Action,
         );
-        let result = match tokio::time::timeout(
-            MEMBER_RESOLUTION_DEADLINE,
-            self.resolve_member_key_packages_inner(&member_refs, purpose, requirements),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(AppError::RelayDirectory(
-                "member KeyPackage resolution deadline exceeded".to_owned(),
-            )),
-        };
+        let deadline = tokio::time::Instant::now() + MEMBER_RESOLUTION_DEADLINE;
+        let result = self
+            .resolve_member_key_packages_inner(&member_refs, purpose, requirements, deadline)
+            .await;
         if let Some(observation) = observation {
             observation.finish(match &result {
                 Ok(_) => "usable",
@@ -338,11 +331,15 @@ impl MarmotApp {
         result
     }
 
+    /// Both network stages share `deadline`. A member whose lookup had not
+    /// finished when it passed reports `DirectoryLookupIncomplete`; members
+    /// already decided keep their outcome.
     async fn resolve_member_key_packages_inner(
         &self,
         member_refs: &[String],
         purpose: MemberResolutionPurpose,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+        deadline: tokio::time::Instant,
     ) -> Result<ResolvedMemberKeyPackages, AppError> {
         let directory_observation = self
             .product_analytics
@@ -424,23 +421,45 @@ impl MarmotApp {
         let relay_list_unresolved = (0..targets.len())
             .filter(|index| !reused_prewarmed_routes.contains(index))
             .collect::<Vec<_>>();
-        let relay_list_resolution = self
-            .resolve_missing_relay_lists(&mut targets, &relay_list_unresolved)
-            .await;
-        for (index, error) in relay_list_resolution.errors {
-            outcomes[index] = Some(Err(error));
-        }
-        let key_package_unresolved = (0..targets.len())
-            .filter(|index| outcomes[*index].is_none())
-            .collect::<Vec<_>>();
-        self.resolve_missing_key_packages(
-            &targets,
-            &key_package_unresolved,
-            &mut outcomes,
-            purpose,
-            requirements,
+        // Unfinished relay lists cannot support any KeyPackage verdict.
+        let (relay_lists_completed, relay_lists_finished, finished) = match tokio::time::timeout_at(
+            deadline,
+            self.resolve_missing_relay_lists(&mut targets, &relay_list_unresolved),
         )
-        .await;
+        .await
+        {
+            Ok(RelayListResolution { completed, errors }) => {
+                for (index, error) in errors {
+                    outcomes[index] = Some(Err(error));
+                }
+                let key_package_unresolved = (0..targets.len())
+                    .filter(|index| outcomes[*index].is_none())
+                    .collect::<Vec<_>>();
+                let finished = tokio::time::timeout_at(
+                    deadline,
+                    self.resolve_missing_key_packages(
+                        &targets,
+                        &key_package_unresolved,
+                        &mut outcomes,
+                        purpose,
+                        requirements,
+                    ),
+                )
+                .await
+                .is_ok();
+                (completed, true, finished)
+            }
+            Err(_) => (HashSet::new(), false, false),
+        };
+        if !finished {
+            for (target, outcome) in targets.iter().zip(&mut outcomes) {
+                outcome.get_or_insert_with(|| {
+                    Err(AppError::DirectoryLookupIncomplete(
+                        target.account_id_hex.clone(),
+                    ))
+                });
+            }
+        }
 
         if let Some(observation) = directory_observation {
             for outcome in &outcomes {
@@ -453,6 +472,9 @@ impl MarmotApp {
             }
         }
         match purpose {
+            // A cancelled relay-list stage may hold a discovery-only snapshot.
+            MemberResolutionPurpose::Commit | MemberResolutionPurpose::CommitFresh
+                if !relay_lists_finished => {}
             MemberResolutionPurpose::Commit | MemberResolutionPurpose::CommitFresh => {
                 for target in &targets {
                     if !target.relay_lists.nip65.relays.is_empty()
@@ -476,7 +498,7 @@ impl MarmotApp {
                     // Only completed discovery renews the route deadline.
                     // A usable package can arrive after an incomplete metadata
                     // hop retained an older durable inbox/outbox projection.
-                    if relay_list_resolution.completed.contains(&index)
+                    if relay_lists_completed.contains(&index)
                         && matches!(outcomes[index], Some(Ok(_)))
                     {
                         cache.insert(target.account_id_hex.clone(), target.relay_lists.clone());
@@ -787,16 +809,12 @@ impl MarmotApp {
                     && (incomplete_discovery.contains(index)
                         || (attempted_outbox.contains(index) && !completed_outbox.contains(index)))
             })
+            // The known list may be a stale cache or partial snapshot, so a
+            // retry can still find usable relays; claim no verdict. Completed
+            // lookups report MissingMemberInboxRoute.
             .map(|index| {
-                // The known list may be a stale cache or partial snapshot, so a
-                // retry can still find usable relays; name it without claiming
-                // a verdict. Completed lookups report MissingMemberInboxRoute.
-                let message = if targets[index].relay_lists.inbox.relays.is_empty() {
-                    "relay-list absence was not authoritatively established"
-                } else {
-                    "known member inbox relay list has no usable relays and its refresh did not complete"
-                };
-                (index, AppError::RelayDirectory(message.to_owned()))
+                let account = targets[index].account_id_hex.clone();
+                (index, AppError::DirectoryLookupIncomplete(account))
             })
             .collect();
         RelayListResolution { completed, errors }
@@ -875,14 +893,14 @@ impl MarmotApp {
                     (indices, result)
                 }
             });
-        let batches = stream::iter(requests)
-            .buffered(MEMBER_RESOLUTION_RELAY_CONCURRENCY)
-            .collect::<Vec<_>>()
-            .await;
+        // Record each outcome as it arrives: when the shared deadline cancels
+        // this stage, members already decided keep their outcome.
+        let mut batches =
+            stream::iter(requests).buffer_unordered(MEMBER_RESOLUTION_RELAY_CONCURRENCY);
 
         let mut fallback = Vec::new();
         let mut fallback_records = BTreeMap::new();
-        for (indices, result) in batches {
+        while let Some((indices, result)) = batches.next().await {
             let Ok(records) = result else {
                 fallback.extend(indices);
                 continue;
@@ -1020,11 +1038,9 @@ impl MarmotApp {
                         (index, result)
                     }
                 });
-        let fallback_results = stream::iter(work)
-            .buffered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY)
-            .collect::<Vec<_>>()
-            .await;
-        for (index, result) in fallback_results {
+        let mut fallback_results =
+            stream::iter(work).buffer_unordered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY);
+        while let Some((index, result)) = fallback_results.next().await {
             outcomes[index] =
                 Some(result.and_then(|fetched| self.accept_fetched_key_package(purpose, fetched)));
         }
