@@ -155,6 +155,11 @@ pub enum MarmotKitError {
     /// without parsing display text.
     #[error("member {account} has no valid Marmot inbox relay")]
     MissingMemberInboxRoute { account: String },
+    /// Relay-list or KeyPackage lookup for `account` ran out of time or relay
+    /// coverage. Nothing is known to be missing; offer retry. Display omits
+    /// the account; read it from the field.
+    #[error("directory lookup did not complete")]
+    DirectoryLookupIncomplete { account: String },
     #[error("publish failed: {details}")]
     Publish { details: String },
     /// No current kind-3 event was found on the account's known outbox/default
@@ -543,6 +548,9 @@ impl From<&AppError> for MarmotKitError {
                 reason: (*reason).into(),
             },
             AppError::MissingMemberInboxRoute(account) => Self::MissingMemberInboxRoute {
+                account: account.clone(),
+            },
+            AppError::DirectoryLookupIncomplete(account) => Self::DirectoryLookupIncomplete {
                 account: account.clone(),
             },
             AppError::InvalidPublicKey => Self::InvalidIdentity {
@@ -1070,6 +1078,18 @@ mod tests {
             ),
             "invalid KeyPackage events must not be flattened into InvalidIdentity, got {ffi:?}"
         );
+    }
+
+    #[test]
+    fn directory_lookup_incomplete_crosses_ffi_with_account() {
+        let account = "33".repeat(32);
+        let ffi: MarmotKitError = AppError::DirectoryLookupIncomplete(account.clone()).into();
+        assert!(!ffi.to_string().contains(&account));
+        assert!(matches!(
+            ffi,
+            MarmotKitError::DirectoryLookupIncomplete { account: recipient }
+                if recipient == account
+        ));
     }
 
     #[test]

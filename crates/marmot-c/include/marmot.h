@@ -207,10 +207,15 @@ enum MarmotStatus
    */
   MARMOT_STATUS_INVALID_PUBLIC_EVENT_REFERENCES = 103,
   /**
+   * Relay-list or KeyPackage lookup for an account did not complete;
+   * nothing is known to be missing. Retry.
+   */
+  MARMOT_STATUS_DIRECTORY_LOOKUP_INCOMPLETE = 104,
+  /**
    * The edit target is missing, not a chat message, sent by another
    * account, deleted, or withdrawn by convergence; nothing was published.
    */
-  MARMOT_STATUS_INVALID_EDIT_TARGET = 104,
+  MARMOT_STATUS_INVALID_EDIT_TARGET = 105,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L

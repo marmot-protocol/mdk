@@ -361,7 +361,7 @@ async fn failed_preference_refetch_preserves_only_usable_current_batch_packages(
                 .err()
                 .expect("unusable batch material must not become a fallback");
             match batch_case {
-                "absent" => assert!(matches!(error, AppError::RelayDirectory(_))),
+                "absent" => assert!(matches!(error, AppError::DirectoryLookupIncomplete(_))),
                 "malformed" => assert!(matches!(error, AppError::InvalidKeyPackageEvent(_))),
                 "incompatible" => assert!(matches!(
                     error,
@@ -665,7 +665,7 @@ async fn incomplete_legacy_only_lookup_claims_neither_absence_nor_obsolescence()
         .await
         .unwrap_err();
     assert!(
-        matches!(error, AppError::RelayDirectory(_)),
+        matches!(&error, AppError::DirectoryLookupIncomplete(id) if *id == account.account_id_hex),
         "an incomplete search stays retryable: {error:?}"
     );
 }
