@@ -739,6 +739,15 @@ pub enum AuditEventKind {
         met_required_acks: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         transport: Option<AuditTransportWire>,
+        /// Seconds from the published event's outer `created_at` to this
+        /// outcome on the publisher's clock, saturating at zero. A retry
+        /// resends the exact signed event, so for a commit this is how long it
+        /// has waited for relays since it was wrapped; a member whose cursor
+        /// passed that `created_at` before a relay accepted it cannot receive
+        /// it live (mdk#2256). Absent on rows written before this field
+        /// existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_age_secs: Option<u64>,
     },
     /// Account runtime could not complete publish before endpoint receipts.
     PublishFailure {

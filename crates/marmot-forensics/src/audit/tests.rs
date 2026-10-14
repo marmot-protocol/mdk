@@ -734,6 +734,7 @@ fn sample_audit_event_kinds() -> Vec<AuditEventKind> {
             required_acks: 1,
             met_required_acks: true,
             transport: None,
+            event_age_secs: Some(5_700),
         },
         AuditEventKind::PublishFailure {
             msg_id: "ab".repeat(32),
@@ -2948,6 +2949,7 @@ fn application_send_operation_survives_v5_export_without_wire_schema_changes() {
                     required_acks: 1,
                     met_required_acks: true,
                     transport: None,
+                    event_age_secs: None,
                 },
             )
             .with_context(context.clone()),

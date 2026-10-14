@@ -189,7 +189,13 @@ Every cause runs the same job:
 2. **Acquire** (off the worker, holding one of the two process-wide credits).
    Request-local NIP-77 comparison plus bounded exact-ID fetch, reusing #2031/#2037. The
    task returns an owned batch plus a per-relay outcome: complete, truncated, failed or
-   unsupported.
+   unsupported. On an epoch-gap group route, each relay the comparison did not vouch for
+   is then asked for the route's newest events in the same window (at most 256 events and
+   4 MiB per relay, inside the pass deadline). A commit first accepted long after it was
+   wrapped keeps its wrap-time `created_at`, so it sits below every live `since` and a
+   relay that cannot compare would otherwise never return it (mdk#2256). That window fetch
+   is investigation, not coverage: its events are admitted like any other, but they never
+   certify a route, move its replay cursor or withhold its certificate.
 3. **Admit** (worker, bounded turns). A few events per turn go straight into the normal
    ingest path, never through the live queue. The worker yields between turns, so commands
    and live input interleave. A turn admits at most four events.
