@@ -190,8 +190,8 @@ Every cause runs the same job:
    Request-local NIP-77 comparison plus bounded exact-ID fetch, reusing #2031/#2037. The
    task returns an owned batch plus a per-relay outcome: complete, truncated, failed or
    unsupported. On an epoch-gap group route, each relay the comparison did not vouch for
-   is then asked for the route's newest events in the same window (at most 256 events and
-   4 MiB per relay, inside the pass deadline). A commit first accepted long after it was
+   is then asked for the route's newest events in the same window (a REQ `limit` of 256, and
+   at most 4 MiB per relay, inside the pass deadline), and they are admitted oldest first. A commit first accepted long after it was
    wrapped keeps its wrap-time `created_at`, so it sits below every live `since` and a
    relay that cannot compare would otherwise never return it (mdk#2256). That window fetch
    is investigation, not coverage: its events are admitted like any other, but they never

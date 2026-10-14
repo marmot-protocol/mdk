@@ -3606,6 +3606,7 @@ impl MarmotRelayPlaneAccountAdapter {
                 transport_group_id,
                 since,
                 until,
+                newest: Some(limits.max_received_items_per_endpoint),
             },
             endpoints,
             limits,

@@ -181,7 +181,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   they cross a worker-owned job (mdk#2110); `sync()` drains, then runs one job in place; nothing
   re-subscribes to recover history, and only startup, a frozen wake or an unactivated client installs live
   subscriptions. The job's one non-comparison fetch is the epoch-gap window (`fetch_epoch_gap_window`, mdk#2256): the
-  newest events of an epoch-gap group route from the relays that failed its comparison. Admit those events
+  newest events of an epoch-gap group route from the relays its comparison did not vouch for. Admit those events
   (`PendingSource::Window`) without letting them touch the route's certificate, replay cursor or admission verdict. Explicit full-history repair runs the job in place: one comparison pass over every route of its
   grant inside the repair budget. It never reports complete: history below the retained window is unsearched
   (`BelowRetentionWindow` when the window certified), so never certify explicit history from a window; that

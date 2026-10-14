@@ -2550,6 +2550,7 @@ impl ReplayWindow {
                 transport_group_id,
                 since,
                 until,
+                newest: None,
             },
         }
     }

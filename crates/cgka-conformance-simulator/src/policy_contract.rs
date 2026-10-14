@@ -40,7 +40,7 @@ pub struct ConstantDecision {
     pub versioning: VersioningRule,
 }
 
-pub const CONSTANT_DECISIONS: [ConstantDecision; 38] = [
+pub const CONSTANT_DECISIONS: [ConstantDecision; 39] = [
     decision(
         "P1",
         ConstantInfluence::SelectedStateSemantic,
@@ -233,6 +233,13 @@ pub const CONSTANT_DECISIONS: [ConstantDecision; 38] = [
     // relay history arrives, never which history.
     decision(
         "A15",
+        ConstantInfluence::InputAcquisition,
+        VersioningRule::OperationalNonInterference,
+    ),
+    // The epoch-gap window fetch delivers more input and certifies nothing,
+    // so it changes which history arrives, never what counts as covered.
+    decision(
+        "A16",
         ConstantInfluence::InputAcquisition,
         VersioningRule::OperationalNonInterference,
     ),

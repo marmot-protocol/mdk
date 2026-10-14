@@ -647,16 +647,22 @@ impl AppClient {
                 }
             };
             // A window event the comparison also returned is admitted once,
-            // as a comparison event.
+            // as a comparison event. Relays answer the window newest first,
+            // but the late commit is its oldest event: queue it first, so no
+            // newer commit from the page converges before it is buffered.
             let compared = events
                 .iter()
                 .map(|event| event.event.id.clone())
                 .collect::<HashSet<_>>();
-            let window = route
+            let mut window = route
                 .window
                 .into_iter()
                 .filter(|event| !compared.contains(&event.event.id))
                 .collect::<Vec<_>>();
+            window.sort_by(|a, b| {
+                (a.event.created_at, &a.event.id).cmp(&(b.event.created_at, &b.event.id))
+            });
+            window.dedup_by(|a, b| a.event.id == b.event.id);
             admission.pending.extend(
                 events
                     .into_iter()
@@ -1925,6 +1931,45 @@ mod tests {
         assert!(
             matches!(outcome, EpochBackfillRunOutcome::Incomplete(_)),
             "a window fetch certifies nothing"
+        );
+    }
+
+    /// The late commit is the oldest event in a gap, and relays answer the
+    /// window newest first. Admission must not converge a newer commit from
+    /// the same page before the late one is buffered, so the window is queued
+    /// oldest first.
+    #[tokio::test]
+    async fn a_window_is_admitted_oldest_first() {
+        let mut fixture = fixture().await;
+        let (grant, mut execution, route, group_route) = group_route_grant(&mut fixture).await;
+        let at = |created_at: u64| {
+            let signed = EventBuilder::new(Kind::MlsGroupMessage, "window")
+                .tags([Tag::custom("h", [hex::encode(group_route)])])
+                .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(created_at))
+                .finalize(&Keys::generate())
+                .unwrap();
+            transport_nostr_adapter::NostrRelayEvent {
+                endpoint: cgka_traits::TransportEndpoint("wss://relay.example".into()),
+                subscription_id: None,
+                event: transport_nostr_peeler::NostrTransportEvent::from_nostr_event(&signed)
+                    .unwrap(),
+            }
+        };
+        let mut network = fetched(route, Vec::new());
+        network.routes[0].window = vec![at(30), at(10), at(20)];
+        let admission = fixture
+            .client
+            .accept_comparison_network(&grant, &mut execution, network)
+            .await
+            .unwrap()
+            .expect("an unchanged grant owns its result");
+        assert_eq!(
+            admission
+                .pending
+                .iter()
+                .map(|(_, _, event)| event.event.created_at)
+                .collect::<Vec<_>>(),
+            vec![10, 20, 30]
         );
     }
 

@@ -5878,11 +5878,6 @@ fn welcome_recipient(message: &TransportMessage) -> Option<MemberId> {
     }
 }
 
-/// Build the outbound transport wire envelope for a publish, from the message's
-/// transport source and (for group messages) the transport-visible group id.
-/// Transport-generic: the post-wrap relay event id and ephemeral pubkey are
-/// produced inside the transport adapter and are intentionally not recorded
-/// here.
 /// How long `message` had existed at `now`, from its outer `created_at`, for
 /// the `publish_outcome` row. Retries resend the exact signed event, so this
 /// grows with every retry of one publish (mdk#2256).
@@ -5890,6 +5885,11 @@ fn publish_event_age_secs(message: &TransportMessage, now: Timestamp) -> Option<
     Some(now.0.saturating_sub(message.timestamp.0))
 }
 
+/// Build the outbound transport wire envelope for a publish, from the message's
+/// transport source and (for group messages) the transport-visible group id.
+/// Transport-generic: the post-wrap relay event id and ephemeral pubkey are
+/// produced inside the transport adapter and are intentionally not recorded
+/// here.
 fn publish_wire_metadata(message: &TransportMessage) -> AuditTransportWire {
     let transport_group_id = match &message.envelope {
         TransportEnvelope::GroupMessage { transport_group_id } => {
