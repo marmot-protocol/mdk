@@ -13,6 +13,8 @@ fn finish() -> EncryptedMediaUploadFinish {
         caption: None,
         message_tags: Vec::new(),
         control: None,
+        _epoch_hold: upload_holds::UploadEpochHolds::default()
+            .hold(GroupId::new(vec![0xab; 16]), 0),
     }
 }
 

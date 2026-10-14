@@ -23499,6 +23499,82 @@ fn assert_group_catching_up<T: std::fmt::Debug>(
     }
 }
 
+/// mdk#2158: while an attachment upload is in flight, this device holds its
+/// own due self-update for the group, so a rotation cannot leave the finished
+/// upload unsendable. The rotation stays owed and runs once the upload ends.
+#[tokio::test]
+async fn an_in_flight_upload_holds_the_groups_self_update_until_it_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        crate::MarmotAppConfig::default().with_allow_loopback_blob_endpoints(true),
+    )
+    .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("uploading", &[]).await.unwrap();
+    let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
+    let upload = client
+        .prepare_encrypted_media_upload(
+            &group_id,
+            crate::MediaUploadRequest {
+                attachments: vec![crate::MediaUploadAttachmentRequest {
+                    file_name: "photo.bin".into(),
+                    media_type: "application/octet-stream".into(),
+                    plaintext: vec![7; 64],
+                    dim: None,
+                    thumbhash: None,
+                }],
+                caption: None,
+                send: false,
+                blossom_server: Some("http://127.0.0.1:9".into()),
+                message_tags: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+    client
+        .runtime
+        .schedule_manual_self_update(&group_id)
+        .unwrap();
+    let mut obligation = client
+        .runtime
+        .session()
+        .maintenance_obligations()
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("scheduled maintenance obligation");
+    obligation.phase = cgka_traits::MaintenancePhase::Retry;
+    client
+        .runtime
+        .session()
+        .put_maintenance_obligation(&obligation)
+        .unwrap();
+    client.run_due_maintenance().await.unwrap();
+    let held = client
+        .runtime
+        .session()
+        .maintenance_obligation(&obligation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.last_failure_code.as_deref(), Some("upload_hold"));
+    assert_eq!(client.runtime.group_record(&group_id).unwrap().epoch, epoch);
+
+    // The upload ends (here: abandoned before its HTTP ran); the rotation runs.
+    drop(upload);
+    client.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        client.runtime.group_record(&group_id).unwrap().epoch.0,
+        epoch.0 + 1
+    );
+}
+
 /// mdk#2258: a device with unresolved epoch-gap recovery knows the group moved
 /// past its local epoch. Any commit it authors from there forks the group, so
 /// every group change is refused and the maintenance self-update waits, unless

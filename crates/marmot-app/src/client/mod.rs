@@ -82,6 +82,7 @@ mod retention;
 mod sync;
 #[cfg(test)]
 mod upload_cleanup_tests;
+mod upload_holds;
 
 use epoch_stall::EpochStallDetector;
 use push::notification_trigger_for_intent;
@@ -414,6 +415,9 @@ pub(crate) struct EncryptedMediaUploadFinish {
     /// File-backed uploads only: a cancellation observed before message
     /// admission prevents publication. Admission itself is not interruptible.
     control: Option<Arc<crate::MediaFileTransferControl>>,
+    /// Holds the group's due self-update while the upload is in flight, until
+    /// this finish is consumed or dropped (mdk#2158).
+    _epoch_hold: upload_holds::UploadEpochHold,
 }
 
 /// Preserve the primary upload/admission failure when orphan cleanup also fails.
@@ -694,6 +698,8 @@ pub struct AppClient {
     pub(crate) relay_plane: MarmotRelayPlane,
     pub(crate) transport_signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
     pub(crate) blossom_http_transport: BlossomHttpTransport,
+    /// Attachment uploads in flight; each holds its group's due self-update.
+    pub(crate) upload_epoch_holds: upload_holds::UploadEpochHolds,
     pub(crate) state: AccountState,
     /// O(1) membership index over `state.seen_events`, kept in lockstep by
     /// `remember_seen_event` (which removes pruned ring entries from it).
@@ -1315,7 +1321,7 @@ impl AppClient {
             "sweep",
             crate::ProductUnit::Attempt,
         );
-        let held = self.epoch_gap_held_groups()?;
+        let held = self.self_update_holds()?;
         let effects = self.runtime.run_due_maintenance_holding(&held).await;
         let mut activity = self.runtime.take_maintenance_activity();
         activity.absorb(previous);
@@ -5285,6 +5291,11 @@ impl AppClient {
             endpoints
         };
         let (source_epoch, media_secret) = self.encrypted_media_secret(group_id)?;
+        // The media key is now bound to `source_epoch`: hold this device's own
+        // rotation for the group until the upload is sent, admitted or dropped.
+        let epoch_hold = self
+            .upload_epoch_holds
+            .hold(group_id.clone(), recovery::wall_now_ms()?);
         let account = self.app.account_home().account(&self.state.label)?;
         let signer = self.app.account_signer_for_summary(&account)?;
         crate::messages::validate_message_tags(request.tags())?;
@@ -5321,6 +5332,7 @@ impl AppClient {
                 caption,
                 message_tags,
                 control,
+                _epoch_hold: epoch_hold,
             },
         ))
     }
@@ -6120,6 +6132,27 @@ impl AppClient {
             .account_storage(&self.state.label)?
             .app_storage()
             .epoch_gap_recovery_open_since(group_id.as_slice(), epoch.0)?)
+    }
+
+    /// Groups whose due self-update waits, and why: epoch-gap recovery first,
+    /// then an attachment upload in flight (mdk#2158).
+    fn self_update_holds(
+        &self,
+    ) -> Result<Vec<(GroupId, marmot_account::SelfUpdateHold)>, AppError> {
+        let mut held: Vec<_> = self
+            .epoch_gap_held_groups()?
+            .into_iter()
+            .map(|group| (group, marmot_account::SelfUpdateHold::EpochGap))
+            .collect();
+        for group in self
+            .upload_epoch_holds
+            .held_groups(recovery::wall_now_ms()?)
+        {
+            if !held.iter().any(|(held_group, _)| held_group == &group) {
+                held.push((group, marmot_account::SelfUpdateHold::Upload));
+            }
+        }
+        Ok(held)
     }
 
     /// Groups whose due self-updates wait for epoch-gap recovery. Automatic
