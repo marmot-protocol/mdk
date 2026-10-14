@@ -1339,3 +1339,154 @@ async fn retained_edit_orders_after_direct_edits_of_a_recovering_original() {
     assert_eq!(row.plaintext, "retained revision");
     h.app.close_storage().unwrap();
 }
+
+#[tokio::test]
+async fn retained_edit_never_shares_a_second_with_a_concurrent_direct_edit() {
+    // A direct edit chooses its second before storing its event, while a
+    // retained admission may run concurrently on another thread. Model the
+    // direct edit paused between choosing and storing: its reservation alone
+    // must push the retained revision to the next second.
+    let h = History::new(0).await;
+    let group_hex = hex::encode(h.group.as_slice());
+    let storage = h.app.account_storage("alice").unwrap();
+    let alice = h
+        .app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let (original, _) = h
+        .app
+        .admit_local_message_at(
+            "alice",
+            &h.group,
+            "original-token".into(),
+            LocalMessageRequest {
+                content: "original".into(),
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+            42,
+        )
+        .unwrap();
+    let edit_time = crate::unix_now_seconds();
+    let direct = h
+        .app
+        .reserve_edit_created_at(
+            &alice,
+            &group_hex,
+            &original.message_id_hex,
+            edit_time,
+            None,
+        )
+        .unwrap();
+    assert_eq!(direct, edit_time);
+
+    h.app
+        .admit_local_message_with_edit_at(
+            "alice",
+            &h.group,
+            "edit-token".into(),
+            LocalMessageRequest {
+                content: "retained revision".into(),
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+            Some("original-token".into()),
+            edit_time,
+        )
+        .unwrap();
+    assert_eq!(
+        storage
+            .latest_authored_edit_at(&group_hex, &original.message_id_hex, &alice)
+            .unwrap(),
+        Some(edit_time + 1),
+        "the retained revision must follow the second the direct edit reserved"
+    );
+    h.app.close_storage().unwrap();
+}
+
+#[tokio::test]
+async fn retained_edit_of_a_deleted_message_is_refused_at_admission() {
+    // The prepared event skips the send preflight, so admission applies the
+    // same rule: an edit of a deleted message would be dropped by recipients.
+    let h = History::new(0).await;
+    let group_hex = hex::encode(h.group.as_slice());
+    let alice = h
+        .app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let (original, _) = h
+        .app
+        .admit_local_message_at(
+            "alice",
+            &h.group,
+            "original-token".into(),
+            LocalMessageRequest {
+                content: "original".into(),
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+            42,
+        )
+        .unwrap();
+    h.app
+        .record_account_app_event(
+            "alice",
+            &crate::AppMessageProjection {
+                authority: None,
+                message_id_hex: "de".repeat(32),
+                source_message_id_hex: None,
+                direction: "sent".into(),
+                group_id_hex: group_hex.clone(),
+                sender: alice,
+                plaintext: String::new(),
+                kind: cgka_traits::app_event::MARMOT_APP_EVENT_KIND_DELETE,
+                tags: vec![vec!["e".into(), original.message_id_hex.clone()]],
+                source_epoch: None,
+                retention: None,
+                recorded_at: Some(43),
+                origin_commit_id: None,
+                moderation_grant: false,
+            },
+        )
+        .unwrap();
+    let storage = h.app.account_storage("alice").unwrap();
+    assert!(
+        storage
+            .timeline_message(&group_hex, &original.message_id_hex)
+            .unwrap()
+            .is_some_and(|row| row.deleted),
+        "fixture must delete the original"
+    );
+
+    let error = h
+        .app
+        .admit_local_message_with_edit_at(
+            "alice",
+            &h.group,
+            "edit-token".into(),
+            LocalMessageRequest {
+                content: "revision".into(),
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+            Some("original-token".into()),
+            1_000,
+        )
+        .unwrap_err();
+    assert!(matches!(error, AppError::InvalidEditTarget), "{error:?}");
+    assert!(
+        storage
+            .local_submission(&group_hex, "edit-token")
+            .unwrap()
+            .is_none()
+    );
+    h.app.close_storage().unwrap();
+}

@@ -411,24 +411,41 @@ impl MarmotApp {
                         "pending edit requires an outgoing text message".into(),
                     ));
                 }
+                // Same rule as direct edits, checked here because the prepared
+                // event later skips the send preflight: recipients drop edits of
+                // deleted or convergence-withdrawn messages. A failed publish
+                // awaiting retry stays editable.
+                if original_row.deleted
+                    || original_row
+                        .invalidation_status
+                        .as_deref()
+                        .is_some_and(|status| status != crate::LOCAL_PUBLISH_FAILED_REASON)
+                {
+                    return Err(AppError::InvalidEditTarget);
+                }
                 // Order after every edit this account stored for the target,
                 // direct or retained: an original awaiting its publish retry
                 // exposes no accepted edits, yet they compete once it recovers.
                 // Hosts already match this documented message (0.11.0), so
                 // retained admissions keep it rather than `EditRateLimited`.
-                event_created_at = next_edit_created_at(
-                    created_at,
-                    storage.latest_authored_edit_at(
+                let stored_latest = storage.latest_authored_edit_at(
+                    &group_hex,
+                    &original.message_id_hex,
+                    &account.account_id_hex,
+                )?;
+                event_created_at = self
+                    .reserve_edit_created_at(
+                        &account.account_id_hex,
                         &group_hex,
                         &original.message_id_hex,
-                        &account.account_id_hex,
-                    )?,
-                )
-                .ok_or_else(|| {
-                    AppError::InvalidAppMessagePayload(
-                        "pending edit rate limit: retry shortly".into(),
+                        created_at,
+                        stored_latest,
                     )
-                })?;
+                    .ok_or_else(|| {
+                        AppError::InvalidAppMessagePayload(
+                            "pending edit rate limit: retry shortly".into(),
+                        )
+                    })?;
                 AppMessageIntent::Edit {
                     target_message_id: original.message_id_hex,
                     content: request.content.clone(),
