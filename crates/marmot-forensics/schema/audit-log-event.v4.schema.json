@@ -943,9 +943,6 @@
             },
             "met_required_acks": {
               "type": "boolean"
-            },
-            "event_age_secs": {
-              "$ref": "#/$defs/u64"
             }
           }
         },
