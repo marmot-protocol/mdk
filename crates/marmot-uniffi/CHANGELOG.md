@@ -4,6 +4,7 @@
 
 ### Breaking changes
 
+- `MarmotKitError` adds `InvalidPublicEventReferences`: a cached public event preview read named more than 16 references. Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
 - `MarmotKitError::MissingKeyPackage` adds `reason: MissingKeyPackageReasonFfi`. `ObsoleteOnly`
   means the recipient has published only obsolete KeyPackages and must update their app;
   these recipients previously surfaced as `InvalidKeyPackageEvent` (mdk#1975). `NotFound`
@@ -15,10 +16,12 @@
   Swift/Kotlin handling and regenerate bindings with the matching native
   library; render a storage prompt rather than a retry timer. See
   [the attachment access contract](ATTACHMENT-ACCESS.md).
-- `MarmotKitError` adds `InvalidEditTarget` and `EditRateLimited`, returned by `edit_message` (see Fixed). Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
+- `MarmotKitError` adds `InvalidEditTarget`, returned by `edit_message` (see Fixed). Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
 - `MarmotKitError` adds `GroupCommitUndelivered`: a group change was refused because the group's last change has not reached every group relay yet (mdk#2255). Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
 
 ### Added
+
+- `Marmot::cached_public_event_previews` and `Marmot::resolve_public_event_preview` cache verified public Nostr events referenced from message content (mdk#1547). Cached reads are network-free and survive restarts; resolve fetches missing or stale previews. See [public event previews](README.md#public-event-previews).
 
 - Account-wide attachment candidate pages, group/sender/date queries and opaque account/query-bound cursor/version handles. Filtered empty pages can continue; source changes require restart. Existing group history and acquisition primitives are unchanged.
 
@@ -30,7 +33,7 @@
 
 ### Fixed
 
-- `edit_message` returns `InvalidEditTarget`, publishing nothing, unless the target is an available chat message this account sent. Before, an edit of another account's message, a reaction or a deleted message was published to the group and reported as sent, then ignored by every recipient. It returns `EditRateLimited` when a burst of edits of one message would need a timestamp more than 30 seconds ahead; keep the text and retry after a few seconds. Two edits in the same second no longer risk leaving the earlier text effective.
+- `edit_message` returns `InvalidEditTarget`, publishing nothing, unless the target is an available chat message this account sent. Before, an edit of another account's message, a reaction or a deleted message was published to the group and reported as sent, then ignored by every recipient.
 
 ## 0.13.0 - 2026-10-12
 

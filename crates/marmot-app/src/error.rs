@@ -174,6 +174,8 @@ pub enum AppError {
     ChatPresentationNotReady,
     #[error("invalid cached identity page: {0}")]
     InvalidCachedIdentityPage(String),
+    #[error("invalid public event reference batch: {0}")]
+    InvalidPublicEventReferences(String),
     #[error("invalid chat pin: {0}")]
     InvalidChatPin(String),
     #[error("group is disbanding or disbanded; outbound work is blocked")]
@@ -263,10 +265,6 @@ pub enum AppError {
     /// nothing was published.
     #[error("edit target must be an available self-authored chat message")]
     InvalidEditTarget,
-    /// Successive edits of one message need strictly newer seconds, and the
-    /// next one would exceed the 30-second future bound; nothing was published.
-    #[error("too many edits of this message; try again shortly")]
-    EditRateLimited,
     #[error("relay directory fetch failed: {0}")]
     RelayDirectory(String),
     /// An account worker's transport catch-up failed (sync error or timeout).
@@ -497,6 +495,7 @@ impl AppError {
             Self::ChatPresentationNotReady => "chat_presentation_not_ready",
             Self::DirectConversationIndexNotReady => "direct_conversation_index_not_ready",
             Self::InvalidCachedIdentityPage(_) => "invalid_cached_identity_page",
+            Self::InvalidPublicEventReferences(_) => "invalid_public_event_references",
             Self::InvalidChatPin(_) => "invalid_chat_pin",
             Self::GroupDisbanding(_) => "group_disbanding",
             Self::GroupRemoved(_) => "group_removed",
@@ -524,7 +523,6 @@ impl AppError {
             Self::CannotReportSelf => "cannot_report_self",
             Self::ModerationReportRateLimited => "moderation_report_rate_limited",
             Self::InvalidEditTarget => "invalid_edit_target",
-            Self::EditRateLimited => "edit_rate_limited",
             Self::FollowListUnavailable => "follow_list_unavailable",
             Self::RelayDirectory(_) => "relay_directory",
             Self::AccountCatchUp(_) => "account_catch_up",

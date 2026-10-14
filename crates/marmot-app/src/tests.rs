@@ -4046,15 +4046,14 @@ async fn media_send_epoch_pin_body() {
 }
 
 #[test]
-fn edits_require_an_available_own_chat_target_and_order_same_second_revisions() {
+fn edits_require_an_available_own_chat_target() {
     run_composed_app_runtime_test("edit-target-preflight", edit_target_preflight_body);
 }
 
 async fn edit_target_preflight_body() {
     // Recipients honor an edit only of an available chat message by the same
-    // author, ordered by (second, event id). The sender must refuse every
-    // other target before publishing it to the group, and must stamp rapid
-    // revisions so the last one submitted is the one recipients keep.
+    // author. The sender must refuse every other target before publishing it
+    // to the group.
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
@@ -4072,21 +4071,15 @@ async fn edit_target_preflight_body() {
 
     let original = client.send(&group_id, b"status: starting").await.unwrap();
     let original_id = original.message_ids[0].clone();
-    for content in ["status: step 1", "status: step 2"] {
-        client
-            .send_app_event(&group_id, edit(&original_id, content))
-            .await
-            .unwrap();
-    }
+    client
+        .send_app_event(&group_id, edit(&original_id, "status: done"))
+        .await
+        .unwrap();
     let row = app
         .timeline_message("alice", &group_hex, &original_id)
         .unwrap()
         .unwrap();
-    assert_eq!(
-        row.plaintext, "status: step 2",
-        "the later of two same-second edits must stay effective"
-    );
-    assert_eq!(row.edit.as_ref().map(|edit| edit.edit_count), Some(2));
+    assert_eq!(row.plaintext, "status: done");
 
     let reaction = client
         .react_to_message(&group_id, &original_id, "+")
@@ -4141,91 +4134,21 @@ async fn edit_target_preflight_body() {
         "a refused edit must reach the relay with nothing"
     );
 
-    // Each revision needs a newer second, at most 30 seconds ahead; a burst
-    // past that bound is refused as retryable instead of publishing out of order.
-    let mut refused = None;
-    for revision in 0..40 {
-        match client
-            .send_app_event(&group_id, edit(&original_id, &format!("burst {revision}")))
-            .await
-        {
-            Ok(_) => {}
-            Err(error) => {
-                refused = Some((revision, error));
-                break;
-            }
-        }
-    }
-    let Some((revision, error)) = refused else {
-        panic!("a 40-edit burst must exceed the 30-second bound");
-    };
-    assert!(matches!(error, AppError::EditRateLimited), "{error:?}");
-    assert!(revision >= 29, "refused too early, at revision {revision}");
-    let row = app
-        .timeline_message("alice", &group_hex, &original_id)
+    // A failed publish awaiting retry can still recover (publish finalization
+    // revives it), and recipients apply the edit once the original arrives.
+    let retrying = client.send(&group_id, b"retrying").await.unwrap();
+    app.account_storage("alice")
         .unwrap()
-        .unwrap();
-    assert_eq!(row.plaintext, format!("burst {}", revision - 1));
-}
-
-#[test]
-fn edits_of_an_original_awaiting_publish_retry_stay_ordered() {
-    run_composed_app_runtime_test("edit-recovering-original", edit_recovering_original_body);
-}
-
-async fn edit_recovering_original_body() {
-    // While an original's own publish is being retried it exposes no accepted
-    // edits, yet the edits sent meanwhile compete by (second, event id) once
-    // it recovers. Each must still take a strictly newer second.
-    let dir = tempfile::tempdir().unwrap();
-    AccountHome::open(dir.path())
-        .create_account("alice")
-        .unwrap();
-    let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-        .with_test_relay_client(relay.clone());
-    let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("edits", &[]).await.unwrap();
-    let group_hex = hex::encode(group_id.as_slice());
-    let original = client.send(&group_id, b"status: starting").await.unwrap();
-    let original_id = original.message_ids[0].clone();
-    let storage = app.account_storage("alice").unwrap();
-    storage
         .invalidate_app_event_by_message_id(
             &group_hex,
-            &original_id,
+            &retrying.message_ids[0],
             crate::LOCAL_PUBLISH_FAILED_REASON,
         )
         .unwrap();
-
-    let mut stamped = Vec::new();
-    for content in ["status: step 1", "status: step 2"] {
-        let (event, _) = client
-            .send_app_event(
-                &group_id,
-                AppMessageIntent::Edit {
-                    target_message_id: original_id.clone(),
-                    content: content.to_owned(),
-                },
-            )
-            .await
-            .expect("a target awaiting its publish retry stays editable");
-        stamped.push(event.created_at);
-    }
-    assert!(
-        stamped[1] > stamped[0],
-        "edits sent while the original recovers must take newer seconds: {stamped:?}"
-    );
-
-    storage
-        .clear_local_publish_failure(&group_hex, &original_id)
-        .unwrap();
-    let row = app
-        .timeline_message("alice", &group_hex, &original_id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(row.invalidation_status, None);
-    assert_eq!(row.plaintext, "status: step 2");
+    client
+        .send_app_event(&group_id, edit(&retrying.message_ids[0], "retried"))
+        .await
+        .expect("a target awaiting its publish retry stays editable");
 }
 
 #[test]

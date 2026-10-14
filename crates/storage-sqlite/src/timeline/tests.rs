@@ -4115,11 +4115,12 @@ fn user_blocks_notification_suppression_pruned_with_event_but_welcome_replay_fen
 fn accepted_edits_resolve_authorship_order_and_reply_without_activity() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let group = "11".repeat(32);
-    // Edits may precede the target. Timestamp then lexicographic id breaks ties,
-    // independently of arrival order. Only one e tag and the target's author qualify.
+    // Edits may precede the target. Timestamp wins, then the lexically smallest
+    // id (NIP-01) breaks a same-second tie, independently of arrival order.
+    // Only one e tag and the target's author qualify.
     for event in [
-        edit("z", "alice", "target", 3, "winner"),
-        edit("a", "alice", "target", 3, "older tie"),
+        edit("a", "alice", "target", 3, "winner"),
+        edit("z", "alice", "target", 3, "older tie"),
         edit("forged", "bob", "target", 9, "forged"),
     ] {
         store.record_app_event(&event).unwrap();
@@ -4141,8 +4142,24 @@ fn accepted_edits_resolve_authorship_order_and_reply_without_activity() {
     assert_eq!(target.edit.as_ref().unwrap().edit_count, 2);
     assert_eq!(
         target.edit.as_ref().unwrap().latest_edit_message_id_hex,
-        "z"
+        "a"
     );
+    // History runs oldest to effective under the same order, and its cursor
+    // pages within a tied second.
+    let history = store
+        .message_edit_history(&group, "target", None, 100)
+        .unwrap();
+    let ids = |page: &TimelineEditHistoryPage| {
+        page.versions
+            .iter()
+            .map(|v| v.message_id_hex.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&history), ["z", "a"]);
+    let older = store
+        .message_edit_history(&group, "target", Some((3, "a".into())), 100)
+        .unwrap();
+    assert_eq!(ids(&older), ["z"]);
     assert_eq!(
         list(&store).len(),
         2,

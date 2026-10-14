@@ -143,18 +143,6 @@ impl LocalMessageRequest {
     }
 }
 
-/// Recipients pick an edit's effective version by `(created_at second, event
-/// id)`, not by arrival order, so a revision must land in a strictly newer
-/// second than the latest one. Returns `None` once that would put the edit
-/// more than 30 seconds past `now`.
-pub(crate) fn next_edit_created_at(now: u64, latest_edit: Option<u64>) -> Option<u64> {
-    let created_at = match latest_edit {
-        Some(latest) => now.max(latest.checked_add(1)?),
-        None => now,
-    };
-    (created_at <= now.saturating_add(30)).then_some(created_at)
-}
-
 impl MarmotApp {
     pub(crate) fn finish_local_message(
         &self,
@@ -423,29 +411,17 @@ impl MarmotApp {
                 {
                     return Err(AppError::InvalidEditTarget);
                 }
-                // Order after every edit this account stored for the target,
-                // direct or retained: an original awaiting its publish retry
-                // exposes no accepted edits, yet they compete once it recovers.
-                // Hosts already match this documented message (0.11.0), so
-                // retained admissions keep it rather than `EditRateLimited`.
-                let stored_latest = storage.latest_authored_edit_at(
-                    &group_hex,
-                    &original.message_id_hex,
-                    &account.account_id_hex,
-                )?;
-                event_created_at = self
-                    .reserve_edit_created_at(
-                        &account.account_id_hex,
-                        &group_hex,
-                        &original.message_id_hex,
-                        created_at,
-                        stored_latest,
-                    )
-                    .ok_or_else(|| {
-                        AppError::InvalidAppMessagePayload(
+                // Edit resolution uses (second, event id), not queue order.
+                // Give rapid local revisions strictly increasing seconds so
+                // the last submitted text remains the effective version.
+                if let Some(previous) = original_row.edit {
+                    event_created_at = event_created_at.max(previous.edited_at.saturating_add(1));
+                    if event_created_at > created_at.saturating_add(30) {
+                        return Err(AppError::InvalidAppMessagePayload(
                             "pending edit rate limit: retry shortly".into(),
-                        )
-                    })?;
+                        ));
+                    }
+                }
                 AppMessageIntent::Edit {
                     target_message_id: original.message_id_hex,
                     content: request.content.clone(),
@@ -527,25 +503,5 @@ impl MarmotApp {
             self.notify_draft_changed(&account.label, &group_hex);
         }
         Ok((result.0, result.1))
-    }
-}
-
-#[cfg(test)]
-mod edit_created_at_tests {
-    use super::next_edit_created_at;
-
-    #[test]
-    fn same_second_edits_get_strictly_newer_seconds() {
-        let first = next_edit_created_at(100, None).unwrap();
-        let second = next_edit_created_at(100, Some(first)).unwrap();
-        assert_eq!((first, second), (100, 101));
-        assert_eq!(next_edit_created_at(110, Some(second)), Some(110));
-    }
-
-    #[test]
-    fn edit_created_at_stays_within_the_future_bound() {
-        assert_eq!(next_edit_created_at(100, Some(129)), Some(130));
-        assert_eq!(next_edit_created_at(100, Some(130)), None);
-        assert_eq!(next_edit_created_at(100, Some(u64::MAX)), None);
     }
 }

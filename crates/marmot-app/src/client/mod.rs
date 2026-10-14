@@ -4416,7 +4416,6 @@ impl AppClient {
             .account_home()
             .account(&self.state.label)?
             .account_id_hex;
-        let mut created_at = unix_now_seconds();
         // NIP-25 has no native un-react: kind-7 reactions are retracted with a
         // kind-5 delete. Resolve every matching active own reaction from the
         // projection and place all ids in one tombstone so remove-all is atomic.
@@ -4465,10 +4464,9 @@ impl AppClient {
                 ref target_message_id,
                 ..
             } if prepared.is_none() => {
-                let storage = self.app.account_storage(&self.state.label)?;
-                let group_hex = hex::encode(group_id.as_slice());
-                storage
-                    .timeline_message(&group_hex, target_message_id)?
+                self.app
+                    .account_storage(&self.state.label)?
+                    .timeline_message(&hex::encode(group_id.as_slice()), target_message_id)?
                     .filter(|target| {
                         target.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT
                             && target.sender == sender
@@ -4480,20 +4478,6 @@ impl AppClient {
                             })
                     })
                     .ok_or(AppError::InvalidEditTarget)?;
-                // Not `target.edit`: a target awaiting its publish retry exposes
-                // no accepted edits, but its earlier edits still compete.
-                let stored_latest =
-                    storage.latest_authored_edit_at(&group_hex, target_message_id, &sender)?;
-                created_at = self
-                    .app
-                    .reserve_edit_created_at(
-                        &sender,
-                        &group_hex,
-                        target_message_id,
-                        created_at,
-                        stored_latest,
-                    )
-                    .ok_or(AppError::EditRateLimited)?;
                 intent
             }
             AppMessageIntent::Delete { target_message_id } => {
@@ -4562,10 +4546,13 @@ impl AppClient {
             (event, payload)
         } else {
             let event = match draft.as_ref().and_then(|(_, reply)| reply.as_deref()) {
-                Some(reply) => {
-                    build_inner_event_with_media_reply(&intent, &sender, created_at, Some(reply))?
-                }
-                None => build_inner_event(&intent, &sender, created_at)?,
+                Some(reply) => build_inner_event_with_media_reply(
+                    &intent,
+                    &sender,
+                    unix_now_seconds(),
+                    Some(reply),
+                )?,
+                None => build_inner_event(&intent, &sender, unix_now_seconds())?,
             };
             let payload = encode_inner_event(&event)?;
             (event, payload)

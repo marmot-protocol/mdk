@@ -261,6 +261,7 @@ pub use media::{
 pub use messages::{is_reserved_app_event_kind, is_stream_final_event, tag_value, tag_values};
 pub use nostr_secret::is_nostr_secret;
 pub use nostr_verification::verify_public_nostr_event_json;
+mod public_event_preview;
 pub use notifications::{
     BackgroundNotificationCollection, ChatNotificationSettings, GroupPushDebugInfo,
     GroupPushTokenDebugEntry, GroupPushTokenRecord, KIND_MARMOT_NOTIFICATION_RUMOR,
@@ -274,6 +275,9 @@ pub use notifications::{
     parse_provider_token, push_token_fingerprint,
 };
 pub use profile_pseudonyms::{default_profile_pseudonym, random_profile_pseudonym};
+pub use public_event_preview::{
+    MAX_PUBLIC_EVENT_REFERENCES, PublicEventPreview, PublicEventPreviewRead,
+};
 pub use relay_plane::{
     EngineReorgMetrics, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
     RelayEndpointClassification, RelayEndpointPolicy, RelayPlaneHealth, RelayRollupEntry,
@@ -512,6 +516,9 @@ pub struct MarmotApp {
     account_storages: Arc<Mutex<HashMap<String, SqliteAccountStorage>>>,
     account_session_owners: Arc<Mutex<HashSet<String>>>,
     directory_caches: Arc<Mutex<HashMap<String, DirectoryCache>>>,
+    /// When each `(account label, cache key)` public event refresh last
+    /// finished; see `public_event_preview`.
+    public_event_refreshes: Arc<Mutex<HashMap<String, Instant>>>,
     /// Bounded, process-local composition prewarm. Entries are never durable
     /// directory admission and never reserve or consume a KeyPackage.
     member_key_package_prewarm_cache: Arc<Mutex<directory::MemberKeyPackagePrewarmCache>>,
@@ -549,23 +556,6 @@ pub struct MarmotApp {
     /// In-memory view of the persisted per-kind authoring floors; see
     /// `sign_replaceable_identity_event`.
     replaceable_identity_created_at: Arc<Mutex<HashMap<(String, u64), u64>>>,
-    /// Edit seconds already handed out per (sender, group, target), so a direct
-    /// edit and a concurrently admitted retained edit never share one; see
-    /// [`Self::reserve_edit_created_at`].
-    edit_created_at: Arc<Mutex<EditClock>>,
-}
-
-/// (sender, group id hex, target message id hex) for [`MarmotApp::reserve_edit_created_at`].
-type EditClockKey = (String, String, String);
-
-/// Edit seconds handed out, pruned against a time floor that never moves back.
-#[derive(Default)]
-struct EditClock {
-    /// The newest `now` any caller reserved with. A caller holding an older
-    /// `now` picks at or after it, so pruning can never hand it a second that a
-    /// pruned reservation already used.
-    now_floor: u64,
-    reserved: HashMap<EditClockKey, u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1670,6 +1660,7 @@ impl MarmotApp {
             account_storages: Arc::new(Mutex::new(HashMap::new())),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
+            public_event_refreshes: Arc::default(),
             member_key_package_prewarm_cache: Arc::new(Mutex::new(
                 directory::MemberKeyPackagePrewarmCache::default(),
             )),
@@ -1702,7 +1693,6 @@ impl MarmotApp {
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
-            edit_created_at: Arc::new(Mutex::new(EditClock::default())),
         }
     }
 
@@ -1765,6 +1755,7 @@ impl MarmotApp {
             account_storages: Arc::new(Mutex::new(HashMap::new())),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
+            public_event_refreshes: Arc::default(),
             member_key_package_prewarm_cache: Arc::new(Mutex::new(
                 directory::MemberKeyPackagePrewarmCache::default(),
             )),
@@ -1797,7 +1788,6 @@ impl MarmotApp {
             account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
-            edit_created_at: Arc::new(Mutex::new(EditClock::default())),
         }
     }
 
@@ -3170,42 +3160,6 @@ impl MarmotApp {
             .advance_replaceable_record_floor(account_ref, kind, created_at)?;
         latest.insert(key, created_at);
         Ok(created_at)
-    }
-
-    /// Pick the next edit second for `target` and reserve it. Recipients order
-    /// edits by `(second, event id)`, so it must follow `stored_latest` (the
-    /// newest edit this sender stored for the target) and every second already
-    /// handed out: a direct edit stores its event only after choosing, while a
-    /// retained admission may choose concurrently on another thread. Callers
-    /// read `stored_latest` before calling, and the lock is never held across
-    /// storage or relay I/O. `None` means the 30-second bound is exhausted.
-    pub(crate) fn reserve_edit_created_at(
-        &self,
-        sender: &str,
-        group_id_hex: &str,
-        target_message_id_hex: &str,
-        now: u64,
-        stored_latest: Option<u64>,
-    ) -> Option<u64> {
-        let mut clock = self
-            .edit_created_at
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // A caller may resume with a `now` (and stored snapshot) older than
-        // another caller's. Picking at or after the floor keeps every pick
-        // above any reservation pruned below, which is all pruning removes.
-        clock.now_floor = clock.now_floor.max(now);
-        let now = clock.now_floor;
-        clock.reserved.retain(|_, at| *at >= now);
-        let key = (
-            sender.to_owned(),
-            group_id_hex.to_owned(),
-            target_message_id_hex.to_owned(),
-        );
-        let latest = stored_latest.max(clock.reserved.get(&key).copied());
-        let created_at = crate::local_submissions::next_edit_created_at(now, latest)?;
-        clock.reserved.insert(key, created_at);
-        Some(created_at)
     }
 
     pub(crate) fn spawn_quorum_cancelled_delivery(&self, delivery: QuorumCancelledDelivery) {

@@ -5,7 +5,7 @@
 ### Breaking changes
 
 - `AppError` adds `GroupCatchingUp` and `GroupCommitUndelivered`; update exhaustive matches.
-- `AppError` adds `InvalidEditTarget` and `EditRateLimited`; update exhaustive matches.
+- `AppError` adds `InvalidEditTarget`; update exhaustive matches.
 - `AppError::MissingKeyPackage` is now `{ account, reason: MissingKeyPackageReason }`.
   `ObsoleteOnly` means a completed lookup found only legacy-profile KeyPackages, so the
   recipient must update and publish a current one; `NotFound` keeps the previous meaning.
@@ -14,6 +14,8 @@
   its checkpoint and readmits once space frees or on explicit Retry.
 
 ### Added
+
+- `MarmotAppRuntime::cached_public_event_previews` and `resolve_public_event_preview` keep verified public Nostr events referenced from message content in the account's directory cache (mdk#1547). The cache adds directory-cache migration 2; an older build refuses the upgraded cache. `AppError` adds `InvalidPublicEventReferences` for batches over 16 references.
 
 - Account-wide local attachment pages expose bounded typed metadata, group/sender/date selection, continuation cursors and retention deadlines. Reads start no acquisition or relay activity.
 
@@ -25,8 +27,7 @@
 
 ### Fixed
 
-- `edit_message` refuses with `AppError::InvalidEditTarget`, publishing nothing, unless the target is an available chat message this account sent. Before, the CLI, bindings and connector could publish an edit of another account's message, a reaction, or a deleted message to the whole group, report it as sent, and have every recipient ignore it. A target whose own publish failed and is awaiting retry stays editable.
-- Two edits of one message in the same second could leave the earlier text effective, because recipients order edits by `(second, event id)`. Direct edits now take a strictly newer second, as retained local edits already did, and return `AppError::EditRateLimited` once a burst would stamp more than 30 seconds ahead.
+- `edit_message` refuses with `AppError::InvalidEditTarget`, publishing nothing, unless the target is an available chat message this account sent. Before, the CLI, bindings and connector could publish an edit of another account's message, a reaction, or a deleted message to the whole group, report it as sent, and have every recipient ignore it. Queued local edits apply the same rule at admission. A target whose own publish failed and is awaiting retry stays editable.
 - Inviting or looking up an account that has published only legacy-profile KeyPackages
   (including MDK 0.8 publications) returns `MissingKeyPackage` with reason `ObsoleteOnly`
   instead of `InvalidKeyPackageEvent` (mdk#1975). Legacy packages are still never selected,

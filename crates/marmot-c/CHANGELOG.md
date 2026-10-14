@@ -9,6 +9,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Add `marmot_cached_public_event_previews` and `marmot_resolve_public_event_preview` (record `MarmotPublicEventPreview`, enum `MarmotPublicEventPreviewState`, freed with `marmot_public_event_preview_free` / `marmot_public_event_preview_list_free`) for cached public Nostr event previews (mdk#1547), and `MARMOT_STATUS_INVALID_PUBLIC_EVENT_REFERENCES` (103) for a read of more than 16 references. Use matching regenerated headers and libraries.
+
 - Account attachment pages, bounded borrowed query inputs and opaque cursor/version handles with deep-free and version-clone functions. New records/symbols require matching headers and libraries; existing group history remains supported.
 
 - Add `marmot_send_prepared_media_with_client_token` for captured ordinary-media admission and conditional draft consumption. Inputs are borrowed; the nullable captured revision remains owned by its selected-draft root. The owned result uses the existing `marmot_local_send_acceptance_free`; layouts and status values are unchanged. Use matching regenerated headers and libraries.
@@ -17,7 +19,7 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 - Add `MARMOT_STATUS_GROUP_COMMIT_UNDELIVERED` (102): a group change was refused because the group's last change has not reached every group relay yet (mdk#2255). Add `marmot_group_commit_delivery` (record `MarmotGroupCommitDelivery`, freed with `marmot_group_commit_delivery_free`) to list the owed relays, and `marmot_acknowledge_group_commit_undelivered` to let one change through once the user accepts the risk. Use matching regenerated headers and libraries.
 
-- Add `MARMOT_STATUS_INVALID_EDIT_TARGET` (103) and `MARMOT_STATUS_EDIT_RATE_LIMITED` (104), returned by `marmot_edit_message`. An edit is refused, publishing nothing, unless its target is an available chat message this account sent; before, it was published and then ignored by every recipient. Rate limiting means a burst of edits of one message would need a timestamp more than 30 seconds ahead; retry after a few seconds. Existing status values are unchanged. Use matching regenerated headers and libraries.
+- Add `MARMOT_STATUS_INVALID_EDIT_TARGET` (104), returned by `marmot_edit_message`: an edit is refused, publishing nothing, unless its target is an available chat message this account sent. Before, it was published and then ignored by every recipient. Existing status values are unchanged. Use matching regenerated headers and libraries.
 
 ### Changed
 

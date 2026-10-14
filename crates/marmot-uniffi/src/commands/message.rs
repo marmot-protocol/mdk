@@ -183,9 +183,8 @@ impl Marmot {
     /// Recipients honour the edit only when its authenticated author matches
     /// the target's author; MDK ignores mismatched edits. It returns
     /// `InvalidEditTarget`, publishing nothing, unless the target is an
-    /// available chat message this account sent, and `EditRateLimited` when a
-    /// burst of edits of one message would need a timestamp more than 30
-    /// seconds ahead; retry that after a few seconds.
+    /// available chat message this account sent. Competing edits resolve by
+    /// `created_at`, then the lexically smallest event id (NIP-01).
     ///
     /// MDK overlays accepted edits on the target timeline row and selected list
     /// preview, without changing its identity, activity order or unread state.

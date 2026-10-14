@@ -150,11 +150,11 @@ pub enum MarmotStatus {
     /// The group's last change has not reached every group relay yet; group
     /// changes wait while MDK retries them (mdk#2255).
     GroupCommitUndelivered = 102,
+    /// A cached public event preview read named more than 16 references.
+    InvalidPublicEventReferences = 103,
     /// The edit target is missing, not a chat message, sent by another
     /// account, deleted, or withdrawn by convergence; nothing was published.
-    InvalidEditTarget = 103,
-    /// Too many edits of one message in a burst; retry after a few seconds.
-    EditRateLimited = 104,
+    InvalidEditTarget = 104,
 }
 
 thread_local! {
@@ -212,7 +212,6 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::CannotReportSelf => MarmotStatus::CannotReportSelf,
         MarmotKitError::ModerationReportRateLimited => MarmotStatus::ModerationReportRateLimited,
         MarmotKitError::InvalidEditTarget => MarmotStatus::InvalidEditTarget,
-        MarmotKitError::EditRateLimited => MarmotStatus::EditRateLimited,
         MarmotKitError::ChatWindowInvalidLimit => MarmotStatus::ChatWindowInvalidLimit,
         MarmotKitError::ChatWindowStale => MarmotStatus::ChatWindowStale,
         MarmotKitError::ChatWindowAnchorOutside => MarmotStatus::ChatWindowAnchorOutside,
@@ -293,6 +292,9 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
             MarmotStatus::CreatedGroupProjectionUnavailable
         }
         MarmotKitError::InvalidCachedIdentityPage { .. } => MarmotStatus::InvalidCachedIdentityPage,
+        MarmotKitError::InvalidPublicEventReferences { .. } => {
+            MarmotStatus::InvalidPublicEventReferences
+        }
         MarmotKitError::ChatPresentationNotReady => MarmotStatus::ChatPresentationNotReady,
         MarmotKitError::DirectConversationIndexNotReady => {
             MarmotStatus::DirectConversationIndexNotReady
@@ -369,7 +371,6 @@ mod tests {
             MarmotKitError::CannotReportSelf,
             MarmotKitError::ModerationReportRateLimited,
             MarmotKitError::InvalidEditTarget,
-            MarmotKitError::EditRateLimited,
             MarmotKitError::ChatWindowInvalidLimit,
             MarmotKitError::ChatWindowStale,
             MarmotKitError::ChatWindowAnchorOutside,
@@ -395,6 +396,7 @@ mod tests {
             },
             MarmotKitError::InvalidGroupMembershipPage { max_groups: 1 },
             MarmotKitError::InvalidCachedIdentityPage { max_accounts: 1 },
+            MarmotKitError::InvalidPublicEventReferences { max_references: 1 },
             MarmotKitError::GroupHydrationPending {
                 group_id_hex: "aa".into(),
             },
@@ -547,10 +549,6 @@ mod tests {
         );
         assert_eq!(
             status_from_error(&MarmotKitError::InvalidEditTarget) as i32,
-            103
-        );
-        assert_eq!(
-            status_from_error(&MarmotKitError::EditRateLimited) as i32,
             104
         );
         assert_eq!(
