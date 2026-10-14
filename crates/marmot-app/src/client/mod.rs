@@ -4456,10 +4456,14 @@ impl AppClient {
                 }
                 intent
             }
-            // Recipients honor an edit only of an available chat message by the
-            // same author, so refuse anything else before publishing it to the
-            // group. Retained edits were checked at admission and keep their
-            // stamped identity; re-rejecting them here would erase their text.
+            // Fail fast on edits recipients would ignore: the target must be an
+            // available chat message by the same author in this device's view
+            // now. Recipients stay authoritative; a delete or convergence change
+            // landing after this check yields a harmlessly ignored edit, so it is
+            // not re-checked later. Retained edits were checked at admission and
+            // keep their stamped identity; re-rejecting them here would erase
+            // their text. `local_publish_failed` is a local delivery state that
+            // recipients never see, and the row can still be published.
             AppMessageIntent::Edit {
                 ref target_message_id,
                 ..

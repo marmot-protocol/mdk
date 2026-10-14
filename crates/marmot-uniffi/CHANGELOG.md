@@ -37,7 +37,7 @@
 
 ### Fixed
 
-- `edit_message` returns `InvalidEditTarget`, publishing nothing, unless the target is an available chat message this account sent. Before, an edit of another account's message, a reaction or a deleted message was published to the group and reported as sent, then ignored by every recipient.
+- `edit_message` returns `InvalidEditTarget`, publishing nothing, unless the target is an available chat message this account sent. Before, an edit of another account's message, a reaction or a deleted message was published to the group and reported as sent, then ignored by every recipient. The check uses this device's view when the edit is requested; recipients stay authoritative.
 
 ## 0.13.0 - 2026-10-12
 

@@ -399,10 +399,11 @@ impl MarmotApp {
                         "pending edit requires an outgoing text message".into(),
                     ));
                 }
-                // Same rule as direct edits, checked here because the prepared
-                // event later skips the send preflight: recipients drop edits of
-                // deleted or convergence-withdrawn messages. A failed publish
-                // awaiting retry stays editable.
+                // The same fail-fast rule as direct edits, applied at admission
+                // because the prepared event skips the send preflight and is not
+                // re-checked at publish. Best-effort against this device's view;
+                // recipients stay authoritative. A failed publish awaiting retry
+                // stays editable.
                 if original_row.deleted
                     || original_row
                         .invalidation_status
