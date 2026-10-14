@@ -11,7 +11,7 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
-- `wn messages edit` refuses, publishing nothing, unless the target is an available chat message this account sent, and reports `invalid_edit_target` in JSON output. A burst of edits of one message reports the retryable `edit_rate_limited` instead of publishing out of order. Both used to fall through to `command_failed` or publish an edit every recipient ignored.
+- `wn messages edit` refuses, publishing nothing, unless the target is an available chat message this account sent, and reports `invalid_edit_target` in JSON output. Before, it published an edit of another account's message, a reaction or a deleted message that every recipient ignored.
 - `wn-claude`, `wn-codex`, `wn-goose`, `wn-opencode` and `wn-pi` now bound
   each backend turn's output: 4 MiB per stdout record, 64 MiB of stdout, 1 MiB
   of assistant text and 256 reply chunks. A backend that exceeds a limit is

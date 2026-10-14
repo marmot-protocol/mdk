@@ -2753,6 +2753,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::InvalidChatPin(_)
         | AppError::InvalidGroupMembershipPage(_)
         | AppError::InvalidCachedIdentityPage(_)
+        | AppError::InvalidPublicEventReferences(_)
         | AppError::InvalidMessageDraft(_)
         | AppError::InvalidPublicKey
         | AppError::UnexpectedPrivateKey
@@ -2807,8 +2808,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::InvalidReportedPublicKey
         | AppError::CannotReportSelf
         | AppError::ModerationReportRateLimited
-        | AppError::InvalidEditTarget
-        | AppError::EditRateLimited => SubjectFailureCategory::ExpectedRefusal,
+        | AppError::InvalidEditTarget => SubjectFailureCategory::ExpectedRefusal,
         AppError::Account(_)
         | AppError::AccountHome(_)
         | AppError::Session(_)

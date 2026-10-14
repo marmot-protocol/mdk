@@ -56,10 +56,6 @@ pub enum MarmotKitError {
     /// account, deleted, or withdrawn by convergence; nothing was published.
     #[error("edit target must be an available self-authored chat message")]
     InvalidEditTarget,
-    /// Too many edits of one message in a burst; nothing was published.
-    /// Retry after a few seconds.
-    #[error("too many edits of this message; try again shortly")]
-    EditRateLimited,
     #[error("usage and diagnostics consent required")]
     ConsentRequired,
     #[error("invalid product analytics configuration")]
@@ -84,6 +80,8 @@ pub enum MarmotKitError {
     InvalidGroupMembershipPage { max_groups: u64 },
     #[error("cached identity page exceeds the maximum of {max_accounts} accounts")]
     InvalidCachedIdentityPage { max_accounts: u64 },
+    #[error("public event preview batch exceeds the maximum of {max_references} references")]
+    InvalidPublicEventReferences { max_references: u64 },
     /// The group exists but its full hydration has not completed yet
     /// (mdk#1161). Retryable: the runtime's background pipeline promotes the
     /// group shortly after account readiness, and worker-routed reads wait
@@ -417,7 +415,6 @@ impl From<&AppError> for MarmotKitError {
             AppError::CannotReportSelf => Self::CannotReportSelf,
             AppError::ModerationReportRateLimited => Self::ModerationReportRateLimited,
             AppError::InvalidEditTarget => Self::InvalidEditTarget,
-            AppError::EditRateLimited => Self::EditRateLimited,
             AppError::ProductAnalytics(marmot_app::ProductAnalyticsError::ConsentRequired) => {
                 Self::ConsentRequired
             }
@@ -488,6 +485,9 @@ impl From<&AppError> for MarmotKitError {
             AppError::DirectConversationIndexNotReady => Self::DirectConversationIndexNotReady,
             AppError::InvalidCachedIdentityPage(_) => Self::InvalidCachedIdentityPage {
                 max_accounts: marmot_app::MAX_CACHED_IDENTITY_PAGE_SIZE as u64,
+            },
+            AppError::InvalidPublicEventReferences(_) => Self::InvalidPublicEventReferences {
+                max_references: marmot_app::MAX_PUBLIC_EVENT_REFERENCES as u64,
             },
             AppError::InvalidChatPin(details) => Self::InvalidChatPin {
                 details: details.clone(),
@@ -725,10 +725,6 @@ mod tests {
             MarmotKitError::from(AppError::InvalidEditTarget),
             MarmotKitError::InvalidEditTarget
         ));
-        assert!(matches!(
-            MarmotKitError::from(AppError::EditRateLimited),
-            MarmotKitError::EditRateLimited
-        ));
     }
 
     #[test]
@@ -745,6 +741,16 @@ mod tests {
         assert!(matches!(
             ffi,
             MarmotKitError::InvalidGroupMembershipPage { max_groups: 100 }
+        ));
+    }
+
+    #[test]
+    fn oversized_public_event_batch_crosses_ffi_as_typed_variant() {
+        let ffi: MarmotKitError =
+            AppError::InvalidPublicEventReferences("too many references".into()).into();
+        assert!(matches!(
+            ffi,
+            MarmotKitError::InvalidPublicEventReferences { max_references: 16 }
         ));
     }
 

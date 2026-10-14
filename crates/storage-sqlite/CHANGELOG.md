@@ -48,6 +48,10 @@
   representation with a fallible reservation: a refused allocation is a
   storage error that keeps the checkpoint, not a process abort (mdk#2241).
 
+### Changed
+
+- Competing edits of one message in the same second now resolve to the lexically smallest edit event id, the NIP-01 tiebreak, so every client selects the same overlay; the largest id used to win. Edit history and its cursor use the same order. A row already projected with a tie keeps its previous overlay until its edits are re-projected.
+
 ## 0.13.0 - 2026-10-12
 
 Account storage advances from migration 101 through 107 on first open; downgrade

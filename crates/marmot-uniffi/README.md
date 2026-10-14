@@ -16,7 +16,8 @@ Read the documentation at the tag matching your binaries; `master` can describe 
 - Accounts and identity: [interactive account onboarding](#interactive-account-onboarding),
   [identity references and profiles](#identity-references-and-profiles),
   [KeyPackage inventory](#keypackage-inventory), [KeyPackage client preference](#keypackage-client-preference),
-  [public Nostr event verification](#public-nostr-event-verification)
+  [public Nostr event verification](#public-nostr-event-verification),
+  [public event previews](#public-event-previews)
 - Screens: [selected chat-list presentation](#selected-chat-list-presentation),
   [bounded chat screens](#bounded-chat-screens), [prepared conversation windows](#prepared-conversation-windows),
   [live timeline updates](#live-timeline-updates), [durable avatar access](#durable-avatar-access)
@@ -642,6 +643,20 @@ secret key. It checks both the canonical event ID and signature. A host must
 still enforce its own allowed authors, kinds, tags, and input-size limits.
 Malformed input and invalid signatures return `false`; it does not authenticate
 an MLS group message or replace MDK's relay ingestion checks.
+
+## Public event previews
+
+Event cards for `nostr:` references in message content read from an
+account-scoped cache, so a reopened chat renders prior previews in its first
+frame, offline included. Call `cachedPublicEventPreviews` (at most 16
+references, network-free) before layout, then `resolvePublicEventPreview` for
+each reference shown; it touches the network only for missing or stale rows.
+MDK fetches from safe relay hints and the configured directory relays, stores
+only verified events that match the reference, keeps the newest `naddr`
+version, and turns an author's NIP-09 deletion into a `Deleted` row. Event JSON is the signed
+event; shape its content for display on the host. Author names and avatars
+come from `cachedIdentityProjections`. See
+[the method reference](API-REFERENCE.md#marmotcached_public_event_previews).
 
 ## Selected chat-list presentation
 

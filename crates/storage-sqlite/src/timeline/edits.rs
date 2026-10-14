@@ -83,9 +83,18 @@ fn resolve<'a>(
             plaintext: e.plaintext.clone(),
         })
         .collect::<Vec<_>>();
+    versions.sort_by(|a, b| version_order(a).cmp(&version_order(b)));
     versions
-        .sort_by(|a, b| (a.edited_at, &a.message_id_hex).cmp(&(b.edited_at, &b.message_id_hex)));
-    versions
+}
+
+/// Accepted versions run oldest to effective: by `created_at`, then, for
+/// edits in the same second, the lexically smallest event id is the newer
+/// one (the NIP-01 tiebreak), so every client selects the same overlay.
+fn version_order(version: &TimelineEditVersion) -> (u64, std::cmp::Reverse<&str>) {
+    (
+        version.edited_at,
+        std::cmp::Reverse(version.message_id_hex.as_str()),
+    )
 }
 
 pub(super) fn accepted_versions_tx(
@@ -117,41 +126,6 @@ pub(super) fn apply(row: &mut TimelineRow, versions: &[TimelineEditVersion]) {
 }
 
 impl SqliteAccountStorage {
-    /// The newest timestamp `sender` put on any stored edit of `target`, whether
-    /// or not it is accepted right now. A target whose own publish is being
-    /// retried exposes no accepted edits, yet its earlier edits still compete by
-    /// `(second, event id)` once it recovers, so the next edit must follow them.
-    pub fn latest_authored_edit_at(
-        &self,
-        group: &str,
-        target: &str,
-        sender: &str,
-    ) -> StorageResult<Option<u64>> {
-        self.connection.with_deferred_read(|conn| {
-            let latest: Option<i64> = conn
-                .query_row_cached(
-                    "SELECT MAX(app_events.recorded_at)
-                     FROM message_modifier_edges AS edges
-                     CROSS JOIN app_events
-                       ON app_events.group_id_hex = edges.group_id_hex
-                      AND app_events.message_id_hex = edges.modifier_message_id_hex
-                     WHERE edges.group_id_hex = ?1
-                       AND edges.kind = ?2
-                       AND edges.target_message_id_hex = ?3
-                       AND app_events.sender = ?4",
-                    params![
-                        group,
-                        u64_to_i64(MARMOT_APP_EVENT_KIND_EDIT)?,
-                        target,
-                        sender
-                    ],
-                    |row| row.get(0),
-                )
-                .storage()?;
-            Ok(latest.map(|at| at.try_into().unwrap_or_default()))
-        })
-    }
-
     /// Read accepted edit history separately from the bounded screen payload.
     /// A cursor is an exclusive (timestamp, id) key, so it survives removal of its event.
     /// Output is capped at 100; resolution work is scoped to this target's retained edits.
@@ -194,7 +168,8 @@ impl SqliteAccountStorage {
             let row = timeline_row_from_chat(&event);
             let mut versions = accepted_versions_tx(conn, &row)?;
             if let Some((at, id)) = before {
-                versions.retain(|v| (v.edited_at, v.message_id_hex.as_str()) < (at, id.as_str()));
+                let cursor = (at, std::cmp::Reverse(id.as_str()));
+                versions.retain(|v| version_order(v) < cursor);
             }
             let has_more_before = versions.len() > limit;
             if has_more_before {

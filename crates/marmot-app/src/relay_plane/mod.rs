@@ -1807,6 +1807,25 @@ impl MarmotRelayPlane {
             .await
     }
 
+    /// Bounded read of public events for a message-content reference. Relay
+    /// hints come from other people's messages, so every endpoint passes the
+    /// discovered-endpoint safety rule; unsafe ones are dropped, not fatal.
+    pub(crate) async fn fetch_public_events(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        filters: Vec<Filter>,
+        max_events: usize,
+    ) -> Result<directory::PublicEventFetch, String> {
+        let endpoints = self
+            .inner
+            .relay_safety
+            .retain_safe_endpoints(endpoints, "public event fetch");
+        if endpoints.is_empty() {
+            return Err("public event fetch: no safe relay endpoints".to_owned());
+        }
+        directory::fetch_public_events(&endpoints, filters, max_events).await
+    }
+
     pub(crate) async fn fetch_directory_events_with_completion(
         &self,
         endpoints: Vec<TransportEndpoint>,

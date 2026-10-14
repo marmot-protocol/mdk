@@ -151,7 +151,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   state), `methods.rs` (the split `impl MarmotApp` block: relay-list/profile/key-package/follow-list fetches, the
   public `directory_*`/`*_user_directory` API, directory-cache lifecycle, and in-memory directory-record hydration),
   `cache.rs` (the per-account SQLCipher directory cache, with its independent numbered migration runner in
-  `cache/migrations.rs`, frozen initial schema in `cache/v1.sql`, and populated/interrupted-upgrade
+  `cache/migrations.rs`, frozen initial schema in `cache/v1.sql`, the public event preview table in `cache/v2.sql`, and populated/interrupted-upgrade
   tests in `cache/assurance_tests.rs` using the historical `cache/fixtures/pre_ledger.sql` fixture), and `sync.rs` (the directory-subscription sync worker and
   plan). `mod.rs` re-exports the DTOs so the `marmot_app::...` paths stay stable; private items referenced across these
   files (and from `tests.rs`/sibling test modules) are widened to `pub(crate)`, never narrowed.
@@ -286,7 +286,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `moderation_reports/tests.rs`), `history_notices.rs` (public notice DTOs and opaque id codec),
   `notifications.rs` (push platform, triggers, settings), `external_signer.rs` (`ExternalAccountSigner` and the
   internal `AccountSigner`), `nostr_secret.rs` (secret-key shape classification shared with CLI/UniFFI),
-  `nostr_verification.rs` (stateless public-event verification), `profile_pseudonyms.rs` (cosmetic display names; not a
+  `nostr_verification.rs` (stateless public-event verification), `public_event_preview.rs` (verified previews of
+  `nostr:` references, stored in the directory cache; tests in `public_event_preview/tests.rs`), `profile_pseudonyms.rs` (cosmetic display names; not a
   security primitive), `publisher_sequences.rs` (QUIC preview publisher lifecycle state), `agent_streams.rs` (agent
   stream watch DTOs and manager), `root_runtime_lease.rs` (cross-process exclusive root lease), `app_telemetry.rs` +
   `app_telemetry/` (aggregate app-performance telemetry; same privacy model as relay telemetry), `product_analytics/`
