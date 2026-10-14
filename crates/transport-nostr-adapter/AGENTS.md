@@ -129,13 +129,16 @@ for reconnect/backoff and relay status mechanics.
   always carries exactly `AccountRoutes::groups`. Activation packs every route (`pack_group_batches`) and numbers
   batches from 0. A group sync that changes the route set repacks every batch (`repacked_group_routes`): each route
   keeps the floor it was issued at, or starts at the sync's floor when the activation's replay coverage is complete;
-  the new batches go out before the replaced ones close, and replay coverage swaps them (`replace_replay_batches`), so
-  a sync's batches page like an activation's. Never append batches or leave a removed route in a live filter: that
+  the new batches enter replay coverage before their REQs go out (`stage_replay_batches`, as activation does, so an
+  early EOSE or stored page counts), go out before the replaced ones close, and the replaced ones leave coverage on
+  commit (`retire_replay_batches`); a failed or cancelled sync retires only its own uncommitted batches. A sync's
+  batches page like an activation's. Never append batches or leave a removed route in a live filter: that
   fragments batches back to the REQ limit, and a removed route's events still reach the relay client, which then
   suppresses the re-added route's replay of them. Batch numbers come from `AccountRoutes::next_batch`, which staging
   spends whether or not the sync commits, so no id is reused within an attempt. Coverage, refusals, lag repair and
   `account_subscription_ids` are per batch; a clamped batch replay pages its whole filter
-  (`NostrAcquisitionScope::GroupsWindow`) up to `REPLAY_PAGE_MAX_PAGES` per route it carries. Post-join maintenance
+  (`NostrAcquisitionScope::GroupsWindow`) up to `REPLAY_PAGE_MAX_PAGES` per route it carries; a full batch page that
+  cannot move past one second continues one window per route, and the batch counts only once every route's does. Post-join maintenance
   and one-shot fetches stay per route.
 - Recovery maintenance ids include the owner's durable attempt serial. A duplicate install joins only a live session;
   after failure, cancellation, removal or account reactivation, require a strictly greater serial for that account/group.

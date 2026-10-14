@@ -227,10 +227,11 @@ pub enum NostrSubscription {
     },
     /// The live REQ for up to [`GROUP_BATCH_ROUTES`] group routes that share
     /// endpoints and `since`: one filter whose `#h` values are their routing
-    /// ids. Activation packs every group route into batches; a group sync
-    /// adds batches for the routes it adds and closes a batch only once none
-    /// of its routes is live. `batch` numbers the account's batches within
-    /// its activation attempt, so an id names one batch's REQ for good.
+    /// ids. Activation packs every group route into batches, and a group
+    /// sync that changes the routes repacks them all and closes the batches
+    /// it replaced. `batch` numbers the account's batches within its
+    /// activation attempt, never reused, so an id names one batch's REQ for
+    /// good.
     GroupBatch {
         account_id: MemberId,
         routes: Vec<GroupBatchRoute>,
@@ -2116,18 +2117,85 @@ impl NostrTransportAdapter {
     /// reconciled events. Only then does the relay's EOSE count as coverage;
     /// a failed or over-long paging leaves it incomplete.
     async fn page_replay(&self, paging: ReplayPaging) {
-        let mut until = paging.until;
         let mut pages = 0;
         let mut delivered = 0;
-        let max_pages = paging.window.max_pages();
-        let complete = loop {
-            if pages == max_pages {
-                break false;
+        let mut outcome = self
+            .page_window(
+                &paging,
+                &paging.window,
+                paging.until,
+                paging.window.max_pages(),
+                &mut pages,
+                &mut delivered,
+            )
+            .await;
+        // A batch's routes share each page, so a full page can be one second
+        // of several routes' history that no single route fills. Past that
+        // second, each route pages on its own, as it would unbatched; the
+        // batch's replay counts only once every route's does.
+        if let PagedWindow::Saturated(until) = outcome {
+            let routes = paging.window.per_route();
+            if routes.len() > 1 {
+                outcome = PagedWindow::Complete;
+                for route in &routes {
+                    match self
+                        .page_window(
+                            &paging,
+                            route,
+                            until,
+                            route.max_pages(),
+                            &mut pages,
+                            &mut delivered,
+                        )
+                        .await
+                    {
+                        PagedWindow::Complete => {}
+                        other => {
+                            outcome = other;
+                            break;
+                        }
+                    }
+                }
             }
-            pages += 1;
+        }
+        if outcome == PagedWindow::Closed {
+            return;
+        }
+        let complete = outcome == PagedWindow::Complete;
+        if complete {
+            self.state.write().await.finish_replay_paging(&paging);
+        }
+        tracing::debug!(
+            target: "transport_nostr_adapter::adapter",
+            method = "page_replay",
+            pages,
+            delivered,
+            complete,
+            "paged a clamped relay replay"
+        );
+    }
+
+    /// Page one window of `paging`'s relay backwards from `until`, at most
+    /// `max_pages` pages, delivering what arrives to the REQ's account.
+    async fn page_window(
+        &self,
+        paging: &ReplayPaging,
+        window: &ReplayWindow,
+        mut until: u64,
+        max_pages: usize,
+        pages: &mut usize,
+        delivered: &mut usize,
+    ) -> PagedWindow {
+        let mut window_pages = 0;
+        loop {
+            if window_pages == max_pages {
+                return PagedWindow::Incomplete;
+            }
+            window_pages += 1;
+            *pages += 1;
             let request = NostrAcquisitionRequest {
                 account_id: paging.account_id.clone(),
-                scope: paging.window.acquisition_scope(until),
+                scope: window.acquisition_scope(until),
                 endpoints: vec![paging.endpoint.clone()],
                 limits: REPLAY_PAGE_LIMITS,
             };
@@ -2138,12 +2206,12 @@ impl NostrTransportAdapter {
             {
                 Ok(mut result) => match result.endpoints.pop() {
                     Some(page) => page,
-                    None => break false,
+                    None => return PagedWindow::Incomplete,
                 },
                 // A backend that cannot page cannot prove the older history
                 // was served, so the replay stays incomplete.
-                Err(NostrAcquisitionError::Unsupported) => break false,
-                Err(NostrAcquisitionError::InvalidRequest) => break false,
+                Err(NostrAcquisitionError::Unsupported) => return PagedWindow::Incomplete,
+                Err(NostrAcquisitionError::InvalidRequest) => return PagedWindow::Incomplete,
             };
             let received = page.events.len();
             let oldest = page.events.iter().map(|event| event.created_at).min();
@@ -2157,41 +2225,32 @@ impl NostrTransportAdapter {
                     .handle_reconciled_event(&paging.account_id, relay_event)
                     .await
                 {
-                    Ok(count) => delivered += count,
+                    Ok(count) => *delivered += count,
                     // Only a closed delivery channel ends paging. An event that
                     // does not map (bad encoding, signature or tag shape) is
                     // skipped, as the live replay skips it; returning would
                     // leave the relay in paging and wedge the cursor.
-                    Err(TransportAdapterError::Closed) => return,
+                    Err(TransportAdapterError::Closed) => return PagedWindow::Closed,
                     Err(_) => {}
                 }
             }
             if page.end != NostrAcquisitionEnd::RequestPolicySatisfied {
-                break false;
+                return PagedWindow::Incomplete;
             }
             // `until` is inclusive, so the next page repeats the boundary
             // second; duplicates are harmless. A full page that cannot move
             // past that second is saturated by it: the rest of that second and
-            // everything older may be unfetched, so it stays incomplete.
+            // everything older may be unfetched.
             match oldest {
                 Some(oldest) if received >= RELAY_REPLAY_PAGE_LIMIT && oldest < until => {
                     until = oldest;
                 }
-                Some(_) if received >= RELAY_REPLAY_PAGE_LIMIT => break false,
-                _ => break true,
+                Some(_) if received >= RELAY_REPLAY_PAGE_LIMIT => {
+                    return PagedWindow::Saturated(until);
+                }
+                _ => return PagedWindow::Complete,
             }
-        };
-        if complete {
-            self.state.write().await.finish_replay_paging(&paging);
         }
-        tracing::debug!(
-            target: "transport_nostr_adapter::adapter",
-            method = "page_replay",
-            pages,
-            delivered,
-            complete,
-            "paged a clamped relay replay"
-        );
     }
 }
 
@@ -2403,6 +2462,7 @@ impl TransportAdapter for NostrTransportAdapter {
         {
             let mut state = self.state.write().await;
             state.stage_subscription_starts(&batches, now_ms);
+            state.stage_replay_batches(&sync.account_id, &batches);
             state.stage_group_routes(&to_add);
             // Spend the batch numbers whether or not this sync commits: a
             // failed sync's batch may still be closing under its id, which a
@@ -2423,12 +2483,14 @@ impl TransportAdapter for NostrTransportAdapter {
         let cleanup_client = Arc::clone(&self.relay_client);
         let cleanup_barriers = Arc::clone(&self.subscribe_tasks);
         let cleanup_batch = batches.clone();
+        let cleanup_account = sync.account_id.clone();
         tokio::spawn(async move {
             let _subscription_guard = subscription_guard;
             if staging_abandoned.await.is_err() {
                 {
                     let mut state = cleanup_state.write().await;
                     state.rollback_staged_subscription_starts();
+                    state.retire_unlive_replay_batches(&cleanup_account, &cleanup_batch);
                     state.rebuild_transport_group_index();
                 }
                 close_abandoned_sync_batch(
@@ -2451,6 +2513,7 @@ impl TransportAdapter for NostrTransportAdapter {
             {
                 let mut state = self.state.write().await;
                 state.rollback_staged_subscription_starts();
+                state.retire_unlive_replay_batches(&sync.account_id, &batches);
                 state.rebuild_transport_group_index();
             }
             close_abandoned_sync_batch(
@@ -2474,7 +2537,7 @@ impl TransportAdapter for NostrTransportAdapter {
             state.commit_staged_subscription_starts();
             let account_id = sync.account_id.clone();
             let replaced = state.sync_groups(sync, &desired, &batches);
-            state.replace_replay_batches(&account_id, &replaced, &batches);
+            state.retire_replay_batches(&account_id, &replaced);
             state.forget_subscription_starts(&replaced);
             state.queue_pending_unsubscribes(replaced);
         };
@@ -2728,6 +2791,20 @@ impl ReplayWindow {
         }
     }
 
+    /// One window per route this window covers, with its floor.
+    fn per_route(&self) -> Vec<ReplayWindow> {
+        match &self.scope {
+            ReplayScope::Inbox => vec![self.clone()],
+            ReplayScope::Groups(ids) => ids
+                .iter()
+                .map(|id| ReplayWindow {
+                    scope: ReplayScope::Groups(vec![*id]),
+                    since: self.since,
+                })
+                .collect(),
+        }
+    }
+
     /// The most backward pages a replay of this window may take: the
     /// per-route bound for each route its REQ carries.
     fn max_pages(&self) -> usize {
@@ -2736,6 +2813,20 @@ impl ReplayWindow {
             ReplayScope::Groups(ids) => REPLAY_PAGE_MAX_PAGES.saturating_mul(ids.len().max(1)),
         }
     }
+}
+
+/// How one window's backward paging ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PagedWindow {
+    /// A page came back short: the window's history up to its floor is in.
+    Complete,
+    /// Paging stopped short of the floor: a failed page, an unsupported
+    /// backend, or the page bound.
+    Incomplete,
+    /// A full page could not move past this inclusive second.
+    Saturated(u64),
+    /// The delivery channel closed.
+    Closed,
 }
 
 /// How many stored events one relay sent for one REQ before EOSE, and the
@@ -3153,17 +3244,12 @@ impl AdapterState {
         replaced
     }
 
-    /// Swap a repack's batches into the account's replay coverage: the
-    /// replaced batches leave it, and the new ones await their relays'
-    /// replay. The new batches carry every wanted route from no later a floor
-    /// than it was proven from, so a route's obligation is replaced, never
-    /// dropped; a route the sync removed is no longer owed.
-    fn replace_replay_batches(
-        &mut self,
-        account_id: &MemberId,
-        replaced: &[NostrSubscription],
-        batches: &[NostrSubscription],
-    ) {
+    /// Add a repack's batches to the account's replay coverage before their
+    /// REQs go out, as activation does, so a relay's stored events, EOSE or
+    /// refusal for them count however soon they arrive. Until the sync
+    /// commits, the batches they replace stay in coverage too, which only
+    /// asks more of it.
+    fn stage_replay_batches(&mut self, account_id: &MemberId, batches: &[NostrSubscription]) {
         let entries = batches
             .iter()
             .map(|batch| {
@@ -3182,17 +3268,46 @@ impl AdapterState {
         let Some(coverage) = self.account_replay_coverage.get_mut(account_id) else {
             return;
         };
-        for batch in replaced {
-            let id = batch.subscription_id();
-            coverage.subscriptions.remove(&id);
-            coverage.windows.remove(&id);
-            coverage.stored.retain(|(stored, _), _| stored != &id);
-        }
         for (id, relays, window) in entries {
             if let Some(window) = window {
                 coverage.windows.insert(id.clone(), window);
             }
             coverage.subscriptions.insert(id, relays);
+        }
+    }
+
+    /// Drop a repack's staged batches from replay coverage when its sync
+    /// failed or was cancelled before committing them. A sync cancelled after
+    /// its commit keeps them: they are live.
+    fn retire_unlive_replay_batches(
+        &mut self,
+        account_id: &MemberId,
+        batches: &[NostrSubscription],
+    ) {
+        let abandoned = batches
+            .iter()
+            .filter(|batch| {
+                self.live_subscription_route(&batch.subscription_id())
+                    .is_none()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        self.retire_replay_batches(account_id, &abandoned);
+    }
+
+    /// Drop batches from the account's replay coverage: those a committed
+    /// repack replaced, whose routes its own batches now carry from no later
+    /// a floor, or a failed repack's own. A route the sync removed is no
+    /// longer owed.
+    fn retire_replay_batches(&mut self, account_id: &MemberId, batches: &[NostrSubscription]) {
+        let Some(coverage) = self.account_replay_coverage.get_mut(account_id) else {
+            return;
+        };
+        for batch in batches {
+            let id = batch.subscription_id();
+            coverage.subscriptions.remove(&id);
+            coverage.windows.remove(&id);
+            coverage.stored.retain(|(stored, _), _| stored != &id);
         }
     }
 
@@ -3429,14 +3544,12 @@ impl AdapterState {
     /// Subscription ids implied by an account's stored routes: its inbox plus
     /// one per live group batch.
     ///
-    /// Ids are derived from account/group/endpoint state plus the activation
-    /// attempt stored alongside those routes — never `since`. `since` is not
-    /// recorded with the routes and could not be reconstructed here, which is
-    /// why it stays out of the id; the attempt is recorded, so it can. That
-    /// keeps the reconstructed ids byte-identical to the ones recorded at
-    /// subscribe time while still separating one attempt's REQs from the next
-    /// attempt's over the same routes. Empty for an account with no stored
-    /// routes.
+    /// The inbox id is rebuilt from its endpoints and the activation attempt
+    /// stored with the routes (never `since`, which is not stored), so it is
+    /// byte-identical to the one sent. Batch ids are read from the stored
+    /// batches, never rebuilt from the routes: batch numbers come from a
+    /// counter a failed sync also spends, so they are not a function of the
+    /// route set. Empty for an account with no stored routes.
     fn account_subscription_ids(&self, account_id: &MemberId) -> Vec<String> {
         let Some(routes) = self.accounts.get(account_id) else {
             return Vec::new();

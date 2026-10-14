@@ -1610,6 +1610,57 @@ async fn a_synced_batch_replay_past_500_events_is_paged_for_every_group() {
     fx.shutdown().await;
 }
 
+/// A batch's routes share each page, so a full page can be one second of
+/// several routes' history: 50 groups with 10 events each in the newest
+/// second fill it, and paging the batch cannot move past that second. Each
+/// route then pages on its own, as it would unbatched, and the older history
+/// behind that second still arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_page_saturated_by_one_second_is_paged_per_route() {
+    const NEWEST: usize = 10;
+    const OLDER: usize = 5;
+    let fx = Fixture::new(LimitConfig::default(), false).await;
+    let keys = Keys::generate();
+    for group in 0..GROUP_BATCH_ROUTES {
+        for index in 0..NEWEST + OLDER {
+            let created_at = if index < NEWEST {
+                1_700_100_000
+            } else {
+                1_700_000_000 + (group * OLDER + index) as u64
+            };
+            let event = EventBuilder::new(Kind::MlsGroupMessage, format!("second-{group}-{index}"))
+                .tags([Tag::custom("h", [hex::encode(route(group))])])
+                .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(created_at))
+                .finalize(&keys)
+                .unwrap();
+            fx.database
+                .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+                .await
+                .unwrap();
+        }
+    }
+    let url = fx.limit.url();
+    fx.adapter
+        .activate_account(
+            fx.activation(std::slice::from_ref(&url), groups(GROUP_BATCH_ROUTES, &url)),
+        )
+        .await
+        .unwrap();
+    let delivered = distinct_deliveries(&fx.adapter, Duration::from_secs(15)).await;
+    let complete = fx
+        .adapter
+        .account_subscription_eose(&fx.account)
+        .await
+        .complete();
+    eprintln!(
+        "[h] saturated batch delivered={delivered} complete={complete} {}",
+        fx.limit.stats().summary()
+    );
+    assert_eq!(delivered, GROUP_BATCH_ROUTES * (NEWEST + OLDER));
+    assert!(complete, "every route's own paging completed");
+    fx.shutdown().await;
+}
+
 /// Groups joined one sync at a time stay packed: 199 joins on top of an
 /// inbox hold the same few REQs one activation of 199 groups would, far
 /// from the relay's limit. Each repack briefly holds both packings.

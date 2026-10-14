@@ -1227,6 +1227,18 @@ async fn stored_events_replayed_during_group_sync_subscribe_are_delivered() {
         })
         .await
         .expect("initial group sync succeeds");
+    // The relay answered the sync's batch with EOSE before its subscribe
+    // returned. The batch was in replay coverage before its REQ went out, so
+    // that answer counts; the inbox here never answers.
+    let coverage = adapter.account_subscription_eose(&account_id).await;
+    assert_eq!(
+        (
+            coverage.relay_subscription_attempts,
+            coverage.relay_subscription_attempts_with_eose
+        ),
+        (2, 1),
+        "an EOSE that arrives while the sync subscribes counts"
+    );
     let initial_delivery = adapter.receive().await.unwrap().unwrap();
     assert_eq!(initial_delivery.group_id_hint, Some(old_group_id.clone()));
     relay.replayed_deliveries.store(0, Ordering::SeqCst);
@@ -1249,6 +1261,15 @@ async fn stored_events_replayed_during_group_sync_subscribe_are_delivered() {
         })
         .await
         .expect("replacement group sync succeeds");
+    let coverage = adapter.account_subscription_eose(&account_id).await;
+    assert_eq!(
+        (
+            coverage.relay_subscription_attempts,
+            coverage.relay_subscription_attempts_with_eose
+        ),
+        (2, 1),
+        "the replacing batch's early EOSE counts, and the replaced batch left coverage"
+    );
 
     assert_eq!(
         relay.replayed_deliveries.load(Ordering::SeqCst),
