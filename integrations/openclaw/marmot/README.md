@@ -55,7 +55,8 @@ Verify both tools in the installed release. See [Admin group profile tool](#admi
   See [first file verification](#verify-text-and-files-separately).
 - **Reply, react, edit and retract own messages.** Normal assistant replies
   need no manual target. Explicit `message` sends target the MLS group id (a DM
-  is also a group); the registered delete action retracts a prior own message.
+  is also a group); the registered delete action retracts a prior own message
+  in the authorized `to` or current conversation.
   `message(action: "edit", messageId: <id>, message: <new text>)` replaces the
   text of a message the agent sent, keeping its place in the conversation (for
   example a status line); only the agent's own available chat messages can be
@@ -576,9 +577,11 @@ contain only fixed reason classes and aggregate limits/counts, never identifiers
   `delete_message` (kind-5, `MarmotAppRuntime::delete_message`), and inbound
   kind-5 deletions from other members surface as a `message_deleted` event,
   routed to the agent as quiet ambient context (below). The agent-facing delete
-  message action is wired through the channel's `base.actions` adapter: it first
-  uses the bounded send-time `messageId → {account, group}` cache, then falls
-  back to an explicit `to` group id when the cache misses.
+  message action is wired through the channel's `base.actions` adapter. Like
+  edit, it acts only in the host-authorized explicit `to` or current
+  conversation; the bounded send-time `messageId → {account, group}` cache only
+  fills in a missing target, and a message sent to a different conversation is
+  refused.
 - **Group state changes**: durable, MLS-authenticated changes (member
   add/remove/leave, admin grant/revoke, rename/avatar) surface as a
   `group_state_changed` event carrying only a coarse `change` kind and, for a

@@ -56,7 +56,7 @@ function deleteCtx(params: Record<string, unknown>): ChannelMessageActionContext
 
 function editCtx(
   params: Record<string, unknown>,
-  toolContext: { currentMessagingTarget?: string; currentChannelId?: string } = {},
+  toolContext: { currentChannelId?: string; currentMessagingTarget?: string } = {},
 ): ChannelMessageActionContext {
   return {
     channel: "marmot",
@@ -440,7 +440,6 @@ describe("resolveMarmotChannelAccount", () => {
 describe("createMarmotMessageActionAdapter", () => {
   it("owns delete and react so core durable sends can fall through", () => {
     const adapter = createMarmotMessageActionAdapter({
-      deleteByMessageId: async () => false,
       resolveTarget: async () => ({
         client: messageActionClient(),
         marmotAccountIdHex: HEX32("aa"),
@@ -454,7 +453,6 @@ describe("createMarmotMessageActionAdapter", () => {
 
   it("declares delete, edit and react through describeMessageTool", () => {
     const adapter = createMarmotMessageActionAdapter({
-      deleteByMessageId: async () => false,
       resolveTarget: async () => ({
         client: messageActionClient(),
         marmotAccountIdHex: HEX32("aa"),
@@ -468,7 +466,6 @@ describe("createMarmotMessageActionAdapter", () => {
   it("edits a sent message routed through the send-time cache", async () => {
     const editMessage = vi.fn(async () => undefined);
     const adapter = createMarmotMessageActionAdapter({
-      deleteByMessageId: async () => false,
       sentTargetFor: (id) =>
         id === HEX32("99") ? { marmotAccountIdHex: HEX32("ab"), groupIdHex: HEX32("cd") } : undefined,
       resolveTarget: async () => ({
@@ -488,7 +485,6 @@ describe("createMarmotMessageActionAdapter", () => {
   it("refuses to edit a cached message from another conversation than the authorized target", async () => {
     const editMessage = vi.fn(async () => undefined);
     const adapter = createMarmotMessageActionAdapter({
-      deleteByMessageId: async () => false,
       sentTargetFor: () => ({ marmotAccountIdHex: HEX32("ab"), groupIdHex: HEX32("bb") }),
       resolveTarget: async () => ({
         client: messageActionClient({ editMessage }),
@@ -515,39 +511,58 @@ describe("createMarmotMessageActionAdapter", () => {
     expect(editMessage).not.toHaveBeenCalled();
   });
 
-  it("treats the bound turn's currentChannelId as the authorized group", async () => {
+  it("keeps a targetless edit in the bound conversation the host supplies as currentChannelId", async () => {
     const editMessage = vi.fn(async () => undefined);
-    const cache = new Map([[HEX32("99"), { marmotAccountIdHex: HEX32("ab"), groupIdHex: HEX32("bb") }]]);
+    const cached = new Map([[HEX32("99"), { marmotAccountIdHex: HEX32("ab"), groupIdHex: HEX32("bb") }]]);
     const adapter = createMarmotMessageActionAdapter({
-      deleteByMessageId: async () => false,
-      sentTargetFor: (id) => cache.get(id),
+      sentTargetFor: (id) => cached.get(id),
       resolveTarget: async () => ({
         client: messageActionClient({ editMessage }),
         marmotAccountIdHex: HEX32("aa"),
       }),
     });
-    // Pinned OpenClaw binds a Marmot turn via currentChannelId only; the
-    // documented call has no `to`, so the host's cross-context guard sees none.
-    const bound = { currentChannelId: HEX32("cc") };
 
-    const crossConversation = await adapter.handleAction!(
-      editCtx({ messageId: HEX32("99"), message: "x" }, bound),
+    // The pinned host binds the turn to group A via `currentChannelId` only and
+    // does not infer `to` for an edit. A cached message in group B is refused.
+    const crossGroup = await adapter.handleAction!(
+      editCtx({ messageId: HEX32("99"), message: "x" }, { currentChannelId: HEX32("cc") }),
     );
-    expect(resultError(crossConversation)).toMatch(/different conversation/);
+    expect(resultOk(crossGroup)).toBe(false);
+    expect(resultError(crossGroup)).toMatch(/different conversation than the edit target/);
     expect(editMessage).not.toHaveBeenCalled();
 
-    const cacheMiss = await adapter.handleAction!(
-      editCtx({ messageId: HEX32("98"), message: "status: done" }, bound),
+    // An uncached message is edited in the bound conversation.
+    const uncached = await adapter.handleAction!(
+      editCtx({ messageId: HEX32("98"), message: "x" }, { currentChannelId: HEX32("cc") }),
     );
-    expect(resultOk(cacheMiss)).toBe(true);
-    expect(editMessage).toHaveBeenCalledWith(HEX32("aa"), HEX32("cc"), HEX32("98"), "status: done");
+    expect(resultOk(uncached)).toBe(true);
+    expect(editMessage).toHaveBeenCalledWith(HEX32("aa"), HEX32("cc"), HEX32("98"), "x");
+  });
+
+  it("refuses a delete of a cached message from another group than currentChannelId", async () => {
+    const deleteMessage = vi.fn(async () => undefined);
+    const adapter = createMarmotMessageActionAdapter({
+      sentTargetFor: () => ({ marmotAccountIdHex: HEX32("ab"), groupIdHex: HEX32("bb") }),
+      resolveTarget: async () => ({
+        client: messageActionClient({ deleteMessage }),
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+    });
+
+    const result = await adapter.handleAction!({
+      ...deleteCtx({ messageId: HEX32("99") }),
+      toolContext: { currentChannelId: HEX32("cc") },
+    } as ChannelMessageActionContext);
+
+    expect(resultOk(result)).toBe(false);
+    expect(resultError(result)).toMatch(/different conversation than the delete target/);
+    expect(deleteMessage).not.toHaveBeenCalled();
   });
 
   it("does not let a blank or non-Marmot `to` hide the bound group", async () => {
     const editMessage = vi.fn(async () => undefined);
     const cache = new Map([[HEX32("99"), { marmotAccountIdHex: HEX32("ab"), groupIdHex: HEX32("bb") }]]);
     const adapter = createMarmotMessageActionAdapter({
-      deleteByMessageId: async () => false,
       sentTargetFor: (id) => cache.get(id),
       resolveTarget: async () => ({
         client: messageActionClient({ editMessage }),
@@ -575,10 +590,42 @@ describe("createMarmotMessageActionAdapter", () => {
     expect(editMessage).toHaveBeenCalledWith(HEX32("aa"), HEX32("cc"), HEX32("98"), "status: done");
   });
 
+  it("does not let a blank or non-Marmot `to` hide the bound group for a delete", async () => {
+    const deleteMessage = vi.fn(async () => undefined);
+    const cache = new Map([[HEX32("99"), { marmotAccountIdHex: HEX32("ab"), groupIdHex: HEX32("bb") }]]);
+    const adapter = createMarmotMessageActionAdapter({
+      sentTargetFor: (id) => cache.get(id),
+      resolveTarget: async () => ({
+        client: messageActionClient({ deleteMessage }),
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+    });
+    const boundDelete = (params: Record<string, unknown>) =>
+      ({
+        ...deleteCtx(params),
+        toolContext: { currentChannelId: HEX32("cc") },
+      }) as ChannelMessageActionContext;
+
+    for (const to of ["", "   "]) {
+      const crossConversation = await adapter.handleAction!(
+        boundDelete({ messageId: HEX32("99"), to }),
+      );
+      expect(resultError(crossConversation)).toMatch(/different conversation than the delete target/);
+    }
+    const notMarmot = await adapter.handleAction!(
+      boundDelete({ messageId: HEX32("99"), to: "telegram:12345" }),
+    );
+    expect(resultError(notMarmot)).toMatch(/delete target is not a Marmot conversation/);
+    expect(deleteMessage).not.toHaveBeenCalled();
+
+    const blankOnCacheMiss = await adapter.handleAction!(boundDelete({ messageId: HEX32("98"), to: "" }));
+    expect(resultOk(blankOnCacheMiss)).toBe(true);
+    expect(deleteMessage).toHaveBeenCalledWith(HEX32("aa"), HEX32("cc"), HEX32("98"));
+  });
+
   it("edits a cached message when it matches the authorized target", async () => {
     const editMessage = vi.fn(async () => undefined);
     const adapter = createMarmotMessageActionAdapter({
-      deleteByMessageId: async () => false,
       sentTargetFor: () => ({ marmotAccountIdHex: HEX32("ab"), groupIdHex: HEX32("cc") }),
       resolveTarget: async () => ({
         client: messageActionClient({ editMessage }),
@@ -597,7 +644,6 @@ describe("createMarmotMessageActionAdapter", () => {
   it("edits in the current conversation on a cache miss", async () => {
     const editMessage = vi.fn(async () => undefined);
     const adapter = createMarmotMessageActionAdapter({
-      deleteByMessageId: async () => false,
       resolveTarget: async () => ({
         client: messageActionClient({ editMessage }),
         marmotAccountIdHex: HEX32("aa"),
@@ -618,7 +664,6 @@ describe("createMarmotMessageActionAdapter", () => {
   it("requires a message id, replacement text and a group before editing", async () => {
     const editMessage = vi.fn(async () => undefined);
     const adapter = createMarmotMessageActionAdapter({
-      deleteByMessageId: async () => false,
       resolveTarget: async () => ({
         client: messageActionClient({ editMessage }),
         marmotAccountIdHex: HEX32("aa"),
@@ -639,7 +684,6 @@ describe("createMarmotMessageActionAdapter", () => {
       [HEX32("01")]: new AgentControlError("refused", { code: "invalid_edit_target" }),
     };
     const adapter = createMarmotMessageActionAdapter({
-      deleteByMessageId: async () => false,
       resolveTarget: async () => ({
         client: messageActionClient({
           editMessage: async (_account, _group, id) => {
@@ -657,24 +701,79 @@ describe("createMarmotMessageActionAdapter", () => {
     expect(resultError(refused)).toMatch(/this agent sent/);
   });
 
-  it("deletes via the send-time cache on a cache hit", async () => {
-    const deleteByMessageId = vi.fn(async () => true);
+  it("deletes via the send-time cache when no target is given", async () => {
+    const deleteMessage = vi.fn(async () => undefined);
     const resolveTarget = vi.fn(async () => ({
-      client: messageActionClient({ deleteMessage: vi.fn(async () => undefined) }),
+      client: messageActionClient({ deleteMessage }),
       marmotAccountIdHex: HEX32("aa"),
     }));
-    const adapter = createMarmotMessageActionAdapter({ deleteByMessageId, resolveTarget });
+    const adapter = createMarmotMessageActionAdapter({
+      sentTargetFor: (id) =>
+        id === HEX32("99") ? { marmotAccountIdHex: HEX32("ab"), groupIdHex: HEX32("cd") } : undefined,
+      resolveTarget,
+    });
 
     const result = await adapter.handleAction!(deleteCtx({ messageId: HEX32("99") }));
 
-    // The cache-hit delete must carry the action's routing context so it resolves
-    // the correct account/client in a multi-account deployment.
-    expect(deleteByMessageId).toHaveBeenCalledWith(HEX32("99"), {
-      cfg: {},
-      accountId: undefined,
-    });
-    expect(resolveTarget).not.toHaveBeenCalled();
+    // The delete must carry the action's routing context so it resolves the
+    // correct account/client in a multi-account deployment.
+    expect(resolveTarget).toHaveBeenCalledWith({}, null);
+    expect(deleteMessage).toHaveBeenCalledWith(HEX32("ab"), HEX32("cd"), HEX32("99"));
     expect(resultOk(result)).toBe(true);
+  });
+
+  it("refuses to delete a cached message from another conversation than the authorized target", async () => {
+    const deleteMessage = vi.fn(async () => undefined);
+    const adapter = createMarmotMessageActionAdapter({
+      sentTargetFor: () => ({ marmotAccountIdHex: HEX32("ab"), groupIdHex: HEX32("bb") }),
+      resolveTarget: async () => ({
+        client: messageActionClient({ deleteMessage }),
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+    });
+
+    // The host checked cross-context policy against group A (explicit `to`, or
+    // the current conversation); the message was sent to group B. Nothing may
+    // be deleted in B.
+    const explicit = await adapter.handleAction!(
+      deleteCtx({ messageId: HEX32("99"), to: HEX32("cc") }),
+    );
+    const current = await adapter.handleAction!({
+      ...deleteCtx({ messageId: HEX32("99") }),
+      toolContext: { currentMessagingTarget: `marmot:${HEX32("cc")}` },
+    } as ChannelMessageActionContext);
+
+    for (const result of [explicit, current]) {
+      expect(resultOk(result)).toBe(false);
+      expect(resultError(result)).toMatch(/different conversation than the delete target/);
+    }
+    expect(deleteMessage).not.toHaveBeenCalled();
+  });
+
+  it("deletes a cached message when it matches the authorized target", async () => {
+    const deleteMessage = vi.fn(async () => undefined);
+    const adapter = createMarmotMessageActionAdapter({
+      sentTargetFor: () => ({ marmotAccountIdHex: HEX32("ab"), groupIdHex: HEX32("cc") }),
+      resolveTarget: async () => ({
+        client: messageActionClient({ deleteMessage }),
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+    });
+
+    const explicit = await adapter.handleAction!(
+      deleteCtx({ messageId: HEX32("99"), to: `marmot:${HEX32("cc").toUpperCase()}` }),
+    );
+    const current = await adapter.handleAction!({
+      ...deleteCtx({ messageId: HEX32("99") }),
+      toolContext: { currentMessagingTarget: `marmot:${HEX32("cc")}` },
+    } as ChannelMessageActionContext);
+
+    expect(resultOk(explicit)).toBe(true);
+    expect(resultOk(current)).toBe(true);
+    expect(deleteMessage.mock.calls).toEqual([
+      [HEX32("ab"), HEX32("cc"), HEX32("99")],
+      [HEX32("ab"), HEX32("cc"), HEX32("99")],
+    ]);
   });
 
   it("falls back to the explicit `to` group on a cache miss", async () => {
@@ -686,7 +785,6 @@ describe("createMarmotMessageActionAdapter", () => {
       },
     });
     const adapter = createMarmotMessageActionAdapter({
-      deleteByMessageId: async () => false,
       resolveTarget: async () => ({ client, marmotAccountIdHex: HEX32("aa") }),
     });
 
@@ -702,7 +800,6 @@ describe("createMarmotMessageActionAdapter", () => {
 
   it("returns an error when messageId is missing", async () => {
     const adapter = createMarmotMessageActionAdapter({
-      deleteByMessageId: async () => false,
       resolveTarget: async () => ({
         client: messageActionClient(),
         marmotAccountIdHex: HEX32("aa"),
@@ -717,7 +814,6 @@ describe("createMarmotMessageActionAdapter", () => {
   it("errors on a cache miss with no `to` group to fall back to", async () => {
     const deleteMessage = vi.fn(async () => undefined);
     const adapter = createMarmotMessageActionAdapter({
-      deleteByMessageId: async () => false,
       resolveTarget: async () => ({
         client: messageActionClient({ deleteMessage }),
         marmotAccountIdHex: HEX32("aa"),
@@ -733,7 +829,6 @@ describe("createMarmotMessageActionAdapter", () => {
   it("adds a reaction to the current inbound message with a prefixed target", async () => {
     const sendReaction = vi.fn(async () => undefined);
     const adapter = createMarmotMessageActionAdapter({
-      deleteByMessageId: async () => false,
       resolveTarget: async () => ({
         client: messageActionClient({ sendReaction }),
         marmotAccountIdHex: HEX32("aa"),
@@ -759,7 +854,6 @@ describe("createMarmotMessageActionAdapter", () => {
   it("honors the message_id alias over the current inbound message", async () => {
     const sendReaction = vi.fn(async () => undefined);
     const adapter = createMarmotMessageActionAdapter({
-      deleteByMessageId: async () => false,
       resolveTarget: async () => ({
         client: messageActionClient({ sendReaction }),
         marmotAccountIdHex: HEX32("aa"),
@@ -784,7 +878,6 @@ describe("createMarmotMessageActionAdapter", () => {
   it("removes all reactions only when remove is explicit and emoji is empty", async () => {
     const removeReaction = vi.fn(async () => undefined);
     const adapter = createMarmotMessageActionAdapter({
-      deleteByMessageId: async () => false,
       resolveTarget: async () => ({
         client: messageActionClient({ removeReaction }),
         marmotAccountIdHex: HEX32("aa"),
@@ -810,7 +903,6 @@ describe("createMarmotMessageActionAdapter", () => {
       marmotAccountIdHex: HEX32("aa"),
     }));
     const adapter = createMarmotMessageActionAdapter({
-      deleteByMessageId: async () => false,
       resolveTarget,
     });
     const toolContext = {
@@ -832,7 +924,6 @@ describe("createMarmotMessageActionAdapter", () => {
       marmotAccountIdHex: HEX32("aa"),
     }));
     const adapter = createMarmotMessageActionAdapter({
-      deleteByMessageId: async () => false,
       resolveTarget,
     });
 
@@ -847,7 +938,6 @@ describe("createMarmotMessageActionAdapter", () => {
 
   it("treats an already-absent reaction as an idempotent removal", async () => {
     const adapter = createMarmotMessageActionAdapter({
-      deleteByMessageId: async () => false,
       resolveTarget: async () => ({
         client: messageActionClient({
           removeReaction: async () => {
@@ -874,7 +964,6 @@ describe("createMarmotMessageActionAdapter", () => {
   it("removes the bot's reaction when remove is true even with an emoji", async () => {
     const removeReaction = vi.fn(async () => undefined);
     const adapter = createMarmotMessageActionAdapter({
-      deleteByMessageId: async () => false,
       resolveTarget: async () => ({
         client: messageActionClient({ removeReaction }),
         marmotAccountIdHex: HEX32("aa"),
@@ -899,7 +988,6 @@ describe("createMarmotMessageActionAdapter", () => {
 
   it("returns a privacy-safe reaction failure", async () => {
     const adapter = createMarmotMessageActionAdapter({
-      deleteByMessageId: async () => false,
       resolveTarget: async () => ({
         client: messageActionClient({
           sendReaction: async () => { throw new Error("secret socket detail"); },
@@ -921,7 +1009,6 @@ describe("createMarmotMessageActionAdapter", () => {
 
   it("sanitizes failures while resolving a reaction target", async () => {
     const adapter = createMarmotMessageActionAdapter({
-      deleteByMessageId: async () => false,
       resolveTarget: async () => {
         throw new Error("secret socket path");
       },
@@ -940,7 +1027,6 @@ describe("createMarmotMessageActionAdapter", () => {
 
   it("rejects an unsupported action", async () => {
     const adapter = createMarmotMessageActionAdapter({
-      deleteByMessageId: async () => true,
       resolveTarget: async () => ({
         client: messageActionClient(),
         marmotAccountIdHex: HEX32("aa"),

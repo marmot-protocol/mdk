@@ -700,7 +700,7 @@ describe("createMarmotMessageAdapter", () => {
     }
   });
 
-  it("records sent ids in the cache and a delete resolves the group from it", async () => {
+  it("records sent ids in the send-time target cache", async () => {
     const calls = emptyClientCalls();
     const sentId = HEX32("99");
     const adapter = createMarmotMessageAdapter({
@@ -719,47 +719,6 @@ describe("createMarmotMessageAdapter", () => {
       marmotAccountIdHex: HEX32("aa"),
       groupIdHex: HEX32("cc"),
     });
-
-    const deleted = await adapter.deleteByMessageId(sentId, { cfg: {}, accountId: null });
-    expect(deleted).toBe(true);
-    expect(calls.delete).toEqual([
-      { accountIdHex: HEX32("aa"), groupIdHex: HEX32("cc"), targetMessageIdHex: sentId },
-    ]);
-  });
-
-  it("deleteByMessageId routes the cache-hit delete with the action's account context", async () => {
-    const calls = emptyClientCalls();
-    const sentId = HEX32("99");
-    const resolveCalls: { cfg: unknown; accountId?: string | null }[] = [];
-    const adapter = createMarmotMessageAdapter({
-      resolveTarget: (cfg, accountId) => {
-        resolveCalls.push({ cfg, accountId });
-        return { client: stubClient(calls, [sentId]), marmotAccountIdHex: HEX32("aa") };
-      },
-    });
-    // Seed the send-time cache directly via its typed API (no ctx construction).
-    adapter.sentTargets.record(sentId, {
-      marmotAccountIdHex: HEX32("aa"),
-      groupIdHex: HEX32("cc"),
-    });
-
-    const deleted = await adapter.deleteByMessageId(sentId, {
-      cfg: { marker: "delete-cfg" },
-      accountId: "acct-2",
-    });
-    expect(deleted).toBe(true);
-    // The delete resolve must use the action's own cfg + accountId, not a
-    // context-free resolve (which would mis-route in a multi-account deployment).
-    expect(resolveCalls.at(-1)).toEqual({ cfg: { marker: "delete-cfg" }, accountId: "acct-2" });
-  });
-
-  it("deleteByMessageId returns false for an unknown (uncached) message id", async () => {
-    const calls = emptyClientCalls();
-    const adapter = createMarmotMessageAdapter({
-      resolveTarget: () => ({ client: stubClient(calls), marmotAccountIdHex: HEX32("aa") }),
-    });
-    expect(await adapter.deleteByMessageId(HEX32("77"), { cfg: {}, accountId: null })).toBe(false);
-    expect(calls.delete).toHaveLength(0);
   });
 });
 
