@@ -47,6 +47,8 @@ pub enum MarmotKitError {
     InvalidGroupMembershipPage { max_groups: u64 },
     #[error("cached identity page exceeds the maximum of {max_accounts} accounts")]
     InvalidCachedIdentityPage { max_accounts: u64 },
+    #[error("public event preview batch exceeds the maximum of {max_references} references")]
+    InvalidPublicEventReferences { max_references: u64 },
     /// The group exists but its full hydration has not completed yet
     /// (mdk#1161). Retryable: the runtime's background pipeline promotes the
     /// group shortly after account readiness, and worker-routed reads wait
@@ -444,6 +446,9 @@ impl From<&AppError> for MarmotKitError {
             AppError::InvalidCachedIdentityPage(_) => Self::InvalidCachedIdentityPage {
                 max_accounts: marmot_app::MAX_CACHED_IDENTITY_PAGE_SIZE as u64,
             },
+            AppError::InvalidPublicEventReferences(_) => Self::InvalidPublicEventReferences {
+                max_references: marmot_app::MAX_PUBLIC_EVENT_REFERENCES as u64,
+            },
             AppError::InvalidChatPin(details) => Self::InvalidChatPin {
                 details: details.clone(),
             },
@@ -691,6 +696,16 @@ mod tests {
         assert!(matches!(
             ffi,
             MarmotKitError::InvalidGroupMembershipPage { max_groups: 100 }
+        ));
+    }
+
+    #[test]
+    fn oversized_public_event_batch_crosses_ffi_as_typed_variant() {
+        let ffi: MarmotKitError =
+            AppError::InvalidPublicEventReferences("too many references".into()).into();
+        assert!(matches!(
+            ffi,
+            MarmotKitError::InvalidPublicEventReferences { max_references: 16 }
         ));
     }
 

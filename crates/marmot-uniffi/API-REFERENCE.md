@@ -4600,7 +4600,7 @@ Synchronously clone fixed native phases, monotonic durations and migration progr
 pub fn cached_public_event_previews( &self, account_ref: String, references: Vec<String>, ) -> Result<Vec<PublicEventPreviewFfi>, MarmotKitError>
 ```
 
-Network-free read of cached public Nostr events referenced from message content, for first-frame rendering of event cards. Pass up to 16 `note`, `nevent`, `naddr` or hex event-ID references, with or without `nostr:`; each gets one row in input order, duplicates included, echoing the reference. `Present` rows carry the signature-verified event JSON. `Deleted` means the author published a NIP-09 deletion; `Missing` is not durable, so call `resolve_public_event_preview`; `Unsupported` rows never resolve. More than 16 references is an error. The cache is per account and survives restarts. A cold call may open the account's encrypted cache, so warm it off the UI thread. Read author names and avatars from `cached_identity_projections`.
+Network-free read of cached public Nostr events referenced from message content, for first-frame rendering of event cards. Pass up to 16 `note`, `nevent`, `naddr` or hex event-ID references, with or without `nostr:`; each gets one row in input order, duplicates included, echoing the reference. `Present` rows carry the signature-verified event JSON. `Deleted` means the author published a NIP-09 deletion; `Missing` is not durable, so call `resolve_public_event_preview`; `Unsupported` rows never resolve. More than 16 references fails with `InvalidPublicEventReferences`; split the batch. The cache is per account and survives restarts. A cold call may open the account's encrypted cache, so warm it off the UI thread. Read author names and avatars from `cached_identity_projections`.
 
 [Source](src/commands/public_event_preview.rs#L63)
 
@@ -4610,7 +4610,7 @@ Network-free read of cached public Nostr events referenced from message content,
 pub async fn resolve_public_event_preview( &self, account_ref: String, reference: String, ) -> Result<PublicEventPreviewFfi, MarmotKitError>
 ```
 
-Fetch one referenced event from at most two safe relay hints plus the configured directory relays when it is missing or stale, store it if it verifies and matches, and return the resulting local state. Event-ID previews never refetch once cached; `naddr` previews refetch after 30 minutes and keep the newest version. Calls within 30 seconds of a finished fetch for the same reference return local state without network I/O. A failed or empty fetch keeps prior content and stores no miss. Call it for `Missing` rows and for `Present` `naddr` rows whose `fetched_at` is older than 30 minutes.
+Fetch one referenced event from at most two safe relay hints plus the configured directory relays when it is missing or stale, store it if it verifies and matches, and return the resulting local state. Event-ID previews never refetch once a complete fetch confirmed them; `naddr` previews, and event-ID previews admitted while a relay did not finish, refetch after 30 minutes. `naddr` keeps the newest version. Author-signed NIP-09 deletions apply in either tag form, and a deleted version never returns. Calls within 30 seconds of a finished fetch for the same reference return local state without network I/O, as does any call while the row is fresh, so call it for every reference a screen shows. A failed or empty fetch keeps prior content and stores no miss.
 
 [Source](src/commands/public_event_preview.rs#L81)
 

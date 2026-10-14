@@ -17,8 +17,8 @@ use cgka_traits::{
 use futures::{Stream, StreamExt, stream::FuturesUnordered};
 use nostr_sdk::NotificationUpdate;
 use nostr_sdk::prelude::{
-    Client as NostrSdkClient, ClientNotification, Event, Filter, Kind, PublicKey, RelayMessage,
-    RelayUrl, SubscriptionId, Timestamp as NostrTimestamp,
+    Client as NostrSdkClient, ClientNotification, Filter, Kind, PublicKey, RelayMessage, RelayUrl,
+    SubscriptionId, Timestamp as NostrTimestamp,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -1815,7 +1815,7 @@ impl MarmotRelayPlane {
         endpoints: Vec<TransportEndpoint>,
         filters: Vec<Filter>,
         max_events: usize,
-    ) -> Result<Vec<Event>, String> {
+    ) -> Result<directory::PublicEventFetch, String> {
         let endpoints = self
             .inner
             .relay_safety

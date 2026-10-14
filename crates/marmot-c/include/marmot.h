@@ -202,6 +202,10 @@ enum MarmotStatus
    * changes wait while MDK retries them (mdk#2255).
    */
   MARMOT_STATUS_GROUP_COMMIT_UNDELIVERED = 102,
+  /**
+   * A cached public event preview read named more than 16 references.
+   */
+  MARMOT_STATUS_INVALID_PUBLIC_EVENT_REFERENCES = 103,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L

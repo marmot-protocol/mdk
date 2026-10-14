@@ -827,6 +827,13 @@ impl NostrSdkDirectoryRelayFetcher {
     }
 }
 
+/// Verified events from one public-event read, and whether every requested
+/// relay connected and reached its end of stored events.
+pub(crate) struct PublicEventFetch {
+    pub(crate) events: Vec<Event>,
+    pub(crate) complete: bool,
+}
+
 /// One bounded, anonymous read of public events matching `filters`.
 ///
 /// Uses an owned client like [`DirectoryRelayFetcher::fetch_directory_events`],
@@ -836,13 +843,14 @@ pub(crate) async fn fetch_public_events(
     endpoints: &[TransportEndpoint],
     filters: Vec<Filter>,
     max_events: usize,
-) -> Result<Vec<Event>, String> {
+) -> Result<PublicEventFetch, String> {
     let fetcher = NostrSdkDirectoryRelayFetcher::standalone();
     let result = async {
-        let relay_urls = fetcher
-            .connect_relays(parsed_directory_relay_urls(endpoints)?)
-            .await?;
-        let events = fetcher
+        let requested = parsed_directory_relay_urls(endpoints)?;
+        let requested_count = requested.len();
+        let relay_urls = fetcher.connect_relays(requested).await?;
+        let connected_count = relay_urls.len();
+        let outcome = fetcher
             .client
             .fetch_events(ReqTarget::manual(
                 relay_urls.into_iter().map(|url| (url, filters.clone())),
@@ -852,11 +860,21 @@ pub(crate) async fn fetch_public_events(
             .with_outcomes()
             .await
             .map_err(|_| "fetch public events failed".to_owned())?;
-        Ok(events
-            .events
-            .into_iter()
-            .filter(|event| event.verify().is_ok())
-            .collect())
+        let complete = connected_count == requested_count
+            && !outcome.truncated
+            && outcome.relays.len() == connected_count
+            && outcome
+                .relays
+                .values()
+                .all(|relay| matches!(relay, nostr_sdk::client::FetchRelayOutcome::Completed));
+        Ok(PublicEventFetch {
+            events: outcome
+                .events
+                .into_iter()
+                .filter(|event| event.verify().is_ok())
+                .collect(),
+            complete,
+        })
     }
     .await;
     fetcher.client.shutdown().await;

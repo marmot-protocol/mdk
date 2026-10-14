@@ -150,6 +150,8 @@ pub enum MarmotStatus {
     /// The group's last change has not reached every group relay yet; group
     /// changes wait while MDK retries them (mdk#2255).
     GroupCommitUndelivered = 102,
+    /// A cached public event preview read named more than 16 references.
+    InvalidPublicEventReferences = 103,
 }
 
 thread_local! {
@@ -286,6 +288,9 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
             MarmotStatus::CreatedGroupProjectionUnavailable
         }
         MarmotKitError::InvalidCachedIdentityPage { .. } => MarmotStatus::InvalidCachedIdentityPage,
+        MarmotKitError::InvalidPublicEventReferences { .. } => {
+            MarmotStatus::InvalidPublicEventReferences
+        }
         MarmotKitError::ChatPresentationNotReady => MarmotStatus::ChatPresentationNotReady,
         MarmotKitError::DirectConversationIndexNotReady => {
             MarmotStatus::DirectConversationIndexNotReady
@@ -386,6 +391,7 @@ mod tests {
             },
             MarmotKitError::InvalidGroupMembershipPage { max_groups: 1 },
             MarmotKitError::InvalidCachedIdentityPage { max_accounts: 1 },
+            MarmotKitError::InvalidPublicEventReferences { max_references: 1 },
             MarmotKitError::GroupHydrationPending {
                 group_id_hex: "aa".into(),
             },
@@ -523,7 +529,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            93,
+            94,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);

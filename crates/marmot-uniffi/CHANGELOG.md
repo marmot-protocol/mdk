@@ -4,6 +4,7 @@
 
 ### Breaking changes
 
+- `MarmotKitError` adds `InvalidPublicEventReferences`: a cached public event preview read named more than 16 references. Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
 - `MarmotKitError` adds `GroupCatchingUp`: a group change was refused because the group may have moved past this device and recovery has not caught it up yet (mdk#2258). Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
 - `AttachmentTransferStateFfi` adds `StorageBlocked`: free disk cannot cover
   the publication reserve for the body, checkpoints are kept, and the job

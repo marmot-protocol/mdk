@@ -650,10 +650,10 @@ Event cards for `nostr:` references in message content read from an
 account-scoped cache, so a reopened chat renders prior previews in its first
 frame, offline included. Call `cachedPublicEventPreviews` (at most 16
 references, network-free) before layout, then `resolvePublicEventPreview` for
-`Missing` rows and for `naddr` rows older than 30 minutes. MDK fetches from
-safe relay hints and the configured directory relays, stores only verified
-events that match the reference, keeps the newest `naddr` version, and turns
-an author's NIP-09 deletion into a `Deleted` row. Event JSON is the signed
+each reference shown; it touches the network only for missing or stale rows.
+MDK fetches from safe relay hints and the configured directory relays, stores
+only verified events that match the reference, keeps the newest `naddr`
+version, and turns an author's NIP-09 deletion into a `Deleted` row. Event JSON is the signed
 event; shape its content for display on the host. Author names and avatars
 come from `cachedIdentityProjections`. See
 [the method reference](API-REFERENCE.md#marmotcached_public_event_previews).

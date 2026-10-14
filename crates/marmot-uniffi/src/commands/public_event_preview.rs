@@ -130,14 +130,13 @@ mod tests {
                 .iter()
                 .all(|read| read.event_json.is_none() && read.fetched_at.is_none())
         );
-        assert!(
-            marmot
-                .cached_public_event_previews(
-                    "alice".into(),
-                    vec!["ab".repeat(32); marmot_app::MAX_PUBLIC_EVENT_REFERENCES + 1],
-                )
-                .is_err()
-        );
+        assert!(matches!(
+            marmot.cached_public_event_previews(
+                "alice".into(),
+                vec!["ab".repeat(32); marmot_app::MAX_PUBLIC_EVENT_REFERENCES + 1],
+            ),
+            Err(MarmotKitError::InvalidPublicEventReferences { max_references: 16 })
+        ));
 
         let present = PublicEventPreviewFfi::from(marmot_app::PublicEventPreviewRead {
             reference: "r".into(),

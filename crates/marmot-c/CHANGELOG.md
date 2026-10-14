@@ -9,7 +9,7 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
-- Add `marmot_cached_public_event_previews` and `marmot_resolve_public_event_preview` (record `MarmotPublicEventPreview`, enum `MarmotPublicEventPreviewState`, freed with `marmot_public_event_preview_free` / `marmot_public_event_preview_list_free`) for cached public Nostr event previews (mdk#1547). Use matching regenerated headers and libraries.
+- Add `marmot_cached_public_event_previews` and `marmot_resolve_public_event_preview` (record `MarmotPublicEventPreview`, enum `MarmotPublicEventPreviewState`, freed with `marmot_public_event_preview_free` / `marmot_public_event_preview_list_free`) for cached public Nostr event previews (mdk#1547), and `MARMOT_STATUS_INVALID_PUBLIC_EVENT_REFERENCES` (103) for a read of more than 16 references. Use matching regenerated headers and libraries.
 
 - Account attachment pages, bounded borrowed query inputs and opaque cursor/version handles with deep-free and version-clone functions. New records/symbols require matching headers and libraries; existing group history remains supported.
 

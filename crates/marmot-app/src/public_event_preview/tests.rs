@@ -28,15 +28,18 @@ fn naddr(coordinate: &Coordinate) -> String {
         .unwrap()
 }
 
-fn present(event: &Event) -> Admission {
-    Admission::Present(Box::new(event.clone()))
+fn shown(event: &Event, deleted_through: Option<u64>) -> Option<Row> {
+    Some(Row {
+        event: Some(Box::new(event.clone())),
+        deleted_through,
+    })
 }
 
-fn stored(event: &Event) -> Stored {
-    Stored::Present {
-        event: Box::new(event.clone()),
-        fetched_at: 1,
-    }
+fn deleted(through: u64) -> Option<Row> {
+    Some(Row {
+        event: None,
+        deleted_through: Some(through),
+    })
 }
 
 #[test]
@@ -63,7 +66,6 @@ fn references_parse_to_canonical_targets() {
         assert_eq!(parsed.target.cache_key(), format!("event:{}", id.to_hex()));
     }
     let parsed = parse_reference(&nevent).unwrap();
-    assert_eq!(parsed.author_hint, Some(keys.public_key()));
     assert_eq!(
         parsed.relay_hints,
         vec![TransportEndpoint(relay.to_string())]
@@ -105,47 +107,78 @@ fn event_id_admission_requires_exact_match_and_author_deletion() {
     let deletion = signed(&keys, 5, 20, "", vec![e.clone()]);
     let forged = signed(&Keys::generate(), 5, 20, "", vec![e]);
 
-    assert_eq!(admit(&target, None, &[]), Admission::Keep);
+    assert_eq!(admit(&target, None, &[]), None);
+    assert_eq!(admit(&target, None, std::slice::from_ref(&other)), None);
     assert_eq!(
-        admit(&target, None, std::slice::from_ref(&other)),
-        Admission::Keep
+        admit(&target, None, &[other, note.clone()]),
+        shown(&note, None)
     );
-    assert_eq!(admit(&target, None, &[other, note.clone()]), present(&note));
     assert_eq!(
         admit(&target, None, &[note.clone(), forged.clone()]),
-        present(&note),
+        shown(&note, None),
         "a deletion by anyone but the author is ignored"
     );
+    let cached = shown(&note, None).unwrap();
     assert_eq!(
-        admit(
-            &target,
-            Some(&stored(&note)),
-            std::slice::from_ref(&deletion)
-        ),
-        Admission::Deleted {
-            created_at: 20,
-            deletion_id: deletion.id,
-        },
+        admit(&target, Some(&cached), std::slice::from_ref(&deletion)),
+        deleted(20),
         "the cached event supplies the author when relays no longer serve it"
     );
     assert_eq!(
         admit(&target, None, std::slice::from_ref(&deletion)),
-        Admission::Keep,
+        None,
         "an unattributable deletion stores nothing"
     );
-    let marker = Stored::Deleted {
-        created_at: 20,
-        fetched_at: 1,
-    };
+    let marker = deleted(20).unwrap();
     assert_eq!(
         admit(&target, Some(&marker), &[note]),
-        Admission::Keep,
+        Some(marker),
         "a relay that kept the event cannot restore it"
     );
 }
 
 #[test]
-fn coordinate_admission_keeps_newest_version_and_honours_deletions() {
+fn deletions_apply_in_either_tag_form() {
+    let keys = Keys::generate();
+    let d = || vec![tag(&["d", "entry"])];
+    let article = coordinate(&keys, 30023, "entry");
+    let a = tag(&["a", &article.to_string()]);
+    let v1 = signed(&keys, 30023, 10, "v1", d());
+    let v2 = signed(&keys, 30023, 20, "v2", d());
+
+    // A `note`/`nevent` link to an article version honours an `a` deletion
+    // dated at or after that version, and only those.
+    let a_deletion = signed(&keys, 5, 15, "", vec![a]);
+    assert_eq!(
+        admit(
+            &Target::EventId(v1.id),
+            None,
+            &[v1.clone(), a_deletion.clone()]
+        ),
+        deleted(15)
+    );
+    assert_eq!(
+        admit(&Target::EventId(v2.id), None, &[v2.clone(), a_deletion]),
+        shown(&v2, None)
+    );
+
+    // An `naddr` link honours an `e` deletion of a version: that version and
+    // every older one stay hidden.
+    let target = Target::Coordinate(article);
+    let e_deletion = signed(&keys, 5, 30, "", vec![tag(&["e", &v2.id.to_hex()])]);
+    assert_eq!(
+        admit(&target, None, &[v1.clone(), v2.clone(), e_deletion]),
+        deleted(20)
+    );
+    let v3 = signed(&keys, 30023, 40, "v3", d());
+    assert_eq!(
+        admit(&target, deleted(20).as_ref(), &[v1, v2, v3.clone()]),
+        shown(&v3, Some(20))
+    );
+}
+
+#[test]
+fn coordinate_admission_keeps_newest_version_and_deletion_bound() {
     let keys = Keys::generate();
     let article = coordinate(&keys, 30023, "entry");
     let target = Target::Coordinate(article.clone());
@@ -165,63 +198,74 @@ fn coordinate_admission_keeps_newest_version_and_honours_deletions() {
             None,
             &[v1.clone(), v2.clone(), other_d, other_author]
         ),
-        present(&v2)
+        shown(&v2, None)
     );
     let lower = if v2.id < v2_twin.id { &v2 } else { &v2_twin };
     assert_eq!(
         admit(&target, None, &[v2.clone(), v2_twin.clone()]),
-        present(lower),
+        shown(lower, None),
         "equal timestamps keep the lower ID"
     );
+    let cached = shown(&v2, None).unwrap();
     assert_eq!(
-        admit(&target, Some(&stored(&v2)), std::slice::from_ref(&v1)),
-        present(&v2),
+        admit(&target, Some(&cached), std::slice::from_ref(&v1)),
+        Some(cached.clone()),
         "an older version never replaces a newer cached one"
     );
     assert_eq!(
-        admit(&target, Some(&stored(&v2)), &[v2.clone(), forged]),
-        present(&v2)
+        admit(&target, Some(&cached), &[v2.clone(), forged.clone()]),
+        Some(cached.clone())
     );
-    let deleted = Admission::Deleted {
-        created_at: 25,
-        deletion_id: deletion.id,
-    };
     assert_eq!(
-        admit(&target, Some(&stored(&v2)), std::slice::from_ref(&deletion)),
-        deleted
+        admit(&target, None, &[forged]),
+        None,
+        "another key's `a` deletion sets no bound"
+    );
+    assert_eq!(
+        admit(&target, Some(&cached), std::slice::from_ref(&deletion)),
+        deleted(25)
+    );
+    assert_eq!(
+        admit(&target, None, std::slice::from_ref(&deletion)),
+        deleted(25),
+        "an `a` deletion bounds the coordinate with no version in hand"
     );
 
-    let marker = Stored::Deleted {
-        created_at: 25,
-        fetched_at: 1,
-    };
-    assert_eq!(
-        admit(&target, Some(&marker), &[v1, v2.clone()]),
-        Admission::Confirm,
-        "versions up to the deletion stay deleted"
-    );
+    // A newer version is shown again, and the row keeps the bound, so a stale
+    // relay serving only old versions can never bring them back.
     let v3 = signed(&keys, 30023, 30, "v3", d());
-    assert_eq!(
-        admit(&target, Some(&marker), &[v2, v3.clone(), deletion]),
-        present(&v3),
-        "a version newer than the deletion is valid again"
+    let row = admit(
+        &target,
+        deleted(25).as_ref(),
+        &[v1.clone(), v2.clone(), v3.clone()],
     );
+    assert_eq!(row, shown(&v3, Some(25)));
+    assert_eq!(admit(&target, row.as_ref(), &[v1, v2]), row);
 }
 
 #[test]
-fn coordinate_rows_refetch_after_thirty_minutes_and_event_ids_never() {
+fn refresh_rules_follow_target_kind_and_completeness() {
     let keys = Keys::generate();
     let note = signed(&keys, 1, 10, "note", Vec::new());
     let event = Target::EventId(note.id);
     let article = Target::Coordinate(coordinate(&keys, 30023, "entry"));
-    let row = Stored::Present {
-        event: Box::new(note),
+    let stored = |row: Option<Row>, complete| Stored {
+        row: row.unwrap(),
+        complete,
         fetched_at: 1_000,
     };
+    let fresh = 1_000 + 30 * 60 - 1;
+    let stale = 1_000 + 30 * 60;
     assert!(needs_refresh(&event, None, 1_000));
-    assert!(!needs_refresh(&event, Some(&row), u64::MAX));
-    assert!(!needs_refresh(&article, Some(&row), 1_000 + 30 * 60 - 1));
-    assert!(needs_refresh(&article, Some(&row), 1_000 + 30 * 60));
+    let complete = stored(shown(&note, None), true);
+    assert!(!needs_refresh(&event, Some(&complete), u64::MAX));
+    let partial = stored(shown(&note, None), false);
+    assert!(!needs_refresh(&event, Some(&partial), fresh));
+    assert!(needs_refresh(&event, Some(&partial), stale));
+    let marker = stored(deleted(5), false);
+    assert!(!needs_refresh(&event, Some(&marker), u64::MAX));
+    assert!(!needs_refresh(&article, Some(&complete), fresh));
+    assert!(needs_refresh(&article, Some(&complete), stale));
 }
 
 fn previews_table() -> Connection {
@@ -231,38 +275,69 @@ fn previews_table() -> Connection {
     conn
 }
 
+fn fetched_at(conn: &Connection, key: &str) -> (u64, bool) {
+    let stored = read_row(conn, key).unwrap().unwrap();
+    (stored.fetched_at, stored.complete)
+}
+
+#[test]
+fn incomplete_fetches_never_confirm_a_row() {
+    let keys = Keys::generate();
+    let conn = previews_table();
+    let note = signed(&keys, 1, 10, "note", Vec::new());
+    let key = "event:note";
+    let target = Target::EventId(note.id);
+    let fetched = std::slice::from_ref(&note);
+
+    persist_refresh(&conn, key, &target, fetched, false, 100).unwrap();
+    assert_eq!(fetched_at(&conn, key), (100, false));
+    persist_refresh(&conn, key, &target, fetched, false, 200).unwrap();
+    assert_eq!(fetched_at(&conn, key), (100, false), "not re-dated");
+    persist_refresh(&conn, key, &target, fetched, true, 300).unwrap();
+    assert_eq!(fetched_at(&conn, key), (300, true));
+    persist_refresh(&conn, key, &target, &[], true, 400).unwrap();
+    assert_eq!(fetched_at(&conn, key), (400, true));
+}
+
 #[test]
 fn rows_round_trip_and_trim_least_recently_used() {
     let keys = Keys::generate();
     let conn = previews_table();
     let note = signed(&keys, 1, 10, "note", Vec::new());
-    write_admission(&conn, "event:a", present(&note), 100).unwrap();
-    let Some(Stored::Present { event, fetched_at }) = read_row(&conn, "event:a").unwrap() else {
-        panic!("expected a present row");
-    };
-    assert_eq!((*event, fetched_at), (note.clone(), 100));
-    write_admission(
-        &conn,
-        "event:a",
-        Admission::Deleted {
-            created_at: 20,
-            deletion_id: note.id,
-        },
-        200,
-    )
-    .unwrap();
+    write_row(&conn, "event:a", &shown(&note, None).unwrap(), true, 100).unwrap();
+    let stored = read_row(&conn, "event:a").unwrap().unwrap();
+    assert_eq!(stored.row, shown(&note, None).unwrap());
+    assert_eq!((stored.fetched_at, stored.complete), (100, true));
     assert!(matches!(
-        read_row(&conn, "event:a").unwrap(),
-        Some(Stored::Deleted {
-            created_at: 20,
-            fetched_at: 200
+        read_preview(&conn, "event:a").unwrap(),
+        Some(PublicEventPreview::Present {
+            fetched_at: 100,
+            ..
         })
     ));
+    write_row(&conn, "event:a", &deleted(20).unwrap(), true, 50).unwrap();
+    assert_eq!(
+        read_row(&conn, "event:a").unwrap().unwrap().row,
+        deleted(20).unwrap()
+    );
+    assert_eq!(
+        read_preview(&conn, "event:a").unwrap(),
+        Some(PublicEventPreview::Deleted)
+    );
     assert!(read_row(&conn, "event:missing").unwrap().is_none());
 
-    // The entry budget evicts the least recently touched row first.
+    // Rows with a deletion time go last, whatever their age: `event:a` was
+    // touched first, yet survives a full budget of newer plain rows.
     for index in 0..MAX_ENTRIES {
-        write_admission(&conn, &format!("event:{index:04}"), present(&note), 300).unwrap();
+        write_row(
+            &conn,
+            &format!("event:{index:04}"),
+            &shown(&note, None).unwrap(),
+            true,
+            300,
+        )
+        .unwrap();
+        trim(&conn).unwrap();
     }
     let count = |conn: &Connection| -> i64 {
         conn.query_row("SELECT count(*) FROM public_event_previews", [], |row| {
@@ -271,12 +346,21 @@ fn rows_round_trip_and_trim_least_recently_used() {
         .unwrap()
     };
     assert_eq!(count(&conn), MAX_ENTRIES);
-    assert!(read_row(&conn, "event:a").unwrap().is_none());
+    assert!(read_row(&conn, "event:a").unwrap().is_some());
+    assert!(read_row(&conn, "event:0000").unwrap().is_none());
 
     // The byte budget evicts too.
     let large = signed(&keys, 1, 10, &"x".repeat(200 * 1024), Vec::new());
     for index in 0..100 {
-        write_admission(&conn, &format!("event:large{index}"), present(&large), 400).unwrap();
+        write_row(
+            &conn,
+            &format!("event:large{index}"),
+            &shown(&large, None).unwrap(),
+            true,
+            400,
+        )
+        .unwrap();
+        trim(&conn).unwrap();
     }
     let total: i64 = conn
         .query_row("SELECT sum(bytes) FROM public_event_previews", [], |row| {
@@ -285,6 +369,7 @@ fn rows_round_trip_and_trim_least_recently_used() {
         .unwrap();
     assert!(total <= MAX_TOTAL_BYTES);
     assert!(read_row(&conn, "event:large99").unwrap().is_some());
+    assert!(read_row(&conn, "event:a").unwrap().is_some());
 }
 
 async fn publish(relay: &MockRelay, events: &[&Event]) {
@@ -336,7 +421,9 @@ async fn public_event_preview_cache_round_trips_across_runtime_restart() {
 
     let note_ref = note.id.to_bech32().unwrap();
     let article_ref = naddr(&coordinate(&keys, 30023, "entry"));
+    // The link names the wrong author; the real author's deletion still counts.
     let regretted_ref = Nip19Event::new(regretted.id)
+        .author(Keys::generate().public_key())
         .relays([stale.url().await])
         .to_bech32()
         .unwrap();
