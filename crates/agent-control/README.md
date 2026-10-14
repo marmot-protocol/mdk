@@ -65,6 +65,16 @@ existing reaction id instead of publishing a duplicate.
 `emoji` retracts all of the calling account's active reactions with that exact content. Omitting `emoji` retracts all
 of the account's active reactions on the target in one durable delete event.
 
+## Message edits
+
+`edit_message` replaces the text of a chat message the calling account sent, so an agent can update one status message
+in place instead of appending new ones. It publishes a kind-1009 edit; the message keeps its identity and position, and
+timeline reads return the latest text. The runtime refuses, before publishing anything, any target that is missing, not
+a chat message, sent by another account, deleted, or withdrawn by convergence (`invalid_edit_target`, not retryable).
+Successive edits get strictly newer seconds so the last one sent stays effective; a burst that would stamp more than 30
+seconds ahead returns the retryable `edit_rate_limited`. Edits have no idempotency key: after an uncertain response,
+read the target with `timeline_message_get` before retrying.
+
 ## Materialized timeline reads
 
 `timeline_message_get` resolves one durable message id and `timeline_list` pages a group's current materialized

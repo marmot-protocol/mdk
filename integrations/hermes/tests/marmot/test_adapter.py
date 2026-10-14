@@ -357,6 +357,44 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("idempotency_key", requests[1])
         self.assertNotIn("idempotency_key", requests[2])
 
+    async def test_edit_message_writes_protocol_request_and_rejects_non_string_text(self):
+        requests = []
+
+        async def handler(reader, writer):
+            request = await read_json_line(reader)
+            requests.append(request)
+            await write_json_line(
+                writer,
+                {
+                    "marmot_agent_control": "marmot.agent-control.v2",
+                    "id": request["id"],
+                    "type": "final_sent",
+                    "message_ids_hex": ["44" * 32],
+                },
+            )
+            writer.close()
+
+        await self.start_server(handler)
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+
+        response = await client.edit_message("11" * 32, "22" * 32, "33" * 32, "status: done")
+        self.assertEqual(response["message_ids_hex"], ["44" * 32])
+        self.assertEqual(
+            {key: requests[0][key] for key in (
+                "type", "account_id_hex", "group_id_hex", "target_message_id_hex", "text",
+            )},
+            {
+                "type": "edit_message",
+                "account_id_hex": "11" * 32,
+                "group_id_hex": "22" * 32,
+                "target_message_id_hex": "33" * 32,
+                "text": "status: done",
+            },
+        )
+        with self.assertRaises(TypeError):
+            await client.edit_message("11" * 32, "22" * 32, "33" * 32, None)
+        self.assertEqual(len(requests), 1)
+
     async def test_remove_reaction_includes_optional_emoji_only_when_supplied(self):
         requests = []
 

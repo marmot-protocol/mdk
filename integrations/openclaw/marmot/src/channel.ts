@@ -156,6 +156,10 @@ export interface MarmotMessageActionDeps {
     targetMessageIdHex: string,
     resolveCtx: { cfg: unknown; accountId?: string | null },
   ) => Promise<boolean>;
+  /** Look up where a message this adapter sent went, without mutating anything. */
+  sentTargetFor?: (
+    messageIdHex: string,
+  ) => { marmotAccountIdHex: string; groupIdHex: string } | undefined;
   /** Resolve the wn-agent client + Marmot account for the explicit-group fallback. */
   resolveTarget: (
     cfg: unknown,
@@ -169,6 +173,12 @@ export interface MarmotMessageActionClient {
     accountIdHex: string,
     groupIdHex: string,
     targetMessageIdHex: string,
+  ) => Promise<unknown>;
+  editMessage: (
+    accountIdHex: string,
+    groupIdHex: string,
+    targetMessageIdHex: string,
+    text: string,
   ) => Promise<unknown>;
   sendReaction: (
     accountIdHex: string,
@@ -193,9 +203,13 @@ export function createMarmotMessageActionAdapter(
   deps: MarmotMessageActionDeps,
 ): ChannelMessageActionAdapter {
   return {
-    describeMessageTool: () => ({ actions: ["delete", "react"] }),
-    supportsAction: ({ action }) => action === "delete" || action === "react",
+    describeMessageTool: () => ({ actions: ["delete", "edit", "react"] }),
+    supportsAction: ({ action }) =>
+      action === "delete" || action === "edit" || action === "react",
     handleAction: async (ctx: ChannelMessageActionContext) => {
+      if (ctx.action === "edit") {
+        return handleEditAction(ctx, deps);
+      }
       if (ctx.action === "react") {
         const messageId =
           typeof ctx.params.messageId === "string"
@@ -276,6 +290,71 @@ export function createMarmotMessageActionAdapter(
   };
 }
 
+/**
+ * Channel-owned `edit` action: `message(action:"edit", messageId, message)`
+ * replaces the text of a chat message this agent sent, keeping its place in the
+ * conversation (for example a status line updated as work progresses). Routes
+ * through the send-time cache, then an explicit or current `to` group.
+ */
+async function handleEditAction(
+  ctx: ChannelMessageActionContext,
+  deps: MarmotMessageActionDeps,
+) {
+  const messageId =
+    typeof ctx.params.messageId === "string"
+      ? ctx.params.messageId
+      : typeof ctx.params.message_id === "string"
+        ? ctx.params.message_id
+        : "";
+  if (!messageId) {
+    return jsonResult({ ok: false, error: "messageId required" });
+  }
+  const text =
+    typeof ctx.params.message === "string"
+      ? ctx.params.message
+      : typeof ctx.params.text === "string"
+        ? ctx.params.text
+        : undefined;
+  if (text === undefined || text.trim().length === 0) {
+    return jsonResult({ ok: false, error: "message required: the replacement text" });
+  }
+  const cached = deps.sentTargetFor?.(messageId);
+  const rawTo =
+    typeof ctx.params.to === "string" ? ctx.params.to : ctx.toolContext?.currentMessagingTarget;
+  const groupIdHex = cached?.groupIdHex ?? normalizeMarmotTarget(rawTo ?? "");
+  if (!groupIdHex) {
+    return jsonResult({ ok: false, error: "could not resolve group for this message id" });
+  }
+  try {
+    const { client, marmotAccountIdHex } = await deps.resolveTarget(
+      ctx.cfg,
+      ctx.accountId ?? null,
+    );
+    await client.editMessage(
+      cached?.marmotAccountIdHex ?? marmotAccountIdHex,
+      groupIdHex,
+      messageId,
+      text,
+    );
+    return jsonResult({ ok: true, edited: true });
+  } catch (error) {
+    if (error instanceof AgentControlError && error.code === "invalid_edit_target") {
+      return jsonResult({
+        ok: false,
+        error: "only an available message this agent sent can be edited",
+      });
+    }
+    if (error instanceof AgentControlError && error.code === "edit_rate_limited") {
+      return jsonResult({
+        ok: false,
+        retryable: true,
+        error: "too many edits of this message; nothing was published, retry shortly",
+      });
+    }
+    return jsonResult({ ok: false, error: "edit failed" });
+  }
+}
+
 /** Build the Marmot channel plugin for registration with OpenClaw. */
 export function createMarmotChannelPlugin() {
   // Resolve the wn-agent client + Marmot agent account for an outbound send or
@@ -295,6 +374,7 @@ export function createMarmotChannelPlugin() {
 
   const actions = createMarmotMessageActionAdapter({
     deleteByMessageId: messageAdapter.deleteByMessageId,
+    sentTargetFor: (messageIdHex) => messageAdapter.sentTargets.get(messageIdHex),
     resolveTarget,
   });
 

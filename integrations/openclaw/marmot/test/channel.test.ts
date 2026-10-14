@@ -28,6 +28,7 @@ function messageActionClient(
 ): MarmotMessageActionClient {
   return {
     deleteMessage: async () => undefined,
+    editMessage: async () => undefined,
     sendReaction: async () => undefined,
     removeReaction: async () => undefined,
     ...overrides,
@@ -50,6 +51,19 @@ function deleteCtx(params: Record<string, unknown>): ChannelMessageActionContext
     action: "delete",
     cfg: {},
     params,
+  } as unknown as ChannelMessageActionContext;
+}
+
+function editCtx(
+  params: Record<string, unknown>,
+  toolContext: { currentMessagingTarget?: string } = {},
+): ChannelMessageActionContext {
+  return {
+    channel: "marmot",
+    action: "edit",
+    cfg: {},
+    params,
+    toolContext,
   } as unknown as ChannelMessageActionContext;
 }
 
@@ -438,7 +452,7 @@ describe("createMarmotMessageActionAdapter", () => {
     expect(adapter.supportsAction?.({ action: "react" })).toBe(true);
   });
 
-  it("declares delete and react through describeMessageTool", () => {
+  it("declares delete, edit and react through describeMessageTool", () => {
     const adapter = createMarmotMessageActionAdapter({
       deleteByMessageId: async () => false,
       resolveTarget: async () => ({
@@ -447,8 +461,100 @@ describe("createMarmotMessageActionAdapter", () => {
       }),
     });
     expect(adapter.describeMessageTool({ cfg: {} } as never)).toEqual({
-      actions: ["delete", "react"],
+      actions: ["delete", "edit", "react"],
     });
+  });
+
+  it("edits a sent message routed through the send-time cache", async () => {
+    const editMessage = vi.fn(async () => undefined);
+    const adapter = createMarmotMessageActionAdapter({
+      deleteByMessageId: async () => false,
+      sentTargetFor: (id) =>
+        id === HEX32("99") ? { marmotAccountIdHex: HEX32("ab"), groupIdHex: HEX32("cd") } : undefined,
+      resolveTarget: async () => ({
+        client: messageActionClient({ editMessage }),
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+    });
+
+    const result = await adapter.handleAction!(
+      editCtx({ messageId: HEX32("99"), message: "status: done" }),
+    );
+
+    expect(editMessage).toHaveBeenCalledWith(HEX32("ab"), HEX32("cd"), HEX32("99"), "status: done");
+    expect(resultOk(result)).toBe(true);
+  });
+
+  it("edits in the current conversation on a cache miss", async () => {
+    const editMessage = vi.fn(async () => undefined);
+    const adapter = createMarmotMessageActionAdapter({
+      deleteByMessageId: async () => false,
+      resolveTarget: async () => ({
+        client: messageActionClient({ editMessage }),
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+    });
+
+    const result = await adapter.handleAction!(
+      editCtx(
+        { messageId: HEX32("99"), text: "status: step 2" },
+        { currentMessagingTarget: `marmot:${HEX32("cc")}` },
+      ),
+    );
+
+    expect(editMessage).toHaveBeenCalledWith(HEX32("aa"), HEX32("cc"), HEX32("99"), "status: step 2");
+    expect(resultOk(result)).toBe(true);
+  });
+
+  it("requires a message id, replacement text and a group before editing", async () => {
+    const editMessage = vi.fn(async () => undefined);
+    const adapter = createMarmotMessageActionAdapter({
+      deleteByMessageId: async () => false,
+      resolveTarget: async () => ({
+        client: messageActionClient({ editMessage }),
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+    });
+
+    const noId = await adapter.handleAction!(editCtx({ message: "x", to: HEX32("cc") }));
+    expect(resultError(noId)).toMatch(/messageId required/);
+    const noText = await adapter.handleAction!(editCtx({ messageId: HEX32("99"), to: HEX32("cc") }));
+    expect(resultError(noText)).toMatch(/message required/);
+    const noGroup = await adapter.handleAction!(editCtx({ messageId: HEX32("99"), message: "x" }));
+    expect(resultError(noGroup)).toMatch(/could not resolve group/);
+    expect(editMessage).not.toHaveBeenCalled();
+  });
+
+  it("explains refused and rate-limited edits", async () => {
+    const refusals: Record<string, AgentControlError> = {
+      [HEX32("01")]: new AgentControlError("refused", { code: "invalid_edit_target" }),
+      [HEX32("02")]: new AgentControlError("limited", {
+        code: "edit_rate_limited",
+        retryable: true,
+      }),
+    };
+    const adapter = createMarmotMessageActionAdapter({
+      deleteByMessageId: async () => false,
+      resolveTarget: async () => ({
+        client: messageActionClient({
+          editMessage: async (_account, _group, id) => {
+            throw refusals[id];
+          },
+        }),
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+    });
+
+    const refused = await adapter.handleAction!(
+      editCtx({ messageId: HEX32("01"), message: "x", to: HEX32("cc") }),
+    );
+    expect(resultOk(refused)).toBe(false);
+    expect(resultError(refused)).toMatch(/this agent sent/);
+    const limited = await adapter.handleAction!(
+      editCtx({ messageId: HEX32("02"), message: "x", to: HEX32("cc") }),
+    );
+    expect(resultError(limited)).toMatch(/retry shortly/);
+    expect((limited.details as { retryable?: boolean }).retryable).toBe(true);
   });
 
   it("deletes via the send-time cache on a cache hit", async () => {
@@ -741,7 +847,7 @@ describe("createMarmotMessageActionAdapter", () => {
       }),
     });
 
-    const ctx = { ...deleteCtx({ messageId: HEX32("99") }), action: "edit" } as ChannelMessageActionContext;
+    const ctx = { ...deleteCtx({ messageId: HEX32("99") }), action: "pin" } as ChannelMessageActionContext;
     const result = await adapter.handleAction!(ctx);
     expect(resultOk(result)).toBe(false);
     expect(resultError(result)).toMatch(/unsupported action/);

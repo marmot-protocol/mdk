@@ -93,6 +93,22 @@ function handleRequest(socket: Socket, req: Record<string, unknown>): void {
         message_ids_hex: [HEX32("de")],
       });
       break;
+    case "edit_message":
+      if (req.target_message_id_hex === HEX32("0f")) {
+        send(socket, id, {
+          type: "error",
+          code: "invalid_edit_target",
+          message: "edit target must be an available chat message this account sent",
+          retryable: false,
+        });
+      } else {
+        send(socket, id, {
+          type: "final_sent",
+          message_ids_hex: [HEX32("ed")],
+          echoed_text: req.text,
+        });
+      }
+      break;
     case "send_reaction":
       if (req.emoji === "__wrong_type") {
         send(socket, id, { type: "final_sent", message_ids_hex: [HEX32("e1")] });
@@ -368,6 +384,26 @@ describe("MarmotAgentControlClient", () => {
   it("deletes a message and returns the deletion event ids", async () => {
     const res = await client.deleteMessage(HEX32("aa"), HEX32("cc"), HEX32("dd"));
     expect(res.message_ids_hex).toEqual([HEX32("de")]);
+  });
+
+  it("edits a message with the agent-control v2 wire shape", async () => {
+    const res = (await client.editMessage(
+      HEX32("aa"), HEX32("cc"), HEX32("dd"), "status: done",
+    )) as unknown as { message_ids_hex: string[]; echoed_text?: string };
+    expect(res.message_ids_hex).toEqual([HEX32("ed")]);
+    expect(res.echoed_text).toBe("status: done");
+  });
+
+  it("surfaces an edit refusal as a typed, non-retryable error", async () => {
+    await expect(
+      client.editMessage(HEX32("aa"), HEX32("cc"), HEX32("0f"), "status: done"),
+    ).rejects.toMatchObject({ code: "invalid_edit_target", retryable: false });
+  });
+
+  it("rejects non-string edit text before writing a request", async () => {
+    await expect(
+      client.editMessage(HEX32("aa"), HEX32("cc"), HEX32("dd"), null as unknown as string),
+    ).rejects.toMatchObject({ code: "invalid_request" });
   });
 
   it("adds and removes reactions with the agent-control v2 wire shape", async () => {

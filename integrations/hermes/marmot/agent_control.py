@@ -29,6 +29,7 @@ _EXPECTED_RESPONSE_TYPES = {
     "account_relay_list_remove": frozenset({"relay_lists"}),
     "send_final": frozenset({"final_sent"}),
     "delete_message": frozenset({"app_event_sent"}),
+    "edit_message": frozenset({"final_sent"}),
     "send_reaction": frozenset({"app_event_sent"}),
     "remove_reaction": frozenset({"app_event_sent"}),
     "group_info": frozenset({"group_info"}),
@@ -337,6 +338,34 @@ class MarmotAgentControlClient:
                     target_message_id_hex,
                     "target_message_id_hex",
                 ),
+            }
+        )
+
+    async def edit_message(
+        self,
+        account_id_hex: str,
+        group_id_hex: str,
+        target_message_id_hex: str,
+        text: str,
+    ) -> Dict[str, Any]:
+        """Replace the text of a chat message this account sent.
+
+        The connector refuses any other target with ``invalid_edit_target`` and
+        a burst of edits with the retryable ``edit_rate_limited``; nothing is
+        published in either case.
+        """
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        return await self.request(
+            {
+                "type": "edit_message",
+                "account_id_hex": _normalize_hex(account_id_hex, "account_id_hex"),
+                "group_id_hex": _normalize_hex(group_id_hex, "group_id_hex"),
+                "target_message_id_hex": _normalize_hex(
+                    target_message_id_hex,
+                    "target_message_id_hex",
+                ),
+                "text": text,
             }
         )
 

@@ -71,6 +71,8 @@ impl ConnectorError {
             Self::App(AppError::AgentStreamFinishMismatch) => "stream_finalize_mismatch",
             Self::App(AppError::AgentStreamSendFailed(_)) => "stream_send_failed",
             Self::App(AppError::InvalidGroupProfile(_)) => "invalid_group_profile",
+            Self::App(AppError::InvalidEditTarget) => "invalid_edit_target",
+            Self::App(AppError::EditRateLimited) => "edit_rate_limited",
             Self::App(error)
                 if matches!(
                     error.as_engine_error(),
@@ -127,6 +129,12 @@ impl ConnectorError {
                 "stream durable send failed; retry the same finish request"
             }
             Self::App(AppError::InvalidGroupProfile(_)) => "invalid group profile",
+            Self::App(AppError::InvalidEditTarget) => {
+                "edit target must be an available chat message this account sent"
+            }
+            Self::App(AppError::EditRateLimited) => {
+                "too many edits of this message; nothing was published, retry shortly"
+            }
             Self::App(error)
                 if matches!(
                     error.as_engine_error(),
@@ -170,7 +178,11 @@ impl ConnectorError {
             self,
             Self::SendInProgress
                 | Self::RelayListInconclusive(_)
-                | Self::App(AppError::MediaUploadTimedOut | AppError::AgentStreamSendFailed(_))
+                | Self::App(
+                    AppError::MediaUploadTimedOut
+                        | AppError::AgentStreamSendFailed(_)
+                        | AppError::EditRateLimited
+                )
         )
     }
 

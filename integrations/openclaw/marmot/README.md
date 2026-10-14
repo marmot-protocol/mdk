@@ -53,9 +53,13 @@ Verify both tools in the installed release. See [Admin group profile tool](#admi
   `message` tool media/attachment fields from an authorized workspace/store.
   Source authorization and connector staging authorization are separate checks.
   See [first file verification](#verify-text-and-files-separately).
-- **Reply, react and retract own messages.** Normal assistant replies
+- **Reply, react, edit and retract own messages.** Normal assistant replies
   need no manual target. Explicit `message` sends target the MLS group id (a DM
-  is also a group); the registered delete action retracts a prior own message. `message(action: "react",
+  is also a group); the registered delete action retracts a prior own message.
+  `message(action: "edit", messageId: <id>, message: <new text>)` replaces the
+  text of a message the agent sent, keeping its place in the conversation (for
+  example a status line); only the agent's own available chat messages can be
+  edited, and a burst of edits is refused as retryable. `message(action: "react",
   emoji: "👀", messageId: <id>, to: <group-id>)` adds a reaction; `remove: true`
   removes it. Use the exact target from the active conversation.
 - **Publish an account display name with consent.** Profile-name onboarding
