@@ -2045,6 +2045,7 @@ impl MarmotApp {
             blossom_http_transport: crate::media::BlossomHttpTransport::new(
                 self.allow_loopback_blob_endpoints(),
             ),
+            upload_epoch_holds: Default::default(),
             state: open.state,
             seen_events_index,
             pending_seen_event_count: 0,
