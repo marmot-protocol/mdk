@@ -68,19 +68,13 @@ pub(crate) async fn group_command(
     app: &MarmotApp,
     command: GroupCommand,
     account_flag: Option<String>,
-    accept_stale: bool,
+    accepted: AcceptedGroupChangeRisks,
 ) -> Result<CommandOutput, WnError> {
     let runtime = app.runtime();
     let requires_welcome_drain = group_command_requires_welcome_drain(&command);
-    let result = group_command_with_runtime(
-        account_home,
-        app,
-        &runtime,
-        command,
-        account_flag,
-        accept_stale,
-    )
-    .await;
+    let result =
+        group_command_with_runtime(account_home, app, &runtime, command, account_flag, accepted)
+            .await;
     // Only create/invite launch post-response Welcome fanout. Read-only and
     // unrelated mutation commands must not join a retained startup Welcome.
     let drain_result = if requires_welcome_drain {
@@ -93,31 +87,54 @@ pub(crate) async fn group_command(
     result
 }
 
-/// Run a group command; with `--accept-stale`, a `group_catching_up` refusal
-/// is acknowledged for the group it names and the command runs once more in
-/// the same runtime, which holds the acknowledgement (mdk#2258).
-async fn retry_accepting_stale<F, Fut>(
+/// Advisory group-change refusals the caller accepts up front: `--accept-stale`
+/// (mdk#2258) and `--accept-undelivered` (mdk#2255).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AcceptedGroupChangeRisks {
+    pub(crate) stale: bool,
+    pub(crate) undelivered: bool,
+}
+
+/// Run a group command. For each advisory refusal the caller accepted, the
+/// refusal is acknowledged for the group it names and the command runs once
+/// more in the same runtime, which holds the acknowledgement. A change can be
+/// refused by both gates in turn; an acknowledgement survives the other
+/// gate's refusal.
+async fn retry_accepting_risks<F, Fut>(
     account_home: &AccountHome,
     runtime: &MarmotAppRuntime,
     account_flag: Option<String>,
-    accept_stale: bool,
+    accepted: AcceptedGroupChangeRisks,
     mut run: F,
 ) -> Result<CommandOutput, WnError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<CommandOutput, WnError>>,
 {
-    match run().await {
-        Err(WnError::App(AppError::GroupCatchingUp(group_hex))) if accept_stale => {
-            let account = resolve_account(account_home, account_flag)?;
-            let group_id = GroupId::new(hex::decode(&group_hex)?);
-            runtime
-                .acknowledge_group_catching_up(&account.label, &group_id)
-                .await?;
-            run().await
+    let mut result = run().await;
+    for _ in 0..2 {
+        match result {
+            Err(WnError::App(AppError::GroupCatchingUp(group_hex))) if accepted.stale => {
+                let account = resolve_account(account_home, account_flag.clone())?;
+                let group_id = GroupId::new(hex::decode(&group_hex)?);
+                runtime
+                    .acknowledge_group_catching_up(&account.label, &group_id)
+                    .await?;
+            }
+            Err(WnError::App(AppError::GroupCommitUndelivered(group_hex)))
+                if accepted.undelivered =>
+            {
+                let account = resolve_account(account_home, account_flag.clone())?;
+                let group_id = GroupId::new(hex::decode(&group_hex)?);
+                runtime
+                    .acknowledge_group_commit_undelivered(&account.label, &group_id)
+                    .await?;
+            }
+            result => return result,
         }
-        result => result,
+        result = run().await;
     }
+    result
 }
 
 pub(crate) async fn group_command_with_runtime(
@@ -126,13 +143,13 @@ pub(crate) async fn group_command_with_runtime(
     runtime: &MarmotAppRuntime,
     command: GroupCommand,
     account_flag: Option<String>,
-    accept_stale: bool,
+    accepted: AcceptedGroupChangeRisks,
 ) -> Result<CommandOutput, WnError> {
-    retry_accepting_stale(
+    retry_accepting_risks(
         account_home,
         runtime,
         account_flag.clone(),
-        accept_stale,
+        accepted,
         || {
             group_command_once(
                 account_home,
@@ -345,19 +362,13 @@ pub(crate) async fn groups_command(
     app: &MarmotApp,
     command: GroupsCommand,
     account_flag: Option<String>,
-    accept_stale: bool,
+    accepted: AcceptedGroupChangeRisks,
 ) -> Result<CommandOutput, WnError> {
     let runtime = app.runtime();
     let requires_welcome_drain = groups_command_requires_welcome_drain(&command);
-    let result = groups_command_with_runtime(
-        account_home,
-        app,
-        &runtime,
-        command,
-        account_flag,
-        accept_stale,
-    )
-    .await;
+    let result =
+        groups_command_with_runtime(account_home, app, &runtime, command, account_flag, accepted)
+            .await;
     let drain_result = if requires_welcome_drain {
         runtime.drain_in_flight_work().await
     } else {
@@ -374,13 +385,13 @@ pub(crate) async fn groups_command_with_runtime(
     runtime: &MarmotAppRuntime,
     command: GroupsCommand,
     account_flag: Option<String>,
-    accept_stale: bool,
+    accepted: AcceptedGroupChangeRisks,
 ) -> Result<CommandOutput, WnError> {
-    retry_accepting_stale(
+    retry_accepting_risks(
         account_home,
         runtime,
         account_flag.clone(),
-        accept_stale,
+        accepted,
         || {
             groups_command_once(
                 account_home,
@@ -1048,6 +1059,34 @@ async fn groups_command_once(
                     json["can_leave"],
                     json["can_disband"]
                 ),
+                json,
+            })
+        }
+        GroupsCommand::CommitDelivery { group_id } => {
+            let account = resolve_account(account_home, account_flag)?;
+            ensure_local_signing(&account)?;
+            app.status(&account.label)?;
+            let group_id_hex = normalize_group_id_hex(&group_id)?;
+            let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+            let delivery = runtime
+                .group_commit_delivery(&account.label, &group_id)
+                .await?;
+            let mut json = json!({
+                "group_id": group_id_hex,
+                "delivered": delivery.is_none(),
+                "commit_delivery": delivery,
+            });
+            insert_account_fields(&mut json, &account)?;
+            Ok(CommandOutput {
+                plain: match &delivery {
+                    None => format!("commit-delivery group={group_id_hex} delivered=true"),
+                    Some(delivery) => format!(
+                        "commit-delivery group={group_id_hex} delivered=false owed_relays={} relay_count={} since={}",
+                        delivery.owed_relay_urls.len(),
+                        delivery.relay_count,
+                        delivery.since
+                    ),
+                },
                 json,
             })
         }

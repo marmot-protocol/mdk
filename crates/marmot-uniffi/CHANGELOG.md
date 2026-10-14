@@ -11,6 +11,7 @@
   Swift/Kotlin handling and regenerate bindings with the matching native
   library; render a storage prompt rather than a retry timer. See
   [the attachment access contract](ATTACHMENT-ACCESS.md).
+- `MarmotKitError` adds `GroupCommitUndelivered`: a group change was refused because the group's last change has not reached every group relay yet (mdk#2255). Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
 
 ### Added
 
@@ -19,6 +20,8 @@
 - `Marmot::send_prepared_media_with_client_token` exposes captured ordinary-media admission with transactional conditional draft consumption. Use the original token and revision for live retries, recover ownership by token after interruption, and pair regenerated Swift/Kotlin bindings with the matching library. See [local sends](LOCAL-SENDS.md).
 
 - `Marmot::acknowledge_group_catching_up`: after `GroupCatchingUp`, call it once the user accepts that the change may split the group, then retry. See [the epoch-gap notes](README.md#history-may-be-incomplete-notices).
+
+- `Marmot::group_commit_delivery` returns the relays still owed the group's last change (`GroupCommitDeliveryFfi`), and `Marmot::acknowledge_group_commit_undelivered` lets one change through after `GroupCommitUndelivered` once the user accepts the risk. See [the delivery notes](README.md#history-may-be-incomplete-notices).
 
 ## 0.13.0 - 2026-10-12
 

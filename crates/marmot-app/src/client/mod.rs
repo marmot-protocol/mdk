@@ -108,6 +108,37 @@ fn self_update_waits_for_epoch_gap(open_since_ms: u64, now_ms: u64) -> bool {
     now_ms.saturating_sub(open_since_ms) < EPOCH_GAP_SELF_UPDATE_HOLD_MS
 }
 
+/// How long a commit may stay owed to a group relay before group changes are
+/// refused (mdk#2255). A commit confirms on its first acknowledgement and the
+/// slower relays are cut off and retried after 30 s, so a healthy relay is
+/// briefly owed after nearly every commit. The grace covers that first retry.
+pub(crate) const COMMIT_DELIVERY_GATE_GRACE_SECS: u64 = 2 * 60;
+
+fn commit_delivery_gates_change(since_secs: u64, now_secs: u64, grace_secs: u64) -> bool {
+    now_secs.saturating_sub(since_secs) >= grace_secs
+}
+
+#[cfg(test)]
+mod commit_delivery_gate_tests {
+    use super::{COMMIT_DELIVERY_GATE_GRACE_SECS, commit_delivery_gates_change};
+
+    /// mdk#2255: a relay cut off at quorum and retried 30 s later does not
+    /// refuse a quick follow-up change; one still owed after the grace does.
+    #[test]
+    fn an_owed_commit_gates_changes_only_after_the_grace() {
+        let since = 1_000_000;
+        let grace = COMMIT_DELIVERY_GATE_GRACE_SECS;
+        assert!(!commit_delivery_gates_change(since, since, grace));
+        assert!(!commit_delivery_gates_change(
+            since,
+            since + grace - 1,
+            grace
+        ));
+        assert!(commit_delivery_gates_change(since, since + grace, grace));
+        assert!(commit_delivery_gates_change(since, since + 1, 0));
+    }
+}
+
 #[cfg(test)]
 mod epoch_gap_hold_tests {
     use super::{EPOCH_GAP_SELF_UPDATE_HOLD_MS, self_update_waits_for_epoch_gap};
@@ -872,6 +903,12 @@ pub struct AppClient {
     /// one group change attempt at that epoch only. Process-local: a rebuilt
     /// client asks again.
     pub(crate) stale_commit_acknowledgements: HashMap<GroupId, cgka_traits::EpochId>,
+    /// Groups whose undelivered last commit the user explicitly accepted, with
+    /// the commit they accepted (mdk#2255). An acknowledgement admits one group
+    /// change attempt while that commit is owed. Process-local.
+    pub(crate) undelivered_commit_acknowledgements: HashMap<GroupId, cgka_traits::MessageId>,
+    /// [`COMMIT_DELIVERY_GATE_GRACE_SECS`]; tests shorten it.
+    pub(crate) commit_delivery_gate_grace_secs: u64,
     /// Batch-start local-deletion frontiers crossed by authenticated fresh
     /// activity. They remain pending until the crossing projection and marker
     /// clears commit in the same account-state transaction.
@@ -2764,7 +2801,7 @@ impl AppClient {
         telemetry: Option<&AppPerformanceTelemetry>,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
-        self.ensure_group_caught_up(group_id)?;
+        self.ensure_group_change_admitted(group_id)?;
 
         let key_package_started_at = Instant::now();
         let requirements = self
@@ -3030,7 +3067,7 @@ impl AppClient {
         member_refs: &[&str],
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
-        self.ensure_group_caught_up(group_id)?;
+        self.ensure_group_change_admitted(group_id)?;
         let mut members = Vec::with_capacity(member_refs.len());
         for member in member_refs {
             members.push(self.app.member_id(member)?);
@@ -3111,7 +3148,7 @@ impl AppClient {
         group_id: &GroupId,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
-        self.ensure_group_caught_up(group_id)?;
+        self.ensure_group_change_admitted(group_id)?;
         let audit_context = Self::local_human_action_context(
             "enable_group_disbanding",
             vec!["lifecycle"],
@@ -3169,7 +3206,7 @@ impl AppClient {
         group_id: &GroupId,
     ) -> Result<AppDisbandRequest, AppError> {
         self.ensure_group(group_id)?;
-        self.ensure_group_caught_up(group_id)?;
+        self.ensure_group_change_admitted(group_id)?;
         let audit_context = Self::local_human_action_context(
             "disband_group",
             vec!["lifecycle", "membership", "admins"],
@@ -3865,7 +3902,7 @@ impl AppClient {
         audit_context: AuditEventContext,
         wake_targets: &[String],
     ) -> Result<SendSummary, AppError> {
-        self.ensure_group_caught_up(group_id)?;
+        self.ensure_group_change_admitted(group_id)?;
         let component = AppGroupAdminPolicyComponent::new(admins).to_app_component_data()?;
 
         self.sync_runtime_groups().await?;
@@ -3915,7 +3952,7 @@ impl AppClient {
     ) -> Result<SendSummary, AppError> {
         validate_app_component(component_id, &data)?;
         self.ensure_group(group_id)?;
-        self.ensure_group_caught_up(group_id)?;
+        self.ensure_group_change_admitted(group_id)?;
         self.sync_runtime_groups().await?;
         // `required_capabilities` is read out of the MLS GroupContext, not
         // from local config, so any admin in the group can mark an
@@ -3988,7 +4025,7 @@ impl AppClient {
         disappearing_message_secs: u64,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
-        self.ensure_group_caught_up(group_id)?;
+        self.ensure_group_change_admitted(group_id)?;
         let component = AppGroupMessageRetentionComponent::new(disappearing_message_secs)
             .to_app_component_data()?;
         let audit_context = Self::local_human_action_context(
@@ -4025,7 +4062,7 @@ impl AppClient {
         endpoints: Vec<AppBlobEndpoint>,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
-        self.ensure_group_caught_up(group_id)?;
+        self.ensure_group_change_admitted(group_id)?;
         let endpoint_count = endpoints.len() as u64;
         let mut allowed_locator_kinds = Vec::new();
         for endpoint in &endpoints {
@@ -4101,7 +4138,7 @@ impl AppClient {
         thumbhash: Option<String>,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
-        self.ensure_group_caught_up(group_id)?;
+        self.ensure_group_change_admitted(group_id)?;
         let component = match url {
             Some(url) if !url.is_empty() => {
                 AppGroupAvatarUrlComponent::new(url, dim, thumbhash)?.to_app_component_data()?
@@ -5549,7 +5586,7 @@ impl AppClient {
         media_type: &str,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group_application_messages_allowed(group_id)?;
-        self.ensure_group_caught_up(group_id)?;
+        self.ensure_group_change_admitted(group_id)?;
         let audit_context = Self::local_human_action_context(
             "update_group_image",
             vec!["image"],
@@ -5894,7 +5931,7 @@ impl AppClient {
         }
         validate_group_profile(name.unwrap_or(""), description.unwrap_or(""))?;
         self.ensure_group(group_id)?;
-        self.ensure_group_caught_up(group_id)?;
+        self.ensure_group_change_admitted(group_id)?;
         let mut fields = Vec::new();
         if name.is_some() {
             fields.push("name");
@@ -5952,45 +5989,6 @@ impl AppClient {
         }
     }
 
-    /// Refuse a group change while unresolved epoch-gap recovery says the
-    /// group moved past this device's local epoch (mdk#2258). A commit
-    /// authored from that epoch forks the group, and fork choice can then
-    /// rewind everyone else's history onto it. The pre-send sync only
-    /// re-registers subscriptions, so it cannot prove the device caught up.
-    ///
-    /// The gate is advisory: the evidence behind an epoch gap is
-    /// undecryptable traffic anyone can mint, so it must never wedge a group.
-    /// [`Self::acknowledge_group_catching_up`] lets the user accept the fork
-    /// risk for the current epoch. Without that, the gate lifts when recovery
-    /// clears the gap or the device leaves the stalled epoch. Dismissing the
-    /// history notice accepts missing history, not fork risk, so it does not
-    /// lift the gate.
-    ///
-    /// Application messages and leave are not gated: neither commits.
-    fn ensure_group_caught_up(&mut self, group_id: &GroupId) -> Result<(), AppError> {
-        let epoch = self.runtime.group_record(group_id)?.epoch;
-        // An acknowledgement admits exactly one attempt: consumed here even if
-        // the change then fails, so a different change asks again.
-        let acknowledged = self.stale_commit_acknowledgements.remove(group_id) == Some(epoch);
-        if self.epoch_gap_open_since(group_id, epoch)?.is_none() {
-            return Ok(());
-        }
-        if acknowledged {
-            tracing::info!(
-                target: "marmot_app::client",
-                method = "ensure_group_caught_up",
-                "user accepted fork risk for a group change while catching up"
-            );
-            return Ok(());
-        }
-        tracing::info!(
-            target: "marmot_app::client",
-            method = "ensure_group_caught_up",
-            "group change refused while epoch-gap recovery is unresolved"
-        );
-        Err(AppError::GroupCatchingUp(hex::encode(group_id.as_slice())))
-    }
-
     /// Record that the user accepts the fork risk of changing a group that is
     /// still catching up, after [`AppError::GroupCatchingUp`]. The next group
     /// change attempt at the current local epoch proceeds; the attempt
@@ -6006,6 +6004,151 @@ impl AppClient {
         self.stale_commit_acknowledgements
             .insert(group_id.clone(), epoch);
         Ok(true)
+    }
+
+    /// Admit a group change only past both advisory commit gates.
+    ///
+    /// **Catching up (mdk#2258).** Unresolved epoch-gap recovery says the group
+    /// moved past this device's local epoch. A commit authored from that epoch
+    /// forks the group, and fork choice can then rewind everyone else's history
+    /// onto it. The pre-send sync only re-registers subscriptions, so it cannot
+    /// prove the device caught up. The evidence behind an epoch gap is
+    /// undecryptable traffic anyone can mint, so the gate must never wedge a
+    /// group: [`Self::acknowledge_group_catching_up`] accepts the fork risk for
+    /// the current epoch. Otherwise it lifts when recovery clears the gap or the
+    /// device leaves the stalled epoch. Dismissing the history notice accepts
+    /// missing history, not fork risk, so it does not lift the gate.
+    ///
+    /// **Undelivered commit (mdk#2255).** The group's last confirmed commit is
+    /// still owed to a group relay. It confirmed on its first acknowledgement;
+    /// members who read only the other relays cannot follow it, and every
+    /// further change builds on a commit they lack. Groups often list a relay
+    /// that is gone for good and retried forever, so this gate is advisory too:
+    /// [`Self::acknowledge_group_commit_undelivered`] accepts that risk.
+    /// Otherwise it lifts when every owed relay accepts or definitively rejects
+    /// the commit. It refuses only once the commit has been owed for
+    /// [`COMMIT_DELIVERY_GATE_GRACE_SECS`]: the first publish cuts slower
+    /// relays off at the first acknowledgement and retries them 30 s later.
+    ///
+    /// An acknowledgement admits exactly one attempt: an admitted attempt
+    /// consumes it even if the change then fails, so a different change asks
+    /// again. When the other gate refuses the attempt, a still-valid
+    /// acknowledgement is kept, so a caller can satisfy both gates in turn.
+    ///
+    /// Application messages and leave are not gated: neither commits.
+    fn ensure_group_change_admitted(&mut self, group_id: &GroupId) -> Result<(), AppError> {
+        let epoch = self.runtime.group_record(group_id)?.epoch;
+        let catching_up = self.epoch_gap_open_since(group_id, epoch)?.is_some();
+        let now_secs = recovery::wall_now_ms()? / 1_000;
+        let undelivered = self.runtime.undelivered_commit(group_id)?.filter(|commit| {
+            commit_delivery_gates_change(
+                commit.since.0,
+                now_secs,
+                self.commit_delivery_gate_grace_secs,
+            )
+        });
+        // Stale acknowledgements (another epoch, another commit) are discarded.
+        let stale_ack = self
+            .stale_commit_acknowledgements
+            .remove(group_id)
+            .filter(|acknowledged| *acknowledged == epoch);
+        let undelivered_ack = self
+            .undelivered_commit_acknowledgements
+            .remove(group_id)
+            .filter(|acknowledged| {
+                undelivered
+                    .as_ref()
+                    .is_some_and(|commit| &commit.message_id == acknowledged)
+            });
+        let refusal = if catching_up && stale_ack.is_none() {
+            tracing::info!(
+                target: "marmot_app::client",
+                method = "ensure_group_change_admitted",
+                "group change refused while epoch-gap recovery is unresolved"
+            );
+            Some(AppError::GroupCatchingUp(hex::encode(group_id.as_slice())))
+        } else if let Some(commit) = undelivered.as_ref()
+            && undelivered_ack.is_none()
+        {
+            tracing::info!(
+                target: "marmot_app::client",
+                method = "ensure_group_change_admitted",
+                owed_relays = commit.owed_endpoints.len(),
+                "group change refused while the last commit is owed to a relay"
+            );
+            Some(AppError::GroupCommitUndelivered(hex::encode(
+                group_id.as_slice(),
+            )))
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
+            if let Some(acknowledged) = stale_ack {
+                self.stale_commit_acknowledgements
+                    .insert(group_id.clone(), acknowledged);
+            }
+            if let Some(acknowledged) = undelivered_ack {
+                self.undelivered_commit_acknowledgements
+                    .insert(group_id.clone(), acknowledged);
+            }
+            return Err(refusal);
+        }
+        if catching_up {
+            tracing::info!(
+                target: "marmot_app::client",
+                method = "ensure_group_change_admitted",
+                "user accepted fork risk for a group change while catching up"
+            );
+        }
+        if undelivered.is_some() {
+            tracing::info!(
+                target: "marmot_app::client",
+                method = "ensure_group_change_admitted",
+                "user accepted a group change while the last commit is undelivered"
+            );
+        }
+        Ok(())
+    }
+
+    /// Record that the user accepts changing a group whose last change has not
+    /// reached every relay, after [`AppError::GroupCommitUndelivered`]. The next
+    /// group change attempt proceeds; the attempt consumes the acknowledgement
+    /// whether or not it commits. Returns `false`, recording nothing, when no
+    /// relay is owed the group's last change.
+    pub fn acknowledge_group_commit_undelivered(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        self.ensure_group(group_id)?;
+        let Some(undelivered) = self.runtime.undelivered_commit(group_id)? else {
+            self.undelivered_commit_acknowledgements.remove(group_id);
+            return Ok(false);
+        };
+        self.undelivered_commit_acknowledgements
+            .insert(group_id.clone(), undelivered.message_id);
+        Ok(true)
+    }
+
+    /// The group's oldest confirmed change that some group relays still owe, or
+    /// `None` when none is owed (mdk#2255). Reported immediately; the group
+    /// change gate waits out the two-minute delivery grace from `since`.
+    pub fn group_commit_delivery(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<crate::GroupCommitDelivery>, AppError> {
+        self.ensure_group(group_id)?;
+        Ok(self
+            .runtime
+            .undelivered_commit(group_id)?
+            .map(|undelivered| crate::GroupCommitDelivery {
+                owed_relay_urls: undelivered
+                    .owed_endpoints
+                    .into_iter()
+                    .map(|endpoint| endpoint.0)
+                    .collect(),
+                relay_count: u32::try_from(undelivered.endpoint_count).unwrap_or(u32::MAX),
+                since: undelivered.since.0,
+            }))
     }
 
     /// When unresolved epoch-gap recovery first covered this group's `epoch`.

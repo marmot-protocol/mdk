@@ -1150,6 +1150,21 @@ pub struct AppMessageQuery {
     pub limit: Option<usize>,
 }
 
+/// The group's oldest confirmed change that some group relays have not accepted
+/// yet (mdk#2255). Members who read only those relays cannot follow the group
+/// until they do; MDK keeps retrying them with the exact event. Reported as
+/// soon as a relay is owed; group changes fail only once `since` is two
+/// minutes old. A newer change can be owed to other relays as well.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GroupCommitDelivery {
+    /// Relays that have not accepted the change yet.
+    pub owed_relay_urls: Vec<String>,
+    /// Relays the change was published to.
+    pub relay_count: u32,
+    /// When the first relay accepted the change, in Unix seconds.
+    pub since: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SendSummary {
     pub published: usize,
@@ -2038,6 +2053,8 @@ impl MarmotApp {
             pending_epoch_stall_escalations: Vec::new(),
             pending_convergence_groups: std::collections::HashSet::new(),
             stale_commit_acknowledgements: std::collections::HashMap::new(),
+            undelivered_commit_acknowledgements: std::collections::HashMap::new(),
+            commit_delivery_gate_grace_secs: crate::client::COMMIT_DELIVERY_GATE_GRACE_SECS,
             pending_local_group_deletion_frontier_clears: std::collections::HashMap::new(),
             pending_application_event_acks: std::collections::HashSet::new(),
             fail_next_published_app_message_acknowledgement: cfg!(

@@ -197,6 +197,11 @@ enum MarmotStatus
    * group changes would fork it. Retry once it has synced (mdk#2258).
    */
   MARMOT_STATUS_GROUP_CATCHING_UP = 101,
+  /**
+   * The group's last change has not reached every group relay yet; group
+   * changes wait while MDK retries them (mdk#2255).
+   */
+  MARMOT_STATUS_GROUP_COMMIT_UNDELIVERED = 102,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -2338,6 +2343,19 @@ typedef struct MarmotGroupAppComponent {
   uint8_t *data;
   uintptr_t data_len;
 } MarmotGroupAppComponent;
+
+/**
+ * The group's oldest change that some group relays have not accepted yet.
+ * Members who read only those relays cannot follow the group until they do.
+ * `since` is when the first relay accepted it, in Unix seconds.
+ */
+typedef struct MarmotGroupCommitDelivery {
+  char *group_id_hex;
+  char **owed_relay_urls;
+  uintptr_t owed_relay_urls_len;
+  uint32_t relay_count;
+  uint64_t since;
+} MarmotGroupCommitDelivery;
 
 /**
  * Embedded replacement offer; show the authenticated inviter before confirmation.
@@ -6790,6 +6808,42 @@ MarmotStatus marmot_acknowledge_group_catching_up(const struct MarmotClient *cli
                                                   const char *account_ref,
                                                   const char *group_id_hex,
                                                   bool *out);
+
+/**
+ * After a group change returns `MARMOT_STATUS_GROUP_COMMIT_UNDELIVERED`,
+ * record that the user accepts that members on relays still owed the
+ * group's last change may not follow, then retry the change. Admits one
+ * attempt, consumed even if it fails; not persisted. Writes false when no
+ * relay is owed the group's last change.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_acknowledge_group_commit_undelivered(const struct MarmotClient *client,
+                                                         const char *account_ref,
+                                                         const char *group_id_hex,
+                                                         bool *out);
+
+/**
+ * The group's oldest change that some group relays have not accepted yet,
+ * or NULL once every relay has accepted or definitively rejected it.
+ * Non-NULL is not a refusal: group changes return
+ * `MARMOT_STATUS_GROUP_COMMIT_UNDELIVERED` only once `since` is two minutes
+ * old. Poll while showing it. Free with `marmot_group_commit_delivery_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_group_commit_delivery(const struct MarmotClient *client,
+                                          const char *account_ref,
+                                          const char *group_id_hex,
+                                          struct MarmotGroupCommitDelivery **out);
 
 /**
  * Query advisory membership health and pending rejoin offers.
@@ -11517,6 +11571,16 @@ void marmot_event_free(struct MarmotEvent *event);
  * this library.
  */
 void marmot_group_app_component_free(struct MarmotGroupAppComponent *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_group_commit_delivery_free(struct MarmotGroupCommitDelivery *ptr);
 
 /**
  * Free a disband request returned by `marmot_disband_group`. NULL is a

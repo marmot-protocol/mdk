@@ -70,6 +70,11 @@ const MAINTENANCE_QUIET_SECS: u64 = 60;
 const PERIODIC_MIN_SECS: u64 = 24 * 24 * 60 * 60;
 const PERIODIC_MAX_SECS: u64 = 36 * 24 * 60 * 60;
 const TRANSPORT_FANOUT_RETENTION_SECS: u64 = 24 * 60 * 60;
+/// How long a due self-update waits for the group's previous commit to reach
+/// every group relay (mdk#2255). The owed relays keep being retried, backing
+/// off to once an hour, so the bound gives an unreachable relay several
+/// retries without letting a dead one suppress key rotation.
+const COMMIT_DELIVERY_SELF_UPDATE_HOLD_SECS: u64 = 60 * 60;
 const FROZEN_FANOUT_AMBIGUOUS_RETRY_BASE_MS: u64 = 30 * 1_000;
 const FROZEN_FANOUT_AMBIGUOUS_RETRY_MAX_MS: u64 = 60 * 60 * 1_000;
 /// A relay that proved it never accepted the event can be retried promptly.
@@ -2041,6 +2046,17 @@ where
                 self.put_maintenance_obligation_if_changed(&original_obligation, &obligation)?;
                 continue;
             }
+            if self
+                .undelivered_commit(&obligation.group_id)?
+                .is_some_and(|commit| {
+                    now.0.saturating_sub(commit.since.0) < COMMIT_DELIVERY_SELF_UPDATE_HOLD_SECS
+                })
+            {
+                obligation.phase = MaintenancePhase::Retry;
+                obligation.last_failure_code = Some("commit_delivery_hold".into());
+                self.put_maintenance_obligation_if_changed(&original_obligation, &obligation)?;
+                continue;
+            }
 
             let group_id = obligation.group_id.clone();
             self.maintenance_activity
@@ -2692,6 +2708,130 @@ where
 
     pub fn has_queued_outbound_intents(&self, group_id: &GroupId) -> AccountResult<bool> {
         Ok(self.session.has_queued_outbound_intents(group_id)?)
+    }
+
+    /// The oldest confirmed commit in `group_id` that some group relay still
+    /// owes (mdk#2255). A commit confirms on its first acknowledgement, so
+    /// members who read only the other relays cannot follow the group until
+    /// they accept it. Owed relays keep being retried with the exact event; a
+    /// relay that definitively rejected it is not owed. A commit convergence
+    /// withdrew from the selected branch no longer gates the group.
+    pub fn undelivered_commit(
+        &self,
+        group_id: &GroupId,
+    ) -> AccountResult<Option<UndeliveredCommit>> {
+        let mut oldest: Option<UndeliveredCommit> = None;
+        let mut consider = |commit: UndeliveredCommit| {
+            if oldest
+                .as_ref()
+                .is_none_or(|current| commit.since < current.since)
+            {
+                oldest = Some(commit);
+            }
+        };
+        for fanout in self.session.outbound_fanouts_for_group(group_id)? {
+            // Application messages have no MLS state; Welcomes go to inboxes.
+            if !matches!(
+                fanout.request().message.envelope,
+                TransportEnvelope::GroupMessage { .. }
+            ) || fanout.mls_state() != FanoutMlsState::Confirmed
+                || self.commit_withdrawn(
+                    fanout
+                        .pending_origin_message_id()
+                        .unwrap_or_else(|| fanout.message_id()),
+                )?
+            {
+                continue;
+            }
+            let endpoints = fanout.request().target.endpoints();
+            let owed_endpoints = endpoints
+                .iter()
+                .zip(fanout.target_statuses())
+                .filter(|(_, status)| status.is_outstanding())
+                .map(|(endpoint, _)| endpoint.clone())
+                .collect::<Vec<_>>();
+            if !owed_endpoints.is_empty() {
+                // Measured from the first acknowledgement: the accepting
+                // attempt's start, not staging, which can be hours earlier.
+                let first_accepted_ms = (0..endpoints.len())
+                    .filter(|&index| {
+                        fanout.target_status(index)
+                            == Some(cgka_traits::FanoutTargetStatus::Accepted)
+                    })
+                    .filter_map(|index| fanout.target_last_attempt_at_ms(index))
+                    .min()
+                    .unwrap_or_else(|| fanout.created_at_ms());
+                consider(UndeliveredCommit {
+                    message_id: fanout.message_id().clone(),
+                    since: Timestamp(first_accepted_ms / 1_000),
+                    owed_endpoints,
+                    endpoint_count: endpoints.len(),
+                });
+            }
+        }
+        // Self-updates staged before the frozen-fanout migration.
+        let now = self.wall_clock.now();
+        // The ungated list: the group-scoped lookup fails for a stored group
+        // the engine has not hydrated yet, which has nothing owed to report.
+        let confirmed_evolutions = self
+            .session
+            .group_evolutions()?
+            .into_iter()
+            .filter(|evolution| {
+                &evolution.group_id == group_id && evolution.phase == GroupEvolutionPhase::Confirmed
+            })
+            .map(|evolution| evolution.id)
+            .collect::<HashSet<_>>();
+        for fanout in self.session.transport_fanouts()? {
+            let Some(evolution_id) = fanout.evolution_id.as_ref() else {
+                continue;
+            };
+            if fanout.group_id.as_ref() != Some(group_id)
+                || fanout.bounded_until.is_some_and(|until| until <= now)
+                || !(fanout.evolution_confirmed || confirmed_evolutions.contains(evolution_id))
+                || self.commit_withdrawn(&fanout.id)?
+            {
+                continue;
+            }
+            let owed_endpoints = fanout
+                .targets
+                .iter()
+                .filter(|target| {
+                    !matches!(
+                        target.state,
+                        TransportFanoutAttemptState::Accepted
+                            | TransportFanoutAttemptState::PolicyProhibited
+                    )
+                })
+                .map(|target| target.endpoint.clone())
+                .collect::<Vec<_>>();
+            if !owed_endpoints.is_empty() {
+                let first_accepted = fanout
+                    .targets
+                    .iter()
+                    .filter(|target| target.state == TransportFanoutAttemptState::Accepted)
+                    .filter_map(|target| target.last_attempt_at)
+                    .min()
+                    .unwrap_or(fanout.created_at);
+                consider(UndeliveredCommit {
+                    message_id: fanout.id.clone(),
+                    since: first_accepted,
+                    owed_endpoints,
+                    endpoint_count: fanout.targets.len(),
+                });
+            }
+        }
+        Ok(oldest)
+    }
+
+    /// Whether convergence withdrew this own commit from the selected branch:
+    /// the same stored dispositions `reconcile_superseded_maintenance_from_state`
+    /// reads, so the answer survives a lost announcement and a restart.
+    fn commit_withdrawn(&self, commit_id: &cgka_traits::MessageId) -> AccountResult<bool> {
+        Ok(matches!(
+            self.session.stored_message_state(commit_id)?,
+            Some(MessageState::ConvergenceDeferred | MessageState::EpochInvalidated)
+        ))
     }
 
     /// Whether retained publications still prevent staging queued sends.
@@ -5855,6 +5995,19 @@ pub struct AccountIngestEffects {
     /// Carried verbatim from [`IngestEffects::left_object_unpersisted`].
     pub left_object_unpersisted: bool,
     pub effects: AccountDeviceEffects,
+}
+
+/// A confirmed commit that some of its group relays have not accepted yet
+/// (mdk#2255). See [`AccountDeviceRuntime::undelivered_commit`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UndeliveredCommit {
+    pub message_id: cgka_traits::MessageId,
+    /// When the first relay accepted the commit, which confirmed it.
+    pub since: Timestamp,
+    /// Relays still owed the exact commit.
+    pub owed_endpoints: Vec<TransportEndpoint>,
+    /// Relays the commit was published to.
+    pub endpoint_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

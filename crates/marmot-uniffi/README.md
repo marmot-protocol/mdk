@@ -888,6 +888,23 @@ recovery catches the group up or the device moves past that epoch. Dismissing th
 history notice does not lift it. Scheduled self-updates wait up to a day for the group to
 catch up, then proceed.
 
+A group change counts as published once one group relay accepts it, and MDK keeps
+retrying the other group relays with the same event. Until they accept it, members who
+read only those relays cannot follow the group. Once a change has been owed to a relay for
+two minutes (a healthy slower relay is retried after 30 seconds), group changes fail with
+`MarmotKitError::GroupCommitUndelivered` (mdk#2255). `group_commit_delivery(account_ref,
+group_id_hex)` returns the oldest change still owed to a relay, with the relays owing it and
+`since` (when the first relay accepted it), or `None`. It is reported immediately, so a host
+can show "not delivered to every relay yet" before the user tries a change; a `Some` result
+alone does not mean the next change fails. No event announces delivery completing, so poll
+while showing it. This check is advisory too, because groups
+often list a relay that is gone for good: once the user accepts that members on those
+relays may not follow, call `acknowledge_group_commit_undelivered(account_ref,
+group_id_hex)` and retry. Like the catching-up acknowledgement, it admits one change
+attempt and is not persisted. A change can need both acknowledgements; each survives the
+other check refusing the attempt. Scheduled self-updates wait up to an hour for delivery,
+then proceed.
+
 ## File-backed media upload
 
 Use `uploadMediaFiles` for private regular-file inputs instead of sending a
