@@ -1177,13 +1177,23 @@ fn ratchet_tree_leaves(tree: openmls::treesync::RatchetTree) -> Result<Vec<LeafN
 }
 
 /// Deduplicated account identifiers for current leaves that have not yet
-/// advertised lifecycle-v1 support. The tree walk is leaf-precise, so sibling
-/// devices cannot be hidden by the account-keyed capability cache.
+/// advertised lifecycle-v1 support.
 pub(crate) fn lifecycle_support_blockers(group: &MlsGroup) -> Result<Vec<MemberId>, EngineError> {
+    app_component_support_blockers(group, GROUP_LIFECYCLE_COMPONENT_ID)
+}
+
+/// Deduplicated account identifiers for current leaves that do not advertise
+/// `component_id`. An empty result means the group is eligible to require it.
+/// The tree walk is leaf-precise, so sibling devices cannot be hidden by the
+/// account-keyed capability cache.
+pub(crate) fn app_component_support_blockers(
+    group: &MlsGroup,
+    component_id: AppComponentId,
+) -> Result<Vec<MemberId>, EngineError> {
     let mut seen = std::collections::HashSet::new();
     let mut blockers = Vec::new();
     for leaf in ratchet_tree_leaves(group.export_ratchet_tree())? {
-        if !app_components_of_leaf(&leaf)?.contains(GROUP_LIFECYCLE_COMPONENT_ID) {
+        if !app_components_of_leaf(&leaf)?.contains(component_id) {
             let member = crate::identity::validated_member_id_of_leaf(&leaf)?;
             if seen.insert(member.clone()) {
                 blockers.push(member);

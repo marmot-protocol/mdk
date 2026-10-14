@@ -69,6 +69,12 @@ const MAINTENANCE_POST_EOSE_GRACE_SECS: u64 = 15;
 const MAINTENANCE_QUIET_SECS: u64 = 60;
 const PERIODIC_MIN_SECS: u64 = 24 * 24 * 60 * 60;
 const PERIODIC_MAX_SECS: u64 = 36 * 24 * 60 * 60;
+/// Window for the randomized self-update that refreshes an own leaf which
+/// advertises fewer app components than this device supports. Wide so that a
+/// release does not make every member of a group commit at once (spec
+/// app-components/README.md, "Enabling a Component in an Existing Group").
+const LEAF_REFRESH_WINDOW_SECS: u64 = 5 * 24 * 60 * 60;
+const COMPONENT_MIGRATION_RECHECK: Duration = Duration::from_secs(10 * 60);
 const TRANSPORT_FANOUT_RETENTION_SECS: u64 = 24 * 60 * 60;
 /// How long a due self-update waits for the group's previous commit to reach
 /// every group relay (mdk#2255). The owed relays keep being retried, backing
@@ -430,6 +436,11 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     maintenance_paused: bool,
     maintenance_activity: std::sync::Mutex<MaintenanceActivity>,
     maintenance_quiet_monotonic: HashMap<cgka_traits::MessageId, Duration>,
+    /// Monotonic time each group's own-leaf currency was last read from the
+    /// engine. It changes only with an own commit or a new build, so the
+    /// per-tick sweep reads it at most every [`COMPONENT_MIGRATION_RECHECK`]
+    /// unless a stored due time arrived.
+    component_migration_checked_at: HashMap<GroupId, Duration>,
     /// Secondary maintenance writes must not discard committed session effects.
     /// Keep their group-scoped reconciliation owned until a quiet retry succeeds.
     pending_leaf_reconciliations: HashMap<GroupId, Option<Timestamp>>,
@@ -464,6 +475,7 @@ where
             maintenance_paused: false,
             maintenance_activity: std::sync::Mutex::new(MaintenanceActivity::default()),
             maintenance_quiet_monotonic: HashMap::new(),
+            component_migration_checked_at: HashMap::new(),
             pending_leaf_reconciliations: HashMap::new(),
             detached_welcome_publishes: HashSet::new(),
             finish_stage_failure: None,
@@ -1702,6 +1714,10 @@ where
             }
         }
 
+        if !self.maintenance_paused {
+            self.schedule_leaf_refreshes(now)?;
+        }
+
         let mut obligations = self.session.maintenance_obligations()?;
         obligations.sort_by_key(|obligation| obligation.created_at);
         for mut obligation in obligations {
@@ -2121,6 +2137,158 @@ where
             }
         }
         Ok(output)
+    }
+
+    /// Refresh stale own leaves: a group whose own leaf advertises fewer app
+    /// components than this build supports gets a self-update at a persisted
+    /// random time within [`LEAF_REFRESH_WINDOW_SECS`], so the group can later
+    /// require those components (spec app-components/README.md, "Enabling a
+    /// Component in an Existing Group"). The self-update runs through the
+    /// ordinary obligation pipeline below, so every commit hold applies.
+    ///
+    /// This pass only schedules. A group whose state cannot be read is skipped
+    /// for this tick; it never stops maintenance for the rest of the account.
+    fn schedule_leaf_refreshes(&mut self, now: Timestamp) -> AccountResult<()> {
+        let active_obligations = self.session.maintenance_obligations()?;
+        for group_id in self.session.live_group_ids()? {
+            if self.pending_leaf_reconciliations.contains_key(&group_id) {
+                continue;
+            }
+            if let Err(error) = self.schedule_leaf_refresh(&group_id, now, &active_obligations) {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    method = "schedule_leaf_refreshes",
+                    error_kind = match &error {
+                        AccountError::Session(_) => "session",
+                        _ => "other",
+                    },
+                    "leaf refresh scheduling skipped a group this tick"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn schedule_leaf_refresh(
+        &mut self,
+        group_id: &GroupId,
+        now: Timestamp,
+        active_obligations: &[MaintenanceObligation],
+    ) -> AccountResult<()> {
+        use sha2::{Digest, Sha256};
+
+        let Some(stored) = skips_group_this_tick(self.session.group_maintenance(group_id))? else {
+            return Ok(());
+        };
+        let due_reached = stored
+            .as_ref()
+            .and_then(|state| state.leaf_refresh_due_at)
+            .is_some_and(|due| due <= now);
+        let elapsed = self.monotonic_clock.elapsed();
+        let recently_checked = self
+            .component_migration_checked_at
+            .get(group_id)
+            .is_some_and(|checked| elapsed.saturating_sub(*checked) < COMPONENT_MIGRATION_RECHECK);
+        if recently_checked && !due_reached {
+            return Ok(());
+        }
+        self.component_migration_checked_at
+            .insert(group_id.clone(), elapsed);
+        let Some(missing) =
+            skips_group_this_tick(self.session.own_leaf_missing_app_components(group_id))?
+        else {
+            return Ok(());
+        };
+        let original = stored.clone();
+        let mut state = stored.unwrap_or_else(|| cgka_traits::maintenance::GroupMaintenanceState {
+            group_id: group_id.clone(),
+            enrolled_at: None,
+            periodic_enrolled: false,
+            last_own_leaf_rotation_at: None,
+            next_periodic_rotation_at: None,
+            leaf_refresh_due_at: None,
+        });
+
+        // Any self-update already in flight refreshes the leaf too.
+        let has_active = active_obligations.iter().any(|obligation| {
+            obligation.group_id == *group_id
+                && !matches!(
+                    obligation.phase,
+                    MaintenancePhase::Complete | MaintenancePhase::Failed
+                )
+        });
+        if missing.is_empty() || has_active {
+            state.leaf_refresh_due_at = None;
+        } else {
+            match state.leaf_refresh_due_at {
+                None => {
+                    state.leaf_refresh_due_at = Some(Timestamp(
+                        now.0.saturating_add(
+                            self.maintenance_random
+                                .sample_inclusive(0, LEAF_REFRESH_WINDOW_SECS),
+                        ),
+                    ));
+                }
+                Some(due) if due <= now => {
+                    let mut hasher = Sha256::new();
+                    hasher.update(b"marmot-leaf-refresh-self-update-v1");
+                    hasher.update((group_id.as_slice().len() as u64).to_be_bytes());
+                    hasher.update(group_id.as_slice());
+                    hasher.update(due.0.to_be_bytes());
+                    let id = cgka_traits::MessageId::new(hasher.finalize().to_vec());
+                    if self.session.maintenance_obligation(&id)?.is_none() {
+                        let obligation = MaintenanceObligation {
+                            id: id.clone(),
+                            group_id: group_id.clone(),
+                            trigger: MaintenanceTrigger::Periodic,
+                            phase: MaintenancePhase::Quiet,
+                            created_at: now,
+                            operational_target_at: None,
+                            overdue: false,
+                            eose_deadline_at: None,
+                            grace_until: None,
+                            quiet_since: Some(now),
+                            own_leaf_baseline_hash: Some(self.session.own_leaf_hash(group_id)?),
+                            // Same contention jitter as a periodic rotation: the
+                            // due time has whole-second resolution, so members
+                            // that drew the same second still commit apart.
+                            sampled_jitter_ms: self
+                                .maintenance_random
+                                .sample_inclusive(0, 15 * 60 * 1_000),
+                            not_before: None,
+                            attempt_count: 0,
+                            semantic_rearm_count: 0,
+                            last_failure_code: None,
+                        };
+                        self.persist_maintenance_obligation(&obligation)?;
+                        self.maintenance_quiet_monotonic
+                            .insert(id, self.monotonic_clock.elapsed());
+                        state.leaf_refresh_due_at = None;
+                    } else {
+                        // This due time already produced a self-update and the
+                        // leaf is still stale: wait a whole window instead of
+                        // retrying every tick.
+                        state.leaf_refresh_due_at = Some(Timestamp(
+                            now.0.saturating_add(
+                                self.maintenance_random
+                                    .sample_inclusive(0, LEAF_REFRESH_WINDOW_SECS),
+                            ),
+                        ));
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+
+        // Write only a changed due time. A group with no row gets one only when
+        // this pass actually schedules a refresh for it.
+        let stored_due = original
+            .as_ref()
+            .and_then(|stored| stored.leaf_refresh_due_at);
+        if state.leaf_refresh_due_at != stored_due {
+            self.session.put_group_maintenance(&state)?;
+        }
+        Ok(())
     }
 
     fn note_maintenance_duration(
