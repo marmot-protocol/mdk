@@ -20,7 +20,8 @@ versioning through the workspace version in the root `Cargo.toml`.
   [terminal harness output limits](../../integrations/terminal-harness/README.md#output-limits).
 - Inviting an account that has published only obsolete KeyPackages now fails with JSON code
   `missing_key_package` and `reason: "obsolete_only"` instead of `invalid_key_package_event`
-  (mdk#1975). Ask the recipient to update their app. Other missing packages report
+  (mdk#1975), and `repair.remote` tells the caller to ask the recipient to update their app.
+  Other missing packages report
   `reason: "not_found"`.
 - Group changes on a group that may have moved past this device now fail with the JSON error code
   `group_catching_up` (carrying `group_id`) instead of committing from the stale epoch and forking
