@@ -469,6 +469,9 @@ where
             tokio::task::consume_budget().await;
             let line = tokio::select! {
                 biased;
+                // The bridge stops listening once it rejects the turn's output;
+                // stop the backend instead of letting it keep working unseen.
+                _ = tx.closed() => return Err(HarnessError::BackendStream),
                 _ = sleep_until(post_exit_deadline.unwrap_or(total_deadline)), if post_exit_deadline.is_some() => break,
                 status = &mut child_exit, if child_status.is_none() => {
                     child_status = Some(status.map_err(HarnessError::from)?);

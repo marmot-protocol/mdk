@@ -272,9 +272,9 @@ Every backend turn has fixed output limits, shared by all terminal harnesses:
 
 Stdout is framed incrementally, so an oversized or newline-free record is
 rejected before it is buffered or parsed. On the first breach the connector
-stops the backend and its process group, sends nothing more from that turn,
-and replies once that the turn was stopped. Text already delivered stays
-delivered. When a backend session is known, the turn is saved for `/retry-last`
+stops the backend and its process group, sends nothing more from that turn
+(including replies still queued or awaiting a retry), and replies once that the
+turn was stopped. Text already delivered stays delivered. When a backend session is known, the turn is saved for `/retry-last`
 or `/discard-last`, like any other interrupted turn.
 
 ## Admin group profile updates
