@@ -730,10 +730,16 @@ impl AppClient {
             admission.pending.clear();
             return Ok(true);
         }
-        for _ in 0..MAX_COMPARISON_ADMISSION_PER_TURN {
+        // An event the account already holds costs a receipt lookup, not an
+        // ingest, so it does not spend one of the turn's slots. A newest
+        // window starts with held history; the late commit behind it then
+        // lands in this turn rather than after live input (mdk#2256).
+        let mut spent = 0;
+        while spent < MAX_COMPARISON_ADMISSION_PER_TURN {
             let Some((index, source, event)) = admission.pending.pop_front() else {
                 break;
             };
+            let mut held_only = true;
             // A window event is delivered like any other, but it bears on
             // neither the route's certificate nor its replay cursor: the
             // comparison never claimed it.
@@ -756,6 +762,7 @@ impl AppClient {
                     route.acquisition.rejected = route.acquisition.rejected.saturating_add(1);
                 }
             }
+            held_only &= !deliveries.is_empty();
             for delivery in deliveries {
                 let (summary, settled) = self.admit_recovered_delivery(delivery).await?;
                 admission.summary.merge(summary);
@@ -768,6 +775,7 @@ impl AppClient {
                         unpersisted,
                         refused_group,
                     } => {
+                        held_only = false;
                         counts.deliveries = counts.deliveries.saturating_add(1);
                         if unpersisted {
                             counts.unpersisted = counts.unpersisted.saturating_add(1);
@@ -785,6 +793,9 @@ impl AppClient {
                         }
                     }
                 }
+            }
+            if !held_only {
+                spent += 1;
             }
         }
         Ok(admission.pending.is_empty())
@@ -1701,6 +1712,57 @@ mod tests {
                 .admit_comparison_turn(&grant, &mut execution, &mut admission)
                 .await
                 .unwrap()
+        );
+        fixture
+            .client
+            .finish_comparison_grant(grant, execution, Some(admission))
+            .await
+            .unwrap();
+    }
+
+    /// A newest window starts with history the device already holds. Those
+    /// events must not spend the turn's admission slots, or the late commit
+    /// behind them waits a turn while live input runs (mdk#2256).
+    #[tokio::test]
+    async fn already_held_events_do_not_spend_a_turns_admission_slots() {
+        let mut fixture = fixture().await;
+        let (grant, mut execution, route, group_route) = group_route_grant(&mut fixture).await;
+        let held = (0..MAX_COMPARISON_ADMISSION_PER_TURN)
+            .map(|_| candidate_for_route(group_route))
+            .collect::<Vec<_>>();
+        let mut admission = fixture
+            .client
+            .accept_comparison_network(&grant, &mut execution, fetched(route, held.clone()))
+            .await
+            .unwrap()
+            .expect("an unchanged grant owns its result");
+        assert!(
+            fixture
+                .client
+                .admit_comparison_turn(&grant, &mut execution, &mut admission)
+                .await
+                .unwrap()
+        );
+        let late = candidate_for_route(group_route);
+        admission.pending.extend(
+            held.into_iter()
+                .chain([late.clone()])
+                .map(|event| (0, PendingSource::Window, event)),
+        );
+        assert!(
+            fixture
+                .client
+                .admit_comparison_turn(&grant, &mut execution, &mut admission)
+                .await
+                .unwrap(),
+            "held events pass without spending the turn"
+        );
+        assert!(
+            fixture
+                .client
+                .transport_receipts()
+                .unwrap()
+                .contains(&late.event.id)
         );
         fixture
             .client
