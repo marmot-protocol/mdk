@@ -206,6 +206,11 @@ enum MarmotStatus
    * A cached public event preview read named more than 16 references.
    */
   MARMOT_STATUS_INVALID_PUBLIC_EVENT_REFERENCES = 103,
+  /**
+   * Relay-list or KeyPackage lookup for an account did not complete;
+   * nothing is known to be missing. Retry.
+   */
+  MARMOT_STATUS_DIRECTORY_LOOKUP_INCOMPLETE = 104,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L

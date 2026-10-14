@@ -5,6 +5,11 @@
 ### Breaking changes
 
 - `AppError` adds `GroupCatchingUp` and `GroupCommitUndelivered`; update exhaustive matches.
+- `AppError` adds `DirectoryLookupIncomplete(account)` (mdk#2302). Invite member resolution,
+  directory KeyPackage lookup and relay-list lookup return it instead of `RelayDirectory` when
+  time or relay coverage ran out, so nothing is known to be missing. When the invite deadline
+  passes, members already decided keep their outcome and the error names the first member
+  whose lookup had not finished. Retry it.
 - `AppError::MissingKeyPackage` is now `{ account, reason: MissingKeyPackageReason }`.
   `ObsoleteOnly` means a completed lookup found only legacy-profile KeyPackages, so the
   recipient must update and publish a current one; `NotFound` keeps the previous meaning.

@@ -635,6 +635,21 @@ the actual group's requirements. Device-aware delivery in
 [MDK #1696](https://github.com/marmot-protocol/mdk/issues/1696) is the intended
 replacement for this temporary client ranking.
 
+
+## Invitation lookup outcomes
+
+Creating or inviting looks up each recipient's relay lists and KeyPackage. The
+first recipient that cannot be used ends the call, in request order:
+
+- `MissingKeyPackage { account, reason }`: the lookup completed and found nothing
+  invitable. `reason` is `NotFound`, or `ObsoleteOnly` when the recipient has only
+  outdated KeyPackages and must update their app.
+- `DirectoryLookupIncomplete { account }`: the lookup for `account` ran out of time
+  or relay coverage, so nothing is known to be missing. Offer retry.
+  `fetch_latest_key_package_for_account_id` and relay-list lookups report the same
+  outcome.
+- `MissingMemberInboxRoute { account }`: the recipient has no usable inbox relay.
+
 ## Public Nostr event verification
 
 The stateless `verifyPublicNostrEventJson` helper verifies public events through

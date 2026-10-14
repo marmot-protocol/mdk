@@ -152,6 +152,9 @@ pub enum MarmotStatus {
     GroupCommitUndelivered = 102,
     /// A cached public event preview read named more than 16 references.
     InvalidPublicEventReferences = 103,
+    /// Relay-list or KeyPackage lookup for an account did not complete;
+    /// nothing is known to be missing. Retry.
+    DirectoryLookupIncomplete = 104,
 }
 
 thread_local! {
@@ -226,6 +229,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::InvalidIdentity { .. } => MarmotStatus::InvalidIdentity,
         MarmotKitError::MissingKeyPackage { .. } => MarmotStatus::MissingKeyPackage,
         MarmotKitError::MissingMemberInboxRoute { .. } => MarmotStatus::MissingMemberInboxRoute,
+        MarmotKitError::DirectoryLookupIncomplete { .. } => MarmotStatus::DirectoryLookupIncomplete,
         MarmotKitError::Publish { .. } => MarmotStatus::Publish,
         MarmotKitError::TransportClosed => MarmotStatus::TransportClosed,
         MarmotKitError::RuntimeStopping => MarmotStatus::RuntimeStopping,
@@ -432,6 +436,9 @@ mod tests {
             MarmotKitError::MissingMemberInboxRoute {
                 account: "a".into(),
             },
+            MarmotKitError::DirectoryLookupIncomplete {
+                account: "a".into(),
+            },
             MarmotKitError::Publish {
                 details: "d".into(),
             },
@@ -530,7 +537,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            94,
+            95,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
@@ -541,6 +548,12 @@ mod tests {
         assert_eq!(
             status_from_error(&MarmotKitError::ModerationReportRateLimited) as i32,
             100
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::DirectoryLookupIncomplete {
+                account: "a".into()
+            }) as i32,
+            104
         );
         assert_eq!(
             status_from_error(&MarmotKitError::BlockListUnavailable) as i32,

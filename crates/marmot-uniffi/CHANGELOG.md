@@ -5,6 +5,10 @@
 ### Breaking changes
 
 - `MarmotKitError` adds `InvalidPublicEventReferences`: a cached public event preview read named more than 16 references. Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
+- `MarmotKitError` adds `DirectoryLookupIncomplete { account }` (mdk#2302): a recipient's or
+  account's relay-list or KeyPackage lookup ran out of time or relay coverage, so nothing is
+  known to be missing. Offer retry. These failures previously arrived as `Runtime`. Update
+  exhaustive Swift `switch` / Kotlin `when` handling.
 - `MarmotKitError::MissingKeyPackage` adds `reason: MissingKeyPackageReasonFfi`. `ObsoleteOnly`
   means the recipient has published only obsolete KeyPackages and must update their app;
   these recipients previously surfaced as `InvalidKeyPackageEvent` (mdk#1975). `NotFound`

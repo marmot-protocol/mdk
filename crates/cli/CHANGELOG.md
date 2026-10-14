@@ -11,6 +11,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- Invites and key-package lookups whose relay lookup ran out of time or relay coverage now fail
+  with JSON code `directory_lookup_incomplete` and the affected `account_id` instead of
+  `relay_directory_failed` (mdk#2302). Retry; nothing is known to be missing.
 - `wn-claude`, `wn-codex`, `wn-goose`, `wn-opencode` and `wn-pi` now bound
   each backend turn's output: 4 MiB per stdout record, 64 MiB of stdout, 1 MiB
   of assistant text and 256 reply chunks. A backend that exceeds a limit is

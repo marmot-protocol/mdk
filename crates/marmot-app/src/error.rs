@@ -149,6 +149,11 @@ pub enum AppError {
     /// presentation, while Display remains identity-free for safe diagnostics.
     #[error("member has no valid Marmot inbox relay")]
     MissingMemberInboxRoute(String),
+    /// Relay-list or KeyPackage lookup for this account ran out of time or
+    /// relay coverage, so neither absence nor a verdict was established.
+    /// Retryable; Display remains identity-free.
+    #[error("account directory lookup did not complete")]
+    DirectoryLookupIncomplete(String),
     /// The creator is already an MLS member and cannot be added again.
     #[error("group members must not include the creator")]
     GroupCreateIncludesCreator,
@@ -483,6 +488,7 @@ impl AppError {
             Self::Hex(_) => "hex",
             Self::MissingKeyPackage { .. } => "missing_key_package",
             Self::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
+            Self::DirectoryLookupIncomplete(_) => "directory_lookup_incomplete",
             Self::GroupCreateIncludesCreator => "group_create_includes_creator",
             Self::UnknownGroup(_) => "unknown_group",
             Self::GroupInviteNotPending => "group_invite_not_pending",
@@ -601,7 +607,9 @@ impl AppError {
             Self::Session(error) => session_error_class(error),
             Self::Account(error) => account_sync_error_class(error),
             Self::Transport(error) => transport_error_class(error),
-            Self::RelayDirectory(_) => SyncErrorClass::RelayDirectory,
+            Self::RelayDirectory(_) | Self::DirectoryLookupIncomplete(_) => {
+                SyncErrorClass::RelayDirectory
+            }
             Self::AccountCatchUp(error) => error.classification().error_class,
             Self::FullHistoryRepairIncomplete { reason, .. } => match reason {
                 FullHistoryRepairIncompleteReason::Cancelled => SyncErrorClass::Cancelled,

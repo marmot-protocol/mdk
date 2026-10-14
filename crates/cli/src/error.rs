@@ -663,6 +663,14 @@ fn app_error_json(err: &AppError) -> Value {
                 "action": "ask the recipient to publish a valid Marmot inbox relay list",
             },
         }),
+        AppError::DirectoryLookupIncomplete(account) => json!({
+            "code": "directory_lookup_incomplete",
+            "message": err.to_string(),
+            "account_id": account,
+            "repair": {
+                "action": "retry; nothing is known to be missing",
+            },
+        }),
         AppError::UnknownGroup(group_id) => json!({
             "code": "unknown_group",
             "message": err.to_string(),
@@ -985,6 +993,22 @@ mod tests {
         assert_eq!(
             error["repair"]["action"],
             "ask the recipient to publish a valid Marmot inbox relay list"
+        );
+    }
+
+    #[test]
+    fn incomplete_directory_lookup_identifies_the_account_and_offers_retry() {
+        let account = "33".repeat(32);
+        let error = wn_error_json(&WnError::App(AppError::DirectoryLookupIncomplete(
+            account.clone(),
+        )));
+
+        assert_eq!(error["code"], "directory_lookup_incomplete");
+        assert_eq!(error["account_id"], account);
+        assert!(!error["message"].as_str().unwrap().contains(&account));
+        assert_eq!(
+            error["repair"]["action"],
+            "retry; nothing is known to be missing"
         );
     }
 

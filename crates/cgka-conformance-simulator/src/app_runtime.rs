@@ -2670,6 +2670,7 @@ fn app_error_kind(error: &AppError) -> &str {
         AppError::MessageDraftRevisionConflict => "message_draft_revision_conflict",
         AppError::MissingKeyPackage { .. } => "missing_key_package",
         AppError::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
+        AppError::DirectoryLookupIncomplete(_) => "directory_lookup_incomplete",
         _ => "app_runtime_operation",
     }
 }
@@ -2701,6 +2702,7 @@ fn app_error_retryable(error: &AppError) -> bool {
             | AppError::DirectConversationIndexNotReady
             | AppError::GroupCatchingUp(_)
             | AppError::GroupCommitUndelivered(_)
+            | AppError::DirectoryLookupIncomplete(_)
     )
 }
 fn app_error(error: AppError) -> SubjectError {
@@ -2739,6 +2741,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::GroupCommitUndelivered(_)
         | AppError::FullHistoryRepairIncomplete { .. }
         | AppError::RelayDirectory(_)
+        | AppError::DirectoryLookupIncomplete(_)
         | AppError::Publish(_)
         | AppError::BlobStore(_)
         | AppError::AgentStreamSendFailed(_)
@@ -3095,6 +3098,12 @@ mod tests {
     #[test]
     fn app_errors_are_classified_without_serializing_inner_details() {
         let marker = "private-storage-path";
+        let incomplete = AppError::DirectoryLookupIncomplete(marker.into());
+        assert!(app_error_retryable(&incomplete));
+        assert_eq!(app_error_kind(&incomplete), "directory_lookup_incomplete");
+        let incomplete = app_error(incomplete);
+        assert_eq!(incomplete.category, SubjectFailureCategory::Resource);
+        assert!(!incomplete.message.contains(marker));
         let environment = app_error(AppError::SqlcipherKeyDerivation(marker.into()));
         assert_eq!(environment.category, SubjectFailureCategory::Environment);
         assert!(!environment.message.contains(marker));

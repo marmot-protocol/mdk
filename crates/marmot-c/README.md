@@ -286,6 +286,16 @@ remains retained. On refresh failure, keep the local result.
 Free either list with `marmot_account_key_package_inventory_entry_list_free`.
 Each entry embeds the existing `MarmotAccountKeyPackage` record plus `MarmotAccountKeyPackageLocalState`.
 
+
+## Invitation lookup outcomes
+
+Creating or inviting reports the first unusable recipient, in request order.
+`MARMOT_STATUS_MISSING_KEY_PACKAGE` means the lookup completed and found nothing
+invitable; the detail ends in `[obsolete_only]` when the recipient must update their
+app. `MARMOT_STATUS_DIRECTORY_LOOKUP_INCOMPLETE` means the lookup ran out of time or
+relay coverage and nothing is known to be missing; offer retry. Directory KeyPackage
+and relay-list lookups report the same status.
+
 ## Selected chat-list presentation
 
 `marmot_presented_chat_list` and `marmot_presented_chat_list_row` return complete existing row fields

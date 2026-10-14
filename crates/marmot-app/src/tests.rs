@@ -8383,7 +8383,7 @@ async fn incomplete_discovery_is_not_cleared_by_an_empty_cached_outbox() {
         .expect_err("an empty outbox cannot prove absence after discovery failed");
 
     assert!(
-        matches!(error, AppError::RelayDirectory(ref message) if message.contains("not authoritatively established")),
+        matches!(error, AppError::DirectoryLookupIncomplete(ref id) if *id == account_id),
         "unknown discovery must remain retryable instead of becoming a missing-route verdict: {error:?}"
     );
     assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
@@ -8413,7 +8413,7 @@ async fn member_inbox_of_only_retired_relays_is_reported_distinctly() {
         .expect_err("a member with no usable inbox cannot be invited");
 
     assert!(
-        matches!(error, AppError::RelayDirectory(ref message) if message.contains("no usable relays") && message.contains("refresh did not complete")),
+        matches!(error, AppError::DirectoryLookupIncomplete(ref id) if *id == account_id),
         "{error:?}"
     );
 }
@@ -8434,7 +8434,7 @@ async fn cached_retired_inbox_with_failed_refresh_remains_retryable() {
         .await
         .expect_err("a failed refresh cannot use a retired-only cached inbox");
     assert!(
-        matches!(error, AppError::RelayDirectory(ref message) if message.contains("refresh did not complete")),
+        matches!(error, AppError::DirectoryLookupIncomplete(ref id) if *id == account_id),
         "{error:?}"
     );
 
@@ -8495,7 +8495,7 @@ async fn account_outbox_route_cap_without_inbox_remains_unknown() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(error, AppError::RelayDirectory(_)));
+    assert!(matches!(error, AppError::DirectoryLookupIncomplete(ref account) if account == id));
     let cached = app.directory_entry_for_account_id(id).unwrap().unwrap();
     assert_eq!(cached.relay_lists.nip65.relays.len(), 17);
     assert!(cached.relay_lists.inbox.relays.is_empty());
@@ -8519,7 +8519,7 @@ async fn account_signed_empty_inbox_with_incomplete_outbox_remains_unknown() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(error, AppError::RelayDirectory(_)));
+    assert!(matches!(error, AppError::DirectoryLookupIncomplete(ref account) if account == id));
     let cached = app.directory_entry_for_account_id(id).unwrap().unwrap();
     assert!(cached.relay_lists.inbox.created_at > 0);
     assert!(cached.relay_lists.inbox.relays.is_empty());
@@ -8596,12 +8596,16 @@ async fn future_dated_inbox_is_unknown_for_account_and_member_resolution() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(account_error, AppError::RelayDirectory(_)));
+    assert!(
+        matches!(account_error, AppError::DirectoryLookupIncomplete(ref account) if account == id)
+    );
     let member_error = app
         .resolve_member_key_packages(&[id.as_str()])
         .await
         .unwrap_err();
-    assert!(matches!(member_error, AppError::RelayDirectory(_)));
+    assert!(
+        matches!(member_error, AppError::DirectoryLookupIncomplete(ref account) if account == id)
+    );
 }
 
 #[tokio::test]
@@ -14599,6 +14603,7 @@ fn app_error_display_does_not_expose_group_or_account_ids() {
         }
         .to_string(),
         AppError::MissingMemberInboxRoute(account_id.clone()).to_string(),
+        AppError::DirectoryLookupIncomplete(account_id.clone()).to_string(),
         AppError::MissingDirectoryEntry(account_id.clone()).to_string(),
         AppError::AccountHome(AccountHomeError::SecretNotFound(account_id.clone())).to_string(),
     ];
