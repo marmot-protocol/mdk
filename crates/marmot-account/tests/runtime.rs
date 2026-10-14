@@ -3828,6 +3828,129 @@ async fn adapter_publish_failure_records_per_relay_causes() {
     }
 }
 
+/// Frozen self-update fanouts retain each relay's distinct failure across a
+/// restart and report the corresponding normalized, privacy-safe v5 reasons.
+#[tokio::test]
+async fn self_update_publish_failure_records_per_relay_causes() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot self update failure cause key").unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let audit_path = dir.path().join("audit.jsonl");
+    let mut initial = current_session(database.clone(), &key, b"alice");
+    let group_id = initial
+        .create_group(CreateGroupRequest {
+            name: "self update failure causes".into(),
+            description: String::new(),
+            members: Vec::new(),
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .group_id;
+    drop(initial);
+
+    let timed_out = TransportEndpoint("wss://group-timed-out.example".into());
+    let refused = TransportEndpoint("wss://group-refused.example".into());
+    let causes = [
+        (
+            &timed_out,
+            "connect relay timed out",
+            "connect_relay_timed_out",
+        ),
+        (&refused, "connect relay failed", "connect_relay_failed"),
+    ];
+    let adapter = RecordingAdapter::default();
+    adapter.fail_endpoints_with_reasons(
+        TransportEndpointFailureKind::RetryableUnavailable,
+        causes
+            .iter()
+            .map(|(endpoint, reason, _)| ((*endpoint).clone(), *reason))
+            .collect(),
+    );
+    let mut session = current_session(database.clone(), &key, b"alice");
+    session.set_audit_recorder(v5_audit_recorder(&audit_path));
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        adapter.clone(),
+        StaticTransportRouting::new(vec![]).with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![timed_out.clone(), refused.clone()],
+        ),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        Arc::new(TestWallClock::new(100_000)),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    )
+    .with_maintenance_timing(MaintenanceTiming::immediate());
+    runtime.schedule_manual_self_update(&group_id).unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    runtime.run_due_maintenance().await.unwrap();
+    let publishes = adapter.publishes();
+    assert_eq!(publishes.len(), 2, "one frozen publish per relay");
+    for publish in &publishes {
+        assert!(matches!(
+            publish.message.envelope,
+            TransportEnvelope::GroupMessage { .. }
+        ));
+        assert_eq!(publish.message.id, publishes[0].message.id);
+        assert_eq!(publish.target.endpoints().len(), 1);
+    }
+    assert!(runtime.session().transport_fanouts().unwrap().is_empty());
+    drop(runtime);
+
+    // Read from the reopened durable store, not the in-memory attempt result.
+    let reopened = current_session(database, &key, b"alice");
+    let fanouts = reopened.outbound_fanouts_for_group(&group_id).unwrap();
+    assert_eq!(fanouts.len(), 1);
+    let fanout = &fanouts[0];
+    assert_eq!(fanout.message_id(), &publishes[0].message.id);
+    assert_eq!(fanout.request().target.endpoints().len(), 2);
+    for (endpoint, reason, _) in causes {
+        let index = fanout
+            .request()
+            .target
+            .endpoints()
+            .iter()
+            .position(|candidate| candidate == endpoint)
+            .expect("relay retained in frozen fanout");
+        let failure = fanout
+            .target_failure(index)
+            .expect("persisted relay failure");
+        assert_eq!(
+            failure.kind,
+            TransportEndpointFailureKind::RetryableUnavailable
+        );
+        assert_eq!(failure.reason, reason);
+        assert_eq!(fanout.target_attempt_count(index), 1);
+    }
+
+    let audit = std::fs::read_to_string(&audit_path).unwrap();
+    assert!(!audit.contains("wss://"));
+    let rows = v5_audit_rows(&audit_path);
+    let outcomes = rows
+        .iter()
+        .filter(|row| row["event"]["type"] == "publish_outcome")
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0]["event"]["met_required_acks"], false);
+    let failures = outcomes[0]["event"]["failed_relays"].as_array().unwrap();
+    assert_eq!(failures.len(), 2);
+    for (endpoint, _, reason) in causes {
+        let endpoint_ref =
+            marmot_forensics::v5::EndpointRef::from_normalized_url(&endpoint.0).unwrap();
+        let failure = failures
+            .iter()
+            .find(|failure| failure["endpoint_ref"] == endpoint_ref.as_str())
+            .expect("per-relay audit failure");
+        assert_eq!(failure["reason"], reason);
+    }
+}
+
 #[tokio::test]
 async fn ambiguous_self_update_exposure_survives_restart_and_respects_retry_backoff() {
     let dir = tempfile::tempdir().unwrap();
