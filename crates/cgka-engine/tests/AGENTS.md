@@ -126,6 +126,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     hydration, both standalone and inside an outer transaction.
     Resumable selection and peeling also kill after historical rewind and after a restored slice; reopening must
     recover live state and queued work, discard scratch progress, and select the same winning branch.
+    Every parent spawns and waits through `spawn_crash_child` / `CrashChild::kill_when_ready`; the ready bound is
+    120 s (`MDK_CGKA_CRASH_READY_TIMEOUT_SECS` overrides). Keep child fixture peers on the migrated in-memory template
+    so setup cost does not eat that bound on loaded CI runners.
 
 - **File:** `update_group_data.rs`
   - **Owns:** Group profile `AppDataUpdate` commits and convergence-side Marmot record refresh

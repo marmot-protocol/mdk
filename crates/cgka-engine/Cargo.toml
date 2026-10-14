@@ -54,7 +54,7 @@ gloo-timers = { version = "0.3", features = ["futures"] }
 openmls = { workspace = true, features = ["js"] }
 
 [dev-dependencies]
-storage-sqlite = { workspace = true, features = ["storage-format-benchmarks"] }
+storage-sqlite = { workspace = true, features = ["storage-format-benchmarks", "test-migrated-template"] }
 tokio = { workspace = true, features = ["macros"] }
 test-log.workspace = true
 insta.workspace = true
