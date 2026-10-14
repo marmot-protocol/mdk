@@ -3660,7 +3660,7 @@ impl MarmotAppRuntime {
     /// current view, the send refuses with [`AppError::InvalidEditTarget`]
     /// unless the target is an available chat message this account sent;
     /// recipients remain authoritative. Competing edits resolve by `created_at`,
-    /// then the lexically smallest event id (NIP-01). The chat-list preview is
+    /// then the larger event id. The chat-list preview is
     /// intentionally left untouched so an edit doesn't reorder the
     /// conversation list.
     pub async fn edit_message(
