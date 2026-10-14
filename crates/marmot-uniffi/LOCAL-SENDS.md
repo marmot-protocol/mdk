@@ -116,8 +116,10 @@ can be rejected if the group changes before engine acceptance: the send fails
 with `MediaReferenceStaleEpoch` (upload the file again; a rejected submission
 needs freshly prepared references and a new token) or, while the group's epoch
 is unsettled, `MediaReferenceEpochUnsettled` (sync and send again). While an
-upload is in flight, this device holds its own scheduled key rotation for that
-group, so only another member's commit can move the epoch under it.
+upload is in flight, this device holds only its own scheduled key rotation for
+that group. Group changes this device makes itself, such as a manual
+self-update or a membership or profile change, and other members' commits can
+still move the epoch under the upload.
 
 ## Captured ordinary-media drafts
 

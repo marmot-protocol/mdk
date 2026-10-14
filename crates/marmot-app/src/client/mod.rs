@@ -5295,7 +5295,7 @@ impl AppClient {
         // rotation for the group until the upload is sent, admitted or dropped.
         let epoch_hold = self
             .upload_epoch_holds
-            .hold(group_id.clone(), recovery::wall_now_ms()?);
+            .hold(group_id.clone(), std::time::Instant::now());
         let account = self.app.account_home().account(&self.state.label)?;
         let signer = self.app.account_signer_for_summary(&account)?;
         crate::messages::validate_message_tags(request.tags())?;
@@ -6146,7 +6146,7 @@ impl AppClient {
             .collect();
         for group in self
             .upload_epoch_holds
-            .held_groups(recovery::wall_now_ms()?)
+            .held_groups(std::time::Instant::now())
         {
             if !held.iter().any(|(held_group, _)| held_group == &group) {
                 held.push((group, marmot_account::SelfUpdateHold::Upload));
