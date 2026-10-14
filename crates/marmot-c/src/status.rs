@@ -549,12 +549,14 @@ mod tests {
             status_from_error(&MarmotKitError::ModerationReportRateLimited) as i32,
             100
         );
+        let account = "33".repeat(32);
         assert_eq!(
             status_from_error(&MarmotKitError::DirectoryLookupIncomplete {
-                account: "a".into()
+                account: account.clone()
             }) as i32,
             104
         );
+        assert!(!take_last_error().unwrap().contains(&account));
         assert_eq!(
             status_from_error(&MarmotKitError::BlockListUnavailable) as i32,
             79

@@ -152,8 +152,9 @@ pub enum MarmotKitError {
     #[error("member {account} has no valid Marmot inbox relay")]
     MissingMemberInboxRoute { account: String },
     /// Relay-list or KeyPackage lookup for `account` ran out of time or relay
-    /// coverage. Nothing is known to be missing; offer retry.
-    #[error("directory lookup for {account} did not complete")]
+    /// coverage. Nothing is known to be missing; offer retry. Display omits
+    /// the account; read it from the field.
+    #[error("directory lookup did not complete")]
     DirectoryLookupIncomplete { account: String },
     #[error("publish failed: {details}")]
     Publish { details: String },
@@ -1074,6 +1075,7 @@ mod tests {
     fn directory_lookup_incomplete_crosses_ffi_with_account() {
         let account = "33".repeat(32);
         let ffi: MarmotKitError = AppError::DirectoryLookupIncomplete(account.clone()).into();
+        assert!(!ffi.to_string().contains(&account));
         assert!(matches!(
             ffi,
             MarmotKitError::DirectoryLookupIncomplete { account: recipient }

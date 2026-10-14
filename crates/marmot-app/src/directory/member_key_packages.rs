@@ -422,7 +422,7 @@ impl MarmotApp {
             .filter(|index| !reused_prewarmed_routes.contains(index))
             .collect::<Vec<_>>();
         // Unfinished relay lists cannot support any KeyPackage verdict.
-        let (relay_lists_completed, finished) = match tokio::time::timeout_at(
+        let (relay_lists_completed, relay_lists_finished, finished) = match tokio::time::timeout_at(
             deadline,
             self.resolve_missing_relay_lists(&mut targets, &relay_list_unresolved),
         )
@@ -447,9 +447,9 @@ impl MarmotApp {
                 )
                 .await
                 .is_ok();
-                (completed, finished)
+                (completed, true, finished)
             }
-            Err(_) => (HashSet::new(), false),
+            Err(_) => (HashSet::new(), false, false),
         };
         if !finished {
             for (target, outcome) in targets.iter().zip(&mut outcomes) {
@@ -472,6 +472,9 @@ impl MarmotApp {
             }
         }
         match purpose {
+            // A cancelled relay-list stage may hold a discovery-only snapshot.
+            MemberResolutionPurpose::Commit | MemberResolutionPurpose::CommitFresh
+                if !relay_lists_finished => {}
             MemberResolutionPurpose::Commit | MemberResolutionPurpose::CommitFresh => {
                 for target in &targets {
                     if !target.relay_lists.nip65.relays.is_empty()

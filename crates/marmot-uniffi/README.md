@@ -16,6 +16,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
 - Accounts and identity: [interactive account onboarding](#interactive-account-onboarding),
   [identity references and profiles](#identity-references-and-profiles),
   [KeyPackage inventory](#keypackage-inventory), [KeyPackage client preference](#keypackage-client-preference),
+  [invitation lookup outcomes](#invitation-lookup-outcomes),
   [public Nostr event verification](#public-nostr-event-verification),
   [public event previews](#public-event-previews)
 - Screens: [selected chat-list presentation](#selected-chat-list-presentation),
