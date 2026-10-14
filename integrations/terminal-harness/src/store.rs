@@ -464,6 +464,25 @@ impl FinalDeliverySnapshot {
             .is_some_and(|reply_tos| reply_tos.contains(reply_to_ref))
     }
 
+    /// Leaves one turn limited behind the incomplete-final barrier, the state
+    /// a restart loads for an interrupted turn.
+    fn mark_limited(&mut self, group_ref: &str, reply_to_ref: &str, default_max: usize) {
+        self.turn_budgets
+            .entry(turn_key(group_ref, reply_to_ref))
+            .or_insert_with(|| TurnBudgetRecord {
+                group_ref: group_ref.to_owned(),
+                reply_to_ref: reply_to_ref.to_owned(),
+                max_durable_sends: default_max,
+                sends_charged: 0,
+                phase: TurnPhase::Limited,
+            })
+            .phase = TurnPhase::Limited;
+        self.incomplete_finals
+            .entry(group_ref.to_owned())
+            .or_default()
+            .insert(reply_to_ref.to_owned());
+    }
+
     /// No handler survives a restart, so a persisted active turn was
     /// interrupted with an unknown outcome: it may already have breached a
     /// limit. It is loaded as limited behind the incomplete-final barrier, the
@@ -490,6 +509,7 @@ pub(crate) struct FinalDeliveryStore {
     changed: watch::Sender<u64>,
     fail_next_set: AtomicBool,
     fail_next_budget_write: AtomicBool,
+    fail_next_turn_end: AtomicBool,
 }
 
 impl FinalDeliveryStore {
@@ -513,6 +533,7 @@ impl FinalDeliveryStore {
             changed,
             fail_next_set: AtomicBool::new(false),
             fail_next_budget_write: AtomicBool::new(false),
+            fail_next_turn_end: AtomicBool::new(false),
         })
     }
 
@@ -857,6 +878,9 @@ impl FinalDeliveryStore {
 
     /// Ends live ownership after safe collection. A turn with pending records or
     /// `keep` (pending artifact work) stays reconcilable; a clean turn is pruned.
+    /// If that write fails, the turn is limited in memory: the durable active
+    /// budget keeps withholding it, and the chat is told to discard it instead
+    /// of waiting on a handler that has already returned.
     pub(crate) async fn finish_turn(
         &self,
         group_ref: &str,
@@ -877,11 +901,14 @@ impl FinalDeliveryStore {
         } else {
             next.turn_budgets.remove(&key);
         }
-        self.commit(&mut state, next).await
+        // The active budget exists, so the fallback maximum is never used.
+        self.commit_turn_end(&mut state, next, group_ref, reply_to_ref, 0)
+            .await
     }
 
     /// Marks a turn limited and records the incomplete-final barrier in one write.
     /// Pending records and acknowledgement-unknown keys are retained unchanged.
+    /// If that write fails, the turn is still limited in memory.
     pub(crate) async fn limit_turn(
         &self,
         group_ref: &str,
@@ -890,21 +917,33 @@ impl FinalDeliveryStore {
     ) -> Result<()> {
         let mut state = self.state.lock().await;
         let mut next = state.clone();
-        next.turn_budgets
-            .entry(turn_key(group_ref, reply_to_ref))
-            .or_insert_with(|| TurnBudgetRecord {
-                group_ref: group_ref.to_owned(),
-                reply_to_ref: reply_to_ref.to_owned(),
-                max_durable_sends: default_max,
-                sends_charged: 0,
-                phase: TurnPhase::Limited,
-            })
-            .phase = TurnPhase::Limited;
-        next.incomplete_finals
-            .entry(group_ref.to_owned())
-            .or_default()
-            .insert(reply_to_ref.to_owned());
-        self.commit(&mut state, next).await
+        next.mark_limited(group_ref, reply_to_ref, default_max);
+        self.commit_turn_end(&mut state, next, group_ref, reply_to_ref, default_max)
+            .await
+    }
+
+    /// Commits the write that ends a live turn. On failure the turn is limited
+    /// in memory, matching what a restart would load, so queued messages get
+    /// the recovery notice; the next successful write persists that state.
+    async fn commit_turn_end(
+        &self,
+        state: &mut tokio::sync::MutexGuard<'_, FinalDeliverySnapshot>,
+        next: FinalDeliverySnapshot,
+        group_ref: &str,
+        reply_to_ref: &str,
+        default_max: usize,
+    ) -> Result<()> {
+        let written = if self.fail_next_turn_end.swap(false, Ordering::SeqCst) {
+            Err(std::io::Error::from(std::io::ErrorKind::Other).into())
+        } else {
+            self.commit(state, next).await
+        };
+        if written.is_err() {
+            state.mark_limited(group_ref, reply_to_ref, default_max);
+            self.changed
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
+        written
     }
 
     /// `limit_turn` for a replay whose budget was exhausted. A discard may
@@ -984,6 +1023,11 @@ impl FinalDeliveryStore {
     #[cfg(test)]
     pub(crate) fn fail_next_budget_write(&self) {
         self.fail_next_budget_write.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_turn_end(&self) {
+        self.fail_next_turn_end.store(true, Ordering::SeqCst);
     }
 
     async fn commit(

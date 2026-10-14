@@ -42,6 +42,7 @@ pub(crate) struct RecordFramer<R> {
     max_record_bytes: usize,
     max_stdout_bytes: usize,
     stdout_bytes: usize,
+    over_budget: bool,
     eof: bool,
 }
 
@@ -56,6 +57,7 @@ impl<R: AsyncRead + Unpin> RecordFramer<R> {
             max_record_bytes,
             max_stdout_bytes,
             stdout_bytes: 0,
+            over_budget: false,
             eof: false,
         }
     }
@@ -66,6 +68,9 @@ impl<R: AsyncRead + Unpin> RecordFramer<R> {
         loop {
             if let Some(record) = self.take_buffered_record()? {
                 return Ok(Some(record));
+            }
+            if self.over_budget {
+                return Err(FrameError::Limit(OutputLimitKind::StdoutBytes));
             }
             if self.eof {
                 return Ok((!self.record.is_empty()).then(|| std::mem::take(&mut self.record)));
@@ -82,12 +87,13 @@ impl<R: AsyncRead + Unpin> RecordFramer<R> {
                 self.eof = true;
                 continue;
             }
-            if read > remaining {
-                return Err(FrameError::Limit(OutputLimitKind::StdoutBytes));
-            }
-            self.stdout_bytes += read;
+            // Frame only the in-budget prefix, so the records emitted before a
+            // breach never depend on how the pipe split its writes.
+            let accepted = read.min(remaining);
+            self.over_budget = read > remaining;
+            self.stdout_bytes += accepted;
             self.start = 0;
-            self.end = read;
+            self.end = accepted;
         }
     }
 
@@ -1066,6 +1072,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn framer_emits_the_same_in_budget_records_for_every_chunk_size() {
+        let data = b"ab\ncd\nef";
+        for max_stdout in 1..data.len() {
+            let (expected, error) = frame_all(data, 1, 8, max_stdout).await;
+            assert_eq!(error, Some(FrameError::Limit(OutputLimitKind::StdoutBytes)));
+            for chunk in [2, 4, STDOUT_SCRATCH_BYTES] {
+                assert_eq!(
+                    frame_all(data, chunk, 8, max_stdout).await,
+                    (
+                        expected.clone(),
+                        Some(FrameError::Limit(OutputLimitKind::StdoutBytes))
+                    ),
+                    "chunk {chunk}, max_stdout {max_stdout}"
+                );
+            }
+        }
+        // A record whose delimiter fits inside the cap is delivered before the breach.
+        assert_eq!(
+            frame_all(b"ab\ncd", STDOUT_SCRATCH_BYTES, 8, 4).await,
+            (
+                vec![b"ab".to_vec()],
+                Some(FrameError::Limit(OutputLimitKind::StdoutBytes))
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn framer_tracks_stdout_bytes_and_never_reads_far_past_the_budget() {
         let data = vec![b'x'; STDOUT_SCRATCH_BYTES * 4];
         let mut framer = RecordFramer::new(
@@ -1077,7 +1110,7 @@ mod tests {
             framer.next_record().await,
             Err(FrameError::Limit(OutputLimitKind::StdoutBytes))
         );
-        assert_eq!(framer.stdout_bytes(), STDOUT_SCRATCH_BYTES);
+        assert_eq!(framer.stdout_bytes(), STDOUT_SCRATCH_BYTES + 3);
         assert!(framer.record_capacity() <= STDOUT_SCRATCH_BYTES * 8);
     }
 

@@ -5,7 +5,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use marmot_terminal_harness::{
     ApprovalSupport, Backend, ExecutionProfile, ExecutionSupport, HarnessError, Invocation,
-    IsolationSupport, Outcome, ParsedEvent, PromptTransport, Result, RunFailure, RunnerEvent,
+    IsolationSupport, Outcome, OutputLimitKind, ParsedEvent, PromptTransport, Result, RunFailure,
+    RunnerEvent, TurnOutputControl,
     process::{EnvironmentChange, ProcessSpec, bounded_command_output, run_jsonl_process},
 };
 use serde_json::Value;
@@ -121,7 +122,7 @@ async fn run_with_bin(
         Some(value) => normalize_session_name(&value).ok_or_else(invalid_session_failure)?,
         None => format!("{SESSION_NAME_PREFIX}{}", Uuid::new_v4()),
     };
-    let mut parser = GooseEventParser::new(session_name.clone());
+    let mut parser = GooseEventParser::new(session_name.clone(), output.clone());
     run_jsonl_process(
         ProcessSpec {
             executable: bin.to_owned(),
@@ -206,20 +207,28 @@ struct PendingText {
 /// Goose streams each assistant message as chunks that share a message id and carry text
 /// deltas. A message is complete once a message with a different id arrives or the run
 /// reports `complete`; text still pending at a terminal `error` is dropped as partial.
+///
+/// Retained deltas are charged against the assistant-text byte limit before they are
+/// buffered, because the shared runner only sees text once a message is flushed. A breach
+/// latches the turn's shared stop signal, which the runner observes before its next record.
 struct GooseEventParser {
     session_name: String,
     session_reported: bool,
     finished: bool,
     pending: Option<PendingText>,
+    text_bytes: usize,
+    output: TurnOutputControl,
 }
 
 impl GooseEventParser {
-    fn new(session_name: String) -> Self {
+    fn new(session_name: String, output: TurnOutputControl) -> Self {
         Self {
             session_name,
             session_reported: false,
             finished: false,
             pending: None,
+            text_bytes: 0,
+            output,
         }
     }
 
@@ -289,6 +298,14 @@ impl GooseEventParser {
         let text = user_visible_text(content)?;
 
         let is_assistant = role == "assistant";
+        let retains_text = is_assistant && user_visible && !text.is_empty();
+        if retains_text {
+            self.text_bytes = self
+                .text_bytes
+                .checked_add(text.len())
+                .filter(|total| *total <= self.output.limits().max_text_bytes())
+                .ok_or_else(|| self.output.exceeded(OutputLimitKind::AssistantTextBytes))?;
+        }
         // Chunks of one message share an id. Id-less assistant chunks cannot be told apart,
         // so they are joined until a different message or a terminal event arrives.
         let continues_pending = is_assistant
@@ -301,7 +318,7 @@ impl GooseEventParser {
         } else {
             self.flush()
         };
-        if is_assistant && user_visible && !text.is_empty() {
+        if retains_text {
             match &mut self.pending {
                 Some(pending) if continues_pending => pending.text.push_str(&text),
                 _ => self.pending = Some(PendingText { id, text }),
@@ -392,6 +409,8 @@ mod tests {
     #[cfg(unix)]
     use std::path::Path;
     use std::time::Instant;
+
+    use marmot_terminal_harness::{OutputLimitSettings, OutputLimits};
 
     use super::*;
 
@@ -488,7 +507,7 @@ mod tests {
 
     #[test]
     fn parser_joins_chunks_by_message_id_and_forwards_only_user_text() {
-        let mut parser = GooseEventParser::new(SESSION.to_owned());
+        let mut parser = GooseEventParser::new(SESSION.to_owned(), TurnOutputControl::default());
         assert_eq!(
             parser
                 .parse_line(&message(
@@ -563,7 +582,7 @@ mod tests {
 
     #[test]
     fn parser_joins_id_less_chunks_and_skips_hidden_messages() {
-        let mut parser = GooseEventParser::new(SESSION.to_owned());
+        let mut parser = GooseEventParser::new(SESSION.to_owned(), TurnOutputControl::default());
         let no_id = |role: &str, content: &str| {
             format!(
                 r#"{{"type":"message","message":{{"id":null,"role":"{role}","created":1,"content":{content},"metadata":{{"userVisible":true,"agentVisible":true}}}}}}"#
@@ -609,7 +628,7 @@ mod tests {
 
     #[test]
     fn parser_sanitizes_errors_and_drops_partial_text() {
-        let mut parser = GooseEventParser::new(SESSION.to_owned());
+        let mut parser = GooseEventParser::new(SESSION.to_owned(), TurnOutputControl::default());
         parser
             .parse_line(&message("m1", "assistant", &text("partial")))
             .unwrap();
@@ -627,7 +646,8 @@ mod tests {
             ParsedEvent::Ignored
         );
 
-        let mut interrupted = GooseEventParser::new(SESSION.to_owned());
+        let mut interrupted =
+            GooseEventParser::new(SESSION.to_owned(), TurnOutputControl::default());
         assert_eq!(
             interrupted
                 .parse_line(r#"{"type":"error","error":"Headless run interrupted"}"#)
@@ -641,7 +661,7 @@ mod tests {
 
     #[test]
     fn parser_rejects_malformed_events_without_reporting_a_session() {
-        let mut parser = GooseEventParser::new(SESSION.to_owned());
+        let mut parser = GooseEventParser::new(SESSION.to_owned(), TurnOutputControl::default());
         for line in [
             "{",
             "not json",
@@ -987,6 +1007,117 @@ exit 1
     }
 
     #[cfg(unix)]
+    fn text_limited_output(max_text_bytes: usize) -> TurnOutputControl {
+        TurnOutputControl::new(
+            OutputLimits::new(OutputLimitSettings {
+                max_text_bytes,
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn parser_charges_retained_deltas_against_the_text_byte_limit() {
+        let output = text_limited_output(32);
+        let mut parser = GooseEventParser::new(SESSION.to_owned(), output.clone());
+        let delta = text("0123456789abcdefghijklmn");
+        assert_eq!(
+            parser
+                .parse_line(&message("m1", "assistant", &delta))
+                .unwrap(),
+            ParsedEvent::Session(SESSION.to_owned())
+        );
+        assert!(matches!(
+            parser.parse_line(&message("m1", "assistant", &delta)),
+            Err(HarnessError::OutputLimitExceeded {
+                kind: OutputLimitKind::AssistantTextBytes
+            })
+        ));
+        assert_eq!(output.latched(), Some(OutputLimitKind::AssistantTextBytes));
+
+        // Whitespace-only text is never flushed, so it is charged when retained.
+        let mut parser = GooseEventParser::new(SESSION.to_owned(), text_limited_output(4));
+        parser
+            .parse_line(&message("m1", "assistant", &text("   ")))
+            .unwrap();
+        assert!(matches!(
+            parser.parse_line(&message("m2", "assistant", &text("   "))),
+            Err(HarnessError::OutputLimitExceeded {
+                kind: OutputLimitKind::AssistantTextBytes
+            })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runner_stops_same_id_deltas_over_the_text_byte_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("chatty-goose");
+        let pid_path = root.path().join("descendant.pid");
+        write_executable(
+            &script,
+            &format!(
+                r#"#!/usr/bin/env bash
+cat >/dev/null
+sleep 30 &
+echo $! > '{pid}'
+emit() {{
+  printf '{{"type":"message","message":{{"id":"m1","role":"assistant","created":1,"content":[{{"type":"text","text":"%s"}}],"metadata":{{"userVisible":true,"agentVisible":true}}}}}}\n' "$1"
+}}
+emit 0123456789abcdefghijklmn
+emit 0123456789abcdefghijklmn
+wait
+"#,
+                pid = pid_path.display(),
+            ),
+        );
+        let mut limited = invocation(root.path(), None, "private prompt");
+        limited.timeout = Duration::from_secs(10);
+        limited.idle_timeout = Duration::from_secs(5);
+        limited.output = text_limited_output(32);
+        let (tx, mut rx) = mpsc::channel(4);
+        let started = std::time::Instant::now();
+        let failure = run_with_bin(
+            script.to_str().unwrap(),
+            GoosePermission::Inherited,
+            None,
+            limited,
+            tx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            failure.error,
+            HarnessError::OutputLimitExceeded {
+                kind: OutputLimitKind::AssistantTextBytes
+            }
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(rx.recv().await.is_none());
+        let pid = fs::read_to_string(&pid_path).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .output()
+            .is_ok_and(|output| output.status.success())
+            && fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(") ")
+                        .map(|(_, rest)| rest.starts_with('Z'))
+                })
+                != Some(true)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "backend descendant survived the limit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[tokio::test]
     async fn runner_enforces_total_timeout() {
         let root = tempfile::tempdir().unwrap();

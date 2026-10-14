@@ -1617,7 +1617,7 @@ async fn handle_output_limit(
         )
         .await
     {
-        warn!(target: TRACE_TARGET, method = "turn_budget", error_kind = err.privacy_safe_kind(), "failed to persist the limited turn; its active budget keeps the group blocked");
+        warn!(target: TRACE_TARGET, method = "turn_budget", error_kind = err.privacy_safe_kind(), "failed to persist the limited turn; it stays limited in memory until discarded");
     }
 }
 
@@ -6509,6 +6509,62 @@ mod tests {
         assert_eq!(recovery_notices(&requests).len(), 1);
         assert!(!fifo_is_blocked(&ctx, "group").await);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_turn_end_write_tells_queued_prompts_to_discard_without_restart() {
+        // A completed turn whose finish write fails, then a limited turn with no
+        // recovery record whose limit write fails.
+        for (max_text_events, expected_finals) in [(8, &["done", "more"][..]), (1, &["done"][..])] {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            let config = limited_config(root.path(), |settings| {
+                settings.max_text_events = max_text_events;
+            });
+            let (server, requests) = spawn_recording_server(&config.socket);
+            let ctx = test_context_with_backend(
+                root.path(),
+                &home,
+                config,
+                ScriptedEventsBackend::new(texts(&["done", "more"]), None),
+            );
+            ctx.deliveries.fail_next_turn_end();
+
+            assert!(dispatch_test_message(ctx.clone(), "message", "work").await);
+            assert_eq!(final_texts(&requests), expected_finals);
+            assert_eq!(
+                ctx.deliveries
+                    .turn_budget("group", "message")
+                    .await
+                    .unwrap()
+                    .phase,
+                crate::store::TurnPhase::Limited
+            );
+            assert!(ctx.deliveries.requires_recovery_command("group").await);
+
+            let queued = tokio::spawn(dispatch_test_message(ctx.clone(), "later", "later work"));
+            let notice = wait_for_recovery_notice(&requests).await;
+            assert!(notice.contains("`/discard-last`"));
+            assert!(!notice.contains("/retry-last"));
+            assert!(!queued.is_finished());
+
+            // Storage has recovered: the discard persists and releases the chat.
+            assert!(dispatch_test_message(ctx.clone(), "discard", "/discard-last").await);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(2), queued)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            );
+            assert!(
+                ctx.deliveries
+                    .turn_budget("group", "message")
+                    .await
+                    .is_none()
+            );
+            assert_eq!(recovery_notices(&requests).len(), 1);
+            server.abort();
+        }
     }
 
     #[tokio::test]

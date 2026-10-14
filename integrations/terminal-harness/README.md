@@ -321,7 +321,9 @@ is unknown: the backend may have acted or breached a limit before the stop.
 Startup therefore loads it as limited behind the same discardable barrier, and
 its staged but unacknowledged chunks are not replayed. Other groups and turns
 that had already finished are unaffected. Send `/discard-last` in that chat to
-release it. Discarding does not clear a saved backend session.
+release it. Discarding does not clear a saved backend session. If the connector
+cannot persist the end of a turn, it treats that turn the same way without
+waiting for a restart.
 
 While a chat waits on `/retry-last` or `/discard-last` for a limited or
 interrupted turn, each newly queued message gets one activity notice naming the
