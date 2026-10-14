@@ -294,7 +294,7 @@ export function createMarmotMessageActionAdapter(
  * Channel-owned `edit` action: `message(action:"edit", messageId, message)`
  * replaces the text of a chat message this agent sent, keeping its place in the
  * conversation (for example a status line updated as work progresses). The host
- * authorizes the explicit or current `to` group, so that group always wins; the
+ * authorizes the explicit `to` or the turn's bound group, so that group wins; the
  * send-time cache only fills in a missing target, and a cached message from a
  * different group is refused rather than edited there.
  */
@@ -320,8 +320,12 @@ async function handleEditAction(
   if (text === undefined || text.trim().length === 0) {
     return jsonResult({ ok: false, error: "message required: the replacement text" });
   }
+  // A bound Marmot turn carries its group on `currentChannelId`: Marmot has no
+  // threading hook, so the host never sets `currentMessagingTarget` for it.
   const rawTo =
-    typeof ctx.params.to === "string" ? ctx.params.to : ctx.toolContext?.currentMessagingTarget;
+    typeof ctx.params.to === "string"
+      ? ctx.params.to
+      : (ctx.toolContext?.currentMessagingTarget ?? ctx.toolContext?.currentChannelId);
   const authorized = normalizeMarmotTarget(rawTo ?? "");
   const cached = deps.sentTargetFor?.(messageId);
   if (authorized && cached && cached.groupIdHex.toLowerCase() !== authorized) {

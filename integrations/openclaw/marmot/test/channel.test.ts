@@ -56,7 +56,7 @@ function deleteCtx(params: Record<string, unknown>): ChannelMessageActionContext
 
 function editCtx(
   params: Record<string, unknown>,
-  toolContext: { currentMessagingTarget?: string } = {},
+  toolContext: { currentMessagingTarget?: string; currentChannelId?: string } = {},
 ): ChannelMessageActionContext {
   return {
     channel: "marmot",
@@ -513,6 +513,34 @@ describe("createMarmotMessageActionAdapter", () => {
       expect(resultError(result)).toMatch(/different conversation/);
     }
     expect(editMessage).not.toHaveBeenCalled();
+  });
+
+  it("treats the bound turn's currentChannelId as the authorized group", async () => {
+    const editMessage = vi.fn(async () => undefined);
+    const cache = new Map([[HEX32("99"), { marmotAccountIdHex: HEX32("ab"), groupIdHex: HEX32("bb") }]]);
+    const adapter = createMarmotMessageActionAdapter({
+      deleteByMessageId: async () => false,
+      sentTargetFor: (id) => cache.get(id),
+      resolveTarget: async () => ({
+        client: messageActionClient({ editMessage }),
+        marmotAccountIdHex: HEX32("aa"),
+      }),
+    });
+    // Pinned OpenClaw binds a Marmot turn via currentChannelId only; the
+    // documented call has no `to`, so the host's cross-context guard sees none.
+    const bound = { currentChannelId: HEX32("cc") };
+
+    const crossConversation = await adapter.handleAction!(
+      editCtx({ messageId: HEX32("99"), message: "x" }, bound),
+    );
+    expect(resultError(crossConversation)).toMatch(/different conversation/);
+    expect(editMessage).not.toHaveBeenCalled();
+
+    const cacheMiss = await adapter.handleAction!(
+      editCtx({ messageId: HEX32("98"), message: "status: done" }, bound),
+    );
+    expect(resultOk(cacheMiss)).toBe(true);
+    expect(editMessage).toHaveBeenCalledWith(HEX32("aa"), HEX32("cc"), HEX32("98"), "status: done");
   });
 
   it("edits a cached message when it matches the authorized target", async () => {
