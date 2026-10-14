@@ -106,7 +106,6 @@ async fn run_with_bin(
         session_id,
         prompt,
         artifact_output: _,
-        output,
     } = invocation;
     let files = prepare_attachments(attachments).map_err(|error| RunFailure {
         error,
@@ -134,7 +133,6 @@ async fn run_with_bin(
             backend_name: "opencode",
             total_timeout: timeout,
             idle_timeout,
-            output,
         },
         tx,
         parse_event_line,
@@ -369,7 +367,6 @@ printf '%s\n' '{"type":"text","sessionID":"ses_control","part":{"type":"text","t
             session_id: None,
             prompt: scenario.to_owned(),
             artifact_output: None,
-            output: Default::default(),
         }
     }
 
@@ -635,7 +632,6 @@ printf '%s\n' '{"type":"text","sessionID":"ses_control","part":{"type":"text","t
             session_id: session_id.map(str::to_owned),
             prompt: "caption: compare these files".to_owned(),
             artifact_output: None,
-            output: Default::default(),
         }
     }
 
@@ -1081,7 +1077,6 @@ exec sleep 30
             session_id,
             prompt: prompt.to_owned(),
             artifact_output: None,
-            output: Default::default(),
         };
         async fn collect(mut rx: mpsc::Receiver<RunnerEvent>) -> String {
             let mut reply = String::new();
@@ -1136,80 +1131,5 @@ exec sleep 30
             reply.contains(second_token) && reply.contains(first_token),
             "resumed reply: {reply:?}"
         );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn runner_inherits_the_configured_record_limit() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let root = tempfile::tempdir().unwrap();
-        let script = root.path().join("oversized-backend");
-        let pid_path = root.path().join("descendant.pid");
-        std::fs::write(
-            &script,
-            format!(
-                "#!/usr/bin/env bash\nsleep 30 &\necho $! > '{}'\nprintf '%0100d\\n' 0\nwait\n",
-                pid_path.display()
-            ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&script, permissions).unwrap();
-        let limits = marmot_terminal_harness::OutputLimits::new(
-            marmot_terminal_harness::OutputLimitSettings {
-                max_record_bytes: 16,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let invocation = Invocation {
-            timeout: std::time::Duration::from_secs(10),
-            idle_timeout: std::time::Duration::from_secs(5),
-            cwd: root.path().to_path_buf(),
-            session_id: None,
-            prompt: "private prompt".to_owned(),
-            artifact_output: None,
-            output: marmot_terminal_harness::TurnOutputControl::new(limits),
-        };
-        let (tx, mut rx) = mpsc::channel(4);
-        let failure = run_with_bin(
-            script.to_str().unwrap(),
-            ExecutionProfile::Inherit,
-            invocation,
-            &[],
-            tx,
-        )
-        .await
-        .unwrap_err();
-
-        assert!(matches!(
-            failure.error,
-            marmot_terminal_harness::HarnessError::OutputLimitExceeded {
-                kind: marmot_terminal_harness::OutputLimitKind::StdoutRecord
-            }
-        ));
-        assert!(rx.recv().await.is_none());
-        let pid = std::fs::read_to_string(&pid_path).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::process::Command::new("kill")
-            .args(["-0", pid.trim()])
-            .output()
-            .is_ok_and(|output| output.status.success())
-            && std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
-                .ok()
-                .and_then(|stat| {
-                    stat.rsplit_once(") ")
-                        .map(|(_, rest)| rest.starts_with('Z'))
-                })
-                != Some(true)
-        {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "backend descendant survived the limit"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
     }
 }

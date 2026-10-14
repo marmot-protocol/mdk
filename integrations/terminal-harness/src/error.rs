@@ -3,8 +3,6 @@ use std::io;
 use agent_control::AgentControlError;
 use thiserror::Error;
 
-use crate::OutputLimitKind;
-
 pub type Result<T> = std::result::Result<T, HarnessError>;
 
 #[derive(Debug, Error)]
@@ -34,12 +32,10 @@ pub enum HarnessError {
     BackendTimedOut,
     #[error("backend stream error")]
     BackendStream,
+    #[error("backend output exceeded a per-turn limit")]
+    OutputLimitExceeded,
     #[error("backend process failed to start")]
     BackendSpawn,
-    #[error("backend output exceeded a configured limit: {kind}")]
-    OutputLimitExceeded { kind: OutputLimitKind },
-    #[error("durable output is withheld for this turn")]
-    DeliveryWithheld,
     #[error("inbound attachment count exceeds the configured limit")]
     AttachmentCountLimit,
     #[error("inbound attachment bytes exceed the configured limit")]
@@ -86,9 +82,8 @@ impl HarnessError {
             Self::ControlRejected { .. } => "control_rejected",
             Self::BackendTimedOut => "backend_timeout",
             Self::BackendStream => "backend_stream",
+            Self::OutputLimitExceeded => "output_limit_exceeded",
             Self::BackendSpawn => "backend_spawn",
-            Self::OutputLimitExceeded { kind } => kind.as_str(),
-            Self::DeliveryWithheld => "delivery_withheld",
             Self::AttachmentCountLimit => "attachment_count_limit",
             Self::AttachmentBytesLimit => "attachment_bytes_limit",
             Self::AttachmentInvalid => "attachment_invalid",
