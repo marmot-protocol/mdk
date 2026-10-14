@@ -23,6 +23,14 @@ pub enum MarmotKitError {
     /// Local per-account cap against runaway clients; retry later.
     #[error("too many moderation reports; try again later")]
     ModerationReportRateLimited,
+    /// The edit target is missing, not a chat message, sent by another
+    /// account, deleted, or withdrawn by convergence; nothing was published.
+    #[error("edit target must be an available self-authored chat message")]
+    InvalidEditTarget,
+    /// Too many edits of one message in a burst; nothing was published.
+    /// Retry after a few seconds.
+    #[error("too many edits of this message; try again shortly")]
+    EditRateLimited,
     #[error("usage and diagnostics consent required")]
     ConsentRequired,
     #[error("invalid product analytics configuration")]
@@ -373,6 +381,8 @@ impl From<&AppError> for MarmotKitError {
             AppError::InvalidReportedPublicKey => Self::InvalidReportedPublicKey,
             AppError::CannotReportSelf => Self::CannotReportSelf,
             AppError::ModerationReportRateLimited => Self::ModerationReportRateLimited,
+            AppError::InvalidEditTarget => Self::InvalidEditTarget,
+            AppError::EditRateLimited => Self::EditRateLimited,
             AppError::ProductAnalytics(marmot_app::ProductAnalyticsError::ConsentRequired) => {
                 Self::ConsentRequired
             }
@@ -674,6 +684,14 @@ mod tests {
         assert!(matches!(
             MarmotKitError::from(AppError::ModerationReportRateLimited),
             MarmotKitError::ModerationReportRateLimited
+        ));
+        assert!(matches!(
+            MarmotKitError::from(AppError::InvalidEditTarget),
+            MarmotKitError::InvalidEditTarget
+        ));
+        assert!(matches!(
+            MarmotKitError::from(AppError::EditRateLimited),
+            MarmotKitError::EditRateLimited
         ));
     }
 

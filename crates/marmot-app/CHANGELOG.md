@@ -5,6 +5,7 @@
 ### Breaking changes
 
 - `AppError` adds `GroupCatchingUp` and `GroupCommitUndelivered`; update exhaustive matches.
+- `AppError` adds `InvalidEditTarget` and `EditRateLimited`; update exhaustive matches.
 - `AttachmentTransferState` adds `StorageBlocked`: free disk cannot cover the
   publication reserve for the body. Update exhaustive matches; the job keeps
   its checkpoint and readmits once space frees or on explicit Retry.
@@ -21,6 +22,8 @@
 
 ### Fixed
 
+- `edit_message` refuses with `AppError::InvalidEditTarget`, publishing nothing, unless the target is an available chat message this account sent. Before, the CLI, bindings and connector could publish an edit of another account's message, a reaction, or a deleted message to the whole group, report it as sent, and have every recipient ignore it. A target whose own publish failed and is awaiting retry stays editable.
+- Two edits of one message in the same second could leave the earlier text effective, because recipients order edits by `(second, event id)`. Direct edits now take a strictly newer second, as retained local edits already did, and return `AppError::EditRateLimited` once a burst would stamp more than 30 seconds ahead.
 - Group changes fail with `AppError::GroupCatchingUp` while unresolved epoch-gap recovery (pending, parked or with its notice dismissed) covers the group's current local epoch. Before, a device that knew the group had moved on could still commit from its stale epoch and fork the group (mdk#2258). The check is advisory: after the user accepts the risk, `acknowledge_group_catching_up` lets the change through. Due self-updates wait up to 24 hours for the gap to close. Messages and leave are not affected.
 - A failed or cancelled transport activation no longer leaves untracked REQs
   live on the relay. They used to stay open until disconnect, be re-sent on

@@ -181,7 +181,11 @@ impl Marmot {
     /// Edit `target_message_id` by publishing a kind-1009 event that
     /// references it and carries the replacement plaintext in `content`.
     /// Recipients honour the edit only when its authenticated author matches
-    /// the target's author; MDK ignores mismatched edits.
+    /// the target's author; MDK ignores mismatched edits. It returns
+    /// `InvalidEditTarget`, publishing nothing, unless the target is an
+    /// available chat message this account sent, and `EditRateLimited` when a
+    /// burst of edits of one message would need a timestamp more than 30
+    /// seconds ahead; retry that after a few seconds.
     ///
     /// MDK overlays accepted edits on the target timeline row and selected list
     /// preview, without changing its identity, activity order or unread state.

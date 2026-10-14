@@ -879,7 +879,10 @@ c_cmd! {
     /// `marmot_send_summary_free`.
     async fn marmot_delete_message(account_ref: str, group_id_hex: str, target_message_id: str) -> rec(MarmotSendSummary) = delete_message;
 
-    /// Edit an own message's content. Free with
+    /// Edit an own message's content. Returns
+    /// `MARMOT_STATUS_INVALID_EDIT_TARGET` unless the target is an available
+    /// chat message this account sent, and `MARMOT_STATUS_EDIT_RATE_LIMITED`
+    /// for a burst of edits of one message. Free with
     /// `marmot_send_summary_free`.
     async fn marmot_edit_message(account_ref: str, group_id_hex: str, target_message_id: str, content: str) -> rec(MarmotSendSummary) = edit_message;
 

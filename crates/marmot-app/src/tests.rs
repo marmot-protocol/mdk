@@ -4046,6 +4046,129 @@ async fn media_send_epoch_pin_body() {
 }
 
 #[test]
+fn edits_require_an_available_own_chat_target_and_order_same_second_revisions() {
+    run_composed_app_runtime_test("edit-target-preflight", edit_target_preflight_body);
+}
+
+async fn edit_target_preflight_body() {
+    // Recipients honor an edit only of an available chat message by the same
+    // author, ordered by (second, event id). The sender must refuse every
+    // other target before publishing it to the group, and must stamp rapid
+    // revisions so the last one submitted is the one recipients keep.
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("edits", &[]).await.unwrap();
+    let group_hex = hex::encode(group_id.as_slice());
+    let edit = |target: &str, content: &str| AppMessageIntent::Edit {
+        target_message_id: target.to_owned(),
+        content: content.to_owned(),
+    };
+
+    let original = client.send(&group_id, b"status: starting").await.unwrap();
+    let original_id = original.message_ids[0].clone();
+    for content in ["status: step 1", "status: step 2"] {
+        client
+            .send_app_event(&group_id, edit(&original_id, content))
+            .await
+            .unwrap();
+    }
+    let row = app
+        .timeline_message("alice", &group_hex, &original_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.plaintext, "status: step 2",
+        "the later of two same-second edits must stay effective"
+    );
+    assert_eq!(row.edit.as_ref().map(|edit| edit.edit_count), Some(2));
+
+    let reaction = client
+        .react_to_message(&group_id, &original_id, "+")
+        .await
+        .unwrap();
+    let foreign_id = "f0".repeat(32);
+    app.record_account_app_event(
+        "alice",
+        &AppMessageProjection {
+            authority: None,
+            message_id_hex: foreign_id.clone(),
+            source_message_id_hex: None,
+            direction: "received".to_owned(),
+            group_id_hex: group_hex.clone(),
+            sender: "b0".repeat(32),
+            plaintext: "someone else's message".to_owned(),
+            kind: cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+            tags: Vec::new(),
+            source_epoch: None,
+            retention: None,
+            recorded_at: Some(10),
+            origin_commit_id: None,
+            moderation_grant: false,
+        },
+    )
+    .unwrap();
+    let deleted = client.send(&group_id, b"soon deleted").await.unwrap();
+    client
+        .delete_message(&group_id, &deleted.message_ids[0])
+        .await
+        .unwrap();
+
+    let published_before = relay.published_event_ids().len();
+    for (target, case) in [
+        (foreign_id.as_str(), "another account's message"),
+        (reaction.message_ids[0].as_str(), "a reaction"),
+        (deleted.message_ids[0].as_str(), "a deleted message"),
+        ("c0c0", "an unknown message"),
+    ] {
+        let error = client
+            .send_app_event(&group_id, edit(target, "rewritten"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AppError::InvalidEditTarget),
+            "editing {case} must be refused before publication, got {error:?}"
+        );
+    }
+    assert_eq!(
+        relay.published_event_ids().len(),
+        published_before,
+        "a refused edit must reach the relay with nothing"
+    );
+
+    // Each revision needs a newer second, at most 30 seconds ahead; a burst
+    // past that bound is refused as retryable instead of publishing out of order.
+    let mut refused = None;
+    for revision in 0..40 {
+        match client
+            .send_app_event(&group_id, edit(&original_id, &format!("burst {revision}")))
+            .await
+        {
+            Ok(_) => {}
+            Err(error) => {
+                refused = Some((revision, error));
+                break;
+            }
+        }
+    }
+    let Some((revision, error)) = refused else {
+        panic!("a 40-edit burst must exceed the 30-second bound");
+    };
+    assert!(matches!(error, AppError::EditRateLimited), "{error:?}");
+    assert!(revision >= 29, "refused too early, at revision {revision}");
+    let row = app
+        .timeline_message("alice", &group_hex, &original_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.plaintext, format!("burst {}", revision - 1));
+}
+
+#[test]
 fn pending_disband_is_projected_and_blocks_optimistic_application_messages() {
     run_composed_app_runtime_test(
         "pending-disband-composer-gate",

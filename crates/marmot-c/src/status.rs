@@ -150,6 +150,12 @@ pub enum MarmotStatus {
     /// The group's last change has not reached every group relay yet; group
     /// changes wait while MDK retries them (mdk#2255).
     GroupCommitUndelivered = 102,
+    /// The edit target is missing, not a chat message, sent by another
+    /// account, deleted, or withdrawn by convergence; nothing was published.
+    /// 103 and 104 are left for the pending key-package statuses (mdk#2178).
+    InvalidEditTarget = 105,
+    /// Too many edits of one message in a burst; retry after a few seconds.
+    EditRateLimited = 106,
 }
 
 thread_local! {
@@ -206,6 +212,8 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::InvalidReportedPublicKey => MarmotStatus::InvalidReportedPublicKey,
         MarmotKitError::CannotReportSelf => MarmotStatus::CannotReportSelf,
         MarmotKitError::ModerationReportRateLimited => MarmotStatus::ModerationReportRateLimited,
+        MarmotKitError::InvalidEditTarget => MarmotStatus::InvalidEditTarget,
+        MarmotKitError::EditRateLimited => MarmotStatus::EditRateLimited,
         MarmotKitError::ChatWindowInvalidLimit => MarmotStatus::ChatWindowInvalidLimit,
         MarmotKitError::ChatWindowStale => MarmotStatus::ChatWindowStale,
         MarmotKitError::ChatWindowAnchorOutside => MarmotStatus::ChatWindowAnchorOutside,
@@ -361,6 +369,8 @@ mod tests {
             MarmotKitError::InvalidReportedPublicKey,
             MarmotKitError::CannotReportSelf,
             MarmotKitError::ModerationReportRateLimited,
+            MarmotKitError::InvalidEditTarget,
+            MarmotKitError::EditRateLimited,
             MarmotKitError::ChatWindowInvalidLimit,
             MarmotKitError::ChatWindowStale,
             MarmotKitError::ChatWindowAnchorOutside,
@@ -523,7 +533,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            93,
+            95,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
@@ -534,6 +544,14 @@ mod tests {
         assert_eq!(
             status_from_error(&MarmotKitError::ModerationReportRateLimited) as i32,
             100
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::InvalidEditTarget) as i32,
+            105
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::EditRateLimited) as i32,
+            106
         );
         assert_eq!(
             status_from_error(&MarmotKitError::BlockListUnavailable) as i32,

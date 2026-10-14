@@ -202,6 +202,16 @@ enum MarmotStatus
    * changes wait while MDK retries them (mdk#2255).
    */
   MARMOT_STATUS_GROUP_COMMIT_UNDELIVERED = 102,
+  /**
+   * The edit target is missing, not a chat message, sent by another
+   * account, deleted, or withdrawn by convergence; nothing was published.
+   * 103 and 104 are left for the pending key-package statuses (mdk#2178).
+   */
+  MARMOT_STATUS_INVALID_EDIT_TARGET = 105,
+  /**
+   * Too many edits of one message in a burst; retry after a few seconds.
+   */
+  MARMOT_STATUS_EDIT_RATE_LIMITED = 106,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -7371,7 +7381,10 @@ MarmotStatus marmot_delete_message(const struct MarmotClient *client,
                                    struct MarmotSendSummary **out);
 
 /**
- * Edit an own message's content. Free with
+ * Edit an own message's content. Returns
+ * `MARMOT_STATUS_INVALID_EDIT_TARGET` unless the target is an available
+ * chat message this account sent, and `MARMOT_STATUS_EDIT_RATE_LIMITED`
+ * for a burst of edits of one message. Free with
  * `marmot_send_summary_free`.
  *
  * # Safety

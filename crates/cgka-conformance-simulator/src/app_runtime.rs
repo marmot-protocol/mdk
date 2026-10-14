@@ -2806,7 +2806,9 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::ReactionNotFound
         | AppError::InvalidReportedPublicKey
         | AppError::CannotReportSelf
-        | AppError::ModerationReportRateLimited => SubjectFailureCategory::ExpectedRefusal,
+        | AppError::ModerationReportRateLimited
+        | AppError::InvalidEditTarget
+        | AppError::EditRateLimited => SubjectFailureCategory::ExpectedRefusal,
         AppError::Account(_)
         | AppError::AccountHome(_)
         | AppError::Session(_)

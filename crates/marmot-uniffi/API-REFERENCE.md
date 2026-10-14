@@ -2388,9 +2388,9 @@ Run the engine-owned disappearing-message sweep for one account using the suppli
 pub async fn edit_message( &self, account_ref: String, group_id_hex: String, target_message_id: String, content: String, ) -> Result<SendSummaryFfi, MarmotKitError>
 ```
 
-Edit `target_message_id` by publishing a kind-1009 event that references it and carries the replacement plaintext in `content`. Recipients honour the edit only when its authenticated author matches the target's author; MDK ignores mismatched edits.
+Edit `target_message_id` by publishing a kind-1009 event that references it and carries the replacement plaintext in `content`. Recipients honour the edit only when its authenticated author matches the target's author; MDK ignores mismatched edits. It returns `InvalidEditTarget`, publishing nothing, unless the target is an available chat message this account sent, and `EditRateLimited` when a burst of edits of one message would need a timestamp more than 30 seconds ahead; retry that after a few seconds.
 
-[Source](src/commands/message.rs#L190)
+[Source](src/commands/message.rs#L194)
 
 ### `Marmot::send_custom_event`
 
@@ -2402,7 +2402,7 @@ pub async fn send_custom_event( &self, account_ref: String, group_id_hex: String
 
 Send an app-defined event with an arbitrary non-reserved kind. `tags` and `content` pass through verbatim; kinds MDK owns (chat, reaction, edit, delete, agent, group system, push token) are rejected so an app cannot forge protocol events. Custom events appear in the timeline as standalone rows and can be fetched via `Marmot::messages` with a `kinds` filter.
 
-[Source](src/commands/message.rs#L211)
+[Source](src/commands/message.rs#L215)
 
 ### `Marmot::create_poll`
 
@@ -2418,7 +2418,7 @@ poll projection. Creation follows MDK's canonical conversation classification: n
 groups, while unnamed two-member conversations are direct. Polls are neither anonymous nor election-grade. See
 [Polls](POLLS.md).
 
-[Source](src/commands/message.rs#L229)
+[Source](src/commands/message.rs#L233)
 
 ### `Marmot::cast_poll_vote`
 
@@ -2433,7 +2433,7 @@ or one through ten unique ids for multiple choice; use the ids from `TimelineMes
 This is a replacement, not a delta or unvote. MDK revalidates the poll against the response event's actual timestamp at
 send time, and an accepted open poll remains votable after conversation reclassification. See [Polls](POLLS.md).
 
-[Source](src/commands/message.rs#L254)
+[Source](src/commands/message.rs#L258)
 
 ### `Marmot::message_reactions`
 
@@ -2475,7 +2475,7 @@ pub fn messages( &self, account_ref: String, group_id_hex: Option<String>, limit
 
 Initial history fetch for a group (or, when `group_id_hex` is None, the account-wide tail). Used to populate the conversation view before the subscription stream takes over.
 
-[Source](src/commands/message.rs#L275)
+[Source](src/commands/message.rs#L279)
 
 </details>
 

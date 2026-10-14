@@ -17,6 +17,8 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 - Add `MARMOT_STATUS_GROUP_COMMIT_UNDELIVERED` (102): a group change was refused because the group's last change has not reached every group relay yet (mdk#2255). Add `marmot_group_commit_delivery` (record `MarmotGroupCommitDelivery`, freed with `marmot_group_commit_delivery_free`) to list the owed relays, and `marmot_acknowledge_group_commit_undelivered` to let one change through once the user accepts the risk. Use matching regenerated headers and libraries.
 
+- Add `MARMOT_STATUS_INVALID_EDIT_TARGET` (105) and `MARMOT_STATUS_EDIT_RATE_LIMITED` (106), returned by `marmot_edit_message`. An edit is refused, publishing nothing, unless its target is an available chat message this account sent; before, it was published and then ignored by every recipient. Rate limiting means a burst of edits of one message would need a timestamp more than 30 seconds ahead; retry after a few seconds. Existing status values are unchanged. Use matching regenerated headers and libraries.
+
 ### Changed
 
 - `MarmotAttachmentTransferState` appends

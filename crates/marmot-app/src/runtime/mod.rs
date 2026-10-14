@@ -3655,8 +3655,11 @@ impl MarmotAppRuntime {
 
     /// Edit a prior message: publish a kind-1009 event whose single `e` tag
     /// references `target_message_id` and whose content is the replacement
-    /// text. Authorship is enforced on read (an edit is only honored when its
-    /// authenticated author matches the target's author), and the chat-list
+    /// text. Recipients honor an edit only when its authenticated author
+    /// matches the target's author, so the send refuses with
+    /// [`AppError::InvalidEditTarget`] unless the target is an available chat
+    /// message this account sent. Rapid edits get strictly newer seconds and
+    /// return [`AppError::EditRateLimited`] past the 30-second bound. The chat-list
     /// preview is intentionally left untouched so an edit doesn't reorder the
     /// conversation list.
     pub async fn edit_message(

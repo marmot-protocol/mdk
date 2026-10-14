@@ -11,6 +11,7 @@
   Swift/Kotlin handling and regenerate bindings with the matching native
   library; render a storage prompt rather than a retry timer. See
   [the attachment access contract](ATTACHMENT-ACCESS.md).
+- `MarmotKitError` adds `InvalidEditTarget` and `EditRateLimited`, returned by `edit_message` (see Fixed). Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
 - `MarmotKitError` adds `GroupCommitUndelivered`: a group change was refused because the group's last change has not reached every group relay yet (mdk#2255). Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
 
 ### Added
@@ -22,6 +23,10 @@
 - `Marmot::acknowledge_group_catching_up`: after `GroupCatchingUp`, call it once the user accepts that the change may split the group, then retry. See [the epoch-gap notes](README.md#history-may-be-incomplete-notices).
 
 - `Marmot::group_commit_delivery` returns the relays still owed the group's last change (`GroupCommitDeliveryFfi`), and `Marmot::acknowledge_group_commit_undelivered` lets one change through after `GroupCommitUndelivered` once the user accepts the risk. See [the delivery notes](README.md#history-may-be-incomplete-notices).
+
+### Fixed
+
+- `edit_message` returns `InvalidEditTarget`, publishing nothing, unless the target is an available chat message this account sent. Before, an edit of another account's message, a reaction or a deleted message was published to the group and reported as sent, then ignored by every recipient. It returns `EditRateLimited` when a burst of edits of one message would need a timestamp more than 30 seconds ahead; keep the text and retry after a few seconds. Two edits in the same second no longer risk leaving the earlier text effective.
 
 ## 0.13.0 - 2026-10-12
 

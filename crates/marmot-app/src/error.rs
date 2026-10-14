@@ -232,6 +232,14 @@ pub enum AppError {
     /// The local per-account cap; it guards against runaway clients only.
     #[error("too many moderation reports; try again later")]
     ModerationReportRateLimited,
+    /// An edit must target an available chat message this account sent;
+    /// nothing was published.
+    #[error("edit target must be an available self-authored chat message")]
+    InvalidEditTarget,
+    /// Successive edits of one message need strictly newer seconds, and the
+    /// next one would exceed the 30-second future bound; nothing was published.
+    #[error("too many edits of this message; try again shortly")]
+    EditRateLimited,
     #[error("relay directory fetch failed: {0}")]
     RelayDirectory(String),
     /// An account worker's transport catch-up failed (sync error or timeout).
@@ -488,6 +496,8 @@ impl AppError {
             Self::InvalidReportedPublicKey => "invalid_reported_public_key",
             Self::CannotReportSelf => "cannot_report_self",
             Self::ModerationReportRateLimited => "moderation_report_rate_limited",
+            Self::InvalidEditTarget => "invalid_edit_target",
+            Self::EditRateLimited => "edit_rate_limited",
             Self::FollowListUnavailable => "follow_list_unavailable",
             Self::RelayDirectory(_) => "relay_directory",
             Self::AccountCatchUp(_) => "account_catch_up",
