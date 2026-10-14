@@ -23500,8 +23500,9 @@ fn assert_group_catching_up<T: std::fmt::Debug>(
 }
 
 /// mdk#2158: while an attachment upload is in flight, this device holds its
-/// own due self-update for the group, so a rotation cannot leave the finished
-/// upload unsendable. The rotation stays owed and runs once the upload ends.
+/// own due automatic self-update for the group, so a rotation cannot leave the
+/// finished upload unsendable. The rotation stays owed and runs once the upload
+/// ends.
 #[tokio::test]
 async fn an_in_flight_upload_holds_the_groups_self_update_until_it_ends() {
     let dir = tempfile::tempdir().unwrap();
@@ -23550,6 +23551,8 @@ async fn an_in_flight_upload_holds_the_groups_self_update_until_it_ends() {
         .into_iter()
         .next()
         .expect("scheduled maintenance obligation");
+    // An automatic rotation that is due now; a manual one would go ahead.
+    obligation.trigger = cgka_traits::MaintenanceTrigger::Periodic;
     obligation.phase = cgka_traits::MaintenancePhase::Retry;
     client
         .runtime

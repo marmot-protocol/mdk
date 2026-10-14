@@ -184,14 +184,15 @@
   and `relays_incomplete` now count distinct relays; before, they were summed
   per compared route and could exceed `relays_required` (#2265).
 - An attachment upload no longer loses all its bytes to this device's own key
-  rotation. While an upload for a group is in flight, from the moment its media
-  key is bound to the group's epoch until the send is admitted or the upload is
-  dropped, this device holds its own due self-update for that group (recorded
-  as `upload_hold`); the rotation stays owed and runs once the upload ends. One
-  upload holds it for at most an hour of elapsed time. Another member's commit,
-  or a group change this device makes itself, can still move the epoch; that
-  send now fails with a typed error the host can recover from by uploading
-  again (#2158).
+  rotation. While an upload for a group is in flight, from the moment its
+  media key is bound to the group's epoch until the send is admitted or the
+  upload is dropped, this device holds its own due automatic self-update
+  (post-join or periodic rotation) for that group, recorded as `upload_hold`;
+  the rotation stays owed and runs once the upload ends, and a self-update the
+  user asks for goes ahead. One upload holds it for at most an hour of elapsed
+  time. Another member's commit, or a group change this device makes itself,
+  can still move the epoch; that send now fails with a typed error the host
+  can recover from by uploading again (#2158).
 
 ## 0.13.0 - 2026-10-12
 

@@ -96,8 +96,9 @@ pub enum SelfUpdateHold {
     /// forks the group (mdk#2258).
     EpochGap,
     /// An attachment upload for the group is in flight. Its media key is bound
-    /// to the epoch it was encrypted under, so a rotation would make the
-    /// finished upload unsendable (mdk#2158).
+    /// to the epoch it was encrypted under, so an automatic rotation would make
+    /// the finished upload unsendable (mdk#2158). A self-update the user asked
+    /// for is not held: the user chose to change the group now.
     Upload,
 }
 
@@ -107,6 +108,15 @@ impl SelfUpdateHold {
         match self {
             Self::EpochGap => "epoch_gap_hold",
             Self::Upload => "upload_hold",
+        }
+    }
+
+    /// Whether this hold defers a due self-update started by `trigger`: an
+    /// epoch gap holds every rotation, an upload only automatic ones.
+    pub fn applies_to(self, trigger: MaintenanceTrigger) -> bool {
+        match self {
+            Self::EpochGap => true,
+            Self::Upload => trigger != MaintenanceTrigger::Manual,
         }
     }
 }
@@ -2089,7 +2099,9 @@ where
                 self.put_maintenance_obligation_if_changed(&original_obligation, &obligation)?;
                 continue;
             }
-            if let Some((_, hold)) = held.iter().find(|(group, _)| group == &obligation.group_id) {
+            if let Some((_, hold)) = held.iter().find(|(group, hold)| {
+                group == &obligation.group_id && hold.applies_to(obligation.trigger)
+            }) {
                 obligation.phase = MaintenancePhase::Retry;
                 obligation.last_failure_code = Some(hold.code().into());
                 self.put_maintenance_obligation_if_changed(&original_obligation, &obligation)?;
