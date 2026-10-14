@@ -53,7 +53,7 @@ pub(crate) struct ComparisonAdmission {
 
 /// Where an owned event came from. Only comparison events bear on the
 /// route's certificate and replay cursor; a window fetch certifies nothing.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingSource {
     Comparison,
     Window,
@@ -152,10 +152,14 @@ pub(crate) struct ComparisonRouteResult {
 }
 
 impl ComparisonRouteWorkResult {
-    /// The relays among `endpoints` this result does not vouch for: all of
-    /// them when the comparison did not return or did not say which relay
-    /// failed, else the ones it names. A route the deadline skipped has no
-    /// time left to fetch anything.
+    /// The relays among `endpoints` a window fetch may stand in for: all of
+    /// them when the comparison did not return, else every failed relay that
+    /// did not answer its comparison. A relay that answered but left claimed
+    /// IDs for a later pass is fetching that backlog oldest first, and while
+    /// any compared relay still owes older history (or the pass could not
+    /// order what it was missing), a newest page would skip the unfetched
+    /// middle (#2086), so none is fetched. A route the deadline skipped has
+    /// no time left to fetch anything.
     fn uncompared_endpoints(
         &self,
         endpoints: &[cgka_traits::TransportEndpoint],
@@ -165,17 +169,20 @@ impl ComparisonRouteWorkResult {
             Self::Skipped => Vec::new(),
             Self::TimedOut | Self::Returned(Err(_) | Ok(None)) => endpoints.to_vec(),
             Self::Returned(Ok(Some((summary, _)))) => {
-                if summary.failed_endpoints.len() < summary.relays_failed {
-                    return endpoints.to_vec();
+                if summary.order_unproven || summary.received_items < summary.remote_items {
+                    return Vec::new();
                 }
+                let unattributed = summary.failed_endpoints.len() < summary.relays_failed;
+                let named =
+                    |set: &[cgka_traits::TransportEndpoint],
+                     endpoint: &cgka_traits::TransportEndpoint| {
+                        set.iter()
+                            .any(|named| same_relay(endpoint.as_str(), named.as_str()))
+                    };
                 endpoints
                     .iter()
-                    .filter(|endpoint| {
-                        summary
-                            .failed_endpoints
-                            .iter()
-                            .any(|failed| same_relay(endpoint.as_str(), failed.as_str()))
-                    })
+                    .filter(|endpoint| unattributed || named(&summary.failed_endpoints, endpoint))
+                    .filter(|endpoint| !named(&summary.incomplete_endpoints, endpoint))
                     .cloned()
                     .collect()
             }
@@ -648,32 +655,44 @@ impl AppClient {
                     (outcome, certified, answered, events)
                 }
             };
-            // A window event the comparison also returned is admitted once,
-            // as a comparison event. Relays answer the window newest first,
-            // but the late commit is its oldest event: queue it first, so no
-            // newer commit from the page converges before it is buffered.
+            // The late commit is the oldest event a window recovers, and a
+            // relay that compared can return a newer commit from the same
+            // epoch. Queue the route's comparison and window events together,
+            // oldest first, so no newer commit converges before the late one
+            // is buffered. An event both returned is admitted once, as a
+            // comparison event.
             let compared = events
                 .iter()
                 .map(|event| event.event.id.clone())
                 .collect::<HashSet<_>>();
-            let mut window = route
-                .window
+            let mut batch = events
                 .into_iter()
-                .filter(|event| !compared.contains(&event.event.id))
+                .map(|event| (PendingSource::Comparison, event))
+                .chain(
+                    route
+                        .window
+                        .into_iter()
+                        .filter(|event| !compared.contains(&event.event.id))
+                        .map(|event| (PendingSource::Window, event)),
+                )
                 .collect::<Vec<_>>();
-            window.sort_by(|a, b| {
-                (a.event.created_at, &a.event.id).cmp(&(b.event.created_at, &b.event.id))
+            batch.sort_by(|(a_source, a), (b_source, b)| {
+                (
+                    a.event.created_at,
+                    &a.event.id,
+                    *a_source == PendingSource::Window,
+                )
+                    .cmp(&(
+                        b.event.created_at,
+                        &b.event.id,
+                        *b_source == PendingSource::Window,
+                    ))
             });
-            window.dedup_by(|a, b| a.event.id == b.event.id);
+            batch.dedup_by(|(_, later), (_, kept)| later.event.id == kept.event.id);
             admission.pending.extend(
-                events
+                batch
                     .into_iter()
-                    .map(|event| (index, PendingSource::Comparison, event))
-                    .chain(
-                        window
-                            .into_iter()
-                            .map(|event| (index, PendingSource::Window, event)),
-                    ),
+                    .map(|(source, event)| (index, source, event)),
             );
             admission.routes.push(AdmissionRoute {
                 route: route.route,
@@ -1849,13 +1868,26 @@ mod tests {
 
     /// Script the relay's answer to a window fetch: `event`, then EOSE.
     fn script_window(fixture: &Fixture, event: &transport_nostr_adapter::NostrRelayEvent) {
+        script_window_ending(
+            fixture,
+            event,
+            transport_nostr_adapter::NostrAcquisitionEnd::RequestPolicySatisfied,
+        );
+    }
+
+    /// Script the relay's answer to a window fetch: `event`, then `end`.
+    fn script_window_ending(
+        fixture: &Fixture,
+        event: &transport_nostr_adapter::NostrRelayEvent,
+        end: transport_nostr_adapter::NostrAcquisitionEnd,
+    ) {
         *fixture.relay.acquisition_result.lock().unwrap() =
             Some(transport_nostr_adapter::NostrAcquisitionResult {
                 endpoints: vec![transport_nostr_adapter::NostrAcquisitionEndpoint {
                     endpoint: event.endpoint.clone(),
                     session_generation: None,
                     events: vec![event.event.clone()],
-                    end: transport_nostr_adapter::NostrAcquisitionEnd::RequestPolicySatisfied,
+                    end,
                     stats: Default::default(),
                 }],
             });
@@ -1957,7 +1989,9 @@ mod tests {
                     .unwrap(),
             }
         };
-        let mut network = fetched(route, Vec::new());
+        // A relay that compared returned a newer commit than the late one
+        // the window recovered from a relay that could not compare.
+        let mut network = fetched(route, vec![at(25)]);
         network.routes[0].window = vec![at(30), at(10), at(20)];
         let admission = fixture
             .client
@@ -1969,10 +2003,123 @@ mod tests {
             admission
                 .pending
                 .iter()
-                .map(|(_, _, event)| event.event.created_at)
+                .map(|(_, source, event)| (event.event.created_at, *source))
                 .collect::<Vec<_>>(),
-            vec![10, 20, 30]
+            vec![
+                (10, PendingSource::Window),
+                (20, PendingSource::Window),
+                (25, PendingSource::Comparison),
+                (30, PendingSource::Window),
+            ]
         );
+    }
+
+    fn endpoint(name: &str) -> cgka_traits::TransportEndpoint {
+        cgka_traits::TransportEndpoint(format!("wss://{name}.example"))
+    }
+
+    fn compared(
+        summary: transport_nostr_adapter::NostrReconciliationSummary,
+    ) -> ComparisonRouteWorkResult {
+        ComparisonRouteWorkResult::Returned(Ok(Some((summary, Vec::new()))))
+    }
+
+    /// A relay that answered its comparison but left claimed IDs for a later
+    /// pass is not a relay the window should replace: the comparison is
+    /// fetching that backlog oldest first, and a newest page would skip its
+    /// unfetched middle (#2086).
+    #[test]
+    fn a_relay_that_answered_its_comparison_is_not_window_fetched() {
+        let relays = [endpoint("silent"), endpoint("partial")];
+        let result = compared(transport_nostr_adapter::NostrReconciliationSummary {
+            relays_failed: 2,
+            failed_endpoints: relays.to_vec(),
+            incomplete_endpoints: vec![endpoint("partial")],
+            ..Default::default()
+        });
+        assert_eq!(
+            result.uncompared_endpoints(&relays),
+            vec![endpoint("silent")]
+        );
+    }
+
+    /// While a compared relay still owes older history, the pass keeps its
+    /// oldest-first boundary: no window fetch jumps past what it has not
+    /// fetched yet.
+    #[test]
+    fn a_known_unfetched_backlog_holds_the_window_fetch() {
+        let relays = [endpoint("healthy"), endpoint("silent")];
+        for summary in [
+            transport_nostr_adapter::NostrReconciliationSummary {
+                relays_succeeded: 1,
+                relays_failed: 1,
+                failed_endpoints: vec![endpoint("silent")],
+                remote_items: 600,
+                received_items: 256,
+                ..Default::default()
+            },
+            transport_nostr_adapter::NostrReconciliationSummary {
+                relays_failed: 1,
+                failed_endpoints: vec![endpoint("silent")],
+                order_unproven: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(compared(summary).uncompared_endpoints(&relays).is_empty());
+        }
+        let caught_up = compared(transport_nostr_adapter::NostrReconciliationSummary {
+            relays_succeeded: 1,
+            relays_failed: 1,
+            failed_endpoints: vec![endpoint("silent")],
+            remote_items: 7,
+            received_items: 7,
+            ..Default::default()
+        });
+        assert_eq!(
+            caught_up.uncompared_endpoints(&relays),
+            vec![endpoint("silent")]
+        );
+    }
+
+    /// Relays send the newest page newest first, so a page the byte budget
+    /// or the deadline cut holds only the newer events and leaves the late
+    /// commit behind. Only a page the relay itself ended is admitted.
+    #[tokio::test]
+    async fn a_window_page_the_relay_did_not_finish_is_not_admitted() {
+        for end in [
+            transport_nostr_adapter::NostrAcquisitionEnd::ByteLimitReached,
+            transport_nostr_adapter::NostrAcquisitionEnd::Deadline,
+            transport_nostr_adapter::NostrAcquisitionEnd::ItemLimitReached,
+        ] {
+            let mut fixture = fixture_with_group_relays_and_comparison(None, false).await;
+            arm_unpaced_epoch_gap(&fixture);
+            let (grant, group_route) = epoch_gap_grant(&mut fixture);
+            let newer = candidate_for_route(group_route);
+            script_window_ending(&fixture, &newer, end);
+            fixture.client.test_comparison_results = Some(group_route_comparison(true));
+
+            fixture
+                .client
+                .run_recovery_grant_for_test(grant)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                fixture
+                    .relay
+                    .acquisition_calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert!(
+                !fixture
+                    .client
+                    .transport_receipts()
+                    .unwrap()
+                    .contains(&newer.event.id),
+                "a page cut short ({end:?}) admits nothing"
+            );
+        }
     }
 
     #[tokio::test]

@@ -3590,8 +3590,9 @@ impl MarmotRelayPlaneAccountAdapter {
 
     /// Fetch the newest kind-445 events of one group route from `endpoints`,
     /// inside `[since, until]` and `limits`. The answer is investigation, not
-    /// coverage: each relay contributes what it sent before its own end, and a
-    /// request the plane refuses contributes nothing.
+    /// coverage. Relays send the page newest first, so only a page a relay
+    /// ended itself holds its oldest events; a relay cut short by a budget or
+    /// the deadline, and a request the plane refuses, contribute nothing.
     pub(crate) async fn acquire_group_window(
         &self,
         transport_group_id: [u8; 32],
@@ -3621,6 +3622,9 @@ impl MarmotRelayPlaneAccountAdapter {
         result
             .endpoints
             .into_iter()
+            .filter(|answer| {
+                answer.end == transport_nostr_adapter::NostrAcquisitionEnd::RequestPolicySatisfied
+            })
             .flat_map(|answer| {
                 let endpoint = answer.endpoint;
                 answer.events.into_iter().map(move |event| {
