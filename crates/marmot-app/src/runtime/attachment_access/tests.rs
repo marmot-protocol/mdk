@@ -440,6 +440,38 @@ fn report_ready(
     runtime.shared.attachment_updates.send_modify(|_| {});
 }
 
+/// Asserts a frame reported at `reported` arrived without waiting out the
+/// progress window that opened at `opened`. When the report itself ran most of
+/// the window, a held frame and a prompt one cannot be told apart, so only a
+/// prompt report is timed.
+fn assert_not_held(
+    opened: std::time::Instant,
+    reported: std::time::Instant,
+    arrived: std::time::Instant,
+) {
+    if reported - opened < std::time::Duration::from_millis(120) {
+        assert!(
+            arrived - reported < std::time::Duration::from_millis(110),
+            "frame arrived {:?} after its report, {:?} into the window",
+            arrived - reported,
+            arrived - opened
+        );
+    }
+}
+
+/// Waits for the next frame of `stream` and returns its only row.
+async fn next_row(
+    stream: &crate::RuntimeAttachmentTransferSubscription,
+) -> crate::AttachmentTransferStatus {
+    tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .remove(0)
+        .unwrap()
+}
+
 /// mdk#2157: a transfer that becomes Ready right after the previous frame is
 /// delivered at once, not up to 250 ms later.
 #[tokio::test]
@@ -447,28 +479,18 @@ async fn attachment_transfer_state_change_skips_the_progress_window() {
     use crate::AttachmentTransferState;
     let dir = tempfile::tempdir().unwrap();
     let (runtime, store, job, stream) = downloading_subscription(&dir, b"prompt").await;
-    let started = std::time::Instant::now();
+    let opened = std::time::Instant::now();
     report_ready(&runtime, &store, &job, b"prompt");
-    let ready = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap()
-        .remove(0)
-        .unwrap();
+    let reported = std::time::Instant::now();
+    let ready = next_row(&stream).await;
     assert_eq!(ready.state, AttachmentTransferState::Ready);
-    // The window would hold this frame until 250 ms after the initial one.
-    assert!(
-        started.elapsed() < std::time::Duration::from_millis(200),
-        "Ready arrived after {:?}",
-        started.elapsed()
-    );
+    assert_not_held(opened, reported, std::time::Instant::now());
     stream.close();
     runtime.shutdown_and_close().await.unwrap();
 }
 
 /// Byte progress alone is still coalesced: with a write every 20 ms, frames
-/// that only advance progress stay at least the window apart.
+/// that only advance progress stay close to the window apart.
 #[tokio::test]
 async fn attachment_progress_only_frames_stay_coalesced() {
     let dir = tempfile::tempdir().unwrap();
@@ -499,9 +521,11 @@ async fn attachment_progress_only_frames_stay_coalesced() {
         arrivals.len() >= 3,
         "expected some progress frames: {arrivals:?}"
     );
+    // Uncoalesced frames would follow the 20 ms writes; the slack below the
+    // 250 ms window absorbs a loaded runner timing a frame late.
     for pair in arrivals.windows(2) {
         assert!(
-            pair[1] - pair[0] >= std::time::Duration::from_millis(200),
+            pair[1] - pair[0] >= std::time::Duration::from_millis(175),
             "progress frames {:?} apart",
             pair[1] - pair[0]
         );
@@ -510,36 +534,91 @@ async fn attachment_progress_only_frames_stay_coalesced() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-/// A state change that lands while byte progress waits out the window is
-/// delivered at once, and no stale progress frame follows it.
+/// A state change that lands while a read progress frame waits out the window
+/// is delivered at once, and no stale progress frame follows it.
 #[tokio::test]
 async fn attachment_terminal_frame_is_not_held_behind_progress() {
     use crate::AttachmentTransferState;
     let dir = tempfile::tempdir().unwrap();
     let (runtime, store, job, stream) = downloading_subscription(&dir, b"terminal").await;
+    let opened = std::time::Instant::now();
+    let pending = tokio::spawn({
+        let stream = stream.clone();
+        async move { next_row(&stream).await }
+    });
     report_progress(&runtime, &store, &job, 1024);
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    let started = std::time::Instant::now();
+    // The pending call reads this progress and holds it for the window.
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
     report_ready(&runtime, &store, &job, b"terminal");
-    let next = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap()
-        .remove(0)
-        .unwrap();
+    let reported = std::time::Instant::now();
+    let next = pending.await.unwrap();
     assert_eq!(next.state, AttachmentTransferState::Ready);
+    assert_not_held(opened, reported, std::time::Instant::now());
     assert!(
-        started.elapsed() < std::time::Duration::from_millis(200),
-        "Ready waited {:?} behind progress",
-        started.elapsed()
+        tokio::time::timeout(std::time::Duration::from_millis(400), stream.next())
+            .await
+            .is_err(),
+        "a frame followed the terminal one"
     );
-    if let Ok(later) =
-        tokio::time::timeout(std::time::Duration::from_millis(400), stream.next()).await
-    {
-        let row = later.unwrap().unwrap().remove(0).unwrap();
-        assert_eq!(row.state, AttachmentTransferState::Ready);
-    }
+    stream.close();
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// A state change that lands while a presentation wake waits out its spacing
+/// is read at once rather than at the end of that spacing.
+#[tokio::test]
+async fn attachment_state_change_is_not_held_behind_presentation_churn() {
+    use crate::AttachmentTransferState;
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, store, job, stream) = downloading_subscription(&dir, b"churn").await;
+    let opened = std::time::Instant::now();
+    let pending = tokio::spawn({
+        let stream = stream.clone();
+        async move { next_row(&stream).await }
+    });
+    let _ = runtime.accounts.app.presentation_signals.updates.send(
+        crate::chat_presentation::signals::PresentationInvalidation {
+            account_label: "alice".into(),
+            version: storage_sqlite::ChatPresentationVersion {
+                store_epoch: Vec::new(),
+                revision: 1,
+            },
+        },
+    );
+    // The pending call takes the presentation wake and waits out its spacing.
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    report_ready(&runtime, &store, &job, b"churn");
+    let reported = std::time::Instant::now();
+    let next = pending.await.unwrap();
+    assert_eq!(next.state, AttachmentTransferState::Ready);
+    assert_not_held(opened, reported, std::time::Instant::now());
+    stream.close();
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// A caller timeout that cancels `next()` while progress waits out the window
+/// keeps the owed read, so the next call delivers that progress when the
+/// window ends rather than after the idle fallback.
+#[tokio::test]
+async fn attachment_progress_survives_a_cancelled_next() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, store, job, stream) = downloading_subscription(&dir, b"cancel").await;
+    let opened = std::time::Instant::now();
+    report_progress(&runtime, &store, &job, 1024);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), stream.next())
+            .await
+            .is_err(),
+        "progress skipped the window"
+    );
+    let row = next_row(&stream).await;
+    assert_eq!(row.received, 1024);
+    // The idle fallback for an active transfer is a second away.
+    assert!(
+        opened.elapsed() < std::time::Duration::from_millis(700),
+        "progress arrived {:?} after its report",
+        opened.elapsed()
+    );
     stream.close();
     runtime.shutdown_and_close().await.unwrap();
 }

@@ -577,9 +577,9 @@ Read 1..=1048576 bytes at an offset from an opaque local asset reference. Unavai
 pub async fn next(&self) -> Result<Option<AttachmentTransferSnapshotFfi>, MarmotKitError>
 ```
 
-Initial snapshot, then coalesced replacements. None means closed. Errors terminate this observation; close/drop never cancels acquisition.
+Initial snapshot, then replacements: a transfer state change at once, progress-only changes at most four per second. None means closed. Errors terminate this observation; close/drop never cancels acquisition.
 
-[Source](src/commands/attachment_controls.rs#L12)
+[Source](src/commands/attachment_controls.rs#L13)
 
 ### `AttachmentTransferSubscription::cancel`
 
@@ -591,7 +591,7 @@ pub fn cancel(&self)
 
 Stop observation and wake receivers; does not cancel acquisition.
 
-[Source](src/commands/attachment_controls.rs#L21)
+[Source](src/commands/attachment_controls.rs#L22)
 
 ### `Marmot::attachment_download_policy`
 
@@ -603,7 +603,7 @@ pub async fn attachment_download_policy( &self, account_ref: String, ) -> Result
 
 Read the durable per-account automatic acquisition, quota, disk-reserve and transfer-cap policy.
 
-[Source](src/commands/attachment_controls.rs#L64)
+[Source](src/commands/attachment_controls.rs#L65)
 
 ### `Marmot::set_attachment_download_policy`
 
@@ -615,7 +615,7 @@ pub async fn set_attachment_download_policy( &self, account_ref: String, policy:
 
 Validate and persist acquisition policy; disabling automatic work preserves explicit work and retained files.
 
-[Source](src/commands/attachment_controls.rs#L74)
+[Source](src/commands/attachment_controls.rs#L75)
 
 ### `Marmot::request_explicit_attachment`
 
@@ -625,7 +625,7 @@ pub async fn request_explicit_attachment( &self, account_ref: String, group_id_h
 
 Join a current source or promote automatic demand to explicit priority without resetting retry budgets or scheduled backoff. Use this for ordinary interactive demand; reserve `control_attachment(Retry)` and `download_attachment_again` for deliberate recovery. A returned opaque reference does not promise readiness: inspect transfer state and prefer local assets first. Active attempts retain their original size limit and deadline; promotion changes subsequent admission, not the existing transport budget. Cancelled, removed, exhausted and failed sources are not rearmed.
 
-[Source](src/commands/attachment_controls.rs#L101)
+[Source](src/commands/attachment_controls.rs#L102)
 
 ### `Marmot::control_attachment`
 
@@ -637,7 +637,7 @@ pub async fn control_attachment( &self, account_ref: String, reference: String, 
 
 Cancel durably, retry explicitly, or remove local bytes. Returns false for obsolete references or ineligible operations; cancellation preserves ready bytes.
 
-[Source](src/commands/attachment_controls.rs#L86)
+[Source](src/commands/attachment_controls.rs#L87)
 
 ### `Marmot::download_attachment_again`
 
@@ -649,7 +649,7 @@ pub async fn download_attachment_again( &self, account_ref: String, group_id_hex
 
 Queue explicit acquisition for a current original source slot, clearing removal/cancellation; no reference means unavailable or obsolete.
 
-[Source](src/commands/attachment_controls.rs#L115)
+[Source](src/commands/attachment_controls.rs#L116)
 
 ### `Marmot::attachment_transfer_snapshot`
 
@@ -661,7 +661,7 @@ pub async fn attachment_transfer_snapshot( &self, account_ref: String, group_id_
 
 Read bounded transfer state for up to 64 source slots in one group without requesting a transfer.
 
-[Source](src/commands/attachment_controls.rs#L128)
+[Source](src/commands/attachment_controls.rs#L129)
 
 ### `Marmot::subscribe_attachment_transfers`
 
@@ -673,7 +673,7 @@ pub async fn subscribe_attachment_transfers( &self, account_ref: String, group_i
 
 Observe initial transfer state and coalesced complete replacements for bounded source slots; observation does not request a transfer.
 
-[Source](src/commands/attachment_controls.rs#L150)
+[Source](src/commands/attachment_controls.rs#L151)
 
 </details>
 
@@ -4360,7 +4360,7 @@ pub async fn begin_attachment_permission_update( &self, account_ref: String, ) -
 
 Revoke automatic permission for this account before asynchronous network/preference evaluation. Returns a single-use runtime/account generation. Requires HostManaged construction; do not persist the token or mint a new one from a stale callback. See the [host-managed contract](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104).
 
-[Source](src/commands/attachment_controls.rs#L28)
+[Source](src/commands/attachment_controls.rs#L29)
 
 ### `Marmot::request_automatic_attachment`
 
@@ -4370,7 +4370,7 @@ pub async fn request_automatic_attachment( &self, account_ref: String, group_id_
 
 Submit idempotent automatic demand for an authoritative original source slot. Returns current status plus whether work was newly queued; preserves suppression, history, deadlines and retry budgets. Use from foreground and restored workers; never substitute explicit download-again or legacy downloadMedia after a local miss. See [Android migration](ATTACHMENT-ACCESS.md#android-migration).
 
-[Source](src/commands/attachment_controls.rs#L50)
+[Source](src/commands/attachment_controls.rs#L51)
 
 ### `Marmot::set_attachment_automatic_permission`
 
@@ -4380,7 +4380,7 @@ pub async fn set_attachment_automatic_permission( &self, account_ref: String, ge
 
 Apply media-category permission using the generation captured before evaluating host policy. False means stale, foreign or already consumed; it is not permission to retry with a fresh token. Approval is runtime-only and cannot override the durable automatic policy. See the [permission lifecycle](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104).
 
-[Source](src/commands/attachment_controls.rs#L38)
+[Source](src/commands/attachment_controls.rs#L39)
 
 </details>
 

@@ -102,7 +102,9 @@
   to 250 ms after the previous frame, so a small download opens when the engine
   finishes it. Progress-only changes are still coalesced to at most four frames
   per second, and presentation and idle wakes still read at most four times a
-  second (#2157).
+  second. A `next()` call cancelled by its caller, such as a C timeout, no
+  longer loses a frame that was waiting out that window: the next call
+  delivers it (#2157).
 
 ## 0.13.0 - 2026-10-12
 
