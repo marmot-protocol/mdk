@@ -53,7 +53,7 @@ the seams that are already nearly separate: the media store (in progress, #2314)
 | Crate | Documented role | Production lines | What it actually holds |
 | --- | --- | ---: | --- |
 | `traits` | Shared engine, storage and transport contracts | 10,136 | The contracts (about 5.5k), plus about 2.6k of app-level types: polls, reporting, app-event UI strings, media and avatar components, agent streams, host safety. Also account-runtime state machines: the `OutboundFanout` transitions and maintenance records. |
-| `cgka-engine` | The CGKA engine: MLS, convergence, capability rules | 37,203 | Mostly the protocol core: convergence and canonicalization (about 11.2k, including `openmls_projection.rs`, which is really the replay and apply engine), group lifecycle and send (about 7.2k), message ingest and peel (about 4.8k), publish lifecycle, deferred peel and hydration. A smaller slice does three other jobs: about 30 storage pass-throughs for account records, the app's audit sink and metrics (about 1.7k), and a few product-policy rules (see §2.4). |
+| `cgka-engine` | The CGKA engine: MLS, convergence, capability rules | 37,203 | Mostly the protocol core: convergence and canonicalization (about 11k, including `openmls_projection.rs`, which is really the replay and apply engine), group lifecycle and send (about 7.2k), message ingest and peel (about 4.8k), publish lifecycle, deferred peel and hydration. A smaller slice does three other jobs: about 30 storage pass-throughs for account records, the app's audit sink and metrics (about 1.7k), and a few product-policy rules (see §2.4). |
 | `cgka-session` | One encrypted account-device session | 1,687 | About 700 lines of real work (open, hydrate, effect collation) and 119 pass-throughs. Its API leaks engine types, so callers import the engine anyway. |
 | `marmot-account` | Account and session coordinator: publish-before-apply, transport activation | 9,400 | Account identity and files (2.7k), the publish pipeline, a second "legacy" fanout that is the live Welcome path, maintenance, KeyPackage scheduling and a routing implementation the app duplicates |
 | `storage-sqlite` | SQLCipher implementation of `StorageProvider` and OpenMLS storage | 43,707 | Protocol 16%, app projections 33%, attachments and avatars 17%, recovery and transport bookkeeping 12%, product state 11%, infrastructure 7%, shared DB 2% |
@@ -185,21 +185,25 @@ App concerns tunnel down through the session: the draft-commit observer and the 
 - **Product policy.** Several rules belong to product layers, not the protocol:
   - a chat with an `imeta` tag triggers media-secret export (`crates/cgka-engine/src/app_payload.rs:41-48`);
   - an app moderation rule decides which message kinds need source authority;
-  - the join transaction creates a 24-hour post-join maintenance obligation with a relay-EOSE deadline;
+  - the join transaction creates a post-join maintenance obligation with a 24-hour operational target. Its relay-EOSE
+    deadline is set later, when the post-join subscription is installed (`eose_deadline_at` is `None` in this function);
   - the engine decodes `NostrRoutingV1` to derive transport routes.
-- **The protocol core is most of the crate, and it is sound.** Convergence and canonicalization are about 11.2k lines
-  across the convergence modules; the three largest files, `distributed_convergence.rs`, `canonicalization.rs` and
-  `openmls_projection.rs`, are 8,973 lines at the baseline. Group lifecycle and send add about 7.2k, and message ingest
-  and peel about 4.8k. All of it has matching tests, the simulator and the formal model. The three jobs above are a
-  small slice of the 37.2k lines, which makes them cheap to move. The name `openmls_projection.rs` hides that it is the
-  replay and apply engine.
+- **The protocol core is most of the crate, and it is sound.** Convergence and canonicalization are about 11k lines:
+  `distributed_convergence.rs`, `canonicalization.rs` and `openmls_projection.rs` are 8,973 lines together at the
+  baseline, and `convergence.rs`, `convergence_input.rs`, `convergence_clock.rs` and
+  `openmls_projection/{group_activity,resumable}.rs` bring the raw total to 11,003. Group lifecycle and send add about
+  7.2k, and message ingest and peel about 4.8k. All of it has matching tests, the simulator and the formal model. The
+  three jobs above are a small slice of the 37.2k lines, which makes them cheap to move. The name
+  `openmls_projection.rs` hides that it is the replay and apply engine.
 
 **Evidence (observed):**
 - The storage proxy: `crates/cgka-engine/src/maintenance.rs` (21 `pub fn`) and `engine.rs:865-990`.
 - The audit sink: `engine.rs:2917-2970`.
 - Moderation authority: `reporting::requires_source_authority`, called at `message_processor/ingest.rs:1464`.
 - The post-join obligation: `group_lifecycle.rs:50-105`. Routing decode: `app_components.rs:235-251`.
-- Convergence size, measured over `distributed_convergence.rs`, `canonicalization.rs` and `openmls_projection.rs`.
+- Convergence size: raw lines at `ab1de296f` of `distributed_convergence.rs`, `canonicalization.rs`,
+  `openmls_projection.rs`, `convergence.rs`, `convergence_input.rs`, `convergence_clock.rs` and
+  `openmls_projection/{group_activity,resumable}.rs`.
 
 ### 2.5 The unit of work decides placement
 

@@ -16,7 +16,8 @@ statements are observed in source unless marked (hypothesis).
 ## Why this seam first
 
 - **It is the most separable part of `marmot-app`.** `relay_plane/` is about 5.1k production lines. About 10% of it is
-  methods on the app's hub objects, and it imports only four things from the rest of the crate (§3).
+  methods on the app's hub objects, and it imports only four things from the rest of the crate (see "Edges to cut
+  before moving").
 - **It gives transport work a home.** The size handling and coverage surface from [Pass 1 E](e-transport.md#9-recommendations),
   and the per-group transport evidence that [Pass 1 B](b-runtime-concurrency.md#5-options) needs, all belong in the
   transport layer. Today the only place for them is inside `marmot-app`.
@@ -87,7 +88,8 @@ PRs (see the end of this brief).
 | Lifecycle (construction, shutdown) | 5 |
 
 The 35 `pub(crate)` adapter methods that the app calls become `#[doc(hidden)] pub` in the move. The test hooks
-(33 calls to 9 `_for_test` hooks from `marmot-app` tests) move behind a `test-support` feature, because
+(10 `_for_test` hooks, including the `new_with_directory_fetcher_for_test` constructor, with 46 calls from
+`marmot-app` tests) move behind a `test-support` feature, because
 `#[cfg(test)]` doesn't cross crate boundaries.
 
 ## PR sequence
@@ -104,9 +106,15 @@ Each PR is green on its own and changes no behaviour.
      example `notification_lag_with_a_legacy_retained_route_stays_bounded` reads
      `app.relay_plane.inner.transport.sdk_relay_client` (`relay_plane/tests.rs:5435-5446`). Rewrite those assertions
      to use the accessors, so PR 2 can move the tests without dropping any.
+   - Adapt `relay_label_resolution_is_gated_behind_opt_in` to the new export-gate trait. Today it builds the app's
+     `RelayTelemetryRuntimeConfig` from `crate::config` (`relay_plane/tests.rs:33-51`, `:2338-2358`).
    - Proof: `relay_plane/` has no production `crate::` or `storage_sqlite::` imports.
 2. **Move the eight tests that build a whole `MarmotApp` or runtime** out of `relay_plane/tests.rs` into the app's
    tests, using the accessors from PR 1. Tests only.
+   - Give `relay_telemetry_export.rs`'s `account_publish_counters_round_trip_as_unlabeled_cumulative_sums` its own
+     fixture, or move the shared fixture behind `test-support`. Today it imports `AccountPublishFixture` and
+     `PublishScript` from `relay_plane::publish_accounting_tests` (`relay_telemetry_export.rs:2466-2475`), a
+     `#[cfg(test)] pub(crate)` module (`relay_plane/mod.rs:45-46`) that disappears once the plane is another crate.
 3. **Create `crates/transport-nostr` and `git mv` the files.**
    - In `marmot-app`, `mod relay_plane { pub use transport_nostr::*; }` keeps every existing path and re-export, so
      the move touches nothing else.
