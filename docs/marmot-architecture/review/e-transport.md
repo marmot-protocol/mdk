@@ -19,8 +19,9 @@ marks claims reasoned from code but not traced at runtime.
   358 bytes per member, and NIP-59 wrapping triples it. A one-invitee Welcome passes the 64 KiB default of public
   strfry relays at about 56 members, and the White Noise relays' 2 MiB limit at about 1,917. A group of thousands
   cannot be joined by Welcome today, even on our own relays.
-- **Large Welcomes stop being standard NIP-44 at about 81 members.** The pinned rust-nostr fork extends NIP-44 past its
-  65,535-byte plaintext limit. Other Marmot clients may be unable to decrypt those Welcomes (inferred).
+- **From about 81 members, Welcomes need NIP-44's extended length format.** NIP-44 v2 uses a 6-byte length prefix for
+  plaintexts of 65,536 bytes or more. The pinned rust-nostr fork implements it, but libraries that implement only the
+  older 2-byte format cannot handle these Welcomes. Whether other Marmot implementations support it is unverified.
 - **Commits are not the near-term problem on our relays.** They grow about 109 bytes per member in the worst case, so
   they stay under 2 MiB until about 19,000 members. On 64 KiB public relays they would fail from about 586 members, but
   group traffic uses only the White Noise relays today.
@@ -88,12 +89,14 @@ Where the bytes come from:
 - **Invite traffic.** Every invitee receives a full copy of a Welcome that grows with N. Inviting 50 people into a group
   of 1,000 publishes about 52 MB per relay.
 
-**NIP-44 interoperability.** The pinned fork
+**NIP-44 length format.** NIP-44 v2 encodes plaintexts of 65,536 bytes or more with a 6-byte length prefix (two zero
+bytes and a `u32`), up to 2³²−1 bytes. The pinned fork
 ([`erskingardner/rust-nostr@a9c7a64`](https://github.com/erskingardner/rust-nostr/tree/a9c7a6423d104c603de6ea8244265ea17f0f9d89))
-uses a 6-byte length prefix for NIP-44 plaintexts of 65,536 bytes or more, where standard NIP-44 v2 stops at 65,535
-(`nostr/src/nips/nip44/v2.rs:26-29`, `:98-110` in the fork). A gift wrap's plaintext passes that point at about 81
-members for one invitee, 69 for ten, and 11 for fifty. Above those sizes, only clients on the fork can decrypt the
-Welcome.
+implements this (`nostr/src/nips/nip44/v2.rs:26-29`, `:98-110` in the fork). Older implementations cap plaintext just
+below 64 KiB: upstream `nostr` 0.44.8 could not wrap a 64-member Welcome at all
+([#1638](https://github.com/marmot-protocol/mdk/issues/1638)). A gift wrap's plaintext needs the extended format from
+about 81 members for one invitee, 69 for ten, and 11 for fifty. Clients whose NIP-44 library predates the extended
+format cannot decrypt those Welcomes.
 
 ## 3. When an event is too big
 
@@ -206,12 +209,13 @@ No code knows the White Noise relays' 1,095-day or 15-minute timestamp windows (
 
 **Large groups.** These are protocol-level and belong in the Marmot spec, backed by the numbers in §2.
 
-1. **Take the ratchet tree out of the Welcome.** MLS allows a Welcome without the ratchet-tree extension, if the joiner
-   gets the tree another way. Upload the tree, or the whole GroupInfo, once as an encrypted blob, and reference it from
-   the Welcome by locator, key and hash. Each Welcome then shrinks from O(N) to O(k), and an invite's traffic from
-   k × O(N) to O(N) + k × O(k). This is the change that makes groups of thousands joinable.
-2. **Don't rely on non-standard NIP-44.** Either standardize the extended length prefix or keep NIP-44 plaintexts under
-   65,535 bytes. Recommendation 1 does the latter for Welcomes.
+1. **Take the ratchet tree out of the Welcome.** Every Welcome carries the full tree (§2), so its size grows with the
+   group and every invitee receives a full copy. MLS allows a Welcome without the tree when the joiner gets it another
+   way. This is a wire-format change, so the design belongs in the Marmot spec; [#2336](https://github.com/marmot-protocol/mdk/issues/2336)
+   tracks the proposal. With the tree delivered once per invitation, each Welcome would grow with the number of
+   invitees instead of the group size. This is the change that makes groups of thousands joinable.
+2. **Confirm that every Marmot implementation supports NIP-44's extended length format.** Welcomes for groups above
+   about 81 members depend on it. Recommendation 1 would keep Welcome plaintexts small enough not to need it.
 3. **Invite in batches sized to fit relay limits,** since each added member costs about 626 bytes in the commit.
 4. **Keep the tree filled.** Members' self-updates, including the existing post-join self-update, keep commit paths
    near O(log N) instead of O(N).
@@ -244,7 +248,7 @@ the protocol change in recommendation 1 and the existing [#1638](https://github.
 | E-1 ([#2332](https://github.com/marmot-protocol/mdk/issues/2332)) | A commit that every relay may have received, but none acknowledged, stays pending and retries hourly forever, blocking further commits | Observed in code (rollback condition and uncapped backoff); end-to-end effect inferred |
 | E-2 ([#2333](https://github.com/marmot-protocol/mdk/issues/2333)) | A relay that definitively rejects a commit is "not owed", so members who read only that relay lose the epoch with no warning | Observed |
 | E-3 ([#2334](https://github.com/marmot-protocol/mdk/issues/2334)) | No pre-publish size check, no NIP-11 use, and "too large" indistinguishable from other rejections; untyped host errors | Observed |
-| E-4 ([#2335](https://github.com/marmot-protocol/mdk/issues/2335)) | Welcomes for groups larger than about 81 members use non-standard NIP-44 | Observed in the pinned dependency; interoperability impact inferred |
+| E-4 ([#2335](https://github.com/marmot-protocol/mdk/issues/2335)) | Welcomes for groups larger than about 81 members need NIP-44's extended length format, which older NIP-44 libraries lack | Observed. Corrected on 2026-10-15: the extended format is part of NIP-44 v2, not a fork extension |
 | E-5 ([#2336](https://github.com/marmot-protocol/mdk/issues/2336)) | Groups larger than about 1,900 cannot be joined by Welcome even on the White Noise relays | Measured |
 
 ## 11. Questions for the product owner
@@ -253,6 +257,6 @@ the protocol change in recommendation 1 and the existing [#1638](https://github.
    `#h` values under one key; if it means values, every batch REQ would be refused.
 2. Do White Noise users' inbox relay lists (kind 10050) default to the White Noise relays? If so, Welcomes inherit the
    2 MiB limit for most users today.
-3. Is the extended NIP-44 length prefix intentional, and do other Marmot implementations, such as Marmot-TS, support it?
+3. Do other Marmot implementations, such as Marmot-TS, support NIP-44's extended length format?
 4. Do the White Noise relays prune old events? The 1,095-day window is a write-time limit, but catch-up assumes relays
    keep history.

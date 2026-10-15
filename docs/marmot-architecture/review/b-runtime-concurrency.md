@@ -277,9 +277,11 @@ Each step ships on its own and can be judged by measurement.
 - Blocking work that cannot be aborted fails fast. After `close_storage`, every later database call returns
   `StorageError::Closed`, and close waits only for a statement that has already started
   (`crates/marmot-app/src/runtime/mod.rs:6105-6121`). Such work therefore stops at its next statement.
-- No writer unit runs longer than the engine's existing budgets: 250 ms in the foreground and 500 ms in the background
-  (`crates/cgka-engine/src/message_processor/mod.rs:273`, `:283`). This is measured at p99 on a mid-range Android device
-  in Step 0. On long histories, meeting it depends on [#2326](https://github.com/marmot-protocol/mdk/issues/2326).
+- Writer units meet the engine's existing budgets as a p99 target: 250 ms in the foreground and 500 ms in the
+  background (`crates/cgka-engine/src/message_processor/mod.rs:273`, `:283`), measured on a mid-range Android device in
+  Step 0. These are targets, not guarantees. The same trace reports the maximum unit duration and counts every unit
+  over its budget, so outliers stay visible. On long histories, meeting the target depends on
+  [#2326](https://github.com/marmot-protocol/mdk/issues/2326).
 - `shutdown_and_close` returns within its current graceful budget of 5 s (`crates/marmot-app/src/lib.rs:427`) while a
   convergence pass and a hydration batch are in flight. When it returns, no connection to any database in the root is
   open ([#2323](https://github.com/marmot-protocol/mdk/issues/2323)).
