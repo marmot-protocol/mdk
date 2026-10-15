@@ -700,8 +700,8 @@ pub struct AppClient {
     pub(crate) transport_signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
     pub(crate) blossom_http_transport: BlossomHttpTransport,
     /// Attachment uploads in flight; each holds its group's due periodic
-    /// self-update. Per client: only uploads this client prepares hold the
-    /// rotations its own maintenance sweep runs.
+    /// self-update. Shared by every client of this account on this app, so a
+    /// client rebuilt on reconnect still sees uploads its predecessor started.
     pub(crate) upload_epoch_holds: upload_holds::UploadEpochHolds,
     pub(crate) state: AccountState,
     /// O(1) membership index over `state.seen_events`, kept in lockstep by
