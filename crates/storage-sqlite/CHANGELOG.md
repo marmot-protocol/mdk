@@ -4,6 +4,11 @@
 
 ### Breaking changes
 
+- Migration 0110 advances account storage to schema 110 on first open. Older
+  binaries reject the upgraded database; downgrade is unsupported. It adds
+  `media_files` (per-file keys and states for the encrypted media store,
+  mdk#2314) and `media_file_refs` (attachment slot to ready file), with triggers
+  that delete a file's key with its last reference and on a store reset.
 - Migration 0108 advances account storage to schema 108 with account-wide attachment seek/expiry indexes and invalidation counters. Older binaries reject the upgraded database; downgrade is unsupported.
 - Migration 0109 advances account storage to schema 109 on first open. Older
   binaries reject the upgraded database; downgrade is unsupported. It adds
@@ -13,6 +18,10 @@
 - `AttachmentTransferState` adds `StorageBlocked`; update exhaustive matches.
 
 ### Added
+
+- `SqliteMediaCatalog` and `SlotPublication` implement the `media-store` crate's
+  `MediaCatalog` and `PublishTarget` traits on the account database;
+  `release_media_reference` removes a slot's reference and reports released files.
 
 - Bounded account-wide attachment pages with group/sender selections, inclusive date bounds and account/query-bound continuation cursors.
 - `SqliteAccountStorage::block_attachment_storage` parks a live attempt whose
