@@ -236,13 +236,16 @@ No code knows the White Noise relays' 1,095-day or 15-minute timestamp windows (
 
 ## 10. Possible defects found in this pass
 
+All five are filed. [#2336](https://github.com/marmot-protocol/mdk/issues/2336) tracks the large-group work, including
+the protocol change in recommendation 1 and the existing [#1638](https://github.com/marmot-protocol/mdk/issues/1638).
+
 | # | Candidate | Status |
 | --- | --- | --- |
-| E-1 | A commit that every relay may have received, but none acknowledged, stays pending and retries hourly forever, blocking further commits | Observed in code (rollback condition and uncapped backoff); end-to-end effect inferred |
-| E-2 | A relay that definitively rejects a commit is "not owed", so members who read only that relay lose the epoch with no warning | Observed |
-| E-3 | No pre-publish size check, no NIP-11 use, and "too large" indistinguishable from other rejections; untyped host errors | Observed |
-| E-4 | Welcomes for groups larger than about 81 members use non-standard NIP-44 | Observed in the pinned dependency; interoperability impact inferred |
-| E-5 | Groups larger than about 1,900 cannot be joined by Welcome even on the White Noise relays | Measured |
+| E-1 ([#2332](https://github.com/marmot-protocol/mdk/issues/2332)) | A commit that every relay may have received, but none acknowledged, stays pending and retries hourly forever, blocking further commits | Observed in code (rollback condition and uncapped backoff); end-to-end effect inferred |
+| E-2 ([#2333](https://github.com/marmot-protocol/mdk/issues/2333)) | A relay that definitively rejects a commit is "not owed", so members who read only that relay lose the epoch with no warning | Observed |
+| E-3 ([#2334](https://github.com/marmot-protocol/mdk/issues/2334)) | No pre-publish size check, no NIP-11 use, and "too large" indistinguishable from other rejections; untyped host errors | Observed |
+| E-4 ([#2335](https://github.com/marmot-protocol/mdk/issues/2335)) | Welcomes for groups larger than about 81 members use non-standard NIP-44 | Observed in the pinned dependency; interoperability impact inferred |
+| E-5 ([#2336](https://github.com/marmot-protocol/mdk/issues/2336)) | Groups larger than about 1,900 cannot be joined by Welcome even on the White Noise relays | Measured |
 
 ## 11. Questions for the product owner
 
