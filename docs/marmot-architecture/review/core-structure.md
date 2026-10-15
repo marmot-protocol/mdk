@@ -14,33 +14,36 @@ the biggest gaps between what each crate is documented to be and what it contain
 with a sequence for getting there. Baseline `ab1de296f`.
 
 Line counts are production code. They exclude test files and inline `#[cfg(test)]` blocks, so they are lower than
-Pass 0's figures. Counts that split mixed files by function are approximate, to about ±15%. "(inferred)" marks
-judgements not traced end to end.
+Pass 0's figures. Counts that split mixed files by function are approximate, to about ±15%.
+
+Evidence labels follow the [review's evidence rules](README.md#evidence-rules). Every finding is **observed** (read
+in source at the baseline, or measured) unless it is marked **(hypothesis)**. Each finding section in §2 ends with
+the citations behind it. §4 and §5 are proposals, not findings.
 
 ## Summary
 
-1. **`marmot-app` is a product monolith in a runtime's clothing.** Its documented job is "the runtime boundary for
-   client applications". Only about 23% of its 107k production lines are runtime orchestration. About 57% are product
-   features, and about 20% are infrastructure and observability code (audit logs, telemetry, analytics) that belongs
-   lower in the stack or in a crate of its own.
-2. **The real per-account core is an undocumented god object.** `AppClient` has 58 fields and 449 methods, 299 of them
-   taking `&mut self`. The docs call it "a lower-level compatibility surface", and they describe a
+1. **`marmot-app` is a product monolith in a runtime's clothing.** (Observed; §2.1.) Its documented job is "the runtime
+   boundary for client applications". Only about 23% of its 107k production lines are runtime orchestration. About 57%
+   are product features, and about 20% are infrastructure and observability code (audit logs, telemetry, analytics) that
+   belongs lower in the stack or in a crate of its own.
+2. **The real per-account core is an undocumented god object.** (Observed; §2.1.) `AppClient` has 58 fields and 449
+   methods, 299 of them taking `&mut self`. The docs call it "a lower-level compatibility surface", and they describe a
    `MarmotAccountSession` and `SharedServices` that don't exist. The public runtime mostly forwards calls: 179 of its
    250 public methods are thin delegations, and a feature crosses four hand-written layers.
-3. **`storage-sqlite` is the app's whole data model with a protocol store inside it.** Protocol persistence is 16% of
-   its production code. It exposes 389 public app methods next to 119 storage-trait methods, 84% of them used by
-   `marmot-app`, and its protocol code behaves differently depending on app tables.
-4. **The lower stack has three identical wrappers and no layer narrows the surface.** The account runtime makes 34
-   pass-throughs and hands out the session directly. The session makes 119 more. The engine exposes 153 methods,
-   about 38 of which are a storage proxy for account records plus the app's audit sink.
-5. **The protocol/app boundary is crossed inside single transactions in both directions.** That, not the contracts,
-   decides where code lives. Account-runtime state machines sit in `traits` because the engine's transactions write
-   them. Drafts are consumed inside the engine's outbound transaction, and the engine's outbox is acknowledged inside
-   the app's.
-6. **`marmot-account` is two crates in one.** Account identity and files are used by the bindings, the CLI and the
-   agent connector. The account-device publish runtime is used only by `marmot-app`. The two share no state.
-7. **Nostr knowledge sits in the wrong layers in both directions.** It is below the transport in the engine, `traits`,
-   the account crate and storage, and above it in `marmot-app`'s relay plane.
+3. **`storage-sqlite` is the app's whole data model with a protocol store inside it.** (Observed; §2.2.) Protocol
+   persistence is 16% of its production code. It exposes 389 public app methods next to 119 storage-trait methods, 84%
+   of them used by `marmot-app`, and its protocol code behaves differently depending on app tables.
+4. **The lower stack has three identical wrappers and no layer narrows the surface.** (Observed; §2.3 and §2.4.) The
+   account runtime makes 34 pass-throughs and hands out the session directly. The session makes 119 more. The engine
+   exposes 153 methods, about 38 of which are a storage proxy for account records plus the app's audit sink.
+5. **The protocol/app boundary is crossed inside single transactions in both directions.** (Observed; §2.5.) That, not
+   the contracts, decides where code lives. Account-runtime state machines sit in `traits` because the engine's
+   transactions write them. Drafts are consumed inside the engine's outbound transaction, and the engine's outbox is
+   acknowledged inside the app's.
+6. **`marmot-account` is two crates in one.** (Observed; §2.6.) Account identity and files are used by the bindings, the
+   CLI and the agent connector. The account-device publish runtime is used only by `marmot-app`. The two share no state.
+7. **Nostr knowledge sits in the wrong layers in both directions.** (Observed; §2.8.) It is below the transport in the
+   engine, `traits`, the account crate and storage, and above it in `marmot-app`'s relay plane.
 
 The proposed direction (§4): about eight focused crates around a slimmer engine and a smaller `marmot-app`. Start with
 the seams that are already nearly separate: the media store (in progress, #2314), the relay plane and the directory.
@@ -94,6 +97,19 @@ modules. Forty `_unobserved` functions exist only to pair each public operation 
 Sync and history recovery are one subsystem split across two files: they share about 10 `AppClient` fields, and sync
 references 48 recovery symbols.
 
+**Evidence (observed at `ab1de296f`):**
+- Hub objects: `MarmotApp` (`crates/marmot-app/src/lib.rs:484`), `AppClient` (`client/mod.rs:788`),
+  `MarmotAppRuntime` and `AccountManager` (`runtime/mod.rs:184`, `:243`).
+- The command enum: `runtime/account_worker.rs:339-751`.
+- The reaction chain: `runtime/mod.rs:3540`, `runtime/commands.rs:1671`, `account_worker.rs:590` and `:5657`,
+  `client/mod.rs:4243` and `:4429`.
+- `relay_plane` held four times: `lib.rs:513`, `client/mod.rs:824`, `runtime/mod.rs:377`, `account_worker.rs:333`.
+- `AppError`: `error.rs:121`.
+- The documented role: [`marmot-app-runtime.md`](../overview/marmot-app-runtime.md) (crate responsibility list) and
+  [`app-core-boundary.md`](../overview/app-core-boundary.md) line 49.
+- Measured: line counts, domain shares and hook counts by the method in the page header; growth by `git diff --stat`
+  from 2026-07-15. The split of the seven mixed hub files is approximate.
+
 ### 2.2 `storage-sqlite`: two stores in one type
 
 - **The callers are the app.** One concrete type, `SqliteAccountStorage`, carries 389 public app methods and 119
@@ -132,6 +148,16 @@ The couplings a split has to carry, all with file:line in the source inventory:
 Several bridges already half exist: the at-least-once outbox, the released-receipt journal, the secure-delete intents
 and the replay fingerprint.
 
+**Evidence (observed):**
+- `SqliteAccountStorage`: `crates/storage-sqlite/src/connection.rs:1380`.
+- The release probe: `storage/messages.rs:283-290`. The forget wipe: `account_projection.rs:1427-1600`.
+- Draft and submission consumption: `storage/outbound.rs:20-62`, `:240-262`. The outbox acknowledgement:
+  `account_projection.rs:1313-1318`.
+- Engine-table triggers: `migrations/0072_chat_list_pages.rs:68-171`, and `reject_forgotten_group_insert` in
+  migration 0071. The media reset: `migrations/0110_media_files.rs:51`.
+- The cache generation: `connection.rs:1387-1404`. The transport rule: the root `AGENTS.md` invariants.
+- Measured: method counts, the migration and trigger classification, and the commit history over non-test files.
+
 ### 2.3 The lower stack: three wrappers, no narrowing
 
 A query from the app can cross the account runtime (34 pass-throughs), then the session (119), then the engine.
@@ -144,6 +170,11 @@ The session's public API exposes `FeatureRegistry`, `CanonicalizationPolicy`, `A
 above benefits from that genericity.
 
 App concerns tunnel down through the session: the draft-commit observer and the promotion of legacy message rows.
+
+**Evidence (observed):** the session struct and effect collation (`crates/cgka-session/src/lib.rs:193-197`,
+`:1482-1578`); the draft observer (`:433-441`); the app's engine imports and session configuration
+(`crates/marmot-app/src/lib.rs:15-18`, `:4537-4583`); pass-through counts in
+[the engine map](map-engine-contract.md#3-the-api-the-layers-above-use).
 
 ### 2.4 The engine: protocol core plus three other jobs
 
@@ -160,6 +191,13 @@ App concerns tunnel down through the session: the draft-commit observer and the 
   the matching tests, simulator and formal model. The name `openmls_projection.rs` hides that it is the replay and
   apply engine.
 
+**Evidence (observed):**
+- The storage proxy: `crates/cgka-engine/src/maintenance.rs` (21 `pub fn`) and `engine.rs:865-990`.
+- The audit sink: `engine.rs:2917-2970`.
+- Moderation authority: `reporting::requires_source_authority`, called at `message_processor/ingest.rs:1464`.
+- The post-join obligation: `group_lifecycle.rs:50-105`. Routing decode: `app_components.rs:235-251`.
+- Convergence size, measured over `distributed_convergence.rs`, `canonicalization.rs` and `openmls_projection.rs`.
+
 ### 2.5 The unit of work decides placement
 
 Because the confirm transaction writes the `OutboundFanout` record, its 668-line state machine lives in `traits`, the
@@ -169,6 +207,12 @@ checkpoint transaction.
 
 The real architectural rule today is "whatever one transaction must cover lives in the same crate", and the
 protocol/app line is drawn around that, not around responsibilities.
+
+**Evidence (observed):** the `OutboundFanout` state machine (`crates/traits/src/transport_adapter.rs:186-853`);
+maintenance records with EOSE fields (`crates/traits/src/maintenance.rs:62`, `:130`); the engine's confirm transaction
+(`crates/cgka-engine/src/publish.rs:133-288`); draft consumption (`crates/storage-sqlite/src/storage/outbound.rs:50`,
+`:253`); the outbox acknowledgement (`account_projection.rs:1313-1318`). The rule stated in the last paragraph is a
+reading of these facts (hypothesis).
 
 ### 2.6 `marmot-account`: two crates
 
@@ -182,12 +226,24 @@ protocol/app line is drawn around that, not around responsibilities.
   - **Welcomes:** the "legacy" `DurableTransportFanout` is still the live publication path, next to two app-side
     mechanisms.
 
+**Evidence (observed):**
+- Consumers found by searching for `marmot_account::` in `marmot-uniffi`, `cli`, `agent-connector` and the simulator.
+- Routing duplication: `AppTransportRouting` (`crates/marmot-app/src/lib.rs:7421-7585`) against
+  `StaticTransportRouting` (`crates/marmot-account/src/routing.rs:84-131`).
+- KeyPackage publication in the app: `crates/marmot-app/src/lib.rs:7654-7700`.
+- The live Welcome path through `DurableTransportFanout`: `crates/marmot-account/src/runtime.rs:4025`, `:4408`.
+
 ### 2.7 `traits`: contracts mixed with app types
 
 About 26% of the crate is app-level: polls, reporting, the UI strings in `app_event`, the encrypted-media, avatar and
 Blossom components, agent text streams, and host safety. Nostr specifics such as `NostrRoutingV1` and EOSE fields
 sit in a crate meant to be transport-neutral. The `CgkaEngine` trait has no generic consumer, so it is a compile-time
 witness, not the contract the layers above use.
+
+**Evidence (observed):** UI strings (`crates/traits/src/app_event.rs:112-116`); the compile-time witness
+(`crates/traits/src/lib.rs:136`, `crates/cgka-engine/src/lib.rs:96`); `TransportKind::Nostr`
+(`crates/traits/src/capabilities.rs:60`); EOSE fields (`crates/traits/src/maintenance.rs:62`, `:130`); the app-level
+share measured over the module inventory.
 
 ### 2.8 Nostr in the wrong layers
 
@@ -198,6 +254,11 @@ witness, not the contract the layers above use.
   - Nostr replaceable-event floors in `AccountHome`;
   - NIP-77, NIP-51 and NIP-59 bookkeeping in storage.
 - **Above the transport:** the relay plane, and with it the KeyPackage event format, in `marmot-app`.
+
+**Evidence (observed):** the identity proof (`crates/cgka-engine/src/account_identity_proof.rs:13-25`); routing
+decode (`crates/cgka-engine/src/app_components.rs:235-251`); replaceable floors
+(`crates/marmot-account/src/home.rs:686-712`); `transport_reconciliation.rs`, `delivery_spill.rs`, `user_blocks.rs` and
+`moderation_reports.rs` in `crates/storage-sqlite/src/`; and `crates/marmot-app/src/relay_plane/`.
 
 ### 2.9 Generic SDK or White Noise's app core
 
@@ -280,7 +341,7 @@ Each step can ship on its own, and later steps depend on the in-flight fixes lan
 | 7 | Inside `marmot-app`: break up `AppClient` along Pass 1 B's roles; make sync and recovery one owned subsystem; take onboarding out of `AccountManager`; remove duplicated state | Depends on the runtime work (multi-thread runtime session) | Large |
 | 8 | Split `storage-sqlite` into protocol, app and base crates; move app types into `marmot-components`; inject engine policy | Last, because they need steps 4 and 5 | Large |
 
-Steps 1, 2, 3 and 6 alone would move about a third of `marmot-app`'s production code into focused crates (inferred).
+Steps 1, 2, 3 and 6 alone would move about a third of `marmot-app`'s production code into focused crates (hypothesis).
 
 ## 6. Questions for the product owner
 
