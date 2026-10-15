@@ -560,7 +560,7 @@ async fn arming_a_backfill_records_one_epoch_stall_backfill_armed_row() {
 /// syncs, that traffic arrives as duplicates, so live detection never counts
 /// it (mdk#2257). The next `Advance` open must rebuild the evidence from the
 /// retained deferred rows and arm.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn undecryptable_traffic_ingested_only_while_frozen_arms_on_the_next_advance_open() {
     let dir_bob = tempfile::tempdir().unwrap();
     let dir_alice = tempfile::tempdir().unwrap();
