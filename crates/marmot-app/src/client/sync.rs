@@ -3982,8 +3982,9 @@ impl AppClient {
     /// detection never sees them. A device woken mostly by notifications then
     /// arms only when one app session happens to see enough live traffic
     /// (mdk#2257). This feeds the rows retained at each group's current epoch
-    /// through the same detector and filters instead. It changes no durable
-    /// state unless the detector arms.
+    /// through the same detector and filters instead, for groups the detector
+    /// has not already signalled at that epoch. It changes no durable state
+    /// unless the detector arms.
     pub(crate) fn seed_epoch_stall_from_deferred_rows(&mut self) {
         if self.app.cursor_persistence() != CursorPersistence::Advance {
             return;
@@ -4000,7 +4001,13 @@ impl AppClient {
             let Ok(evidence) = self.runtime.deferred_stall_evidence(&group_id, limit) else {
                 continue;
             };
-            if evidence.rows.is_empty() {
+            // Retained rows supply only the first arm. Once this group has
+            // signalled at the evidence epoch, here or in the durable state
+            // restored before hydration, rows replayed on every later open are
+            // not fresh traffic and must not pace re-arms or end the run.
+            if evidence.rows.is_empty()
+                || self.epoch_stall.has_signalled_at(&group_id, evidence.epoch)
+            {
                 continue;
             }
             let outcome = IngestOutcome::TransportDeferred {
