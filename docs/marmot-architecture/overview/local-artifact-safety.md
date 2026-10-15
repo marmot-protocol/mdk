@@ -90,15 +90,22 @@ there is killed with `RUNNINGBOARD 0xdead10cc`. Two artifacts hold such a lock b
 - the root runtime lease (`.marmot-runtime.lock`), an advisory lock held for as long as any app/runtime handle lives.
 
 So a host needs an operation that ends those at a known instant and can be awaited. Dropping handles is not that
-operation: the databases live behind `Arc`s reachable from the engine, the OpenMLS adapter, and app projections at
-once, so no host can observe or await the last clone going away, and `shutdown()` takes `&self` and therefore cannot
-drop anything.
+operation: a connection lives behind `Arc`s shared with the OpenMLS adapter and app projections, so no host can
+observe or await the last clone going away, and `shutdown()` takes `&self` and therefore cannot drop anything. Nor
+does any one cache hold every connection: each account has two connections to `session.sqlite`, the app's cached one
+and the one its engine opens for itself.
 
 **The rules:**
 
 - **Close, don't drop.** Every long-lived SQLite handle is built on `storage_sqlite::CloseableConnection`, which takes
   the connection out of its slot, checkpoints (`PRAGMA wal_checkpoint(TRUNCATE)`), and closes it. Surviving clones then
   fail with `StorageError::Closed` rather than panicking or keeping the file locked.
+- **Register, don't cache.** Every resource that can hold a lock in the root registers a closer with the app when it
+  opens, under the same storage-open admission the close takes exclusively, so an open either registers before the
+  close drains the list or refuses. `MarmotApp::close_storage` closes that list, not the handle caches. A closer
+  (`storage_sqlite::DatabaseCloser`) holds only a weak reference, so an owner that drops its last handle still releases
+  the lock then. This is how the close reaches each account engine's own connection while its worker is still running
+  or its open is still in flight.
 - **Closing is terminal, and nothing reopens.** `MarmotApp::close_storage` latches, and every database accessor
   refuses afterwards. A late background read that transparently reopened would re-lock the container the host was just
   told is clear — the exact failure the close exists to prevent. Hosts construct a fresh runtime on resume.

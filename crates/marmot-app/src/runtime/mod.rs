@@ -6089,22 +6089,25 @@ impl MarmotAppRuntime {
     ///
     /// This is the operation a host needs before its process can be suspended.
     /// [`Self::shutdown`] alone is not enough: it stops workers but takes
-    /// `&self`, so it cannot drop anything, and the databases live behind
-    /// `Arc`s shared by the engine, the OpenMLS adapter, and app projections.
-    /// A WAL connection holds a lock on its `-shm` sidecar for its entire
-    /// lifetime, so "the workers stopped" and "the store is unlocked" are
-    /// different facts, and only the second one keeps an iOS app alive across
-    /// suspension (`0xdead10cc`, raised for holding a lock in a shared App
-    /// Group container).
+    /// `&self`, so it cannot drop anything. Each account has two connections
+    /// to `session.sqlite`, the app's cached one and the one its engine opened,
+    /// and each lives behind `Arc`s shared with the OpenMLS adapter and its
+    /// other users. A WAL connection holds a lock on its `-shm` sidecar for its
+    /// entire lifetime, so "the workers stopped" and "the store is unlocked"
+    /// are different facts, and only the second one keeps an iOS app alive
+    /// across suspension (`0xdead10cc`, raised for holding a lock in a shared
+    /// App Group container).
     ///
     /// Ordering is the point of this method: the lifecycle stop latch closes
     /// admission first, then storage closure takes priority over graceful
     /// draining. This is deliberately different from [`Self::shutdown`]. A
     /// host suspension deadline cannot safely sit behind directory, worker,
     /// relay, or audit cleanup that may be awaiting network or task progress.
-    /// SQLite completes the statement holding a connection guard and rolls an
-    /// uncommitted transaction back on close; later work sees `Closed` and
-    /// cannot reopen storage.
+    /// Storage closure closes every connection, the engines' included, while a
+    /// worker or an account open may still hold one. SQLite completes the
+    /// statement holding a connection guard and rolls an uncommitted
+    /// transaction back on close; later work sees `Closed` and cannot reopen
+    /// storage.
     ///
     /// **Terminal.** This runtime and the [`MarmotApp`] it came from are done:
     /// every later database access fails with
