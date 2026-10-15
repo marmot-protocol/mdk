@@ -8,11 +8,10 @@ description = "SQLite storage backend for the CGKA engine with Marmot and OpenML
 
 [dependencies]
 cgka-traits.workspace = true
-chacha20poly1305.workspace = true
 fs-private.workspace = true
 hex.workspace = true
 hkdf.workspace = true
-libc = { workspace = true, optional = true }
+libc.workspace = true
 openmls.workspace = true
 openmls_traits.workspace = true
 openssl.workspace = true
@@ -35,7 +34,7 @@ extensions-draft = ["openmls_traits/extensions-draft"]
 storage-format-benchmarks = []
 # Media file store benchmark (mdk#2314 step 0): `media_store::bench` and the
 # `media_store_bench` example, run on desktop and on devices.
-media-store-benchmarks = ["dep:libc"]
+media-store-benchmarks = []
 test-conformance-replay = []
 # Copy in-memory test databases from one migrated template per process.
 test-migrated-template = ["rusqlite/backup"]
@@ -50,8 +49,3 @@ test-support = []
 [[example]]
 name = "media_store_bench"
 required-features = ["media-store-benchmarks"]
-
-[lints.rust]
-# `chacha20_force_neon` selects RustCrypto's aarch64 NEON backend; the
-# benchmark reports whether a build set it.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(chacha20_force_neon)"] }

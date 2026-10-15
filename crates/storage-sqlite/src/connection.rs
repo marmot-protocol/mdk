@@ -925,6 +925,8 @@ pub struct SqliteAccountStorage {
     migration_duration: Duration,
     pub(crate) connection: SharedConnection,
     pub(crate) openmls: SqliteOpenMlsStorage,
+    /// In-flight media publishes and the media sweep cursor, shared by clones.
+    pub(crate) media: Arc<crate::media_store::MediaStoreShared>,
 }
 
 #[deprecated(
@@ -1161,6 +1163,7 @@ impl SqliteAccountStorage {
             connection,
             openmls,
             draft_commit_observer: Default::default(),
+            media: Default::default(),
             migrations_applied,
             migration_duration,
         })

@@ -21,11 +21,13 @@
 //! the code that seals local files. Segments cannot be reordered, dropped or
 //! truncated undetected; a single segment can be authenticated on its own,
 //! which is what makes offset reads cheap.
+//!
+//! Segments are sealed with OpenSSL's EVP ChaCha20-Poly1305, which has ARMv8
+//! and x86 assembly. The mdk#2314 step 0 benchmark measured it at two to
+//! three times the speed of RustCrypto's `chacha20poly1305` on phones.
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
-use chacha20poly1305::aead::{AeadInPlace, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
 use hkdf::Hkdf;
 use openssl::cipher::Cipher;
 use openssl::cipher_ctx::CipherCtx;
@@ -63,7 +65,7 @@ pub enum MediaFormatError {
     InvalidLength,
     #[error("media file segment failed authentication")]
     Authentication,
-    #[error("media file cipher backend failed")]
+    #[error("media file cipher failed")]
     Backend,
 }
 
@@ -77,27 +79,6 @@ impl From<MediaFormatError> for io::Error {
 }
 
 pub type MediaFormatResult<T> = Result<T, MediaFormatError>;
-
-/// ChaCha20-Poly1305 implementation. Both produce identical bytes; they differ
-/// only in speed per platform, which the step-0 benchmark measures.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CipherBackend {
-    /// RustCrypto `chacha20poly1305`.
-    RustCrypto,
-    /// OpenSSL's EVP ChaCha20-Poly1305, which has ARMv8 and x86 assembly.
-    OpenSsl,
-}
-
-impl CipherBackend {
-    pub const ALL: [Self; 2] = [Self::RustCrypto, Self::OpenSsl];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::RustCrypto => "rustcrypto",
-            Self::OpenSsl => "openssl",
-        }
-    }
-}
 
 /// The random key stored in a media file's database row.
 pub struct FileKey(Zeroizing<[u8; FILE_KEY_BYTES]>);
@@ -160,24 +141,17 @@ fn segment_nonce(index: u64, last: bool) -> [u8; 12] {
     nonce
 }
 
-enum SegmentCipher {
-    RustCrypto(Box<ChaCha20Poly1305>),
-    OpenSsl {
-        key: Zeroizing<[u8; 32]>,
-        context: CipherCtx,
-    },
+/// One OpenSSL context per reader or writer, reinitialized per segment.
+struct SegmentCipher {
+    key: Zeroizing<[u8; 32]>,
+    context: CipherCtx,
 }
 
 impl SegmentCipher {
-    fn new(key: &PayloadKey, backend: CipherBackend) -> MediaFormatResult<Self> {
-        Ok(match backend {
-            CipherBackend::RustCrypto => Self::RustCrypto(Box::new(ChaCha20Poly1305::new(
-                Key::from_slice(key.0.as_ref()),
-            ))),
-            CipherBackend::OpenSsl => Self::OpenSsl {
-                key: key.0.clone(),
-                context: CipherCtx::new().map_err(|_| MediaFormatError::Backend)?,
-            },
+    fn new(key: &PayloadKey) -> MediaFormatResult<Self> {
+        Ok(Self {
+            key: key.0.clone(),
+            context: CipherCtx::new().map_err(|_| MediaFormatError::Backend)?,
         })
     }
 
@@ -189,26 +163,18 @@ impl SegmentCipher {
         segment: &mut [u8],
     ) -> MediaFormatResult<[u8; TAG_BYTES]> {
         let nonce = segment_nonce(index, last);
-        match self {
-            Self::RustCrypto(cipher) => cipher
-                .encrypt_in_place_detached(Nonce::from_slice(&nonce), &[], segment)
-                .map(Into::into)
-                .map_err(|_| MediaFormatError::Backend),
-            Self::OpenSsl { key, context } => {
-                let mut tag = [0; TAG_BYTES];
-                context
-                    .encrypt_init(
-                        Some(Cipher::chacha20_poly1305()),
-                        Some(key.as_ref()),
-                        Some(&nonce),
-                    )
-                    .and_then(|()| context.cipher_update_inplace(segment, segment.len()))
-                    .and_then(|_| context.cipher_final(&mut []))
-                    .and_then(|_| context.tag(&mut tag))
-                    .map_err(|_| MediaFormatError::Backend)?;
-                Ok(tag)
-            }
-        }
+        let mut tag = [0; TAG_BYTES];
+        self.context
+            .encrypt_init(
+                Some(Cipher::chacha20_poly1305()),
+                Some(self.key.as_ref()),
+                Some(&nonce),
+            )
+            .and_then(|()| self.context.cipher_update_inplace(segment, segment.len()))
+            .and_then(|_| self.context.cipher_final(&mut []))
+            .and_then(|_| self.context.tag(&mut tag))
+            .map_err(|_| MediaFormatError::Backend)?;
+        Ok(tag)
     }
 
     /// Decrypts `segment` in place, or fails without exposing plaintext.
@@ -220,31 +186,22 @@ impl SegmentCipher {
         tag: &[u8],
     ) -> MediaFormatResult<()> {
         let nonce = segment_nonce(index, last);
-        let result = match self {
-            Self::RustCrypto(cipher) => cipher
-                .decrypt_in_place_detached(
-                    Nonce::from_slice(&nonce),
-                    &[],
-                    segment,
-                    Tag::from_slice(tag),
-                )
-                .map_err(|_| MediaFormatError::Authentication),
-            Self::OpenSsl { key, context } => context
-                .decrypt_init(
-                    Some(Cipher::chacha20_poly1305()),
-                    Some(key.as_ref()),
-                    Some(&nonce),
-                )
-                .and_then(|()| context.set_tag(tag))
-                .and_then(|()| context.cipher_update_inplace(segment, segment.len()))
-                .map_err(|_| MediaFormatError::Backend)
-                .and_then(|_| {
-                    context
-                        .cipher_final(&mut [])
-                        .map_err(|_| MediaFormatError::Authentication)
-                })
-                .map(|_| ()),
-        };
+        let result = self
+            .context
+            .decrypt_init(
+                Some(Cipher::chacha20_poly1305()),
+                Some(self.key.as_ref()),
+                Some(&nonce),
+            )
+            .and_then(|()| self.context.set_tag(tag))
+            .and_then(|()| self.context.cipher_update_inplace(segment, segment.len()))
+            .map_err(|_| MediaFormatError::Backend)
+            .and_then(|_| {
+                self.context
+                    .cipher_final(&mut [])
+                    .map_err(|_| MediaFormatError::Authentication)
+            })
+            .map(|_| ());
         if result.is_err() {
             // OpenSSL decrypts before it checks the tag; never leave
             // unauthenticated plaintext in the caller's buffer.
@@ -310,21 +267,16 @@ impl<W: Write> MediaFileWriter<W> {
         mut inner: W,
         file_key: &FileKey,
         file_id: &[u8; FILE_ID_BYTES],
-        backend: CipherBackend,
     ) -> MediaFormatResult<Self> {
         let header = header_bytes(file_id);
         inner.write_all(&header)?;
-        Self::with_payload_key(inner, &PayloadKey::for_file(file_key, &header), backend)
+        Self::with_payload_key(inner, &PayloadKey::for_file(file_key, &header))
     }
 
-    pub(crate) fn with_payload_key(
-        inner: W,
-        key: &PayloadKey,
-        backend: CipherBackend,
-    ) -> MediaFormatResult<Self> {
+    pub(crate) fn with_payload_key(inner: W, key: &PayloadKey) -> MediaFormatResult<Self> {
         Ok(Self {
             inner,
-            cipher: SegmentCipher::new(key, backend)?,
+            cipher: SegmentCipher::new(key)?,
             index: 0,
             buffer: Vec::with_capacity(SEGMENT_CIPHERTEXT_BYTES),
             plaintext_bytes: 0,
@@ -398,7 +350,6 @@ impl<R: Read + Seek> MediaFileReader<R> {
         mut inner: R,
         file_key: &FileKey,
         expected_id: &[u8; FILE_ID_BYTES],
-        backend: CipherBackend,
     ) -> MediaFormatResult<Self> {
         let mut header = [0; HEADER_BYTES];
         inner.seek(SeekFrom::Start(0))?;
@@ -416,7 +367,6 @@ impl<R: Read + Seek> MediaFileReader<R> {
             &PayloadKey::for_file(file_key, &header),
             HEADER_BYTES as u64,
             total - HEADER_BYTES as u64,
-            backend,
         )
     }
 
@@ -425,11 +375,10 @@ impl<R: Read + Seek> MediaFileReader<R> {
         key: &PayloadKey,
         payload_start: u64,
         payload_bytes: u64,
-        backend: CipherBackend,
     ) -> MediaFormatResult<Self> {
         Ok(Self {
             inner,
-            cipher: SegmentCipher::new(key, backend)?,
+            cipher: SegmentCipher::new(key)?,
             payload_start,
             layout: PayloadLayout::from_payload_bytes(payload_bytes)?,
             segment: Zeroizing::new(Vec::with_capacity(SEGMENT_CIPHERTEXT_BYTES)),
@@ -497,18 +446,9 @@ impl<R: Read + Seek> Read for MediaFileReader<R> {
 
 /// Decrypts a whole age payload held in memory.
 #[cfg(test)]
-pub(crate) fn open_payload(
-    key: &PayloadKey,
-    payload: &[u8],
-    backend: CipherBackend,
-) -> MediaFormatResult<Vec<u8>> {
-    let mut reader = MediaFileReader::with_payload_key(
-        io::Cursor::new(payload),
-        key,
-        0,
-        payload.len() as u64,
-        backend,
-    )?;
+pub(crate) fn open_payload(key: &PayloadKey, payload: &[u8]) -> MediaFormatResult<Vec<u8>> {
+    let mut reader =
+        MediaFileReader::with_payload_key(io::Cursor::new(payload), key, 0, payload.len() as u64)?;
     let mut plaintext = vec![0; reader.plaintext_bytes() as usize];
     let read = reader.read_at(0, &mut plaintext)?;
     debug_assert_eq!(read, plaintext.len());

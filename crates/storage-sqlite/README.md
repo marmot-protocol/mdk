@@ -27,8 +27,9 @@ group snapshots and rollback must be atomic across Marmot records and group-scop
 - App-facing projections and account state: account event projection, chat list (including avatar URLs), the
   materialized timeline and conversation opening, message drafts, attachments, avatar cache, encrypted-media secrets,
   account recovery, delivery spill, transport reconciliation, user blocks, and more.
-- `media_store/` — the encrypted per-file media store that retained attachment bodies move to (mdk#2314). It holds
-  only the file format so far: nothing in the runtime writes it yet.
+- `media_store/` — the encrypted per-file media store that retained attachment bodies move to (mdk#2314): the file
+  format and `MediaFileStore`, which keeps each file's random key and state in `media_files` and its body in
+  `<account>/media/<shard>/<id>`. Nothing in the runtime writes it yet.
 - `shared.rs` — `SqliteSharedStorage`, a separate, non-account-scoped database for cross-identity state: the
   public-directory user cache and presentation, relay-telemetry, usage-diagnostics and audit-log settings, and the
   telemetry install id.
@@ -234,7 +235,7 @@ just bench-media-store       # media file format vs the SQLCipher retained-attac
 ```
 
 **Media store benchmark** (`media-store-benchmarks` feature, `examples/media_store_bench.rs`): for 64 KiB, 1 MiB and
-100 MiB bodies it times the file format in memory per cipher backend, writing and reading private files, and today's
+100 MiB bodies it times the file format in memory, writing and reading private files, and today's
 SQLCipher import (`complete_attachment_acquisition_from_reader`) and `read_retained_attachment`, and prints
 `MDK_BENCH media_store ...` lines. `MDK_MEDIA_BENCH_SIZES`, `MDK_MEDIA_BENCH_ITERATIONS` and `MDK_MEDIA_BENCH_DIR`
 override the defaults. The example cross-compiles for Android (`adb push`, run from `/data/local/tmp`), and

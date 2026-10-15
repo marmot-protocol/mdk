@@ -40,8 +40,9 @@ not "fix" it into the per-account database.
 | `src/attachment_acquisition/access.rs` | Read-only source-bound retained-asset lookup and opaque reference encoding; no demand registration. |
 | `src/attachment_acquisition/controls.rs` | Durable user intent and coalesced transfer metadata in the job store. |
 | `src/attachment_acquisition/partial.rs` | Attempt-fenced SQLCipher ciphertext checkpoints, combined retained/partial byte accounting, bounded writes and abandoned-partial cleanup. |
-| `src/media_store.rs`, `src/media_store/format.rs` | Encrypted per-file media store (mdk#2314). Today only the file format: header plus the age v1 payload (HKDF-SHA256 key salted with the header, 64 KiB ChaCha20-Poly1305 segments), two interchangeable cipher backends, and offset reads. No runtime caller yet. |
-| `src/media_store/format_tests.rs`, `src/media_store/testdata/age/` | Format tests, including the vendored C2SP CCTV age vectors whose outcome depends only on the payload; keep both backends byte-identical. |
+| `src/media_store.rs`, `src/media_store/format.rs` | Encrypted per-file media store (mdk#2314). The file format: a header plus the age v1 payload (HKDF-SHA256 key salted with the header, 64 KiB OpenSSL ChaCha20-Poly1305 segments), with offset reads. |
+| `src/media_store/store.rs` | `MediaFileStore`: `media_files`/`media_file_refs` rows (migration 0110), intent-first publish (row, file, one sync, `ready` commit), digest dedup, key-first deletion, lost marking and the bounded sweep. No runtime caller yet. |
+| `src/media_store/format_tests.rs`, `src/media_store/store_tests.rs`, `src/media_store/testdata/age/` | Format tests against the vendored C2SP CCTV age payload vectors; store tests for every crash state, races, reset and terminal close. |
 | `src/media_store/bench.rs`, `examples/media_store_bench.rs` | `media-store-benchmarks` feature: file format against the SQLCipher retained path, runnable on devices. |
 | `src/attachment_history.rs` | Bounded canonical attachment-slot discovery and per-group revision-fenced cursors; source/visibility triggers maintain the derived index. |
 | `src/timeline.rs` | Materialized message-timeline aggregation; `timeline/` holds capture, edits, opening (`conversation_open` / `conversation_window`), presentation, and reports. |
@@ -62,6 +63,10 @@ not "fix" it into the per-account database.
 - Build every long-lived connection on `CloseableConnection` so a host can release the database's file locks at a known
   instant. Closing is terminal: surviving clones return `StorageError::Closed`, and nothing reopens implicitly. See
   `docs/marmot-architecture/overview/local-artifact-safety.md`.
+- Media files take no locks and follow the intent-first order: a `pending` `media_files` row commits before its file
+  exists, the file syncs once (plain `fsync` on Apple), and only then does a transaction mark it `ready`. Delete the
+  row (key) before unlinking. The sweep decides from the database alone; never adopt a file whose row is `pending`. See
+  `docs/marmot-architecture/overview/local-artifact-safety.md#encrypted-media-files`.
 - Retained-anchor policy is engine/group policy. SQLite stores snapshots and policy bytes; the engine decides when to
   prune.
 - Follow `docs/marmot-architecture/storage-format-v2.md`: numbered schema migrations gate database compatibility;

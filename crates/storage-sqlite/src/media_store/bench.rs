@@ -3,8 +3,8 @@
 //!
 //! Every row is one `MDK_BENCH media_store ...` line. Rows per body size:
 //!
-//! - `seal` / `open`: the format in memory, per cipher backend. This isolates
-//!   the cipher from storage.
+//! - `seal` / `open`: the format in memory. This isolates the cipher from
+//!   storage.
 //! - `file_write`: plaintext from memory in 1 MiB host writes, sealed into a
 //!   private temp file, `sync_all`, renamed, then the directory synced. On
 //!   Apple platforms `sync_all` is `F_FULLFSYNC`, which SQLite does not use by
@@ -37,14 +37,14 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-use super::format::{
-    CipherBackend, FILE_ID_BYTES, FILE_KEY_BYTES, FileKey, MediaFileReader, MediaFileWriter,
-};
+use super::format::{FILE_ID_BYTES, FILE_KEY_BYTES, FileKey, MediaFileReader, MediaFileWriter};
 use crate::{
     AttachmentAssetRef, AttachmentDemand, AttachmentHistoryEntry, AttachmentPublishResult,
     MAX_ATTACHMENT_LOCAL_READ_BYTES, SqlCipherKey, SqliteAccountStorage, StoredAppEvent,
 };
 
+/// Row label for the file format's cipher.
+const BACKEND: &str = "openssl";
 const WINDOW: usize = MAX_ATTACHMENT_LOCAL_READ_BYTES;
 const GROUP: &str = "abababababababababababababababab";
 const NOW: u64 = 1_000;
@@ -60,7 +60,6 @@ pub struct MediaStoreBenchConfig {
     pub iterations: usize,
     /// Timed repetitions per row for bodies of 32 MiB or more.
     pub large_iterations: usize,
-    pub backends: Vec<CipherBackend>,
 }
 
 impl Default for MediaStoreBenchConfig {
@@ -69,7 +68,6 @@ impl Default for MediaStoreBenchConfig {
             sizes: vec![64 * 1024, 1024 * 1024, 100 * 1024 * 1024],
             iterations: 7,
             large_iterations: 3,
-            backends: CipherBackend::ALL.to_vec(),
         }
     }
 }
@@ -83,10 +81,9 @@ pub fn run_media_store_benchmark(
 ) -> Result<(), String> {
     fs_private::create_dir_all_private(dir).map_err(error)?;
     emit(format!(
-        "MDK_BENCH media_store_env arch={} os={} rustcrypto_neon={} segment_bytes={}",
+        "MDK_BENCH media_store_env arch={} os={} segment_bytes={}",
         std::env::consts::ARCH,
         std::env::consts::OS,
-        cfg!(chacha20_force_neon),
         super::format::SEGMENT_PLAINTEXT_BYTES,
     ));
     for &size in &config.sizes {
@@ -97,10 +94,8 @@ pub fn run_media_store_benchmark(
         }
         .max(1);
         let body = body(size);
-        for &backend in &config.backends {
-            format_rows(&body, backend, iterations, emit)?;
-            file_rows(dir, &body, backend, iterations, emit)?;
-        }
+        format_rows(&body, iterations, emit)?;
+        file_rows(dir, &body, iterations, emit)?;
         sqlcipher_rows(dir, &body, iterations, emit)?;
     }
     Ok(())
@@ -159,12 +154,7 @@ fn timed<T>(f: impl FnOnce() -> Result<T, String>) -> Result<(Duration, T), Stri
     Ok((started.elapsed(), value))
 }
 
-fn format_rows(
-    body: &[u8],
-    backend: CipherBackend,
-    iterations: usize,
-    emit: &mut dyn FnMut(String),
-) -> Result<(), String> {
+fn format_rows(body: &[u8], iterations: usize, emit: &mut dyn FnMut(String)) -> Result<(), String> {
     let id = file_id(0);
     let mut seal = Vec::new();
     let mut open = Vec::new();
@@ -174,7 +164,6 @@ fn format_rows(
                 Vec::with_capacity(body.len() + body.len() / 4096 + 64),
                 &key(),
                 &id,
-                backend,
             )
             .map_err(error)?;
             writer.write_all(body).map_err(error)?;
@@ -187,7 +176,7 @@ fn format_rows(
         let mut plaintext = vec![0; body.len()];
         let (elapsed, ()) = timed(|| {
             let mut reader =
-                MediaFileReader::open(Cursor::new(&sealed), &key(), &id, backend).map_err(error)?;
+                MediaFileReader::open(Cursor::new(&sealed), &key(), &id).map_err(error)?;
             reader.read_at(0, &mut plaintext).map_err(error)?;
             Ok(())
         })?;
@@ -198,18 +187,14 @@ fn format_rows(
             open.push(elapsed);
         }
     }
-    row("seal", backend.name(), body.len(), &mut seal, emit);
-    row("open", backend.name(), body.len(), &mut open, emit);
+    row("seal", BACKEND, body.len(), &mut seal, emit);
+    row("open", BACKEND, body.len(), &mut open, emit);
     Ok(())
 }
 
-fn read_whole_file(
-    path: &Path,
-    id: &[u8; FILE_ID_BYTES],
-    backend: CipherBackend,
-) -> Result<u64, String> {
-    let mut reader = MediaFileReader::open(File::open(path).map_err(error)?, &key(), id, backend)
-        .map_err(error)?;
+fn read_whole_file(path: &Path, id: &[u8; FILE_ID_BYTES]) -> Result<u64, String> {
+    let mut reader =
+        MediaFileReader::open(File::open(path).map_err(error)?, &key(), id).map_err(error)?;
     let mut window = vec![0; WINDOW];
     let mut offset = 0;
     loop {
@@ -286,7 +271,6 @@ const WRITE_MODES: &[WriteMode] = &[
 fn file_rows(
     dir: &Path,
     body: &[u8],
-    backend: CipherBackend,
     iterations: usize,
     emit: &mut dyn FnMut(String),
 ) -> Result<(), String> {
@@ -303,7 +287,7 @@ fn file_rows(
             let (elapsed, ()) = timed(|| {
                 let target = if mode.rename { &temp_path } else { &final_path };
                 let file = fs_private::create_new_private(target).map_err(error)?;
-                let mut writer = MediaFileWriter::new(file, &key(), &id, backend).map_err(error)?;
+                let mut writer = MediaFileWriter::new(file, &key(), &id).map_err(error)?;
                 for chunk in body.chunks(WINDOW) {
                     writer.write_all(chunk).map_err(error)?;
                 }
@@ -318,15 +302,14 @@ fn file_rows(
                 write.push(elapsed);
             }
             if mode == WRITE_MODES[0] {
-                let (elapsed, len) = timed(|| read_whole_file(&final_path, &id, backend))?;
+                let (elapsed, len) = timed(|| read_whole_file(&final_path, &id))?;
                 if len != body.len() as u64 {
                     return Err("file read length mismatch".into());
                 }
                 let mut window = vec![0; WINDOW.min(body.len()).max(1)];
                 let (first_elapsed, ()) = timed(|| {
                     let file = File::open(&final_path).map_err(error)?;
-                    let mut reader =
-                        MediaFileReader::open(file, &key(), &id, backend).map_err(error)?;
+                    let mut reader = MediaFileReader::open(file, &key(), &id).map_err(error)?;
                     reader.read_at(0, &mut window).map_err(error)?;
                     Ok(())
                 })?;
@@ -337,23 +320,17 @@ fn file_rows(
                     let on_disk = std::fs::metadata(&final_path).map_err(error)?.len();
                     emit(format!(
                         "MDK_BENCH media_store_footprint layout=file backend={} bytes={} disk_bytes={on_disk}",
-                        backend.name(),
+                        BACKEND,
                         body.len()
                     ));
                 }
             }
             std::fs::remove_file(&final_path).map_err(error)?;
         }
-        row(mode.case, backend.name(), body.len(), &mut write, emit);
+        row(mode.case, BACKEND, body.len(), &mut write, emit);
     }
-    row("file_read", backend.name(), body.len(), &mut read, emit);
-    row(
-        "file_first_read",
-        backend.name(),
-        body.len(),
-        &mut first,
-        emit,
-    );
+    row("file_read", BACKEND, body.len(), &mut read, emit);
+    row("file_first_read", BACKEND, body.len(), &mut first, emit);
     Ok(())
 }
 
