@@ -13,6 +13,8 @@ these helpers is
 
 - Creates files with `O_CREAT` at the target mode (no post-create chmod on reachable paths): `write_private`,
   `create_new_private`, `open_private_append`, `ensure_private_file`, `ensure_private_db_files`.
+- Prepares SQLite databases without disturbing live connections (`ensure_private_db_files`): it never opens an
+  existing database or sidecar, because closing that descriptor would drop the connection's POSIX locks.
 - Creates directories atomically at mode `0700` (`create_dir_all_private`), and prepares directory paths
   descriptor-relatively without following symlinks (`prepare_directory_path`).
 - Acquires nonblocking, kernel-released exclusive leases on private lock files
