@@ -153,6 +153,7 @@ fn round_trips_at_segment_boundaries() {
     ] {
         let body = plaintext(len);
         let file = seal(&body);
+        assert_eq!(file.len() as u64, file_bytes(len as u64), "{len}");
         let segments = len.div_ceil(SEGMENT).max(1);
         assert_eq!(
             file.len(),

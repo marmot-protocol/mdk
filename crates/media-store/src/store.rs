@@ -37,11 +37,13 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::catalog::{
-    Category, ExistingOutcome, FileId, FileState, MediaCatalog, NewFile, PublishTarget,
-    ReadyOutcome,
+    CatalogError, CatalogResult, Category, ExistingOutcome, FileId, FilePresence, FileState,
+    MediaCatalog, NewFile, PublishTarget, ReadyOutcome,
 };
 use crate::error::{MediaError, MediaResult, io_error};
-use crate::format::{FILE_ID_BYTES, FILE_KEY_BYTES, FileKey, MediaFileReader, MediaFileWriter};
+use crate::format::{
+    FILE_ID_BYTES, FILE_KEY_BYTES, FileKey, MediaFileReader, MediaFileWriter, file_bytes,
+};
 
 const COPY_CHUNK_BYTES: usize = 1024 * 1024;
 /// Open readers kept for sequential offset reads (`read_attachment_asset`
@@ -84,10 +86,11 @@ struct SweepCursor {
     /// Last row id checked in the current pass.
     row: Option<FileId>,
     rows_done: bool,
-    /// Next shard directory to list.
+    /// Shard directory being listed.
     shard: u16,
-    /// Last file name checked in that shard, when it needs more batches.
-    name: Option<String>,
+    /// Its open listing, kept across batches so each entry is visited once
+    /// per pass. Holds a directory handle, not a lock; close drops it.
+    entries: Option<std::fs::ReadDir>,
 }
 
 struct CachedReader {
@@ -117,6 +120,27 @@ impl<C: MediaCatalog> Inner<C> {
             return Err(MediaError::Closed);
         }
         Ok(())
+    }
+
+    /// Drops a cached reader (and the key it holds) for `id`.
+    fn forget_reader(&self, id: &FileId) {
+        lock(&self.readers).retain(|cached| cached.id != *id);
+    }
+
+    /// A ready file failed verification: it can never be read, so mark its
+    /// row lost (zeroing the key) and drop its cached reader, so reuse stops
+    /// attaching it. I/O and cipher errors are not this: they may pass.
+    fn lose(&self, id: &FileId) {
+        self.forget_reader(id);
+        let _ = self.catalog.mark_lost(*id);
+    }
+
+    /// Marks `id` lost when `result` is a verification failure.
+    fn lose_on_corruption<T>(&self, id: &FileId, result: MediaResult<T>) -> MediaResult<T> {
+        if let Err(MediaError::Corruption(_)) = &result {
+            self.lose(id);
+        }
+        result
     }
 }
 
@@ -217,6 +241,7 @@ impl<C: MediaCatalog> MediaStore<C> {
     pub fn close(&self) {
         self.inner.closed.store(true, Ordering::Release);
         lock(&self.inner.readers).clear();
+        *lock(&self.inner.sweep) = SweepCursor::default();
     }
 
     /// Makes every publication fail as if the disk were full, until reset.
@@ -226,9 +251,8 @@ impl<C: MediaCatalog> MediaStore<C> {
         self.inner.full_disk_for_test.store(full, Ordering::Release);
     }
 
-    /// Drops a cached reader (and the key it holds) for `id`.
     fn forget_reader(&self, id: &FileId) {
-        lock(&self.inner.readers).retain(|cached| cached.id != *id);
+        self.inner.forget_reader(id);
     }
 
     pub fn is_closed(&self) -> bool {
@@ -244,9 +268,27 @@ impl<C: MediaCatalog> MediaStore<C> {
         self.shard_dir(id.0[0]).join(hex::encode(id.0))
     }
 
-    /// One `stat`: the only file I/O a catalog transaction may wait on.
-    fn present(&self, id: FileId) -> bool {
-        std::fs::symlink_metadata(self.path(&id)).is_ok()
+    /// One `stat`: the only file I/O a catalog transaction may wait on. A
+    /// file is present only with the exact length its row implies; a missing
+    /// or wrong-length file is absent (its cached reader dropped first), and
+    /// any other failure is an error that must leave the row untouched.
+    pub(crate) fn present(&self, id: FileId, byte_len: u64) -> CatalogResult<FilePresence> {
+        match std::fs::symlink_metadata(self.path(&id)) {
+            Ok(metadata) if metadata.is_file() && metadata.len() == file_bytes(byte_len) => {
+                Ok(FilePresence::Present)
+            }
+            Ok(_) => {
+                self.forget_reader(&id);
+                Ok(FilePresence::Absent)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.forget_reader(&id);
+                Ok(FilePresence::Absent)
+            }
+            Err(_) => Err(CatalogError::Backend(
+                "media file presence check failed".into(),
+            )),
+        }
     }
 
     pub fn file_state(&self, id: &FileId) -> MediaResult<Option<FileState>> {
@@ -276,7 +318,11 @@ impl<C: MediaCatalog> MediaStore<C> {
             .write_body(&id, &key, body, byte_len, &digest, cancelled)
             .and_then(|()| {
                 self.inner.ensure_open()?;
-                Ok(target.commit_ready(id, category, &digest, &|twin| self.present(twin))?)
+                Ok(
+                    target.commit_ready(id, category, &digest, &|twin, byte_len| {
+                        self.present(twin, byte_len)
+                    })?,
+                )
             });
         match result {
             Ok(ReadyOutcome::Ready) => Ok(PublishOutcome::Published(id)),
@@ -310,7 +356,9 @@ impl<C: MediaCatalog> MediaStore<C> {
             return Ok(Some(PublishOutcome::Superseded));
         }
         Ok(
-            match target.commit_existing(category, digest, &|id| self.present(id))? {
+            match target
+                .commit_existing(category, digest, &|id, byte_len| self.present(id, byte_len))?
+            {
                 ExistingOutcome::Attached(id) => Some(PublishOutcome::Existing(id)),
                 ExistingOutcome::Superseded => Some(PublishOutcome::Superseded),
                 ExistingOutcome::None => None,
@@ -413,6 +461,7 @@ impl<C: MediaCatalog> MediaStore<C> {
     pub fn open_reader(&self, id: &FileId) -> MediaResult<Option<MediaReader<C>>> {
         Ok(self.open_file_reader(id)?.map(|reader| MediaReader {
             inner: self.inner.clone(),
+            id: *id,
             reader,
             position: 0,
         }))
@@ -431,13 +480,18 @@ impl<C: MediaCatalog> MediaStore<C> {
             }
             Err(error) => return Err(io_error(&error)),
         };
-        let reader = MediaFileReader::open(file, &row.key, &id.0)?;
-        if reader.plaintext_bytes() != row.byte_len {
-            return Err(MediaError::Corruption(
-                "media file length differs from its row",
-            ));
-        }
-        Ok(Some(reader))
+        let verified = MediaFileReader::open(file, &row.key, &id.0)
+            .map_err(MediaError::from)
+            .and_then(|reader| {
+                if reader.plaintext_bytes() == row.byte_len {
+                    Ok(reader)
+                } else {
+                    Err(MediaError::Corruption(
+                        "media file length differs from its row",
+                    ))
+                }
+            });
+        self.inner.lose_on_corruption(id, verified).map(Some)
     }
 
     /// Reads plaintext at `offset` into `out`. `None` means no ready file.
@@ -464,7 +518,9 @@ impl<C: MediaCatalog> MediaStore<C> {
                 None => return Ok(None),
             },
         };
-        let read = reader.read_at(offset, out)?;
+        let read = self
+            .inner
+            .lose_on_corruption(id, reader.read_at(offset, out).map_err(MediaError::from))?;
         // Read outside the lock; return the reader only after success.
         let mut readers = lock(&self.inner.readers);
         if !self.inner.is_closed() {
@@ -560,9 +616,9 @@ impl<C: MediaCatalog> MediaStore<C> {
         Ok(())
     }
 
-    /// Checks up to `limit` of this store's file names, resuming inside a
-    /// shard that needs more than one batch. Listing a shard is a directory
-    /// read; catalog lookups and unlinks stay within `limit`.
+    /// Visits up to `limit` directory entries, resuming the open listing of
+    /// a shard across batches: each entry is listed once per pass, and every
+    /// entry visited (foreign names included) counts against `limit`.
     fn sweep_files(
         &self,
         cursor: &mut SweepCursor,
@@ -573,36 +629,37 @@ impl<C: MediaCatalog> MediaStore<C> {
         while cursor.shard <= u8::MAX as u16 && budget > 0 {
             self.inner.ensure_open()?;
             let shard = cursor.shard as u8;
-            let entries = match std::fs::read_dir(self.shard_dir(shard)) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    cursor.shard += 1;
-                    cursor.name = None;
-                    continue;
-                }
-                Err(error) => return Err(io_error(&error)),
-            };
-            // Only names this store creates are its to judge.
-            let mut names = Vec::new();
-            for entry in entries {
-                let entry = entry.map_err(|e| io_error(&e))?;
-                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                    continue;
-                };
-                let ours = FileId::parse_hex(&name).is_some_and(|id| id.0[0] == shard);
-                if ours && cursor.name.as_ref().is_none_or(|after| &name > after) {
-                    names.push(name);
+            if cursor.entries.is_none() {
+                match std::fs::read_dir(self.shard_dir(shard)) {
+                    Ok(entries) => cursor.entries = Some(entries),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        cursor.shard += 1;
+                        continue;
+                    }
+                    Err(error) => return Err(io_error(&error)),
                 }
             }
-            names.sort_unstable();
-            let take = names.len().min(budget);
-            for name in &names[..take] {
-                let Some(id) = FileId::parse_hex(name) else {
-                    continue;
+            let mut exhausted = false;
+            while budget > 0 {
+                let Some(entries) = cursor.entries.as_mut() else {
+                    break;
                 };
+                let Some(entry) = entries.next() else {
+                    exhausted = true;
+                    break;
+                };
+                let entry = entry.map_err(|e| io_error(&e))?;
                 budget -= 1;
                 report.files_checked += 1;
-                cursor.name = Some(name.clone());
+                // Only names this store creates are its to judge.
+                let Some(id) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(FileId::parse_hex)
+                    .filter(|id| id.0[0] == shard)
+                else {
+                    continue;
+                };
                 if self.inner.catalog.file_state(id)?.is_none() {
                     self.forget_reader(&id);
                     if remove_if_present(&self.path(&id)).map_err(|e| io_error(&e))? {
@@ -610,9 +667,9 @@ impl<C: MediaCatalog> MediaStore<C> {
                     }
                 }
             }
-            if take == names.len() {
+            if exhausted {
+                cursor.entries = None;
                 cursor.shard += 1;
-                cursor.name = None;
             }
         }
         if cursor.shard > u8::MAX as u16 {
@@ -627,6 +684,7 @@ impl<C: MediaCatalog> MediaStore<C> {
 /// closes, including reads of a segment it already decrypted.
 pub struct MediaReader<C> {
     inner: Arc<Inner<C>>,
+    id: FileId,
     reader: MediaFileReader<File>,
     position: u64,
 }
@@ -639,7 +697,8 @@ impl<C: MediaCatalog> MediaReader<C> {
     /// Fills `out` from plaintext `offset`; returns 0 at or past the end.
     pub fn read_at(&mut self, offset: u64, out: &mut [u8]) -> MediaResult<usize> {
         self.inner.ensure_open()?;
-        Ok(self.reader.read_at(offset, out)?)
+        let read = self.reader.read_at(offset, out).map_err(MediaError::from);
+        self.inner.lose_on_corruption(&self.id, read)
     }
 }
 

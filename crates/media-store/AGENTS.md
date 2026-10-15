@@ -39,6 +39,12 @@ The encrypted per-file media store (mdk#2314). Human overview: [`README.md`](REA
 - Nothing runs after close, including abandon cleanup; the next process's sweep reclaims what is left. The runtime
   closes the store through `marmot-app`'s close registry, the same one every other closeable handle uses.
 - Inside a catalog transaction the only file I/O is the one `present` check (a single `stat`) for the ready twin.
+  It has three outcomes: `Present` (exact expected length), `Absent` (missing or wrong length: mark lost) and an error,
+  which must roll back and leave the twin's key untouched. Never turn a failed `stat` into "missing".
+- A ready file that fails verification (`Corruption`) is marked lost and its cached reader dropped; `Io` and `Cipher`
+  errors leave it ready, since they may be transient.
+- Sweep batches charge every directory entry they visit and resume the open shard listing, so a pass lists each entry
+  once however the batches split it.
 - `read_at` trusts that the caller authorized the read in the catalog's domain; its reader cache only skips the key
   lookup and file open. Evict a cached reader whenever its file is released, lost or unlinked.
 - Plaintext handoff leases (mdk#2314 step 4) are refused on Windows, which is not a target platform: `fs-private`

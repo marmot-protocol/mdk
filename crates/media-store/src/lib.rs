@@ -21,8 +21,8 @@ pub mod conformance;
 pub mod memory;
 
 pub use catalog::{
-    CatalogError, CatalogResult, Category, ExistingOutcome, FileId, FileState, MediaCatalog,
-    NewFile, Presence, PublishTarget, ReadyFile, ReadyOutcome,
+    CatalogError, CatalogResult, Category, ExistingOutcome, FileId, FilePresence, FileState,
+    MediaCatalog, NewFile, Presence, PublishTarget, ReadyFile, ReadyOutcome,
 };
 pub use error::{MediaError, MediaResult};
 pub use format::FileKey;

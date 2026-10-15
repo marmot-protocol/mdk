@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::catalog::{
-    CatalogError, CatalogResult, Category, ExistingOutcome, FileId, FileState, MediaCatalog,
-    NewFile, Presence, PublishTarget, ReadyFile, ReadyOutcome,
+    CatalogError, CatalogResult, Category, ExistingOutcome, FileId, FilePresence, FileState,
+    MediaCatalog, NewFile, Presence, PublishTarget, ReadyFile, ReadyOutcome,
 };
 
 struct Row {
@@ -27,12 +27,13 @@ struct State {
 }
 
 impl State {
+    /// The ready file with this content other than `except`, and its length.
     fn ready_twin(
         &self,
         category: Category,
         digest: &[u8; 32],
         except: Option<FileId>,
-    ) -> Option<FileId> {
+    ) -> Option<(FileId, u64)> {
         self.rows
             .iter()
             .find(|(id, row)| {
@@ -41,7 +42,7 @@ impl State {
                     && row.category == category
                     && &row.digest == digest
             })
-            .map(|(id, _)| *id)
+            .map(|(id, row)| (*id, row.byte_len))
     }
 
     fn mark_lost(&mut self, id: FileId) -> bool {
@@ -217,10 +218,10 @@ impl PublishTarget for MemoryTarget {
         present: Presence<'_>,
     ) -> CatalogResult<ExistingOutcome> {
         let mut state = self.catalog.state()?;
-        let Some(twin) = state.ready_twin(category, digest, None) else {
+        let Some((twin, byte_len)) = state.ready_twin(category, digest, None) else {
             return Ok(ExistingOutcome::None);
         };
-        if !present(twin) {
+        if present(twin, byte_len)? == FilePresence::Absent {
             state.mark_lost(twin);
             return Ok(ExistingOutcome::None);
         }
@@ -249,8 +250,8 @@ impl PublishTarget for MemoryTarget {
         if state.superseded.contains(&self.slot) {
             return Ok(ReadyOutcome::Superseded);
         }
-        if let Some(twin) = state.ready_twin(category, digest, Some(id)) {
-            if present(twin) {
+        if let Some((twin, byte_len)) = state.ready_twin(category, digest, Some(id)) {
+            if present(twin, byte_len)? == FilePresence::Present {
                 state.rows.remove(&id);
                 state.attach(self.slot, twin);
                 return Ok(ReadyOutcome::Existing(twin));
