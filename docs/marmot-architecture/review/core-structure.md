@@ -53,7 +53,7 @@ the seams that are already nearly separate: the media store (in progress, #2314)
 | Crate | Documented role | Production lines | What it actually holds |
 | --- | --- | ---: | --- |
 | `traits` | Shared engine, storage and transport contracts | 10,136 | The contracts (about 5.5k), plus about 2.6k of app-level types: polls, reporting, app-event UI strings, media and avatar components, agent streams, host safety. Also account-runtime state machines: the `OutboundFanout` transitions and maintenance records. |
-| `cgka-engine` | The CGKA engine: MLS, convergence, capability rules | 37,203 | Protocol core and convergence: about 11.2k, including `openmls_projection.rs`, which is really the replay and apply engine. Also about 30 storage pass-throughs for account records, the app's audit recorder, and product policy (see §2.4). |
+| `cgka-engine` | The CGKA engine: MLS, convergence, capability rules | 37,203 | Mostly the protocol core: convergence and canonicalization (about 11.2k, including `openmls_projection.rs`, which is really the replay and apply engine), group lifecycle and send (about 7.2k), message ingest and peel (about 4.8k), publish lifecycle, deferred peel and hydration. A smaller slice does three other jobs: about 30 storage pass-throughs for account records, the app's audit sink and metrics (about 1.7k), and a few product-policy rules (see §2.4). |
 | `cgka-session` | One encrypted account-device session | 1,687 | About 700 lines of real work (open, hydrate, effect collation) and 119 pass-throughs. Its API leaks engine types, so callers import the engine anyway. |
 | `marmot-account` | Account and session coordinator: publish-before-apply, transport activation | 9,400 | Account identity and files (2.7k), the publish pipeline, a second "legacy" fanout that is the live Welcome path, maintenance, KeyPackage scheduling and a routing implementation the app duplicates |
 | `storage-sqlite` | SQLCipher implementation of `StorageProvider` and OpenMLS storage | 43,707 | Protocol 16%, app projections 33%, attachments and avatars 17%, recovery and transport bookkeeping 12%, product state 11%, infrastructure 7%, shared DB 2% |
@@ -187,9 +187,12 @@ App concerns tunnel down through the session: the draft-commit observer and the 
   - an app moderation rule decides which message kinds need source authority;
   - the join transaction creates a 24-hour post-join maintenance obligation with a relay-EOSE deadline;
   - the engine decodes `NostrRoutingV1` to derive transport routes.
-- **The protocol core itself is sound.** Convergence and canonicalization are about 11.2k of the 37.2k lines, with
-  the matching tests, simulator and formal model. The name `openmls_projection.rs` hides that it is the replay and
-  apply engine.
+- **The protocol core is most of the crate, and it is sound.** Convergence and canonicalization are about 11.2k lines
+  across the convergence modules; the three largest files, `distributed_convergence.rs`, `canonicalization.rs` and
+  `openmls_projection.rs`, are 8,973 lines at the baseline. Group lifecycle and send add about 7.2k, and message ingest
+  and peel about 4.8k. All of it has matching tests, the simulator and the formal model. The three jobs above are a
+  small slice of the 37.2k lines, which makes them cheap to move. The name `openmls_projection.rs` hides that it is the
+  replay and apply engine.
 
 **Evidence (observed):**
 - The storage proxy: `crates/cgka-engine/src/maintenance.rs` (21 `pub fn`) and `engine.rs:865-990`.
@@ -296,8 +299,9 @@ App services: directory   media-store + media transfer   app store   marmot-obse
                     │
 Account:      marmot-device-runtime (session + publish pipeline + maintenance +
                     │                KeyPackage lifecycle + single routing + one Welcome rail)
-              marmot-account (identity, files, secrets)          transport-nostr (adapter + relay plane
-                    │                                             + routing, EOSE/coverage, KeyPackage format)
+              marmot-account (identity, files, secrets)          transport-nostr (relay plane + routing,
+                    │                                             EOSE/coverage, KeyPackage format)
+                    │                                             over transport-nostr-adapter (SDK-free core)
 Protocol:     cgka-engine (protocol core; policy injected)   protocol store (StorageProvider + OpenMLS)
                     │
 Foundation:   cgka-traits (contracts only)   marmot-components (app component and payload types)
@@ -313,7 +317,7 @@ Foundation:   cgka-traits (contracts only)   marmot-components (app component an
 | App store | `storage-sqlite` | Projections, product state and the recovery ledger. Transport-specific bookkeeping moves to `transport-nostr` or the directory. |
 | `marmot-device-runtime` (new) | `cgka-session`, `marmot-account` runtime | One layer that owns the engine and its own account-record store handle: publish pipeline, maintenance, KeyPackage lifecycle, one routing implementation, one Welcome path. It re-exports the config types callers need. |
 | `marmot-account` | itself | Identity, files, secret stores: what the bindings, CLI and agent already use. |
-| `transport-nostr` | `transport-nostr-adapter`, `marmot-app` `relay_plane/` | Adapter plus relay plane, routing derivation, coverage evidence (EOSE and paging), and the KeyPackage event format. This is where Pass 1 E's size handling and coverage surface belong. |
+| `transport-nostr` (new) | `marmot-app` `relay_plane/` | The relay plane, routing derivation, coverage evidence (EOSE and paging), and the KeyPackage event format, built on `transport-nostr-adapter`, which stays its own crate. This is where Pass 1 E's size handling and coverage surface belong. Folding the adapter's SDK client in later is an option, not part of step 2 ([brief](brief-relay-plane.md#decision-a-new-crate-on-top-of-the-adapter)). |
 | `directory` (new) | `marmot-app` `directory/`, relay-plane directory code, previews | Discovery, profiles, KeyPackage lookup and search, with the databases it already owns. |
 | `media-store` and media transfer | #2314; `marmot-app` `media/` | The encrypted file store (in progress), plus Blossom transfer, crypto and resume. |
 | `marmot-observability` (new) | `marmot-app` `relay_telemetry_export`, `product_analytics`, `audit_otlp_sender`, audit upload, `collector_host_safety` | The code that ships diagnostics off the device: relay telemetry over OTLP, Aptabase product analytics, audit-log upload and OTLP delivery, and the collector dial-safety checks. The recording points stay in `marmot-app` and report through one observer interface, replacing the 40 `_unobserved` pairs over time. Decided 2026-10-15: move it as it is first, and generalize later (§2.9). |
@@ -322,7 +326,8 @@ Foundation:   cgka-traits (contracts only)   marmot-components (app component an
 **Dependency rules for the target:**
 - Dependencies point downward only.
 - App services never depend on `marmot-app`.
-- Hosts depend only on `marmot-app` and `marmot-account`.
+- Hosts depend only on `marmot-app` and `marmot-account`. The one existing exception is `marmot-c`, which depends
+  on `transport-nostr-adapter` for its process proxy helper.
 - No storage crate contains transport code.
 - Nothing below `transport-nostr` knows Nostr relay semantics. Nostr identity is the documented exception.
 

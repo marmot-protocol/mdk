@@ -10,7 +10,8 @@ status: proposed, needs approval before implementation
 
 Step 2 of the [core structure plan](core-structure.md#5-sequencing). It moves the relay plane out of `marmot-app` into
 a new `transport-nostr` crate, without changing behaviour. Baseline `b76b5338e`, which includes the multi-thread
-runtime from #2340. Line counts are production code. "(inferred)" marks claims not traced end to end.
+runtime from #2340. Line counts are production code. Following the [review's evidence rules](README.md#evidence-rules),
+statements are observed in source unless marked (hypothesis).
 
 ## Why this seam first
 
@@ -29,8 +30,9 @@ merging into the adapter.
 
 - The relay plane already compiles against the adapter's public API, because it lives in another crate today, so the
   move needs no adapter changes.
-- The adapter keeps an SDK-free core behind its `sdk` feature. `cgka-session`'s tests use that core without the SDK,
-  and `marmot-c` uses only its proxy helper. Merging the relay plane in would bring nostr-sdk into those users.
+- The adapter keeps an SDK-free core behind its `sdk` feature, which `cgka-session`'s test harness uses without the SDK.
+  Merging the relay plane in would make that core carry the whole relay plane. (`marmot-c` depends on the adapter
+  with `sdk` enabled, only for its proxy helper, so it is unaffected either way.)
 - It matches the target map in [core-structure §4](core-structure.md#4-proposed-target-structure).
 
 Folding the adapter's `sdk_client.rs` into `transport-nostr` later, so the adapter becomes SDK-free, is a natural
@@ -58,7 +60,7 @@ follow-up. It is out of scope here.
 | --- | --- |
 | `config::RelayTelemetryExportConfig` (`relay_plane/mod.rs:37`) | Replace it with a one-method export-gate trait that the app's config implements |
 | `directory::DirectorySyncPlan` (`relay_plane/mod.rs:40`) | Move the plain-data struct, and `DirectorySyncBatch`, into the relay plane. The directory already depends on the relay plane, so leaving it would create a cycle. |
-| `network_proxy::nostr_builder` | Call the adapter's `network_proxy::nostr_builder` directly |
+| `network_proxy::nostr_builder` | Call the adapter's `network_proxy::nostr_builder(network_proxy::socks5_proxy())` directly, as `crates/marmot-app/src/network_proxy.rs:17-18` does today. Passing `Ok(None)` would compile but silently drop SOCKS5 routing and the fail-closed path for a bad proxy configuration. |
 | `storage_sqlite::{DeliverySpillDisposition, DeliverySpillLimits}` (`relay_plane/delivery_spill.rs:19`) | Define plane-owned types, and map them in the closure `open_account` builds. No storage crate may depend on the transport crate. |
 
 The relay plane reaches storage only through two closures built in `open_account`: the delivery-loss marker and the
@@ -98,9 +100,13 @@ Each PR is green on its own and changes no behaviour.
    - Call the adapter's proxy builder directly.
    - Turn `telemetry_exporter` into a free constructor.
    - Put the test hooks behind `cfg(any(test, feature = "test-support"))`.
+   - Add the narrow test-support accessors that the eight app-level tests need. Some read private plane fields, for
+     example `notification_lag_with_a_legacy_retained_route_stays_bounded` reads
+     `app.relay_plane.inner.transport.sdk_relay_client` (`relay_plane/tests.rs:5435-5446`). Rewrite those assertions
+     to use the accessors, so PR 2 can move the tests without dropping any.
    - Proof: `relay_plane/` has no production `crate::` or `storage_sqlite::` imports.
 2. **Move the eight tests that build a whole `MarmotApp` or runtime** out of `relay_plane/tests.rs` into the app's
-   tests. Tests only.
+   tests, using the accessors from PR 1. Tests only.
 3. **Create `crates/transport-nostr` and `git mv` the files.**
    - In `marmot-app`, `mod relay_plane { pub use transport_nostr::*; }` keeps every existing path and re-export, so
      the move touches nothing else.
@@ -116,7 +122,9 @@ Each PR is green on its own and changes no behaviour.
 All six must pass on each of PRs 3–6:
 
 1. The moved tests keep their names and pass under `cargo test -p transport-nostr --features test-support`.
-2. `cargo test -p marmot-app` passes for the library, `--test relay_runtime`, and
+2. `cargo test -p marmot-app` passes for the library, `--features test-policy-overrides` (which runs feature-gated
+   relay regressions such as `offline_member_post_join_catch_up_sees_the_commit_made_before_its_join`,
+   `relay_plane/tests.rs:5469-5474`), `--test relay_runtime`, and
    `--features otlp-export --test relay_telemetry_otlp`. `relay_runtime` is flaky on some local machines, so CI is the
    authority for it.
 3. `cargo test -p wn-cli --features test-policy-overrides` passes.
