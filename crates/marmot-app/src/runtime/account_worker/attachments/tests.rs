@@ -8,9 +8,22 @@ fn attachment_capacity_reserves_disk_overhead_and_never_evicts() {
     assert_eq!(p.transfer_limit, 64 * 1024 * 1024);
     // The reserve plus a wire checkpoint and a store file (mdk#2314).
     let free = p.disk_reserve + 2 * p.transfer_limit;
-    assert!(capacity(&p, p.transfer_limit, free));
-    assert!(!capacity(&p, p.transfer_limit, free - 1));
-    assert!(!capacity(&p, u64::MAX, u64::MAX));
+    assert!(capacity(&p, p.transfer_limit, 0, free));
+    assert!(!capacity(&p, p.transfer_limit, 0, free - 1));
+    assert!(!capacity(&p, u64::MAX, 0, u64::MAX));
+    // A saved checkpoint is already on disk: a resumed download needs only
+    // the rest of it plus the store file, never less than the store file.
+    let saved = p.transfer_limit / 2;
+    assert!(capacity(&p, p.transfer_limit, saved, free - saved));
+    assert!(!capacity(&p, p.transfer_limit, saved, free - saved - 1));
+    let floor = p.disk_reserve + p.transfer_limit;
+    assert!(capacity(&p, p.transfer_limit, 2 * p.transfer_limit, floor));
+    assert!(!capacity(
+        &p,
+        p.transfer_limit,
+        2 * p.transfer_limit,
+        floor - 1
+    ));
 }
 
 use crate::tests::ScriptedPushRelayClient;

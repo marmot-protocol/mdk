@@ -641,8 +641,9 @@ impl SqliteAccountStorage {
 
     /// Readmit at most one bounded page of storage-parked jobs whose recorded
     /// headroom now fits below `free` less the policy reserve and a fixed
-    /// margin, provided admission itself (`disk_reserve + 4 * transfer_limit`)
-    /// would pass, so a readmitted row is not bounced back to a timer. The
+    /// margin, provided admission itself (`disk_reserve` plus
+    /// [`media_store::DiskPolicy::download_bytes`] of `transfer_limit`) would
+    /// pass, so a readmitted row is not bounced back to a timer. The
     /// margin keeps measurement noise from flipping a row every tick, and a job
     /// that parked more than once waits out its park streak (15 s doubling to
     /// an hour) before it is due again, so free space that oscillates around a
@@ -657,7 +658,9 @@ impl SqliteAccountStorage {
         transfer_limit: u64,
         automatic: bool,
     ) -> StorageResult<usize> {
-        if free < disk_reserve.saturating_add(transfer_limit.saturating_mul(4)) {
+        if free
+            < disk_reserve.saturating_add(media_store::DiskPolicy::download_bytes(transfer_limit))
+        {
             return Ok(0);
         }
         let Some(headroom) =

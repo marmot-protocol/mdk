@@ -58,7 +58,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (`blossom.rs`, `crypto.rs`, `group_image.rs`, `host_safety.rs`, `avatar.rs` for downloaded avatar admission).
   `media/attachment_resume.rs` adapts attempt-fenced checkpoints (metadata rows in storage, ciphertext in the media
   store's `.wire` files) to the shared safe HTTP path, and admits disk use through `media_store::DiskPolicy` built
-  from the configured reserve;
+  from the configured reserve. Every checkpoint read, write and clear holds the job's `CheckpointLock` from the
+  metadata lookup through the file change, so a cancelled attempt's blocking task cannot touch a newer attempt's file;
   keep Range validation, protected partials and complete-body authentication separate from native progress/access.
   `media/file_transfer.rs` owns file-backed upload preparation: private owner-only snapshots under the account's
   `media-staging/`, streaming EVP ChaCha20-Poly1305 that reproduces the in-memory wire bytes, and the

@@ -119,15 +119,23 @@ fn admit_demands(
 
 /// Admits a download of up to `max` body bytes under the app's
 /// [`media_store::DiskPolicy`]: the reserve plus room for its wire checkpoint
-/// and its store file.
-fn capacity(policy: &storage_sqlite::AttachmentDownloadPolicy, max: u64, free: u64) -> bool {
+/// and its store file, less the `checkpointed` bytes already on disk, and
+/// never less than the store file.
+fn capacity(
+    policy: &storage_sqlite::AttachmentDownloadPolicy,
+    max: u64,
+    checkpointed: u64,
+    free: u64,
+) -> bool {
     let disk = media_store::DiskPolicy {
         reserve_bytes: policy.disk_reserve,
     };
+    let needed = media_store::DiskPolicy::download_bytes(max)
+        .saturating_sub(checkpointed)
+        .max(max);
     max > 0
         && max <= crate::media::MAX_ENCRYPTED_MEDIA_BLOB_BYTES
-        && disk.admit(free, media_store::DiskPolicy::download_bytes(max))
-            == media_store::Admission::Admitted
+        && disk.admit(free, needed) == media_store::Admission::Admitted
 }
 
 async fn cancelled(
@@ -404,7 +412,8 @@ pub(super) fn schedule(
         // automatic-sized object even for explicit work, then enforce actual
         // checkpoint/publication capacity as the transfer grows.
         let reservation = policy.transfer_limit;
-        if !capacity(&policy, reservation, free) {
+        let checkpointed = storage.attachment_checkpoint_bytes(&candidate)?;
+        if !capacity(&policy, reservation, checkpointed, free) {
             storage.finish_attachment_preparation(&candidate, now, Some(now.saturating_add(15)))?;
             continue;
         }
