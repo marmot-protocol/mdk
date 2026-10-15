@@ -11,7 +11,10 @@ use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
 
-use crate::catalog::{Category, FileId, FileState, MediaCatalog, PublishTarget, ReadyOutcome};
+use crate::catalog::{
+    CatalogError, Category, ExistingOutcome, FileId, FileState, MediaCatalog, PublishTarget,
+    ReadyOutcome,
+};
 use crate::format::MediaFileWriter;
 use crate::store::{MediaStore, PublishOutcome};
 
@@ -140,6 +143,8 @@ pub fn run_all<H: Harness>(make: &dyn Fn() -> H) {
     missing_ready_files_become_lost(make());
     reuse_skips_a_twin_whose_file_is_gone(make());
     ready_commit_keeps_its_file_when_the_twin_is_gone(make());
+    a_failed_presence_check_leaves_the_twin_untouched(make());
+    a_torn_twin_is_lost_and_the_new_body_kept(make());
     the_last_reference_releases_the_file(make());
     supersession_during_the_write_keeps_nothing(make());
     reset_during_the_write_keeps_nothing(make());
@@ -312,13 +317,82 @@ pub fn ready_commit_keeps_its_file_when_the_twin_is_gone<H: Harness>(harness: H)
     std::fs::remove_file(store.path(&twin)).unwrap();
     let outcome = harness
         .target(1)
-        .commit_ready(own, Category::Retained, &digest(&content), &|id| {
-            store.path(&id).exists()
+        .commit_ready(own, Category::Retained, &digest(&content), &|id, len| {
+            store.present(id, len)
         })
         .unwrap();
     assert_eq!(outcome, ReadyOutcome::Ready);
     assert_eq!(store.file_state(&twin).unwrap(), Some(FileState::Lost));
     assert_eq!(read_all(&store, &own).unwrap(), content);
+}
+
+/// A presence check that fails (permission, I/O) must never cost the twin its
+/// key: both commits return the error and change nothing.
+pub fn a_failed_presence_check_leaves_the_twin_untouched<H: Harness>(harness: H) {
+    let store = store(&harness);
+    let content = body(2_000, 9);
+    let twin = published(&harness, &store, 0, &content);
+    let failing = |_: FileId, _: u64| Err(CatalogError::Backend("stat failed".into()));
+    assert!(
+        harness
+            .target(1)
+            .commit_existing(Category::Retained, &digest(&content), &failing)
+            .is_err()
+    );
+    let (own, key, _in_flight) = store
+        .insert_pending(
+            Category::Retained,
+            content.len() as u64,
+            &digest(&content),
+            NOW,
+        )
+        .unwrap();
+    store
+        .write_body(
+            &own,
+            &key,
+            &mut Cursor::new(&content),
+            content.len() as u64,
+            &digest(&content),
+            &|| false,
+        )
+        .unwrap();
+    assert!(
+        harness
+            .target(1)
+            .commit_ready(own, Category::Retained, &digest(&content), &failing)
+            .is_err()
+    );
+    assert_eq!(store.file_state(&twin).unwrap(), Some(FileState::Ready));
+    assert_eq!(store.file_state(&own).unwrap(), Some(FileState::Pending));
+    assert_eq!(read_all(&store, &twin).unwrap(), content);
+}
+
+/// A twin whose file is on disk but torn (shorter than its row implies) is
+/// not reused: it is marked lost and the body in hand is stored.
+pub fn a_torn_twin_is_lost_and_the_new_body_kept<H: Harness>(harness: H) {
+    let store = store(&harness);
+    let content = body(100_000, 10);
+    let torn = published(&harness, &store, 0, &content);
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(store.path(&torn))
+        .unwrap();
+    file.set_len(1_000).unwrap();
+    drop(file);
+    assert_eq!(
+        harness
+            .target(1)
+            .commit_existing(Category::Retained, &digest(&content), &|id, len| {
+                store.present(id, len)
+            })
+            .unwrap(),
+        ExistingOutcome::None
+    );
+    assert_eq!(store.file_state(&torn).unwrap(), Some(FileState::Lost));
+    let fresh = published(&harness, &store, 1, &content);
+    assert_ne!(fresh, torn);
+    assert_eq!(read_all(&store, &fresh).unwrap(), content);
 }
 
 pub fn the_last_reference_releases_the_file<H: Harness>(harness: H) {

@@ -12,8 +12,8 @@
 
 use cgka_traits::storage::{StorageError, StorageResult};
 use media_store::{
-    CatalogError, CatalogResult, Category, ExistingOutcome, FileId, FileState, MediaCatalog,
-    NewFile, Presence, PublishTarget, ReadyFile, ReadyOutcome,
+    CatalogError, CatalogResult, Category, ExistingOutcome, FileId, FilePresence, FileState,
+    MediaCatalog, NewFile, Presence, PublishTarget, ReadyFile, ReadyOutcome,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use zeroize::Zeroizing;
@@ -177,23 +177,34 @@ fn mark_lost_in(conn: &Connection, id: FileId) -> StorageResult<bool> {
         == 1)
 }
 
-/// The ready file with this content other than `except`, if any.
+/// The ready file with this content other than `except`, and its length.
 fn ready_twin(
     conn: &Connection,
     category: Category,
     digest: &[u8; 32],
     except: Option<FileId>,
-) -> StorageResult<Option<FileId>> {
+) -> StorageResult<Option<(FileId, u64)>> {
     let except = except.map(|id| id.as_bytes().to_vec()).unwrap_or_default();
     conn.query_row(
-        "SELECT id FROM media_files WHERE category=?1 AND plaintext_digest=?2 AND state=?3 AND id<>?4",
+        "SELECT id,byte_len FROM media_files WHERE category=?1 AND plaintext_digest=?2 AND state=?3 AND id<>?4",
         params![category_sql(category), digest.as_slice(), STATE_READY, except],
-        |row| row.get::<_, Vec<u8>>(0),
+        |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
     )
     .optional()
     .storage()?
-    .map(id_from_sql)
+    .map(|(id, byte_len)| {
+        let byte_len = u64::try_from(byte_len)
+            .map_err(|_| StorageError::Corruption("invalid media file length".into()))?;
+        Ok((id_from_sql(id)?, byte_len))
+    })
     .transpose()
+}
+
+/// Runs the store's presence check. Its error aborts the caller's
+/// transaction, leaving the twin's row and key untouched.
+fn check_presence(present: Presence<'_>, id: FileId, byte_len: u64) -> StorageResult<FilePresence> {
+    present(id, byte_len)
+        .map_err(|_| StorageError::Backend("media file presence check failed".into()))
 }
 
 /// Points slot `token` at a ready file. Re-pointing deletes the old reference
@@ -230,10 +241,10 @@ pub(crate) fn commit_existing_in(
     superseded: &dyn Fn(&Connection) -> StorageResult<bool>,
     attach: &dyn Fn(&Connection, FileId) -> StorageResult<()>,
 ) -> StorageResult<ExistingOutcome> {
-    let Some(twin) = ready_twin(conn, category, digest, None)? else {
+    let Some((twin, byte_len)) = ready_twin(conn, category, digest, None)? else {
         return Ok(ExistingOutcome::None);
     };
-    if !present(twin) {
+    if check_presence(present, twin, byte_len)? == FilePresence::Absent {
         mark_lost_in(conn, twin)?;
         return Ok(ExistingOutcome::None);
     }
@@ -265,8 +276,8 @@ pub(crate) fn commit_ready_in(
     if !pending || superseded(conn)? {
         return Ok(ReadyOutcome::Superseded);
     }
-    if let Some(twin) = ready_twin(conn, category, digest, Some(id))? {
-        if present(twin) {
+    if let Some((twin, byte_len)) = ready_twin(conn, category, digest, Some(id))? {
+        if check_presence(present, twin, byte_len)? == FilePresence::Present {
             conn.execute(
                 "DELETE FROM media_files WHERE id=?1",
                 [id.as_bytes().as_slice()],

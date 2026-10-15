@@ -269,17 +269,22 @@ fn the_sweep_bounds_its_work_inside_a_single_shard() {
     for n in 0..25_u32 {
         std::fs::write(shard.join(format!("ab{n:030x}")), b"orphan").unwrap();
     }
-    let mut unlinked = 0;
+    std::fs::write(shard.join("foreign.txt"), b"not ours").unwrap();
+    let (mut unlinked, mut visited) = (0, 0);
     for _ in 0..10 {
         let batch = store.sweep(10).unwrap();
         assert!(batch.files_checked <= 10, "{batch:?}");
         unlinked += batch.orphans_unlinked;
+        visited += batch.files_checked;
         if batch.complete {
             break;
         }
     }
     assert_eq!(unlinked, 25);
-    assert_eq!(files(&harness.root()), 0);
+    // Each entry, foreign ones included, is listed once per pass: batches
+    // resume the open listing instead of re-reading the shard.
+    assert_eq!(visited, 26);
+    assert_eq!(files(&harness.root()), 1);
 }
 
 #[test]
@@ -316,11 +321,33 @@ fn a_corrupted_file_fails_verification_instead_of_returning_bytes() {
         store.read_at(&id, 0, &mut [0; 10]),
         Err(MediaError::Corruption(_))
     ));
-    std::fs::write(&path, b"short").unwrap();
+    // A file that fails verification can never be read: its row is lost, so
+    // reuse no longer attaches it and the same bytes publish a new file.
+    assert_eq!(store.file_state(&id).unwrap(), Some(FileState::Lost));
+    let content = vec![5; 1_000];
+    let fresh = match publish(
+        &harness,
+        &store,
+        1,
+        &content,
+        1_000,
+        digest(&content),
+        &|| false,
+    )
+    .unwrap()
+    {
+        PublishOutcome::Published(fresh) => fresh,
+        other => panic!("expected a new file, got {other:?}"),
+    };
+    assert_ne!(fresh, id);
+
+    // A length that does not match the row is corruption too.
+    std::fs::write(store.path(&fresh), b"short").unwrap();
     assert!(matches!(
-        store.open_reader(&id).map(|r| r.is_some()),
+        store.open_reader(&fresh).map(|r| r.is_some()),
         Err(MediaError::Corruption(_))
     ));
+    assert_eq!(store.file_state(&fresh).unwrap(), Some(FileState::Lost));
 }
 
 #[test]

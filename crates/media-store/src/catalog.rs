@@ -115,12 +115,25 @@ pub trait MediaCatalog: Send + Sync {
     fn page(&self, after: Option<FileId>, limit: usize) -> CatalogResult<Vec<(FileId, FileState)>>;
 }
 
-/// The store's view of the disk for reuse decisions: is this file present?
-/// It is a single existence check (one `stat`), and the only file I/O a
-/// catalog performs inside a transaction: call it at most once per commit,
-/// for the one ready twin, and do no other file work while the transaction
-/// is open.
-pub type Presence<'a> = &'a dyn Fn(FileId) -> bool;
+/// What one existence check found for a ready file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilePresence {
+    /// The file is on disk with exactly the length its row implies.
+    Present,
+    /// Confirmed absent, or a length its row cannot have (a torn or
+    /// replaced file). The catalog marks the row lost; the store has already
+    /// dropped any cached reader for it.
+    Absent,
+}
+
+/// The store's view of the disk for reuse decisions, given a ready file's id
+/// and its row's plaintext length. It is a single existence check (one
+/// `stat`), and the only file I/O a catalog performs inside a transaction:
+/// call it at most once per commit, for the one ready twin, and do no other
+/// file work while the transaction is open. An `Err` means the check itself
+/// failed (permission, I/O): the catalog must return it, rolling back, and
+/// leave the twin's row and key untouched.
+pub type Presence<'a> = &'a dyn Fn(FileId, u64) -> CatalogResult<FilePresence>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExistingOutcome {
@@ -150,8 +163,9 @@ pub trait PublishTarget {
     /// Cheap fence before any byte is written.
     fn superseded(&self) -> CatalogResult<bool>;
     /// Finds a ready file with this category and digest. Reuses it only if
-    /// `present(id)`; otherwise marks it lost (overwriting its key) and
-    /// returns `None`. When reusing, applies the target's fences and attaches.
+    /// `present` reports it `Present`; `Absent` marks it lost (overwriting its
+    /// key) and returns `None`; a presence error is returned unchanged. When
+    /// reusing, applies the target's fences and attaches.
     fn commit_existing(
         &self,
         category: Category,
@@ -160,9 +174,10 @@ pub trait PublishTarget {
     ) -> CatalogResult<ExistingOutcome>;
     /// Step 3 of publish. If `id` is no longer pending → `Superseded`. Apply
     /// the target's fences (refused → `Superseded`, row left pending). If a
-    /// ready twin with this category and digest is `present`, delete `id`'s
-    /// row and attach the twin → `Existing(twin)`; a twin that is not present
-    /// is marked lost. Otherwise mark `id` ready and attach it → `Ready`.
+    /// ready twin with this category and digest is `Present`, delete `id`'s
+    /// row and attach the twin → `Existing(twin)`; an `Absent` twin is marked
+    /// lost; a presence error is returned and nothing changes. Otherwise mark
+    /// `id` ready and attach it → `Ready`.
     fn commit_ready(
         &self,
         id: FileId,

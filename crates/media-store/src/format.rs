@@ -95,6 +95,15 @@ impl FileKey {
     }
 }
 
+/// On-disk length of a complete file holding `plaintext_bytes`: the header,
+/// the plaintext and one tag per segment (an empty plaintext has one).
+pub fn file_bytes(plaintext_bytes: u64) -> u64 {
+    let segments = plaintext_bytes
+        .div_ceil(SEGMENT_PLAINTEXT_BYTES as u64)
+        .max(1);
+    HEADER_BYTES as u64 + plaintext_bytes + segments * TAG_BYTES as u64
+}
+
 pub fn header_bytes(file_id: &[u8; FILE_ID_BYTES]) -> [u8; HEADER_BYTES] {
     let mut header = [0; HEADER_BYTES];
     header[..MAGIC.len()].copy_from_slice(&MAGIC);
