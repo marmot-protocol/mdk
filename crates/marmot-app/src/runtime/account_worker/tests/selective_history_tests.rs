@@ -127,7 +127,7 @@ impl NostrReconciliationProgress for Cursor {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::disallowed_methods)]
 async fn empty_endpoint_comparison_keeps_public_no_op_result() {
     let sdk = NostrSdkRelayClient::new(SdkClient::builder().build());
@@ -147,7 +147,7 @@ async fn empty_endpoint_comparison_keeps_public_no_op_result() {
     assert!(events.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::disallowed_methods)]
 async fn unsupported_endpoint_is_reprobed_after_connection_generation_changes() {
     let _guard = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;

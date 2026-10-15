@@ -107,12 +107,12 @@ impl QueryPolicy for HeldExact {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn receive_selected_comparison_serves_status_during_held_sdk_request() {
     run_receive_selected_comparison(false).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn receive_selected_comparison_shutdown_reaps_held_request() {
     run_receive_selected_comparison(true).await;
 }
@@ -446,14 +446,20 @@ async fn run_receive_selected_comparison(shutdown_while_held: bool) {
             selections.lock().unwrap(),
         )
     });
-    let mut second_published = false;
-    while let Ok(event) = events.try_recv() {
-        if let MarmotAppEvent::MessageReceived(update) = event {
-            second_published |=
-                update.account_label == alice.label && update.message.plaintext == "while held";
+    // The record is durable before its update is broadcast, possibly from
+    // another thread.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let MarmotAppEvent::MessageReceived(update) = events.recv().await.unwrap()
+                && update.account_label == alice.label
+                && update.message.plaintext == "while held"
+            {
+                break;
+            }
         }
-    }
-    assert!(second_published);
+    })
+    .await
+    .expect("second delivery is published while comparison held");
     assert_eq!(selections.lock().unwrap().len(), 1);
     assert_eq!(
         storage.recovery_retry_state().unwrap().attempt_serial,

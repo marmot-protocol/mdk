@@ -100,7 +100,7 @@ fn ready(snapshot: &AccountAttentionSnapshot, id: &str) -> AccountAttentionTotal
     *total
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn independent_initial_snapshot_manual_updates_and_cancelled_recv() {
     let f = Fixture::new();
     let store = f.seed(&f.alice, 2, true);
@@ -160,7 +160,7 @@ async fn independent_initial_snapshot_manual_updates_and_cancelled_recv() {
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incomplete_base_rows_are_unavailable_then_retry_without_worker_or_new_event() {
     let f = Fixture::new();
     let storage = f.seed(&f.alice, 120, false);
@@ -189,7 +189,7 @@ async fn incomplete_base_rows_are_unavailable_then_retry_without_worker_or_new_e
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_read_failure_is_not_zero_or_removal_and_recovers_without_notification() {
     let f = Fixture::new();
     let storage = f.seed(&f.alice, 1, true);
@@ -233,7 +233,7 @@ async fn account_read_failure_is_not_zero_or_removal_and_recovers_without_notifi
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn event_lag_recovers_effective_invite_archive_and_departure_state() {
     let f = Fixture::new();
     let storage = f.seed(&f.alice, 1, true);
@@ -330,7 +330,7 @@ async fn unrelated_account_database_is_not_read_on_another_accounts_update() {
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn catalog_tracks_creation_sign_out_removal_and_external_accounts_without_workers() {
     let f = Fixture::new();
     let mut sub = f.runtime.subscribe_account_attention().await.unwrap();
@@ -434,7 +434,7 @@ async fn first_snapshot_attaches_before_a_concurrent_commit() {
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unreadable_catalog_is_explicit_and_retries_all_lost_dirty_work() {
     let f = Fixture::new();
     f.seed(&f.alice, 1, true);
@@ -465,7 +465,7 @@ async fn unreadable_catalog_is_explicit_and_retries_all_lost_dirty_work() {
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_subscription_closes_on_terminal_storage_close() {
     let dir = tempfile::tempdir().unwrap();
     let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), "wss://relay.example"));
@@ -486,7 +486,7 @@ async fn empty_subscription_closes_on_terminal_storage_close() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn message_and_mention_totals_change_while_unread_membership_stays_true() {
     let f = Fixture::new();
     let storage = f.seed(&f.alice, 1, true);
@@ -539,7 +539,7 @@ async fn message_and_mention_totals_change_while_unread_membership_stays_true() 
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_does_not_reenumerate_unrelated_account_records() {
     let f = Fixture::new();
     let storage = f.seed(&f.alice, 1, true);
@@ -576,7 +576,7 @@ async fn retry_does_not_reenumerate_unrelated_account_records() {
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_presentation_label_discovers_account_without_catalog_notification() {
     let f = Fixture::new();
     let mut sub = f.runtime.subscribe_account_attention().await.unwrap();
@@ -602,7 +602,7 @@ async fn unknown_presentation_label_discovers_account_without_catalog_notificati
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn teardown_after_catalog_read_is_a_transition_and_can_recover_without_new_catalog() {
     let f = Fixture::new();
     let known = catalog(&f.runtime.accounts).await.unwrap();
@@ -663,7 +663,7 @@ async fn stalled_retry_backoff_is_capped_and_progress_resets_it() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_invitation_attention_updates_without_an_account_worker() {
     let f = Fixture::new();
     let storage = f.seed(&f.alice, 1, true);

@@ -161,7 +161,7 @@ async fn blocked_account_admission_does_not_delay_sibling_send_or_resurrect_dele
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_permanent_removal_preserves_live_row_timing_then_committed_removal_cancels_it() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());

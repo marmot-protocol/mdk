@@ -27,7 +27,7 @@ fn projection_progress_counts_broadcast_results_without_buffering_snapshots() {
 }
 
 /// Global wakeups alone are not account-local pressure; an active admission is.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn secondary_retry_observer_ignores_unrelated_wakes_and_never_waits_on_admission() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())

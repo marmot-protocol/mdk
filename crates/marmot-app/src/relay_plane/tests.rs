@@ -101,7 +101,7 @@ fn subscription_rebuild_since_uses_trusted_past_cursor() {
     assert!(since < now, "since {since} must be in the past");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn set_transport_signer_arms_the_sdk_client_for_nip42_auth() {
     let plane = MarmotRelayPlane::with_subscription_rebuild_lookback(Duration::from_secs(30));
     let sdk = plane
@@ -131,7 +131,7 @@ async fn set_transport_signer_arms_the_sdk_client_for_nip42_auth() {
     assert!(directory_client.relays().await.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn history_acquisition_rejects_unsafe_endpoint_before_sdk_registration() {
     use transport_nostr_adapter::{NostrAcquisitionLimits, NostrAcquisitionScope};
 
@@ -191,7 +191,7 @@ fn account_deliveries_lock_helpers_recover_from_poisoned_guard() {
     assert_eq!(account_deliveries_read(&deliveries).len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_delivery_recovery_metrics_report_retry_outcomes_without_identity() {
     let overflow = AccountDeliveryOverflowState::default();
     let generation = overflow
@@ -235,7 +235,7 @@ async fn account_delivery_recovery_metrics_report_retry_outcomes_without_identit
     assert_eq!(overflow.metrics.dropped.load(Ordering::Relaxed), 3);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overflow_marker_uses_one_worker_and_stops_when_storage_closes() {
     let overflow = AccountDeliveryOverflowState::default();
     assert!(
@@ -335,7 +335,7 @@ async fn assert_stale_marker_worker_preserves_new_generation(
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_overflow_marker_workers_preserve_new_generation_claim() {
     assert_stale_marker_worker_preserves_new_generation(Ok(())).await;
     assert_stale_marker_worker_preserves_new_generation(Err(
@@ -373,7 +373,7 @@ fn notification_restart_backoff_caps_and_resets_after_healthy_runtime() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn notification_consumer_reports_lag_without_silently_ending() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay);
@@ -405,7 +405,7 @@ async fn notification_consumer_reports_lag_without_silently_ending() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abandoned_notification_lane_counts_queued_loss_for_only_its_account() {
     let sdk = NostrSdkRelayClient::multi_account();
     let alice_keys = nostr::prelude::Keys::generate();
@@ -531,7 +531,7 @@ impl RelayNotificationSource for QueuedWorkerFailureSource {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_notification_worker_latches_queued_loss_for_only_its_account() {
     let sdk = NostrSdkRelayClient::multi_account();
     let alice_keys = nostr::prelude::Keys::generate();
@@ -608,15 +608,17 @@ async fn failed_notification_worker_latches_queued_loss_for_only_its_account() {
     .await
     .expect("supervisor signals account recovery from the real loss exit");
     assert!(bob_adapter.pending_delivery_overflow().is_none());
-    assert_eq!(
-        plane
-            .inner
-            .transport
-            .notification_forwarder_health
-            .snapshot()
-            .lagged_notifications,
-        3
-    );
+    // The supervisor records the account's loss before it updates its health
+    // counters, possibly on another thread.
+    let health = &plane.inner.transport.notification_forwarder_health;
+    timeout(Duration::from_secs(2), async {
+        while health.snapshot().lagged_notifications < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("supervisor counts the lost notifications");
+    assert_eq!(health.snapshot().lagged_notifications, 3);
 
     source.sender.send(RelayPoolNotification::Shutdown).unwrap();
     timeout(Duration::from_secs(2), supervisor)
@@ -632,7 +634,7 @@ async fn failed_notification_worker_latches_queued_loss_for_only_its_account() {
 /// Declaring it notification loss would cost the account a comparison
 /// recovery pass for history it is receiving anyway (the nightly 1024-message
 /// backlog journeys).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn busy_notification_worker_absorbs_rebuild_replay_without_loss() {
     use nostr_sdk::prelude::{EventBuilder, Keys, Tag};
 
@@ -722,7 +724,7 @@ async fn busy_notification_worker_absorbs_rebuild_replay_without_loss() {
     sdk.shutdown_accounts().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn notification_consumer_exit_closes_only_account_delivery() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -780,7 +782,7 @@ async fn notification_consumer_exit_closes_only_account_delivery() {
 /// A lag means only that the consumer fell behind; the live subscriptions
 /// did not fail. The account keeps its route, gets one control record per
 /// loss generation, and the loss carries the lowest REQ floor of its lags.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn notification_lag_keeps_account_delivery_open_and_bounds_the_loss() {
     use NostrNotificationLossFloor::{Since, Unbounded};
     let relay = Arc::new(RecordingRelayClient::default());
@@ -879,7 +881,7 @@ async fn notification_lag_keeps_account_delivery_open_and_bounds_the_loss() {
 /// reopens or retires. A control record still queued there dies with it, and
 /// `signal_queued` would keep `finish_recovery` from ever clearing the
 /// generation, so the next route carries the signal instead.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn next_route_carries_a_control_record_that_died_with_its_queue() {
     for retire_first in [false, true] {
         let relay = Arc::new(RecordingRelayClient::default());
@@ -922,7 +924,7 @@ async fn next_route_carries_a_control_record_that_died_with_its_queue() {
 
 /// A predecessor whose receiver is still alive keeps its own control record,
 /// so a new route gets no duplicate.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_predecessor_keeps_its_control_record() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -945,7 +947,7 @@ async fn live_predecessor_keeps_its_control_record() {
 
 /// A scoped supervisor charges the floor its source read at the lag, and the
 /// shared forwarder, whose receiver spans accounts, charges none.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervised_notification_lag_charges_the_source_floor() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -1287,7 +1289,7 @@ fn inbox_subscription_count(relay: &RecordingRelayClient) -> usize {
         .count()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn managed_account_worker_reopens_transport_after_notification_consumer_exit() {
     let dir = tempfile::tempdir().unwrap();
     marmot_account::AccountHome::open(dir.path())
@@ -1325,7 +1327,7 @@ async fn managed_account_worker_reopens_transport_after_notification_consumer_ex
 /// replayed the whole backlog from the loss-fenced cursor, and the replay
 /// overflowed again. Now the worker keeps its session and persists the loss,
 /// bounded by the REQ floor read at the lag, for comparison recovery.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn managed_account_worker_keeps_its_session_through_notification_lag() {
     let dir = tempfile::tempdir().unwrap();
     let home = marmot_account::AccountHome::open(dir.path());
@@ -1424,6 +1426,7 @@ struct TestNotificationSource {
     /// Reported for every recorded loss, as an SDK account context reports
     /// its REQ floor.
     lag_floor: NostrNotificationLossFloor,
+    shutdown: AtomicBool,
 }
 
 impl TestNotificationSource {
@@ -1434,6 +1437,7 @@ impl TestNotificationSource {
             preload_lag: false,
             panic_first: AtomicBool::new(false),
             lag_floor: NostrNotificationLossFloor::Unbounded,
+            shutdown: AtomicBool::new(false),
         }
     }
 
@@ -1448,6 +1452,7 @@ impl TestNotificationSource {
             preload_lag: true,
             panic_first: AtomicBool::new(false),
             lag_floor,
+            shutdown: AtomicBool::new(false),
         }
     }
 
@@ -1458,10 +1463,17 @@ impl TestNotificationSource {
             preload_lag: false,
             panic_first: AtomicBool::new(true),
             lag_floor: NostrNotificationLossFloor::Unbounded,
+            shutdown: AtomicBool::new(false),
         }
     }
 
     fn send(&self, notification: RelayPoolNotification) {
+        // Like the SDK pool, mark shutdown before broadcasting it: a consumer
+        // that still had queued work reports the shutdown as a lag, and the
+        // supervisor then stops on the source's shutdown state.
+        if matches!(notification, RelayPoolNotification::Shutdown) {
+            self.shutdown.store(true, Ordering::SeqCst);
+        }
         self.sender
             .send(notification)
             .expect("test supervisor should have an active notification receiver");
@@ -1487,7 +1499,7 @@ impl RelayNotificationSource for TestNotificationSource {
     }
 
     fn is_shutdown(&self) -> bool {
-        false
+        self.shutdown.load(Ordering::SeqCst)
     }
 
     fn record_loss(&self, _skipped: u64) -> NostrNotificationLossFloor {
@@ -1495,7 +1507,7 @@ impl RelayNotificationSource for TestNotificationSource {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn aborted_scoped_supervisors_release_health_across_account_restarts() {
     let relay = Arc::new(RecordingRelayClient::default());
     let plane = MarmotRelayPlane::with_subscription_rebuild_lookback(Duration::from_secs(30));
@@ -1586,7 +1598,7 @@ async fn aborted_scoped_supervisors_release_health_across_account_restarts() {
     plane.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn notification_supervisor_restarts_after_consumer_panic() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -1646,7 +1658,7 @@ async fn notification_supervisor_restarts_after_consumer_panic() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clean_sdk_shutdown_stays_terminal_across_spawn_router_reentry() {
     let relay_plane = MarmotRelayPlane::with_subscription_rebuild_lookback(Duration::from_secs(30));
     let relay = Arc::new(RecordingRelayClient::default());
@@ -1832,7 +1844,9 @@ impl DirectoryRelayFetcher for BlockingDirectoryFetcher {
         _request: DirectoryFetchRequest,
     ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
         self.fetch_count.fetch_add(1, Ordering::SeqCst);
-        self.started.notify_waiters();
+        // `notify_one` keeps a permit, so neither side can miss the other on a
+        // multi-thread runtime.
+        self.started.notify_one();
         self.release.notified().await;
         Ok(self.events.clone())
     }
@@ -1889,7 +1903,7 @@ fn relay_plane_with_directory_fetcher(
     )
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_plane_rejects_invalid_relay_endpoints_before_subscribing() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -1923,7 +1937,7 @@ fn notification_trigger_endpoints_use_the_relay_safety_policy() {
     assert!(err.contains("host is not a public address"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsafe_group_routes_isolated() {
     let relay = Arc::new(RecordingRelayClient::default());
     let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -2049,7 +2063,7 @@ fn recovery_route_cap_and_aliases() {
     assert_eq!(endpoints.len(), 22, "signed route remains unchanged");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_plane_deduplicates_canonical_relay_endpoints() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -2087,7 +2101,7 @@ async fn relay_plane_deduplicates_canonical_relay_endpoints() {
     }));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_telemetry_reflects_activation_through_the_plane() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -2123,7 +2137,7 @@ async fn relay_telemetry_reflects_activation_through_the_plane() {
     assert_eq!(telemetry.delivery_spread.spread.sample_count(), 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn settled_activation_uses_diff() {
     let relay = Arc::new(RecordingRelayClient::default());
     let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -2306,7 +2320,7 @@ fn rollup_observed_reorg_rate_uses_folded_engine_metrics() {
     assert_eq!(empty_engine.observed_reorg_rate(), None);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn telemetry_rollup_is_empty_without_observed_relay_traffic() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -2316,7 +2330,7 @@ async fn telemetry_rollup_is_empty_without_observed_relay_traffic() {
     assert!(rollup.engine.is_none());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_label_resolution_is_gated_behind_opt_in() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -2368,7 +2382,18 @@ async fn relay_label_resolution_is_gated_behind_opt_in() {
     );
 }
 
-#[tokio::test]
+/// Wait until a second identical fetch has joined the in-flight one.
+async fn wait_for_directory_waiter(plane: &MarmotRelayPlane) {
+    timeout(Duration::from_secs(2), async {
+        while plane.relay_health().await.directory_coalesced_waiters < 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the second fetch joins the in-flight one");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn directory_fetches_coalesce_identical_inflight_requests() {
     let relay = Arc::new(RecordingRelayClient::default());
     let event = DirectoryRelayEventRecord {
@@ -2401,8 +2426,8 @@ async fn directory_fetches_coalesce_identical_inflight_requests() {
             .fetch_directory_events(endpoints, vec![query])
             .await
     });
-    tokio::task::yield_now().await;
-    directory_fetcher.release.notify_waiters();
+    wait_for_directory_waiter(&relay_plane).await;
+    directory_fetcher.release.notify_one();
 
     assert_eq!(first.await.unwrap().unwrap(), vec![event.clone()]);
     assert_eq!(second.await.unwrap().unwrap(), vec![event]);
@@ -2415,7 +2440,7 @@ async fn directory_fetches_coalesce_identical_inflight_requests() {
     assert_eq!(health.directory_failed_fetches, 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn directory_completion_coalesces_and_survives_waiter_cancellation() {
     let fetcher = Arc::new(BlockingDirectoryFetcher {
         fetch_count: AtomicUsize::new(0),
@@ -2474,7 +2499,7 @@ async fn directory_completion_coalesces_and_survives_waiter_cancellation() {
     assert_eq!(health.directory_completed_fetches, 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn directory_fetch_owner_cancellation_does_not_orphan_waiters() {
     let relay = Arc::new(RecordingRelayClient::default());
     let event = DirectoryRelayEventRecord {
@@ -2508,8 +2533,8 @@ async fn directory_fetch_owner_cancellation_does_not_orphan_waiters() {
             .fetch_directory_events(endpoints, vec![query])
             .await
     });
-    tokio::task::yield_now().await;
-    directory_fetcher.release.notify_waiters();
+    wait_for_directory_waiter(&relay_plane).await;
+    directory_fetcher.release.notify_one();
 
     assert_eq!(second.await.unwrap().unwrap(), vec![event]);
     assert_eq!(directory_fetcher.fetch_count.load(Ordering::SeqCst), 1);
@@ -2519,7 +2544,7 @@ async fn directory_fetch_owner_cancellation_does_not_orphan_waiters() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn directory_fetch_panic_clears_inflight_entry_for_retry() {
     let relay = Arc::new(RecordingRelayClient::default());
     let directory_fetcher = Arc::new(PanicOnceDirectoryFetcher::default());
@@ -2547,7 +2572,7 @@ async fn directory_fetch_panic_clears_inflight_entry_for_retry() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn directory_fetches_reject_invalid_relay_endpoints_before_fetching() {
     let relay = Arc::new(RecordingRelayClient::default());
     let directory_fetcher = Arc::new(RecordingDirectoryFetcher::default());
@@ -2565,7 +2590,7 @@ async fn directory_fetches_reject_invalid_relay_endpoints_before_fetching() {
     assert_eq!(directory_fetcher.fetch_count.load(Ordering::SeqCst), 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn directory_fetches_reject_retired_relays_before_fetching() {
     let relay = Arc::new(RecordingRelayClient::default());
     let directory_fetcher = Arc::new(RecordingDirectoryFetcher::default());
@@ -2586,7 +2611,7 @@ async fn directory_fetches_reject_retired_relays_before_fetching() {
     assert_eq!(directory_fetcher.fetch_count.load(Ordering::SeqCst), 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn group_subscriptions_remain_account_scoped_for_shared_group_routes() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -2645,7 +2670,7 @@ async fn group_subscriptions_remain_account_scoped_for_shared_group_routes() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shared_group_event_is_delivered_to_each_matching_account_receiver() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -2702,7 +2727,7 @@ async fn shared_group_event_is_delivered_to_each_matching_account_receiver() {
     assert_eq!(bob_delivery.source.plane, TransportDeliveryPlane::Group);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_account_queue_spills_before_it_omits() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -2831,7 +2856,7 @@ async fn fill_account_queue(
 
 /// A queue-loss generation carries the earliest wire `created_at` among the
 /// deliveries it dropped, so recovery can bound what it must compare.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn router_drops_record_the_earliest_created_at_they_lost() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -2870,7 +2895,7 @@ async fn router_drops_record_the_earliest_created_at_they_lost() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transient_spill_store_failures_are_retried_instead_of_lost() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -2910,7 +2935,7 @@ async fn transient_spill_store_failures_are_retried_instead_of_lost() {
     assert!(!adapter.delivery_loss_blocks_cursor());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replaced_adapter_wakes_when_an_earlier_spill_write_commits() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -2963,7 +2988,7 @@ async fn replaced_adapter_wakes_when_an_earlier_spill_write_commits() {
 /// adapter shares that writer's coordination, so it stays fenced until the
 /// batch settles, wakes when it commits, and is told to recover when it fails,
 /// whether the replacement registered before or after the failure.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replacement_after_retirement_shares_an_in_flight_spill_write() {
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Outcome {
@@ -3089,7 +3114,7 @@ async fn replacement_after_retirement_shares_an_in_flight_spill_write() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_spill_wakeup_wins_over_a_ready_live_queue() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -3119,7 +3144,7 @@ async fn pending_spill_wakeup_wins_over_a_ready_live_queue() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spill_hand_off_bounds_deliveries_with_empty_payloads() {
     let release = Arc::new(AtomicBool::new(false));
     let gate = release.clone();
@@ -3280,7 +3305,7 @@ fn drain_queued_created_at(adapter: &MarmotRelayPlaneAccountAdapter) -> Vec<u64>
     queued
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cursor_seal_stops_where_a_restart_still_fetches_every_queued_delivery() {
     let (store, kept) = recording_spill_store();
     let (relay_plane, adapter, alice) = cursor_floor_adapter(Some(store), None);
@@ -3375,7 +3400,7 @@ async fn cursor_seal_stops_where_a_restart_still_fetches_every_queued_delivery()
 /// stops where a restart fetches it again. A redelivery of the same event
 /// takes over its pin, and once that redelivery is ingested nothing holds the
 /// cursor back.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_delivery_whose_ingest_failed_caps_commits_until_a_redelivery_is_released() {
     let (store, _) = recording_spill_store();
     let (relay_plane, adapter, alice) = cursor_floor_adapter(Some(store), None);
@@ -3434,7 +3459,7 @@ async fn a_delivery_whose_ingest_failed_caps_commits_until_a_redelivery_is_relea
 /// queue: the new route's subscriptions fetch it again from a cursor it
 /// capped. Its pin must not survive into the new generation, where the same
 /// event's release would free the count of a different delivery.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_new_queue_generation_drops_the_pins_of_the_last() {
     let (store, _) = recording_spill_store();
     let (relay_plane, first, alice) = cursor_floor_adapter(Some(store.clone()), None);
@@ -3469,7 +3494,7 @@ async fn a_new_queue_generation_drops_the_pins_of_the_last() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deliveries_placed_after_a_live_seal_spill_what_only_that_promotion_stopped_covering() {
     let (store, kept) = recording_spill_store();
     let (relay_plane, adapter, alice) = cursor_floor_adapter(Some(store), None);
@@ -3534,7 +3559,7 @@ async fn deliveries_placed_after_a_live_seal_spill_what_only_that_promotion_stop
 /// restart from fetching is spilled. Once the save succeeds the settled floor
 /// rises with it, and a later arrival below is queued as it always was. A
 /// live promotion past that floor spills only what lies between the two.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_settled_commit_spills_only_what_arrives_during_its_save() {
     let (store, kept) = recording_spill_store();
     let (relay_plane, adapter, alice) = cursor_floor_adapter(Some(store), None);
@@ -3590,7 +3615,7 @@ async fn a_settled_commit_spills_only_what_arrives_during_its_save() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn without_a_spill_a_delivery_below_the_live_floor_becomes_bounded_loss() {
     let marked = Arc::new(StdMutex::new(Vec::new()));
     let recorded = marked.clone();
@@ -3637,7 +3662,7 @@ async fn without_a_spill_a_delivery_below_the_live_floor_becomes_bounded_loss() 
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_save_lowers_the_floor_its_seal_raised() {
     let (store, kept) = recording_spill_store();
     let (relay_plane, adapter, alice) = cursor_floor_adapter(Some(store), None);
@@ -3683,7 +3708,7 @@ async fn a_failed_save_lowers_the_floor_its_seal_raised() {
     assert_eq!(drain_queued_created_at(&adapter), [OPENED_CURSOR + 1_001]);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replaced_adapter_cannot_promote_the_cursor() {
     let (store, _) = recording_spill_store();
     let (relay_plane, first, alice) = cursor_floor_adapter(Some(store.clone()), None);
@@ -3705,7 +3730,7 @@ async fn a_replaced_adapter_cannot_promote_the_cursor() {
 /// A settled commit a fence held reaches nothing of its own, so the cursor it
 /// re-persists, which an earlier live promotion set, must not become the
 /// settled floor: what only that promotion exposed is still spilled.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_fenced_settled_commit_keeps_spilling_what_live_promotion_exposed() {
     let (store, kept) = recording_spill_store();
     let (relay_plane, adapter, alice) = cursor_floor_adapter(Some(store), None);
@@ -3750,7 +3775,7 @@ async fn a_fenced_settled_commit_keeps_spilling_what_live_promotion_exposed() {
 /// durable floor, every older arrival is spilled, however old, until a
 /// settled cursor exists: before it, a restart relied on its comparison, not
 /// the cursor, for everything.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn before_the_first_settled_cursor_a_seal_spills_every_older_arrival() {
     let (store, kept) = recording_spill_store();
     let (relay_plane, adapter, alice) = cursor_floor_adapter_opened(Some(store), None, None);
@@ -3808,7 +3833,7 @@ async fn before_the_first_settled_cursor_a_seal_spills_every_older_arrival() {
     assert_eq!(kept.lock().unwrap().len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_queue_overflow_invalidates_eose_without_blocking_other_accounts() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -3974,7 +3999,7 @@ async fn account_queue_overflow_invalidates_eose_without_blocking_other_accounts
     assert!(overflow.queue_depth >= ACCOUNT_DELIVERY_BUFFER);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_and_runtime_kind_445_shape_rejection_are_both_malformed() {
     let transport_group_id = vec![0xD4; 32];
     let mut event = group_event("extra-tag", &transport_group_id);
@@ -4003,7 +4028,7 @@ async fn direct_and_runtime_kind_445_shape_rejection_are_both_malformed() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn published_group_event_is_fanned_out_to_matching_local_accounts() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -4096,7 +4121,7 @@ async fn directory_plane_with_active_subscription(
     directory
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn directory_sync_keeps_filter_for_subscription_created_before_later_error() {
     let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -4195,7 +4220,7 @@ async fn directory_sync_keeps_filter_for_subscription_created_before_later_error
     relay_plane.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn directory_endpoint_change_retries_a_batch_left_pending_by_partial_failure() {
     use nostr::prelude::{EventBuilder, Keys};
 
@@ -4312,7 +4337,7 @@ async fn directory_endpoint_change_retries_a_batch_left_pending_by_partial_failu
     relay_plane.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn directory_subscribe_error_restores_filter_and_keeps_rebuild_pending() {
     let id = "directory_users_retry";
     let old_author = "11".repeat(32);
@@ -4343,7 +4368,7 @@ async fn directory_subscribe_error_restores_filter_and_keeps_rebuild_pending() {
     assert!(!directory.accepts_live_event(id, &new_author, 0).await);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn directory_forwards_immediate_event_while_rebuild_is_pending() {
     use nostr::prelude::{EventBuilder, Keys};
 
@@ -4371,6 +4396,7 @@ async fn directory_forwards_immediate_event_while_rebuild_is_pending() {
         preload_lag: false,
         panic_first: AtomicBool::new(false),
         lag_floor: NostrNotificationLossFloor::Unbounded,
+        shutdown: AtomicBool::new(false),
     });
     let (sender, mut events) = broadcast::channel(8);
     let forwarder =
@@ -4547,17 +4573,17 @@ async fn directory_live_auth_challenge(deny_read: bool) {
     let _ = server.await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn anonymous_live_directory_auth_required_is_visible_without_retry_loop() {
     directory_live_auth_challenge(true).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn anonymous_live_directory_accepts_event_after_optional_auth() {
     directory_live_auth_challenge(false).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn directory_notification_lag_requests_refresh() {
     let source: Arc<dyn RelayNotificationSource> = Arc::new(TestNotificationSource::lag_once());
     let (sender, mut receiver) = broadcast::channel(4);
@@ -4574,7 +4600,7 @@ async fn directory_notification_lag_requests_refresh() {
     let _ = task.await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn directory_auth_required_blocks_only_the_rejecting_endpoint() {
     let author = "11".repeat(32);
     let id = "directory_users_shared";
@@ -4613,7 +4639,7 @@ async fn directory_auth_required_blocks_only_the_rejecting_endpoint() {
     assert_eq!(stats.active_subscriptions, 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn directory_live_event_matching_active_subscription_is_accepted() {
     let author = "11".repeat(32);
     let directory = directory_plane_with_active_subscription(
@@ -4631,7 +4657,7 @@ async fn directory_live_event_matching_active_subscription_is_accepted() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn directory_live_event_with_unknown_subscription_id_is_rejected() {
     let author = "11".repeat(32);
     let directory = directory_plane_with_active_subscription(
@@ -4649,7 +4675,7 @@ async fn directory_live_event_with_unknown_subscription_id_is_rejected() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn directory_live_event_with_wrong_author_is_rejected() {
     let author = "11".repeat(32);
     let other_author = "22".repeat(32);
@@ -4665,7 +4691,7 @@ async fn directory_live_event_with_wrong_author_is_rejected() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn directory_live_event_with_wrong_kind_is_rejected() {
     let author = "11".repeat(32);
     let directory = directory_plane_with_active_subscription(
@@ -4685,7 +4711,7 @@ async fn directory_live_event_with_wrong_kind_is_rejected() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn directory_live_event_rejected_after_subscription_removed() {
     let author = "11".repeat(32);
     let directory = directory_plane_with_active_subscription(
@@ -4745,7 +4771,7 @@ fn relay_pool_group_notification(
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervised_notification_lag_delivers_later_inbound_exactly_once() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -4899,7 +4925,7 @@ fn publish_report_preserves_fallback_message_id() {
     assert_eq!(report.required_acks, 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn notification_loss_is_durable_and_survives_receiver_replacement() {
     use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
     use storage_sqlite::RecoveryLossCause::NotificationConsumer;
@@ -5042,7 +5068,7 @@ fn loss_authority_notification_cannot_claim_the_queue_writer() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loss_authority_persists_count_growth_after_the_first_queue_write() {
     let overflow = AccountDeliveryOverflowState::default();
     overflow.record_drop(1, Some(1));
@@ -5068,7 +5094,7 @@ async fn loss_authority_persists_count_growth_after_the_first_queue_write() {
     assert_eq!(observed.load(Ordering::SeqCst), 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loss_authority_normal_close_does_not_invent_notification_loss() {
     let relay = Arc::new(RecordingRelayClient::default());
     let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
@@ -5086,7 +5112,7 @@ async fn loss_authority_normal_close_does_not_invent_notification_loss() {
     plane.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loss_authority_router_updates_a_marker_with_its_control_already_queued() {
     let overflow = Arc::new(AccountDeliveryOverflowState::default());
     let (sender, mut receiver) = mpsc::channel(2);
@@ -5131,7 +5157,7 @@ async fn loss_authority_router_updates_a_marker_with_its_control_already_queued(
 /// immutable account context is live, so the worker must retire that context
 /// first. Otherwise every reopen fails and the account stays in reconnect
 /// backoff, where commands fail with `transport_closed`.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sdk_account_worker_reopens_after_notification_consumer_exit() {
     let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
     let url = relay.url().await.to_string();
@@ -5193,7 +5219,7 @@ async fn sdk_account_worker_reopens_after_notification_consumer_exit() {
 /// On the real SDK plane a lag keeps the account's context and session. The
 /// loss is charged with the floor the account's SDK context reports for its
 /// REQs, and commands keep being served.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sdk_account_worker_keeps_serving_through_notification_lag() {
     let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
     let url = relay.url().await.to_string();
@@ -5285,7 +5311,7 @@ async fn sdk_account_worker_keeps_serving_through_notification_lag() {
 /// comparison can certify, instead of an unbounded one that parks as "history
 /// may be incomplete". The Welcome here is older than every other REQ floor,
 /// so the lag's floor is the maintenance REQ's own.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn notification_lag_while_post_join_maintenance_is_live_stays_bounded() {
     use cgka_traits::storage::{GroupStorage, MaintenanceStorage};
     let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
@@ -5382,7 +5408,7 @@ async fn notification_lag_while_post_join_maintenance_is_live_stays_bounded() {
 /// A retained route stored before switch times were kept is stamped at the
 /// first load after the upgrade, so its REQ is floored and a lag on an
 /// account that has one stays bounded.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn notification_lag_with_a_legacy_retained_route_stays_bounded() {
     let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
     let url = relay.url().await.to_string();
@@ -5469,7 +5495,7 @@ async fn notification_lag_with_a_legacy_retained_route_stays_bounded() {
 /// Test-policy builds settle convergence at once. A directly driven client has
 /// no worker timer for the pinned quiescence window, so it needs that.
 #[cfg(feature = "test-policy-overrides")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join() {
     use crate::relay_plane::AccountDeliveryReceive;
     let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
@@ -5644,7 +5670,7 @@ async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join(
 /// A reopen cancelled mid-retirement leaves nothing running. The reaper
 /// retires the context, and a replacement registered afterwards keeps its
 /// SDK context.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_reopen_retirement_cannot_remove_a_replacement_context() {
     use futures::FutureExt;
     use nostr_sdk::prelude::Keys;
@@ -5697,7 +5723,7 @@ fn eose_report(scope: Option<MemberId>) -> EoseRepairReport {
 
 /// A shared receiver's report waits for an account that can record it: a
 /// worker with no v5 recorder that looks first takes only its own reports.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_shared_eose_repair_report_waits_for_an_account_that_records_it() {
     let relay = Arc::new(RecordingRelayClient::default());
     let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay);
@@ -5725,7 +5751,7 @@ async fn a_shared_eose_repair_report_waits_for_an_account_that_records_it() {
 /// Evicted reports are counted on their receiver's next surviving report,
 /// or in one bounded scalar: the accounting never grows with the number of
 /// receivers.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn evicted_eose_repair_reports_are_counted_without_unbounded_state() {
     let relay = Arc::new(RecordingRelayClient::default());
     let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay);
@@ -5909,7 +5935,7 @@ impl NostrRelayClient for ObservedPublishClient {
 }
 
 /// Public and authenticated receipts must satisfy one required quorum.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn publish_auth_receipts() {
     use nostr_relay_builder::builder::{RelayBuilderNip42, RelayBuilderNip42Mode};
     use nostr_relay_builder::{LocalRelay, RelayBuilder};
@@ -5959,7 +5985,8 @@ async fn publish_auth_receipts() {
 }
 
 /// Below-quorum authentication retries share the original publication deadline.
-#[tokio::test]
+// Pauses the clock, which needs the current-thread runtime.
+#[tokio::test(flavor = "current_thread")]
 async fn publish_auth_deadline() {
     use nostr_relay_builder::builder::{RelayBuilderNip42, RelayBuilderNip42Mode};
     use nostr_relay_builder::{LocalRelay, RelayBuilder};
@@ -6062,7 +6089,7 @@ async fn publish_auth_deadline() {
 }
 
 /// Quorum cancellation must preserve the same conservative exposure evidence as timeout.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn publish_auth_quorum_does_not_wait_for_unobserved_fallback() {
     use nostr_relay_builder::builder::{RelayBuilderNip42, RelayBuilderNip42Mode};
     use nostr_relay_builder::{LocalRelay, RelayBuilder};
@@ -6162,7 +6189,7 @@ async fn publish_auth_quorum_does_not_wait_for_unobserved_fallback() {
 /// mdk#2255: a public relay still pending when quorum is met may yet store
 /// the event. Report it with unknown-acknowledgement evidence so the caller's
 /// durable fanout keeps it owed instead of silently dropping it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn publish_quorum_reports_cancelled_public_relay_as_unknown() {
     use nostr_relay_builder::{LocalRelay, RelayBuilder};
 
@@ -6205,7 +6232,7 @@ async fn publish_quorum_reports_cancelled_public_relay_as_unknown() {
     plane.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::disallowed_methods)]
 async fn publish_allows_independent_account_registration() {
     use nostr_relay_builder::{LocalRelay, RelayBuilder};
@@ -6313,7 +6340,7 @@ async fn publish_allows_independent_account_registration() {
 /// adapter crate's standalone forwarder, hands a relay's `CLOSED` to the
 /// adapter: the refusal reaches the account's reports and settles its inbox
 /// replay without completing it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_notification_consumer_reports_relay_closed() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());

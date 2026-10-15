@@ -1195,12 +1195,12 @@ mod tests {
     use super::*;
     use nostr_sdk::prelude::FinalizeEvent;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn anonymous_directory_fetch_accepts_profiles_after_optional_auth_challenge() {
         assert_anonymous_profiles_after_optional_auth_challenge(false).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn anonymous_directory_fetch_completes_after_optional_auth_challenge() {
         assert_anonymous_profiles_after_optional_auth_challenge(true).await;
     }
@@ -1279,7 +1279,7 @@ mod tests {
         assert_eq!(records[0].event.id, expected_id);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn signerless_inspection_never_retains_relays_in_the_shared_client() {
         let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
         let endpoint = TransportEndpoint(relay.url().await.to_string());
@@ -1301,7 +1301,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn inspection_preserves_auth_and_payment_closed_reasons() {
         use futures::{SinkExt, StreamExt};
         use tokio::net::TcpListener;
@@ -1358,7 +1358,7 @@ mod tests {
     /// relays allow at most 3 filters per REQ and refuse the rest with
     /// `invalid: too many filters`, which this path reports as incomplete.
     /// Today's callers pass at most two queries; a fourth would fail closed.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn strict_directory_fetch_puts_every_query_in_one_req() {
         use futures::{SinkExt, StreamExt};
         use tokio::net::TcpListener;
@@ -1448,7 +1448,7 @@ mod tests {
         assert!(validated_directory_event(&tampered, &query).is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn strict_directory_exact_filter_limit_keeps_records_but_not_absence_proof() {
         use nostr_sdk::local_relay::MockRelay;
         use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys};
@@ -1487,7 +1487,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn strict_directory_sdk_tag_drop_cannot_certify_deletion_absence() {
         use futures::{SinkExt, StreamExt};
         use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Tag};
@@ -1555,7 +1555,7 @@ mod tests {
         let _ = server.await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sdk_fetcher_errors_do_not_echo_invalid_relay_urls() {
         let secret_url = "not-a-relay-with-secret-token";
         let request = DirectoryFetchRequest::new(
@@ -1655,7 +1655,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scoped_deletion_filters_reach_all_sdk_fetch_paths() {
         use futures::{SinkExt, StreamExt};
         use nostr_sdk::prelude::{EventBuilder, Keys, Tag, Timestamp};

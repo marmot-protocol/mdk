@@ -407,7 +407,7 @@ fn closed() -> AppError {
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn finish_reserves_before_spawn() {
         let root = tempfile::tempdir().unwrap();
         let runtime = crate::MarmotApp::with_relays(root.path(), vec![]).runtime();
@@ -452,7 +452,7 @@ mod tests {
         ));
         cancel.await;
     }
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sealed_finish_retains_retry() {
         let root = tempfile::tempdir().unwrap();
         let runtime = crate::MarmotApp::with_relays(root.path(), vec![]).runtime();

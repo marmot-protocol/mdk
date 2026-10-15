@@ -95,7 +95,7 @@ fn resume_context(
 
 /// Exercise the file sink on small fixtures: the same implementation handles
 /// large explicit transfers without allocating a whole-file array.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn file_attachment_resume_survives_irregular_chunks_and_publishes_authenticated_bytes() {
     let plain = vec![42; 2 * ATTACHMENT_CHECKPOINT_BYTES + 71];
     let (listener, reference, cipher) = listener_fixture(&plain).await;
@@ -244,7 +244,7 @@ async fn file_attachment_resume_survives_irregular_chunks_and_publishes_authenti
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn file_attachment_complete_checkpoint_is_verified_without_network() {
     let (listener, reference, cipher) = listener_fixture(b"completed ciphertext").await;
     let dir = tempfile::tempdir().unwrap();
@@ -289,7 +289,7 @@ async fn file_attachment_complete_checkpoint_is_verified_without_network() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn file_attachment_invalid_range_restarts_without_mixing_representations() {
     const REDIRECT_COUNT: usize = 5;
     for scenario in ["duplicate", "etag", "416"] {
@@ -387,12 +387,12 @@ async fn file_attachment_invalid_range_restarts_without_mixing_representations()
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resumed_hash_retries_fresh() {
     check_resume_failure(ResumeFailure::HashMismatch).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resumed_overflow_clears_prefix() {
     check_resume_failure(ResumeFailure::Overflow).await;
 }
@@ -507,12 +507,12 @@ async fn check_resume_failure(failure: ResumeFailure) {
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disk_reserve_without_etag() {
     check_disk_reserve(ResponseLength::Known).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disk_reserve_unknown_length() {
     check_disk_reserve(ResponseLength::Unknown).await;
 }
@@ -606,7 +606,7 @@ async fn check_disk_reserve(length: ResponseLength) {
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn file_attachment_corrupt_ciphertext_is_terminal_and_never_readable() {
     let (listener, reference, mut cipher) =
         listener_fixture(&vec![42; ATTACHMENT_CHECKPOINT_BYTES + 71]).await;
@@ -663,7 +663,7 @@ async fn file_attachment_corrupt_ciphertext_is_terminal_and_never_readable() {
     );
     server.await.unwrap();
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn file_redirect_limit_stops() {
     let (listener, reference, _) = listener_fixture(b"redirect boundary").await;
     let server = tokio::spawn(async move {
@@ -748,7 +748,7 @@ async fn listener_fixture(
     (listener, reference, cipher)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_resume_interrupted_transfer_reopens_and_publishes_verified_bytes() {
     let plaintext = vec![42; 2 * ATTACHMENT_CHECKPOINT_BYTES];
     let (listener, reference, cipher) = listener_fixture(&plaintext).await;
@@ -860,7 +860,7 @@ async fn attachment_resume_interrupted_transfer_reopens_and_publishes_verified_b
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_resume_validates_ranges_and_restarts_incompatible_responses() {
     for case in [
         "resume",
@@ -1055,7 +1055,7 @@ async fn attachment_resume_validates_ranges_and_restarts_incompatible_responses(
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_resume_cancellation_keeps_only_committed_ciphertext() {
     let body = vec![17; ATTACHMENT_CHECKPOINT_BYTES * 2];
     let (listener, reference, cipher) = listener_fixture(&body).await;
@@ -1128,7 +1128,7 @@ async fn attachment_resume_cancellation_keeps_only_committed_ciphertext() {
     assert!(server.await.unwrap_err().is_cancelled());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_resume_without_strong_validator_uses_full_download() {
     for etag in ["", "ETag: W/\"v1\"\r\n"] {
         let (listener, reference, cipher) =
@@ -1165,7 +1165,7 @@ async fn attachment_resume_without_strong_validator_uses_full_download() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_resume_failover_does_not_mix_locator_validators() {
     let (listener, mut reference, cipher) =
         listener_fixture(b"only the complete authenticated object is usable").await;
@@ -1227,7 +1227,7 @@ async fn attachment_resume_failover_does_not_mix_locator_validators() {
     second_server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_resume_failed_fallback_preserves_prefix_across_reopen() {
     for case in [
         "interrupted",
@@ -1375,7 +1375,7 @@ async fn attachment_resume_failed_fallback_preserves_prefix_across_reopen() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_resume_cleanup_error_preserves_terminal_integrity_failure() {
     let (listener, reference, mut cipher) =
         listener_fixture(b"must remain a terminal hash failure").await;
@@ -1414,7 +1414,7 @@ async fn attachment_resume_cleanup_error_preserves_terminal_integrity_failure() 
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_resume_complete_small_body_does_not_write_checkpoint() {
     let (listener, reference, cipher) = listener_fixture(b"small complete attachment").await;
     let server = tokio::spawn(async move {
@@ -1453,7 +1453,7 @@ async fn attachment_resume_complete_small_body_does_not_write_checkpoint() {
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_resume_disabled_acquisition_still_prunes_expired_checkpoints() {
     let (_dir, mut client, store, reference) = offline_fixture().await;
     let job = claim(&store);
@@ -1495,7 +1495,7 @@ async fn attachment_resume_disabled_acquisition_still_prunes_expired_checkpoints
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_resume_hash_failure_clears_redirected_replacement() {
     let body = vec![17; ATTACHMENT_CHECKPOINT_BYTES * 2];
     let (first, mut reference, mut cipher) = listener_fixture(&body).await;
@@ -1579,7 +1579,7 @@ async fn attachment_resume_hash_failure_clears_redirected_replacement() {
     b.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_resume_hash_miss_retries_from_zero_after_reopen() {
     for complete_prefix in [false, true] {
         for fresh_is_valid in [false, true] {
@@ -1722,7 +1722,7 @@ async fn attachment_resume_hash_miss_retries_from_zero_after_reopen() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_controls_interrupt_http_and_release_capacity_without_publishing() {
     for disable in [false, true] {
         let (listener, reference, cipher) =
@@ -1824,7 +1824,7 @@ async fn attachment_controls_interrupt_http_and_release_capacity_without_publish
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_body_idle_deadline_releases_global_capacity_and_retries() {
     let (listener, reference, cipher) =
         listener_fixture(&vec![42; 2 * ATTACHMENT_CHECKPOINT_BYTES]).await;
@@ -1875,7 +1875,7 @@ async fn attachment_body_idle_deadline_releases_global_capacity_and_retries() {
     let _ = server.await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_http_attempt_budget_includes_transport_retries() {
     let (mut reference, _) = crate::media::tests::attachment_worker_fixture(b"bounded network");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1948,7 +1948,7 @@ async fn attachment_http_attempt_budget_includes_transport_retries() {
     server.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_revocation_prevents_retry_and_old_approval_cannot_restore_it() {
     let (mut reference, _) = crate::media::tests::attachment_worker_fixture(b"permission race");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2038,7 +2038,7 @@ async fn attachment_revocation_prevents_retry_and_old_approval_cannot_restore_it
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_retained_media_body_is_not_downloaded_again() {
     let (mut reference, ciphertext) =
         crate::media::tests::attachment_worker_fixture(b"one completed body");
@@ -2138,7 +2138,7 @@ async fn opt_in(client: &AppClient) {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_verified_http_body_publishes_after_permission_and_policy_revocation() {
     let body = b"verified before revocation";
     let (mut reference, ciphertext) = crate::media::tests::attachment_worker_fixture(body);
@@ -2213,7 +2213,7 @@ async fn attachment_verified_http_body_publishes_after_permission_and_policy_rev
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_revocation_waits_for_in_progress_verified_receipt() {
     let finishing = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let started = finishing.clone();
@@ -2247,7 +2247,7 @@ async fn attachment_revocation_waits_for_in_progress_verified_receipt() {
 
 /// Disk pressure on an opted-in body is not a timer retry (mdk#2239): the job
 /// parks as storage-blocked without a receipt, and readmits once the reserve fits.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_disk_pressure_parks_before_receipt_and_readmits_when_space_frees() {
     let body = b"disk pressure can recover";
     let (listener, reference, cipher) = listener_fixture(body).await;
@@ -2358,7 +2358,7 @@ async fn attachment_disk_pressure_parks_before_receipt_and_readmits_when_space_f
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_missing_on_every_locator_fails_without_retry() {
     let (first, mut reference, _) = listener_fixture(b"deleted from every server").await;
     let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2421,7 +2421,7 @@ async fn attachment_missing_on_every_locator_fails_without_retry() {
 
 /// A tap during a held HTTP body preserves its owner and deadline after revoking
 /// automatic permission; completion consumes exactly the original response.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_promoted_http_body_survives_automatic_revocation() {
     for pause_first in [false, true] {
         promoted_body_revocation_order(pause_first).await;
@@ -2456,10 +2456,9 @@ async fn promoted_body_revocation_order(pause_first: bool) {
             )
             .await
             .unwrap();
-        socket.write_all(&ciphertext[..1]).await.unwrap();
         started.send(()).unwrap();
         released.await.unwrap();
-        socket.write_all(&ciphertext[1..]).await.unwrap();
+        socket.write_all(&ciphertext).await.unwrap();
         drop(socket);
         assert!(
             tokio::time::timeout(Duration::from_millis(100), listener.accept())
@@ -2493,6 +2492,8 @@ async fn promoted_body_revocation_order(pause_first: bool) {
         &store.attachment_store_identity().unwrap(),
         &reference.media_type,
     );
+    let (updates, mut progress) = tokio::sync::watch::channel(());
+    resume.updates = Some(updates);
     let prepared = client
         .prepare_background_attachment_download(
             &GroupId::new(vec![0xab; 16]),
@@ -2503,6 +2504,12 @@ async fn promoted_body_revocation_order(pause_first: bool) {
         .unwrap();
     let transfer = tokio::spawn(prepared.run_classified(resume));
     start.await.unwrap();
+    // The body's restart checkpoint is the transfer's last durable write until
+    // the server sends bytes; storage changes before it would race it.
+    tokio::time::timeout(Duration::from_secs(5), progress.changed())
+        .await
+        .expect("transfer records its body restart")
+        .unwrap();
     if pause_first {
         // Freeze the durable pause before upgrading intent; the HTTP poll stays
         // held so the test controls the storage race rather than timer ordering.

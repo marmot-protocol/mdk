@@ -382,7 +382,7 @@ fn serve(
 /// same tick. Now the declared size parks the job before any body byte, the
 /// target includes the staging a retry needs, and the row stays parked until
 /// space frees.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn file_sink_without_validator_parks_once_inside_the_loop_window() {
     let plain = vec![0x5a; 32 * MIB as usize];
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -432,7 +432,7 @@ async fn file_sink_without_validator_parks_once_inside_the_loop_window() {
 /// check counts the checkpoint the download would add, so the job parks before
 /// fetching anything, the readmission wakes transfer subscribers, and the retry
 /// is a single fresh request.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn memory_sink_with_validator_parks_at_the_header_inside_the_loop_window() {
     let plain = vec![0x6b; 24 * MIB as usize];
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -502,7 +502,7 @@ async fn memory_sink_with_validator_parks_at_the_header_inside_the_loop_window()
 /// free. Refetches are bounded in time: each readmission waits out the park
 /// streak, which the test crosses by pinning the scheduler's clock at each due
 /// time instead of sleeping.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_length_parks_record_the_proven_need_and_back_off() {
     let plain = vec![0x7c; 8 * MIB as usize];
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -751,7 +751,7 @@ async fn park_mid_transfer() -> MidTransferPark {
 /// margin, the attempt restores the saved prefix, finishes with one Range
 /// request and publishes without parking again. A target that dropped the
 /// held staging or the remaining checkpoint growth would re-park here.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mid_transfer_park_readmits_at_its_target_and_resumes() {
     let MidTransferPark {
         mut fixture,
@@ -783,7 +783,7 @@ async fn mid_transfer_park_readmits_at_its_target_and_resumes() {
 /// Space shrinks after the whole body has arrived: the in-memory sink
 /// checkpoints the complete ciphertext, the job parks, and the readmitted
 /// attempt verifies and publishes locally without a second request.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pressure_after_the_body_arrives_parks_with_a_complete_checkpoint_and_readmits_offline() {
     let plain = vec![0x33; (2 * MIB + 71) as usize];
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -864,7 +864,7 @@ async fn pressure_after_the_body_arrives_parks_with_a_complete_checkpoint_and_re
 /// the free space seen at the refusal plus the body, so free space that merely
 /// looked sufficient does not refetch onto the same full disk; once the volume
 /// gains room the readmitted attempt publishes.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn memory_publication_onto_a_full_disk_parks_until_room_returns() {
     let plain = vec![0x44; (2 * MIB + 9) as usize];
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -927,7 +927,7 @@ async fn memory_publication_onto_a_full_disk_parks_until_room_returns() {
 /// A full disk during file-sink publication parks as well: the decrypted
 /// file this attempt held is counted into the target, the remembered file sink
 /// skips the header probe on readmission, and the retried attempt publishes.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn file_publication_onto_a_full_disk_parks_until_room_returns() {
     let plain = vec![0x45; (3 * MIB + 5) as usize];
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -992,7 +992,7 @@ async fn file_publication_onto_a_full_disk_parks_until_room_returns() {
 /// parked otherwise polls only every 30 seconds: readmission must wake it
 /// through the shared update signal, well inside that interval. The park
 /// itself always follows an active state and is signalled as well.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transfer_subscribers_see_park_and_readmission_without_the_active_refresh() {
     let plain = vec![0x6c; 2 * MIB as usize];
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

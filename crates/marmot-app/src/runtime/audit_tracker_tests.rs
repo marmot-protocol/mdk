@@ -233,7 +233,7 @@ fn tracker_config(endpoint: String) -> AuditLogTrackerConfig {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v5_catalog_failure_retains_completed_v4_result_and_requests_retry() {
     let tmp = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relay(tmp.path(), "wss://relay.example");
@@ -271,7 +271,7 @@ async fn v5_catalog_failure_retains_completed_v4_result_and_requests_retry() {
     assert_eq!(schedule.retry_after, Some(Duration::ZERO));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn automatic_pass_stops_on_auth_rate_limit_and_server_failure() {
     // 400 and 413 are the file-specific controls: with Retry-After present,
     // both are ordinary rejections, so the pass continues and the cooldown
@@ -309,7 +309,7 @@ async fn automatic_pass_stops_on_auth_rate_limit_and_server_failure() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bare_413_latches_the_file_while_any_retry_after_keeps_it_retryable() {
     // "\u{e9}" is obs-text: hyper accepts it, but `HeaderValue::to_str` does
     // not, so the header must count as present even without a readable value.
@@ -351,7 +351,7 @@ fn batch_window_override_is_local_to_one_uploader() {
     assert_eq!(second.duration(), Duration::from_secs(30));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redirected_tracker_upload_is_not_checkpointed_until_direct_success() {
     let tmp = tempfile::tempdir().unwrap();
     let home = marmot_account::AccountHome::open(tmp.path());

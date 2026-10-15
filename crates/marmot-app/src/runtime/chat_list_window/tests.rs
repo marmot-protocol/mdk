@@ -101,18 +101,28 @@ impl Fixture {
                 version: self.store.chat_presentation_version().unwrap(),
             });
     }
-    fn mutate(&self, id: &str, change: impl FnOnce(&mut storage_sqlite::StoredAccountGroup)) {
+    fn mutate(&self, id: &str, change: impl FnMut(&mut storage_sqlite::StoredAccountGroup)) {
+        self.mutate_all(&[id], change);
+    }
+    /// One background change to several groups, saved and signalled once.
+    fn mutate_all(
+        &self,
+        ids: &[&str],
+        mut change: impl FnMut(&mut storage_sqlite::StoredAccountGroup),
+    ) {
         let mut state = self
             .store
             .load_account_projection_state("alice", 100)
             .unwrap();
-        change(
-            state
-                .groups
-                .iter_mut()
-                .find(|g| g.group_id_hex == id)
-                .unwrap(),
-        );
+        for id in ids {
+            change(
+                state
+                    .groups
+                    .iter_mut()
+                    .find(|g| g.group_id_hex == *id)
+                    .unwrap(),
+            );
+        }
         self.store
             .save_account_projection_state(&state, 100, 120)
             .unwrap();
@@ -148,6 +158,20 @@ async fn next_with_unread(
         }
     }
 }
+/// The subscription keeps only the latest window, so a refresh that lands
+/// between two signals may be observed on its own; wait for the window that
+/// reflects the change instead of taking the next one.
+async fn next_where(
+    sub: &mut RuntimeChatListWindowSubscription,
+    reflects: impl Fn(&ChatListWindowSnapshot) -> bool,
+) -> ChatListWindowSnapshot {
+    loop {
+        let window = next(sub).await;
+        if reflects(&window) {
+            return window;
+        }
+    }
+}
 fn ids(window: &ChatListWindowSnapshot) -> Vec<&str> {
     window
         .rows
@@ -156,7 +180,7 @@ fn ids(window: &ChatListWindowSnapshot) -> Vec<&str> {
         .collect()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_window_prepares_only_selected_rows_and_never_opens_legacy_list() {
     let f = Fixture::new(240);
     let before = f.runtime.events.receiver_count();
@@ -224,7 +248,7 @@ async fn first_window_prepares_only_selected_rows_and_never_opens_legacy_list() 
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn paging_while_recv_waits_slides_capped_window_and_rejects_old_commands() {
     let f = Fixture::new(450);
     let mut sub = f
@@ -286,7 +310,7 @@ async fn paging_while_recv_waits_slides_capped_window_and_rejects_old_commands()
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commands_quoting_a_sequence_replaced_only_by_new_content_apply_to_the_current_viewport() {
     let f = Fixture::new(20);
     let mut sub = f
@@ -320,7 +344,7 @@ async fn commands_quoting_a_sequence_replaced_only_by_new_content_apply_to_the_c
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_command_that_leaves_the_viewport_in_place_does_not_supersede_sequences() {
     let f = Fixture::new(20);
     let sub = f
@@ -345,7 +369,7 @@ async fn a_command_that_leaves_the_viewport_in_place_does_not_supersede_sequence
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn anchor_dropped_by_a_background_replacement_is_stale_for_an_older_sequence() {
     let f = Fixture::new(20);
     let mut sub = f
@@ -370,7 +394,7 @@ async fn anchor_dropped_by_a_background_replacement_is_stale_for_an_older_sequen
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commands_quoting_an_unpublished_sequence_are_stale() {
     let f = Fixture::new(5);
     let sub = f
@@ -385,7 +409,7 @@ async fn commands_quoting_an_unpublished_sequence_are_stale() {
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn archive_and_anchor_loss_recover_neighbors_then_reset_without_stale_splicing() {
     let f = Fixture::new(20);
     let mut sub = f
@@ -397,35 +421,35 @@ async fn archive_and_anchor_loss_recover_neighbors_then_reset_without_stale_spli
     let anchored = h.set_visible_anchor(0, "0002").await.unwrap();
     let _ = next(&mut sub).await;
     f.mutate("0002", |g| g.archived = true);
-    let recovered = next(&mut sub).await;
+    let recovered = next_where(&mut sub, |w| !ids(w).contains(&"0002")).await;
     assert!(recovered.sequence > anchored.sequence);
     assert!(
-        matches!(&recovered.anchor,ChatListAnchorOutcome::Recovered{group_id_hex,index:2} if group_id_hex == "0003")
+        matches!(&recovered.anchor,ChatListAnchorOutcome::Recovered{group_id_hex,index:2} if group_id_hex == "0003"),
+        "{:?} {:?}",
+        recovered.anchor,
+        ids(&recovered)
     );
-    assert!(!ids(&recovered).contains(&"0002"));
     assert_eq!(ids(&recovered), ["0000", "0001", "0003", "0004", "0005"]);
     // Remove anchor and every following prior neighbor: prefer the previous neighbor.
-    for id in ["0003", "0004", "0005"] {
-        f.mutate(id, |g| g.archived = true);
-    }
-    let recovered = next(&mut sub).await;
+    f.mutate_all(&["0003", "0004", "0005"], |g| g.archived = true);
+    let recovered = next_where(&mut sub, |w| !ids(w).contains(&"0003")).await;
     assert!(
-        matches!(&recovered.anchor,ChatListAnchorOutcome::Recovered{group_id_hex,..} if group_id_hex == "0001")
+        matches!(&recovered.anchor,ChatListAnchorOutcome::Recovered{group_id_hex,..} if group_id_hex == "0001"),
+        "{:?} {:?}",
+        recovered.anchor,
+        ids(&recovered)
     );
-    let retained_ids = ids(&recovered)
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    for id in retained_ids {
-        f.mutate(&id, |g| g.archived = true);
-    }
-    let reset = next(&mut sub).await;
+    let first = ids(&recovered)[0].to_owned();
+    f.mutate_all(&ids(&recovered), |g| g.archived = true);
+    let reset = next_where(&mut sub, |w| !ids(w).contains(&first.as_str())).await;
     assert_eq!(reset.anchor, ChatListAnchorOutcome::Reset);
     assert!(!reset.has_more_before);
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+// Overflows the invalidation broadcast without yielding so the window must
+// recover from lag; only one thread guarantees it cannot drain meanwhile.
+#[tokio::test(flavor = "current_thread")]
 async fn lag_and_cancelled_receiver_recover_without_new_events_and_mutes_expire() {
     let f = Fixture::new(20);
     f.store
@@ -465,7 +489,7 @@ async fn lag_and_cancelled_receiver_recover_without_new_events_and_mutes_expire(
     assert!(sub.recv().await.unwrap().is_none());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn four_views_suppress_invite_and_left_badges_without_erasing_read_intent() {
     let f = Fixture::new(4);
     for id in ["0000", "0001", "0002", "0003"] {
@@ -515,7 +539,7 @@ async fn four_views_suppress_invite_and_left_badges_without_erasing_read_intent(
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_local_preparation_retries_without_another_invalidation() {
     let f = Fixture::new(20);
     let peer = "cc".repeat(32);
@@ -566,7 +590,7 @@ async fn failed_local_preparation_retries_without_another_invalidation() {
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accepted_command_outlives_caller_and_reopen_uses_new_generation() {
     let f = Fixture::new(20);
     let mut sub = f
@@ -606,7 +630,7 @@ async fn accepted_command_outlives_caller_and_reopen_uses_new_generation() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_projection_and_lifecycle_routes_update_each_view_directly() {
     let f = Fixture::new(20);
     let mut chats = f
@@ -645,7 +669,7 @@ async fn runtime_projection_and_lifecycle_routes_update_each_view_directly() {
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_deactivation_closes_idle_window_even_with_surviving_command_handle() {
     let f = Fixture::new(20);
     let mut sub = f
@@ -722,7 +746,7 @@ async fn initial_subscription_is_attached_before_a_concurrent_storage_commit() {
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authoritative_worker_acceptance_preserves_archive_and_rejoin_restores_owner_state() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -783,7 +807,7 @@ async fn authoritative_worker_acceptance_preserves_archive_and_rejoin_restores_o
         .unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn closing_storage_directly_terminates_an_idle_window() {
     let f = Fixture::new(20);
     let mut sub = f
@@ -802,7 +826,7 @@ async fn closing_storage_directly_terminates_an_idle_window() {
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn preview_sender_profile_commits_refresh_at_unchanged_selected_revision() {
     let f = Fixture::new(20);
     let sender = nostr::prelude::Keys::generate().public_key().to_hex();
@@ -896,7 +920,7 @@ async fn preview_sender_profile_commits_refresh_at_unchanged_selected_revision()
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn outside_view_navigation_changes_do_not_invalidate_visible_window_sequences() {
     let f = Fixture::new(20);
     f.mutate("0013", |g| g.archived = true);
@@ -921,7 +945,7 @@ async fn outside_view_navigation_changes_do_not_invalidate_visible_window_sequen
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn initial_open_repairs_multiple_base_batches_without_a_worker_or_full_list_warm() {
     let f = Fixture::with_base_rows(120, false);
     assert!(!f.store.pending_chat_presentation_rows().unwrap().is_empty());
@@ -945,7 +969,7 @@ async fn initial_open_repairs_multiple_base_batches_without_a_worker_or_full_lis
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invalid_window_query_is_distinct_from_readiness() {
     let f = Fixture::new(20);
     let reader = Reader {
@@ -970,7 +994,7 @@ async fn invalid_window_query_is_distinct_from_readiness() {
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lost_reset_signal_closes_window_even_when_the_durable_epoch_is_unchanged() {
     let f = Fixture::new(20);
     let mut sub = f
@@ -1008,7 +1032,7 @@ async fn lost_reset_signal_closes_window_even_when_the_durable_epoch_is_unchange
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn group_source_changes_refresh_selected_display_without_legacy_rebuild() {
     let f = Fixture::new(20);
     let mut sub = f
@@ -1025,15 +1049,17 @@ async fn group_source_changes_refresh_selected_display_without_legacy_rebuild() 
     )
     .unwrap();
     f.signal();
-    let updated = next(&mut sub).await;
-    assert!(
-        matches!(&updated.rows[0].presentation.title, PresentationText::Literal(name) if name == "Renamed group")
-    );
+    // The mutation's own signal may publish a window before the display is
+    // prepared.
+    next_where(&mut sub, |w| {
+        matches!(&w.rows[0].presentation.title, PresentationText::Literal(name) if name == "Renamed group")
+    })
+    .await;
     assert!(f.app.chat_list_projection_warmed.lock().unwrap().is_empty());
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn declined_invitation_rejoins_through_real_client_flow_and_restores_chats() {
     use crate::tests::{ScriptedPushRelayClient, remember_test_member_inbox};
     let dir = tempfile::tempdir().unwrap();
@@ -1135,7 +1161,7 @@ async fn declined_invitation_rejoins_through_real_client_flow_and_restores_chats
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn system_preview_resolves_subject_fallback_and_refreshes_profile_without_new_activity() {
     let f = Fixture::new(1);
     let actor = "bb".repeat(32);
@@ -1197,7 +1223,7 @@ async fn system_preview_resolves_subject_fallback_and_refreshes_profile_without_
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn avatar_batches_are_local_bounded_and_update_attached_windows_after_lag() {
     let f = Fixture::new(3);
     let mut sub = f
@@ -1325,7 +1351,7 @@ async fn avatar_batches_are_local_bounded_and_update_attached_windows_after_lag(
     reopened.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn draft_preview_updates_both_list_contracts_without_reordering_or_network() {
     let f = Fixture::with_base_rows(3, true);
     let mut window = f
@@ -1402,7 +1428,7 @@ async fn draft_preview_updates_both_list_contracts_without_reordering_or_network
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chat_list_draft_acceptance_rollback_and_lag_use_authoritative_store() {
     use cgka_traits::storage::{
         GroupStorage, OutboundIntentStorage, QueuedOutboundIntent, StorageProvider,
