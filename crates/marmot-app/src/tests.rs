@@ -23189,29 +23189,42 @@ fn assert_group_catching_up<T: std::fmt::Debug>(
     }
 }
 
-/// mdk#2158: while an attachment upload is in flight, this device holds its
-/// own due periodic self-update for the group, so a rotation cannot leave the
-/// finished upload unsendable. The rotation stays owed and runs once the upload
-/// ends.
-#[tokio::test]
-async fn an_in_flight_upload_holds_the_groups_self_update_until_it_ends() {
+/// Opens alice's client on an app that accepts loopback blob servers and
+/// creates a group for an upload hold test.
+async fn upload_hold_fixture(
+    name: &str,
+) -> (
+    tempfile::TempDir,
+    MarmotApp,
+    AppClient,
+    GroupId,
+    cgka_traits::EpochId,
+) {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap();
-    let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         "wss://relay.example",
         crate::MarmotAppConfig::default().with_allow_loopback_blob_endpoints(true),
     )
-    .with_test_relay_client(relay.clone());
+    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("uploading", &[]).await.unwrap();
+    let group_id = client.create_group(name, &[]).await.unwrap();
     let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
-    let upload = client
+    (dir, app, client, group_id, epoch)
+}
+
+/// Prepares an upload to `group_id` up to its HTTP step, which binds its media
+/// key to the group's epoch and starts its hold.
+async fn prepare_held_upload(
+    client: &mut AppClient,
+    group_id: &GroupId,
+) -> crate::client::EncryptedMediaUploadFinish {
+    let (_http, finish) = client
         .prepare_encrypted_media_upload(
-            &group_id,
+            group_id,
             crate::MediaUploadRequest {
                 attachments: vec![crate::MediaUploadAttachmentRequest {
                     file_name: "photo.bin".into(),
@@ -23228,20 +23241,23 @@ async fn an_in_flight_upload_holds_the_groups_self_update_until_it_ends() {
         )
         .await
         .unwrap();
+    finish
+}
 
-    client
+/// Makes a periodic self-update of `group_id` due now and runs a maintenance
+/// sweep, returning the failure code the obligation records: `upload_hold`
+/// when an upload holds it, none when it ran.
+async fn run_due_periodic_rotation(client: &mut AppClient, group_id: &GroupId) -> Option<String> {
+    let obligation_id = client
         .runtime
-        .schedule_manual_self_update(&group_id)
+        .schedule_manual_self_update(group_id)
         .unwrap();
     let mut obligation = client
         .runtime
         .session()
-        .maintenance_obligations()
+        .maintenance_obligation(&obligation_id)
         .unwrap()
-        .into_iter()
-        .next()
-        .expect("scheduled maintenance obligation");
-    // A periodic rotation that is due now; a manual one would go ahead.
+        .unwrap();
     obligation.trigger = cgka_traits::MaintenanceTrigger::Periodic;
     obligation.phase = cgka_traits::MaintenancePhase::Retry;
     client
@@ -23250,13 +23266,28 @@ async fn an_in_flight_upload_holds_the_groups_self_update_until_it_ends() {
         .put_maintenance_obligation(&obligation)
         .unwrap();
     client.run_due_maintenance().await.unwrap();
-    let held = client
+    client
         .runtime
         .session()
-        .maintenance_obligation(&obligation.id)
+        .maintenance_obligation(&obligation_id)
         .unwrap()
-        .unwrap();
-    assert_eq!(held.last_failure_code.as_deref(), Some("upload_hold"));
+        .and_then(|obligation| obligation.last_failure_code)
+}
+
+/// mdk#2158: while an attachment upload is in flight, this device holds its
+/// own due periodic self-update for the group, so a rotation cannot leave the
+/// finished upload unsendable. The rotation stays owed and runs once the upload
+/// ends.
+#[tokio::test]
+async fn an_in_flight_upload_holds_the_groups_self_update_until_it_ends() {
+    let (_dir, _app, mut client, group_id, epoch) = upload_hold_fixture("uploading").await;
+    let upload = prepare_held_upload(&mut client, &group_id).await;
+    assert_eq!(
+        run_due_periodic_rotation(&mut client, &group_id)
+            .await
+            .as_deref(),
+        Some("upload_hold")
+    );
     assert_eq!(client.runtime.group_record(&group_id).unwrap().epoch, epoch);
 
     // The upload ends (here: abandoned before its HTTP ran); the rotation runs.
@@ -23273,39 +23304,8 @@ async fn an_in_flight_upload_holds_the_groups_self_update_until_it_ends() {
 /// admission grace, so that send still finds the epoch the upload used.
 #[tokio::test]
 async fn an_upload_sent_separately_holds_its_group_through_admission() {
-    let dir = tempfile::tempdir().unwrap();
-    AccountHome::open(dir.path())
-        .create_account("alice")
-        .unwrap();
-    let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = MarmotApp::with_relay_and_config(
-        dir.path(),
-        "wss://relay.example",
-        crate::MarmotAppConfig::default().with_allow_loopback_blob_endpoints(true),
-    )
-    .with_test_relay_client(relay.clone());
-    let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("admitting", &[]).await.unwrap();
-    let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
-    let (_http, finish) = client
-        .prepare_encrypted_media_upload(
-            &group_id,
-            crate::MediaUploadRequest {
-                attachments: vec![crate::MediaUploadAttachmentRequest {
-                    file_name: "photo.bin".into(),
-                    media_type: "application/octet-stream".into(),
-                    plaintext: vec![7; 64],
-                    dim: None,
-                    thumbhash: None,
-                }],
-                caption: None,
-                send: false,
-                blossom_server: Some("http://127.0.0.1:9".into()),
-                message_tags: Vec::new(),
-            },
-        )
-        .await
-        .unwrap();
+    let (_dir, _app, mut client, group_id, epoch) = upload_hold_fixture("admitting").await;
+    let finish = prepare_held_upload(&mut client, &group_id).await;
     // The HTTP upload completed; the send follows in another command.
     let (reference, _) = crate::media::tests::attachment_worker_fixture(b"generated bytes");
     let result = crate::MediaUploadResult {
@@ -23319,32 +23319,12 @@ async fn an_upload_sent_separately_holds_its_group_through_admission() {
         .finish_encrypted_media_upload(finish, result, Vec::new())
         .await
         .unwrap();
-
-    let obligation_id = client
-        .runtime
-        .schedule_manual_self_update(&group_id)
-        .unwrap();
-    let mut obligation = client
-        .runtime
-        .session()
-        .maintenance_obligation(&obligation_id)
-        .unwrap()
-        .unwrap();
-    obligation.trigger = cgka_traits::MaintenanceTrigger::Periodic;
-    obligation.phase = cgka_traits::MaintenancePhase::Retry;
-    client
-        .runtime
-        .session()
-        .put_maintenance_obligation(&obligation)
-        .unwrap();
-    client.run_due_maintenance().await.unwrap();
-    let held = client
-        .runtime
-        .session()
-        .maintenance_obligation(&obligation_id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(held.last_failure_code.as_deref(), Some("upload_hold"));
+    assert_eq!(
+        run_due_periodic_rotation(&mut client, &group_id)
+            .await
+            .as_deref(),
+        Some("upload_hold")
+    );
     assert_eq!(client.runtime.group_record(&group_id).unwrap().epoch, epoch);
     assert!(
         client
@@ -23354,6 +23334,31 @@ async fn an_upload_sent_separately_holds_its_group_through_admission() {
             )
             .is_empty(),
         "the hold ends with the grace"
+    );
+}
+
+/// mdk#2158: an upload outlives the client that started it when the account
+/// worker rebuilds its client, as it does on reconnect, so the rebuilt client
+/// still holds the group's periodic self-update until the upload ends.
+#[tokio::test]
+async fn an_upload_holds_its_group_across_a_client_rebuild() {
+    let (_dir, app, mut client, group_id, epoch) = upload_hold_fixture("reconnecting").await;
+    let upload = prepare_held_upload(&mut client, &group_id).await;
+    drop(client);
+    let mut client = app.client("alice").await.unwrap();
+    assert_eq!(
+        run_due_periodic_rotation(&mut client, &group_id)
+            .await
+            .as_deref(),
+        Some("upload_hold")
+    );
+    assert_eq!(client.runtime.group_record(&group_id).unwrap().epoch, epoch);
+
+    drop(upload);
+    client.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        client.runtime.group_record(&group_id).unwrap().epoch.0,
+        epoch.0 + 1
     );
 }
 
