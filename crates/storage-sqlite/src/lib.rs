@@ -37,7 +37,7 @@ pub use delivery_spill::{
 };
 mod encrypted_media_secrets;
 mod media_catalog;
-pub use media_catalog::{SlotPublication, SqliteMediaCatalog};
+pub use media_catalog::{SlotPublication, SqliteMediaCatalog, media_storage_error};
 mod local_submissions;
 mod message_drafts;
 pub use local_submissions::LocalSubmission;
@@ -72,9 +72,9 @@ pub use attachment_acquisition::{
     ATTACHMENT_STAGING_CHUNK_BYTES, AttachmentAcquisition, AttachmentAcquisitionSource,
     AttachmentAcquisitionState, AttachmentAcquisitionStatus, AttachmentAssetRef, AttachmentDemand,
     AttachmentPartial, AttachmentPartialIdentity, AttachmentPermissionCategory,
-    AttachmentPublishResult, AttachmentUploadSource, AttachmentWorkerDemand,
+    AttachmentPublication, AttachmentPublishResult, AttachmentUploadSource, AttachmentWorkerDemand,
     MAX_ATTACHMENT_LOCAL_READ_BYTES, MAX_RETAINED_ATTACHMENT_BYTES,
-    MAX_RETAINED_FILE_ATTACHMENT_BYTES, RetainedAttachmentAsset,
+    MAX_RETAINED_FILE_ATTACHMENT_BYTES, RetainedAttachmentAsset, RetainedAttachmentRead,
 };
 pub use attachment_history::{
     AccountAttachmentCursor, AccountAttachmentEntry, AccountAttachmentHistoryError,

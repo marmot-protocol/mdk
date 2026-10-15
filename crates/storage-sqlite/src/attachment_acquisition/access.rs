@@ -21,13 +21,12 @@ impl SqliteAccountStorage {
         let conn = self.lock()?;
         conn.query_row(
             &format!(
-                "SELECT q.token,coalesce((SELECT byte_len FROM retained_attachment_files f WHERE f.token=q.token AND f.completed=1),length(b.bytes)),
+                "SELECT q.token,{RETAINED_BYTE_LEN},
                         (SELECT store_epoch FROM chat_presentation_meta WHERE id=1)
                  FROM attachment_acquisition q
-                 JOIN retained_attachment_bytes b USING(token)
                  WHERE q.group_id_hex=?1 AND q.message_id_hex=?2
                    AND q.source_message_id_hex=?3 AND q.attachment_index=?4
-                   AND q.state=3 AND {SOURCE_MATCH}
+                   AND q.state=3 AND {RETAINED_BODY} AND {SOURCE_MATCH}
                    AND (q.expires_at IS NULL OR q.expires_at>?5)"
             ),
             params![group, message, source, index, u64_to_i64(now)?],

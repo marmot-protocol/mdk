@@ -443,13 +443,20 @@ async fn download_without_engine_and_retain(
             "a deliberately retried outgoing receipt remains single-body; pure explicit received work keeps its existing contract"
         );
     }
-    complete_media_http(&mut client, done, &shared, &http).await;
+    complete_and_settle(&mut client, done, &shared, &http, &mut completions).await;
     assert_eq!(shared.attachment_transfer.available_permits(), 1);
     assert_eq!(
-        &*storage
-            .read_retained_attachment(&asset, crate::unix_now_seconds(), 0, 100)
-            .unwrap()
-            .unwrap(),
+        &*read_retained(
+            &storage,
+            &client.app,
+            &client.state.label,
+            &asset,
+            crate::unix_now_seconds(),
+            0,
+            100
+        )
+        .unwrap()
+        .unwrap(),
         b"retained worker bytes"
     );
     schedule(&client, &shared, &http, &mut admission).unwrap();
@@ -467,10 +474,17 @@ async fn download_without_engine_and_retain(
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let storage = app.account_storage("alice").unwrap();
     assert_eq!(
-        &*storage
-            .read_retained_attachment(&asset, crate::unix_now_seconds(), 0, 100)
-            .unwrap()
-            .unwrap(),
+        &*read_retained(
+            &storage,
+            &app,
+            "alice",
+            &asset,
+            crate::unix_now_seconds(),
+            0,
+            100
+        )
+        .unwrap()
+        .unwrap(),
         b"retained worker bytes"
     );
     stop_observing.send(()).unwrap();
@@ -791,13 +805,20 @@ fn attachment_explicit_retry_derives_an_uncached_source_epoch_key() {
             .expect("Retry must start the transfer")
             .unwrap();
         server.await.unwrap();
-        complete_media_http(&mut client, done, &shared, &http).await;
+        complete_and_settle(&mut client, done, &shared, &http, &mut completions).await;
         assert_eq!(transfer(), storage_sqlite::AttachmentTransferState::Ready);
         assert_eq!(
-            &*storage
-                .read_retained_attachment(&asset, crate::unix_now_seconds(), 0, 100)
-                .unwrap()
-                .unwrap(),
+            &*read_retained(
+                &storage,
+                &client.app,
+                &client.state.label,
+                &asset,
+                crate::unix_now_seconds(),
+                0,
+                100
+            )
+            .unwrap()
+            .unwrap(),
             b"anchored bytes"
         );
     });
@@ -840,14 +861,20 @@ async fn attachment_restart_reclaims_inflight_and_late_publication_cannot_win() 
             file_name: "fixture.bin".into(),
             media_type: "application/octet-stream".into(),
         }),
-        10000,
     )
     .unwrap();
     assert!(
-        storage
-            .read_retained_attachment(&asset, now, 0, 100)
-            .unwrap()
-            .is_none()
+        read_retained(
+            &storage,
+            &client.app,
+            &client.state.label,
+            &asset,
+            now,
+            0,
+            100
+        )
+        .unwrap()
+        .is_none()
     );
     let next = storage
         .claim_attachment_acquisition(&asset, now, now + LEASE_SECONDS)
@@ -865,14 +892,20 @@ async fn attachment_restart_reclaims_inflight_and_late_publication_cannot_win() 
             file_name: "fixture.bin".into(),
             media_type: "application/octet-stream".into(),
         }),
-        10000,
     )
     .unwrap();
     assert!(
-        storage
-            .read_retained_attachment(&asset, now, 0, 100)
-            .unwrap()
-            .is_none()
+        read_retained(
+            &storage,
+            &client.app,
+            &client.state.label,
+            &asset,
+            now,
+            0,
+            100
+        )
+        .unwrap()
+        .is_none()
     );
 }
 
@@ -905,7 +938,6 @@ async fn attachment_publication_digest_bug_is_terminal_and_native_default_is_on(
             file_name: "fixture.bin".into(),
             media_type: "application/octet-stream".into(),
         }),
-        10000,
     )
     .unwrap();
     let status = storage
@@ -1420,4 +1452,60 @@ async fn outgoing_retention_failure_preserves_all_source_projection_paths() {
 #[tokio::test]
 async fn attachment_worker_quarantined_outgoing_retry_downloads_once_and_retains() {
     download_without_engine_and_retain(true, "sent", false).await;
+}
+
+/// Reads a retained body the way the runtime does: the database authorizes
+/// and locates it, and a media-file body is read through the account's store.
+pub(super) fn read_retained(
+    storage: &SqliteAccountStorage,
+    app: &crate::MarmotApp,
+    label: &str,
+    reference: &storage_sqlite::AttachmentAssetRef,
+    now: u64,
+    offset: u64,
+    limit: usize,
+) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, AppError> {
+    match storage.retained_attachment_read(reference, now, offset, limit)? {
+        None => Ok(None),
+        Some(storage_sqlite::RetainedAttachmentRead::Bytes(bytes)) => Ok(Some(bytes)),
+        Some(storage_sqlite::RetainedAttachmentRead::MediaFile(id)) => {
+            let media = app.account_media_store(label)?;
+            let mut bytes = zeroize::Zeroizing::new(vec![0; limit]);
+            let Some(read) = media
+                .read_at(&id, offset, &mut bytes)
+                .map_err(storage_sqlite::media_storage_error)?
+            else {
+                return Ok(None);
+            };
+            bytes.truncate(read);
+            Ok(Some(bytes))
+        }
+    }
+}
+
+/// Processes a media completion the way the worker loop does, including the
+/// follow-up that a body's publication on the blocking pool sends back.
+pub(super) async fn complete_and_settle(
+    client: &mut AppClient,
+    done: MediaHttpDone,
+    shared: &RuntimeSharedServices,
+    http: &MediaHttpContext,
+    completions: &mut mpsc::UnboundedReceiver<MediaHttpDone>,
+) {
+    let publishes = matches!(
+        &done.completion,
+        MediaHttpCompletion::Attachment { result: Ok(_), .. }
+    );
+    complete_media_http(client, done, shared, http).await;
+    if publishes {
+        let retained = tokio::time::timeout(Duration::from_secs(60), completions.recv())
+            .await
+            .expect("publication finishes on the blocking pool")
+            .expect("publication completion");
+        assert!(matches!(
+            retained.completion,
+            MediaHttpCompletion::AttachmentRetained { .. }
+        ));
+        complete_media_http(client, retained, shared, http).await;
+    }
 }

@@ -581,6 +581,9 @@ pub(crate) struct EncryptedMediaDownloadHttp {
 pub(crate) enum AcquiredMediaBody {
     Memory(MediaDownloadResult),
     File(crate::media::file_transfer::PrivateMediaFile),
+    /// Completed without a body: identical content was already retained in
+    /// the media store, or the job no longer needed one.
+    Retained,
 }
 
 impl EncryptedMediaDownloadHttp {

@@ -103,6 +103,8 @@ struct Inner<C> {
     in_flight: Mutex<HashSet<FileId>>,
     sweep: Mutex<SweepCursor>,
     readers: Mutex<Vec<CachedReader>>,
+    #[cfg(any(test, feature = "test-support"))]
+    full_disk_for_test: AtomicBool,
 }
 
 impl<C: MediaCatalog> Inner<C> {
@@ -198,6 +200,8 @@ impl<C: MediaCatalog> MediaStore<C> {
                 in_flight: Mutex::new(HashSet::new()),
                 sweep: Mutex::new(SweepCursor::default()),
                 readers: Mutex::new(Vec::new()),
+                #[cfg(any(test, feature = "test-support"))]
+                full_disk_for_test: AtomicBool::new(false),
             }),
         }
     }
@@ -213,6 +217,13 @@ impl<C: MediaCatalog> MediaStore<C> {
     pub fn close(&self) {
         self.inner.closed.store(true, Ordering::Release);
         lock(&self.inner.readers).clear();
+    }
+
+    /// Makes every publication fail as if the disk were full, until reset.
+    /// Test support only.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn simulate_full_disk_for_test(&self, full: bool) {
+        self.inner.full_disk_for_test.store(full, Ordering::Release);
     }
 
     /// Drops a cached reader (and the key it holds) for `id`.
@@ -257,14 +268,8 @@ impl<C: MediaCatalog> MediaStore<C> {
         now: u64,
         cancelled: &dyn Fn() -> bool,
     ) -> MediaResult<PublishOutcome> {
-        self.inner.ensure_open()?;
-        if target.superseded()? {
-            return Ok(PublishOutcome::Superseded);
-        }
-        match target.commit_existing(category, &digest, &|id| self.present(id))? {
-            ExistingOutcome::Attached(id) => return Ok(PublishOutcome::Existing(id)),
-            ExistingOutcome::Superseded => return Ok(PublishOutcome::Superseded),
-            ExistingOutcome::None => {}
+        if let Some(outcome) = self.attach_existing(target, category, &digest)? {
+            return Ok(outcome);
         }
         let (id, key, _in_flight) = self.insert_pending(category, byte_len, &digest, now)?;
         let result = self
@@ -289,6 +294,28 @@ impl<C: MediaCatalog> MediaStore<C> {
                 Err(error)
             }
         }
+    }
+
+    /// Attaches `target` to a ready file with this content whose file is on
+    /// disk, writing nothing: the check before downloading a body. `None`
+    /// means there is no such file and the body is needed.
+    pub fn attach_existing(
+        &self,
+        target: &dyn PublishTarget,
+        category: Category,
+        digest: &[u8; 32],
+    ) -> MediaResult<Option<PublishOutcome>> {
+        self.inner.ensure_open()?;
+        if target.superseded()? {
+            return Ok(Some(PublishOutcome::Superseded));
+        }
+        Ok(
+            match target.commit_existing(category, digest, &|id| self.present(id))? {
+                ExistingOutcome::Attached(id) => Some(PublishOutcome::Existing(id)),
+                ExistingOutcome::Superseded => Some(PublishOutcome::Superseded),
+                ExistingOutcome::None => None,
+            },
+        )
     }
 
     /// Step 1: the intent row, registered as in flight before it commits.
@@ -328,6 +355,10 @@ impl<C: MediaCatalog> MediaStore<C> {
         digest: &[u8; 32],
         cancelled: &dyn Fn() -> bool,
     ) -> MediaResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        if self.inner.full_disk_for_test.load(Ordering::Acquire) {
+            return Err(MediaError::Capacity);
+        }
         fs_private::create_dir_all_private(&self.shard_dir(id.0[0])).map_err(|e| io_error(&e))?;
         let file = fs_private::create_new_private(&self.path(id)).map_err(|e| io_error(&e))?;
         let mut writer = MediaFileWriter::new(file, key, &id.0)?;

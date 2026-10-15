@@ -3860,7 +3860,6 @@ enum MediaHttpCompletion {
     Attachment {
         job: storage_sqlite::AttachmentAcquisition,
         result: Result<crate::client::AcquiredMediaBody, crate::media::AttachmentDownloadFailure>,
-        byte_budget: u64,
         background_permit: OwnedSemaphorePermit,
     },
     Avatar {
@@ -4068,11 +4067,13 @@ async fn complete_media_http(
         MediaHttpCompletion::Attachment {
             job,
             result,
-            byte_budget,
             background_permit,
         } => {
-            if let Ok(crate::client::AcquiredMediaBody::File(file)) = result {
+            // A body is published into the media store on the blocking pool
+            // (file I/O, hashing, AEAD); a failure is a database update.
+            if result.is_ok() {
                 let storage = client.app.account_storage(&client.state.label);
+                let media = client.app.account_media_store(&client.state.label);
                 let fallback = super::attachment_controls::default_policy(&client.app.config);
                 let directory = client.app.account_dir(&client.state.label);
                 let tx = media_http.tx.clone();
@@ -4084,11 +4085,11 @@ async fn complete_media_http(
                     let result = storage.and_then(|storage| {
                         attachments::complete_acquired_stored(
                             &storage,
+                            &media?,
                             &fallback,
                             &directory,
                             &job,
-                            Ok(crate::client::AcquiredMediaBody::File(file)),
-                            byte_budget,
+                            result,
                             &|| lifecycle.is_stopping() || lifetime.has_changed().is_err(),
                         )
                     });
@@ -4103,7 +4104,7 @@ async fn complete_media_http(
                 });
                 return;
             }
-            if attachments::complete_acquired(client, &job, result, byte_budget).is_err() {
+            if attachments::complete_acquired(client, &job, result).is_err() {
                 tracing::warn!(target: "marmot_app::runtime", method = "attachment_acquisition",
                     "attachment completion failed; durable lease permits recovery");
             }

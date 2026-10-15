@@ -3767,6 +3767,7 @@ dependencies = [
  "marmot-account",
  "marmot-forensics",
  "marmot-markdown",
+ "media-store",
  "nostr 0.45.5",
  "nostr-relay-builder",
  "nostr-sdk",

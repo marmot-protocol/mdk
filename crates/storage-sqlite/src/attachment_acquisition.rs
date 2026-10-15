@@ -137,6 +137,12 @@ fn matches_store(conn: &Connection, reference: &AttachmentAssetRef) -> StorageRe
 
 // Deliberately independent of timeline row identity and sort/received timestamps.
 // Repairs may recreate rows; only changed attachment source material invalidates.
+/// A completed body exists for `q.token`: a legacy SQLCipher row or a ready
+/// media file (mdk#2314). Every "is the body retained" check uses this.
+pub(crate) const RETAINED_BODY: &str = "(EXISTS(SELECT 1 FROM retained_attachment_bytes rb WHERE rb.token=q.token) OR EXISTS(SELECT 1 FROM media_file_refs mr JOIN media_files mf ON mf.id=mr.file_id WHERE mr.token=q.token AND mf.state=1))";
+/// Plaintext length of `q.token`'s retained body, preferring a ready media
+/// file over legacy chunked and single-row bodies.
+pub(crate) const RETAINED_BYTE_LEN: &str = "coalesce((SELECT mf.byte_len FROM media_file_refs mr JOIN media_files mf ON mf.id=mr.file_id WHERE mr.token=q.token AND mf.state=1),(SELECT byte_len FROM retained_attachment_files f WHERE f.token=q.token AND f.completed=1),(SELECT length(bytes) FROM retained_attachment_bytes b WHERE b.token=q.token),0)";
 const SOURCE_MATCH: &str = "EXISTS(SELECT 1 FROM attachment_history h
  WHERE h.group_id_hex=q.group_id_hex AND h.message_id_hex=q.message_id_hex
  AND h.attachment_index=q.attachment_index AND h.source_message_id_hex=q.source_message_id_hex
@@ -802,6 +808,9 @@ impl SqliteAccountStorage {
                 "INSERT INTO attachment_removal_suppression VALUES(?1,?2,?3) ON CONFLICT DO NOTHING",
                 params![group, message, index],
             ).storage()?;
+            // A media-backed body's reference cascades away with the job; the
+            // last reference deletes the file's key, and the media store's
+            // sweep unlinks the file.
             conn.execute(
                 "DELETE FROM attachment_acquisition
                  WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3",
@@ -859,18 +868,25 @@ impl SqliteAccountStorage {
         if !matches_store(&conn, reference)? {
             return Ok(None);
         }
-        let row = conn.query_row(
-            "SELECT state,attempts,due,
-                CASE WHEN q.state=3 THEN COALESCE((SELECT byte_len FROM retained_attachment_files f WHERE f.token=q.token AND f.completed=1),(SELECT length(bytes) FROM retained_attachment_bytes b WHERE b.token=q.token),0) ELSE 0 END
-             FROM attachment_acquisition q WHERE token=?1",
-            [&reference.token],
-            |r| Ok((
-                r.get::<_, u8>(0)?,
-                nonnegative(r, 1)?,
-                r.get::<_, Option<i64>>(2)?,
-                nonnegative(r, 3)?,
-            )),
-        ).optional().storage()?;
+        let row = conn
+            .query_row(
+                &format!(
+                    "SELECT state,attempts,due,
+                CASE WHEN q.state=3 THEN {RETAINED_BYTE_LEN} ELSE 0 END
+             FROM attachment_acquisition q WHERE token=?1"
+                ),
+                [&reference.token],
+                |r| {
+                    Ok((
+                        r.get::<_, u8>(0)?,
+                        nonnegative(r, 1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                        nonnegative(r, 3)?,
+                    ))
+                },
+            )
+            .optional()
+            .storage()?;
         row.map(|(state, attempts, due, byte_count)| {
             Ok(AttachmentAcquisitionStatus {
                 state: match state {
@@ -893,9 +909,9 @@ impl SqliteAccountStorage {
         })
         .transpose()
     }
-    /// Bounded local read after source visibility/expiry checks. No download is
-    /// started; None means unavailable or obsolete. Returned plaintext is wiped
-    /// on drop. Hosts must not interpret a handle as a permanent authorization.
+    /// Bounded local read of a database-backed body after source visibility
+    /// and expiry checks. Use `retained_attachment_read`, which also locates
+    /// media-file bodies; this returns an error for one.
     pub fn read_retained_attachment(
         &self,
         reference: &AttachmentAssetRef,
@@ -903,6 +919,27 @@ impl SqliteAccountStorage {
         offset: u64,
         limit: usize,
     ) -> StorageResult<Option<Zeroizing<Vec<u8>>>> {
+        match self.retained_attachment_read(reference, now, offset, limit)? {
+            None => Ok(None),
+            Some(RetainedAttachmentRead::Bytes(bytes)) => Ok(Some(bytes)),
+            Some(RetainedAttachmentRead::MediaFile(_)) => Err(invalid(
+                "retained attachment is a media file; read it through the media store",
+            )),
+        }
+    }
+
+    /// Bounded local read after source visibility/expiry checks. No download is
+    /// started; None means unavailable or obsolete. A legacy database body is
+    /// read here (wiped on drop); a media-file body is returned as its file id
+    /// for the caller to read through the media store, off any async thread.
+    /// Hosts must not interpret a handle as a permanent authorization.
+    pub fn retained_attachment_read(
+        &self,
+        reference: &AttachmentAssetRef,
+        now: u64,
+        offset: u64,
+        limit: usize,
+    ) -> StorageResult<Option<RetainedAttachmentRead>> {
         if limit == 0 || limit > MAX_ATTACHMENT_LOCAL_READ_BYTES {
             return Err(invalid("invalid attachment local read limit"));
         }
@@ -913,26 +950,36 @@ impl SqliteAccountStorage {
             if !matches_store(conn, reference)? {
                 return Ok(None);
             }
-            // Select only the row identity. SQL substr(bytes, ...) materializes
-            // the whole value inside SQLite before slicing it.
-            let row_id: Option<i64> = conn
+            // Select only the body identities. SQL substr(bytes, ...)
+            // materializes the whole value inside SQLite before slicing it.
+            let row: Option<(Option<Vec<u8>>, Option<i64>)> = conn
                 .query_row(
                     &format!(
-                        "SELECT b.rowid FROM attachment_acquisition q
-                    JOIN retained_attachment_bytes b USING(token)
+                        "SELECT (SELECT mr.file_id FROM media_file_refs mr JOIN media_files mf ON mf.id=mr.file_id
+                            WHERE mr.token=q.token AND mf.state=1),
+                        (SELECT b.rowid FROM retained_attachment_bytes b WHERE b.token=q.token)
+                    FROM attachment_acquisition q
                     WHERE token=?1 AND state=3 AND {SOURCE_MATCH}
                     AND (expires_at IS NULL OR expires_at>?2)"
                     ),
                     params![reference.token, now],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()
                 .storage()?;
+            let Some((media, row_id)) = row else {
+                return Ok(None);
+            };
+            if let Some(id) = media {
+                let id = media_store::FileId::from_slice(&id)
+                    .ok_or_else(|| StorageError::Corruption("invalid media file id".into()))?;
+                return Ok(Some(RetainedAttachmentRead::MediaFile(id)));
+            }
             let Some(row_id) = row_id else {
                 return Ok(None);
             };
             if let Some(bytes) = file_import::read(conn, &reference.token, offset, limit)? {
-                return Ok(Some(bytes));
+                return Ok(Some(RetainedAttachmentRead::Bytes(bytes)));
             }
             let blob = conn
                 .blob_open("main", "retained_attachment_bytes", "bytes", row_id, true)
@@ -943,7 +990,7 @@ impl SqliteAccountStorage {
                 blob.read_at_exact(&mut bytes, offset).storage()?;
             }
             blob.close().storage()?;
-            Ok(Some(bytes))
+            Ok(Some(RetainedAttachmentRead::Bytes(bytes)))
         })
     }
     /// One bounded maintenance pass. Source pruning separately cascades deletion;
@@ -993,18 +1040,15 @@ impl SqliteAccountStorage {
     }
 }
 
-/// Shared publication admission: store, attempt, lease, source, acceptance and
-/// expiry fences, then the retained+partial quota (excluding this job's own
-/// partial reservation). `Some` is the refusal to return without inserting.
-fn publication_refusal(
+/// Store, attempt, lease, source, acceptance and expiry fences shared by every
+/// publication path. `true` means this attempt no longer owns the job.
+pub(crate) fn publication_superseded(
     conn: &Connection,
     job: &AttachmentAcquisition,
     now: i64,
-    len: u64,
-    byte_budget: u64,
-) -> StorageResult<Option<AttachmentPublishResult>> {
+) -> StorageResult<bool> {
     if !matches_store(conn, &job.reference)? {
-        return Ok(Some(AttachmentPublishResult::Superseded));
+        return Ok(true);
     }
     let valid: bool = conn
         .query_row(
@@ -1018,7 +1062,21 @@ fn publication_refusal(
             |r| r.get(0),
         )
         .storage()?;
-    if !valid {
+    Ok(!valid)
+}
+
+/// Shared SQLCipher publication admission: the fences, then the
+/// retained+partial quota (excluding this job's own partial reservation).
+/// `Some` is the refusal to return without inserting. Media-file publication
+/// applies the fences only: free disk is its limit.
+fn publication_refusal(
+    conn: &Connection,
+    job: &AttachmentAcquisition,
+    now: i64,
+    len: u64,
+    byte_budget: u64,
+) -> StorageResult<Option<AttachmentPublishResult>> {
+    if publication_superseded(conn, job, now)? {
         return Ok(Some(AttachmentPublishResult::Superseded));
     }
     let used: u64 = conn
@@ -1052,6 +1110,14 @@ fn publication_refusal(
     }
     Ok(None)
 }
+/// Where a retained body's bytes are.
+pub enum RetainedAttachmentRead {
+    /// A legacy body read from the account database.
+    Bytes(Zeroizing<Vec<u8>>),
+    /// A body in the encrypted media store: read it there.
+    MediaFile(media_store::FileId),
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -1063,6 +1129,8 @@ pub use partial::{
 
 mod file_import;
 mod file_staging;
+mod media;
+pub use media::AttachmentPublication;
 
 mod access;
 pub use access::RetainedAttachmentAsset;

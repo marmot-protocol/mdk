@@ -27,3 +27,6 @@ tempfile.workspace = true
 # Exports the catalog conformance suite so a `MediaCatalog` implementation in
 # another crate (storage-sqlite) can run it against its real database.
 catalog-conformance = []
+# Inert test hooks for dependents' tests (a simulated full disk). Nothing
+# happens unless a test calls one; release builds never enable it.
+test-support = []

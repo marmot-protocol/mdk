@@ -23,7 +23,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `avatar_access.rs` (bounded local native batches), `attachment_history.rs` (bounded local attachment discovery and
   shared-parser presentation), `attachment_access.rs` (read-only source-slot availability and verified local byte
   ranges), and `account_worker/attachments.rs` (durable attachment demand admission, fair background transfer capacity
-  and retained-byte publication). Other runtime modules are listed in the Code map below. Keep `mod.rs` re-exporting the
+  and publication into the account's media store). Other runtime modules are listed in the Code map below. Keep `mod.rs` re-exporting the
   moved public types so `crate::runtime::Item` and the `marmot_app::...` paths stay stable.
 - Keep app-client commands and query methods in the `src/client/` module; the crate root should construct clients but
   not absorb their behavior again. The `AppClient` inherent impl is split across the module along these seams: `mod.rs`
@@ -62,6 +62,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `media-staging/`, streaming EVP ChaCha20-Poly1305 that reproduces the in-memory wire bytes, and the
   `MediaFileTransferControl` cancellation/progress handle. Prepare every snapshot before the first PUT, keep chunks
   at 64 KiB, and stage retention through `stage_attachment_upload_files` (never a whole-file `Vec`).
+- Downloaded attachment bodies are retained in the account's encrypted media store (`media-store` crate,
+  `MarmotApp::account_media_store`, one per account; mdk#2314). Every media store call (publish, reuse check, reads,
+  sweep) runs on the blocking pool, never inline on an account worker or other async task: file I/O, hashing and AEAD
+  would stall every account under UniFFI's single runtime thread. The database authorizes and locates each read
+  (`retained_attachment_read`) before the store reads the file. Media stores close through `close_registry.rs`, the
+  closure registry `close_storage` runs; register any other runtime-owned closeable handle there too.
 - Never discard the shared `imeta` parser's verdict in a projection (mdk#1787). `parse_media_attachment` returns a
   typed `MediaAttachmentRejection` whose `kind` is judged version-first so it does not depend on field order, and
   `media_attachment_outcomes_from_tags` / `media_attachment_outcomes_from_media_json` yield ordered per-attachment
@@ -276,6 +282,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 ## Code map (modules not covered above)
 
 - Crate root `src/`: `config.rs` (`MarmotAppConfig`, service endpoints, attachment acquisition policy), `error.rs`,
+  `close_registry.rs` (terminal-close closures for runtime-owned handles outside the storage caches),
   `ids.rs` (npub/nprofile/account-ref helpers), `drafts.rs` (encrypted per-account composer drafts),
   `chat_presentation.rs` + `chat_presentation/` (shared selected-chat presentation policy and maintenance),
   `conversation_presentation/` (C5 header, capability, and window selectors; they never subscribe, acknowledge
