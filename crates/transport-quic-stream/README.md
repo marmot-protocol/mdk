@@ -14,6 +14,8 @@ orchestration stay in higher layers.
   wildcard source bind is not authorization of the remote address: `SendTextStream` callers must supply an already
   validated and pinned `SocketAddr` plus configuration-derived trust/`server_name`. The API has no resolver or
   dev-flag context and does not infer permission from the destination IP.
+- Verifies servers under default (`ServerTrust::Platform`) trust against the bundled Mozilla roots (`webpki-roots`), the
+  same anchors relays and HTTP use, on every platform. A pinned certificate replaces those roots.
 - Parses and validates adopted `quic://host:port` broker candidates (`QuicCandidate`, bounded to 512 bytes).
 - Seals and opens length-delimited preview records with HKDF-derived keys and AAD.
 - Sends and receives text-stream preview chunks over ordered QUIC streams.

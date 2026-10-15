@@ -4912,8 +4912,9 @@ typedef struct MarmotPublisherAck {
 } MarmotPublisherAck;
 
 /**
- * Borrowed broker options. NULL certificate with zero length selects
- * platform trust. `trust` is a `MarmotPublisherTrust` discriminant.
+ * Borrowed broker options. NULL certificate with zero length selects the
+ * bundled public-CA roots (not the OS trust store). `trust` is a
+ * `MarmotPublisherTrust` discriminant.
  */
 typedef struct MarmotPublisherOptions {
   const char *candidate;
@@ -11051,7 +11052,8 @@ void marmot_agent_stream_subscription_free(struct MarmotAgentStreamSubscription 
  * Watch a live agent text stream over the brokered QUIC channel. Pass
  * `stream_id_hex = NULL` to follow the latest stream in the group.
  * `server_cert_der` (+ `server_cert_der_len`) pins a self-signed broker
- * certificate; pass NULL with length 0 to use platform trust. The bytes
+ * certificate; pass NULL with length 0 to use the bundled public-CA roots
+ * (not the OS trust store). The bytes
  * are copied — the caller keeps ownership. `insecure_local` is
  * loopback-only for testing. Free with
  * `marmot_agent_stream_subscription_free`.

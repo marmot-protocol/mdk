@@ -115,9 +115,10 @@ keyring-core = "1"
 quinn = { version = "0.11", default-features = false, features = ["log", "runtime-tokio", "rustls-ring"] }
 rcgen = "0.14"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
-# Direct verifier for the transports' ALPN-carrying Rustls client configs.
-# Quinn's convenience verifier feature is unused and would add a second copy.
-rustls-platform-verifier = "0.6"
+# Bundled Mozilla roots for the QUIC preview transports' default trust: the
+# same anchors relay WebSockets and HTTP use (via tokio-tungstenite/reqwest).
+# The OS verifier needs JNI setup on Android that MarmotKit hosts never run.
+webpki-roots = "1.0"
 nostr = { git = "https://github.com/erskingardner/rust-nostr", rev = "a9c7a6423d104c603de6ea8244265ea17f0f9d89", default-features = false, features = ["std", "rand", "os-rng", "nip04", "nip49", "nip59"] }
 nostr-sdk = { git = "https://github.com/erskingardner/rust-nostr", rev = "a9c7a6423d104c603de6ea8244265ea17f0f9d89", features = ["local-relay"] }
 nostr-gossip = { git = "https://github.com/erskingardner/rust-nostr", rev = "a9c7a6423d104c603de6ea8244265ea17f0f9d89" }
