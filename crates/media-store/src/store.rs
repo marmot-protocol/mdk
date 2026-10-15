@@ -31,6 +31,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -43,6 +44,12 @@ use crate::error::{MediaError, MediaResult, io_error};
 use crate::format::{FILE_ID_BYTES, FILE_KEY_BYTES, FileKey, MediaFileReader, MediaFileWriter};
 
 const COPY_CHUNK_BYTES: usize = 1024 * 1024;
+/// Open readers kept for sequential offset reads (`read_attachment_asset`
+/// reads at most 1 MiB per call), so each window skips the key lookup and the
+/// file open. Small, and dropped after a short idle time so a cached key does
+/// not outlive its use.
+const READER_CACHE_ENTRIES: usize = 4;
+const READER_CACHE_IDLE: Duration = Duration::from_secs(30);
 const TRACE_TARGET: &str = "media_store";
 
 /// Directory name of the store inside an account directory.
@@ -83,12 +90,19 @@ struct SweepCursor {
     name: Option<String>,
 }
 
+struct CachedReader {
+    id: FileId,
+    reader: MediaFileReader<File>,
+    used: Instant,
+}
+
 struct Inner<C> {
     root: PathBuf,
     catalog: C,
     closed: AtomicBool,
     in_flight: Mutex<HashSet<FileId>>,
     sweep: Mutex<SweepCursor>,
+    readers: Mutex<Vec<CachedReader>>,
 }
 
 impl<C: MediaCatalog> Inner<C> {
@@ -183,6 +197,7 @@ impl<C: MediaCatalog> MediaStore<C> {
                 closed: AtomicBool::new(false),
                 in_flight: Mutex::new(HashSet::new()),
                 sweep: Mutex::new(SweepCursor::default()),
+                readers: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -197,6 +212,12 @@ impl<C: MediaCatalog> MediaStore<C> {
     /// to release.
     pub fn close(&self) {
         self.inner.closed.store(true, Ordering::Release);
+        lock(&self.inner.readers).clear();
+    }
+
+    /// Drops a cached reader (and the key it holds) for `id`.
+    fn forget_reader(&self, id: &FileId) {
+        lock(&self.inner.readers).retain(|cached| cached.id != *id);
     }
 
     pub fn is_closed(&self) -> bool {
@@ -212,6 +233,7 @@ impl<C: MediaCatalog> MediaStore<C> {
         self.shard_dir(id.0[0]).join(hex::encode(id.0))
     }
 
+    /// One `stat`: the only file I/O a catalog transaction may wait on.
     fn present(&self, id: FileId) -> bool {
         std::fs::symlink_metadata(self.path(&id)).is_ok()
     }
@@ -355,8 +377,17 @@ impl<C: MediaCatalog> MediaStore<C> {
     }
 
     /// Opens a ready file for offset reads. `None` means there is no ready
-    /// file; a ready row whose file is missing is marked lost first.
+    /// file; a ready row whose file is missing is marked lost first. The
+    /// reader holds the file's key, so its reads need no catalog lookup.
     pub fn open_reader(&self, id: &FileId) -> MediaResult<Option<MediaReader<C>>> {
+        Ok(self.open_file_reader(id)?.map(|reader| MediaReader {
+            inner: self.inner.clone(),
+            reader,
+            position: 0,
+        }))
+    }
+
+    fn open_file_reader(&self, id: &FileId) -> MediaResult<Option<MediaFileReader<File>>> {
         self.inner.ensure_open()?;
         let Some(row) = self.inner.catalog.ready_file(*id)? else {
             return Ok(None);
@@ -375,25 +406,55 @@ impl<C: MediaCatalog> MediaStore<C> {
                 "media file length differs from its row",
             ));
         }
-        Ok(Some(MediaReader {
-            inner: self.inner.clone(),
-            reader,
-            position: 0,
-        }))
+        Ok(Some(reader))
     }
 
     /// Reads plaintext at `offset` into `out`. `None` means no ready file.
+    ///
+    /// Callers authorize every read in the catalog's domain first (for an
+    /// attachment, the database locates the slot's ready file). Consecutive
+    /// reads of one file reuse a cached open reader and its key, skipping the
+    /// catalog lookup; the cache is small, idles out after 30 s, and is
+    /// dropped on close, release, loss and any read error.
     pub fn read_at(&self, id: &FileId, offset: u64, out: &mut [u8]) -> MediaResult<Option<usize>> {
-        let Some(mut reader) = self.open_reader(id)? else {
-            return Ok(None);
+        self.inner.ensure_open()?;
+        let cached = {
+            let mut readers = lock(&self.inner.readers);
+            readers.retain(|cached| cached.used.elapsed() < READER_CACHE_IDLE);
+            readers
+                .iter()
+                .position(|cached| cached.id == *id)
+                .map(|index| readers.remove(index).reader)
         };
-        reader.read_at(offset, out).map(Some)
+        let mut reader = match cached {
+            Some(reader) => reader,
+            None => match self.open_file_reader(id)? {
+                Some(reader) => reader,
+                None => return Ok(None),
+            },
+        };
+        let read = reader.read_at(offset, out)?;
+        // Read outside the lock; return the reader only after success.
+        let mut readers = lock(&self.inner.readers);
+        if !self.inner.is_closed() {
+            readers.insert(
+                0,
+                CachedReader {
+                    id: *id,
+                    reader,
+                    used: Instant::now(),
+                },
+            );
+            readers.truncate(READER_CACHE_ENTRIES);
+        }
+        Ok(Some(read))
     }
 
     /// Unlinks the files of `ids` whose rows are gone. Callers pass the ids a
     /// committed deletion released; the sweep removes anything missed.
     pub fn unlink_released(&self, ids: &[FileId]) {
         for id in ids {
+            self.forget_reader(id);
             if matches!(self.inner.catalog.file_state(*id), Ok(None)) {
                 let _ = remove_if_present(&self.path(id));
             }
@@ -451,6 +512,7 @@ impl<C: MediaCatalog> MediaStore<C> {
                 FileState::Ready => match std::fs::symlink_metadata(self.path(id)) {
                     Ok(_) => {}
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        self.forget_reader(id);
                         if self.inner.catalog.mark_lost(*id)? {
                             report.lost_marked += 1;
                         }
@@ -510,10 +572,11 @@ impl<C: MediaCatalog> MediaStore<C> {
                 budget -= 1;
                 report.files_checked += 1;
                 cursor.name = Some(name.clone());
-                if self.inner.catalog.file_state(id)?.is_none()
-                    && remove_if_present(&self.path(&id)).map_err(|e| io_error(&e))?
-                {
-                    report.orphans_unlinked += 1;
+                if self.inner.catalog.file_state(id)?.is_none() {
+                    self.forget_reader(&id);
+                    if remove_if_present(&self.path(&id)).map_err(|e| io_error(&e))? {
+                        report.orphans_unlinked += 1;
+                    }
                 }
             }
             if take == names.len() {

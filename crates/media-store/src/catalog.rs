@@ -116,6 +116,10 @@ pub trait MediaCatalog: Send + Sync {
 }
 
 /// The store's view of the disk for reuse decisions: is this file present?
+/// It is a single existence check (one `stat`), and the only file I/O a
+/// catalog performs inside a transaction: call it at most once per commit,
+/// for the one ready twin, and do no other file work while the transaction
+/// is open.
 pub type Presence<'a> = &'a dyn Fn(FileId) -> bool;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,7 +144,8 @@ pub enum ReadyOutcome {
 }
 
 /// One publication's domain side: an attachment slot, an outgoing upload, an
-/// avatar. Each method is **one transaction** in the catalog's database.
+/// avatar. Each method is **one transaction** in the catalog's database, and
+/// calls `present` at most once, for the ready twin (see [`Presence`]).
 pub trait PublishTarget {
     /// Cheap fence before any byte is written.
     fn superseded(&self) -> CatalogResult<bool>;

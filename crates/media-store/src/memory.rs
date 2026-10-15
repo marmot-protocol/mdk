@@ -3,7 +3,7 @@
 //! attachment slots; a superseded slot refuses publication like a removed one.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::catalog::{
@@ -84,6 +84,7 @@ impl State {
 pub struct MemoryCatalog {
     state: Arc<Mutex<State>>,
     closed: Arc<AtomicBool>,
+    key_lookups: Arc<AtomicUsize>,
 }
 
 impl MemoryCatalog {
@@ -92,6 +93,11 @@ impl MemoryCatalog {
             return Err(CatalogError::Closed);
         }
         Ok(self.state.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// How many times a ready file's key was looked up.
+    pub fn key_lookups(&self) -> usize {
+        self.key_lookups.load(Ordering::Relaxed)
     }
 
     /// Closes the catalog, like the account database closing.
@@ -164,6 +170,7 @@ impl MediaCatalog for MemoryCatalog {
     }
 
     fn ready_file(&self, id: FileId) -> CatalogResult<Option<ReadyFile>> {
+        self.key_lookups.fetch_add(1, Ordering::Relaxed);
         Ok(self
             .state()?
             .rows

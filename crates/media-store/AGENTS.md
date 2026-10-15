@@ -23,7 +23,7 @@ The encrypted per-file media store (mdk#2314). Human overview: [`README.md`](REA
 | --- | --- |
 | `src/format.rs` | File format: header, header-salted HKDF payload key, 64 KiB OpenSSL ChaCha20-Poly1305 segments, streaming writer (poisoned after a failure), offset reader. |
 | `src/catalog.rs` | `FileId`, `Category`, `FileState`, and the two traits other crates implement: `MediaCatalog` (store-wide rows) and `PublishTarget` (one publication's one-transaction commits). |
-| `src/store.rs` | `MediaStore`: intent-first publish, presence-checked reuse, close-checked readers, `unlink_released`, the bounded sweep, the close latch and in-flight set. `sync_file` (plain `fsync` on Apple). |
+| `src/store.rs` | `MediaStore`: intent-first publish, presence-checked reuse, `attach_existing` (reuse before a download), close-checked readers that hold their key, a small idle-limited reader cache for `read_at`, `unlink_released`, the bounded sweep, the close latch and in-flight set. `sync_file` (plain `fsync` on Apple). |
 | `src/error.rs` | `MediaError`: fixed, privacy-safe messages. |
 | `src/memory.rs`, `src/conformance.rs` | `catalog-conformance` feature: an in-memory catalog and the conformance suite every catalog must pass (crash table, reuse of a lost twin, release, supersession and reset during a write). |
 | `src/format_tests.rs`, `src/store_tests.rs`, `testdata/age/` | Vendored C2SP CCTV age payload vectors; format tests; the in-memory conformance run and store tests (modes, close, sweep bounds, corruption). |
@@ -36,7 +36,13 @@ The encrypted per-file media store (mdk#2314). Human overview: [`README.md`](REA
   `conformance.rs` in the same commit, and every catalog (`storage-sqlite`, the in-memory one) must keep passing it.
 - One `MediaStore` (and its clones) per account: the in-flight set that protects live publishes from the sweep is
   per instance.
-- Nothing runs after close, including abandon cleanup; the next process's sweep reclaims what is left.
+- Nothing runs after close, including abandon cleanup; the next process's sweep reclaims what is left. The runtime
+  closes the store through `marmot-app`'s close registry, the same one every other closeable handle uses.
+- Inside a catalog transaction the only file I/O is the one `present` check (a single `stat`) for the ready twin.
+- `read_at` trusts that the caller authorized the read in the catalog's domain; its reader cache only skips the key
+  lookup and file open. Evict a cached reader whenever its file is released, lost or unlinked.
+- Plaintext handoff leases (mdk#2314 step 4) are refused on Windows, which is not a target platform: `fs-private`
+  mode bits are no-ops there, and plaintext must not depend on an inherited ACL.
 - Keep sealing byte-identical to the age payload construction: the vectors must keep passing unchanged.
 - A writer that hit an error is poisoned; never reseal or rewrite its buffer.
 - Create files and directories through `fs-private` (0600/0700 at creation).

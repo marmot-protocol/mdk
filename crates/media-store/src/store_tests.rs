@@ -322,3 +322,37 @@ fn a_corrupted_file_fails_verification_instead_of_returning_bytes() {
         Err(MediaError::Corruption(_))
     ));
 }
+
+#[test]
+fn consecutive_reads_reuse_one_cached_reader_and_key() {
+    let (harness, store) = fixture();
+    let content: Vec<u8> = (0..3_000_000_u32).map(|i| (i % 253) as u8).collect();
+    let id = published(&harness, &store, &content);
+    let mut out = Vec::new();
+    let mut window = vec![0; 1024 * 1024];
+    while let Some(read) = store.read_at(&id, out.len() as u64, &mut window).unwrap() {
+        if read == 0 {
+            break;
+        }
+        out.extend_from_slice(&window[..read]);
+    }
+    assert_eq!(out, content);
+    assert_eq!(
+        harness.catalog.key_lookups(),
+        1,
+        "one key lookup for the whole file"
+    );
+
+    // Releasing the file drops its cached reader and key with it.
+    harness.catalog.release(0);
+    store.unlink_released(&[id]);
+    assert_eq!(store.read_at(&id, 0, &mut window).unwrap(), None);
+    // Closing drops the cache and refuses reads.
+    let other = published(&harness, &store, &content[..10]);
+    assert_eq!(store.read_at(&other, 0, &mut window).unwrap(), Some(10));
+    store.close();
+    assert_eq!(
+        store.read_at(&other, 0, &mut window),
+        Err(MediaError::Closed)
+    );
+}
