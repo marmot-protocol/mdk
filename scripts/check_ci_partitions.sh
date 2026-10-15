@@ -13,7 +13,10 @@ list_tests() {
 }
 
 list_tests "$@" | sort > "$work_dir/expected"
-test -s "$work_dir/expected"
+# A selected leaf package can have no tests; a full workspace must not.
+if [[ "${CI_ALLOW_EMPTY_TESTS:-false}" != true ]]; then
+    test -s "$work_dir/expected"
+fi
 for ((partition = 1; partition <= partitions; partition++)); do
     list_tests "$@" --partition "count:$partition/$partitions" >> "$work_dir/actual"
 done

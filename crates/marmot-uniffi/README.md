@@ -1155,10 +1155,15 @@ check, not a comparison benchmark. It builds Kotlin/Swift generation and every
 Android or Apple native target once in parallel, transfers those inputs only
 within the current workflow run, verifies their source, builder, toolchain,
 profile, feature and run provenance, then assembles and validates the Android,
-iOS and macOS candidate packages. Because macOS runners are scarce, pull requests
-build only the Android package unless a maintainer adds the `ci:apple` label,
-which builds the Apple inputs and packages too. `master` pushes always build the
-complete matrix and open an issue when it fails. Pull requests restore the trusted release
+iOS and macOS candidate packages. Full packaging is opt-in on pull requests:
+`ci:android` selects Kotlin generation and all four Android ABIs, `ci:apple`
+selects the Apple inputs and packages, and `ci:full` selects both platforms.
+Adding a packaging label triggers a new candidate run; re-running a workflow
+also reads the current labels. Ordinary PRs retain Rust compilation/API and
+packaging-contract checks without building complete candidate bundles.
+Matching `master` pushes always build the complete matrix and open an issue
+when it fails; later pushes do not cancel running or queued candidate builds.
+Pull requests restore the trusted release
 cache read-only; only runs using the workflow from `master` may update it. A
 weekly scheduled exact-head run on `master` provides drift detection and
 refreshes those trusted cache seeds; it intentionally executes the complete

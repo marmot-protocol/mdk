@@ -170,6 +170,23 @@ cargo test -p <crate>        # targeted tests for the crate you changed
 just ci                      # full local parity with GitHub CI (slow)
 ```
 
+Pull requests run native tests for changed workspace crates and their transitive
+dependents, using the `ci-pr` nextest profile. It retains ordinary regressions and
+focused CLI/runtime journeys while deferring named scale cases and exhaustive
+matrices. Changes to Rust test sources use `ci-full` for the affected crates;
+shared build inputs and unknown paths fall back to the full workspace. Formatting,
+dependency audit, contract checks and workspace clippy keep their existing coverage.
+This first pass still compiles the workspace test archive with the existing unified
+features; selection reduces test execution, not the workspace compilation gate.
+
+Add `ci:full` and re-run all jobs to request full workspace tests and complete
+Android/Apple candidate packaging. For packaging alone, use `ci:android` or
+`ci:apple`; those labels also trigger the candidate workflow immediately. Ordinary
+PRs skip complete native candidate packaging. `master`, merge groups and manual
+main-CI runs use `ci-full`; master CI runs are not cancelled by later pushes,
+including while queued. Existing nightly and weekly campaigns retain their wider
+coverage. These profiles do not change local `just test` or `just ci` selection.
+
 Common targeted runs:
 
 ```sh

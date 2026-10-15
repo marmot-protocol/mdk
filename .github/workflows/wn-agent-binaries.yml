@@ -62,8 +62,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: wn-agent-binaries-${{ github.ref }}
-  cancel-in-progress: true
+  group: wn-agent-binaries-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
