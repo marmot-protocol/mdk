@@ -8,14 +8,12 @@ description = "SQLite storage backend for the CGKA engine with Marmot and OpenML
 
 [dependencies]
 cgka-traits.workspace = true
-chacha20poly1305.workspace = true
 fs-private.workspace = true
 hex.workspace = true
-hkdf.workspace = true
 libc = { workspace = true, optional = true }
+media-store = { workspace = true, optional = true }
 openmls.workspace = true
 openmls_traits.workspace = true
-openssl.workspace = true
 rmp-serde = "1.3.1"
 rusqlite = { workspace = true, features = ["blob"] }
 serde.workspace = true
@@ -26,16 +24,16 @@ tracing.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-flate2.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true
 
 [features]
 extensions-draft = ["openmls_traits/extensions-draft"]
 storage-format-benchmarks = []
-# Media file store benchmark (mdk#2314 step 0): `media_store::bench` and the
+# Media file store benchmark (mdk#2314 step 0): `media_store_bench` (the
+# `media-store` format against the SQLCipher retained-attachment path) and the
 # `media_store_bench` example, run on desktop and on devices.
-media-store-benchmarks = ["dep:libc"]
+media-store-benchmarks = ["dep:libc", "dep:media-store"]
 test-conformance-replay = []
 # Copy in-memory test databases from one migrated template per process.
 test-migrated-template = ["rusqlite/backup"]

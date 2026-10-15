@@ -3,6 +3,7 @@ resolver = "3"
 exclude = ["vendor/hpke-rs-libcrux"]
 members = [
     "crates/fs-private",
+    "crates/media-store",
     "crates/traits",
     "crates/cgka-engine",
     "crates/cgka-session",
@@ -133,6 +134,7 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 
 # workspace-internal
 fs-private = { path = "crates/fs-private" }
+media-store = { path = "crates/media-store" }
 cgka-traits = { path = "crates/traits" }
 cgka-engine = { path = "crates/cgka-engine" }
 cgka-session = { path = "crates/cgka-session" }

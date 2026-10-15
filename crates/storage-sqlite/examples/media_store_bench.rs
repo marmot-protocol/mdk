@@ -8,7 +8,7 @@
 //! - `MDK_MEDIA_BENCH_ITERATIONS`: repetitions per row (default 7; bodies of
 //!   32 MiB or more use `MDK_MEDIA_BENCH_LARGE_ITERATIONS`, default 3).
 
-use storage_sqlite::media_store::bench::{MediaStoreBenchConfig, run_media_store_benchmark};
+use storage_sqlite::media_store_bench::{MediaStoreBenchConfig, run_media_store_benchmark};
 
 fn parse_size(value: &str) -> usize {
     let value = value.trim();

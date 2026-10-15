@@ -25,6 +25,7 @@ before adding behavior or bindings.
 | App message Markdown display parsing | `crates/marmot-markdown/AGENTS.md` |
 | Storage traits and shared types | `crates/traits/AGENTS.md` |
 | Private file/dir/socket creation helpers | `crates/fs-private/AGENTS.md` |
+| Encrypted per-file media store (format, file lifecycle) | `crates/media-store/AGENTS.md` |
 | SQLite storage | `crates/storage-sqlite/AGENTS.md` (`src/migrations/`, `src/openmls_storage/`, `src/storage/`, `src/storage/snapshots/` have their own) |
 | Nostr transport adapter | `crates/transport-nostr-adapter/AGENTS.md` |
 | Nostr transport peeler | `crates/transport-nostr-peeler/AGENTS.md` |

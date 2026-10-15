@@ -3899,6 +3899,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "media-store"
+version = "0.13.0"
+dependencies = [
+ "chacha20poly1305",
+ "flate2",
+ "hex",
+ "hkdf 0.12.4",
+ "openssl",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "zeroize",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6260,15 +6274,12 @@ name = "storage-sqlite"
 version = "0.13.0"
 dependencies = [
  "cgka-traits",
- "chacha20poly1305",
- "flate2",
  "fs-private",
  "hex",
- "hkdf 0.12.4",
  "libc",
+ "media-store",
  "openmls",
  "openmls_traits",
- "openssl",
  "rmp-serde",
  "rusqlite",
  "serde",

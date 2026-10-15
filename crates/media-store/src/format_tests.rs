@@ -3,7 +3,7 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-use super::format::*;
+use crate::format::*;
 
 const FILE_ID: [u8; FILE_ID_BYTES] = [7; FILE_ID_BYTES];
 const OTHER_ID: [u8; FILE_ID_BYTES] = [8; FILE_ID_BYTES];
@@ -94,7 +94,7 @@ fn parse_age_vector(path: &Path) -> AgeVector {
 }
 
 fn age_vectors() -> Vec<AgeVector> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/media_store/testdata/age");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/age");
     let mut paths: Vec<_> = std::fs::read_dir(dir)
         .unwrap()
         .map(|entry| entry.unwrap().path())

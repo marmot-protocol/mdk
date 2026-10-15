@@ -39,7 +39,8 @@ mod encrypted_media_secrets;
 mod local_submissions;
 mod message_drafts;
 pub use local_submissions::LocalSubmission;
-pub mod media_store;
+#[cfg(feature = "media-store-benchmarks")]
+pub mod media_store_bench;
 mod migrations;
 mod moderation_reports;
 pub use moderation_reports::{ModerationReportOutboxEntry, ModerationReportOutboxOutcome};

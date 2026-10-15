@@ -40,9 +40,7 @@ not "fix" it into the per-account database.
 | `src/attachment_acquisition/access.rs` | Read-only source-bound retained-asset lookup and opaque reference encoding; no demand registration. |
 | `src/attachment_acquisition/controls.rs` | Durable user intent and coalesced transfer metadata in the job store. |
 | `src/attachment_acquisition/partial.rs` | Attempt-fenced SQLCipher ciphertext checkpoints, combined retained/partial byte accounting, bounded writes and abandoned-partial cleanup. |
-| `src/media_store.rs`, `src/media_store/format.rs` | Encrypted per-file media store (mdk#2314). Today only the file format: header plus the age v1 payload (HKDF-SHA256 key salted with the header, 64 KiB ChaCha20-Poly1305 segments), two interchangeable cipher backends, and offset reads. No runtime caller yet. |
-| `src/media_store/format_tests.rs`, `src/media_store/testdata/age/` | Format tests, including the vendored C2SP CCTV age vectors whose outcome depends only on the payload; keep both backends byte-identical. |
-| `src/media_store/bench.rs`, `examples/media_store_bench.rs` | `media-store-benchmarks` feature: file format against the SQLCipher retained path, runnable on devices. |
+| `src/media_store_bench.rs`, `examples/media_store_bench.rs` | `media-store-benchmarks` feature: the `media-store` file format against the SQLCipher retained path, runnable on devices (mdk#2314 step 0). |
 | `src/attachment_history.rs` | Bounded canonical attachment-slot discovery and per-group revision-fenced cursors; source/visibility triggers maintain the derived index. |
 | `src/timeline.rs` | Materialized message-timeline aggregation; `timeline/` holds capture, edits, opening (`conversation_open` / `conversation_window`), presentation, and reports. |
 | `src/avatar_cache.rs` | Account-scoped encoded avatar storage, source generations, local reads and eviction; `avatar_cache/acquisition.rs` owns durable demand/retry state and `avatar_cache/access.rs` owns opaque screen targets/local metadata. |

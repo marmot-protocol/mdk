@@ -1,0 +1,19 @@
+[package]
+name = "media-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Encrypted per-file media store for Marmot accounts: file format and file lifecycle, with metadata behind a catalog trait."
+
+[dependencies]
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+openssl.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+flate2.workspace = true
+hex.workspace = true
