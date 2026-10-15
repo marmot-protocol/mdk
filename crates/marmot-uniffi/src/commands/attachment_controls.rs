@@ -10,6 +10,7 @@ pub struct AttachmentTransferSubscription {
 impl AttachmentTransferSubscription {
     /// Initial snapshot, then coalesced replacements. None means closed. Errors
     /// terminate this observation; close/drop never cancels acquisition.
+    #[marmot_uniffi_macros::receive]
     pub async fn next(&self) -> Result<Option<AttachmentTransferSnapshotFfi>, MarmotKitError> {
         match self.inner.next().await {
             Ok(v) => Ok(v.map(Into::into)),

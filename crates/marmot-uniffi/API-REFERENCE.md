@@ -579,7 +579,7 @@ pub async fn next(&self) -> Result<Option<AttachmentTransferSnapshotFfi>, Marmot
 
 Initial snapshot, then coalesced replacements. None means closed. Errors terminate this observation; close/drop never cancels acquisition.
 
-[Source](src/commands/attachment_controls.rs#L13)
+[Source](src/commands/attachment_controls.rs#L14)
 
 ### `AttachmentTransferSubscription::cancel`
 
@@ -591,7 +591,7 @@ pub fn cancel(&self)
 
 Stop observation and wake receivers; does not cancel acquisition.
 
-[Source](src/commands/attachment_controls.rs#L22)
+[Source](src/commands/attachment_controls.rs#L23)
 
 ### `Marmot::attachment_download_policy`
 
@@ -603,7 +603,7 @@ pub async fn attachment_download_policy( &self, account_ref: String, ) -> Result
 
 Read the durable per-account automatic acquisition, quota, disk-reserve and transfer-cap policy.
 
-[Source](src/commands/attachment_controls.rs#L66)
+[Source](src/commands/attachment_controls.rs#L67)
 
 ### `Marmot::set_attachment_download_policy`
 
@@ -615,7 +615,7 @@ pub async fn set_attachment_download_policy( &self, account_ref: String, policy:
 
 Validate and persist acquisition policy; disabling automatic work preserves explicit work and retained files.
 
-[Source](src/commands/attachment_controls.rs#L76)
+[Source](src/commands/attachment_controls.rs#L77)
 
 ### `Marmot::request_explicit_attachment`
 
@@ -625,7 +625,7 @@ pub async fn request_explicit_attachment( &self, account_ref: String, group_id_h
 
 Join a current source or promote automatic demand to explicit priority without resetting retry budgets or scheduled backoff. Use this for ordinary interactive demand; reserve `control_attachment(Retry)` and `download_attachment_again` for deliberate recovery. A returned opaque reference does not promise readiness: inspect transfer state and prefer local assets first. Active attempts retain their original size limit and deadline; promotion changes subsequent admission, not the existing transport budget. Cancelled, removed, exhausted and failed sources are not rearmed.
 
-[Source](src/commands/attachment_controls.rs#L103)
+[Source](src/commands/attachment_controls.rs#L104)
 
 ### `Marmot::control_attachment`
 
@@ -637,7 +637,7 @@ pub async fn control_attachment( &self, account_ref: String, reference: String, 
 
 Cancel durably, retry explicitly, or remove local bytes. Returns false for obsolete references or ineligible operations; cancellation preserves ready bytes.
 
-[Source](src/commands/attachment_controls.rs#L88)
+[Source](src/commands/attachment_controls.rs#L89)
 
 ### `Marmot::download_attachment_again`
 
@@ -649,7 +649,7 @@ pub async fn download_attachment_again( &self, account_ref: String, group_id_hex
 
 Queue explicit acquisition for a current original source slot, clearing removal/cancellation; no reference means unavailable or obsolete.
 
-[Source](src/commands/attachment_controls.rs#L117)
+[Source](src/commands/attachment_controls.rs#L118)
 
 ### `Marmot::attachment_transfer_snapshot`
 
@@ -661,7 +661,7 @@ pub async fn attachment_transfer_snapshot( &self, account_ref: String, group_id_
 
 Read bounded transfer state for up to 64 source slots in one group without requesting a transfer.
 
-[Source](src/commands/attachment_controls.rs#L130)
+[Source](src/commands/attachment_controls.rs#L131)
 
 ### `Marmot::subscribe_attachment_transfers`
 
@@ -673,7 +673,7 @@ pub async fn subscribe_attachment_transfers( &self, account_ref: String, group_i
 
 Observe initial transfer state and coalesced complete replacements for bounded source slots; observation does not request a transfer.
 
-[Source](src/commands/attachment_controls.rs#L152)
+[Source](src/commands/attachment_controls.rs#L153)
 
 </details>
 
@@ -2682,7 +2682,7 @@ pub async fn next(&self) -> Option<OnboardingSnapshotFfi>
 
 Wait for the next value; None means the observation ended. Bind one receive loop to this handle.
 
-[Source](src/commands/onboarding.rs#L22)
+[Source](src/commands/onboarding.rs#L23)
 
 ### `Marmot::onboarding_recovery_required`
 
@@ -2694,7 +2694,7 @@ pub fn onboarding_recovery_required( &self, account_ref: String, ) -> Result<boo
 
 Whether an unreadable or exhausted checkpoint needs explicit recovery.
 
-[Source](src/commands/onboarding.rs#L30)
+[Source](src/commands/onboarding.rs#L31)
 
 ### `Marmot::recover_onboarding`
 
@@ -2706,7 +2706,7 @@ pub async fn recover_onboarding( &self, account_ref: String, acknowledge_latest_
 
 Preserve opaque evidence, sign out, and retire the old attempt. Hosts invalidate old UI callbacks first, acknowledge latest-only retention, then explicitly begin again and use the snapshot's recovery_epoch.
 
-[Source](src/commands/onboarding.rs#L43)
+[Source](src/commands/onboarding.rs#L44)
 
 ### `Marmot::propose_onboarding_relay_repair`
 
@@ -2718,7 +2718,7 @@ pub async fn propose_onboarding_relay_repair( &self, account_ref: String, step: 
 
 Preview an exact, minimal general or inbox relay-list repair. The returned `proposal.relay_repair` carries the source event ID, ordered before/after tags, unchanged content, typed occurrence diff, and repair mode. This method only persists a revision-bound proposal; it never signs or publishes. Show the diff and use `approve_onboarding_repair` (or its epoch-aware variant) only when `ApproveRepair` is offered. `ManualReview` deliberately has no approval action; prefill an editor from `before_tags` or offer a separately labeled full reset. Preserve the account, attempt, recovery epoch, source event, and snapshot revision until approval.
 
-[Source](src/commands/onboarding.rs#L273)
+[Source](src/commands/onboarding.rs#L274)
 
 ### `Marmot::approve_onboarding_repair_in_epoch`
 
@@ -2730,7 +2730,7 @@ pub async fn approve_onboarding_repair_in_epoch( &self, account_ref: String, rev
 
 Approve with the epoch and revision from the same displayed snapshot.
 
-[Source](src/commands/onboarding.rs#L56)
+[Source](src/commands/onboarding.rs#L57)
 
 ### `Marmot::acknowledge_onboarding_single_device_in_epoch`
 
@@ -2742,7 +2742,7 @@ pub async fn acknowledge_onboarding_single_device_in_epoch( &self, account_ref: 
 
 Acknowledge with the epoch and revision from the displayed device notice.
 
-[Source](src/commands/onboarding.rs#L71)
+[Source](src/commands/onboarding.rs#L72)
 
 ### `Marmot::cancel_onboarding`
 
@@ -2754,7 +2754,7 @@ pub async fn cancel_onboarding(&self, account_ref: String) -> Result<(), MarmotK
 
 Cancel the current interactive onboarding attempt at any step, including approved or ready checkpoints. The identity stays signed out. Already journaled evidence is retained in the latest cancellation checkpoint; later cancellations replace it even if publication remains uncertain. A later explicit `begin_*_onboarding` starts a new attempt. Hosts should invalidate the UI attempt, ignore the old subscription, and await this call before beginning again. Open Chats stays host-owned.
 
-[Source](src/commands/onboarding.rs#L91)
+[Source](src/commands/onboarding.rs#L92)
 
 ### `Marmot::acknowledge_onboarding_single_device`
 
@@ -2766,7 +2766,7 @@ pub async fn acknowledge_onboarding_single_device( &self, account_ref: String, r
 
 Record Continue anyway for the displayed notice, then resume setup.
 
-[Source](src/commands/onboarding.rs#L100)
+[Source](src/commands/onboarding.rs#L101)
 
 ### `Marmot::begin_onboarding`
 
@@ -2778,7 +2778,7 @@ pub async fn begin_onboarding( &self, nsec: String, options: OnboardingOptionsFf
 
 Persist the identity and return before any network preflight or publication.
 
-[Source](src/commands/onboarding.rs#L113)
+[Source](src/commands/onboarding.rs#L114)
 
 ### `Marmot::begin_external_signer_onboarding`
 
@@ -2790,7 +2790,7 @@ pub async fn begin_external_signer_onboarding( &self, public_key: String, signer
 
 Begin interactive identity-only onboarding with a host signer; signer remains host-owned and must be registered after reconstruction.
 
-[Source](src/commands/onboarding.rs#L125)
+[Source](src/commands/onboarding.rs#L126)
 
 ### `Marmot::onboarding_snapshot`
 
@@ -2802,7 +2802,7 @@ pub fn onboarding_snapshot( &self, account_ref: String, ) -> Result<Option<Onboa
 
 Read the persisted onboarding state.
 
-[Source](src/commands/onboarding.rs#L142)
+[Source](src/commands/onboarding.rs#L143)
 
 ### `Marmot::subscribe_onboarding`
 
@@ -2814,7 +2814,7 @@ pub fn subscribe_onboarding( &self, account_ref: String, ) -> Result<Arc<Onboard
 
 Observe onboarding snapshots for one account.
 
-[Source](src/commands/onboarding.rs#L152)
+[Source](src/commands/onboarding.rs#L153)
 
 ### `Marmot::set_onboarding_discovery_relays`
 
@@ -2826,7 +2826,7 @@ pub async fn set_onboarding_discovery_relays( &self, account_ref: String, discov
 
 Change discovery sources for the workflow without publishing them as account relay lists.
 
-[Source](src/commands/onboarding.rs#L162)
+[Source](src/commands/onboarding.rs#L163)
 
 ### `Marmot::run_onboarding`
 
@@ -2838,7 +2838,7 @@ pub async fn run_onboarding( &self, account_ref: String, ) -> Result<OnboardingS
 
 Run/resume the durable onboarding workflow until ready or user input is required.
 
-[Source](src/commands/onboarding.rs#L174)
+[Source](src/commands/onboarding.rs#L175)
 
 ### `Marmot::retry_onboarding_step`
 
@@ -2850,7 +2850,7 @@ pub async fn retry_onboarding_step( &self, account_ref: String, step: Onboarding
 
 Retry a step whose current snapshot offers Retry.
 
-[Source](src/commands/onboarding.rs#L185)
+[Source](src/commands/onboarding.rs#L186)
 
 ### `Marmot::continue_onboarding_without`
 
@@ -2862,7 +2862,7 @@ pub async fn continue_onboarding_without( &self, account_ref: String, step: Onbo
 
 Explicitly skip an optional step where the current snapshot permits it.
 
-[Source](src/commands/onboarding.rs#L197)
+[Source](src/commands/onboarding.rs#L198)
 
 ### `Marmot::propose_onboarding_recommended_relays`
 
@@ -2877,7 +2877,7 @@ NIP-65 roles, including declarations this runtime cannot use. Dial policy filter
 connection attempts without deleting published entries. A policy-allowed outbox
 or inbox route is required; proposal alone is not publication.
 
-[Source](src/commands/onboarding.rs#L209)
+[Source](src/commands/onboarding.rs#L210)
 
 ### `Marmot::propose_onboarding_relays`
 
@@ -2889,7 +2889,7 @@ pub async fn propose_onboarding_relays( &self, account_ref: String, step: Onboar
 
 Prepare explicit relay changes for approval.
 
-[Source](src/commands/onboarding.rs#L221)
+[Source](src/commands/onboarding.rs#L222)
 
 ### `Marmot::propose_onboarding_profile`
 
@@ -2901,7 +2901,7 @@ pub async fn propose_onboarding_profile( &self, account_ref: String, profile: Us
 
 Prepare profile changes for approval.
 
-[Source](src/commands/onboarding.rs#L235)
+[Source](src/commands/onboarding.rs#L236)
 
 ### `Marmot::propose_onboarding_follows`
 
@@ -2913,7 +2913,7 @@ pub async fn propose_onboarding_follows( &self, account_ref: String, follows: Ve
 
 Prepare follow-list changes for approval.
 
-[Source](src/commands/onboarding.rs#L247)
+[Source](src/commands/onboarding.rs#L248)
 
 ### `Marmot::approve_onboarding_repair`
 
@@ -2925,7 +2925,7 @@ pub async fn approve_onboarding_repair( &self, account_ref: String, revision: u6
 
 Approve the displayed revision for a non-recovered attempt; recovered attempts require the epoch-aware method.
 
-[Source](src/commands/onboarding.rs#L259)
+[Source](src/commands/onboarding.rs#L260)
 
 ### `Marmot::cancel_onboarding_repair`
 
@@ -2937,7 +2937,7 @@ pub async fn cancel_onboarding_repair( &self, account_ref: String, ) -> Result<O
 
 Dismiss an unapproved repair proposal; this cannot undo already-approved publication intent.
 
-[Source](src/commands/onboarding.rs#L285)
+[Source](src/commands/onboarding.rs#L286)
 
 </details>
 
@@ -3409,7 +3409,7 @@ pub async fn next(&self) -> Option<BlockListSnapshotFfi>
 
 Wait for the next value; None means the observation ended. Bind one receive loop to this handle.
 
-[Source](src/commands/user_blocks.rs#L45)
+[Source](src/commands/user_blocks.rs#L46)
 
 ### `Marmot::block_user`
 
@@ -3421,7 +3421,7 @@ pub async fn block_user( &self, account_ref: String, user_account_id_hex: String
 
 Block a user for the account.
 
-[Source](src/commands/user_blocks.rs#L52)
+[Source](src/commands/user_blocks.rs#L53)
 
 ### `Marmot::unblock_user`
 
@@ -3433,7 +3433,7 @@ pub async fn unblock_user( &self, account_ref: String, user_account_id_hex: Stri
 
 Remove a user block.
 
-[Source](src/commands/user_blocks.rs#L62)
+[Source](src/commands/user_blocks.rs#L63)
 
 ### `Marmot::get_blocked_users`
 
@@ -3445,7 +3445,7 @@ pub fn get_blocked_users( &self, account_ref: String, ) -> Result<Vec<BlockedUse
 
 Read the current blocked-user collection.
 
-[Source](src/commands/user_blocks.rs#L72)
+[Source](src/commands/user_blocks.rs#L73)
 
 ### `Marmot::is_user_blocked`
 
@@ -3457,7 +3457,7 @@ pub fn is_user_blocked( &self, account_ref: String, user_account_id_hex: String,
 
 Check one user block.
 
-[Source](src/commands/user_blocks.rs#L83)
+[Source](src/commands/user_blocks.rs#L84)
 
 ### `Marmot::subscribe_blocked_users`
 
@@ -3469,7 +3469,7 @@ pub fn subscribe_blocked_users( &self, account_ref: String, ) -> Result<Arc<Bloc
 
 Observe block-list snapshots.
 
-[Source](src/commands/user_blocks.rs#L92)
+[Source](src/commands/user_blocks.rs#L93)
 
 </details>
 
@@ -3756,7 +3756,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L451)
+[Source](src/lib.rs#L452)
 
 ### `Marmot::storage_is_closed`
 
@@ -3768,7 +3768,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L459)
+[Source](src/lib.rs#L460)
 
 ### `Marmot::is_stopping`
 
@@ -3780,7 +3780,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L466)
+[Source](src/lib.rs#L467)
 
 </details>
 
@@ -3939,7 +3939,7 @@ pub async fn next(&self) -> Result<Option<ChatListWindowSnapshotFfi>, MarmotKitE
 
 One receiver per handle. Cancellation does not consume an update.
 
-[Source](src/subscriptions/chat_window.rs#L34)
+[Source](src/subscriptions/chat_window.rs#L35)
 
 ### `ChatListWindowSubscription::page`
 
@@ -3951,7 +3951,7 @@ pub async fn page( &self, sequence: u64, direction: ChatListPageDirectionFfi, co
 
 1–100 rows, at most 200 retained. Uses the installed snapshot's sequence. This can run while next() waits; accepted commands survive caller cancellation.
 
-[Source](src/subscriptions/chat_window.rs#L39)
+[Source](src/subscriptions/chat_window.rs#L40)
 
 ### `ChatListWindowSubscription::set_visible_anchor`
 
@@ -3963,7 +3963,7 @@ pub async fn set_visible_anchor( &self, sequence: u64, group_id_hex: String, ) -
 
 Stable row identity, not pixel offset. A missing/outside anchor is rejected.
 
-[Source](src/subscriptions/chat_window.rs#L52)
+[Source](src/subscriptions/chat_window.rs#L53)
 
 ### `ChatListWindowSubscription::return_to_top`
 
@@ -3975,7 +3975,7 @@ pub async fn return_to_top( &self, sequence: u64, ) -> Result<ChatListWindowSnap
 
 Navigate the prepared chat list back to its current head with sequence validation.
 
-[Source](src/subscriptions/chat_window.rs#L63)
+[Source](src/subscriptions/chat_window.rs#L64)
 
 ### `AccountAttentionSubscription::snapshot`
 
@@ -3987,7 +3987,7 @@ pub fn snapshot(&self) -> Option<AccountAttentionSnapshotFfi>
 
 Take the initial account set once. Unavailable entries never contain invented totals.
 
-[Source](src/subscriptions/chat_window.rs#L90)
+[Source](src/subscriptions/chat_window.rs#L91)
 
 ### `AccountAttentionSubscription::next`
 
@@ -3999,7 +3999,7 @@ pub async fn next(&self) -> Result<Option<AccountAttentionSnapshotFfi>, MarmotKi
 
 Wait for the next value; None means the observation ended. Bind one receive loop to this handle.
 
-[Source](src/subscriptions/chat_window.rs#L93)
+[Source](src/subscriptions/chat_window.rs#L95)
 
 </details>
 
@@ -4028,7 +4028,7 @@ pub async fn next(&self) -> Result<Option<ConversationWindowSnapshotFfi>, Marmot
 
 One receiver; cancellation leaves pending replacements available. Worker replacement is terminal: reopen the conversation after Closed/None with a fresh generation.
 
-[Source](src/subscriptions/conversation_window.rs#L97)
+[Source](src/subscriptions/conversation_window.rs#L98)
 
 ### `ConversationWindowSubscription::cancel`
 
@@ -4040,7 +4040,7 @@ pub async fn cancel(&self)
 
 Wake receivers/commands and release the retained runtime window. Idempotent. Drop the native object too when finished. Previously returned snapshots stay valid.
 
-[Source](src/subscriptions/conversation_window.rs#L116)
+[Source](src/subscriptions/conversation_window.rs#L117)
 
 ### `ConversationWindowSubscription::page`
 
@@ -4052,7 +4052,7 @@ pub async fn page( &self, revision: ConversationWindowRevisionFfi, direction: Co
 
 1–200 rows, at most 200 retained; report a new visible anchor to page beyond saturated context. Zero timeout uses 30 seconds. After timeout/cancellation an accepted command may still complete through next(); refresh before retrying.
 
-[Source](src/subscriptions/conversation_window.rs#L128)
+[Source](src/subscriptions/conversation_window.rs#L129)
 
 ### `ConversationWindowSubscription::set_visible_anchor`
 
@@ -4064,7 +4064,7 @@ pub async fn set_visible_anchor( &self, revision: ConversationWindowRevisionFfi,
 
 Report a row in the installed replacement, not a pixel offset. No read acknowledgement.
 
-[Source](src/subscriptions/conversation_window.rs#L147)
+[Source](src/subscriptions/conversation_window.rs#L148)
 
 ### `ConversationWindowSubscription::return_to_latest`
 
@@ -4076,7 +4076,7 @@ pub async fn return_to_latest( &self, revision: ConversationWindowRevisionFfi, t
 
 Resume following new arrivals. Retains the current row budget (up to 200).
 
-[Source](src/subscriptions/conversation_window.rs#L160)
+[Source](src/subscriptions/conversation_window.rs#L161)
 
 ### `ConversationWindowSubscription::jump_to_message`
 
@@ -4088,7 +4088,7 @@ pub async fn jump_to_message( &self, revision: ConversationWindowRevisionFfi, me
 
 Missing targets fail explicitly. Commands may run while next() waits.
 
-[Source](src/subscriptions/conversation_window.rs#L170)
+[Source](src/subscriptions/conversation_window.rs#L171)
 
 </details>
 
@@ -4117,7 +4117,7 @@ pub async fn next(&self) -> Option<AppGroupRecordFfi>
 
 Wait for the next value; None means the observation ended. Bind one receive loop to this handle.
 
-[Source](src/subscriptions.rs#L62)
+[Source](src/subscriptions.rs#L63)
 
 ### `ChatListSubscription::snapshot`
 
@@ -4129,7 +4129,7 @@ pub fn snapshot(&self) -> Vec<ChatListRowFfi>
 
 Read the initial/current snapshot for this handle; follow its feature contract for one-shot versus repeatable reads.
 
-[Source](src/subscriptions.rs#L98)
+[Source](src/subscriptions.rs#L99)
 
 ### `ChatListSubscription::next`
 
@@ -4141,7 +4141,7 @@ pub async fn next(&self) -> Option<ChatListRowFfi>
 
 Legacy row-only update stream.
 
-[Source](src/subscriptions.rs#L112)
+[Source](src/subscriptions.rs#L114)
 
 ### `ChatListSubscription::next_update`
 
@@ -4153,7 +4153,7 @@ pub async fn next_update(&self) -> Option<ChatListSubscriptionUpdateFfi>
 
 Typed update stream, including atomic full-list replacement snapshots.
 
-[Source](src/subscriptions.rs#L136)
+[Source](src/subscriptions.rs#L139)
 
 ### `MessagesSubscription::snapshot`
 
@@ -4165,7 +4165,7 @@ pub fn snapshot(&self) -> Vec<AppMessageRecordFfi>
 
 Read the initial/current snapshot for this handle; follow its feature contract for one-shot versus repeatable reads.
 
-[Source](src/subscriptions.rs#L164)
+[Source](src/subscriptions.rs#L167)
 
 ### `MessagesSubscription::next`
 
@@ -4177,7 +4177,7 @@ pub async fn next(&self) -> Option<MessageUpdateFfi>
 
 Wait for the next value; None means the observation ended. Bind one receive loop to this handle.
 
-[Source](src/subscriptions.rs#L168)
+[Source](src/subscriptions.rs#L172)
 
 ### `TimelineMessagesSubscription::snapshot`
 
@@ -4189,7 +4189,7 @@ pub fn snapshot(&self) -> Option<TimelinePageFfi>
 
 Read the initial/current snapshot for this handle; follow its feature contract for one-shot versus repeatable reads.
 
-[Source](src/subscriptions.rs#L259)
+[Source](src/subscriptions.rs#L263)
 
 ### `TimelineMessagesSubscription::next`
 
@@ -4201,7 +4201,7 @@ pub async fn next(&self) -> Option<TimelinePageFfi>
 
 Await the next live update and return the resulting authoritative window. Windowing (ordering, dedup, head-anchoring while scrolled back, and the cap) is owned by the runtime, so this returns exactly the bounded window pagination operates on — render it directly. Use `next_update`(Self::next_update) instead to receive the raw delta.
 
-[Source](src/subscriptions.rs#L268)
+[Source](src/subscriptions.rs#L273)
 
 ### `TimelineMessagesSubscription::next_update`
 
@@ -4213,7 +4213,7 @@ pub async fn next_update(&self) -> Option<TimelineSubscriptionUpdateFfi>
 
 Consume raw timeline deltas or a replacement page. Use either next or next_update, not both; the host maintains delta ordering and bounds.
 
-[Source](src/subscriptions.rs#L277)
+[Source](src/subscriptions.rs#L283)
 
 ### `TimelineMessagesSubscription::paginate_backwards`
 
@@ -4225,7 +4225,7 @@ pub async fn paginate_backwards(&self, count: u32) -> Result<TimelinePageFfi, Ma
 
 Extend the materialized window toward older history by up to `count` messages and return the new window. The returned page is already sorted, deduplicated, capped, and carries correct `has_more_before` / `has_more_after` flags — render it directly; no client-side merging or windowing is required. The store read runs off the caller thread and uses a different lock than `next()`, so a host driving `next()` on a background task can paginate without blocking (and this never blocks the UI thread, unlike the synchronous `Marmot::timeline_messages`).
 
-[Source](src/subscriptions.rs#L290)
+[Source](src/subscriptions.rs#L296)
 
 ### `TimelineMessagesSubscription::paginate_forwards`
 
@@ -4237,7 +4237,7 @@ pub async fn paginate_forwards(&self, count: u32) -> Result<TimelinePageFfi, Mar
 
 Extend the materialized window toward the live head by up to `count` messages and return the new window. Reaching the head re-anchors the window (`has_more_after` becomes false). Same windowing/threading guarantees as `paginate_backwards`(Self::paginate_backwards).
 
-[Source](src/subscriptions.rs#L299)
+[Source](src/subscriptions.rs#L305)
 
 ### `GroupStateSubscription::snapshot`
 
@@ -4249,7 +4249,7 @@ pub fn snapshot(&self) -> Option<AppGroupRecordFfi>
 
 Read the initial/current snapshot for this handle; follow its feature contract for one-shot versus repeatable reads.
 
-[Source](src/subscriptions.rs#L324)
+[Source](src/subscriptions.rs#L330)
 
 ### `GroupStateSubscription::next`
 
@@ -4261,7 +4261,7 @@ pub async fn next(&self) -> Option<AppGroupRecordFfi>
 
 Wait for the next value; None means the observation ended. Bind one receive loop to this handle.
 
-[Source](src/subscriptions.rs#L328)
+[Source](src/subscriptions.rs#L335)
 
 ### `EventsSubscription::next`
 
@@ -4273,7 +4273,7 @@ pub async fn next(&self) -> Option<MarmotEventFfi>
 
 Wait for the next value; None means the observation ended. Bind one receive loop to this handle.
 
-[Source](src/subscriptions.rs#L354)
+[Source](src/subscriptions.rs#L362)
 
 ### `NotificationsSubscription::next`
 
@@ -4285,7 +4285,7 @@ pub async fn next(&self) -> Option<NotificationUpdateFfi>
 
 Wait for the next value; None means the observation ended. Bind one receive loop to this handle.
 
-[Source](src/subscriptions.rs#L376)
+[Source](src/subscriptions.rs#L385)
 
 ### `UserSearchSubscription::next_update`
 
@@ -4297,7 +4297,7 @@ pub async fn next_update(&self) -> Option<UserSearchUpdateFfi>
 
 Await the next step of the search, or `None` once it is over.
 
-[Source](src/subscriptions.rs#L435)
+[Source](src/subscriptions.rs#L445)
 
 ### `AgentStreamSubscription::stream_id_hex`
 
@@ -4309,7 +4309,7 @@ pub fn stream_id_hex(&self) -> String
 
 The resolved stream id this watch is following (hex).
 
-[Source](src/subscriptions.rs#L445)
+[Source](src/subscriptions.rs#L455)
 
 ### `AgentStreamSubscription::next`
 
@@ -4321,7 +4321,7 @@ pub async fn next(&self) -> Option<AgentStreamUpdateFfi>
 
 Wait for the next value; None means the observation ended. Bind one receive loop to this handle.
 
-[Source](src/subscriptions.rs#L449)
+[Source](src/subscriptions.rs#L460)
 
 ### `PresentedChatListSubscription::snapshot`
 
@@ -4333,7 +4333,7 @@ pub fn snapshot(&self) -> Option<crate::conversions::PresentedChatListUpdateFfi>
 
 Take the initial snapshot once, with generation and sequence zero.
 
-[Source](src/subscriptions.rs#L483)
+[Source](src/subscriptions.rs#L494)
 
 ### `PresentedChatListSubscription::next`
 
@@ -4345,7 +4345,7 @@ pub async fn next( &self, ) -> Result<Option<crate::conversions::PresentedChatLi
 
 Wait for the next value; None means the observation ended. Bind one receive loop to this handle.
 
-[Source](src/subscriptions.rs#L486)
+[Source](src/subscriptions.rs#L498)
 
 </details>
 
@@ -4360,7 +4360,7 @@ pub async fn begin_attachment_permission_update( &self, account_ref: String, ) -
 
 Revoke automatic permission for this account before asynchronous network/preference evaluation. Returns a single-use runtime/account generation. Requires HostManaged construction; do not persist the token or mint a new one from a stale callback. See the [host-managed contract](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104).
 
-[Source](src/commands/attachment_controls.rs#L30)
+[Source](src/commands/attachment_controls.rs#L31)
 
 ### `Marmot::request_automatic_attachment`
 
@@ -4370,7 +4370,7 @@ pub async fn request_automatic_attachment( &self, account_ref: String, group_id_
 
 Submit idempotent automatic demand for an authoritative original source slot. Returns current status plus whether work was newly queued; preserves suppression, history, deadlines and retry budgets. Use from foreground and restored workers; never substitute explicit download-again or legacy downloadMedia after a local miss. See [Android migration](ATTACHMENT-ACCESS.md#android-migration).
 
-[Source](src/commands/attachment_controls.rs#L52)
+[Source](src/commands/attachment_controls.rs#L53)
 
 ### `Marmot::set_attachment_automatic_permission`
 
@@ -4380,7 +4380,7 @@ pub async fn set_attachment_automatic_permission( &self, account_ref: String, ge
 
 Apply media-category permission using the generation captured before evaluating host policy. False means stale, foreign or already consumed; it is not permission to retry with a fresh token. Approval is runtime-only and cannot override the durable automatic policy. See the [permission lifecycle](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104).
 
-[Source](src/commands/attachment_controls.rs#L40)
+[Source](src/commands/attachment_controls.rs#L41)
 
 </details>
 

@@ -311,9 +311,13 @@ MarmotKit runs MDK on a Tokio runtime it owns, not on the threads that call it.
 - **Async methods** run their work as a task on that runtime. The Swift task or Kotlin coroutine
   awaiting the call only waits for the task to finish, so awaiting from the main actor or
   `Dispatchers.Main` does not run MDK work on the UI thread. Cancelling a Kotlin coroutine frees
-  the call, which aborts the task at its next suspension point unless the method documents that
-  its work outlives cancellation, as `shutdownAndClose()` does. Generated Swift waits for the
-  call to finish even when its `Task` is cancelled.
+  the call, which aborts the task at its next suspension point; `shutdownAndClose()` keeps
+  running regardless. Generated Swift waits for the call to finish even when its `Task` is
+  cancelled.
+- **Subscription receives** (`next()`, `nextUpdate()`) are the exception: they wait on the calling
+  thread, with the runtime entered, because a receive that ran ahead on the runtime could consume
+  an update that a cancelled caller never collects. They only wait and convert; the work that
+  produces updates runs on the runtime.
 - **Synchronous methods and constructors** run on the calling thread. Some are SQLCipher reads;
   keep them off the UI thread. Constructors enter MarmotKit's runtime, so background tasks they
   start run there too.

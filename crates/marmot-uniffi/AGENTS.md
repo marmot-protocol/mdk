@@ -52,8 +52,10 @@ Expose `marmot-app` behavior through bindings, following [MDK's host boundary](.
 - The Rust API in `src/` is the source of truth for both Swift and Kotlin — scripts package, they do not fork types.
 - Export async methods with `#[marmot_uniffi_macros::on_tokio_runtime]` directly above `#[uniffi::export]`, never
   with `async_runtime = "tokio"`: UniFFI's `async_compat` fallback runs every MDK task on one thread and part of each
-  call on the host's thread. Constructors enter `tokio_runtime::handle()` so construction-time spawns land on the
-  same runtime. Keep the worker count small (`tokio_runtime::worker_threads`) and workers abortable `tokio::spawn`
+  call on the host's thread. Mark subscription receives (`next`, `next_update`) `#[marmot_uniffi_macros::receive]`
+  so a cancelled wait never consumes an update, and work that must outlive a cancelled call
+  `#[marmot_uniffi_macros::survives_cancellation]`. Constructors enter `tokio_runtime::handle()` so
+  construction-time spawns land on the same runtime. Keep the worker count small (`tokio_runtime::worker_threads`) and workers abortable `tokio::spawn`
   tasks; see README.md#threading-model.
 - Android consumers must call `MarmotAndroid.initialize(context)` before constructing `Marmot` (Keystore JNI via
   `ndk-context`).

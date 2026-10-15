@@ -82,7 +82,7 @@ which runtime that is and which thread polls the calling future:
 
 | Binding | Runtime | Who runs a call's own work | Spawned MDK tasks |
 | --- | --- | --- | --- |
-| `marmot-uniffi` (Swift, Kotlin) | One process-wide multi-thread runtime owned by the crate: (CPUs / 2) clamped to 2–4 workers plus the on-demand blocking pool, threads named `marmotkit-rt` | A runtime worker: `#[marmot_uniffi_macros::on_tokio_runtime]` exports each async method through a wrapper that spawns it and awaits the join handle; the host thread only polls that handle | Same runtime; constructors enter it |
+| `marmot-uniffi` (Swift, Kotlin) | One process-wide multi-thread runtime owned by the crate: (CPUs / 2) clamped to 2–4 workers plus the on-demand blocking pool, threads named `marmotkit-rt` | A runtime worker: `#[marmot_uniffi_macros::on_tokio_runtime]` exports each async method through a wrapper that spawns it and awaits the join handle; the host thread only polls that handle. Subscription receives stay on the host thread with the runtime entered, so a cancelled wait cannot consume an update | Same runtime; constructors enter it |
 | `marmot-c` | One multi-thread runtime per client, Tokio's default worker count | The C caller's thread, inside `block_on` | The client's runtime |
 | `wn` / `wnd`, `wn-agent` | The binary's multi-thread runtime (`#[tokio::main]` or an explicit builder) | Runtime tasks | Same runtime |
 

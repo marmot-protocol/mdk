@@ -448,6 +448,7 @@ impl Marmot {
     // Object-method and error-variant addition: binding regeneration and the
     // workspace version bump ride the release per this crate's lockstep
     // invariant — do not bump versions here.
+    #[marmot_uniffi_macros::survives_cancellation]
     pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError> {
         self.runtime.shutdown_and_close().await?;
         Ok(())

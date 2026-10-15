@@ -94,6 +94,7 @@ impl ConversationWindowSubscription {
     }
     /// One receiver; cancellation leaves pending replacements available. Worker replacement
     /// is terminal: reopen the conversation after Closed/None with a fresh generation.
+    #[marmot_uniffi_macros::receive]
     pub async fn next(&self) -> Result<Option<ConversationWindowSnapshotFfi>, MarmotKitError> {
         let mut closed = self.closed.subscribe();
         if *closed.borrow() {

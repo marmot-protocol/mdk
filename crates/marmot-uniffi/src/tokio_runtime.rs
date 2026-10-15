@@ -10,7 +10,12 @@
 //!
 //! Instead, exports annotated with `#[marmot_uniffi_macros::on_tokio_runtime]`
 //! spawn their bodies with [`spawn_export`], and the constructors enter
-//! [`handle`] so construction-time spawns land on the same runtime. When the
+//! [`handle`] so construction-time spawns land on the same runtime.
+//! Subscription receives marked `#[marmot_uniffi_macros::receive]` stay on the
+//! caller's thread through [`poll_on_caller`], so a cancelled wait never
+//! consumes an update, and terminal shutdown marked
+//! `#[marmot_uniffi_macros::survives_cancellation]` uses
+//! [`spawn_detached_export`] so a cancelled call cannot stop it. When the
 //! caller is already inside a runtime (the `marmot-c` client runtime, Rust
 //! tests), that runtime is used; otherwise MarmotKit's own multi-thread runtime
 //! is. If that runtime cannot be built, construction fails with
@@ -23,7 +28,7 @@ use std::future::Future;
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use tokio::runtime::{Handle, Runtime};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 
 use crate::MarmotKitError;
 
@@ -82,19 +87,61 @@ pub(crate) fn handle() -> Result<Handle, MarmotKitError> {
 /// Run an export's body as a task on [`handle`] and wait for it.
 ///
 /// Dropping the returned future aborts the task, so a host that cancels its
-/// call (a Swift `Task` or Kotlin coroutine) still cancels the work, as when
-/// the body ran inside the host's poll. A panic in the body resumes here,
-/// where UniFFI reports it to the host as before.
+/// call (a Kotlin coroutine) still cancels the work, as when the body ran
+/// inside the host's poll. A panic in the body resumes here, where UniFFI
+/// reports it to the host as before.
 pub(crate) async fn spawn_export<F>(future: F) -> F::Output
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    // Exports are methods on objects a constructor made, and construction
-    // fails unless `handle` succeeds, so this cannot fail in practice.
-    let runtime = handle().unwrap_or_else(|error| panic!("{error}"));
-    let mut task = AbortOnDrop(runtime.spawn(future));
-    match (&mut task.0).await {
+    let mut task = AbortOnDrop(spawn(future));
+    join(&mut task.0).await
+}
+
+/// Like [`spawn_export`], but dropping the returned future leaves the task
+/// running. The task exists once the host first polls the call, so work that
+/// must outlive cancellation starts even if the host gives up before a runtime
+/// worker reaches it.
+pub(crate) async fn spawn_detached_export<F>(future: F) -> F::Output
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    join(spawn(future)).await
+}
+
+/// Poll `future` on the caller's thread with [`handle`] entered, so anything
+/// it spawns or times runs on MarmotKit's runtime.
+///
+/// A subscription receive must not advance between host polls: a spawned
+/// receive could consume an update that the host, having cancelled, never
+/// collects.
+pub(crate) fn poll_on_caller<F: Future>(future: F) -> impl Future<Output = F::Output> {
+    let runtime = expect_handle();
+    let mut future = Box::pin(future);
+    std::future::poll_fn(move |cx| {
+        let _entered = runtime.enter();
+        future.as_mut().poll(cx)
+    })
+}
+
+fn spawn<F>(future: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    expect_handle().spawn(future)
+}
+
+/// Exports are methods on objects a constructor made, and construction fails
+/// unless [`handle`] succeeds, so this cannot fail in practice.
+fn expect_handle() -> Handle {
+    handle().unwrap_or_else(|error| panic!("{error}"))
+}
+
+async fn join<T>(task: impl Future<Output = Result<T, JoinError>>) -> T {
+    match task.await {
         Ok(output) => output,
         Err(error) => match error.try_into_panic() {
             Ok(panic) => std::panic::resume_unwind(panic),
@@ -172,6 +219,41 @@ mod tests {
     }
 
     #[test]
+    fn a_dropped_receive_leaves_its_item_queued() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let mut call = Box::pin(poll_on_caller(receiver.recv()));
+            let waker = futures::task::noop_waker();
+            assert!(
+                call.as_mut()
+                    .poll(&mut std::task::Context::from_waker(&waker))
+                    .is_pending()
+            );
+            sender.send(1).unwrap();
+            // Nothing polls the receive between host polls, so the item stays
+            // queued when the host drops the call.
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let next = futures::executor::block_on(poll_on_caller(receiver.recv()));
+        assert_eq!(next, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_detached_export_runs_after_its_call_is_dropped() {
+        let (done, finished) = tokio::sync::oneshot::channel();
+        let mut call = Box::pin(spawn_detached_export(async move {
+            let _ = done.send(());
+        }));
+        // On this current-thread runtime the task cannot start before the drop.
+        assert!(futures::poll!(&mut call).is_pending());
+        drop(call);
+        tokio::time::timeout(Duration::from_secs(5), finished)
+            .await
+            .expect("the dropped call's task still runs")
+            .unwrap();
+    }
+
+    #[test]
     fn export_panics_reach_the_caller() {
         let result = std::panic::catch_unwind(|| {
             futures::executor::block_on(spawn_export(async { panic!("export body panicked") }))
@@ -180,6 +262,47 @@ mod tests {
         assert_eq!(
             payload.downcast_ref::<&str>().copied(),
             Some("export body panicked")
+        );
+    }
+
+    /// A spawned receive could consume an update its cancelled caller never
+    /// collects, so subscription receives stay on the caller's thread.
+    #[test]
+    fn subscription_receives_poll_on_the_caller() {
+        fn visit(dir: &Path, unmarked: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(&path, unmarked);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                let lines: Vec<&str> = source.lines().collect();
+                for (index, line) in lines.iter().enumerate() {
+                    let line = line.trim();
+                    let receive = line.starts_with("pub async fn next(")
+                        || line.starts_with("pub async fn next_update(");
+                    if receive
+                        && (index == 0
+                            || lines[index - 1].trim() != "#[marmot_uniffi_macros::receive]")
+                    {
+                        unmarked.push(format!("{}:{}", path.display(), index + 1));
+                    }
+                }
+            }
+        }
+
+        let mut unmarked = Vec::new();
+        visit(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut unmarked,
+        );
+        assert!(
+            unmarked.is_empty(),
+            "subscription receives without #[receive]: {unmarked:#?}"
         );
     }
 

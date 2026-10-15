@@ -31,6 +31,7 @@ impl ChatListWindowSubscription {
         take_snapshot(&self.snapshot)
     }
     /// One receiver per handle. Cancellation does not consume an update.
+    #[marmot_uniffi_macros::receive]
     pub async fn next(&self) -> Result<Option<ChatListWindowSnapshotFfi>, MarmotKitError> {
         Ok(self.receiver.lock().await.recv().await?.map(Into::into))
     }
@@ -90,6 +91,7 @@ impl AccountAttentionSubscription {
     pub fn snapshot(&self) -> Option<AccountAttentionSnapshotFfi> {
         take_snapshot(&self.snapshot)
     }
+    #[marmot_uniffi_macros::receive]
     pub async fn next(&self) -> Result<Option<AccountAttentionSnapshotFfi>, MarmotKitError> {
         Ok(self
             .receiver

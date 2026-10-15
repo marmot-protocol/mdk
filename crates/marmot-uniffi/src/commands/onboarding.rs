@@ -19,6 +19,7 @@ impl OnboardingSubscription {
     pub fn snapshot(&self) -> OnboardingSnapshotFfi {
         self.snapshot.clone()
     }
+    #[marmot_uniffi_macros::receive]
     pub async fn next(&self) -> Option<OnboardingSnapshotFfi> {
         self.inner.lock().await.recv().await.map(Into::into)
     }

@@ -42,6 +42,7 @@ impl BlockListSubscription {
     pub fn snapshot(&self) -> Option<BlockListSnapshotFfi> {
         self.snapshot.lock().ok()?.take()
     }
+    #[marmot_uniffi_macros::receive]
     pub async fn next(&self) -> Option<BlockListSnapshotFfi> {
         self.inner.lock().await.recv().await.map(Into::into)
     }

@@ -20,11 +20,7 @@ fn open(dir: &tempfile::TempDir, relay: &str) -> MarmotApp {
 }
 
 /// Prove member-visible add/retract updates and target stability across independent encrypted-store reopens.
-// Single-threaded: on parallel workers Alice's live timeline can show the
-// final reaction before her ingest has committed it, so the immediate
-// `shutdown_and_close` leaves it to catch-up after the reopen and the
-// post-reopen read below races that catch-up.
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn members_share_real_activity_targets_and_reactions_after_reopen() {
     let relay = MockRelay::run().await.unwrap();
     let url = relay.url().await.to_string();
@@ -161,6 +157,25 @@ async fn members_share_real_activity_targets_and_reactions_after_reopen() {
     })
     .await
     .unwrap();
+    // Alice's live timeline can show the reaction before her ingest commits it,
+    // and `shutdown_and_close` rolls an uncommitted write back. Close only once
+    // both stores hold it, so the reopen below checks durable state.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        for (app, label) in [(&alice_app, "alice"), (&bob_app, "bob")] {
+            while app
+                .timeline_messages_with_query(label, query.clone())
+                .unwrap()
+                .messages[0]
+                .reactions
+                .user_reactions
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    })
+    .await
+    .expect("both stores commit the reaction");
     alice.shutdown_and_close().await.unwrap();
     bob.shutdown_and_close().await.unwrap();
     for (dir, label) in [(&alice_dir, "alice"), (&bob_dir, "bob")] {

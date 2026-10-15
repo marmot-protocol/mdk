@@ -5,7 +5,9 @@ Proc macros used only by `crates/marmot-uniffi`. What the macro does and why: [`
 ## Layout
 
 - `src/lib.rs` — `on_tokio_runtime`: splits each exported `async fn` into the original method (not exported) and an
-  exported `__ffi_<name>` wrapper that spawns it through `crate::tokio_runtime::spawn_export`.
+  exported `__ffi_<name>` wrapper that spawns it through `crate::tokio_runtime::spawn_export`. The `receive` and
+  `survives_cancellation` markers switch the wrapper to `poll_on_caller` and `spawn_detached_export`; standalone, they
+  are compile errors.
 
 ## Rules
 
@@ -16,6 +18,9 @@ Proc macros used only by `crates/marmot-uniffi`. What the macro does and why: [`
   rejects it. Hide wrappers with `#[cfg_attr(doc, doc(hidden))]`.
 - Reject `async_runtime` on the export. It would wrap the join handle in `async_compat` and start its fallback thread.
 - The expansion names `crate::tokio_runtime`; it is only meaningful inside `marmot-uniffi`.
+- A spawned export is not cancel-safe for a receive: it can consume an update the cancelled caller never collects.
+  Keep every subscription receive on `receive`; `subscription_receives_poll_on_the_caller` enforces it for `next` and
+  `next_update`.
 - `marmot-uniffi`'s `tokio_runtime::tests::every_async_export_block_runs_on_the_tokio_runtime` fails if an async
   export block lacks this attribute. Keep it in step with the attribute's spelling.
 

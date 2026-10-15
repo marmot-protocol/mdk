@@ -28,6 +28,11 @@ use syn::{
 ///   docs and UniFFI defaults. It clones the `Arc` and awaits
 ///   `crate::tokio_runtime::spawn_export(..)` on `name`.
 ///
+/// Two method markers change the wrapper: [`macro@receive`] polls the method on
+/// the caller's thread instead of spawning it, and
+/// [`macro@survives_cancellation`] keeps its task running when the call is
+/// dropped.
+///
 /// The generated bindings, symbol names and checksums are unchanged: UniFFI
 /// derives them from the exported name, and receiver kind is not part of its
 /// metadata. Synchronous methods and constructors are exported as written.
@@ -44,6 +49,84 @@ pub fn on_tokio_runtime(args: TokenStream, input: TokenStream) -> TokenStream {
     expand(item)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
+}
+
+/// Mark an async export, inside an [`macro@on_tokio_runtime`] block, that
+/// hands the host the next item from a channel or watch.
+///
+/// Its wrapper polls it on the calling thread with MarmotKit's runtime entered
+/// instead of spawning it, so the body advances only while the host polls and
+/// a cancelled call never consumes an item. Keep such bodies to waiting and
+/// converting; the work that produces items already runs on the runtime.
+#[proc_macro_attribute]
+pub fn receive(_args: TokenStream, _input: TokenStream) -> TokenStream {
+    marker_outside_block("receive")
+}
+
+/// Mark an async export, inside an [`macro@on_tokio_runtime`] block, whose
+/// work must finish even when the host cancels the call, such as terminal
+/// shutdown.
+///
+/// Its wrapper spawns it like any other export but leaves the task running
+/// when the call is dropped, so the work starts even if the host gives up
+/// before a runtime worker first polls it.
+#[proc_macro_attribute]
+pub fn survives_cancellation(_args: TokenStream, _input: TokenStream) -> TokenStream {
+    marker_outside_block("survives_cancellation")
+}
+
+/// The block macro strips both markers, so expanding one means it is misplaced.
+fn marker_outside_block(marker: &str) -> TokenStream {
+    syn::Error::new(
+        Span::call_site(),
+        format!("#[{marker}] only applies to an async method inside an #[on_tokio_runtime] impl"),
+    )
+    .to_compile_error()
+    .into()
+}
+
+/// How an export's wrapper runs the original method.
+#[derive(Clone, Copy)]
+enum Mode {
+    /// Spawned on the runtime; dropping the call aborts the task.
+    Spawned,
+    /// Polled on the caller's thread with the runtime entered.
+    Receive,
+    /// Spawned on the runtime; dropping the call leaves the task running.
+    SurvivesCancellation,
+}
+
+/// Remove the mode markers from `attrs` and return the mode they select.
+fn take_mode(attrs: &mut Vec<Attribute>) -> syn::Result<Mode> {
+    let mut markers = Vec::new();
+    attrs.retain(|attr| {
+        let mode = if is_marker(attr, "receive") {
+            Mode::Receive
+        } else if is_marker(attr, "survives_cancellation") {
+            Mode::SurvivesCancellation
+        } else {
+            return true;
+        };
+        markers.push((mode, attr.span()));
+        false
+    });
+    match markers.as_slice() {
+        [] => Ok(Mode::Spawned),
+        [(mode, _)] => Ok(*mode),
+        [_, (_, span), ..] => Err(syn::Error::new(
+            *span,
+            "an export takes at most one of #[receive] and #[survives_cancellation]",
+        )),
+    }
+}
+
+fn is_marker(attr: &Attribute, name: &str) -> bool {
+    let segments: Vec<_> = attr.path().segments.iter().map(|s| &s.ident).collect();
+    match segments.as_slice() {
+        [marker] => *marker == name,
+        [krate, marker] => *krate == "marmot_uniffi_macros" && *marker == name,
+        _ => false,
+    }
 }
 
 fn expand(mut exported: ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
@@ -66,7 +149,8 @@ fn expand(mut exported: ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
         if let ImplItem::Fn(method) = item
             && method.sig.asyncness.is_some()
         {
-            let wrapper = ffi_wrapper(method)?;
+            let mode = take_mode(&mut method.attrs)?;
+            let wrapper = ffi_wrapper(method, mode)?;
             let mut original = std::mem::replace(method, wrapper);
             original.attrs.retain(|attr| !is_uniffi(attr));
             originals.push(original);
@@ -105,7 +189,7 @@ fn check_export_attribute(item: &ItemImpl) -> syn::Result<()> {
 }
 
 /// The exported `__ffi_` wrapper for `method`.
-fn ffi_wrapper(method: &ImplItemFn) -> syn::Result<ImplItemFn> {
+fn ffi_wrapper(method: &ImplItemFn, mode: Mode) -> syn::Result<ImplItemFn> {
     match method.sig.inputs.first() {
         Some(FnArg::Receiver(receiver))
             if receiver.reference.is_some() && receiver.mutability.is_none() => {}
@@ -151,11 +235,23 @@ fn ffi_wrapper(method: &ImplItemFn) -> syn::Result<ImplItemFn> {
 
     wrapper.attrs = exported_attrs(&method.attrs, name)?;
     let this = Ident::new("this", Span::mixed_site());
-    wrapper.block = parse_quote!({
-        let #this = ::std::sync::Arc::clone(self);
-        crate::tokio_runtime::spawn_export(async move { #this.#name(#(#arg_names),*).await })
+    wrapper.block = match mode {
+        Mode::Spawned => parse_quote!({
+            let #this = ::std::sync::Arc::clone(self);
+            crate::tokio_runtime::spawn_export(async move { #this.#name(#(#arg_names),*).await })
+                .await
+        }),
+        Mode::SurvivesCancellation => parse_quote!({
+            let #this = ::std::sync::Arc::clone(self);
+            crate::tokio_runtime::spawn_detached_export(async move {
+                #this.#name(#(#arg_names),*).await
+            })
             .await
-    });
+        }),
+        Mode::Receive => parse_quote!({
+            crate::tokio_runtime::poll_on_caller(self.#name(#(#arg_names),*)).await
+        }),
+    };
     Ok(wrapper)
 }
 
