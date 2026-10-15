@@ -160,6 +160,22 @@ impl SqliteAccountStorage {
         .storage()
     }
 
+    /// Bytes `reference`'s checkpoint holds on disk, or zero. Unfenced: worker
+    /// admission credits them against the space a resumed download needs,
+    /// and the attempt's own checks repeat under its fences.
+    pub fn attachment_checkpoint_bytes(
+        &self,
+        reference: &AttachmentAssetRef,
+    ) -> StorageResult<u64> {
+        self.lock()?
+            .query_row(
+                "SELECT coalesce((SELECT received FROM attachment_partial WHERE token=?1),0)",
+                [&reference.token],
+                |row| nonnegative(row, 0),
+            )
+            .storage()
+    }
+
     /// Starts a new checkpoint for this attempt, replacing any earlier one,
     /// and returns the id of the wire file to create. The row commits before
     /// that file exists, with nothing received. `None` means the attempt no

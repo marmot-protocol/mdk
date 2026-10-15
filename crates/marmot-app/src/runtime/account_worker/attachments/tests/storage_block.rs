@@ -215,7 +215,10 @@ impl Fixture {
             panic!("attachment completion");
         };
         let Ok(crate::client::AcquiredMediaBody::Memory(body)) = result else {
-            panic!("bodies within the transfer limit publish through the in-memory sink");
+            panic!(
+                "bodies within the transfer limit publish through the in-memory sink: {:?}",
+                result.as_ref().err()
+            );
         };
         assert_eq!(body.plaintext.len(), plain.len());
         let capacity = body.plaintext.capacity();
@@ -457,6 +460,105 @@ async fn memory_sink_with_validator_publishes_with_twice_the_body_free() {
     assert_eq!(requests.load(Ordering::SeqCst), 1);
     stop.send(()).unwrap();
     server.await.unwrap();
+}
+
+/// An interrupted in-memory download keeps its checkpoint on disk, so its
+/// retry is admitted with twice the body less what is saved: free space
+/// already excludes those bytes. Charging two whole bodies again would defer
+/// the retry every 15 seconds until more space freed.
+#[tokio::test]
+async fn interrupted_download_retries_with_its_checkpoint_credited() {
+    let plain = vec![0x2d; (3 * MIB + 5) as usize];
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (reference, cipher) = loopback_reference(&listener, &plain);
+    let total = cipher.len() as u64;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let interrupted = (2 * MIB + 100) as usize;
+    let server = {
+        let requests = Arc::clone(&requests);
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                requests.fetch_add(1, Ordering::SeqCst);
+                let request = request_headers(&mut socket).await;
+                // Only the declared locator serves the body; the extension
+                // fallback must not replace its checkpoint.
+                if request
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.contains(".bin "))
+                {
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                    continue;
+                }
+                let range = request
+                    .lines()
+                    .find_map(|line| line.strip_prefix("range: bytes="))
+                    .and_then(|value| value.trim_end_matches('-').parse::<usize>().ok());
+                if let Some(start) = range {
+                    let _ = socket
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{}/{}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n",
+                                cipher.len() - start,
+                                cipher.len() - 1,
+                                cipher.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                    let _ = socket.write_all(&cipher[start..]).await;
+                    continue;
+                }
+                let _ = socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n",
+                            cipher.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+                // The connection drops partway through the body.
+                let _ = socket.write_all(&cipher[..interrupted]).await;
+            }
+        })
+    };
+    let mut fixture = explicit_fixture(&reference, total).await;
+    fixture.set_free(PLENTY);
+    fixture.tick().await;
+    let done = fixture.completion().await;
+    assert!(matches!(
+        &done.completion,
+        MediaHttpCompletion::Attachment {
+            result: Err(AttachmentDownloadFailure::Retry(_)),
+            ..
+        }
+    ));
+    complete_media_http(&mut fixture.client, done, &fixture.shared, &fixture.http).await;
+    let saved = fixture.storage.attachment_partial_bytes_for_test().unwrap();
+    assert_eq!(saved, interrupted as u64, "the interrupted prefix is kept");
+    assert!(
+        fixture
+            .storage
+            .retry_attachment_acquisition(
+                &fixture.status().reference.unwrap(),
+                crate::unix_now_seconds()
+            )
+            .unwrap()
+    );
+    // Exactly the rest of the checkpoint plus the store file.
+    fixture.set_free(2 * total - saved);
+    fixture.tick().await;
+    fixture.publish_memory(&plain).await;
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        3,
+        "the interrupted request, its failed fallback, and one Range request"
+    );
+    server.abort();
 }
 
 #[tokio::test]

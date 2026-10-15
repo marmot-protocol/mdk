@@ -75,6 +75,81 @@ pub(crate) fn available_space(path: &std::path::Path) -> std::io::Result<u64> {
     media_store::free_space(path)
 }
 
+/// Jobs whose checkpoint a blocking task is reading or writing. A cancelled
+/// download does not stop a checkpoint task already on the blocking pool, so
+/// a stale attempt's task could otherwise open the wire file at its own
+/// recorded length after a newer attempt recorded more, truncating that
+/// suffix or writing over it. Each checkpoint operation holds its job here
+/// from the metadata lookup through the file change and the record, so the
+/// file's recorded prefix is always the one the operation read.
+static CHECKPOINT_JOBS: std::sync::Mutex<Vec<storage_sqlite::AttachmentAssetRef>> =
+    std::sync::Mutex::new(Vec::new());
+static CHECKPOINT_RELEASED: std::sync::Condvar = std::sync::Condvar::new();
+
+struct CheckpointLock(storage_sqlite::AttachmentAssetRef);
+
+impl CheckpointLock {
+    /// Blocks until no other checkpoint operation holds `job`'s asset.
+    fn acquire(job: &AttachmentAcquisition) -> Self {
+        let mut held = CHECKPOINT_JOBS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while held.contains(&job.reference) {
+            held = CHECKPOINT_RELEASED
+                .wait(held)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        held.push(job.reference.clone());
+        Self(job.reference.clone())
+    }
+}
+
+impl Drop for CheckpointLock {
+    fn drop(&mut self) {
+        let mut held = CHECKPOINT_JOBS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(index) = held.iter().position(|reference| *reference == self.0) {
+            held.swap_remove(index);
+        }
+        CHECKPOINT_RELEASED.notify_all();
+    }
+}
+
+/// Test hooks run between a checkpoint write's metadata lookup and its file
+/// change, keyed by job so parallel tests do not see each other's hooks.
+#[cfg(test)]
+pub(crate) mod checkpoint_hooks {
+    use storage_sqlite::AttachmentAssetRef;
+
+    type Hook = Box<dyn FnOnce() + Send>;
+    static HOOKS: std::sync::Mutex<Vec<(AttachmentAssetRef, Hook)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    pub(crate) fn after_lookup(
+        reference: &AttachmentAssetRef,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        HOOKS
+            .lock()
+            .unwrap()
+            .push((reference.clone(), Box::new(hook)));
+    }
+
+    pub(super) fn run(reference: &AttachmentAssetRef) {
+        let hook = {
+            let mut hooks = HOOKS.lock().unwrap();
+            hooks
+                .iter()
+                .position(|(held, _)| held == reference)
+                .map(|index| hooks.swap_remove(index).1)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 /// Appends `bytes` at `offset` to this attempt's `.wire` checkpoint and
 /// records the new length (mdk#2314 step 2b). Offset zero starts a new
 /// checkpoint, replacing any earlier one: its row commits before its file is
@@ -91,6 +166,7 @@ pub(crate) fn write_checkpoint(
     bytes: &[u8],
     now: u64,
 ) -> Result<bool, AppError> {
+    let _lock = CheckpointLock::acquire(job);
     let (id, mut wire) = if offset == 0 {
         let previous = storage.load_attachment_partial(job, now, u64::MAX, None)?;
         let Some(id) = storage.begin_attachment_partial(job, identity, now)? else {
@@ -109,6 +185,8 @@ pub(crate) fn write_checkpoint(
         if part.received != offset || part.identity != *identity {
             return Ok(false);
         }
+        #[cfg(test)]
+        checkpoint_hooks::run(&job.reference);
         let Some(wire) = media
             .open_wire(&part.wire_file, offset)
             .map_err(media_error)?
@@ -133,6 +211,7 @@ pub(crate) fn read_checkpoint(
     max: u64,
     expected: Option<(&[u8; 32], &[u8; 32])>,
 ) -> Result<Option<RestoredPartial>, AppError> {
+    let _lock = CheckpointLock::acquire(job);
     let Some(part) = storage.load_attachment_partial(job, now, max, expected)? else {
         return Ok(None);
     };
@@ -161,6 +240,7 @@ pub(crate) fn clear_checkpoint(
     now: u64,
     expected: Option<(&[u8; 32], &[u8; 32])>,
 ) -> Result<(), AppError> {
+    let _lock = CheckpointLock::acquire(job);
     let part = storage.load_attachment_partial(job, now, u64::MAX, expected)?;
     if storage.clear_attachment_partial(job, now, expected)?
         && let Some(part) = part
@@ -571,6 +651,7 @@ impl AttachmentResume {
         let this = self.clone();
         let locator_digest: [u8; 32] = Sha256::digest(url.as_str().as_bytes()).into();
         tokio::task::spawn_blocking(move || {
+            let _lock = CheckpointLock::acquire(&this.job);
             let now = crate::unix_now_seconds();
             let expected = (&this.ciphertext_digest, &locator_digest);
             let Some(part) = this

@@ -2967,7 +2967,7 @@ fn storage_block_parks_until_space_or_retry_and_keeps_checkpoints() {
 
 /// Readmission never outruns admission: a parked row whose target fits is left
 /// parked while free space is still below the reserve plus two transfer
-/// limits, instead of being bounced back to a retry timer.
+/// limits (worker admission), instead of being bounced back to a retry timer.
 #[test]
 fn storage_readmission_waits_for_admission_capacity() {
     let store = SqliteAccountStorage::in_memory().unwrap();
@@ -3220,7 +3220,7 @@ fn retry_after_a_park_longer_than_a_day_keeps_the_prefix() {
 }
 
 /// A storage-parked prefix is kept for at most a week after its latest park:
-/// past that it is pruned and releases its quota reservation, while the row
+/// past that it is pruned, while the row
 /// stays parked and simply starts the body over when it is readmitted.
 #[test]
 fn storage_parked_prefixes_expire_after_the_maximum_parked_age() {
@@ -3244,13 +3244,14 @@ fn storage_parked_prefixes_expire_after_the_maximum_parked_age() {
             )
             .unwrap()
     };
-    assert_eq!(reserved(&store), 10);
+    // Wire checkpoints live outside SQLCipher and reserve no retained budget.
+    assert_eq!(reserved(&store), 0);
     let limit = 12 + STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS;
     assert_eq!(store.prune_attachment_partials(limit - 1, 64).unwrap(), 0);
     assert_eq!(partial_usage(&store), 3);
     assert_eq!(store.prune_attachment_partials(limit, 64).unwrap(), 1);
     assert_eq!(partial_usage(&store), 0);
-    assert_eq!(reserved(&store), 0, "the quota reservation is released");
+    assert_eq!(reserved(&store), 0);
     assert_eq!(
         parked_headroom(&store, &asset),
         Some(8192),

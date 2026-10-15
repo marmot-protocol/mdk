@@ -19,8 +19,11 @@
 - Migration 0112 advances account storage to schema 112 on first open. Older
   binaries reject the upgraded database; downgrade is unsupported. It discards
   existing download checkpoints (the next attempt starts its body over) and adds
-  `attachment_partial.wire_file_id` and `progress_floor`: checkpoint ciphertext now lives in a media
-  store `.wire` file and the row keeps only its metadata (mdk#2314).
+  `attachment_partial.wire_file_id` and `progress_floor`: checkpoint
+  ciphertext now lives in a media store `.wire` file and the row keeps only
+  its metadata (mdk#2314). Checkpoints no longer reserve retained budget
+  (`attachment_partial_usage.reserved_bytes` stays zero), and storage
+  readmission's admission floor is the reserve plus twice the transfer limit.
 - Download checkpoints are metadata only. `begin_attachment_partial` starts one
   and returns its wire file id, `record_attachment_partial` records bytes the
   caller appended to that file, and `load_attachment_partial` returns
