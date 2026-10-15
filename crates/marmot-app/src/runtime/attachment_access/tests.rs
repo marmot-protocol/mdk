@@ -596,6 +596,34 @@ async fn attachment_state_change_is_not_held_behind_presentation_churn() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
+/// Caller timeouts that cancel `next()` while its database read runs leave
+/// that read in flight, and the next call awaits it rather than starting
+/// another, so short timeouts under contention never stack reads.
+#[tokio::test]
+async fn attachment_reads_survive_cancelled_next_without_stacking() {
+    use crate::AttachmentTransferState;
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, store, job, stream) = downloading_subscription(&dir, b"stacked").await;
+    let gate = stream.gate_reads_for_test();
+    report_ready(&runtime, &store, &job, b"stacked");
+    for _ in 0..6 {
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), stream.next())
+                .await
+                .is_err(),
+            "a held read delivered a frame"
+        );
+    }
+    let started = || gate.started.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(started(), 1, "each cancelled call started another read");
+    gate.open.send_replace(true);
+    let ready = next_row(&stream).await;
+    assert_eq!(ready.state, AttachmentTransferState::Ready);
+    assert_eq!(started(), 1);
+    stream.close();
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 /// A caller timeout that cancels `next()` while progress waits out the window
 /// keeps the owed read, so the next call delivers that progress when the
 /// window ends rather than after the idle fallback.

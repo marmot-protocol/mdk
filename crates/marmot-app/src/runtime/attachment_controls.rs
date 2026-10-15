@@ -273,7 +273,10 @@ impl MarmotAppRuntime {
                 last: tokio::time::Instant::now(),
                 read: tokio::time::Instant::now(),
                 owed: None,
+                reading: None,
             }),
+            #[cfg(test)]
+            read_gate: Default::default(),
         }))
     }
 }
@@ -293,6 +296,21 @@ struct TransferSubscriptionState {
     /// a C timeout drops the future — so the next call reads instead of
     /// waiting for another wake.
     owed: Option<tokio::time::Instant>,
+    /// The read in flight. A `next()` cancelled mid-read leaves it running, and
+    /// the next call awaits it rather than starting another, so caller
+    /// timeouts never stack reads.
+    reading: Option<FrameRead>,
+}
+
+type FrameRead = tokio::task::JoinHandle<Result<storage_sqlite::AttachmentTransferFrame, AppError>>;
+
+/// Holds a subscription's reads before they touch the database, counting
+/// those that started, so a test can cancel `next()` mid-read.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct ReadGateForTest {
+    pub(crate) started: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) open: Arc<watch::Sender<bool>>,
 }
 pub struct RuntimeAttachmentTransferSubscription {
     runtime: MarmotAppRuntime,
@@ -302,10 +320,55 @@ pub struct RuntimeAttachmentTransferSubscription {
     identity: Vec<u8>,
     closed: watch::Sender<bool>,
     state: Mutex<TransferSubscriptionState>,
+    #[cfg(test)]
+    read_gate: std::sync::Mutex<Option<ReadGateForTest>>,
 }
 impl RuntimeAttachmentTransferSubscription {
     pub fn close(&self) {
         self.closed.send_replace(true);
+    }
+
+    /// Hold this subscription's later reads until the returned gate opens.
+    #[cfg(test)]
+    pub(crate) fn gate_reads_for_test(&self) -> ReadGateForTest {
+        let gate = ReadGateForTest {
+            started: Default::default(),
+            open: Arc::new(watch::channel(false).0),
+        };
+        *self.read_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    /// Read the current frame, resuming the read a cancelled call left in
+    /// flight instead of starting another: one handle never runs two reads.
+    async fn read_frame(
+        &self,
+        reading: &mut Option<FrameRead>,
+    ) -> Result<storage_sqlite::AttachmentTransferFrame, AppError> {
+        let read = reading.get_or_insert_with(|| {
+            let runtime = self.runtime.clone();
+            let (account, group, targets) = (
+                self.account.clone(),
+                self.group.clone(),
+                self.targets.clone(),
+            );
+            #[cfg(test)]
+            let gate = self.read_gate.lock().unwrap().clone();
+            tokio::spawn(async move {
+                #[cfg(test)]
+                if let Some(gate) = gate {
+                    gate.started
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = gate.open.subscribe().wait_for(|open| *open).await;
+                }
+                runtime
+                    .attachment_transfer_frame(&account, &group, targets)
+                    .await
+            })
+        });
+        let frame = read.await;
+        *reading = None;
+        frame.map_err(|error| AppError::BlockingTask(error.to_string()))?
     }
     pub async fn next(&self) -> Result<Option<Vec<Option<AttachmentTransferStatus>>>, AppError> {
         let mut closed = self.closed.subscribe();
@@ -321,10 +384,7 @@ impl RuntimeAttachmentTransferSubscription {
                 store_epoch: identity,
                 rows,
                 next_expiry,
-            } = self
-                .runtime
-                .attachment_transfer_frame(&self.account, &self.group, self.targets.clone())
-                .await?;
+            } = self.read_frame(&mut state.reading).await?;
             if identity != self.identity
                 || *closed.borrow()
                 || self.runtime.shared.lifecycle().ensure_running().is_err()
@@ -392,10 +452,7 @@ impl RuntimeAttachmentTransferSubscription {
                 store_epoch: identity,
                 rows,
                 next_expiry,
-            } = self
-                .runtime
-                .attachment_transfer_frame(&self.account, &self.group, self.targets.clone())
-                .await?;
+            } = self.read_frame(&mut state.reading).await?;
             if identity != self.identity
                 || *closed.borrow()
                 || self.runtime.shared.lifecycle().ensure_running().is_err()
