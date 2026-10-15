@@ -1,0 +1,237 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::io::Cursor;
+use std::path::PathBuf;
+
+use media_store::conformance::{self, Harness};
+use media_store::{MEDIA_DIRECTORY, MediaStore, PublishOutcome};
+use sha2::{Digest, Sha256};
+
+use super::*;
+use crate::{
+    AttachmentDemand, AttachmentHistoryEntry, SqlCipherKey, SqliteAccountStorage, StoredAppEvent,
+};
+
+const GROUP: &str = "abababababababababababababababab";
+const NOW: u64 = 1_000;
+
+struct SqliteHarness {
+    dir: tempfile::TempDir,
+    key: SqlCipherKey,
+    storage: SqliteAccountStorage,
+    slots: RefCell<HashMap<u32, Vec<u8>>>,
+}
+
+impl SqliteHarness {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SqlCipherKey::new(hex::encode([0x6b; 32])).unwrap();
+        let storage =
+            SqliteAccountStorage::open_encrypted(dir.path().join("session.sqlite"), &key).unwrap();
+        storage
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO account_groups(group_id_hex,endpoint,updated_at) VALUES(?1,'',0)",
+                [GROUP],
+            )
+            .unwrap();
+        Self {
+            dir,
+            key,
+            storage,
+            slots: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// A real attachment slot (acquisition token) per test slot number.
+    fn token(&self, slot: u32) -> Vec<u8> {
+        if let Some(token) = self.slots.borrow().get(&slot) {
+            return token.clone();
+        }
+        let message = format!("{:064x}", slot + 1);
+        let digest = [9; 32];
+        let tag = vec![
+            "imeta".to_owned(),
+            "m image/png".to_owned(),
+            format!("x {}", hex::encode(digest)),
+        ];
+        self.storage
+            .record_app_event(&StoredAppEvent {
+                group_id_hex: GROUP.into(),
+                message_id_hex: message.clone(),
+                source_message_id_hex: Some(message.clone()),
+                source_epoch: Some(1),
+                direction: "received".into(),
+                sender: "author".into(),
+                plaintext: String::new(),
+                kind: 9,
+                tags: vec![tag.clone()],
+                recorded_at: NOW,
+                received_at: NOW,
+                origin_commit_id: None,
+                moderation_grant: false,
+            })
+            .unwrap();
+        let entry = AttachmentHistoryEntry {
+            emoji_tags: Vec::new(),
+            message_id_hex: message.clone(),
+            attachment_index: 0,
+            source_message_id_hex: message.clone(),
+            source_epoch: Some(1),
+            sender: "author".into(),
+            timeline_at: NOW,
+            received_at: NOW,
+            slot: serde_json::to_value(&tag).unwrap(),
+        };
+        assert!(matches!(
+            self.storage
+                .request_attachment_acquisition(GROUP, &entry, digest, NOW)
+                .unwrap(),
+            AttachmentDemand::Requested(_)
+        ));
+        let token: Vec<u8> = self
+            .storage
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT token FROM attachment_acquisition WHERE message_id_hex=?1",
+                [&message],
+                |r| r.get(0),
+            )
+            .unwrap();
+        self.slots.borrow_mut().insert(slot, token.clone());
+        token
+    }
+
+    fn sql(&self, sql: &str, param: &[u8]) {
+        self.storage.lock().unwrap().execute(sql, [param]).unwrap();
+    }
+}
+
+impl Harness for SqliteHarness {
+    type Catalog = SqliteMediaCatalog;
+
+    fn root(&self) -> PathBuf {
+        self.dir.path().join(MEDIA_DIRECTORY)
+    }
+
+    fn catalog(&self) -> SqliteMediaCatalog {
+        SqliteMediaCatalog::new(self.storage.clone())
+    }
+
+    fn target(&self, slot: u32) -> Box<dyn PublishTarget + '_> {
+        Box::new(SlotPublication::new(self.storage.clone(), self.token(slot)))
+    }
+
+    /// Deleting the acquisition, as removal and source invalidation do.
+    fn supersede(&self, slot: u32) {
+        self.sql(
+            "DELETE FROM attachment_acquisition WHERE token=?1",
+            &self.token(slot),
+        );
+    }
+
+    fn release(&self, slot: u32) -> Vec<FileId> {
+        self.storage
+            .release_media_reference(&self.token(slot))
+            .unwrap()
+    }
+
+    fn delete_row(&self, id: FileId) {
+        self.sql("DELETE FROM media_files WHERE id=?1", id.as_bytes());
+    }
+
+    fn reset(&self) {
+        self.storage
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE chat_presentation_meta SET store_epoch=randomblob(16) WHERE id=1",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn restart(&mut self) {
+        self.storage.close().unwrap();
+        self.storage =
+            SqliteAccountStorage::open_encrypted(self.dir.path().join("session.sqlite"), &self.key)
+                .unwrap();
+    }
+}
+
+#[test]
+fn the_sqlcipher_catalog_passes_the_conformance_suite() {
+    conformance::run_all(&SqliteHarness::new);
+}
+
+#[test]
+fn deleting_a_key_relies_on_secure_delete() {
+    let harness = SqliteHarness::new();
+    let secure_delete: i64 = harness
+        .storage
+        .lock()
+        .unwrap()
+        .query_row("PRAGMA secure_delete", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(secure_delete, 1);
+}
+
+fn publish(
+    harness: &SqliteHarness,
+    store: &MediaStore<SqliteMediaCatalog>,
+    slot: u32,
+    body: &[u8],
+) -> FileId {
+    match store
+        .publish(
+            harness.target(slot).as_ref(),
+            Category::Retained,
+            &mut Cursor::new(body),
+            body.len() as u64,
+            Sha256::digest(body).into(),
+            NOW,
+            &|| false,
+        )
+        .unwrap()
+    {
+        PublishOutcome::Published(id) => id,
+        other => panic!("expected a new file, got {other:?}"),
+    }
+}
+
+#[test]
+fn references_require_ready_files_and_repointing_releases_the_old_file() {
+    let harness = SqliteHarness::new();
+    let store = MediaStore::new(harness.root(), harness.catalog());
+    let token = harness.token(9);
+    let pending = FileId([3; 16]);
+    harness
+        .catalog()
+        .insert_pending(&NewFile {
+            id: pending,
+            key: media_store::FileKey::from_bytes([1; 32]),
+            category: Category::Retained,
+            byte_len: 1,
+            digest: [2; 32],
+            created_at: NOW,
+        })
+        .unwrap();
+    assert!(
+        harness
+            .storage
+            .connection
+            .with_transaction(|| {
+                let conn = harness.storage.lock()?;
+                attach_slot(&conn, &token, pending)
+            })
+            .is_err()
+    );
+
+    let old = publish(&harness, &store, 9, b"old");
+    let new = publish(&harness, &store, 9, b"new");
+    // The second publish re-pointed slot 9, releasing the old file's key.
+    assert_eq!(store.file_state(&old).unwrap(), None);
+    assert_eq!(store.file_state(&new).unwrap(), Some(FileState::Ready));
+}

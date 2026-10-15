@@ -135,6 +135,7 @@ still land on the same epoch and group state. The engine — not relay order or 
 | | [`cgka-session`](crates/cgka-session/README.md) | Encrypted account-device session over the engine |
 | Storage | [`storage-sqlite`](crates/storage-sqlite/README.md) | SQLCipher persistence for engine, session, and simulator |
 | | [`fs-private`](crates/fs-private/README.md) | Owner-only file, directory, and socket creation |
+| | [`media-store`](crates/media-store/README.md) | Encrypted per-file media store: file format and file lifecycle |
 | Transport | [`transport-nostr-peeler`](crates/transport-nostr-peeler/README.md) | Nostr event ⇄ engine message boundary |
 | | [`transport-nostr-adapter`](crates/transport-nostr-adapter/README.md) | Relay I/O behind an injectable client |
 | | [`transport-quic-stream`](crates/transport-quic-stream/README.md) | QUIC transport for live agent text previews |

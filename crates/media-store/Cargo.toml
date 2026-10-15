@@ -1,0 +1,29 @@
+[package]
+name = "media-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Encrypted per-file media store for Marmot accounts: file format and file lifecycle, with metadata behind a catalog trait."
+
+[dependencies]
+fs-private.workspace = true
+hex.workspace = true
+hkdf.workspace = true
+openssl.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+flate2.workspace = true
+tempfile.workspace = true
+
+[features]
+# Exports the catalog conformance suite so a `MediaCatalog` implementation in
+# another crate (storage-sqlite) can run it against its real database.
+catalog-conformance = []

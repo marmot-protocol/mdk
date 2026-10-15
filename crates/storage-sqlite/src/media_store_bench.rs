@@ -41,10 +41,12 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-use super::format::{FILE_ID_BYTES, FILE_KEY_BYTES, FileKey, MediaFileReader, MediaFileWriter};
 use crate::{
     AttachmentAssetRef, AttachmentDemand, AttachmentHistoryEntry, AttachmentPublishResult,
     MAX_ATTACHMENT_LOCAL_READ_BYTES, SqlCipherKey, SqliteAccountStorage, StoredAppEvent,
+};
+use media_store::format::{
+    FILE_ID_BYTES, FILE_KEY_BYTES, FileKey, MediaFileReader, MediaFileWriter,
 };
 
 /// Row label for the file format's cipher.
@@ -88,7 +90,7 @@ pub fn run_media_store_benchmark(
         "MDK_BENCH media_store_env arch={} os={} segment_bytes={}",
         std::env::consts::ARCH,
         std::env::consts::OS,
-        super::format::SEGMENT_PLAINTEXT_BYTES,
+        media_store::format::SEGMENT_PLAINTEXT_BYTES,
     ));
     for &size in &config.sizes {
         let iterations = if size >= LARGE_BODY {
