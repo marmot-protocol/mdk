@@ -332,6 +332,23 @@ impl RetainedAnchorRewindCounter {
     }
 }
 
+/// Counts full pre-apply group snapshots: the canonical apply's rollback copy
+/// of the group's whole message ledger (mdk#2326).
+#[derive(Clone, Default)]
+struct ApplySnapshotCounter(Arc<AtomicUsize>);
+
+impl ApplySnapshotCounter {
+    fn note(&self, name: &str) {
+        if name.starts_with("openmls-apply-") {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 /// `SqliteAccountStorage` wrapper that injects a transient `Busy` on
 /// selected record/cache writes. Every other call delegates unchanged.
 struct FaultStorage {
@@ -346,6 +363,7 @@ struct FaultStorage {
     release_fault: LeaveWriteFault,
     preparation_delay: PreparationDelay,
     retained_anchor_rewinds: RetainedAnchorRewindCounter,
+    apply_snapshots: ApplySnapshotCounter,
     termination_fault: LeaveWriteFault,
     post_commit_disband_read_fault: LeaveWriteFault,
 }
@@ -482,6 +500,7 @@ impl MessageStorage for FaultStorage {
         self.inner.has_processed_transport_id(transport_id)
     }
     fn create_group_snapshot(&self, group_id: &GroupId, name: &str) -> StorageResult<()> {
+        self.apply_snapshots.note(name);
         self.inner.create_group_snapshot(group_id, name)
     }
     fn list_group_snapshots(&self, group_id: &GroupId) -> StorageResult<Vec<String>> {
@@ -837,6 +856,23 @@ impl StorageProvider for FaultStorage {
         self.inner.with_transaction(|_inner| f(self))
     }
 
+    fn with_group_savepoint<T, E, F>(
+        &self,
+        group_id: &GroupId,
+        fallback_snapshot: &str,
+        f: F,
+    ) -> Result<T, E>
+    where
+        Self: Sized,
+        E: From<StorageError>,
+        F: FnOnce(&Self) -> Result<T, E>,
+    {
+        // Same delegation as `with_transaction`: the real savepoint, with the
+        // wrapper's fault-injecting writes inside it.
+        self.inner
+            .with_group_savepoint(group_id, fallback_snapshot, |_inner| f(self))
+    }
+
     fn backend(&self) -> Backend {
         self.inner.backend()
     }
@@ -847,6 +883,16 @@ impl StorageProvider for FaultStorage {
 fn build_fault_selfremove_client(
     id: &[u8],
     fault: PutGroupFault,
+) -> (cgka_engine::Engine<FaultStorage>, SqliteAccountStorage) {
+    build_counted_fault_selfremove_client(id, fault, ApplySnapshotCounter::default())
+}
+
+/// [`build_fault_selfremove_client`] that also reports full pre-apply
+/// snapshots to `apply_snapshots`.
+fn build_counted_fault_selfremove_client(
+    id: &[u8],
+    fault: PutGroupFault,
+    apply_snapshots: ApplySnapshotCounter,
 ) -> (cgka_engine::Engine<FaultStorage>, SqliteAccountStorage) {
     let inner = SqliteAccountStorage::in_memory().unwrap();
     let handle = inner.clone();
@@ -860,6 +906,7 @@ fn build_fault_selfremove_client(
         release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        apply_snapshots,
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
     })
@@ -1331,6 +1378,7 @@ fn build_release_fault_client(
         release_fault,
         preparation_delay: PreparationDelay::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
     })
@@ -1360,6 +1408,7 @@ fn build_capability_fault_client(
         release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
     })
@@ -1390,6 +1439,7 @@ fn build_leave_write_fault_client(
         release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
     })
@@ -1735,33 +1785,43 @@ async fn auto_commit_record_write_failure_leaves_no_torn_group_record() {
     assert!(!record.members.iter().any(|m| m.id == bob_member_id));
 }
 
-/// A same-epoch rival that wins branch selection is applied by the
-/// convergence pass, which mirrors the selected epoch into the durable group
-/// record. A storage fault at that mirror must not leave the engine reporting
-/// one epoch while the record holds another: hydration seeds the in-memory
-/// epoch FROM that record, so an in-process split becomes a wrong epoch on
-/// the next session open.
-///
-/// The winning commit stays durably retained across the failure, so a later
-/// pass (the fault is transient) must still reorg the loser onto the winning
-/// branch, after which redelivery is a plain duplicate — never a `Buffered`
-/// promise of a replay that would never come.
-#[tokio::test]
-async fn inbound_apply_record_mirror_failure_does_not_split_epoch_state() {
+/// The losing side of a same-epoch fork: Alice and Bob, co-admins at epoch 1,
+/// each publish an invite commit without seeing the other's. Both sides are
+/// fault-injectable and count full pre-apply snapshots, so callers never depend
+/// on which one the authenticated ordering key makes the loser.
+struct ConcurrentInviteFork {
+    loser: cgka_engine::Engine<FaultStorage>,
+    loser_handle: SqliteAccountStorage,
+    loser_fault: PutGroupFault,
+    loser_apply_snapshots: ApplySnapshotCounter,
+    routed_winner: TransportMessage,
+    group_id: GroupId,
+}
+
+async fn concurrent_invite_fork(label: &str) -> ConcurrentInviteFork {
     let alice_fault = PutGroupFault::default();
     let bob_fault = PutGroupFault::default();
-    let (mut alice, alice_handle) =
-        build_fault_selfremove_client(b"alice-mirror", alice_fault.clone());
-    let (mut bob, bob_handle) = build_fault_selfremove_client(b"bob-mirror", bob_fault.clone());
-    let mut david = build_selfremove_client(b"david-mirror");
-    let mut eve = build_selfremove_client(b"eve-mirror");
+    let alice_snapshots = ApplySnapshotCounter::default();
+    let bob_snapshots = ApplySnapshotCounter::default();
+    let (mut alice, alice_handle) = build_counted_fault_selfremove_client(
+        format!("alice-{label}").as_bytes(),
+        alice_fault.clone(),
+        alice_snapshots.clone(),
+    );
+    let (mut bob, bob_handle) = build_counted_fault_selfremove_client(
+        format!("bob-{label}").as_bytes(),
+        bob_fault.clone(),
+        bob_snapshots.clone(),
+    );
+    let mut david = build_selfremove_client(format!("david-{label}").as_bytes());
+    let mut eve = build_selfremove_client(format!("eve-{label}").as_bytes());
 
     // Alice and bob are co-admins at epoch 1, so both can publish a privileged
     // invite commit from the same epoch.
     let bob_kp = bob.fresh_key_package().await.unwrap();
     let (group_id, create) = alice
         .create_group(CreateGroupRequest {
-            name: "mirror".into(),
+            name: label.into(),
             description: String::new(),
             members: vec![bob_kp],
             required_features: vec![],
@@ -1828,10 +1888,16 @@ async fn inbound_apply_record_mirror_failure_does_not_split_epoch_state() {
     };
     let bob_wins =
         ordering_key(bob.self_id(), &bob_commit) < ordering_key(alice.self_id(), &alice_commit);
-    let (loser, loser_handle, loser_fault, winning_commit) = if bob_wins {
-        (&mut alice, &alice_handle, &alice_fault, bob_commit)
+    let (loser, loser_handle, loser_fault, loser_apply_snapshots, winning_commit) = if bob_wins {
+        (
+            alice,
+            alice_handle,
+            alice_fault,
+            alice_snapshots,
+            bob_commit,
+        )
     } else {
-        (&mut bob, &bob_handle, &bob_fault, alice_commit)
+        (bob, bob_handle, bob_fault, bob_snapshots, alice_commit)
     };
     assert_eq!(loser.epoch(&group_id).unwrap(), EpochId(2));
 
@@ -1843,6 +1909,37 @@ async fn inbound_apply_record_mirror_failure_does_not_split_epoch_state() {
         },
         ..winning_commit
     };
+    ConcurrentInviteFork {
+        loser,
+        loser_handle,
+        loser_fault,
+        loser_apply_snapshots,
+        routed_winner,
+        group_id,
+    }
+}
+
+/// A same-epoch rival that wins branch selection is applied by the
+/// convergence pass, which mirrors the selected epoch into the durable group
+/// record. A storage fault at that mirror must not leave the engine reporting
+/// one epoch while the record holds another: hydration seeds the in-memory
+/// epoch FROM that record, so an in-process split becomes a wrong epoch on
+/// the next session open.
+///
+/// The winning commit stays durably retained across the failure, so a later
+/// pass (the fault is transient) must still reorg the loser onto the winning
+/// branch, after which redelivery is a plain duplicate — never a `Buffered`
+/// promise of a replay that would never come.
+#[tokio::test]
+async fn inbound_apply_record_mirror_failure_does_not_split_epoch_state() {
+    let ConcurrentInviteFork {
+        mut loser,
+        loser_handle,
+        loser_fault,
+        routed_winner,
+        group_id,
+        ..
+    } = concurrent_invite_fork("mirror").await;
     let ingested = loser.ingest(routed_winner.clone()).await.unwrap();
     assert!(
         matches!(ingested, IngestOutcome::Buffered { .. }),
@@ -1913,6 +2010,84 @@ async fn inbound_apply_record_mirror_failure_does_not_split_epoch_state() {
             })
         ),
         "redelivery after recovery must be a duplicate, got {redelivered:?}"
+    );
+}
+
+/// mdk#2326: a canonical apply used to copy the group's whole message ledger
+/// into a pre-apply snapshot, so its cost grew with stored history. It must
+/// still roll a failed apply back and leave the caller's enclosing transaction
+/// usable: the caller commits its own work, the abandoned apply's writes stay
+/// undone, and the engine reloads the restored MLS state instead of reusing a
+/// group object cached during the apply.
+#[tokio::test]
+async fn failed_canonical_apply_rolls_back_inside_a_committing_caller_without_a_full_snapshot() {
+    let ConcurrentInviteFork {
+        mut loser,
+        loser_handle,
+        loser_fault,
+        loser_apply_snapshots,
+        routed_winner,
+        group_id,
+    } = concurrent_invite_fork("savepoint").await;
+    let ingested = loser.ingest(routed_winner.clone()).await.unwrap();
+    assert!(
+        matches!(ingested, IngestOutcome::Buffered { .. }),
+        "the winning rival must enter convergence, got {ingested:?}"
+    );
+    let record_before = loser_handle.get_group(&group_id).unwrap();
+    let winner_row = MessageId::new(hex::decode(content_hex(&routed_winner)).unwrap());
+    let winner_state_before = loser_handle.get_message(&winner_row).unwrap().state;
+
+    // Fail the selected branch's record write mid-apply, inside a caller
+    // transaction that commits its own write regardless.
+    let caller_write = MessageId::new(b"caller-write-after-failed-apply".to_vec());
+    loser_fault.arm(1);
+    loser_handle
+        .with_transaction(|storage| {
+            let faulted = loser.converge_stored_openmls_messages_at(&group_id, u64::MAX);
+            assert!(
+                faulted.is_err(),
+                "the storage fault must surface from the settling pass, got {faulted:?}"
+            );
+            storage.put_ingress_dedup_marker(&caller_write)
+        })
+        .unwrap();
+
+    assert!(
+        loser_handle
+            .has_ingress_dedup_marker(&caller_write)
+            .unwrap()
+    );
+    let record = loser_handle.get_group(&group_id).unwrap();
+    assert_eq!(record.epoch, record_before.epoch);
+    assert_eq!(record.members, record_before.members);
+    assert_eq!(
+        loser_handle.get_message(&winner_row).unwrap().state,
+        winner_state_before,
+        "the abandoned apply's disposition must not commit with the caller"
+    );
+    assert_eq!(loser.epoch(&group_id).unwrap(), record.epoch);
+    assert_eq!(
+        loser.members(&group_id).unwrap().len(),
+        record.members.len(),
+        "the engine must read the restored MLS state, not the abandoned apply's"
+    );
+
+    let recovered = loser
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .expect("the retry pass settles after the transient fault");
+    assert!(
+        recovered
+            .accepted_commits
+            .contains(&content_hex(&routed_winner)),
+        "convergence must accept the retained winning commit, got {:?}",
+        recovered.accepted_commits
+    );
+    assert_eq!(loser.members(&group_id).unwrap().len(), 3);
+    assert_eq!(
+        loser_apply_snapshots.count(),
+        0,
+        "neither the failed nor the successful apply may copy the whole group ledger"
     );
 }
 
@@ -2207,6 +2382,7 @@ async fn slow_preparation_case(
         release_fault: LeaveWriteFault::default(),
         preparation_delay: delay.clone(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
     })
@@ -2281,6 +2457,7 @@ async fn past_peel_backlog_case(
         release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
         retained_anchor_rewinds: rewinds.clone(),
+        apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
     })
@@ -2642,6 +2819,7 @@ async fn setup_own_intent_fault_case(
         release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
     })
@@ -2853,6 +3031,7 @@ async fn a_failed_terminal_retirement_leaves_every_row_deferred_for_the_next_pas
         release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: LeaveWriteFault::default(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
     })
@@ -3032,6 +3211,7 @@ async fn eviction_realization_retries_all_cleanup_before_announcing_termination(
             release_fault: LeaveWriteFault::default(),
             preparation_delay: PreparationDelay::default(),
             retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+            apply_snapshots: ApplySnapshotCounter::default(),
             termination_fault: termination_fault.clone(),
             post_commit_disband_read_fault: LeaveWriteFault::default(),
         })
@@ -3205,6 +3385,7 @@ async fn assert_convergence_membership_fault(
         release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: termination_fault.clone(),
         post_commit_disband_read_fault: post_commit_disband_read_fault.clone(),
     })
@@ -3395,6 +3576,7 @@ async fn disband_cleanup_failure_preserves_earlier_canonical_activity_once() {
         release_fault: LeaveWriteFault::default(),
         preparation_delay: PreparationDelay::default(),
         retained_anchor_rewinds: RetainedAnchorRewindCounter::default(),
+        apply_snapshots: ApplySnapshotCounter::default(),
         termination_fault: termination_fault.clone(),
         post_commit_disband_read_fault: LeaveWriteFault::default(),
     })

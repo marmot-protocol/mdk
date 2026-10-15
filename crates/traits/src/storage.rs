@@ -1057,7 +1057,67 @@ pub trait StorageProvider:
         f(self)
     }
 
+    /// Run `f` as one unit that a failure undoes without ending the caller's
+    /// transaction. When `f` returns `Err`, `group_id`'s state as
+    /// [`MessageStorage::create_group_snapshot`] captures it (group record,
+    /// OpenMLS state, message ledger and outbound queue) is back to what it was
+    /// before `f` ran, and an enclosing [`Self::with_transaction`] can still
+    /// commit its other work. On success `f`'s writes join the enclosing
+    /// transaction, or commit as one unit when there is none. A backend may
+    /// undo more on failure, up to every write `f` made, so callers must not
+    /// depend on any write of a failed `f` surviving.
+    ///
+    /// The default is [`with_group_snapshot_rollback`]: a full group snapshot
+    /// named `fallback_snapshot`, which costs time and space in proportion to
+    /// the group's stored history. On a backend without transactions that
+    /// snapshot survives a crash inside `f`, so callers choose a name their
+    /// recovery can find and restore. SQLite overrides this with a `SAVEPOINT`,
+    /// whose cost does not grow with history and which writes no snapshot.
+    fn with_group_savepoint<T, E, F>(
+        &self,
+        group_id: &GroupId,
+        fallback_snapshot: &str,
+        f: F,
+    ) -> Result<T, E>
+    where
+        Self: Sized,
+        E: From<StorageError>,
+        F: FnOnce(&Self) -> Result<T, E>,
+    {
+        with_group_snapshot_rollback(self, group_id, fallback_snapshot, f)
+    }
+
     fn backend(&self) -> Backend;
+}
+
+/// [`StorageProvider::with_group_savepoint`] for backends without savepoints.
+///
+/// Captures a full snapshot of `group_id` named `snapshot`, runs `f`, and
+/// releases the snapshot in the same transaction as `f`'s writes. If `f` or
+/// that transaction fails, the group is rolled back to the snapshot and the
+/// snapshot released before the error is returned.
+pub fn with_group_snapshot_rollback<S, T, E, F>(
+    storage: &S,
+    group_id: &GroupId,
+    snapshot: &str,
+    f: F,
+) -> Result<T, E>
+where
+    S: StorageProvider,
+    E: From<StorageError>,
+    F: FnOnce(&S) -> Result<T, E>,
+{
+    storage.create_group_snapshot(group_id, snapshot)?;
+    let result = storage.with_transaction(|storage| {
+        let value = f(storage)?;
+        storage.release_group_snapshot(group_id, snapshot)?;
+        Ok(value)
+    });
+    if result.is_err() {
+        storage.rollback_group_to_snapshot(group_id, snapshot)?;
+        storage.release_group_snapshot(group_id, snapshot)?;
+    }
+    result
 }
 
 #[cfg(test)]

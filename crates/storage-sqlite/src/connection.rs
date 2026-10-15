@@ -649,6 +649,71 @@ impl SharedConnection {
         result
     }
 
+    /// Run `f` as a nested unit of the current transaction, or of a new one
+    /// when none is open. Nested [`Self::with_transaction`] calls flatten, so
+    /// their errors roll back only at the outermost boundary; this rolls `f`
+    /// back on its own. On `Err` or panic, `ROLLBACK TO` undoes every write
+    /// `f` made, drops the wakeups it registered and invalidates cached
+    /// OpenMLS objects, and the caller's transaction stays open and usable.
+    pub(crate) fn with_savepoint<T, E, F>(&self, f: F) -> Result<T, E>
+    where
+        E: From<StorageError>,
+        F: FnOnce() -> Result<T, E>,
+    {
+        self.with_transaction(|| {
+            self.execute_transaction_boundary_with_retry("SAVEPOINT mdk_savepoint")?;
+            let wakeups = self
+                .inner
+                .post_commit
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .len();
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+                Ok(Ok(value)) => {
+                    match self.execute_transaction_boundary_with_retry("RELEASE mdk_savepoint") {
+                        Ok(()) => Ok(value),
+                        Err(release_err) => {
+                            self.rollback_to_savepoint(wakeups)?;
+                            Err(E::from(release_err))
+                        }
+                    }
+                }
+                Ok(Err(err)) => {
+                    self.rollback_to_savepoint(wakeups)?;
+                    Err(err)
+                }
+                Err(payload) => {
+                    let _ = self.rollback_to_savepoint(wakeups);
+                    std::panic::resume_unwind(payload);
+                }
+            }
+        })
+    }
+
+    /// Undo and close the innermost `mdk_savepoint`. A failure leaves the
+    /// transaction in an unknown state that a caller catching the error could
+    /// otherwise commit, so it marks the connection unusable, as a failed
+    /// `ROLLBACK` does. A closed connection already rolled everything back.
+    fn rollback_to_savepoint(&self, wakeups: usize) -> StorageResult<()> {
+        // `ROLLBACK TO` discards OpenMLS writes, like `ROLLBACK`.
+        self.note_openmls_write();
+        self.inner
+            .post_commit
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .truncate(wakeups);
+        match self
+            .execute_transaction_boundary_with_retry("ROLLBACK TO mdk_savepoint")
+            .and_then(|()| self.execute_transaction_boundary_with_retry("RELEASE mdk_savepoint"))
+        {
+            Ok(()) => Ok(()),
+            Err(err @ StorageError::Closed(_)) => Err(err),
+            Err(err) => Err(self.mark_transaction_unusable(format!(
+                "sqlite ROLLBACK TO SAVEPOINT failed ({err}); connection marked unusable",
+            ))),
+        }
+    }
+
     fn wait_for_transaction_slot(&self, current: ThreadId) -> StorageResult<()> {
         let mut owner = self
             .inner
@@ -1431,6 +1496,19 @@ impl StorageProvider for SqliteAccountStorage {
         self.connection.with_transaction(|| f(self))
     }
 
+    fn with_group_savepoint<T, E, F>(
+        &self,
+        _group_id: &cgka_traits::types::GroupId,
+        _fallback_snapshot: &str,
+        f: F,
+    ) -> Result<T, E>
+    where
+        E: From<StorageError>,
+        F: FnOnce(&Self) -> Result<T, E>,
+    {
+        self.connection.with_savepoint(|| f(self))
+    }
+
     fn backend(&self) -> Backend {
         Backend::Sqlite
     }
@@ -1885,6 +1963,160 @@ mod tests {
         assert!(result.is_err());
         let persisted: Option<TestGroupState> = store.mls_storage().group_state(&group_id).unwrap();
         assert_eq!(persisted, None);
+    }
+
+    #[test]
+    fn failed_group_savepoint_undoes_only_its_own_work_inside_a_committing_transaction() {
+        use crate::storage::test_support::{
+            TestGroupState, gid, mid, sample_group, sample_message,
+        };
+        use cgka_traits::storage::{GroupStorage, MessageStorage};
+        use cgka_traits::types::EpochId;
+        use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mls_id = openmls::group::GroupId::from_slice(gid(1).as_slice());
+        let outer_wakeup = Arc::new(AtomicU32::new(0));
+        let savepoint_wakeup = Arc::new(AtomicU32::new(0));
+        let mut generation_inside = None;
+
+        store
+            .with_transaction(|outer| -> StorageResult<()> {
+                outer.put_group(&sample_group(gid(1), 1, 1))?;
+                let failed: StorageResult<()> =
+                    outer.with_group_savepoint(&gid(1), "unused-fallback", |inner| {
+                        inner.put_group(&sample_group(gid(1), 2, 2))?;
+                        inner.put_message(&sample_message(mid(1), gid(1), 2))?;
+                        inner
+                            .mls_storage()
+                            .write_group_state(&mls_id, &TestGroupState(b"partial".to_vec()))
+                            .map_err(|e| StorageError::Backend(e.to_string()))?;
+                        let wakeup = savepoint_wakeup.clone();
+                        inner.connection.after_commit(move || {
+                            wakeup.fetch_add(1, Ordering::SeqCst);
+                        });
+                        generation_inside = inner.mls_write_generation();
+                        Err(StorageError::Backend("abandon the unit".into()))
+                    });
+                assert!(failed.is_err());
+                assert_ne!(
+                    outer.mls_write_generation(),
+                    generation_inside,
+                    "a group cached inside the abandoned unit must not be reused"
+                );
+                assert_eq!(outer.get_group(&gid(1))?.epoch, EpochId(1));
+                let wakeup = outer_wakeup.clone();
+                outer.connection.after_commit(move || {
+                    wakeup.fetch_add(1, Ordering::SeqCst);
+                });
+                outer.put_group(&sample_group(gid(2), 1, 1))
+            })
+            .unwrap();
+
+        assert_eq!(store.get_group(&gid(1)).unwrap().epoch, EpochId(1));
+        assert!(store.get_group(&gid(2)).is_ok());
+        assert!(store.get_message(&mid(1)).is_err());
+        let partial: Option<TestGroupState> = store.mls_storage().group_state(&mls_id).unwrap();
+        assert_eq!(partial, None);
+        assert_eq!(outer_wakeup.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            savepoint_wakeup.load(Ordering::SeqCst),
+            0,
+            "a wakeup registered by the abandoned unit must not fire"
+        );
+    }
+
+    #[test]
+    fn group_savepoint_commits_alone_and_nests() {
+        use crate::storage::test_support::{gid, sample_group};
+        use cgka_traits::storage::GroupStorage;
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .with_group_savepoint(&gid(1), "unused-fallback", |outer| -> StorageResult<()> {
+                outer.put_group(&sample_group(gid(1), 1, 1))?;
+                let inner: StorageResult<()> =
+                    outer.with_group_savepoint(&gid(2), "unused-fallback", |inner| {
+                        inner.put_group(&sample_group(gid(2), 1, 1))?;
+                        Err(StorageError::Backend("abandon the inner unit".into()))
+                    });
+                assert!(inner.is_err());
+                outer.with_group_savepoint(&gid(3), "unused-fallback", |inner| {
+                    inner.put_group(&sample_group(gid(3), 1, 1))
+                })
+            })
+            .unwrap();
+        assert!(!store.connection.is_current_thread_transaction_owner());
+        assert!(store.get_group(&gid(1)).is_ok());
+        assert!(store.get_group(&gid(2)).is_err());
+        assert!(store.get_group(&gid(3)).is_ok());
+
+        let failed: StorageResult<()> =
+            store.with_group_savepoint(&gid(4), "unused-fallback", |storage| {
+                storage.put_group(&sample_group(gid(4), 1, 1))?;
+                Err(StorageError::Backend("abandon the unit".into()))
+            });
+        assert!(failed.is_err());
+        assert!(!store.connection.is_current_thread_transaction_owner());
+        assert!(store.get_group(&gid(4)).is_err());
+    }
+
+    #[test]
+    fn group_savepoint_undoes_a_panic_the_caller_catches_before_committing() {
+        use crate::storage::test_support::{gid, sample_group};
+        use cgka_traits::storage::GroupStorage;
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .with_transaction(|outer| -> StorageResult<()> {
+                let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _: StorageResult<()> =
+                        outer.with_group_savepoint(&gid(1), "unused-fallback", |inner| {
+                            inner.put_group(&sample_group(gid(1), 1, 1))?;
+                            panic!("abandon the unit by panicking");
+                        });
+                }));
+                assert!(panic.is_err());
+                outer.put_group(&sample_group(gid(2), 1, 1))
+            })
+            .unwrap();
+        assert!(store.get_group(&gid(1)).is_err());
+        assert!(store.get_group(&gid(2)).is_ok());
+    }
+
+    /// The trait default for backends without savepoints: the same contract
+    /// through a full group snapshot, released on both exits.
+    #[test]
+    fn group_snapshot_fallback_restores_the_group_inside_a_committing_transaction() {
+        use crate::storage::test_support::{gid, mid, sample_group, sample_message};
+        use cgka_traits::storage::{GroupStorage, MessageStorage, with_group_snapshot_rollback};
+        use cgka_traits::types::EpochId;
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 1, 1)).unwrap();
+        store
+            .with_transaction(|outer| -> StorageResult<()> {
+                let failed: StorageResult<()> =
+                    with_group_snapshot_rollback(outer, &gid(1), "fallback", |inner| {
+                        inner.put_group(&sample_group(gid(1), 2, 2))?;
+                        inner.put_message(&sample_message(mid(1), gid(1), 2))?;
+                        Err(StorageError::Backend("abandon the unit".into()))
+                    });
+                assert!(failed.is_err());
+                outer.put_group(&sample_group(gid(2), 1, 1))
+            })
+            .unwrap();
+        assert_eq!(store.get_group(&gid(1)).unwrap().epoch, EpochId(1));
+        assert!(store.get_message(&mid(1)).is_err());
+        assert!(store.get_group(&gid(2)).is_ok());
+        assert!(store.list_group_snapshots(&gid(1)).unwrap().is_empty());
+
+        with_group_snapshot_rollback(&store, &gid(1), "fallback", |storage| {
+            storage.put_group(&sample_group(gid(1), 3, 1))
+        })
+        .unwrap();
+        assert_eq!(store.get_group(&gid(1)).unwrap().epoch, EpochId(3));
+        assert!(store.list_group_snapshots(&gid(1)).unwrap().is_empty());
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

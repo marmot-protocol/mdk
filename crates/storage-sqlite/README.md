@@ -145,6 +145,12 @@ outbound, and app-projection rows, which the engine validates separately. The fi
 is never logged or persisted. It lets resumable reconstruction ignore unrelated writes through another app connection;
 the `mls_write_generation` contract for cached `MlsGroup` objects is unchanged.
 
+**Group savepoints.** Nested `with_transaction` calls join the outermost transaction and roll back only there.
+`StorageProvider::with_group_savepoint` is the nested unit that rolls back on its own: on `Err` or panic a SQLite
+`SAVEPOINT` undoes every write the unit made, drops the after-commit wakeups it registered and moves
+`mls_write_generation`, and the caller's transaction stays open. Canonical convergence apply uses it in place of a full
+group snapshot, so its rollback cost no longer grows with stored history (mdk#2326).
+
 **Deferred recovery preparation.** `MessageStorage::list_deferred_message_metadata` preserves insertion order and exact
 encoded payload lengths while omitting payload blobs. The engine uses it for sweep preparation and readiness, then
 fetches full records only for selected attempts, retirement, or bounded lifecycle normalization. Legacy format-1 rows
