@@ -258,10 +258,17 @@ arrays. The exact encoded length is computed before allocating the zeroizing
 output buffer; the encoder cannot grow it. Temporary list bodies that can
 contain secret material also use zeroizing ownership.
 
-Temporary replay and branch probes use a canonical-state-only restore even when
-their retained anchor predates state-scoped capture and contains full message
-and queue images. This keeps legacy anchors readable without letting a probe
-rewrite live input or outbound-work rows.
+Every rewind onto a retained anchor, from temporary replay and branch probes to
+the historical apply of a reorg, goes through
+`StorageProvider::rollback_group_state_keeping_live_records`, which leaves the
+live message ledger, pending application events, and outbound queue as they
+are even when the anchor predates state-scoped capture and contains full
+message and queue images. SQLite restores canonical state only, so the rewind
+costs the same however much history the group stores (mdk#2330). Backends
+without a state-only restore inherit a default that rolls back, then deletes
+the rows the image brought back and writes the live ones back. This keeps
+legacy anchors readable without letting a rewind lose a pending application
+event or restore a row or queued intent removed after the anchor was captured.
 
 A blob without `MDKS` is decoded as the corresponding unversioned JSON v1
 snapshot or checkpoint. A blob with `MDKS` never falls back following a v2

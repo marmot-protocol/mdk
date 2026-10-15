@@ -153,6 +153,9 @@ the `mls_write_generation` contract for cached `MlsGroup` objects is unchanged.
 `SAVEPOINT` undoes every write the unit made, drops the after-commit wakeups it registered and moves
 `mls_write_generation`, and the caller's transaction stays open. Canonical convergence apply uses it in place of a full
 group snapshot, so its rollback cost no longer grows with stored history (mdk#2326).
+`StorageProvider::rollback_group_state_keeping_live_records`, the rewind onto a retained anchor that a reorg's apply and
+the convergence probes use, restores canonical state only, even from a legacy full anchor, and leaves message,
+pending-event and queue rows untouched, so it does not grow with stored history either (mdk#2330).
 
 **Deferred recovery preparation.** `MessageStorage::list_deferred_message_metadata` preserves insertion order and exact
 encoded payload lengths while omitting payload blobs. The engine uses it for sweep preparation and readiness, then

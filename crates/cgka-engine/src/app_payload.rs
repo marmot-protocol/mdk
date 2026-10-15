@@ -134,7 +134,7 @@ pub(crate) fn historical_source<S: cgka_traits::StorageProvider>(
         crate::snapshot_guard::RewindSite::ModerationSource,
         &format!("{:032x}", rand::random::<u128>()),
     )?;
-    match storage.rollback_group_state_to_snapshot(&request.group_id, snapshot) {
+    match storage.rollback_group_state_keeping_live_records(&request.group_id, snapshot) {
         Ok(()) => {}
         Err(StorageError::SnapshotMissing(_)) => {
             guard.commit()?;
