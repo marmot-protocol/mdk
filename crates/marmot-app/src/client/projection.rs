@@ -403,6 +403,12 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
     ) -> Result<bool, AppError> {
+        // Startup installs no route for a quarantined hidden group, since it is
+        // not live. Leave that alone instead of failing the whole effects
+        // batch; its `GroupHydrationRecovered` event installs the route.
+        if super::group_is_quarantined(&self.runtime, group_id) {
+            return Ok(false);
+        }
         let subscriptions = self.local_deleted_group_subscriptions(group_id)?;
         Ok(self.routing.replace_group_routes(group_id, subscriptions))
     }

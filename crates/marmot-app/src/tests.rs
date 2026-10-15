@@ -7,6 +7,7 @@ mod key_package_inventory;
 mod key_package_selection;
 mod message_journeys;
 mod publication_progress;
+mod quarantine_receive;
 mod replaceable_delivery;
 mod report_backfill;
 mod user_blocks;
