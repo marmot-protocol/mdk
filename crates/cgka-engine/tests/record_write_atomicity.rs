@@ -2091,10 +2091,7 @@ async fn failed_canonical_apply_rolls_back_inside_a_committing_caller_without_a_
     );
 }
 
-/// Builds one co-admin of [`reorg_onto_a_legacy_full_anchor_keeps_live_records`]
-/// on storage `S`, plus a handle sharing its SQLite connection.
-type ReorgSide<S> = fn(&[u8]) -> (cgka_engine::Engine<S>, SqliteAccountStorage);
-
+/// One co-admin of [`reorg_onto_a_legacy_full_anchor`] on SQLite.
 fn sqlite_reorg_side(
     id: &[u8],
 ) -> (
@@ -2210,20 +2207,39 @@ fn pending_message_ids(handle: &SqliteAccountStorage) -> Vec<MessageId> {
 /// rewind and the generic one that puts the live rows back must hold this.
 #[tokio::test]
 async fn reorg_onto_a_legacy_full_anchor_keeps_live_records() {
-    reorg_onto_a_legacy_full_anchor(
-        "sqlite",
-        sqlite_reorg_side as ReorgSide<SqliteAccountStorage>,
-    )
-    .await;
-    reorg_onto_a_legacy_full_anchor("generic", generic_reorg_side as ReorgSide<FaultStorage>).await;
+    reorg_onto_a_legacy_full_anchor("sqlite", sqlite_reorg_side, None).await;
+    reorg_onto_a_legacy_full_anchor("generic", generic_reorg_side, None).await;
 }
 
+/// A probe that reads the anchor holds only its snapshot guard, which puts
+/// rows back but not pending app-visible output. When a write fails part way
+/// through the generic rewind, after its full rollback has deleted the late
+/// application's pending output, the rewind must undo itself as one unit:
+/// the output stays durable for a restart, and the retried pass reorgs.
+#[tokio::test]
+async fn a_failed_generic_rewind_keeps_pending_app_output() {
+    let fault = LeaveWriteFault::default();
+    let sides = fault.clone();
+    reorg_onto_a_legacy_full_anchor(
+        "generic-faulted",
+        move |id: &[u8]| build_leave_write_fault_client(id, sides.clone(), Box::new(MockPeeler)),
+        Some(&fault),
+    )
+    .await;
+}
+
+/// Fork two co-admins at epoch 1 and reorg the loser onto a legacy full
+/// anchor of epoch 1. With `fault_first_put`, the loser's first convergence
+/// attempt fails at its first `put_message` and the retry settles.
 async fn reorg_onto_a_legacy_full_anchor<S: StorageProvider + 'static>(
     label: &str,
-    build: ReorgSide<S>,
+    build: impl Fn(&[u8]) -> (cgka_engine::Engine<S>, SqliteAccountStorage),
+    fault_first_put: Option<&LeaveWriteFault>,
 ) {
-    let (mut alice, alice_handle) = build(format!("alice-{label}").as_bytes());
-    let (mut bob, bob_handle) = build(format!("bob-{label}").as_bytes());
+    let alice_id = format!("alice-{label}");
+    let bob_id = format!("bob-{label}");
+    let (mut alice, alice_handle) = build(alice_id.as_bytes());
+    let (mut bob, bob_handle) = build(bob_id.as_bytes());
     let mut david = build_selfremove_client(format!("david-{label}").as_bytes());
     let mut eve = build_selfremove_client(format!("eve-{label}").as_bytes());
 
@@ -2269,10 +2285,10 @@ async fn reorg_onto_a_legacy_full_anchor<S: StorageProvider + 'static>(
     };
     let bob_wins =
         ordering_key(bob.self_id(), &bob_commit) < ordering_key(alice.self_id(), &alice_commit);
-    let (mut loser, handle, winner_app, winner_commit) = if bob_wins {
-        (alice, alice_handle, bob_app, bob_commit)
+    let (mut loser, handle, loser_id, winner_app, winner_commit) = if bob_wins {
+        (alice, alice_handle, alice_id, bob_app, bob_commit)
     } else {
-        (bob, bob_handle, alice_app, alice_commit)
+        (bob, bob_handle, bob_id, alice_app, alice_commit)
     };
     assert_eq!(loser.epoch(&group_id).unwrap(), EpochId(2));
 
@@ -2335,8 +2351,50 @@ async fn reorg_onto_a_legacy_full_anchor<S: StorageProvider + 'static>(
         .into_iter()
         .map(|row| row.id)
         .collect::<Vec<_>>();
+    rows_before.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
     let pending_before = pending_message_ids(&handle);
     let queued_before = handle.list_queued_outbound_intents(&group_id).unwrap();
+    let sorted_rows = || {
+        let mut rows = handle
+            .list_messages(&group_id, EpochId(0))
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+        rows
+    };
+
+    if let Some(fault) = fault_first_put {
+        fault.arm_on_write(1);
+        let failed = loser.converge_stored_openmls_messages_at(&group_id, u64::MAX);
+        assert!(
+            failed.is_err(),
+            "{label}: the injected write failure must surface, got {failed:?}"
+        );
+        assert_eq!(fault.remaining(), 0, "{label}: the fault never fired");
+        assert_eq!(
+            pending_message_ids(&handle),
+            pending_before,
+            "{label}: a failed rewind dropped pending app output"
+        );
+        assert_eq!(sorted_rows(), rows_before, "{label}");
+        assert_eq!(
+            handle.list_queued_outbound_intents(&group_id).unwrap(),
+            queued_before,
+            "{label}"
+        );
+        // A restart seeds app output from the durable pending events.
+        let mut reopened = build_selfremove_client_on_storage(loser_id.as_bytes(), handle.clone());
+        assert!(
+            reopened.drain_events().iter().any(|event| matches!(
+                event,
+                cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. }
+                    if *message_id == late_app
+            )),
+            "{label}: a reopened engine must still surface the late application"
+        );
+    }
 
     let result = loser
         .converge_stored_openmls_messages_at(&group_id, u64::MAX)
@@ -2359,16 +2417,9 @@ async fn reorg_onto_a_legacy_full_anchor<S: StorageProvider + 'static>(
         pending_before.iter().all(|id| pending_after.contains(id)),
         "{label}: the rewind dropped pending app output: before {pending_before:?}, after {pending_after:?}"
     );
-    let mut rows_after = handle
-        .list_messages(&group_id, EpochId(0))
-        .unwrap()
-        .into_iter()
-        .map(|row| row.id)
-        .collect::<Vec<_>>();
-    rows_before.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
-    rows_after.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
     assert_eq!(
-        rows_after, rows_before,
+        sorted_rows(),
+        rows_before,
         "{label}: the rewind must neither drop live rows nor restore removed ones"
     );
     assert_eq!(

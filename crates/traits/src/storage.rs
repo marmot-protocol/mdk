@@ -1161,11 +1161,15 @@ pub trait StorageProvider:
 /// full image.
 ///
 /// Reads `group_id`'s message rows, queued outbound intents and pending
-/// app-visible outputs, rolls back, removes the rows and intents the image
-/// brought back, and puts the read ones back. A full image deletes the pending
-/// outputs of messages it lacks, so those are put back after their rows. Run it
-/// inside a transaction or a [`StorageProvider::with_group_savepoint`] unit: a
-/// failure part way leaves the ledger partly restored.
+/// app-visible outputs, then, as one [`StorageProvider::with_group_savepoint`]
+/// unit, rolls back, removes the rows and intents the image brought back, and
+/// puts the read ones back. A full image deletes the pending outputs of
+/// messages it lacks, so those are put back after their rows. The unit matters
+/// to probes, whose snapshot guard restores rows but not pending outputs.
+/// Snapshots hold no pending outputs either, so when the unit fails on a
+/// backend that undoes it from a snapshot, the missing outputs are put back
+/// once more before the error returns; a crash inside the unit on such a
+/// backend still loses them.
 pub fn rollback_group_state_and_put_back_live_records<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -1174,37 +1178,54 @@ pub fn rollback_group_state_and_put_back_live_records<S: StorageProvider>(
     let messages = storage.list_messages(group_id, EpochId(0))?;
     let queued = storage.list_queued_outbound_intents(group_id)?;
     let pending = pending_application_events_of(storage, group_id)?;
-    storage.rollback_group_state_to_snapshot(group_id, name)?;
+    let unit = format!("keep-live-records-{name}");
+    let result = storage.with_group_savepoint(group_id, &unit, |storage| {
+        storage.rollback_group_state_to_snapshot(group_id, name)?;
+        let live = messages
+            .iter()
+            .map(|message| &message.id)
+            .collect::<std::collections::HashSet<_>>();
+        for restored in storage.list_messages(group_id, EpochId(0))? {
+            if !live.contains(&restored.id) {
+                storage.delete_message(&restored.id)?;
+            }
+        }
+        for message in &messages {
+            storage.put_message(message)?;
+        }
+        let live = queued
+            .iter()
+            .map(|intent| &intent.id)
+            .collect::<std::collections::HashSet<_>>();
+        for restored in storage.list_queued_outbound_intents(group_id)? {
+            if !live.contains(&restored.id) {
+                storage.delete_queued_outbound_intent(&restored.id)?;
+            }
+        }
+        for intent in &queued {
+            storage.put_queued_outbound_intent(intent)?;
+        }
+        put_back_pending_application_events(storage, group_id, &pending)
+    });
+    if result.is_err() {
+        // Best effort on the way out: the unit's own error is the one to
+        // report, and a savepoint backend has nothing left to put back.
+        let _ = put_back_pending_application_events(storage, group_id, &pending);
+    }
+    result
+}
 
-    let live = messages
-        .iter()
-        .map(|message| &message.id)
-        .collect::<std::collections::HashSet<_>>();
-    for restored in storage.list_messages(group_id, EpochId(0))? {
-        if !live.contains(&restored.id) {
-            storage.delete_message(&restored.id)?;
-        }
-    }
-    for message in &messages {
-        storage.put_message(message)?;
-    }
-    let live = queued
-        .iter()
-        .map(|intent| &intent.id)
-        .collect::<std::collections::HashSet<_>>();
-    for restored in storage.list_queued_outbound_intents(group_id)? {
-        if !live.contains(&restored.id) {
-            storage.delete_queued_outbound_intent(&restored.id)?;
-        }
-    }
-    for intent in &queued {
-        storage.put_queued_outbound_intent(intent)?;
-    }
+/// Put back the outputs of `pending` that `group_id` no longer holds.
+fn put_back_pending_application_events<S: MessageStorage>(
+    storage: &S,
+    group_id: &GroupId,
+    pending: &[(MessageId, GroupEvent)],
+) -> StorageResult<()> {
     let kept = pending_application_events_of(storage, group_id)?
         .into_iter()
         .map(|(id, _)| id)
         .collect::<std::collections::HashSet<_>>();
-    for (id, event) in &pending {
+    for (id, event) in pending {
         if !kept.contains(id) {
             storage.put_pending_application_event(event)?;
         }

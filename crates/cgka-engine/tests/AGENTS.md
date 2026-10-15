@@ -112,7 +112,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     stored convergence so it is eventually applied. Also owns the snapshot-guard durability pair: a guard whose
     rollback fails keeps its snapshot for open-time recovery, and a historical peel context is derived once per
     candidate generation rather than once per bounded slice. A failed canonical apply rolls back inside a caller
-    transaction that still commits, without a full pre-apply snapshot (mdk#2326)
+    transaction that still commits, without a full pre-apply snapshot (mdk#2326). A reorg onto a legacy full anchor
+    keeps live rows, queued intents and pending app output on SQLite and on the generic rewind, including when a
+    write fails part way through the generic one (mdk#2330)
 
 - **File:** `apply_history_cost.rs`
   - **Owns:** Ignored regression benchmark for canonical-apply cost against stored message history (mdk#2326). Run in
