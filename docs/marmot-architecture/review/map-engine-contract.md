@@ -201,7 +201,10 @@ is valid while the connection's write generation is unchanged, so any write evic
     `Processed` mark in separate transactions; a removal-bearing staged commit with no fanout is kept at hydration
     while the record may already be projected to the next epoch (`ingest.rs:2022`, `engine.rs:2148`).
 11. **Some reads rescan everything.** Full hydration reads every message row for the group (`engine.rs:2059`);
-    `outstanding_sent_welcomes` decodes all rows of all groups (`engine.rs:3247-3300`).
+    `outstanding_sent_welcomes` decodes all rows of all groups (`engine.rs:3247-3300`). Every convergence pass seeds
+    its inputs from all messages in the rewind horizon, `Processed` application messages included
+    (`distributed_convergence.rs:877-885`). Together with the full apply snapshot, this is measured in
+    [#2326](https://github.com/marmot-protocol/mdk/issues/2326).
 12. **Docs lag the source.** `crates/cgka-engine/AGENTS.md:286-291` still names direct ingest as an epoch writer, and
     the publish-before-apply steps in [`target-architecture.md`](../overview/target-architecture.md) omit the frozen
     fanout.

@@ -135,7 +135,9 @@ projection is at-least-once. Other engine events are memory-only; see
    full snapshot (`crates/cgka-engine/src/openmls_projection.rs:2761-2765`), and the full scope copies every
    `cgka_messages` row and queued intent for the group
    (`crates/storage-sqlite/src/storage/snapshots/capture.rs:150-155`).
-   Apply cost therefore grows with group history. It needs measuring on a long-lived group.
+   Apply cost therefore grows with group history. Measured in
+   [#2326](https://github.com/marmot-protocol/mdk/issues/2326): about 570 bytes per message, so 28.5 MB written and
+   deleted per apply at 50,000 messages.
 10. **Not every transaction goes through `with_transaction`.** Raw `BEGIN` or savepoint sites exist in
     `chat_list.rs:952`, `user_blocks.rs:122`, `account_projection.rs:1463` and `:2271`,
     `transport_reconciliation.rs:145`, `pending_welcome_delivery.rs:47`, `storage/groups.rs:96`,

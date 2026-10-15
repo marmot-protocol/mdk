@@ -167,8 +167,10 @@ These recur across several maps. They are hypotheses to test, not conclusions.
    send. Each looks like a fix added next to the previous mechanism rather than replacing it.
 4. **Hidden O(history) costs on hot paths.** Each canonical convergence apply copies the group's whole message
    ledger. Each live checkpoint triggers a full chat-list rebuild on the next read. Full hydration reads every
-   message row of a group. Recovery selection runs on every delivery. None of these has been measured on a
-   long-lived account.
+   message row of a group. Recovery selection runs on every delivery. The first is now measured
+   ([#2326](https://github.com/marmot-protocol/mdk/issues/2326)): at 50,000 messages, each apply writes and deletes a
+   28.5 MB snapshot, and the applying pass takes 0.47 s with old history and 1.35 s with recent history, on an M4 Max.
+   The others are not yet measured.
 5. **The lifecycle contract does not fit mobile well.** Suspension means terminal close and a full rebuild. A cold
    start is expensive. Startup serializes behind a process-wide mutex. `shutdown_and_close` leaves the engine's
    connection to the graceful phase.
@@ -189,6 +191,7 @@ the others still need confirming.
 | D3 | Swift and Kotlin hosts run every runtime task on one thread | [Platform map §3](map-platforms.md#3-async-runtime-per-host); [concurrency observation 1](map-concurrency.md#observations-for-pass-1). In the field, iOS and Android show UI stalls; macOS, on the same binding with a faster CPU, shows fewer, mostly loading delays when opening a group. The Linux desktop app on the multi-thread C ABI is not yet compared. | Observed in code and dependency source; consistent with field symptoms; needs a thread trace on a device |
 | D4 | Every live checkpoint causes a full chat-list rebuild on the next read | [Journey 2, observation 2](map-journeys.md#journey-2-receive-and-converge) | Observed; cost unmeasured, intent unclear |
 | D5 | The NAT64 prefix is rejected, so IPv4-only HTTP and QUIC hosts may be unreachable on IPv6-only networks | [Platforms, observation 7](map-platforms.md#observations-for-pass-1) | Inferred |
+| D6 ([#2326](https://github.com/marmot-protocol/mdk/issues/2326)) | Every canonical convergence apply copies the group's whole message ledger, and every pass rescans all messages in the rewind horizon | [Authority, observation 9](map-authority.md#observations-for-pass-1); benchmark in the issue | Observed and measured |
 
 ## 6. Seams the map suggests
 
@@ -228,5 +231,5 @@ Measurements to collect early, because several themes depend on numbers:
 - a thread-name trace of a MarmotKit build under load;
 - cold-start time per account split into KDF, migrations and hydration;
 - chat-list rebuild cost against chat count;
-- convergence-apply snapshot cost against group history length;
+- convergence-apply snapshot cost against group history length (done: [#2326](https://github.com/marmot-protocol/mdk/issues/2326));
 - worker command latency while a convergence pass or a catch-up runs.
