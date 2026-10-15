@@ -17,6 +17,13 @@
 - `AttachmentTransferState` adds `StorageBlocked`: free disk cannot cover the
   publication reserve for the body. Update exhaustive matches; the job keeps
   its checkpoint and readmits once space frees or on explicit Retry.
+- `marmot_account::AccountDeviceRuntime::run_due_maintenance_holding` takes
+  `&[(GroupId, SelfUpdateHold)]` instead of `&[GroupId]`. Each held group names
+  why it is held, recorded as the held obligation's failure code
+  (`epoch_gap_hold` or `upload_hold`), and `SelfUpdateHold::applies_to` decides
+  which triggers the hold defers. Callers that held groups for epoch-gap
+  recovery pass `SelfUpdateHold::EpochGap`, which still holds every trigger
+  (#2158).
 
 ### Added
 
