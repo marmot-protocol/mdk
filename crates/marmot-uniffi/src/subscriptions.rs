@@ -52,7 +52,8 @@ impl ChatsSubscription {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl ChatsSubscription {
     pub fn snapshot(&self) -> Vec<AppGroupRecordFfi> {
         take_snapshot(&self.snapshot).unwrap_or_default()
@@ -91,7 +92,8 @@ impl ChatListSubscription {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl ChatListSubscription {
     pub fn snapshot(&self) -> Vec<ChatListRowFfi> {
         take_snapshot(&self.snapshot).unwrap_or_default()
@@ -156,7 +158,8 @@ impl MessagesSubscription {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl MessagesSubscription {
     pub fn snapshot(&self) -> Vec<AppMessageRecordFfi> {
         take_snapshot(&self.snapshot).unwrap_or_default()
@@ -250,7 +253,8 @@ impl TimelineMessagesSubscription {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl TimelineMessagesSubscription {
     pub fn snapshot(&self) -> Option<TimelinePageFfi> {
         take_snapshot(&self.snapshot)
@@ -314,7 +318,8 @@ impl GroupStateSubscription {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl GroupStateSubscription {
     pub fn snapshot(&self) -> Option<AppGroupRecordFfi> {
         take_snapshot(&self.snapshot)
@@ -343,7 +348,8 @@ impl EventsSubscription {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl EventsSubscription {
     pub async fn next(&self) -> Option<MarmotEventFfi> {
         let mut inner = self.inner.lock().await;
@@ -364,7 +370,8 @@ impl NotificationsSubscription {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl NotificationsSubscription {
     pub async fn next(&self) -> Option<NotificationUpdateFfi> {
         let mut inner = self.inner.lock().await;
@@ -417,7 +424,8 @@ impl UserSearchSubscription {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl UserSearchSubscription {
     /// Await the next step of the search, or `None` once it is over.
     ///
@@ -430,7 +438,8 @@ impl UserSearchSubscription {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl AgentStreamSubscription {
     /// The resolved stream id this watch is following (hex).
     pub fn stream_id_hex(&self) -> String {
@@ -467,7 +476,8 @@ impl PresentedChatListSubscription {
         })
     }
 }
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl PresentedChatListSubscription {
     /// Take the initial snapshot once, with generation and sequence zero.
     pub fn snapshot(&self) -> Option<crate::conversions::PresentedChatListUpdateFfi> {

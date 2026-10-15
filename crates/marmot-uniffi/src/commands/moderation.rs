@@ -162,7 +162,8 @@ impl From<marmot_app::ModerationReportOutcome> for ModerationReportOutcomeFfi {
         }
     }
 }
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     /// Privately report a user to the configured moderation team (NIP-56 report,
     /// NIP-59 gift-wrapped). Additive to `report_message`, which is unchanged.

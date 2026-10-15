@@ -41,7 +41,8 @@ fn unix_now_seconds() -> u64 {
         .as_secs()
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     /// Anchor a live agent text stream start in the encrypted group history.
     /// Host apps pass the broker candidate(s) they will publish to, such as

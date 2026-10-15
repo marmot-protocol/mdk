@@ -4,7 +4,8 @@ use crate::Marmot;
 use crate::conversions::HistoryNoticeFfi;
 use crate::errors::MarmotKitError;
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     /// Durable, local "history may be incomplete" notices for the account,
     /// oldest first. Refresh on `HistoryNoticesChanged`; group-scoped ones

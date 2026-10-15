@@ -32,7 +32,8 @@ pub fn parse_media_imeta_tag(
     MediaAttachmentReferenceFfi::try_from(reference).map_err(media_reference_error)
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     /// Build one outbound encrypted-media `imeta` tag without publishing it.
     ///

@@ -350,19 +350,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-compat"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1ba85bc55464dcbf728b56d97e119d673f4cf9062be330a9a26f3acf504a590"
-dependencies = [
- "futures-core",
- "futures-io",
- "once_cell",
- "pin-project-lite",
- "tokio",
-]
-
-[[package]]
 name = "async-executor"
 version = "1.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3871,11 +3858,14 @@ version = "0.13.0"
 dependencies = [
  "cgka-engine",
  "cgka-traits",
+ "futures",
  "hex",
  "keyring-core",
+ "libc",
  "marmot-account",
  "marmot-app",
  "marmot-markdown",
+ "marmot-uniffi-macros",
  "nostr 0.45.5",
  "nostr-relay-builder",
  "rand 0.8.6",
@@ -3884,9 +3874,19 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "transport-nostr-peeler",
  "uniffi",
  "zeroize",
+]
+
+[[package]]
+name = "marmot-uniffi-macros"
+version = "0.13.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -7167,7 +7167,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2d990b553d6b9a7ee9c3ae71134674739913d52350b56152b0e613595bb5a6f"
 dependencies = [
  "anyhow",
- "async-compat",
  "bytes",
  "once_cell",
  "static_assertions",

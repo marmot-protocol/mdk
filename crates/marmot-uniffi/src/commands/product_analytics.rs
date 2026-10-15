@@ -1,6 +1,7 @@
 //! One consent control for both independent exporters.
 use crate::{Marmot, MarmotKitError, conversions::*};
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     pub fn usage_diagnostics_settings(
         &self,

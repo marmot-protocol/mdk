@@ -5,7 +5,8 @@ use crate::conversions::{
 use crate::{Marmot, MarmotKitError};
 use std::sync::Arc;
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     /// Read 1..=100 attachment slots in canonical newest-first order. Rejected slots
     /// consume the limit. Filter categories within returned pages; an empty filtered

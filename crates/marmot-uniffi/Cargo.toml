@@ -20,16 +20,17 @@ transport-nostr-peeler.workspace = true
 marmot-app.workspace = true
 marmot-account.workspace = true
 marmot-markdown.workspace = true
+marmot-uniffi-macros.workspace = true
 cgka-engine.workspace = true
 cgka-traits.workspace = true
 nostr.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 thiserror.workspace = true
 hex.workspace = true
 rand.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
-uniffi = { version = "0.29.4", features = ["tokio"] }
+uniffi = "0.29.4"
 zeroize.workspace = true
 
 [dev-dependencies]
@@ -37,6 +38,9 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "test-util"] }
 keyring-core.workspace = true
 nostr-relay-builder.workspace = true
+futures.workspace = true
+libc.workspace = true
+tracing-subscriber.workspace = true
 
 [[bin]]
 name = "uniffi-bindgen"

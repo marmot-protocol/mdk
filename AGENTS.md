@@ -40,6 +40,7 @@ before adding behavior or bindings.
 | Claude Code / Codex / OpenCode / Pi / Goose harnesses | `integrations/{claude,codex,opencode,pi,goose}/marmot/AGENTS.md` |
 | Forensic audit schema | `crates/marmot-forensics/AGENTS.md` |
 | App runtime UniFFI bindings | `crates/marmot-uniffi/AGENTS.md` |
+| UniFFI async-export runtime macro | `crates/marmot-uniffi-macros/AGENTS.md` |
 | App runtime C ABI bindings | `crates/marmot-c/AGENTS.md` |
 | CLI / daemon / TUI surface | `crates/cli/AGENTS.md` |
 | Multi-client harness / vectors | `crates/cgka-conformance-simulator/AGENTS.md` (`src/`, `tests/`, `vectors/` have their own) |

@@ -3,7 +3,8 @@ use crate::conversions::ChatListViewFfi;
 use crate::subscriptions::{AccountAttentionSubscription, ChatListWindowSubscription};
 use crate::{Marmot, MarmotKitError};
 use std::sync::Arc;
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     /// Bind to one account/view. None defaults to 50; explicit sizes must be 1–100.
     pub async fn open_chat_list_window(

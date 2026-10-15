@@ -5,7 +5,8 @@ use std::sync::Arc;
 pub struct AttachmentTransferSubscription {
     inner: Arc<marmot_app::RuntimeAttachmentTransferSubscription>,
 }
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl AttachmentTransferSubscription {
     /// Initial snapshot, then coalesced replacements. None means closed. Errors
     /// terminate this observation; close/drop never cancels acquisition.
@@ -22,7 +23,8 @@ impl AttachmentTransferSubscription {
         self.inner.close();
     }
 }
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     /// Revoke automatic permission before evaluating new host network policy.
     pub async fn begin_attachment_permission_update(

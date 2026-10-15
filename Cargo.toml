@@ -22,6 +22,7 @@ members = [
     "crates/marmot-account",
     "crates/marmot-app",
     "crates/marmot-uniffi",
+    "crates/marmot-uniffi-macros",
     "crates/marmot-c",
     "crates/cli",
     "integrations/terminal-harness",
@@ -57,6 +58,11 @@ tokio = { version = "1", features = ["sync", "macros", "rt", "time"] }
 tokio-util = { version = "0.7", features = ["io", "rt"] }
 async-trait = "0.1"
 futures = "0.3"
+
+# proc macros
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
 
 # utils
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -148,6 +154,7 @@ marmot-markdown = { path = "crates/marmot-markdown" }
 marmot-account = { path = "crates/marmot-account" }
 marmot-app = { path = "crates/marmot-app" }
 marmot-uniffi = { path = "crates/marmot-uniffi" }
+marmot-uniffi-macros = { path = "crates/marmot-uniffi-macros" }
 marmot-terminal-harness = { path = "integrations/terminal-harness" }
 
 # hax-lib-macros 0.3.7 still declares the unmaintained proc-macro-error2

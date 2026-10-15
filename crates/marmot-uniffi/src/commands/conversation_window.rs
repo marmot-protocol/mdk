@@ -3,7 +3,8 @@ use crate::{
     Marmot, MarmotKitError, conversions::*, subscriptions::ConversationWindowSubscription,
 };
 use std::sync::Arc;
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     /// Open first unread/latest or an explicit message. No implicit mark-read.
     /// Zero timeout uses 30 seconds; timeout/cancellation abandons the opening.

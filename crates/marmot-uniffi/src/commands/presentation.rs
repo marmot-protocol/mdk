@@ -4,7 +4,8 @@ use crate::subscriptions::PresentedChatListSubscription;
 use crate::{Marmot, MarmotKitError};
 use std::sync::Arc;
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     /// Local whole rows, including selected title/avatar. First use may await local preparation.
     pub async fn presented_chat_list(

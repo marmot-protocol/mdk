@@ -36,7 +36,8 @@ pub struct BlockListSubscription {
     snapshot: StdMutex<Option<BlockListSnapshotFfi>>,
     inner: Mutex<marmot_app::RuntimeBlockListSubscription>,
 }
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl BlockListSubscription {
     pub fn snapshot(&self) -> Option<BlockListSnapshotFfi> {
         self.snapshot.lock().ok()?.take()
@@ -45,7 +46,8 @@ impl BlockListSubscription {
         self.inner.lock().await.recv().await.map(Into::into)
     }
 }
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     pub async fn block_user(
         &self,

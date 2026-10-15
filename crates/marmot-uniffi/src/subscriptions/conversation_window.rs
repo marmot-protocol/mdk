@@ -85,7 +85,8 @@ impl ConversationWindowSubscription {
         }
     }
 }
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl ConversationWindowSubscription {
     /// Take once before next(). Complete replacements include every visible identity.
     pub fn snapshot(&self) -> Option<ConversationWindowSnapshotFfi> {
