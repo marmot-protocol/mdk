@@ -57,6 +57,16 @@ impl Harness for MemoryHarness {
     /// The rows survive; only the process state (in-flight set) is lost,
     /// which a fresh `MediaStore` models.
     fn restart(&mut self) {}
+
+    fn begin_wire_partial(&self, slot: u32) -> FileId {
+        let id = FileId([slot as u8 ^ 0x5c; 16]);
+        self.catalog.begin_wire_partial(slot, id);
+        id
+    }
+
+    fn end_wire_partial(&self, slot: u32) {
+        self.catalog.end_wire_partial(slot);
+    }
 }
 
 #[test]

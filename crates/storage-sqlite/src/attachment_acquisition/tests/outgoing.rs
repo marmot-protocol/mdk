@@ -661,11 +661,7 @@ fn outgoing_promotion_credits_its_own_partial_at_exact_capacity() {
         .claim_attachment_acquisition(&asset, 11, 100)
         .unwrap()
         .unwrap();
-    assert!(
-        store
-            .checkpoint_attachment_partial(&job, &partial_identity(100), 0, b"prefix", 11, 10000)
-            .unwrap()
-    );
+    assert!(checkpoint(&store, &job, &partial_identity(100), 0, b"prefix", 11).unwrap());
     staged(&store, "partial-race");
     assert_eq!(
         store

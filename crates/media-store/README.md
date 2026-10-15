@@ -20,12 +20,19 @@ database, which this crate reaches through a catalog trait implemented by `stora
   transaction with its reference. Identical content is stored once, but only reused if its file is on disk. Deleting
   the catalog row erases the key; the file is unlinked after. A bounded sweep reclaims anything a crash left behind,
   and marks a ready row whose file vanished as *lost*. Readers check the close latch on every read.
+- **Download checkpoints** (`WireFile`): a resumable download appends its ciphertext to an append-only
+  `<shard>/<id>.wire` file. The catalog's checkpoint row is written before the file and deleted before it, and records
+  how much of the file is durable; reopening truncates any unrecorded tail. The sweep unlinks wire files whose row is
+  gone.
+- **Disk admission** (`DiskPolicy`): the caller supplies the reserve from its configuration; the crate only measures
+  free space (`free_space`) and compares. A download needs the reserve plus twice the body: its wire file and its
+  store file.
 - **The catalog traits**: `MediaCatalog` (store-wide rows) and `PublishTarget` (one publication's commit), implemented
   on the account database by `storage-sqlite`. The `catalog-conformance` feature exports the suite every
   implementation must pass, and an in-memory catalog.
 
-Later steps of mdk#2314 add `.wire` download partials, handoff leases, free-disk admission and the evictable cache
-category, and move attachments onto the store.
+Later steps of mdk#2314 add handoff leases and the evictable cache category, and move the rest of attachments onto
+the store.
 
 ## Using it
 

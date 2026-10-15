@@ -6,7 +6,8 @@ fn attachment_capacity_reserves_disk_overhead_and_never_evicts() {
     assert_eq!(p.retained_bytes, 2 * 1024 * 1024 * 1024);
     assert_eq!(p.disk_reserve, 256 * 1024 * 1024);
     assert_eq!(p.transfer_limit, 64 * 1024 * 1024);
-    let free = p.disk_reserve + 4 * p.transfer_limit;
+    // The reserve plus a wire checkpoint and a store file (mdk#2314).
+    let free = p.disk_reserve + 2 * p.transfer_limit;
     assert!(capacity(&p, p.transfer_limit, free));
     assert!(!capacity(&p, p.transfer_limit, free - 1));
     assert!(!capacity(&p, u64::MAX, u64::MAX));

@@ -11,6 +11,7 @@
 //! pool, never inline on an async task.
 
 pub mod catalog;
+mod disk;
 mod error;
 pub mod format;
 mod store;
@@ -24,9 +25,12 @@ pub use catalog::{
     CatalogError, CatalogResult, Category, ExistingOutcome, FileId, FilePresence, FileState,
     MediaCatalog, NewFile, Presence, PublishTarget, ReadyFile, ReadyOutcome,
 };
+pub use disk::{Admission, DiskPolicy, free_space};
 pub use error::{MediaError, MediaResult};
 pub use format::FileKey;
-pub use store::{MEDIA_DIRECTORY, MediaReader, MediaStore, PublishOutcome, SweepReport, sync_file};
+pub use store::{
+    MEDIA_DIRECTORY, MediaReader, MediaStore, PublishOutcome, SweepReport, WireFile, sync_file,
+};
 
 #[cfg(test)]
 mod format_tests;

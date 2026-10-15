@@ -38,6 +38,11 @@ pub trait Harness {
     fn reset(&self);
     /// Process death and restart: reopen the catalog.
     fn restart(&mut self);
+    /// Records a download checkpoint row for `slot` owning a new wire file,
+    /// and returns that file's id. The file does not exist yet.
+    fn begin_wire_partial(&self, slot: u32) -> FileId;
+    /// Deletes `slot`'s checkpoint row (completion, expiry, cleanup).
+    fn end_wire_partial(&self, slot: u32);
 }
 
 const NOW: u64 = 1_000;
@@ -149,6 +154,7 @@ pub fn run_all<H: Harness>(make: &dyn Fn() -> H) {
     supersession_during_the_write_keeps_nothing(make());
     reset_during_the_write_keeps_nothing(make());
     the_sweep_leaves_live_publishes_alone(make());
+    wire_checkpoints_live_exactly_as_long_as_their_rows(make());
 }
 
 pub fn publish_reads_back_and_reuses_identical_content<H: Harness>(harness: H) {
@@ -475,4 +481,34 @@ pub fn the_sweep_leaves_live_publishes_alone<H: Harness>(harness: H) {
     assert_eq!(store.file_state(&id).unwrap(), Some(FileState::Pending));
     drop(in_flight);
     assert_eq!(sweep_all(&store), (1, 0, 0));
+}
+
+/// A wire checkpoint survives the sweep while its row exists and is unlinked
+/// once the row goes; a wire file no row owns is unlinked. Reopening keeps
+/// only the recorded length, and a file shorter than recorded cannot resume.
+pub fn wire_checkpoints_live_exactly_as_long_as_their_rows<H: Harness>(harness: H) {
+    let store = store(&harness);
+    let id = harness.begin_wire_partial(0);
+    let mut wire = store.create_wire(&id).unwrap();
+    wire.append(b"recorded").unwrap();
+    wire.append(b"-unrecorded").unwrap();
+    drop(wire);
+    let stray = FileId([0x7a; 16]);
+    store.create_wire(&stray).unwrap().append(b"stray").unwrap();
+
+    assert_eq!(sweep_all(&store), (0, 1, 0));
+    assert!(!store.wire_path(&stray).exists());
+    let mut reopened = store.open_wire(&id, 8).unwrap().unwrap();
+    assert_eq!(reopened.len(), 8);
+    let mut prefix = Vec::new();
+    reopened.copy_to(&mut prefix).unwrap();
+    assert_eq!(prefix, b"recorded");
+    assert!(
+        store.open_wire(&id, 9).unwrap().is_none(),
+        "shorter than recorded"
+    );
+
+    harness.end_wire_partial(0);
+    assert_eq!(sweep_all(&store), (0, 1, 0));
+    assert!(!store.wire_path(&id).exists());
 }

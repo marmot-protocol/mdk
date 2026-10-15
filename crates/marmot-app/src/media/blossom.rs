@@ -1339,8 +1339,8 @@ where
             }
             None => None,
         };
-        if let Some(part) = &partial
-            && part.bytes.len() as u64 == part.identity.total
+        if let Some((part, _)) = &partial
+            && part.received == part.identity.total
         {
             if let Some(resume) = resume {
                 resume
@@ -1348,7 +1348,7 @@ where
                     .await?;
             }
             return Ok(FetchedBlob {
-                bytes: partial.expect("checked").bytes,
+                bytes: partial.expect("checked").1,
                 response_url: current,
                 resumed: true,
             });
@@ -1423,12 +1423,9 @@ where
         if resume.is_some() {
             request = request.header(reqwest::header::ACCEPT_ENCODING, "identity");
         }
-        if let Some(part) = &partial {
+        if let Some((part, _)) = &partial {
             request = request
-                .header(
-                    reqwest::header::RANGE,
-                    format!("bytes={}-", part.bytes.len()),
-                )
+                .header(reqwest::header::RANGE, format!("bytes={}-", part.received))
                 .header(reqwest::header::IF_RANGE, &part.identity.etag);
         }
         let response_headers_started = Instant::now();
@@ -1487,7 +1484,7 @@ where
             continue;
         }
         if let Some(context) = resume {
-            let changed = partial.as_ref().is_some_and(|part| {
+            let changed = partial.as_ref().is_some_and(|(part, _)| {
                 super::attachment_resume::strong_etag(response.headers()).as_ref()
                     != Some(&part.identity.etag)
             });
@@ -1503,7 +1500,7 @@ where
             if status == reqwest::StatusCode::PARTIAL_CONTENT
                 && !partial
                     .as_ref()
-                    .is_some_and(|part| super::attachment_resume::valid_range(&response, part))
+                    .is_some_and(|(part, _)| super::attachment_resume::valid_range(&response, part))
             {
                 if partial.is_some() && !restarted_range {
                     context.clear(Some(&current)).await?;

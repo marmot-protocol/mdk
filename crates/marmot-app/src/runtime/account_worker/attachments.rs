@@ -117,10 +117,17 @@ fn admit_demands(
     Ok(more)
 }
 
+/// Admits a download of up to `max` body bytes under the app's
+/// [`media_store::DiskPolicy`]: the reserve plus room for its wire checkpoint
+/// and its store file.
 fn capacity(policy: &storage_sqlite::AttachmentDownloadPolicy, max: u64, free: u64) -> bool {
+    let disk = media_store::DiskPolicy {
+        reserve_bytes: policy.disk_reserve,
+    };
     max > 0
         && max <= crate::media::MAX_ENCRYPTED_MEDIA_BLOB_BYTES
-        && free >= policy.disk_reserve.saturating_add(max.saturating_mul(4))
+        && disk.admit(free, media_store::DiskPolicy::download_bytes(max))
+            == media_store::Admission::Admitted
 }
 
 async fn cancelled(
@@ -464,8 +471,7 @@ pub(super) fn schedule(
             storage: storage.clone(),
             job: job.clone(),
             ciphertext_digest,
-            // Checkpoints have no retained-byte budget; free disk gates them.
-            budget: u64::MAX,
+            media: media.clone(),
             directory: client.app.account_dir(&client.state.label),
             policy: policy.clone(),
             automatic: !explicit,

@@ -90,8 +90,9 @@ mod tests {
             before,
             "a rolled-back apply keeps the old trigger"
         );
-        run(&mut conn, MIGRATIONS).unwrap();
-        run(&mut conn, MIGRATIONS).unwrap();
+        // Through this migration only: 0111 later drops database checkpoints.
+        run(&mut conn, &MIGRATIONS[..109]).unwrap();
+        run(&mut conn, &MIGRATIONS[..109]).unwrap();
         let row = conn
             .query_row(
                 "SELECT state,attempts,due,storage_blocked_headroom,storage_park_count FROM attachment_acquisition",

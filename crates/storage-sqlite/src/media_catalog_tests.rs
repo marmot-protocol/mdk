@@ -159,6 +159,30 @@ impl Harness for SqliteHarness {
             SqliteAccountStorage::open_encrypted(self.dir.path().join("session.sqlite"), &self.key)
                 .unwrap();
     }
+
+    fn begin_wire_partial(&self, slot: u32) -> FileId {
+        let token = self.token(slot);
+        self.storage
+            .lock()
+            .unwrap()
+            .query_row(
+                "INSERT INTO attachment_partial(token,ciphertext_digest,locator_digest,etag,total,expires_at,wire_file_id)
+                 VALUES(?1,zeroblob(32),zeroblob(32),'\"tag\"',100,9999999999,randomblob(16))
+                 ON CONFLICT(token) DO UPDATE SET wire_file_id=randomblob(16),received=0
+                 RETURNING wire_file_id",
+                [&token],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .map(|id| FileId::from_slice(&id).unwrap())
+            .unwrap()
+    }
+
+    fn end_wire_partial(&self, slot: u32) {
+        self.sql(
+            "DELETE FROM attachment_partial WHERE token=?1",
+            &self.token(slot),
+        );
+    }
 }
 
 #[test]

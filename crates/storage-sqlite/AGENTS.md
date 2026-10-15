@@ -39,7 +39,7 @@ not "fix" it into the per-account database.
 | `src/attachment_acquisition.rs` | Source-bound durable acquisition jobs, leased attempts, protected retained bytes, bounded worker demand and explicit-removal suppression. Network orchestration stays in marmot-app. |
 | `src/attachment_acquisition/access.rs` | Read-only source-bound retained-asset lookup and opaque reference encoding; no demand registration. |
 | `src/attachment_acquisition/controls.rs` | Durable user intent and coalesced transfer metadata in the job store. |
-| `src/attachment_acquisition/partial.rs` | Attempt-fenced SQLCipher ciphertext checkpoints, combined retained/partial byte accounting, bounded writes and abandoned-partial cleanup. |
+| `src/attachment_acquisition/partial.rs` | Attempt-fenced checkpoint metadata: identity, recorded length and the media store `.wire` file id (the ciphertext lives in that file, mdk#2314). The row is written before its file and deleted before it; `wire_partial_exists` answers the media sweep. Abandoned-partial cleanup. |
 | `src/media_catalog.rs` | The account database's side of the [`media-store`](../media-store/AGENTS.md) crate: `media_files`/`media_file_refs` rows (migration 0110), the `MediaCatalog` impl, per-use `PublishTarget`s and their one-transaction ready commits, reference release. Runs the crate's catalog conformance suite. No media file I/O here. |
 | `src/media_store_bench.rs`, `examples/media_store_bench.rs` | `media-store-benchmarks` feature: the `media-store` file format against the SQLCipher retained path, runnable on devices (mdk#2314 step 0). |
 | `src/attachment_history.rs` | Bounded canonical attachment-slot discovery and per-group revision-fenced cursors; source/visibility triggers maintain the derived index. |

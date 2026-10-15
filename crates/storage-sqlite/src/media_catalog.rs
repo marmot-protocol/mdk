@@ -163,6 +163,17 @@ impl MediaCatalog for SqliteMediaCatalog {
         self.run(|conn| mark_lost_in(conn, id))
     }
 
+    fn wire_partial_exists(&self, id: FileId) -> CatalogResult<bool> {
+        self.run(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM attachment_partial WHERE wire_file_id=?1)",
+                [id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .storage()
+        })
+    }
+
     fn page(&self, after: Option<FileId>, limit: usize) -> CatalogResult<Vec<(FileId, FileState)>> {
         self.run(|conn| {
             let after = after.map(|id| id.as_bytes().to_vec()).unwrap_or_default();

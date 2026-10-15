@@ -8,6 +8,7 @@ description = "Encrypted per-file media store for Marmot accounts: file format a
 
 [dependencies]
 fs-private.workspace = true
+fs4.workspace = true
 hex.workspace = true
 hkdf.workspace = true
 openssl.workspace = true

@@ -428,13 +428,13 @@ async fn file_sink_without_validator_parks_once_inside_the_loop_window() {
     server.await.unwrap();
 }
 
-/// In-memory sink with a validator, free space inside `[4P, 5P)`: the header
-/// check counts the checkpoint the download would add, so the job parks before
-/// fetching anything, the readmission wakes transfer subscribers, and the retry
-/// is a single fresh request.
+/// In-memory sink with a validator under the 2x rule (mdk#2314): twice the
+/// body free covers its wire checkpoint and its store file. Checkpoints charge
+/// the volume as they are written, and the checks count them once, so the job
+/// downloads and publishes in one request without parking.
 #[tokio::test]
-async fn memory_sink_with_validator_parks_at_the_header_inside_the_loop_window() {
-    let plain = vec![0x6b; 24 * MIB as usize];
+async fn memory_sink_with_validator_publishes_with_twice_the_body_free() {
+    let plain = vec![0x6b; (3 * MIB + 5) as usize];
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (reference, cipher) = loopback_reference(&listener, &plain);
     let total = cipher.len() as u64;
@@ -450,58 +450,15 @@ async fn memory_sink_with_validator_parks_at_the_header_inside_the_loop_window()
         Arc::clone(&requests),
         stopped,
     );
-    // The transfer limit is the body itself, so admission (four limits) passes
-    // inside the window while the header check (four bodies plus the
-    // checkpoint) does not.
     let mut fixture = explicit_fixture(&reference, total).await;
-    fixture.set_free(total * 17 / 4);
+    fixture.set_free(2 * total);
     fixture.tick().await;
-    let headroom = fixture.park_and_hold(&requests).await;
-    assert_eq!(
-        headroom,
-        4 * plain.len() as u64 + total,
-        "the target is the reserve plus the checkpoint a validated body adds"
-    );
-    assert_eq!(requests.load(Ordering::SeqCst), 1, "nothing was fetched");
-    // Subscribers learn about readmission from the shared update channel, not
-    // from the one-second refresh set reserved for active transfers.
-    let mut updates = fixture.shared.attachment_updates.subscribe();
-    updates.borrow_and_update();
-    fixture.set_free(headroom + STORAGE_READMIT_MARGIN_BYTES);
-    schedule(
-        &fixture.client,
-        &fixture.shared,
-        &fixture.http,
-        &mut fixture.admission,
-    )
-    .unwrap();
-    assert!(
-        updates.has_changed().unwrap(),
-        "readmission must wake transfer subscriptions"
-    );
-    assert_eq!(fixture.state(), AttachmentTransferState::Queued);
-    fixture.admission.ready().await;
-    schedule(
-        &fixture.client,
-        &fixture.shared,
-        &fixture.http,
-        &mut fixture.admission,
-    )
-    .unwrap();
-    let capacity = fixture.publish_memory(&plain).await;
-    assert!(capacity <= plain.len() + 16);
-    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    fixture.publish_memory(&plain).await;
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
     stop.send(()).unwrap();
     server.await.unwrap();
 }
 
-/// File sink, chunked body with neither length nor validator, on a disk that
-/// frees exactly what each park asks for. Every attempt starts the body over
-/// and parks a little later, recording the need it proved, which never exceeds
-/// what the body really needs, so the job publishes as soon as that much is
-/// free. Refetches are bounded in time: each readmission waits out the park
-/// streak, which the test crosses by pinning the scheduler's clock at each due
-/// time instead of sleeping.
 #[tokio::test]
 async fn unknown_length_parks_record_the_proven_need_and_back_off() {
     let plain = vec![0x7c; 8 * MIB as usize];
@@ -832,14 +789,15 @@ async fn pressure_after_the_body_arrives_parks_with_a_complete_checkpoint_and_re
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    // Enough for the 4 MiB a checkpoint write wants, not for four bodies.
-    fixture.set_free(6 * MIB);
+    // Enough for the tail checkpoint, not for the store file on top of the
+    // body's remaining checkpoint.
+    fixture.set_free(5 * MIB / 2);
     go.send(()).unwrap();
     let done = fixture.completion().await;
     assert_eq!(
         parked_headroom(&done),
-        4 * plain.len() as u64,
-        "pressure after the body arrived parks with the publication reserve alone"
+        2 * plain.len() as u64 - 2 * MIB,
+        "pressure after the body arrived parks with what is not yet on disk"
     );
     complete_media_http(&mut fixture.client, done, &fixture.shared, &fixture.http).await;
     assert_eq!(fixture.state(), AttachmentTransferState::StorageBlocked);
@@ -1010,7 +968,9 @@ async fn transfer_subscribers_see_park_and_readmission_without_the_active_refres
         Arc::clone(&requests),
         stopped,
     );
-    let mut fixture = explicit_fixture(&reference, total).await;
+    // A transfer limit below the body sends it through the file sink, whose
+    // declared-size check parks it inside 4.25 bodies of free space.
+    let mut fixture = explicit_fixture(&reference, MIB).await;
     let runtime = fixture.client.app.runtime();
     fixture.shared = runtime.shared.clone();
     let stream = runtime

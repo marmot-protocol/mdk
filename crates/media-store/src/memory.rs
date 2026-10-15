@@ -24,6 +24,8 @@ struct State {
     rows: BTreeMap<FileId, Row>,
     refs: HashMap<u32, FileId>,
     superseded: HashSet<u32>,
+    /// Wire files owned by a checkpoint row, by slot.
+    wires: HashMap<u32, FileId>,
 }
 
 impl State {
@@ -132,6 +134,17 @@ impl MemoryCatalog {
         state.refs.clear();
     }
 
+    /// Records a checkpoint row owning a new wire file for `slot`, replacing
+    /// any earlier one, as a download's first checkpoint does.
+    pub fn begin_wire_partial(&self, slot: u32, id: FileId) {
+        self.state().expect("catalog open").wires.insert(slot, id);
+    }
+
+    /// Deletes `slot`'s checkpoint row, as completion, expiry or cleanup do.
+    pub fn end_wire_partial(&self, slot: u32) {
+        self.state().expect("catalog open").wires.remove(&slot);
+    }
+
     /// Deletes a row directly, as a committed key-first deletion does.
     pub fn delete_row(&self, id: FileId) {
         self.state().expect("catalog open").rows.remove(&id);
@@ -186,6 +199,10 @@ impl MediaCatalog for MemoryCatalog {
 
     fn mark_lost(&self, id: FileId) -> CatalogResult<bool> {
         Ok(self.state()?.mark_lost(id))
+    }
+
+    fn wire_partial_exists(&self, id: FileId) -> CatalogResult<bool> {
+        Ok(self.state()?.wires.values().any(|wire| *wire == id))
     }
 
     fn page(&self, after: Option<FileId>, limit: usize) -> CatalogResult<Vec<(FileId, FileState)>> {

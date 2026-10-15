@@ -56,7 +56,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   before member resolution or group mutation, and preserve app-configured relays when omitted.
 - Keep encrypted-media DTOs, exporter labels, and Blossom upload/download helpers in the `src/media/` module
   (`blossom.rs`, `crypto.rs`, `group_image.rs`, `host_safety.rs`, `avatar.rs` for downloaded avatar admission).
-  `media/attachment_resume.rs` adapts attempt-fenced storage checkpoints to the shared safe HTTP path;
+  `media/attachment_resume.rs` adapts attempt-fenced checkpoints (metadata rows in storage, ciphertext in the media
+  store's `.wire` files) to the shared safe HTTP path, and admits disk use through `media_store::DiskPolicy` built
+  from the configured reserve;
   keep Range validation, protected partials and complete-body authentication separate from native progress/access.
   `media/file_transfer.rs` owns file-backed upload preparation: private owner-only snapshots under the account's
   `media-staging/`, streaming EVP ChaCha20-Poly1305 that reproduces the in-memory wire bytes, and the

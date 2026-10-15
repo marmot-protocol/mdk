@@ -23,7 +23,8 @@ The encrypted per-file media store (mdk#2314). Human overview: [`README.md`](REA
 | --- | --- |
 | `src/format.rs` | File format: header, header-salted HKDF payload key, 64 KiB OpenSSL ChaCha20-Poly1305 segments, streaming writer (poisoned after a failure), offset reader. |
 | `src/catalog.rs` | `FileId`, `Category`, `FileState`, and the two traits other crates implement: `MediaCatalog` (store-wide rows) and `PublishTarget` (one publication's one-transaction commits). |
-| `src/store.rs` | `MediaStore`: intent-first publish, presence-checked reuse, `attach_existing` (reuse before a download), close-checked readers that hold their key, a small idle-limited reader cache for `read_at`, `unlink_released`, the bounded sweep, the close latch and in-flight set. `sync_file` (plain `fsync` on Apple). |
+| `src/store.rs` | `MediaStore`: intent-first publish, presence-checked reuse, `attach_existing` (reuse before a download), close-checked readers that hold their key, a small idle-limited reader cache for `read_at`, `unlink_released`, `.wire` download checkpoints (`WireFile`: create, open at the recorded length, append-and-sync, copy out), the bounded sweep, the close latch and in-flight set. `sync_file` (plain `fsync` on Apple). |
+| `src/disk.rs` | `DiskPolicy` admission (reserve plus the bytes a write needs; downloads need twice the body) and `free_space`. The reserve comes from the caller's config; the crate never chooses one. |
 | `src/error.rs` | `MediaError`: fixed, privacy-safe messages. |
 | `src/memory.rs`, `src/conformance.rs` | `catalog-conformance` feature: an in-memory catalog and the conformance suite every catalog must pass (crash table, reuse of a lost twin, release, supersession and reset during a write). |
 | `src/format_tests.rs`, `src/store_tests.rs`, `testdata/age/` | Vendored C2SP CCTV age payload vectors; format tests; the in-memory conformance run and store tests (modes, close, sweep bounds, corruption). |
@@ -32,6 +33,10 @@ The encrypted per-file media store (mdk#2314). Human overview: [`README.md`](REA
 
 - Order is the crash-safety guarantee: catalog row before file, one sync before the ready commit, abandon (row, then
   file) on failure, delete the key before the unlink. A file whose row is `pending` is never adopted.
+- A `.wire` checkpoint lives exactly as long as its catalog row: the row commits before the file is created and is
+  deleted before the file is unlinked. Bytes are appended and synced before the row records them, and opening a
+  wire file truncates it to the recorded length (a shorter file is not opened). The sweep unlinks any wire file
+  `wire_partial_exists` does not claim.
 - `PublishTarget` commits are one transaction each in the implementing catalog. Any change to their contract changes
   `conformance.rs` in the same commit, and every catalog (`storage-sqlite`, the in-memory one) must keep passing it.
 - One `MediaStore` (and its clones) per account: the in-flight set that protects live publishes from the sweep is

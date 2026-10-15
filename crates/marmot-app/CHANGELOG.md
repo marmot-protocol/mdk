@@ -28,6 +28,13 @@
 - The retained-byte budget (`retained_bytes_per_account`) no longer gates
   downloads, so a full budget cannot leave downloads waiting in `RetryScheduled`.
   Free disk is the only limit: a full disk parks the job as `StorageBlocked`.
+- Download checkpoints keep their ciphertext in append-only `.wire` files in
+  the account's `media/` directory instead of SQLCipher rows (mdk#2314).
+  Checkpoints saved by an older build are discarded on upgrade.
+- Download admission and in-memory downloads need the configured disk reserve
+  plus twice the body (its checkpoint and its stored file) instead of four
+  times. Large explicit downloads streamed to a file still need four times
+  until they checkpoint straight into the wire file.
 - Publication, hashing and encryption of downloaded bodies run on the blocking
   pool for in-memory bodies too, never on the account worker.
 - Hosts must exclude the account directory, including `media/`, from cloud and

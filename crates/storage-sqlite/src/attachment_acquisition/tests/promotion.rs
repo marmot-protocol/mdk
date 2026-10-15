@@ -234,9 +234,7 @@ fn active_budget_ceiling_promotion_preserves_partials_and_progress() {
         .claim_attachment_acquisition(&asset, 12, 100)
         .unwrap()
         .unwrap();
-    store
-        .checkpoint_attachment_partial(&job, &partial_identity(10), 0, b"abc", 12, 100)
-        .unwrap();
+    checkpoint(&store, &job, &partial_identity(10), 0, b"abc", 12).unwrap();
     store.lock().unwrap().execute("UPDATE attachment_acquisition SET automatic_history=1,acquisition_attempts=4,network_attempts=64,progress_received=3,progress_total=10,progress_phase=1 WHERE token=?1",[&asset.token]).unwrap();
     let before = budget(&store, &asset);
     assert!(store.promote_attachment_demand(&asset, 20).unwrap());

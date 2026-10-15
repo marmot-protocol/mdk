@@ -82,7 +82,7 @@ fn resume_context(
             .unwrap()
             .try_into()
             .unwrap(),
-        budget: 128 * 1024 * 1024,
+        media: test_media(store, dir),
         directory: dir.into(),
         policy: storage_sqlite::AttachmentDownloadPolicy {
             automatic: true,
@@ -91,6 +91,53 @@ fn resume_context(
             transfer_limit: 64 * 1024 * 1024,
         },
     }
+}
+
+/// The media store holding the account's wire checkpoints in these tests.
+fn test_media(store: &SqliteAccountStorage, dir: &std::path::Path) -> crate::AccountMediaStore {
+    media_store::MediaStore::new(
+        dir.join(media_store::MEDIA_DIRECTORY),
+        storage_sqlite::SqliteMediaCatalog::new(store.clone()),
+    )
+}
+
+/// Saves `bytes` as a new checkpoint at offset zero.
+fn checkpoint(
+    store: &SqliteAccountStorage,
+    dir: &std::path::Path,
+    job: &AttachmentAcquisition,
+    identity: &AttachmentPartialIdentity,
+    bytes: &[u8],
+    now: u64,
+) -> bool {
+    crate::media::attachment_resume::write_checkpoint(
+        store,
+        &test_media(store, dir),
+        job,
+        identity,
+        0,
+        bytes,
+        now,
+    )
+    .unwrap()
+}
+
+/// The ciphertext prefix the job's checkpoint holds, read from its wire file.
+fn saved_prefix(
+    store: &SqliteAccountStorage,
+    dir: &std::path::Path,
+    job: &AttachmentAcquisition,
+) -> Option<Vec<u8>> {
+    crate::media::attachment_resume::read_checkpoint(
+        store,
+        &test_media(store, dir),
+        job,
+        crate::unix_now_seconds(),
+        64 * 1024 * 1024,
+        None,
+    )
+    .unwrap()
+    .map(|(_, bytes)| bytes)
 }
 
 /// Exercise the file sink on small fixtures: the same implementation handles
@@ -258,18 +305,14 @@ async fn file_attachment_complete_checkpoint_is_verified_without_network() {
         etag: "\"v1\"".into(),
         total: cipher.len() as u64,
     };
-    assert!(
-        store
-            .checkpoint_attachment_partial(
-                &job,
-                &identity,
-                0,
-                &cipher,
-                crate::unix_now_seconds(),
-                context.budget
-            )
-            .unwrap()
-    );
+    assert!(checkpoint(
+        &store,
+        dir.path(),
+        &job,
+        &identity,
+        &cipher,
+        crate::unix_now_seconds()
+    ));
     let result = crate::media::fetch_blossom_file_with_transport(
         url.as_str(),
         &crate::media::BlossomHttpTransport::new(true),
@@ -359,18 +402,14 @@ async fn file_attachment_invalid_range_restarts_without_mixing_representations()
             etag: "\"v1\"".into(),
             total: len as u64,
         };
-        assert!(
-            store
-                .checkpoint_attachment_partial(
-                    &job,
-                    &identity,
-                    0,
-                    &valid_cipher[..8],
-                    crate::unix_now_seconds(),
-                    context.budget
-                )
-                .unwrap()
-        );
+        assert!(checkpoint(
+            &store,
+            dir.path(),
+            &job,
+            &identity,
+            &valid_cipher[..8],
+            crate::unix_now_seconds()
+        ));
         let file = crate::media::fetch_blossom_file_with_transport(
             url.as_str(),
             &crate::media::BlossomHttpTransport::new(true),
@@ -447,18 +486,14 @@ async fn check_resume_failure(failure: ResumeFailure) {
         etag: "\"v1\"".into(),
         total: len as u64,
     };
-    assert!(
-        store
-            .checkpoint_attachment_partial(
-                &job,
-                &identity,
-                0,
-                &prefix,
-                crate::unix_now_seconds(),
-                context.budget
-            )
-            .unwrap()
-    );
+    assert!(checkpoint(
+        &store,
+        dir.path(),
+        &job,
+        &identity,
+        &prefix,
+        crate::unix_now_seconds()
+    ));
     let staging = dir.path().join("media-staging");
     let transport = crate::media::BlossomHttpTransport::new(true);
     let fetch = || {
@@ -602,7 +637,7 @@ async fn check_disk_reserve(length: ResponseLength) {
             .unwrap()
             .is_none()
     );
-    assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(&staging).map_or(0, |dir| dir.count()), 0);
     server.await.unwrap();
 }
 
@@ -807,9 +842,8 @@ async fn attachment_resume_interrupted_transfer_reopens_and_publishes_verified_b
             .load_attachment_partial(&old, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
             .unwrap()
             .unwrap()
-            .bytes
-            .len(),
-        prefix
+            .received,
+        prefix as u64
     );
     assert!(
         read_retained(
@@ -982,16 +1016,14 @@ async fn attachment_resume_validates_ranges_and_restarts_incompatible_responses(
             etag: "\"v1\"".into(),
             total: total as u64,
         };
-        store
-            .checkpoint_attachment_partial(
-                &job,
-                &identity,
-                0,
-                &saved,
-                crate::unix_now_seconds(),
-                10000,
-            )
-            .unwrap();
+        checkpoint(
+            &store,
+            dir.path(),
+            &job,
+            &identity,
+            &saved,
+            crate::unix_now_seconds(),
+        );
         let prepared = client
             .prepare_background_attachment_download(
                 &GroupId::new(vec![0xab; 16]),
@@ -1090,7 +1122,7 @@ async fn attachment_resume_cancellation_keeps_only_committed_ciphertext() {
             if store
                 .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
                 .unwrap()
-                .is_some_and(|p| p.bytes.len() == ATTACHMENT_CHECKPOINT_BYTES)
+                .is_some_and(|p| p.received == ATTACHMENT_CHECKPOINT_BYTES as u64)
             {
                 break;
             }
@@ -1107,9 +1139,8 @@ async fn attachment_resume_cancellation_keeps_only_committed_ciphertext() {
             .load_attachment_partial(&next, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
             .unwrap()
             .unwrap()
-            .bytes
-            .len(),
-        ATTACHMENT_CHECKPOINT_BYTES
+            .received,
+        ATTACHMENT_CHECKPOINT_BYTES as u64
     );
     assert!(
         read_retained(
@@ -1204,9 +1235,14 @@ async fn attachment_resume_failover_does_not_mix_locator_validators() {
         etag: "\"v1\"".into(),
         total: total as u64,
     };
-    store
-        .checkpoint_attachment_partial(&job, &identity, 0, &saved, crate::unix_now_seconds(), 10000)
-        .unwrap();
+    checkpoint(
+        &store,
+        dir.path(),
+        &job,
+        &identity,
+        &saved,
+        crate::unix_now_seconds(),
+    );
     let prepared = client
         .prepare_background_attachment_download(
             &GroupId::new(vec![0xab; 16]),
@@ -1311,24 +1347,19 @@ async fn attachment_resume_failed_fallback_preserves_prefix_across_reopen() {
         let (client, store) = client_at(dir.path(), &reference, true).await;
         let job = claim(&store);
         let context = resume_context(&store, &job, dir.path(), &reference);
-        assert!(
-            store
-                .checkpoint_attachment_partial(
-                    &job,
-                    &AttachmentPartialIdentity {
-                        ciphertext_digest: context.ciphertext_digest,
-                        locator_digest: Sha256::digest(reference.locators[0].value.as_bytes())
-                            .into(),
-                        etag: "\"v1\"".into(),
-                        total: total as u64,
-                    },
-                    0,
-                    &prefix,
-                    crate::unix_now_seconds(),
-                    10000
-                )
-                .unwrap()
-        );
+        assert!(checkpoint(
+            &store,
+            dir.path(),
+            &job,
+            &AttachmentPartialIdentity {
+                ciphertext_digest: context.ciphertext_digest,
+                locator_digest: Sha256::digest(reference.locators[0].value.as_bytes()).into(),
+                etag: "\"v1\"".into(),
+                total: total as u64,
+            },
+            &prefix,
+            crate::unix_now_seconds()
+        ));
         let prepared = client
             .prepare_background_attachment_download(
                 &GroupId::new(vec![0xab; 16]),
@@ -1342,10 +1373,7 @@ async fn attachment_resume_failed_fallback_preserves_prefix_across_reopen() {
             Err(AttachmentDownloadFailure::Retry(_))
         ));
         assert_eq!(
-            store
-                .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
-                .unwrap()
-                .map(|p| p.bytes),
+            saved_prefix(&store, dir.path(), &job),
             Some(prefix),
             "failed fallback must preserve A: {case}"
         );
@@ -1432,8 +1460,7 @@ async fn attachment_resume_complete_small_body_does_not_write_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
     let (client, store) = client_at(dir.path(), &reference, true).await;
     let job = claim(&store);
-    let mut context = resume_context(&store, &job, dir.path(), &reference);
-    context.budget = 0; // Any unnecessary checkpoint would refuse.
+    let context = resume_context(&store, &job, dir.path(), &reference);
     let prepared = client
         .prepare_background_attachment_download(
             &GroupId::new(vec![0xab; 16]),
@@ -1455,7 +1482,7 @@ async fn attachment_resume_complete_small_body_does_not_write_checkpoint() {
 
 #[tokio::test]
 async fn attachment_resume_disabled_acquisition_still_prunes_expired_checkpoints() {
-    let (_dir, mut client, store, reference) = offline_fixture().await;
+    let (dir, mut client, store, reference) = offline_fixture().await;
     let job = claim(&store);
     let earlier = crate::unix_now_seconds() - 86401;
     let identity = AttachmentPartialIdentity {
@@ -1467,11 +1494,14 @@ async fn attachment_resume_disabled_acquisition_still_prunes_expired_checkpoints
         etag: "\"v1\"".into(),
         total: 10,
     };
-    assert!(
-        store
-            .checkpoint_attachment_partial(&job, &identity, 0, b"abc", earlier, 100)
-            .unwrap()
-    );
+    assert!(checkpoint(
+        &store,
+        dir.path(),
+        &job,
+        &identity,
+        b"abc",
+        earlier
+    ));
     assert!(
         store
             .load_attachment_partial(&job, earlier, 10, None)
@@ -1538,23 +1568,19 @@ async fn attachment_resume_hash_failure_clears_redirected_replacement() {
     let (client, store) = client_at(dir.path(), &reference, true).await;
     let job = claim(&store);
     let context = resume_context(&store, &job, dir.path(), &reference);
-    assert!(
-        store
-            .checkpoint_attachment_partial(
-                &job,
-                &AttachmentPartialIdentity {
-                    ciphertext_digest: context.ciphertext_digest,
-                    locator_digest: Sha256::digest(reference.locators[0].value.as_bytes()).into(),
-                    etag: "\"v1\"".into(),
-                    total: total as u64,
-                },
-                0,
-                &prefix,
-                crate::unix_now_seconds(),
-                128 * 1024 * 1024
-            )
-            .unwrap()
-    );
+    assert!(checkpoint(
+        &store,
+        dir.path(),
+        &job,
+        &AttachmentPartialIdentity {
+            ciphertext_digest: context.ciphertext_digest,
+            locator_digest: Sha256::digest(reference.locators[0].value.as_bytes()).into(),
+            etag: "\"v1\"".into(),
+            total: total as u64,
+        },
+        &prefix,
+        crate::unix_now_seconds()
+    ));
     let prepared = client
         .prepare_background_attachment_download(
             &GroupId::new(vec![0xab; 16]),
@@ -1634,18 +1660,14 @@ async fn attachment_resume_hash_miss_retries_from_zero_after_reopen() {
                 etag: "\"v1\"".into(),
                 total: total as u64,
             };
-            assert!(
-                store
-                    .checkpoint_attachment_partial(
-                        &job,
-                        &identity,
-                        0,
-                        &saved,
-                        crate::unix_now_seconds(),
-                        10000,
-                    )
-                    .unwrap()
-            );
+            assert!(checkpoint(
+                &store,
+                dir.path(),
+                &job,
+                &identity,
+                &saved,
+                crate::unix_now_seconds()
+            ));
             let prepared = client
                 .prepare_background_attachment_download(
                     &GroupId::new(vec![0xab; 16]),
@@ -2290,7 +2312,7 @@ async fn attachment_disk_pressure_parks_before_receipt_and_readmits_when_space_f
     // No validator, so the park target is the publication reserve alone.
     assert!(matches!(
         &result,
-        Err(AttachmentDownloadFailure::StorageBlocked { headroom, .. }) if *headroom == 4 * body.len() as u64
+        Err(AttachmentDownloadFailure::StorageBlocked { headroom, .. }) if *headroom == 2 * body.len() as u64
     ));
     complete(&client, &job, result).unwrap();
     let status = store

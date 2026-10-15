@@ -113,6 +113,10 @@ pub trait MediaCatalog: Send + Sync {
     fn mark_lost(&self, id: FileId) -> CatalogResult<bool>;
     /// Rows in id order after `after`, for the sweep.
     fn page(&self, after: Option<FileId>, limit: usize) -> CatalogResult<Vec<(FileId, FileState)>>;
+    /// Whether a download checkpoint row still owns the wire file `id`. The
+    /// row is written before its `.wire` file exists and deleted before the
+    /// file is, so the sweep unlinks a wire file only when this is false.
+    fn wire_partial_exists(&self, id: FileId) -> CatalogResult<bool>;
 }
 
 /// What one existence check found for a ready file.

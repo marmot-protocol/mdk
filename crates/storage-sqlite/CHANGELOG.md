@@ -9,6 +9,17 @@
   `media_files` (per-file keys and states for the encrypted media store,
   mdk#2314) and `media_file_refs` (attachment slot to ready file), with triggers
   that delete a file's key with its last reference and on a store reset.
+- Migration 0111 advances account storage to schema 111 on first open. Older
+  binaries reject the upgraded database; downgrade is unsupported. It discards
+  existing download checkpoints (the next attempt starts its body over) and adds
+  `attachment_partial.wire_file_id`: checkpoint ciphertext now lives in a media
+  store `.wire` file and the row keeps only its metadata (mdk#2314).
+- Download checkpoints are metadata only. `begin_attachment_partial` starts one
+  and returns its wire file id, `record_attachment_partial` records bytes the
+  caller appended to that file, and `load_attachment_partial` returns
+  `AttachmentPartial { identity, received, wire_file }` instead of the bytes.
+  `checkpoint_attachment_partial`, `load_attachment_partial_to_writer` and
+  `attachment_acquisition_fits_budget` are removed.
 - `read_retained_attachment` returns an error for a body stored as a media file
   (mdk#2314). Use `retained_attachment_read`, which returns legacy database bytes or
   the media file id to read through the media store.

@@ -1,4 +1,9 @@
-//! Protected ciphertext checkpoints. Metadata and chunks share the account DB.
+//! Download checkpoints. The ciphertext prefix lives in an append-only
+//! `.wire` file in the media store; this row records its identity, the
+//! length received so far and the wire file's id (mdk#2314 step 2b). The row
+//! is written before its file exists and deleted before the file is.
+use media_store::FileId;
+
 use super::*;
 
 pub const ATTACHMENT_CHECKPOINT_BYTES: usize = 1024 * 1024;
@@ -50,10 +55,29 @@ pub struct AttachmentPartialIdentity {
     pub etag: String,
     pub total: u64,
 }
-/// A validated, contiguous ciphertext prefix. Never plaintext or permission to display.
+/// A checkpoint's metadata: `received` bytes of this representation are
+/// durable in the wire file `wire_file`. Never plaintext or permission to
+/// display.
 pub struct AttachmentPartial {
     pub identity: AttachmentPartialIdentity,
-    pub bytes: Vec<u8>,
+    pub received: u64,
+    pub wire_file: FileId,
+}
+
+fn validate_identity(identity: &AttachmentPartialIdentity) -> StorageResult<()> {
+    if identity.total == 0
+        || identity.total > MAX_RETAINED_FILE_ATTACHMENT_BYTES
+        || identity.etag.len() > 1024
+        || identity.etag.len() < 2
+        || !identity.etag.starts_with('"')
+        || !identity.etag.ends_with('"')
+        || !identity.etag.as_bytes()[1..identity.etag.len() - 1]
+            .iter()
+            .all(|b| *b == 0x21 || (0x23..=0x7e).contains(b))
+    {
+        return Err(invalid("invalid partial checkpoint"));
+    }
+    Ok(())
 }
 
 pub(super) fn valid_attempt(
@@ -136,186 +160,74 @@ impl SqliteAccountStorage {
         .storage()
     }
 
-    /// Restore a verified ciphertext prefix into a bounded writer rather than
-    /// returning a whole-file array. Lease and expiry gates include caller I/O.
-    pub fn load_attachment_partial_to_writer(
-        &self,
-        job: &AttachmentAcquisition,
-        now: u64,
-        max_bytes: u64,
-        expected: (&[u8; 32], &[u8; 32]),
-        writer: &mut dyn std::io::Write,
-    ) -> StorageResult<Option<(AttachmentPartialIdentity, u64)>> {
-        let started = std::time::Instant::now();
-        let current_time = || now.saturating_add(started.elapsed().as_secs());
-        let metadata = |conn: &Connection| {
-            conn.query_row(
-                "SELECT ciphertext_digest,locator_digest,etag,total,received,expires_at
-                 FROM attachment_partial WHERE token=?1",
-                [&job.reference.token],
-                |r| {
-                    Ok((
-                        r.get::<_, Vec<u8>>(0)?,
-                        r.get::<_, Vec<u8>>(1)?,
-                        r.get::<_, String>(2)?,
-                        nonnegative(r, 3)?,
-                        nonnegative(r, 4)?,
-                        nonnegative(r, 5)?,
-                    ))
-                },
-            )
-            .optional()
-            .storage()
-        };
-        let snapshot = self.connection.with_transaction(|| {
-            let conn = self.lock()?;
-            let now = current_time();
-            if !valid_attempt(&conn, job, now)? {
-                return Ok(None);
-            }
-            let Some(row) = metadata(&conn)? else {
-                return Ok(None);
-            };
-            if row.0 != expected.0 || row.1 != expected.1 {
-                return Ok(None);
-            }
-            if row.5 <= now
-                || row.3 > max_bytes
-                || row.3 > MAX_RETAINED_FILE_ATTACHMENT_BYTES
-                || row.4 > row.3
-            {
-                conn.execute(
-                    "DELETE FROM attachment_partial WHERE token=?1",
-                    [&job.reference.token],
-                )
-                .storage()?;
-                return Ok(None);
-            }
-            Ok(Some(row))
-        })?;
-        let Some(snapshot) = snapshot else {
-            return Ok(None);
-        };
-        let identity = AttachmentPartialIdentity {
-            ciphertext_digest: snapshot
-                .0
-                .clone()
-                .try_into()
-                .map_err(|_| invalid("invalid partial digest"))?,
-            locator_digest: snapshot
-                .1
-                .clone()
-                .try_into()
-                .map_err(|_| invalid("invalid partial locator"))?,
-            etag: snapshot.2.clone(),
-            total: snapshot.3,
-        };
-        // Recheck the frozen representation as well as the attempt/source before
-        // each bounded read and once after the last caller write. Neither the
-        // account guard nor its transaction survives into hashing or caller I/O.
-        let mut copied = 0u64;
-        let mut previous_offset = -1i64;
-        loop {
-            let next = self.connection.with_transaction(|| {
-                let conn = self.lock()?;
-                let now = current_time();
-                if !valid_attempt(&conn, job, now)? || metadata(&conn)?.as_ref() != Some(&snapshot)
-                {
-                    return Ok(None);
-                }
-                if snapshot.5 <= now {
-                    conn.execute(
-                        "DELETE FROM attachment_partial WHERE token=?1",
-                        [&job.reference.token],
-                    )
-                    .storage()?;
-                    return Ok(None);
-                }
-                let chunk = conn
-                    .query_row(
-                        "SELECT offset,bytes,digest FROM attachment_partial_chunk
-                     WHERE token=?1 AND offset>?2 ORDER BY offset LIMIT 1",
-                        params![job.reference.token, previous_offset],
-                        |r| {
-                            Ok((
-                                nonnegative(r, 0)?,
-                                r.get::<_, Vec<u8>>(1)?,
-                                r.get::<_, Vec<u8>>(2)?,
-                            ))
-                        },
-                    )
-                    .optional()
-                    .storage()?;
-                Ok(Some(chunk))
-            })?;
-            let Some(next) = next else {
-                return Ok(None);
-            };
-            let corrupt = match &next {
-                Some((offset, bytes, digest)) => {
-                    *offset != copied
-                        || bytes.is_empty()
-                        || bytes.len() > ATTACHMENT_CHECKPOINT_BYTES
-                        || copied.saturating_add(bytes.len() as u64) > snapshot.4
-                        || Sha256::digest(bytes).as_slice() != digest
-                }
-                None => copied != snapshot.4,
-            };
-            if corrupt {
-                // A cancelled loader must not clear a replacement checkpoint.
-                self.connection.with_transaction(|| {
-                    let conn = self.lock()?;
-                    if valid_attempt(&conn, job, current_time())?
-                        && metadata(&conn)?.as_ref() == Some(&snapshot)
-                    {
-                        conn.execute(
-                            "DELETE FROM attachment_partial WHERE token=?1",
-                            [&job.reference.token],
-                        )
-                        .storage()?;
-                    }
-                    Ok(())
-                })?;
-                return Ok(None);
-            }
-            let Some((offset, bytes, _)) = next else {
-                return Ok(Some((identity, copied)));
-            };
-            writer
-                .write_all(&bytes)
-                .map_err(|_| invalid("partial checkpoint copy failed"))?;
-            previous_offset = u64_to_i64(offset)?;
-            copied += bytes.len() as u64;
-        }
-    }
-
-    /// Append at an exact offset, in bounded chunks. A new zero-offset checkpoint
-    /// atomically replaces the prior representation. Source/attempt/quota checks
-    /// precede all writes; a late task cannot recreate a removed source.
-    pub fn checkpoint_attachment_partial(
+    /// Starts a new checkpoint for this attempt, replacing any earlier one,
+    /// and returns the id of the wire file to create. The row commits before
+    /// that file exists, with nothing received. `None` means the attempt no
+    /// longer owns the job.
+    pub fn begin_attachment_partial(
         &self,
         job: &AttachmentAcquisition,
         identity: &AttachmentPartialIdentity,
-        offset: u64,
-        bytes: &[u8],
         now: u64,
-        byte_budget: u64,
+    ) -> StorageResult<Option<FileId>> {
+        validate_identity(identity)?;
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if !valid_attempt(&conn, job, now)? {
+                return Ok(None);
+            }
+            // Re-receiving the prefix this replaces is not forward progress.
+            let floor: u64 = conn
+                .query_row(
+                    "SELECT max(received,progress_floor) FROM attachment_partial WHERE token=?1",
+                    [&job.reference.token],
+                    |row| nonnegative(row, 0),
+                )
+                .optional()
+                .storage()?
+                .unwrap_or(0);
+            conn.execute(
+                "DELETE FROM attachment_partial WHERE token=?1",
+                [&job.reference.token],
+            )
+            .storage()?;
+            let wire: Vec<u8> = conn
+                .query_row(
+                    "INSERT INTO attachment_partial(
+                         token,ciphertext_digest,locator_digest,etag,total,expires_at,wire_file_id,
+                         progress_floor)
+                     VALUES(?1,?2,?3,?4,?5,?6,randomblob(16),?7) RETURNING wire_file_id",
+                    params![
+                        job.reference.token,
+                        identity.ciphertext_digest.as_slice(),
+                        identity.locator_digest.as_slice(),
+                        identity.etag,
+                        u64_to_i64(identity.total)?,
+                        u64_to_i64(now.saturating_add(PARTIAL_TTL_SECONDS))?,
+                        u64_to_i64(floor)?
+                    ],
+                    |row| row.get(0),
+                )
+                .storage()?;
+            FileId::from_slice(&wire)
+                .map(Some)
+                .ok_or_else(|| invalid("invalid partial wire file"))
+        })
+    }
+
+    /// Records that the wire file `wire_file` now durably holds the first
+    /// `received` bytes of this checkpoint's representation. The caller has
+    /// appended and synced them first. Only growth of this attempt's own
+    /// checkpoint is accepted.
+    pub fn record_attachment_partial(
+        &self,
+        job: &AttachmentAcquisition,
+        identity: &AttachmentPartialIdentity,
+        wire_file: &FileId,
+        received: u64,
+        now: u64,
     ) -> StorageResult<bool> {
-        let end = offset
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| invalid("partial offset overflow"))?;
-        if bytes.is_empty()
-            || bytes.len() > ATTACHMENT_CHECKPOINT_BYTES
-            || end > identity.total
-            || identity.total > MAX_RETAINED_FILE_ATTACHMENT_BYTES
-            || identity.etag.len() > 1024
-            || !identity.etag.starts_with('"')
-            || !identity.etag.ends_with('"')
-            || identity.etag.len() < 2
-            || !identity.etag.as_bytes()[1..identity.etag.len() - 1]
-                .iter()
-                .all(|b| *b == 0x21 || (0x23..=0x7e).contains(b))
-        {
+        if received > identity.total {
             return Err(invalid("invalid partial checkpoint"));
         }
         self.connection.with_transaction(|| {
@@ -325,8 +237,9 @@ impl SqliteAccountStorage {
             }
             let old = conn
                 .query_row(
-                    "SELECT ciphertext_digest, locator_digest, etag, total, received
-                 FROM attachment_partial WHERE token=?1",
+                    "SELECT ciphertext_digest,locator_digest,etag,total,received,wire_file_id,
+                         progress_floor
+                     FROM attachment_partial WHERE token=?1",
                     [&job.reference.token],
                     |r| {
                         Ok((
@@ -335,65 +248,29 @@ impl SqliteAccountStorage {
                             r.get::<_, String>(2)?,
                             nonnegative(r, 3)?,
                             nonnegative(r, 4)?,
+                            r.get::<_, Option<Vec<u8>>>(5)?,
+                            nonnegative(r, 6)?,
                         ))
                     },
                 )
                 .optional()
                 .storage()?;
-            if offset > 0
-                && !old.as_ref().is_some_and(|v| {
-                    v.0 == identity.ciphertext_digest
-                        && v.1 == identity.locator_digest
-                        && v.2 == identity.etag
-                        && v.3 == identity.total
-                        && v.4 == offset
-                })
+            let Some(old) = old else {
+                return Ok(false);
+            };
+            if old.0 != identity.ciphertext_digest
+                || old.1 != identity.locator_digest
+                || old.2 != identity.etag
+                || old.3 != identity.total
+                || old.5.as_deref() != Some(wire_file.as_bytes().as_slice())
+                || received <= old.4
             {
                 return Ok(false);
             }
-            let used = reserved_bytes(&conn)?;
-            let replaced = old.as_ref().map_or(0, |v| v.3);
-            // Reserve the complete representation on its first checkpoint.
-            // Other interrupted jobs cannot consume space needed to finish it.
-            if used.saturating_sub(replaced).saturating_add(identity.total) > byte_budget {
-                return Ok(false);
-            }
-            if offset == 0 {
-                conn.execute(
-                    "DELETE FROM attachment_partial WHERE token=?1",
-                    [&job.reference.token],
-                )
-                .storage()?;
-                conn.execute(
-                    "INSERT INTO attachment_partial(
-                         token,ciphertext_digest,locator_digest,etag,total,expires_at)
-                     VALUES(?1,?2,?3,?4,?5,?6)",
-                    params![
-                        job.reference.token,
-                        identity.ciphertext_digest.as_slice(),
-                        identity.locator_digest.as_slice(),
-                        identity.etag,
-                        u64_to_i64(identity.total)?,
-                        u64_to_i64(now.saturating_add(PARTIAL_TTL_SECONDS))?
-                    ],
-                )
-                .storage()?;
-            }
-            conn.execute(
-                "INSERT INTO attachment_partial_chunk(token,offset,bytes,digest)
-                 VALUES(?1,?2,?3,?4)",
-                params![
-                    job.reference.token,
-                    u64_to_i64(offset)?,
-                    bytes,
-                    Sha256::digest(bytes).as_slice()
-                ],
-            )
-            .storage()?;
             // Only newly retained resumable bytes break the failure streak and
-            // the storage-park streak. Re-reading/replacing the same prefix
-            // must not suppress backoff.
-            if end > old.as_ref().map_or(0, |old| old.4) {
+            // the storage-park streak. Re-receiving a prefix that a restarted
+            // checkpoint replaced must not suppress backoff.
+            if received > old.6 {
                 conn.execute(
                     "UPDATE attachment_acquisition SET attempts=1,storage_park_count=0 WHERE token=?1",
                     [&job.reference.token],
@@ -404,7 +281,7 @@ impl SqliteAccountStorage {
                 "UPDATE attachment_partial SET received=?2,expires_at=?3 WHERE token=?1",
                 params![
                     job.reference.token,
-                    u64_to_i64(end)?,
+                    u64_to_i64(received)?,
                     u64_to_i64(now.saturating_add(PARTIAL_TTL_SECONDS))?
                 ],
             )
@@ -413,39 +290,10 @@ impl SqliteAccountStorage {
         })
     }
 
-    /// Account bytes committed to retained data and complete partial representations.
-    /// Existing prefixes keep their reservation; new transfers reserve the policy cap.
-    pub fn attachment_acquisition_fits_budget(
-        &self,
-        reference: &AttachmentAssetRef,
-        maximum: u64,
-        budget: u64,
-    ) -> StorageResult<bool> {
-        let conn = self.lock()?;
-        if !matches_store(&conn, reference)? {
-            return Ok(false);
-        }
-        let own: u64 = conn
-            .query_row(
-                "SELECT coalesce((SELECT total FROM attachment_partial WHERE token=?1),0)",
-                [&reference.token],
-                |r| nonnegative(r, 0),
-            )
-            .storage()?;
-        let own_import: u64 = conn.query_row(
-            "SELECT coalesce((SELECT byte_len FROM retained_attachment_files WHERE token=?1 AND completed=0),0)",
-            [&reference.token], |r| nonnegative(r,0),
-        ).storage()?;
-        let required = if own > 0 { own.min(maximum) } else { maximum };
-        Ok(reserved_bytes(&conn)?
-            .saturating_sub(own)
-            .saturating_sub(own_import)
-            .saturating_add(required)
-            <= budget)
-    }
-
-    /// Read only under a current attempt. Optional expected identity is checked
-    /// before reading chunks. Corruption, expiry or policy shrink discards the prefix.
+    /// The checkpoint to resume, under a current attempt. The expected
+    /// identity is checked when given. Expiry, a size over `max_bytes` or an
+    /// inconsistent row discards the checkpoint. The caller opens the wire
+    /// file at `received` and clears the checkpoint if that fails.
     pub fn load_attachment_partial(
         &self,
         job: &AttachmentAcquisition,
@@ -460,7 +308,7 @@ impl SqliteAccountStorage {
             }
             let row = conn
                 .query_row(
-                    "SELECT ciphertext_digest,locator_digest,etag,total,received,expires_at
+                    "SELECT ciphertext_digest,locator_digest,etag,total,received,expires_at,wire_file_id
                  FROM attachment_partial WHERE token=?1",
                     [&job.reference.token],
                     |r| {
@@ -471,71 +319,31 @@ impl SqliteAccountStorage {
                             nonnegative(r, 3)?,
                             nonnegative(r, 4)?,
                             nonnegative(r, 5)?,
+                            r.get::<_, Option<Vec<u8>>>(6)?,
                         ))
                     },
                 )
                 .optional()
                 .storage()?;
-            let Some((cipher, locator, etag, total, received, expiry)) = row else {
+            let Some((cipher, locator, etag, total, received, expiry, wire)) = row else {
                 return Ok(None);
             };
-            let discard = || {
+            let wire = wire.as_deref().and_then(FileId::from_slice);
+            let (Some(wire), true) = (
+                wire,
+                expiry > now
+                    && total <= max_bytes
+                    && received <= total
+                    && total <= MAX_RETAINED_FILE_ATTACHMENT_BYTES,
+            ) else {
                 conn.execute(
                     "DELETE FROM attachment_partial WHERE token=?1",
                     [&job.reference.token],
                 )
-                .storage()
-            };
-            if expiry <= now
-                || total > max_bytes
-                || received > total
-                || total > MAX_RETAINED_FILE_ATTACHMENT_BYTES
-            {
-                discard()?;
-                return Ok(None);
-            }
-            if expected.is_some_and(|(c, l)| cipher != c || locator != l) {
-                return Ok(None);
-            }
-            // The legacy array API cannot restore a large prefix. Leave it
-            // intact for the file-backed API rather than destroying resumability.
-            if total > MAX_RETAINED_ATTACHMENT_BYTES as u64 {
-                return Ok(None);
-            }
-            let mut stmt = conn
-                .prepare(
-                    "SELECT offset,bytes,digest FROM attachment_partial_chunk
-                 WHERE token=?1 ORDER BY offset",
-                )
                 .storage()?;
-            let mut rows = stmt.query([&job.reference.token]).storage()?;
-            // Size the prefix for the complete representation once, so neither
-            // this reassembly nor the resumed body grows it by doubling. A
-            // failed reservation is a backend error the runtime retries later.
-            let mut bytes = Vec::new();
-            bytes.try_reserve_exact(total as usize).map_err(|_| {
-                StorageError::Backend("partial checkpoint buffer unavailable".into())
-            })?;
-            let mut corrupt = false;
-            while let Some(row) = rows.next().storage()? {
-                let offset = nonnegative(row, 0).storage()?;
-                let chunk: Vec<u8> = row.get(1).storage()?;
-                let digest: Vec<u8> = row.get(2).storage()?;
-                if offset != bytes.len() as u64
-                    || chunk.is_empty()
-                    || chunk.len() > ATTACHMENT_CHECKPOINT_BYTES
-                    || offset.saturating_add(chunk.len() as u64) > received
-                    || Sha256::digest(&chunk).as_slice() != digest
-                {
-                    corrupt = true;
-                    break;
-                }
-                bytes.extend_from_slice(&chunk);
-            }
-            drop(rows);
-            drop(stmt);
-            if corrupt || bytes.len() as u64 != received {
-                discard()?;
+                return Ok(None);
+            };
+            if expected.is_some_and(|(c, l)| cipher != c || locator != l) {
                 return Ok(None);
             }
             Ok(Some(AttachmentPartial {
@@ -549,7 +357,8 @@ impl SqliteAccountStorage {
                     etag,
                     total,
                 },
-                bytes,
+                received,
+                wire_file: wire,
             }))
         })
     }
@@ -617,27 +426,16 @@ impl SqliteAccountStorage {
             .storage()
     }
 
-    /// Bytes currently held in ciphertext checkpoints. Test support for
-    /// free-space models that charge checkpoint growth to the volume.
+    /// Bytes recorded in ciphertext checkpoints. Test support for free-space
+    /// models that charge checkpoint growth to the volume.
     #[cfg(any(test, feature = "test-support"))]
     pub fn attachment_partial_bytes_for_test(&self) -> StorageResult<u64> {
         self.lock()?
             .query_row(
-                "SELECT coalesce(sum(length(bytes)),0) FROM attachment_partial_chunk",
+                "SELECT coalesce(sum(received),0) FROM attachment_partial",
                 [],
                 |row| nonnegative(row, 0),
             )
             .storage()
     }
-}
-
-fn reserved_bytes(conn: &Connection) -> StorageResult<u64> {
-    conn.query_row(
-        "SELECT r.byte_count+p.reserved_bytes
-         FROM attachment_retention_usage r,attachment_partial_usage p
-         WHERE r.id=1 AND p.id=1",
-        [],
-        |r| nonnegative(r, 0),
-    )
-    .storage()
 }
