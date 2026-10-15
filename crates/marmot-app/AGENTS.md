@@ -261,8 +261,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   afterwards, and put shutdown checks at engine-step boundaries (never inside a step, where a snapshot guard may be
   live). See `docs/marmot-architecture/overview/local-artifact-safety.md`.
 - Broadcast a projection update only after the write that produced it commits: build it inside the write's
-  transaction, carry it in the operation's summary, and publish from the worker once the operation returns. A host
-  may close storage the moment it shows an update. `tests/group_activity_reactions.rs` closes right after a live
+  transaction and publish it from the worker at one of two points. Received and other summarized updates go out
+  through the operation's summary once the operation returns. A local send publishes its own projection earlier,
+  from the in-command `on_local_projection` callback, right after its record call has committed. A host may close
+  storage the moment it shows an update. `tests/group_activity_reactions.rs` closes right after a live
   reaction and reads the store before any runtime starts (mdk#2345). Tests that wait on a live timeline must match the
   exact expected state: a timeline also carries its own account's changes, so "any reaction" can match a stale one.
 - Keep legacy message-format promotion after account readiness and bounded to
