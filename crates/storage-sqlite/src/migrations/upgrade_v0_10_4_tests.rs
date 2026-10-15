@@ -64,10 +64,23 @@ fn rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<Value>> {
 }
 
 /// Every row of `table` in a canonical order (some tables have no rowid).
-fn table_rows(conn: &rusqlite::Connection, table: &str) -> Vec<Vec<Value>> {
-    let mut all = rows(conn, &format!("SELECT * FROM {table}"));
+///
+/// Only `columns` are compared, so a later migration may add a column to a
+/// preserved table without counting as a change to what v0.10.4 wrote.
+fn table_rows(conn: &rusqlite::Connection, table: &str, columns: &[String]) -> Vec<Vec<Value>> {
+    let mut all = rows(conn, &format!("SELECT {} FROM {table}", columns.join(", ")));
     all.sort_by_cached_key(|row| format!("{row:?}"));
     all
+}
+
+fn table_columns(conn: &rusqlite::Connection, table: &str) -> Vec<String> {
+    rows(conn, &format!("PRAGMA table_info({table})"))
+        .into_iter()
+        .map(|column| match &column[1] {
+            Value::Text(name) => name.clone(),
+            other => panic!("unexpected column name {other:?}"),
+        })
+        .collect()
 }
 
 fn count(conn: &rusqlite::Connection, table: &str) -> i64 {
@@ -124,7 +137,11 @@ fn v0_10_4_account_upgrades_without_losing_state_or_raising_notices() {
         );
         let tables: Vec<_> = PRESERVED_TABLES
             .iter()
-            .map(|table| table_rows(&conn, table))
+            .map(|table| {
+                let columns = table_columns(&conn, table);
+                let rows = table_rows(&conn, table, &columns);
+                (columns, rows)
+            })
             .collect();
         assert_eq!(count(&conn, "cgka_groups"), 3);
         assert!(count(&conn, "message_timeline") >= 18);
@@ -181,7 +198,12 @@ fn v0_10_4_account_upgrades_without_losing_state_or_raising_notices() {
         }
 
         for (table, before) in PRESERVED_TABLES.iter().zip(&before_tables) {
-            assert_eq!(&table_rows(&conn, table), before, "{table} changed");
+            let (columns, before) = before;
+            assert_eq!(
+                &table_rows(&conn, table, columns),
+                before,
+                "{table} changed"
+            );
         }
         assert_eq!(cursor(&conn), Some(PERSISTED_CURSOR));
         assert_eq!(retained_routes(&conn), before_routes);

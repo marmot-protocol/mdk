@@ -41,11 +41,6 @@ pub(crate) struct BoundedIdSet<T: Clone + Eq + Hash> {
     members: HashSet<T>,
     order: VecDeque<T>,
     capacity: usize,
-    /// Monotonic counter bumped on every membership change (insert or the
-    /// eviction that an insert triggers). Lets callers cache a derived view of
-    /// the set (e.g. the convergence hex-encoded snapshot, #636) and rebuild it
-    /// only when the set actually changed, instead of once per convergence pass.
-    generation: u64,
 }
 
 impl<T: Clone + Eq + Hash> BoundedIdSet<T> {
@@ -59,7 +54,6 @@ impl<T: Clone + Eq + Hash> BoundedIdSet<T> {
             members: HashSet::new(),
             order: VecDeque::new(),
             capacity,
-            generation: 0,
         }
     }
 
@@ -77,10 +71,6 @@ impl<T: Clone + Eq + Hash> BoundedIdSet<T> {
         if !self.members.insert(value.clone()) {
             return;
         }
-        // Membership changed (new id, plus any eviction below) — bump once so a
-        // no-op re-insert above leaves the generation (and any derived cache)
-        // untouched.
-        self.generation = self.generation.wrapping_add(1);
         self.order.push_back(value);
         while self.order.len() > self.capacity {
             if let Some(evicted) = self.order.pop_front() {
@@ -89,14 +79,8 @@ impl<T: Clone + Eq + Hash> BoundedIdSet<T> {
         }
     }
 
-    /// A token that changes whenever the set's membership changes. A derived
-    /// snapshot is still current iff the generation matches the one captured
-    /// when it was built.
-    pub(crate) fn generation(&self) -> u64 {
-        self.generation
-    }
-
     /// Iterates the cached entries in no particular order.
+    #[cfg(test)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
         self.members.iter()
     }
@@ -187,28 +171,5 @@ mod tests {
     #[should_panic(expected = "BoundedIdSet capacity must be non-zero")]
     fn zero_capacity_panics() {
         let _ = BoundedIdSet::<u32>::with_capacity(0);
-    }
-
-    #[test]
-    fn generation_bumps_only_on_membership_change() {
-        // Backs the #636 convergence hex-snapshot cache: the generation must
-        // change on any real insert (and its eviction) but NOT on a no-op
-        // re-insert, or the cache would either serve stale data or rebuild
-        // needlessly.
-        let mut set = BoundedIdSet::with_capacity(2);
-        assert_eq!(set.generation(), 0);
-        set.insert(1u32);
-        let after_first = set.generation();
-        assert_ne!(after_first, 0);
-        // No-op re-insert: membership unchanged, generation stable.
-        set.insert(1);
-        assert_eq!(set.generation(), after_first);
-        // New id: generation advances.
-        set.insert(2);
-        let after_second = set.generation();
-        assert_ne!(after_second, after_first);
-        // Insert past capacity evicts the oldest: still a membership change.
-        set.insert(3);
-        assert_ne!(set.generation(), after_second);
     }
 }

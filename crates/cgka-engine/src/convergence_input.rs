@@ -48,6 +48,23 @@ impl ClassifiedConvergenceInput {
         PASS_OPENING_STATES.contains(&self.state)
     }
 
+    /// Whether this is a delivered application that no candidate of a pass
+    /// replaying from `witness_floor` can count or withdraw.
+    ///
+    /// Every candidate forks at the pass's replay start, which is at or
+    /// above `witness_floor`. `attach_app_witnesses` counts an application
+    /// only from an epoch strictly after a candidate's fork, and one at or
+    /// below the replay start is probed on the shared base state before any
+    /// candidate's first commit, so it decrypts on every candidate or on
+    /// none: never a witness, never a `LosingBranch` withdrawal. A delivered
+    /// one also needs no disposition, so leaving it out of the pass changes
+    /// nothing but the work (mdk#2330).
+    pub(crate) fn is_inert_delivered_witness(self, witness_floor: u64) -> bool {
+        self.role == ConvergencePassMemberRole::AppWitnessCandidate
+            && self.state == MessageState::Processed
+            && self.source_epoch <= witness_floor
+    }
+
     fn can_gate_outbound(self) -> bool {
         OUTBOUND_GATING_STATES.contains(&self.state)
     }

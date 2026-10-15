@@ -64,7 +64,8 @@ use cgka_traits::message::{
     DeferredMessageMetadata, MessageRecord, MessageState, StoredMessagePayload,
 };
 use cgka_traits::storage::{
-    DeferredPeelGeneration, QueuedOutboundIntent, StorageError, StorageProvider,
+    DeferredPeelGeneration, OpenMlsContentFilter, QueuedOutboundIntent, StorageError,
+    StorageProvider,
 };
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
@@ -1773,10 +1774,13 @@ impl<S: StorageProvider> Engine<S> {
         )? {
             return Ok(false);
         }
-        let records = self.storage.list_messages_in_states(
+        // A delivered application neither gates nor adds a commit edge, so
+        // storage need not hand back the group's delivered history.
+        let records = self.storage.list_openmls_messages_in_states(
             group_id,
             &GATE_CLASSIFIER_STATES,
             EpochId(anchor),
+            OpenMlsContentFilter::WithoutProcessedApplications,
         )?;
         Ok(self.any_gating_convergence_input(anchor, ceiling, &records))
     }
@@ -3107,10 +3111,11 @@ impl<S: StorageProvider> Engine<S> {
         &mut self,
         group_id: &GroupId,
     ) -> Result<Vec<CommitEdge>, EngineError> {
-        let records = self.storage.list_messages_in_states(
+        let records = self.storage.list_openmls_messages_in_states(
             group_id,
             &crate::openmls_projection::OPENMLS_GRAPH_INPUT_STATES,
             EpochId(0),
+            OpenMlsContentFilter::Commits,
         )?;
         let mut memo = std::mem::take(
             &mut self

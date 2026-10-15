@@ -234,6 +234,8 @@ mod migration_0108_account_attachment_history;
 mod migration_0109_attachment_storage_block;
 #[path = "migrations/0110_media_files.rs"]
 mod migration_0110_media_files;
+#[path = "migrations/0111_message_openmls_content.rs"]
+mod migration_0111_message_openmls_content;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -912,6 +914,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0110_media_files",
         suspend_foreign_keys: &[],
         apply: migration_0110_media_files::apply,
+    },
+    Migration {
+        version: 111,
+        name: "0111_message_openmls_content",
+        suspend_foreign_keys: &[],
+        apply: migration_0111_message_openmls_content::apply,
     },
 ];
 
