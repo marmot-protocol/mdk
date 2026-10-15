@@ -52,7 +52,8 @@ impl From<marmot_app::PublicEventPreviewRead> for PublicEventPreviewFfi {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     /// Network-free cached previews for first-frame rendering: one result per
     /// reference, in input order, duplicates included. Accepts at most 16

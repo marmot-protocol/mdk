@@ -1,7 +1,7 @@
 ---
 title: "Marmot App Runtime Shape"
 created: 2026-05-19
-updated: 2026-09-04
+updated: 2026-10-15
 tags: [marmot, overview, app-runtime, daemon, tui]
 status: implemented-first-slice
 ---
@@ -72,6 +72,44 @@ this contract.
 - app-wide stream hubs;
 - app settings and runtime config;
 - the Nostr relay plane.
+
+## Threading Model
+
+`marmot-app` never builds a Tokio runtime. It spawns account workers, relay-plane tasks, subscription forwarders and
+timers onto the runtime that is current when a call reaches it, and a few paths that may run outside any runtime
+(construction, some `Drop` cleanups) use `Handle::try_current` and skip work when there is none. Each binding decides
+which runtime that is and which thread polls the calling future:
+
+| Binding | Runtime | Who runs a call's own work | Spawned MDK tasks |
+| --- | --- | --- | --- |
+| `marmot-uniffi` (Swift, Kotlin) | One process-wide multi-thread runtime owned by the crate: (CPUs / 2) clamped to 2–4 workers plus the on-demand blocking pool, threads named `marmotkit-rt` | A runtime worker: `#[marmot_uniffi_macros::on_tokio_runtime]` exports each async method through a wrapper that spawns it and awaits the join handle; the host thread only polls that handle. Subscription receives stay on the host thread with the runtime entered, so a cancelled wait cannot consume an update | Same runtime; constructors enter it |
+| `marmot-c` | One multi-thread runtime per client, Tokio's default worker count | The C caller's thread, inside `block_on` | The client's runtime |
+| `wn` / `wnd`, `wn-agent` | The binary's multi-thread runtime (`#[tokio::main]` or an explicit builder) | Runtime tasks | Same runtime |
+
+UniFFI's own `async_runtime = "tokio"` support is not used: it wraps each future in `async_compat`, which, with no
+runtime entered on the host's thread, falls back to a single current-thread runtime on one `async-compat/tokio-1`
+thread. Every spawned MDK task then shared that one thread, and each call's own work ran on the host thread polling
+it, which can be the UI thread: in a two-account message burst, about 45% of MDK's CPU time ran on the calling
+thread. `crates/marmot-uniffi/tests/runtime_threads.rs` drives the exports the way the generated scaffolding does and
+checks that MDK work lands on `marmotkit-rt` threads and that the fallback thread never starts.
+
+What runs in parallel: different accounts' workers, the relay plane, subscription forwarders, timers and the work
+behind concurrent host calls. What stays serial: each account worker handles its own commands one at a time, in
+arrival order, so per-account ordering contracts (mutations replayed in order after catch-up, FIFO sends) are the
+same on every binding. Per-group readiness and priority scheduling inside a worker are not provided.
+
+Workers must stay ordinary async tasks (`tokio::spawn`) so shutdown can abort and join them. Cancellation is
+cooperative: on a multi-thread runtime an aborted task stops at its next `.await`, possibly after finishing a
+synchronous step already running on another thread. Do not move workers onto blocking threads or dedicated
+per-worker runtimes: they cannot be aborted, and an earlier attempt to do so was reverted when hardening shutdown.
+`shutdown_and_close` keeps its ordering on every binding: it closes storage in a runtime-owned task before bounded
+graceful cleanup.
+
+`marmot-app`'s integration suites (`crates/marmot-app/tests/`, including `relay_runtime`) drive whole runtimes on a
+two-worker multi-thread test runtime, so ordering that only holds on one thread fails in CI. A test that needs one
+thread stays on the current-thread flavor and says why. The unit-level suites under `src/runtime/` and
+`src/relay_plane/` still run on one thread: many of them build exact interleavings, and they have not yet been made
+independent of scheduling.
 
 ## Relay Plane And Adapter
 

@@ -105,7 +105,12 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     manager; the group stays usable, and an apply the fault abandoned hands its still-retained winning commit back to
     stored convergence so it is eventually applied. Also owns the snapshot-guard durability pair: a guard whose
     rollback fails keeps its snapshot for open-time recovery, and a historical peel context is derived once per
-    candidate generation rather than once per bounded slice
+    candidate generation rather than once per bounded slice. A failed canonical apply rolls back inside a caller
+    transaction that still commits, without a full pre-apply snapshot (mdk#2326)
+
+- **File:** `apply_history_cost.rs`
+  - **Owns:** Ignored regression benchmark for canonical-apply cost against stored message history (mdk#2326). Run in
+    release with `--ignored --nocapture`; it reports timings and never asserts a threshold
 
 - **File:** `hydration_quarantine.rs`
   - **Owns:** Group hydration-quarantine path — `GroupHydrationQuarantineReason` classification on session open
@@ -125,7 +130,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 - **File:** `crash_recovery_sqlite.rs`
   - **Owns:** Debug-feature-gated subprocess-kill coverage at retained-anchor rewind and historical-apply transaction
     boundaries. Reopens encrypted SQLite, observes the stranded pre-hydration state, then verifies hydration restores
-    live state and releases convergence snapshots. Candidate replay kills after temporary processing and restoration
+    live state and releases convergence snapshots. The historical apply is one savepoint, so its kill strands no
+    snapshot. Candidate replay kills after temporary processing and restoration
     also verify exact pre-probe group state, epoch authenticator, snapshots, input ledger and queued work before
     hydration, both standalone and inside an outer transaction.
     Resumable selection and peeling also kill after historical rewind and after a restored slice; reopening must

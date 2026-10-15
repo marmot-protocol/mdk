@@ -62,6 +62,11 @@ order and the roles agents most often need.
   - **Role:** No-torn-writes convention for multi-step state changes: validation/mutation ordering, compensation,
     intent-first reconciliation, and reality-reflecting confirmation.
 
+- **Path:** `review/`
+  - **Role:** The 2026-10 architecture review: `README.md` (scope, lenses, evidence rules), `00-system-map.md` and
+    `map-*.md` (Pass 0, descriptive and pinned to a baseline commit), and later per-system review pages. Keep the
+    map descriptive; findings and recommendations belong on the Pass 1 and Pass 2 pages.
+
 - **Path:** `further-context/`
   - **Role:** Older or deeper context. Check status and dates before relying on it.
 

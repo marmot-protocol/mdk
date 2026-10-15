@@ -9,7 +9,8 @@ use crate::conversions::{
 use crate::errors::MarmotKitError;
 use marmot_app::audit_otlp_sender::AuditOtlpSender;
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     /// Local forensic audit-log recording settings. Recording is opt-in and only
     /// applies to account sessions opened after the setting is enabled.

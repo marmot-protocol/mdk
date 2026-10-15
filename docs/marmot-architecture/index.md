@@ -1,7 +1,7 @@
 ---
 title: "Marmot Architecture — Index"
 created: 2026-04-15
-updated: 2026-09-30
+updated: 2026-10-15
 tags: [marmot, architecture, index]
 ---
 
@@ -262,6 +262,12 @@ These are longer working documents. Go here when you need depth, not orientation
 
 - **Doc:** [`../learnings.md`](../learnings.md)
   - **What it covers:** Historical engineering notes. Useful for archaeology, not a current contract.
+
+### Architecture review (2026-10)
+
+- **Doc:** [`review/README.md`](./review/README.md)
+  - **What it covers:** In-progress system-by-system architecture review: scope, platform constraint, lenses,
+    evidence rules and status. Start with [`review/00-system-map.md`](./review/00-system-map.md) for the Pass 0 map.
 
 ### Historical context
 

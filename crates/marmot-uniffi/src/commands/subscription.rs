@@ -15,7 +15,8 @@ use crate::subscriptions::{
 };
 use crate::{Marmot, optional_group_id_hex};
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     // -----------------------------------------------------------------------
     // Subscriptions

@@ -6,7 +6,8 @@ use crate::conversions::{
 use crate::errors::MarmotKitError;
 use crate::{Marmot, conversions};
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     /// Hostnames the relay plane will never dial or adopt.
     pub fn retired_relay_hosts(&self) -> Vec<String> {

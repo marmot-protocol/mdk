@@ -135,6 +135,7 @@ still land on the same epoch and group state. The engine — not relay order or 
 | | [`cgka-session`](crates/cgka-session/README.md) | Encrypted account-device session over the engine |
 | Storage | [`storage-sqlite`](crates/storage-sqlite/README.md) | SQLCipher persistence for engine, session, and simulator |
 | | [`fs-private`](crates/fs-private/README.md) | Owner-only file, directory, and socket creation |
+| | [`media-store`](crates/media-store/README.md) | Encrypted per-file media store: file format and file lifecycle |
 | Transport | [`transport-nostr-peeler`](crates/transport-nostr-peeler/README.md) | Nostr event ⇄ engine message boundary |
 | | [`transport-nostr-adapter`](crates/transport-nostr-adapter/README.md) | Relay I/O behind an injectable client |
 | | [`transport-quic-stream`](crates/transport-quic-stream/README.md) | QUIC transport for live agent text previews |
@@ -144,6 +145,7 @@ still land on the same epoch and group state. The engine — not relay order or 
 | | [`marmot-markdown`](crates/marmot-markdown/README.md) | CommonMark + Nostr display parser for messages |
 | | [`marmot-forensics`](crates/marmot-forensics/README.md) | Append-only JSONL forensic audit schema |
 | Bindings | [`marmot-uniffi`](crates/marmot-uniffi/README.md) | MarmotKit: Swift and Kotlin bindings |
+| | [`marmot-uniffi-macros`](crates/marmot-uniffi-macros/README.md) | Runs MarmotKit's async exports on its own Tokio runtime |
 | | [`marmot-c`](crates/marmot-c/README.md) | C ABI bindings |
 | Front ends | [`cli`](crates/cli/README.md) (`wn-cli`) | `wn`, `wnd`, and `wn tui` |
 | Agents | [`agent-connector`](crates/agent-connector/README.md) | The `wn-agent` connector daemon |

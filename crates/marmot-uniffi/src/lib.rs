@@ -6,8 +6,10 @@
 //!
 //! Design notes:
 //! - One process-wide [`Marmot`] handle owns the [`MarmotApp`] + runtime pair.
-//! - All async methods rely on UniFFI's tokio integration (the global tokio
-//!   runtime is implicit via the `async_runtime = "tokio"` attribute).
+//! - Async methods run on a Tokio runtime owned by this crate, not on the host
+//!   thread that polls them: [`marmot_uniffi_macros::on_tokio_runtime`] spawns
+//!   each body through [`tokio_runtime`], and constructors enter the same
+//!   runtime so construction-time spawns land there too.
 //! - Internal Rust types that don't map cleanly across the FFI boundary are
 //!   re-exposed as FFI-friendly records (e.g. byte ids → hex strings,
 //!   variant-with-payload enums → flattened variants).
@@ -38,6 +40,7 @@ mod external_signer;
 mod markdown;
 mod publisher;
 mod secret_store;
+mod tokio_runtime;
 pub use publisher::{
     AgentTextPublisher, PublisherAckFfi, PublisherInfoFfi, PublisherOptionsFfi, PublisherRecordFfi,
     PublisherTrustFfi,
@@ -244,7 +247,8 @@ pub struct Marmot {
     pub(crate) runtime: MarmotAppRuntime,
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     /// Open with any combination of runtime options. Existing constructors are
     /// compatibility wrappers around this entry point.
@@ -444,6 +448,7 @@ impl Marmot {
     // Object-method and error-variant addition: binding regeneration and the
     // workspace version bump ride the release per this crate's lockstep
     // invariant — do not bump versions here.
+    #[marmot_uniffi_macros::survives_cancellation]
     pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError> {
         self.runtime.shutdown_and_close().await?;
         Ok(())
@@ -474,6 +479,10 @@ impl Marmot {
         config: MarmotAppConfig,
         secret_store: Option<Arc<dyn marmot_account::AccountSecretStore>>,
     ) -> Result<Arc<Self>, MarmotKitError> {
+        // Opening can spawn relay-plane tasks (`Handle::try_current` users);
+        // they belong on the runtime the exports will run on.
+        let tokio_handle = tokio_runtime::handle()?;
+        let _entered = tokio_handle.enter();
         let account_home = match secret_store {
             Some(store) => marmot_account::AccountHome::open_with_secret_store(&root_path, store),
             None => marmot_account::AccountHome::open_with_default_keychain(&root_path)

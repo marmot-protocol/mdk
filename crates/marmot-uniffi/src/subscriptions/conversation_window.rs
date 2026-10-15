@@ -85,7 +85,8 @@ impl ConversationWindowSubscription {
         }
     }
 }
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl ConversationWindowSubscription {
     /// Take once before next(). Complete replacements include every visible identity.
     pub fn snapshot(&self) -> Option<ConversationWindowSnapshotFfi> {
@@ -93,6 +94,7 @@ impl ConversationWindowSubscription {
     }
     /// One receiver; cancellation leaves pending replacements available. Worker replacement
     /// is terminal: reopen the conversation after Closed/None with a fresh generation.
+    #[marmot_uniffi_macros::receive]
     pub async fn next(&self) -> Result<Option<ConversationWindowSnapshotFfi>, MarmotKitError> {
         let mut closed = self.closed.subscribe();
         if *closed.borrow() {

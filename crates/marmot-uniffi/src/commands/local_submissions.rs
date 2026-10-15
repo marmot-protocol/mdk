@@ -30,7 +30,8 @@ pub struct MediaUploadSubmissionFfi {
     pub acceptance: Option<LocalSendAcceptanceFfi>,
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     /// Return after durable local admission, independently of relay publication.
     /// Use one opaque token per logical submission; timeline rows echo it locally.

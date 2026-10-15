@@ -1,7 +1,7 @@
 ---
 title: "Local Artifact Safety"
 created: 2026-07-02
-updated: 2026-09-28
+updated: 2026-10-15
 tags: [marmot, overview, security, filesystem, permissions]
 status: overview
 ---
@@ -80,6 +80,33 @@ host's setup request resumes that same identity and supplies the missing context
 startup cannot guess the user's relay configuration. Interrupted staging files
 remain private and are never adopted or swept during another writer's publication.
 
+## Encrypted media files
+
+Retained attachment bodies are moving out of the account database into one encrypted file each (mdk#2314), under
+`<account>/media/<shard>/<id>` next to the database. The `media-store` crate owns the files and their lifecycle. The
+account database stays the authority: each file's random key and state live in its `media_files` row, which
+`storage-sqlite` serves to the crate through its catalog trait.
+
+- **Media files take no locks.** Never use `flock`/`fcntl` on them, and never use the lock-based
+  `rename_noreplace_with_lock` publish meant for key material. Each file has a unique random name and one writer, so
+  creating, writing and syncing it need no lock. Writers serialize on the database row instead. This keeps media out of
+  the suspension rules below: a suspended process can hold no lock on a media file.
+- **Row first, then file, then commit.** A `pending` row commits before the file is exclusively created at 0600 and
+  written. The file is synced once and then one transaction marks it `ready`. There is no temporary name, rename or
+  directory sync, because the `pending` row already marks the file unfinished. A power loss that drops a new file's
+  directory entry after the `ready` commit surfaces as a *lost* row, never as wrong bytes.
+- **Plain `fsync`.** On Apple platforms media files sync with plain `fsync`, which is SQLite's own durability there,
+  not Rust's `sync_all` (`F_FULLFSYNC`). Other platforms use `fsync`.
+- **Delete the key, then the file.** Deleting the row under `secure_delete` is the real erase. The unlink that follows
+  is best effort, and the sweep removes any file whose row is gone.
+- **Terminal close covers media.** Once the account database closes, or the store's own close latch is tripped, media
+  reads (including open readers), writes and sweeps fail with `Closed`. The store joins the runtime's close path; it
+  never adds a second one.
+- **Never on async threads.** The store's API is blocking (file I/O, hashing, AEAD). Runtime callers run it on the
+  blocking pool, never inline on an account worker.
+- **Hosts exclude the account directory from backups** (iCloud and Android auto-backup). Its keys are device-bound,
+  so a restored database, salt or media directory would be unreadable anyway.
+
 ## Releasing artifacts before host suspension
 
 Creation posture is not the only thing a shared container polices. On iOS the Marmot root lives in an App Group
@@ -137,5 +164,5 @@ rules live in [`observability.md`](./observability.md).
 ## Current enforcement
 
 On-disk mode tests accompany each artifact path: `fs-private` unit tests, the daemon/connector socket tests, the
-`storage-sqlite` DB/sidecar mode tests, the `marmot-forensics` audit-file tests, and the `marmot-app`
+`storage-sqlite` DB/sidecar and media-store mode tests, the `marmot-forensics` audit-file tests, and the `marmot-app`
 device-id/key-reveal/salt/cache tests. All assert `mode & 0o777` on the real files.

@@ -1,6 +1,7 @@
 use crate::{Marmot, MarmotKitError, conversions::*};
 use std::sync::Arc;
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     /// Read at most 100 indexed account candidates; filtered empty pages can still have a continuation.
     /// Cursors are account-incarnation/query bound and must be discarded on runtime reconstruction or source mutation.

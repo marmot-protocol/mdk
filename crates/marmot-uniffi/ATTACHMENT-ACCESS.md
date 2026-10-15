@@ -18,6 +18,12 @@ reference means no readable retained bytes, including missing/in-flight/removed/
 or obsolete sources; it is **not** a download failure, progress event or request to fetch.
 An available empty file has a non-null reference and a zero byte count.
 
+Newly downloaded bodies are stored as encrypted files in the account directory's `media/`
+folder, with their keys in the account database (mdk#2314); older bodies stay in the
+database until a later migration. Reads behave the same for both. Exclude the account
+directory, including `media/`, from iCloud and Android auto-backup: its keys are
+device-bound, so a restored copy could not be read anyway.
+
 The call loads no payload bytes and starts no download or engine worker. Automatic
 acquisition defaults on in `NativeAutomatic` mode when the account runtime is running.
 `HostManaged` starts denied until the host grants permission. Use the C8-D2 controls below

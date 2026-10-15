@@ -41,6 +41,7 @@ on:
       - crates/marmot-app/**
       - crates/marmot-forensics/**
       - crates/marmot-markdown/**
+      - crates/media-store/**
       - crates/storage-sqlite/**
       - crates/traits/**
       - crates/transport-nostr-adapter/**

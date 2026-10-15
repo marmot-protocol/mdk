@@ -11,8 +11,11 @@ UniFFI bindings (MarmotKit) for the Marmot app runtime. For integration concepts
 - `src/subscriptions.rs`, `src/subscriptions/`: subscription objects and screen-window handles.
 - `src/markdown.rs` (Markdown display DTOs), `src/publisher.rs` (agent publisher handle), `src/secret_store.rs` and
   `src/external_signer.rs` (host callback traits), `src/bin/uniffi-bindgen.rs` (binding generator).
+- `src/tokio_runtime.rs`: MarmotKit's process-wide multi-thread Tokio runtime and `spawn_export`, which every async
+  export runs through (see `crates/marmot-uniffi-macros`).
 - `kotlin-support/`: hand-written `MarmotAndroid` and keyring JNI shim copied next to generated Kotlin.
-- `tests/`: Rust smoke tests plus the Swift/Kotlin sources driven by the `*-smoke.sh` scripts.
+- `tests/`: Rust smoke tests plus the Swift/Kotlin sources driven by the `*-smoke.sh` scripts;
+  `tests/runtime_threads.rs` drives exports the way the scaffolding does and checks which threads run MDK work.
 
 Expose `marmot-app` behavior through bindings, following [MDK's host boundary](../../docs/marmot-architecture/overview/app-core-boundary.md#host-app-boundary).
 
@@ -47,6 +50,13 @@ Expose `marmot-app` behavior through bindings, following [MDK's host boundary](.
 ## Invariants
 
 - The Rust API in `src/` is the source of truth for both Swift and Kotlin — scripts package, they do not fork types.
+- Export async methods with `#[marmot_uniffi_macros::on_tokio_runtime]` directly above `#[uniffi::export]`, never
+  with `async_runtime = "tokio"`: UniFFI's `async_compat` fallback runs every MDK task on one thread and part of each
+  call on the host's thread. Mark subscription receives (`next`, `next_update`) `#[marmot_uniffi_macros::receive]`
+  so a cancelled wait never consumes an update, and work that must outlive a cancelled call
+  `#[marmot_uniffi_macros::survives_cancellation]`. Constructors enter `tokio_runtime::handle()` so
+  construction-time spawns land on the same runtime. Keep the worker count small (`tokio_runtime::worker_threads`) and workers abortable `tokio::spawn`
+  tasks; see README.md#threading-model.
 - Android consumers must call `MarmotAndroid.initialize(context)` before constructing `Marmot` (Keystore JNI via
   `ndk-context`).
 - Android `arm64-v8a` and `x86_64` JNI libraries are linked with 16 KB ELF load alignment

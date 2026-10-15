@@ -52,12 +52,14 @@ impl ChatsSubscription {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl ChatsSubscription {
     pub fn snapshot(&self) -> Vec<AppGroupRecordFfi> {
         take_snapshot(&self.snapshot).unwrap_or_default()
     }
 
+    #[marmot_uniffi_macros::receive]
     pub async fn next(&self) -> Option<AppGroupRecordFfi> {
         let mut inner = self.inner.lock().await;
         inner.recv().await.map(Into::into)
@@ -91,7 +93,8 @@ impl ChatListSubscription {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl ChatListSubscription {
     pub fn snapshot(&self) -> Vec<ChatListRowFfi> {
         take_snapshot(&self.snapshot).unwrap_or_default()
@@ -107,6 +110,7 @@ impl ChatListSubscription {
     ///
     /// `next` and `next_update` consume the same stream and must not be mixed
     /// for the lifetime of one subscription.
+    #[marmot_uniffi_macros::receive]
     pub async fn next(&self) -> Option<ChatListRowFfi> {
         let mut state = self.state.lock().await;
         if let Some(row) = state.pending_rows.pop_front() {
@@ -131,6 +135,7 @@ impl ChatListSubscription {
     /// Do not mix this with `next` on the same subscription: both consume the
     /// same underlying stream, while `next` may also hold flattened snapshot
     /// rows in its compatibility buffer.
+    #[marmot_uniffi_macros::receive]
     pub async fn next_update(&self) -> Option<ChatListSubscriptionUpdateFfi> {
         let mut state = self.state.lock().await;
         state.inner.recv().await.map(Into::into)
@@ -156,12 +161,14 @@ impl MessagesSubscription {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl MessagesSubscription {
     pub fn snapshot(&self) -> Vec<AppMessageRecordFfi> {
         take_snapshot(&self.snapshot).unwrap_or_default()
     }
 
+    #[marmot_uniffi_macros::receive]
     pub async fn next(&self) -> Option<MessageUpdateFfi> {
         let mut inner = self.inner.lock().await;
         inner.recv().await.map(Into::into)
@@ -250,7 +257,8 @@ impl TimelineMessagesSubscription {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl TimelineMessagesSubscription {
     pub fn snapshot(&self) -> Option<TimelinePageFfi> {
         take_snapshot(&self.snapshot)
@@ -261,6 +269,7 @@ impl TimelineMessagesSubscription {
     /// cap) is owned by the runtime, so this returns exactly the bounded window
     /// pagination operates on — render it directly. Use
     /// [`next_update`](Self::next_update) instead to receive the raw delta.
+    #[marmot_uniffi_macros::receive]
     pub async fn next(&self) -> Option<TimelinePageFfi> {
         let mut receiver = self.receiver.lock().await;
         receiver.recv().await?;
@@ -270,6 +279,7 @@ impl TimelineMessagesSubscription {
         ))
     }
 
+    #[marmot_uniffi_macros::receive]
     pub async fn next_update(&self) -> Option<TimelineSubscriptionUpdateFfi> {
         let mut receiver = self.receiver.lock().await;
         receiver.recv().await.map(Into::into)
@@ -314,12 +324,14 @@ impl GroupStateSubscription {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl GroupStateSubscription {
     pub fn snapshot(&self) -> Option<AppGroupRecordFfi> {
         take_snapshot(&self.snapshot)
     }
 
+    #[marmot_uniffi_macros::receive]
     pub async fn next(&self) -> Option<AppGroupRecordFfi> {
         let mut inner = self.inner.lock().await;
         inner.recv().await.map(Into::into)
@@ -343,8 +355,10 @@ impl EventsSubscription {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl EventsSubscription {
+    #[marmot_uniffi_macros::receive]
     pub async fn next(&self) -> Option<MarmotEventFfi> {
         let mut inner = self.inner.lock().await;
         inner.recv().await.map(Into::into)
@@ -364,8 +378,10 @@ impl NotificationsSubscription {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl NotificationsSubscription {
+    #[marmot_uniffi_macros::receive]
     pub async fn next(&self) -> Option<NotificationUpdateFfi> {
         let mut inner = self.inner.lock().await;
         inner.recv().await.map(Into::into)
@@ -417,26 +433,30 @@ impl UserSearchSubscription {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl UserSearchSubscription {
     /// Await the next step of the search, or `None` once it is over.
     ///
     /// `None` follows the `SearchCompleted` trigger, so a host can loop until
     /// either signal. Dropping this object stops the traversal at its next
     /// checkpoint.
+    #[marmot_uniffi_macros::receive]
     pub async fn next_update(&self) -> Option<UserSearchUpdateFfi> {
         let mut inner = self.inner.lock().await;
         inner.next_update().await.map(Into::into)
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl AgentStreamSubscription {
     /// The resolved stream id this watch is following (hex).
     pub fn stream_id_hex(&self) -> String {
         self.stream_id_hex.clone()
     }
 
+    #[marmot_uniffi_macros::receive]
     pub async fn next(&self) -> Option<AgentStreamUpdateFfi> {
         let mut inner = self.inner.lock().await;
         inner.recv().await.map(Into::into)
@@ -467,12 +487,14 @@ impl PresentedChatListSubscription {
         })
     }
 }
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl PresentedChatListSubscription {
     /// Take the initial snapshot once, with generation and sequence zero.
     pub fn snapshot(&self) -> Option<crate::conversions::PresentedChatListUpdateFfi> {
         take_snapshot(&self.snapshot)
     }
+    #[marmot_uniffi_macros::receive]
     pub async fn next(
         &self,
     ) -> Result<Option<crate::conversions::PresentedChatListUpdateFfi>, MarmotKitError> {

@@ -54,7 +54,8 @@ impl Marmot {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     /// Look up the reusable existing direct conversation with `peer_account_id`.
     ///

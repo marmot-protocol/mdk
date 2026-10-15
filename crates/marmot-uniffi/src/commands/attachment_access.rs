@@ -4,7 +4,8 @@ use crate::conversions::{
 use crate::{Marmot, MarmotKitError};
 use marmot_app::{AppError, AttachmentAssetRef, MAX_ATTACHMENT_ASSET_LOOKUPS};
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     /// Local-only metadata for up to 64 original source slots in one group.
     /// Results preserve input order/duplicates. No bytes are loaded, jobs queued,

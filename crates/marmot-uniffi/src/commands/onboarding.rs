@@ -13,16 +13,19 @@ pub struct OnboardingSubscription {
     snapshot: OnboardingSnapshotFfi,
     inner: Mutex<marmot_app::OnboardingSubscription>,
 }
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl OnboardingSubscription {
     pub fn snapshot(&self) -> OnboardingSnapshotFfi {
         self.snapshot.clone()
     }
+    #[marmot_uniffi_macros::receive]
     pub async fn next(&self) -> Option<OnboardingSnapshotFfi> {
         self.inner.lock().await.recv().await.map(Into::into)
     }
 }
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     /// Whether an unreadable or exhausted checkpoint needs explicit recovery.
     pub fn onboarding_recovery_required(

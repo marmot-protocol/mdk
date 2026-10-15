@@ -2,7 +2,7 @@
 use super::*;
 
 /// Direct sends and Android's durable token route must both retain exact bytes.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn genuine_outgoing_upload_is_local_after_confirmed_send_and_restart() {
     for token_send in [false, true] {
         let dir = tempfile::tempdir().unwrap();

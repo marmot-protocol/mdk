@@ -18,6 +18,21 @@
   publication reserve for the body. Update exhaustive matches; the job keeps
   its checkpoint and readmits once space frees or on explicit Retry.
 
+### Changed
+
+- Downloaded attachment bodies are retained as encrypted files in the account's
+  `media/` directory (the `media-store` crate) instead of SQLCipher rows
+  (mdk#2314). Identical content is stored once and attached without downloading
+  again. `read_attachment_asset` reads either layout unchanged; existing bodies
+  stay in the database until a later migration.
+- The retained-byte budget (`retained_bytes_per_account`) no longer gates
+  downloads, so a full budget cannot leave downloads waiting in `RetryScheduled`.
+  Free disk is the only limit: a full disk parks the job as `StorageBlocked`.
+- Publication, hashing and encryption of downloaded bodies run on the blocking
+  pool for in-memory bodies too, never on the account worker.
+- Hosts must exclude the account directory, including `media/`, from cloud and
+  device backups.
+
 ### Added
 
 - `MarmotAppRuntime::cached_public_event_previews` and `resolve_public_event_preview` keep verified public Nostr events referenced from message content in the account's directory cache (mdk#1547). The cache adds directory-cache migration 2; an older build refuses the upgraded cache. `AppError` adds `InvalidPublicEventReferences` for batches over 16 references.

@@ -1,16 +1,21 @@
-//! Durable automatic acquisition. Parsing/admission and publication run under
-//! the account worker; HTTP/crypto use the existing cancellable media executor.
+//! Durable automatic acquisition. Parsing and admission run under the
+//! account worker; HTTP/crypto use the existing cancellable media executor.
+//! Bodies are retained in the account's encrypted media store (mdk#2314),
+//! whose blocking file I/O, hashing and AEAD always run on the blocking pool.
 use super::*;
+use crate::AccountMediaStore;
 use crate::media::AttachmentDownloadFailure;
+use media_store::{Category, MediaError};
 use storage_sqlite::{
-    ATTACHMENT_ACQUISITION_BATCH_LIMIT, AttachmentAcquisition, AttachmentPublishResult,
-    SqliteAccountStorage,
+    ATTACHMENT_ACQUISITION_BATCH_LIMIT, AttachmentAcquisition, SqliteAccountStorage,
 };
 
 const DEMAND_BATCH: usize = 32;
 // Background HTTP has a two-minute whole-transfer deadline. Leave publication margin.
 const LEASE_SECONDS: u64 = 3 * 60;
 const EXPLICIT_LEASE_SECONDS: u64 = 20 * 60;
+/// Rows, then file names, per media sweep batch.
+const MEDIA_SWEEP_BATCH: usize = 256;
 
 type PermitWait = std::pin::Pin<
     Box<
@@ -26,6 +31,33 @@ pub(super) struct Admission {
     resumed: bool,
     waiting: Option<PermitWait>,
     permit: Option<OwnedSemaphorePermit>,
+    /// The media sweep running on the blocking pool, if any.
+    media_sweep: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Starts a media sweep on the blocking pool unless one is still running:
+/// to completion when the worker takes ownership, otherwise one batch.
+fn spawn_media_sweep(admission: &mut Admission, media: AccountMediaStore, until_complete: bool) {
+    if admission
+        .media_sweep
+        .as_ref()
+        .is_some_and(|task| !task.is_finished())
+    {
+        return;
+    }
+    admission.media_sweep = Some(tokio::task::spawn_blocking(move || {
+        loop {
+            match media.sweep(MEDIA_SWEEP_BATCH) {
+                Ok(report) if until_complete && !report.complete => {}
+                Ok(_) => break,
+                Err(_) => {
+                    tracing::warn!(target: "marmot_app::runtime", method = "media_sweep",
+                        "media store sweep deferred");
+                    break;
+                }
+            }
+        }
+    }));
 }
 impl Admission {
     pub(super) fn is_waiting(&self) -> bool {
@@ -182,6 +214,22 @@ pub(super) fn schedule(
         crate::media::file_transfer::sweep_stale_media_staging(
             &crate::media::file_transfer::media_staging_directory(&client.app, &client.state.label),
         );
+        // Reclaim whatever a crash left in the media store before new work.
+        spawn_media_sweep(
+            admission,
+            client
+                .app
+                .account_media_store(&client.state.label, &storage)?,
+            true,
+        );
+    } else {
+        spawn_media_sweep(
+            admission,
+            client
+                .app
+                .account_media_store(&client.state.label, &storage)?,
+            false,
+        );
     }
     let expired = storage.prune_expired_attachment_acquisitions(now, 64)?;
     let host_managed = client.app.config.attachment_acquisition_mode
@@ -289,6 +337,62 @@ pub(super) fn schedule(
         } else {
             None
         };
+        let lease_until = now.saturating_add(if explicit {
+            EXPLICIT_LEASE_SECONDS
+        } else {
+            LEASE_SECONDS
+        });
+        // Content another slot already retains needs no download: attach it
+        // before the download-only gates (disk headroom for a new body,
+        // source-key preparation) can defer or fail this job. The database
+        // records the twin; the blocking task confirms its file is on disk.
+        if storage.attachment_media_twin_recorded(&candidate)? {
+            if permission.as_ref().is_some_and(|p| !p.allowed()) {
+                continue;
+            }
+            if host_managed && !explicit {
+                storage.enable_attachment_automatic_history(&candidate)?;
+            }
+            let Some(job) = storage.claim_attachment_acquisition(&candidate, now, lease_until)?
+            else {
+                continue;
+            };
+            let media = client
+                .app
+                .account_media_store(&client.state.label, &storage)?;
+            let storage = storage.clone();
+            let updates = shared.attachment_updates.clone();
+            updates.send_modify(|_| {});
+            spawn_media_http(
+                http,
+                permit,
+                async move {
+                    let attached = {
+                        let job = job.clone();
+                        tokio::task::spawn_blocking(move || {
+                            attach_existing_body(&media, &storage, &job)
+                        })
+                    };
+                    let result = if attached.await.unwrap_or(false) {
+                        Ok(crate::client::AcquiredMediaBody::Retained)
+                    } else {
+                        // The recorded file was gone and is now marked lost:
+                        // retry through the ordinary download path.
+                        Err(AttachmentDownloadFailure::Retry(AppError::BlobStore(
+                            "retained attachment copy unavailable".to_owned(),
+                        )))
+                    };
+                    updates.send_modify(|_| {});
+                    MediaHttpCompletion::Attachment {
+                        job,
+                        result,
+                        background_permit,
+                    }
+                },
+                |completion| completion,
+            );
+            return Ok(more);
+        }
         // References do not declare a trustworthy size. Reserve the configured
         // automatic-sized object even for explicit work, then enforce actual
         // checkpoint/publication capacity as the transfer grows.
@@ -297,16 +401,8 @@ pub(super) fn schedule(
             storage.finish_attachment_preparation(&candidate, now, Some(now.saturating_add(15)))?;
             continue;
         }
-        if !storage.attachment_acquisition_fits_budget(
-            &candidate,
-            reservation,
-            policy.retained_bytes,
-        )? {
-            // Defer without spending an attempt. This also lets reserved prefixes
-            // beyond the bounded candidate page reach the worker under pressure.
-            storage.finish_attachment_preparation(&candidate, now, Some(now.saturating_add(15)))?;
-            continue;
-        }
+        // Free disk is the only gate (mdk#2314): retained media has no byte
+        // budget, so a full budget can no longer stall downloads.
         let group = match hex::decode(&source.group_id_hex) {
             Ok(bytes) => GroupId::new(bytes),
             Err(_) => {
@@ -357,25 +453,19 @@ pub(super) fn schedule(
         if host_managed && !explicit {
             storage.enable_attachment_automatic_history(&candidate)?;
         }
-        let Some(job) = storage.claim_attachment_acquisition(
-            &candidate,
-            now,
-            now.saturating_add(if explicit {
-                EXPLICIT_LEASE_SECONDS
-            } else {
-                LEASE_SECONDS
-            }),
-        )?
-        else {
+        let Some(job) = storage.claim_attachment_acquisition(&candidate, now, lease_until)? else {
             continue;
         };
-        let byte_budget = policy.retained_bytes;
+        let media = client
+            .app
+            .account_media_store(&client.state.label, &storage)?;
         let resume = crate::media::attachment_resume::AttachmentResume {
             explicit_permission: Default::default(),
             storage: storage.clone(),
             job: job.clone(),
             ciphertext_digest,
-            budget: byte_budget,
+            // Checkpoints have no retained-byte budget; free disk gates them.
+            budget: u64::MAX,
             directory: client.app.account_dir(&client.state.label),
             policy: policy.clone(),
             automatic: !explicit,
@@ -396,13 +486,23 @@ pub(super) fn schedule(
             permit,
             async move {
                 let finishing = resume.finishing.clone();
-                let result =
-                    finish_or_cancel(prepared.run_acquisition(resume), cancel, finishing).await;
+                // Identical content already in the store is attached without
+                // downloading; the check runs on the blocking pool.
+                let reuse = {
+                    let (media, storage, job) = (media, storage.clone(), job.clone());
+                    tokio::task::spawn_blocking(move || {
+                        attach_existing_body(&media, &storage, &job)
+                    })
+                };
+                let result = if reuse.await.unwrap_or(false) {
+                    Ok(crate::client::AcquiredMediaBody::Retained)
+                } else {
+                    finish_or_cancel(prepared.run_acquisition(resume), cancel, finishing).await
+                };
                 updates.send_modify(|_| {});
                 MediaHttpCompletion::Attachment {
                     job,
                     result,
-                    byte_budget,
                     background_permit,
                 }
             },
@@ -438,34 +538,60 @@ where
     }
 }
 
+/// Whether `job` was completed from a ready media file with the same content
+/// (or no longer needs a body). Blocking.
+fn attach_existing_body(
+    media: &AccountMediaStore,
+    storage: &SqliteAccountStorage,
+    job: &AttachmentAcquisition,
+) -> bool {
+    let Ok(digest) = job.plaintext_digest() else {
+        return false;
+    };
+    let clock = crate::unix_now_seconds;
+    matches!(
+        media.attach_existing(
+            &storage.attachment_publication(job, &clock),
+            Category::Retained,
+            &digest,
+        ),
+        Ok(Some(_))
+    )
+}
+
+/// Finishes a job inline. Blocking when it carries a body: production only
+/// calls it with failures and runs bodies through `complete_acquired_stored`
+/// on the blocking pool.
 pub(super) fn complete_acquired(
     client: &AppClient,
     job: &AttachmentAcquisition,
     result: Result<crate::client::AcquiredMediaBody, AttachmentDownloadFailure>,
-    byte_budget: u64,
 ) -> Result<(), AppError> {
     let storage = client.app.account_storage(&client.state.label)?;
+    let media = client
+        .app
+        .account_media_store(&client.state.label, &storage)?;
     let fallback = super::super::attachment_controls::default_policy(&client.app.config);
     complete_acquired_stored(
         &storage,
+        &media,
         &fallback,
         &client.app.account_dir(&client.state.label),
         job,
         result,
-        byte_budget,
         &|| false,
     )
 }
 
-/// Headroom a job records when the database reports it is full while
-/// publishing a `plaintext`-byte body. The disk itself is the likely cause, so
-/// the target is the publication reserve a retried attempt needs in the
-/// worker's frame (`multiple` bodies), but never less than the free space
-/// measured at the refusal plus one more body: readmission then waits until
-/// the volume has actually gained room, rather than refetching into the same
-/// full database whenever free space looked sufficient. `held` is staging this
-/// attempt still occupies at the measurement, which the worker frame does not.
-fn full_database_headroom(
+/// Headroom a job records when the disk filled while publishing a
+/// `plaintext`-byte body. The target is the publication reserve a retried
+/// attempt needs in the worker's frame (`multiple` bodies), but never less
+/// than the free space measured at the refusal plus one more body:
+/// readmission then waits until the volume has actually gained room, rather
+/// than refetching onto the same full disk whenever free space looked
+/// sufficient. `held` is staging this attempt still occupies at the
+/// measurement, which the worker frame does not.
+fn full_disk_headroom(
     directory: &std::path::Path,
     policy: &storage_sqlite::AttachmentDownloadPolicy,
     plaintext: u64,
@@ -483,85 +609,94 @@ fn full_database_headroom(
     }
 }
 
+/// Publishes a downloaded body into the media store and records the job's
+/// outcome. Blocking: run it on the blocking pool.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn complete_acquired_stored(
     storage: &SqliteAccountStorage,
+    media: &AccountMediaStore,
     fallback: &storage_sqlite::AttachmentDownloadPolicy,
     directory: &std::path::Path,
     job: &AttachmentAcquisition,
     result: Result<crate::client::AcquiredMediaBody, AttachmentDownloadFailure>,
-    byte_budget: u64,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<(), AppError> {
     let now = crate::unix_now_seconds();
-    match result {
-        Ok(crate::client::AcquiredMediaBody::File(file)) => {
-            let policy = storage.attachment_download_policy(fallback)?;
-            let mut reader = file.reader()?;
-            match storage.complete_attachment_acquisition_from_reader_with_clock(
-                job,
-                &mut reader,
-                file.len,
-                &crate::unix_now_seconds,
-                byte_budget.min(policy.retained_bytes),
-                cancelled,
-            ) {
-                Ok(AttachmentPublishResult::Published | AttachmentPublishResult::Superseded) => {}
-                Err(cgka_traits::StorageError::InvalidAttachmentBody(_)) => {
-                    storage.fail_attachment_acquisition(job, None)?;
-                }
-                // The database itself ran out of room: park, never retry on a
-                // timer. A retried file attempt stages the body again before
-                // publishing it, so it needs five bodies; the decrypted file
-                // this attempt still holds is released before the worker looks.
-                Err(cgka_traits::StorageError::Capacity(_)) => {
-                    let headroom =
-                        full_database_headroom(directory, &policy, file.len, 5, file.len);
-                    storage.block_attachment_storage(job, headroom, now)?;
-                }
-                _ => {
-                    storage.fail_attachment_acquisition(job, Some(retry_at(storage, job, now)))?;
-                }
-            }
-        }
-        Ok(crate::client::AcquiredMediaBody::Memory(result)) => {
-            let plaintext = zeroize::Zeroizing::new(result.plaintext);
-            if job.verify_plaintext(&plaintext).is_err() {
-                storage.fail_attachment_acquisition(job, None)?;
-                return Ok(());
-            }
-            let policy = storage.attachment_download_policy(fallback)?;
-            let byte_budget = byte_budget.min(policy.retained_bytes);
-            match storage.complete_attachment_acquisition(job, &plaintext, now, byte_budget) {
-                Ok(AttachmentPublishResult::Published | AttachmentPublishResult::Superseded) => {}
-                // A full database parks like a failed free-space check would;
-                // the in-memory sink holds no staging on disk.
-                Err(cgka_traits::StorageError::Capacity(_)) => {
-                    let headroom =
-                        full_database_headroom(directory, &policy, plaintext.len() as u64, 4, 0);
-                    storage.block_attachment_storage(job, headroom, now)?;
-                }
-                Ok(AttachmentPublishResult::CapacityBlocked) | Err(_) => {
-                    storage.fail_attachment_acquisition(job, Some(retry_at(storage, job, now)))?;
-                }
-            }
-        }
+    let body = match result {
+        Ok(crate::client::AcquiredMediaBody::Retained) => return Ok(()),
+        Ok(body) => body,
         Err(AttachmentDownloadFailure::Retry(_)) => {
             storage.fail_attachment_acquisition(job, Some(retry_at(storage, job, now)))?;
+            return Ok(());
         }
         Err(AttachmentDownloadFailure::SizeLimit(_, limit)) => {
             storage.block_attachment_size_policy(job, limit, now)?;
+            return Ok(());
         }
         // Disk, not the network, is the blocker: park with the checkpoint until
         // free space covers the reserve or the user retries, never on a timer.
         Err(AttachmentDownloadFailure::StorageBlocked { headroom }) => {
             storage.block_attachment_storage(job, headroom, now)?;
+            return Ok(());
         }
-        Err(AttachmentDownloadFailure::Stop(_)) => {
+        Err(AttachmentDownloadFailure::Stop(_) | AttachmentDownloadFailure::FileRequired) => {
+            storage.fail_attachment_acquisition(job, None)?;
+            return Ok(());
+        }
+    };
+    let policy = storage.attachment_download_policy(fallback)?;
+    let digest = job.plaintext_digest()?;
+    let clock = crate::unix_now_seconds;
+    let target = storage.attachment_publication(job, &clock);
+    // A retried file attempt stages the body again before publishing it, so it
+    // needs five bodies; the in-memory sink holds no staging on disk. The
+    // decrypted file stays held until the headroom is measured below.
+    let (published, len, multiple, held, _staged) = match body {
+        crate::client::AcquiredMediaBody::File(file) => {
+            let mut reader = file.reader()?;
+            let published = media.publish(
+                &target,
+                Category::Retained,
+                &mut reader,
+                file.len,
+                digest,
+                now,
+                cancelled,
+            );
+            let len = file.len;
+            (published, len, 5, len, Some(file))
+        }
+        crate::client::AcquiredMediaBody::Memory(result) => {
+            let plaintext = zeroize::Zeroizing::new(result.plaintext);
+            let len = plaintext.len() as u64;
+            let published = media.publish(
+                &target,
+                Category::Retained,
+                &mut std::io::Cursor::new(&plaintext[..]),
+                len,
+                digest,
+                now,
+                cancelled,
+            );
+            (published, len, 4, 0, None)
+        }
+        crate::client::AcquiredMediaBody::Retained => return Ok(()),
+    };
+    match published {
+        // Published, reused or superseded: the store and the job agree.
+        Ok(_) => {}
+        Err(MediaError::InvalidBody(_)) => {
             storage.fail_attachment_acquisition(job, None)?;
         }
-        Err(AttachmentDownloadFailure::FileRequired) => {
-            storage.fail_attachment_acquisition(job, None)?;
+        // The disk (or database) is full: park, never retry on a timer.
+        Err(MediaError::Capacity) => {
+            let headroom = full_disk_headroom(directory, &policy, len, multiple, held);
+            storage.block_attachment_storage(job, headroom, now)?;
+        }
+        // Shutting down: the durable lease lets the next worker resume it.
+        Err(MediaError::Closed) => {}
+        Err(_) => {
+            storage.fail_attachment_acquisition(job, Some(retry_at(storage, job, now)))?;
         }
     }
     Ok(())
@@ -572,13 +707,11 @@ fn complete(
     client: &AppClient,
     job: &AttachmentAcquisition,
     result: Result<MediaDownloadResult, AttachmentDownloadFailure>,
-    byte_budget: u64,
 ) -> Result<(), AppError> {
     complete_acquired(
         client,
         job,
         result.map(crate::client::AcquiredMediaBody::Memory),
-        byte_budget,
     )
 }
 

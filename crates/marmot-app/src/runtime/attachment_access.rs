@@ -71,10 +71,30 @@ impl MarmotAppRuntime {
                 "invalid attachment byte range".into(),
             ));
         }
-        self.attachment_read(account_ref, move |storage, _| {
-            storage
-                .read_retained_attachment(&reference, crate::unix_now_seconds(), offset, limit)
-                .map_err(Into::into)
+        self.attachment_read_with(account_ref, move |app, label, storage, _| {
+            // The database authorizes the read and locates the body; a media
+            // file body is then read through the store on this blocking thread.
+            match storage.retained_attachment_read(
+                &reference,
+                crate::unix_now_seconds(),
+                offset,
+                limit,
+            )? {
+                None => Ok(None),
+                Some(storage_sqlite::RetainedAttachmentRead::Bytes(bytes)) => Ok(Some(bytes)),
+                Some(storage_sqlite::RetainedAttachmentRead::MediaFile(id)) => {
+                    let media = app.account_media_store(label, &storage)?;
+                    let mut bytes = Zeroizing::new(vec![0; limit]);
+                    let Some(read) = media
+                        .read_at(&id, offset, &mut bytes)
+                        .map_err(storage_sqlite::media_storage_error)?
+                    else {
+                        return Ok(None);
+                    };
+                    bytes.truncate(read);
+                    Ok(Some(bytes))
+                }
+            }
         })
         .await
     }

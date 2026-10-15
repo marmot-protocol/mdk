@@ -168,19 +168,26 @@ impl TransportPeeler for UnreadablePeeler {
     }
 }
 
+// The historical apply is one transaction (a savepoint, mdk#2326), so a kill
+// before it commits strands no pre-apply snapshot: the reopened database is
+// already the pre-apply state.
 #[test]
 fn h5_kill_before_historical_apply_commit_preserves_live_inputs() {
-    run_parent_case(H5_POINT, EpochId(2), "openmls-apply-");
+    run_parent_case(H5_POINT, EpochId(2), None);
 }
 
 #[test]
 fn h6_kill_after_retained_anchor_rewind_recovers_live_snapshot() {
-    run_parent_case(H6_POINT, EpochId(1), "openmls-retained-probe-");
+    run_parent_case(H6_POINT, EpochId(1), Some("openmls-retained-probe-"));
 }
 
 #[test]
 fn candidate_branch_kill_after_rewind_recovers_live_state_and_work_rows() {
-    run_parent_case(CANDIDATE_BRANCH_POINT, EpochId(1), "openmls-branch-probe-");
+    run_parent_case(
+        CANDIDATE_BRANCH_POINT,
+        EpochId(1),
+        Some("openmls-branch-probe-"),
+    );
 }
 
 // The deferred-peel sweep rewinds live state onto a retained anchor once per
@@ -190,7 +197,7 @@ fn candidate_branch_kill_after_rewind_recovers_live_state_and_work_rows() {
 // tip instead of accepting the rollback as its own.
 #[test]
 fn past_peel_kill_after_rewind_recovers_the_committed_tip() {
-    run_parent_case(PAST_PEEL_POINT, EpochId(1), "peel-restore-");
+    run_parent_case(PAST_PEEL_POINT, EpochId(1), Some("peel-restore-"));
 }
 
 #[test]
@@ -389,7 +396,9 @@ impl CrashChild {
     }
 }
 
-fn run_parent_case(point: &str, stranded_epoch: EpochId, snapshot_prefix: &str) {
+/// `stranded_snapshot` is the prefix of the snapshot the kill must strand for
+/// hydration to restore, or `None` when the kill must strand none.
+fn run_parent_case(point: &str, stranded_epoch: EpochId, stranded_snapshot: Option<&str>) {
     let dir = tempfile::tempdir().expect("parent temp directory");
     let database = dir.path().join("carol.sqlite3");
     let stderr = spawn_crash_child(&database, point, &[]).kill_when_ready();
@@ -419,13 +428,15 @@ fn run_parent_case(point: &str, stranded_epoch: EpochId, snapshot_prefix: &str) 
             "retained-anchor crash must expose the historical membership before hydration"
         );
     }
-    assert!(
+    let snapshot_prefix = stranded_snapshot.unwrap_or("openmls-apply-");
+    assert_eq!(
         storage
             .list_group_snapshots(&group_id)
             .expect("list stranded snapshots")
             .iter()
             .any(|name| name.starts_with(snapshot_prefix)),
-        "expected stranded snapshot prefix {snapshot_prefix}"
+        stranded_snapshot.is_some(),
+        "stranded snapshot with prefix {snapshot_prefix}"
     );
     if matches!(point, H5_POINT | CANDIDATE_BRANCH_POINT | PAST_PEEL_POINT) {
         assert_eq!(

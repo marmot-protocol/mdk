@@ -10,6 +10,8 @@ description = "SQLite storage backend for the CGKA engine with Marmot and OpenML
 cgka-traits.workspace = true
 fs-private.workspace = true
 hex.workspace = true
+libc = { workspace = true, optional = true }
+media-store.workspace = true
 openmls.workspace = true
 openmls_traits.workspace = true
 rmp-serde = "1.3.1"
@@ -22,12 +24,17 @@ tracing.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+media-store = { workspace = true, features = ["catalog-conformance"] }
 tempfile.workspace = true
 tracing-subscriber.workspace = true
 
 [features]
 extensions-draft = ["openmls_traits/extensions-draft"]
 storage-format-benchmarks = []
+# Media file store benchmark (mdk#2314 step 0): `media_store_bench` (the
+# `media-store` format against the SQLCipher retained-attachment path) and the
+# `media_store_bench` example, run on desktop and on devices.
+media-store-benchmarks = ["dep:libc"]
 test-conformance-replay = []
 # Copy in-memory test databases from one migrated template per process.
 test-migrated-template = ["rusqlite/backup"]
@@ -38,3 +45,7 @@ test-migrated-template = ["rusqlite/backup"]
 # artifact recipes build single packages without dev-dependencies, so it is
 # never compiled into them.
 test-support = []
+
+[[example]]
+name = "media_store_bench"
+required-features = ["media-store-benchmarks"]

@@ -43,7 +43,8 @@ pub struct AgentTextPublisher {
     inner: Arc<marmot_app::AgentPublisher>,
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     /// Publish a new stream start and return a handle for appending records.
     /// No exporter secret or framing state crosses the foreign boundary.
@@ -79,7 +80,8 @@ impl Marmot {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl AgentTextPublisher {
     pub fn info(&self) -> PublisherInfoFfi {
         PublisherInfoFfi {

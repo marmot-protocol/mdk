@@ -581,6 +581,9 @@ pub(crate) struct EncryptedMediaDownloadHttp {
 pub(crate) enum AcquiredMediaBody {
     Memory(MediaDownloadResult),
     File(crate::media::file_transfer::PrivateMediaFile),
+    /// Completed without a body: identical content was already retained in
+    /// the media store, or the job no longer needed one.
+    Retained,
 }
 
 impl EncryptedMediaDownloadHttp {
@@ -868,6 +871,10 @@ pub struct AppClient {
     pub(crate) pending_applied_sync_summary: crate::SyncSummary,
     /// Committed batches retained until every app projection write succeeds.
     pub(super) pending_applied_effects: std::collections::VecDeque<sync::PendingAppliedEffects>,
+    /// Consecutive failures of the head retained batch. The worker stops
+    /// reading deliveries while any batch is retained, so this is how long
+    /// the account's receives have been held.
+    pub(super) retained_projection_failures: u32,
     /// Publication wake ownership through source finalization and durable fanout cleanup.
     pub(super) pending_resumed_message_notifications:
         HashMap<(GroupId, String), sync::PendingMessageNotification>,
@@ -958,6 +965,13 @@ pub struct AppClient {
     /// app projection.
     #[cfg(test)]
     pub(crate) force_event_group_projection_unavailable: bool,
+    /// Unit-test fault injection that reads a quarantined group's components
+    /// strictly, standing in for a path that misses `skips_quarantined_group_reads`.
+    #[cfg(test)]
+    pub(crate) strict_quarantined_group_reads: bool,
+    /// Unit-test fault injection that fails every drained-batch checkpoint.
+    #[cfg(test)]
+    pub(crate) fail_drained_effect_checkpoints: bool,
     /// Welcomes queued for re-delivery during the most recent create/invite.
     /// The runtime account worker drains this after the command and broadcasts a
     /// `WelcomeDeliveryPending` event so callers learn a member is unjoinable
@@ -1201,6 +1215,16 @@ pub(crate) fn group_is_terminal(runtime: &AppRuntime, group_id: &GroupId) -> boo
     runtime
         .group_record(group_id)
         .is_ok_and(|group| group.is_terminal())
+}
+
+/// A hydration-quarantined group has no live MLS state, so its routing and
+/// display components cannot be read until it rehydrates (mdk#2318).
+pub(crate) fn group_is_quarantined(runtime: &AppRuntime, group_id: &GroupId) -> bool {
+    runtime.quarantined_group_count() > 0
+        && runtime
+            .quarantined_groups()
+            .iter()
+            .any(|(quarantined, _)| quarantined == group_id)
 }
 
 /// Translate the engine's refusal of an epoch-pinned application message
@@ -2608,6 +2632,16 @@ impl AppClient {
                 reason: reason.into(),
             })
             .collect()
+    }
+
+    /// Event projection reads a quarantined group best-effort: its components
+    /// are unreadable until it rehydrates (mdk#2318).
+    pub(crate) fn skips_quarantined_group_reads(&self, group_id: &GroupId) -> bool {
+        #[cfg(test)]
+        if self.strict_quarantined_group_reads {
+            return false;
+        }
+        group_is_quarantined(&self.runtime, group_id)
     }
 
     /// Capture a [`GroupReadSnapshot`] of every known group's read-only

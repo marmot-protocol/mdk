@@ -5,11 +5,13 @@ use std::sync::Arc;
 pub struct AttachmentTransferSubscription {
     inner: Arc<marmot_app::RuntimeAttachmentTransferSubscription>,
 }
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl AttachmentTransferSubscription {
     /// Initial snapshot, then replacements: a transfer state change at once,
     /// progress-only changes at most four per second. None means closed. Errors
     /// terminate this observation; close/drop never cancels acquisition.
+    #[marmot_uniffi_macros::receive]
     pub async fn next(&self) -> Result<Option<AttachmentTransferSnapshotFfi>, MarmotKitError> {
         match self.inner.next().await {
             Ok(v) => Ok(v.map(Into::into)),
@@ -23,7 +25,8 @@ impl AttachmentTransferSubscription {
         self.inner.close();
     }
 }
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     /// Revoke automatic permission before evaluating new host network policy.
     pub async fn begin_attachment_permission_update(

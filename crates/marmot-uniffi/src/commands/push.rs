@@ -7,7 +7,8 @@ use crate::conversions::{
 };
 use crate::errors::MarmotKitError;
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     pub fn push_registration(
         &self,

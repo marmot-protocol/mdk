@@ -10,7 +10,8 @@ fn check_count(count: usize) -> Result<(), MarmotKitError> {
     }
     Ok(())
 }
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     /// Pass up to 16 opaque targets from visible screen metadata. Does not await HTTP.
     pub async fn request_avatar_assets(

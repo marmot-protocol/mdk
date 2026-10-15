@@ -12,7 +12,8 @@ use crate::errors::MarmotKitError;
 use crate::external_signer::{ExternalAccountSignerAdapter, ExternalAccountSignerFfi};
 use crate::{Marmot, conversions, endpoints};
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     // -----------------------------------------------------------------------
     // Accounts

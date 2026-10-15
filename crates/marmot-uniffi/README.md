@@ -12,7 +12,8 @@ Read the documentation at the tag matching your binaries; `master` can describe 
 - [Integration guide and API reference](#integration-guide-and-api-reference): documentation map, ownership, API
   selection, lifecycle, snapshots, diagnostics and compatibility
 - Runtime setup: [runtime options and client label](#runtime-options-and-client-label),
-  [exclusive root ownership](#exclusive-root-ownership), [service endpoint defaults](#service-endpoint-defaults)
+  [exclusive root ownership](#exclusive-root-ownership), [threading model](#threading-model),
+  [service endpoint defaults](#service-endpoint-defaults)
 - Accounts and identity: [interactive account onboarding](#interactive-account-onboarding),
   [identity references and profiles](#identity-references-and-profiles),
   [KeyPackage inventory](#keypackage-inventory), [KeyPackage client preference](#keypackage-client-preference),
@@ -130,7 +131,8 @@ All methods, including less common management/diagnostic operations, are listed 
    result still reports the partial failure.
 4. Keep synchronous storage reads off the UI thread. Async Swift/Kotlin calls may suspend;
    C methods are blocking unless documented otherwise. Host signer/secret-store callbacks may
-   run concurrently on worker threads and must be thread-safe.
+   run concurrently on worker threads and must be thread-safe. See
+   [threading model](#threading-model) for which threads run MDK work.
 5. Bind one receive loop to each subscription. On account/view change discard late results from
    the old handle, cancel waiting tasks and release handles. Some handles have explicit `cancel`;
    consult the reference rather than assuming all handles share that method.
@@ -301,6 +303,42 @@ lease while the `Marmot` object or one of its runtime handles is still alive.
 Await `shutdownAndClose()` before suspension or root handoff; it terminally closes
 storage and releases the lease without waiting for every host reference to disappear.
 Reconstruct the runtime and its handles for the next foreground session.
+
+## Threading model
+
+MarmotKit runs MDK on a Tokio runtime it owns, not on the threads that call it.
+
+- **Async methods** run their work as a task on that runtime. The Swift task or Kotlin coroutine
+  awaiting the call only waits for the task to finish, so awaiting from the main actor or
+  `Dispatchers.Main` does not run MDK work on the UI thread. Cancelling a Kotlin coroutine frees
+  the call, which aborts the task at its next suspension point; `shutdownAndClose()` keeps
+  running regardless. Generated Swift waits for the call to finish even when its `Task` is
+  cancelled.
+- **Subscription receives** (`next()`, `nextUpdate()`) are the exception: they wait on the calling
+  thread, with the runtime entered, because a receive that ran ahead on the runtime could consume
+  an update that a cancelled caller never collects. They only wait and convert; the work that
+  produces updates runs on the runtime.
+- **Synchronous methods and constructors** run on the calling thread. Some are SQLCipher reads;
+  keep them off the UI thread. Constructors enter MarmotKit's runtime, so background tasks they
+  start run there too.
+- **One runtime per process**, created by the first constructor and shared by every `Marmot`
+  object. If it cannot start, construction throws `MarmotKitError.Runtime` rather than falling
+  back. It has half as many worker threads as the device has CPUs, at least 2 and at most 4,
+  plus Tokio's blocking pool for storage and file work, whose threads start on demand and exit
+  when idle. All are named `marmotkit-rt` in crash reports and profilers. `shutdownAndClose()`
+  stops MDK's work and releases its files; the idle threads remain for the next `Marmot`.
+- **What runs in parallel:** account workers, the relay plane, subscription forwarders, timers
+  and the work behind concurrent host calls are separate tasks spread over the worker threads.
+  Each account's worker still handles its own commands one at a time, in order, so a slow
+  operation delays that account's later worker-routed calls but not other accounts.
+- **Host callbacks** (`SecretStore`, `ExternalAccountSignerFfi`) can be invoked from runtime
+  threads or the calling thread, possibly concurrently. Implementations must be thread-safe and
+  must not wait for the main thread.
+
+The C bindings block the calling thread on a runtime owned by each client; see
+[`marmot-c`](../marmot-c/README.md). The [app runtime threading
+model](../../docs/marmot-architecture/overview/marmot-app-runtime.md#threading-model) compares
+every binding.
 
 ## Service endpoint defaults
 

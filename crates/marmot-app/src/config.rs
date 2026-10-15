@@ -66,8 +66,12 @@ pub enum AttachmentAcquisitionMode {
     HostManaged,
 }
 
-/// Automatic attachment policy. Quota is retained plaintext; disk admission
-/// additionally reserves space for SQLite/WAL copies. No automatic eviction.
+/// Automatic attachment policy. Downloaded bodies are retained in the
+/// account's encrypted media store with no byte quota: free disk above
+/// `minimum_free_disk_bytes` is the only gate (mdk#2314).
+/// `retained_bytes_per_account` still bounds legacy database copies of sent
+/// attachments until outgoing bodies move to the media store. No automatic
+/// eviction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttachmentAcquisitionPolicy {
     pub retained_bytes_per_account: u64,

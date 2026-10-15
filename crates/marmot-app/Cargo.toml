@@ -53,6 +53,7 @@ secp256k1 = "0.30"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+media-store.workspace = true
 storage-sqlite.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
@@ -69,6 +70,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+media-store = { workspace = true, features = ["test-support"] }
 storage-sqlite = { workspace = true, features = ["test-support"] }
 tokio-tungstenite.workspace = true
 keyring-core.workspace = true

@@ -161,10 +161,17 @@ async fn file_attachment_resume_survives_irregular_chunks_and_publishes_authenti
         .unwrap();
     assert_eq!(prefix.0.len, (ATTACHMENT_CHECKPOINT_BYTES + 123) as u64);
     assert!(
-        store
-            .read_retained_attachment(&job.reference, crate::unix_now_seconds(), 0, 10)
-            .unwrap()
-            .is_none()
+        read_retained(
+            &store,
+            &client.app,
+            &client.state.label,
+            &job.reference,
+            crate::unix_now_seconds(),
+            0,
+            10
+        )
+        .unwrap()
+        .is_none()
     );
     drop(prefix);
     let downloaded = fetch().await.unwrap();
@@ -209,19 +216,29 @@ async fn file_attachment_resume_survives_irregular_chunks_and_publishes_authenti
         &client,
         &job,
         Ok(crate::client::AcquiredMediaBody::File(file)),
-        128 * 1024 * 1024,
     )
     .unwrap();
     assert_eq!(
-        store.retained_attachment_byte_count().unwrap(),
+        store
+            .attachment_acquisition_status(&job.reference)
+            .unwrap()
+            .unwrap()
+            .byte_count,
         plain.len() as u64
     );
     assert_eq!(
-        store
-            .read_retained_attachment(&job.reference, crate::unix_now_seconds(), 0, 100)
-            .unwrap()
-            .unwrap()
-            .as_slice(),
+        read_retained(
+            &store,
+            &client.app,
+            &client.state.label,
+            &job.reference,
+            crate::unix_now_seconds(),
+            0,
+            100
+        )
+        .unwrap()
+        .unwrap()
+        .as_slice(),
         &plain[..100]
     );
     server.await.unwrap();
@@ -795,10 +812,17 @@ async fn attachment_resume_interrupted_transfer_reopens_and_publishes_verified_b
         prefix
     );
     assert!(
-        store
-            .read_retained_attachment(&old.reference, crate::unix_now_seconds(), 0, 10)
-            .unwrap()
-            .is_none()
+        read_retained(
+            &store,
+            &client.app,
+            &client.state.label,
+            &old.reference,
+            crate::unix_now_seconds(),
+            0,
+            10
+        )
+        .unwrap()
+        .is_none()
     );
     store.close().unwrap();
     drop(client);
@@ -818,9 +842,13 @@ async fn attachment_resume_interrupted_transfer_reopens_and_publishes_verified_b
         .await
         .unwrap();
     assert_eq!(result.plaintext, plaintext);
-    complete(&client, &job, Ok(result), 128 * 1024 * 1024).unwrap();
+    complete(&client, &job, Ok(result)).unwrap();
     assert_eq!(
-        store.retained_attachment_byte_count().unwrap(),
+        store
+            .attachment_acquisition_status(&job.reference)
+            .unwrap()
+            .unwrap()
+            .byte_count,
         plaintext.len() as u64
     );
     assert!(
@@ -1084,10 +1112,17 @@ async fn attachment_resume_cancellation_keeps_only_committed_ciphertext() {
         ATTACHMENT_CHECKPOINT_BYTES
     );
     assert!(
-        store
-            .read_retained_attachment(&next.reference, crate::unix_now_seconds(), 0, 10)
-            .unwrap()
-            .is_none()
+        read_retained(
+            &store,
+            &client.app,
+            &client.state.label,
+            &next.reference,
+            crate::unix_now_seconds(),
+            0,
+            10
+        )
+        .unwrap()
+        .is_none()
     );
     server.abort();
     assert!(server.await.unwrap_err().is_cancelled());
@@ -1634,7 +1669,7 @@ async fn attachment_resume_hash_miss_retries_from_zero_after_reopen() {
                     .unwrap()
                     .is_none()
             );
-            complete(&client, &job, result, 128 * 1024 * 1024).unwrap();
+            complete(&client, &job, result).unwrap();
             let status = store
                 .attachment_acquisition_status(&job.reference)
                 .unwrap()
@@ -1669,7 +1704,7 @@ async fn attachment_resume_hash_miss_retries_from_zero_after_reopen() {
             } else {
                 assert!(matches!(result, Err(AttachmentDownloadFailure::Stop(_))));
             }
-            complete(&client, &job, result, 128 * 1024 * 1024).unwrap();
+            complete(&client, &job, result).unwrap();
             assert_eq!(
                 store
                     .attachment_acquisition_status(&job.reference)
@@ -1750,13 +1785,20 @@ async fn attachment_controls_interrupt_http_and_release_capacity_without_publish
             .await
             .unwrap()
             .unwrap();
-        complete_media_http(&mut client, done, &shared, &http).await;
+        complete_and_settle(&mut client, done, &shared, &http, &mut completions).await;
         assert_eq!(shared.attachment_transfer.available_permits(), 1);
         assert!(
-            store
-                .read_retained_attachment(&asset, crate::unix_now_seconds(), 0, 1)
-                .unwrap()
-                .is_none()
+            read_retained(
+                &store,
+                &client.app,
+                &client.state.label,
+                &asset,
+                crate::unix_now_seconds(),
+                0,
+                1
+            )
+            .unwrap()
+            .is_none()
         );
         assert_eq!(
             store
@@ -1819,7 +1861,7 @@ async fn attachment_body_idle_deadline_releases_global_capacity_and_retries() {
         }
         _ => panic!("attachment completion"),
     };
-    complete_media_http(&mut client, done, &shared, &http).await;
+    complete_and_settle(&mut client, done, &shared, &http, &mut completions).await;
     assert_eq!(shared.attachment_transfer.available_permits(), 1);
     assert_eq!(
         store
@@ -1997,7 +2039,7 @@ async fn attachment_revocation_prevents_retry_and_old_approval_cannot_restore_it
 }
 
 #[tokio::test]
-async fn attachment_completed_unretained_body_is_not_downloaded_again() {
+async fn attachment_retained_media_body_is_not_downloaded_again() {
     let (mut reference, ciphertext) =
         crate::media::tests::attachment_worker_fixture(b"one completed body");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2049,7 +2091,7 @@ async fn attachment_completed_unretained_body_is_not_downloaded_again() {
         .run_classified(resume_context(&store, &job, dir.path(), &reference))
         .await;
     assert!(result.is_ok());
-    complete(&client, &job, result, 0).unwrap();
+    complete(&client, &job, result).unwrap();
     let runtime = client.app.runtime();
     let (http, _completions) = context();
     let mut admission = Admission::default();
@@ -2061,10 +2103,11 @@ async fn attachment_completed_unretained_body_is_not_downloaded_again() {
         assert!(!request.newly_queued);
         assert_eq!(
             request.status.unwrap().state,
-            storage_sqlite::AttachmentTransferState::CompletedUnretained
+            storage_sqlite::AttachmentTransferState::Ready
         );
         schedule(&client, &runtime.shared, &http, &mut admission).unwrap();
     }
+    // Retained in the media store, not the database's byte tables.
     assert_eq!(store.retained_attachment_byte_count().unwrap(), 0);
     assert!(!admission.is_waiting());
     server.await.unwrap();
@@ -2152,12 +2195,19 @@ async fn attachment_verified_http_body_publishes_after_permission_and_policy_rev
         finishing,
     )
     .await;
-    complete(&client, &job, result, 128 * 1024 * 1024).unwrap();
+    complete(&client, &job, result).unwrap();
     assert_eq!(
-        &*store
-            .read_retained_attachment(&job.reference, crate::unix_now_seconds(), 0, 100)
-            .unwrap()
-            .unwrap(),
+        &*read_retained(
+            &store,
+            &client.app,
+            &client.state.label,
+            &job.reference,
+            crate::unix_now_seconds(),
+            0,
+            100
+        )
+        .unwrap()
+        .unwrap(),
         body
     );
     server.await.unwrap();
@@ -2242,7 +2292,7 @@ async fn attachment_disk_pressure_parks_before_receipt_and_readmits_when_space_f
         &result,
         Err(AttachmentDownloadFailure::StorageBlocked { headroom, .. }) if *headroom == 4 * body.len() as u64
     ));
-    complete(&client, &job, result, 128 * 1024 * 1024).unwrap();
+    complete(&client, &job, result).unwrap();
     let status = store
         .attachment_acquisition_status(&job.reference)
         .unwrap()
@@ -2296,9 +2346,13 @@ async fn attachment_disk_pressure_parks_before_receipt_and_readmits_when_space_f
         .run_classified(resume_context(&store, &next, dir.path(), &reference))
         .await;
     assert!(result.is_ok());
-    complete(&client, &next, result, 128 * 1024 * 1024).unwrap();
+    complete(&client, &next, result).unwrap();
     assert_eq!(
-        store.retained_attachment_byte_count().unwrap(),
+        store
+            .attachment_acquisition_status(&next.reference)
+            .unwrap()
+            .unwrap()
+            .byte_count,
         body.len() as u64
     );
     server.await.unwrap();
@@ -2338,7 +2392,7 @@ async fn attachment_missing_on_every_locator_fails_without_retry() {
         .run_classified(resume_context(&store, &job, dir.path(), &reference))
         .await;
     assert!(matches!(&result, Err(AttachmentDownloadFailure::Stop(_))));
-    complete(&client, &job, result, 128 * 1024 * 1024).unwrap();
+    complete(&client, &job, result).unwrap();
     let status = store
         .attachment_acquisition_status(&job.reference)
         .unwrap()
@@ -2485,7 +2539,7 @@ async fn promoted_body_revocation_order(pause_first: bool) {
                 128 * 1024 * 1024
             )
             .unwrap(),
-        AttachmentPublishResult::Published
+        storage_sqlite::AttachmentPublishResult::Published
     );
     server.await.unwrap();
 }

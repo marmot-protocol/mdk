@@ -35,65 +35,69 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 async fn capture_one_request(listener: TcpListener, tx: oneshot::Sender<CapturedRequest>) {
-    let Ok((mut stream, _)) = listener.accept().await else {
-        return;
-    };
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        let read = match stream.read(&mut chunk).await {
-            Ok(0) | Err(_) => return,
-            Ok(read) => read,
+    // A restarted exporter can abandon a push it already connected, so skip
+    // connections that close before delivering a whole request.
+    'accept: loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
         };
-        buf.extend_from_slice(&chunk[..read]);
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => continue 'accept,
+                Ok(read) => read,
+            };
+            buf.extend_from_slice(&chunk[..read]);
 
-        let Some(header_end) = find_subsequence(&buf, b"\r\n\r\n").map(|pos| pos + 4) else {
-            continue;
-        };
-        let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
-        let content_length = headers
-            .lines()
-            .find_map(|line| {
-                line.to_ascii_lowercase()
-                    .strip_prefix("content-length:")
-                    .and_then(|value| value.trim().parse::<usize>().ok())
-            })
-            .unwrap_or(0);
-        while buf.len() < header_end + content_length {
-            match stream.read(&mut chunk).await {
-                Ok(0) | Err(_) => break,
-                Ok(read) => buf.extend_from_slice(&chunk[..read]),
+            let Some(header_end) = find_subsequence(&buf, b"\r\n\r\n").map(|pos| pos + 4) else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while buf.len() < header_end + content_length {
+                match stream.read(&mut chunk).await {
+                    Ok(0) | Err(_) => continue 'accept,
+                    Ok(read) => buf.extend_from_slice(&chunk[..read]),
+                }
             }
+
+            let request_line = headers.lines().next().unwrap_or_default();
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or_default().to_owned();
+            let path = parts.next().unwrap_or_default().to_owned();
+            let header_value = |name: &str| {
+                let prefix = format!("{name}:");
+                headers.lines().find_map(|line| {
+                    line.get(..prefix.len())
+                        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&prefix))
+                        .then(|| line[prefix.len()..].trim().to_owned())
+                })
+            };
+            let content_type = header_value("content-type");
+            let authorization = header_value("authorization");
+
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            let _ = stream.shutdown().await;
+            let _ = tx.send(CapturedRequest {
+                method,
+                path,
+                authorization,
+                content_type,
+                body_len: content_length,
+                body: buf[header_end..header_end + content_length].to_vec(),
+            });
+            return;
         }
-
-        let request_line = headers.lines().next().unwrap_or_default();
-        let mut parts = request_line.split_whitespace();
-        let method = parts.next().unwrap_or_default().to_owned();
-        let path = parts.next().unwrap_or_default().to_owned();
-        let header_value = |name: &str| {
-            let prefix = format!("{name}:");
-            headers.lines().find_map(|line| {
-                line.get(..prefix.len())
-                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&prefix))
-                    .then(|| line[prefix.len()..].trim().to_owned())
-            })
-        };
-        let content_type = header_value("content-type");
-        let authorization = header_value("authorization");
-
-        let _ = stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-            .await;
-        let _ = stream.shutdown().await;
-        let _ = tx.send(CapturedRequest {
-            method,
-            path,
-            authorization,
-            content_type,
-            body_len: content_length,
-            body: buf[header_end..header_end + content_length].to_vec(),
-        });
-        return;
     }
 }
 
@@ -202,7 +206,7 @@ fn runtime_config_without_endpoint() -> RelayTelemetryRuntimeConfig {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn export_once_pushes_otlp_metrics_over_http() {
     for host in ["127.0.0.1", "[::1]", "localhost"] {
         let bind = if host == "[::1]" {
@@ -261,7 +265,7 @@ async fn export_once_pushes_otlp_metrics_over_http() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn export_retries_transient_collector_failures_within_interval() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -304,7 +308,7 @@ async fn export_retries_transient_collector_failures_within_interval() {
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn running_runtime_pushes_after_telemetry_settings_toggle() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -344,7 +348,7 @@ async fn running_runtime_pushes_after_telemetry_settings_toggle() {
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn running_runtime_pushes_to_default_telemetry_endpoint_when_runtime_endpoint_missing() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -394,7 +398,7 @@ async fn running_runtime_pushes_to_default_telemetry_endpoint_when_runtime_endpo
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_start_pushes_from_persisted_telemetry_settings() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -434,7 +438,7 @@ async fn runtime_start_pushes_from_persisted_telemetry_settings() {
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_telemetry_host_safety_redirect_never_reaches_target() {
     let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let source = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -469,7 +473,7 @@ async fn relay_telemetry_host_safety_redirect_never_reaches_target() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_telemetry_host_safety_stalled_push_keeps_export_window_deadline() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/v1/metrics", listener.local_addr().unwrap());

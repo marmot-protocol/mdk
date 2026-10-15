@@ -23,13 +23,15 @@ impl ChatListWindowSubscription {
         })
     }
 }
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl ChatListWindowSubscription {
     /// Take the initial complete replacement once, before driving next().
     pub fn snapshot(&self) -> Option<ChatListWindowSnapshotFfi> {
         take_snapshot(&self.snapshot)
     }
     /// One receiver per handle. Cancellation does not consume an update.
+    #[marmot_uniffi_macros::receive]
     pub async fn next(&self) -> Result<Option<ChatListWindowSnapshotFfi>, MarmotKitError> {
         Ok(self.receiver.lock().await.recv().await?.map(Into::into))
     }
@@ -82,12 +84,14 @@ impl AccountAttentionSubscription {
         })
     }
 }
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl AccountAttentionSubscription {
     /// Take the initial account set once. Unavailable entries never contain invented totals.
     pub fn snapshot(&self) -> Option<AccountAttentionSnapshotFfi> {
         take_snapshot(&self.snapshot)
     }
+    #[marmot_uniffi_macros::receive]
     pub async fn next(&self) -> Result<Option<AccountAttentionSnapshotFfi>, MarmotKitError> {
         Ok(self
             .receiver

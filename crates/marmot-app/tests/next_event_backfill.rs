@@ -111,7 +111,7 @@ async fn publish_garbage_group_message_at(
 /// A live delivery that arms the epoch-gap backfill but yields no visible
 /// summary content must still make `next_event` return, so the worker reaches
 /// its `run_pending_epoch_backfill` seam.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn next_event_returns_when_a_live_delivery_arms_the_epoch_backfill() {
     let (_relay, url) = mock_relay().await;
 

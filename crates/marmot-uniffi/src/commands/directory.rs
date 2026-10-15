@@ -12,7 +12,8 @@ use crate::markdown::{self, MarkdownDocumentFfi};
 use crate::subscriptions::UserSearchSubscription;
 use crate::{Marmot, conversions, endpoints};
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     /// Best-effort cached display name for an account id. Returns the Nostr
     /// kind:0 display_name/name when the runtime has projected one, or the

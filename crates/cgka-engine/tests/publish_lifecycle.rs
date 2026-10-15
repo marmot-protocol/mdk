@@ -1690,6 +1690,23 @@ impl StorageProvider for FaultStorage {
         self.inner.with_transaction(|_inner| f(self))
     }
 
+    fn with_group_savepoint<T, E, F>(
+        &self,
+        group_id: &GroupId,
+        fallback_snapshot: &str,
+        f: F,
+    ) -> Result<T, E>
+    where
+        Self: Sized,
+        E: From<StorageError>,
+        F: FnOnce(&Self) -> Result<T, E>,
+    {
+        // Same delegation as `with_transaction`: the real savepoint, with the
+        // wrapper's fault-injecting writes inside it.
+        self.inner
+            .with_group_savepoint(group_id, fallback_snapshot, |_inner| f(self))
+    }
+
     fn backend(&self) -> Backend {
         self.inner.backend()
     }

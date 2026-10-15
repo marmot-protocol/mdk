@@ -10,7 +10,8 @@ use crate::conversions::{
 use crate::errors::MarmotKitError;
 use crate::optional_group_id_hex;
 
-#[uniffi::export(async_runtime = "tokio")]
+#[marmot_uniffi_macros::on_tokio_runtime]
+#[uniffi::export]
 impl Marmot {
     // -----------------------------------------------------------------------
     // Messaging

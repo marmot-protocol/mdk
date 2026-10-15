@@ -116,6 +116,12 @@ impl Fixture {
         self.admission.ready().await;
         schedule(&self.client, &self.shared, &self.http, &mut self.admission).unwrap();
     }
+    fn media(&self) -> crate::AccountMediaStore {
+        self.client
+            .app
+            .account_media_store(&self.client.state.label, &self.storage)
+            .unwrap()
+    }
     async fn completion(&mut self) -> MediaHttpDone {
         tokio::time::timeout(Duration::from_secs(180), self.completions.recv())
             .await
@@ -213,23 +219,42 @@ impl Fixture {
         };
         assert_eq!(body.plaintext.len(), plain.len());
         let capacity = body.plaintext.capacity();
-        complete_media_http(&mut self.client, done, &self.shared, &self.http).await;
+        complete_and_settle(
+            &mut self.client,
+            done,
+            &self.shared,
+            &self.http,
+            &mut self.completions,
+        )
+        .await;
         self.assert_ready(plain);
         capacity
     }
     fn assert_ready(&self, plain: &[u8]) {
         assert_eq!(self.state(), AttachmentTransferState::Ready);
+        let reference = self.status().reference.unwrap();
+        // Retained as a media file: counted in its row, not the database's
+        // retained-byte usage.
         assert_eq!(
-            self.storage.retained_attachment_byte_count().unwrap(),
+            self.storage
+                .attachment_acquisition_status(&reference)
+                .unwrap()
+                .unwrap()
+                .byte_count,
             plain.len() as u64
         );
-        let reference = self.status().reference.unwrap();
         assert_eq!(
-            &*self
-                .storage
-                .read_retained_attachment(&reference, crate::unix_now_seconds(), 0, 64)
-                .unwrap()
-                .unwrap(),
+            &*read_retained(
+                &self.storage,
+                &self.client.app,
+                &self.client.state.label,
+                &reference,
+                crate::unix_now_seconds(),
+                0,
+                64
+            )
+            .unwrap()
+            .unwrap(),
             &plain[..64]
         );
     }
@@ -833,14 +858,14 @@ async fn pressure_after_the_body_arrives_parks_with_a_complete_checkpoint_and_re
     server.await.unwrap();
 }
 
-/// The database itself running out of room during in-memory publication parks
-/// the job like a failed free-space check, instead of a retry timer or an
-/// opted-in body with no retention. The recorded target never sits below the
-/// free space seen at the refusal plus the body, so free space that merely
-/// looked sufficient does not refetch into the same full database; once the
-/// volume gains room the readmitted attempt publishes.
+/// The disk running out of room while the media store writes an in-memory
+/// body parks the job like a failed free-space check, instead of a retry timer
+/// or an opted-in body with no retention. The recorded target never sits below
+/// the free space seen at the refusal plus the body, so free space that merely
+/// looked sufficient does not refetch onto the same full disk; once the volume
+/// gains room the readmitted attempt publishes.
 #[tokio::test]
-async fn memory_publication_into_a_full_database_parks_until_room_returns() {
+async fn memory_publication_onto_a_full_disk_parks_until_room_returns() {
     let plain = vec![0x44; (2 * MIB + 9) as usize];
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (reference, cipher) = loopback_reference(&listener, &plain);
@@ -868,10 +893,16 @@ async fn memory_publication_into_a_full_database_parks_until_room_returns() {
             ..
         }
     ));
-    // The volume reports room, but the database refuses the body; small
-    // bookkeeping updates still fit.
-    fixture.storage.limit_database_pages_for_test(16).unwrap();
-    complete_media_http(&mut fixture.client, done, &fixture.shared, &fixture.http).await;
+    // The volume reports room, but writing the body hits a full disk.
+    fixture.media().simulate_full_disk_for_test(true);
+    complete_and_settle(
+        &mut fixture.client,
+        done,
+        &fixture.shared,
+        &fixture.http,
+        &mut fixture.completions,
+    )
+    .await;
     assert_eq!(fixture.state(), AttachmentTransferState::StorageBlocked);
     assert_eq!(fixture.storage.retained_attachment_byte_count().unwrap(), 0);
     assert_eq!(fixture.status().retry_at, None, "no retry timer runs");
@@ -884,10 +915,7 @@ async fn memory_publication_into_a_full_database_parks_until_room_returns() {
     );
     assert_eq!(fixture.state(), AttachmentTransferState::StorageBlocked);
     assert_eq!(requests.load(Ordering::SeqCst), 1);
-    fixture
-        .storage
-        .limit_database_pages_for_test(1 << 30)
-        .unwrap();
+    fixture.media().simulate_full_disk_for_test(false);
     fixture.set_free(target + STORAGE_READMIT_MARGIN_BYTES);
     fixture.tick().await;
     fixture.publish_memory(&plain).await;
@@ -896,11 +924,11 @@ async fn memory_publication_into_a_full_database_parks_until_room_returns() {
     server.await.unwrap();
 }
 
-/// A full database during file-sink publication parks as well: the decrypted
+/// A full disk during file-sink publication parks as well: the decrypted
 /// file this attempt held is counted into the target, the remembered file sink
 /// skips the header probe on readmission, and the retried attempt publishes.
 #[tokio::test]
-async fn file_publication_into_a_full_database_parks_until_room_returns() {
+async fn file_publication_onto_a_full_disk_parks_until_room_returns() {
     let plain = vec![0x45; (3 * MIB + 5) as usize];
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (reference, cipher) = loopback_reference(&listener, &plain);
@@ -928,7 +956,7 @@ async fn file_publication_into_a_full_database_parks_until_room_returns() {
             ..
         }
     ));
-    fixture.storage.limit_database_pages_for_test(16).unwrap();
+    fixture.media().simulate_full_disk_for_test(true);
     complete_media_http(&mut fixture.client, done, &fixture.shared, &fixture.http).await;
     let retained = fixture.completion().await;
     complete_media_http(
@@ -949,10 +977,7 @@ async fn file_publication_into_a_full_database_parks_until_room_returns() {
     assert!(fixture.completions.try_recv().is_err());
     assert_eq!(fixture.state(), AttachmentTransferState::StorageBlocked);
     assert_eq!(requests.load(Ordering::SeqCst), 2);
-    fixture
-        .storage
-        .limit_database_pages_for_test(1 << 30)
-        .unwrap();
+    fixture.media().simulate_full_disk_for_test(false);
     fixture.set_free(target + STORAGE_READMIT_MARGIN_BYTES);
     fixture.tick().await;
     fixture.publish_file(&plain).await;

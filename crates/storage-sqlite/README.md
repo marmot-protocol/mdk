@@ -27,6 +27,9 @@ group snapshots and rollback must be atomic across Marmot records and group-scop
 - App-facing projections and account state: account event projection, chat list (including avatar URLs), the
   materialized timeline and conversation opening, message drafts, attachments, avatar cache, encrypted-media secrets,
   account recovery, delivery spill, transport reconciliation, user blocks, and more.
+- `media_catalog.rs` — metadata for the encrypted per-file media store in the [`media-store`](../media-store/README.md)
+  crate (mdk#2314): each file's random key and state in `media_files`, slot references in `media_file_refs`. The
+  bodies are files the crate owns; this crate never reads or writes them.
 - `shared.rs` — `SqliteSharedStorage`, a separate, non-account-scoped database for cross-identity state: the
   public-directory user cache and presentation, relay-telemetry, usage-diagnostics and audit-log settings, and the
   telemetry install id.
@@ -145,6 +148,12 @@ outbound, and app-projection rows, which the engine validates separately. The fi
 is never logged or persisted. It lets resumable reconstruction ignore unrelated writes through another app connection;
 the `mls_write_generation` contract for cached `MlsGroup` objects is unchanged.
 
+**Group savepoints.** Nested `with_transaction` calls join the outermost transaction and roll back only there.
+`StorageProvider::with_group_savepoint` is the nested unit that rolls back on its own: on `Err` or panic a SQLite
+`SAVEPOINT` undoes every write the unit made, drops the after-commit wakeups it registered and moves
+`mls_write_generation`, and the caller's transaction stays open. Canonical convergence apply uses it in place of a full
+group snapshot, so its rollback cost no longer grows with stored history (mdk#2326).
+
 **Deferred recovery preparation.** `MessageStorage::list_deferred_message_metadata` preserves insertion order and exact
 encoded payload lengths while omitting payload blobs. The engine uses it for sweep preparation and readiness, then
 fetches full records only for selected attempts, retirement, or bounded lifecycle normalization. Legacy format-1 rows
@@ -228,7 +237,17 @@ reservations. The app-side owner supplies validated facts and owns execution pol
 ```sh
 cargo test -p storage-sqlite
 just bench-storage-upgrade   # ignored file-backed format v1 -> v2 operational benchmark
+just bench-media-store       # media file format vs the SQLCipher retained-attachment path
 ```
+
+**Media store benchmark** (`media-store-benchmarks` feature, `examples/media_store_bench.rs`): for 64 KiB, 1 MiB and
+100 MiB bodies it times the file format in memory, writing and reading private files, and today's
+SQLCipher import (`complete_attachment_acquisition_from_reader`) and `read_retained_attachment`, and prints
+`MDK_BENCH media_store ...` lines. `MDK_MEDIA_BENCH_SIZES`, `MDK_MEDIA_BENCH_ITERATIONS` and `MDK_MEDIA_BENCH_DIR`
+override the defaults. The example cross-compiles for Android (`adb push`, run from `/data/local/tmp`), and
+`media_store_bench::run_media_store_benchmark` can be called from a throwaway iOS app. The format itself lives in
+[`media-store`](../media-store/README.md). Results for mdk#2314 step 0
+are recorded on the issue.
 
 **Deferred recovery preparation benchmark** (opt-in, paired, encrypted temporary files):
 

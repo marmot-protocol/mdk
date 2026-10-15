@@ -74,6 +74,7 @@ use transport_nostr_adapter::{
 };
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 
+mod close_registry;
 mod user_blocks;
 pub use runtime::RuntimeBlockListSubscription;
 pub use user_blocks::{BlockListSnapshot, BlockedUser};
@@ -480,6 +481,13 @@ type AppRuntime = AccountDeviceRuntime<
 #[cfg(test)]
 type LegacyProjectionOpenHook = Arc<dyn Fn() + Send + Sync>;
 
+/// One account's encrypted media store over its SQLCipher catalog.
+pub(crate) type AccountMediaStore = media_store::MediaStore<storage_sqlite::SqliteMediaCatalog>;
+
+fn media_close_key(label: &str) -> String {
+    format!("media/{label}")
+}
+
 #[derive(Clone)]
 pub struct MarmotApp {
     block_list_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
@@ -514,6 +522,13 @@ pub struct MarmotApp {
     config: MarmotAppConfig,
     directory_sync: Arc<RwLock<Option<DirectorySyncHandle>>>,
     account_storages: Arc<Mutex<HashMap<String, SqliteAccountStorage>>>,
+    /// One encrypted media store per account (mdk#2314), over that account's
+    /// cached storage handle. Its in-flight set and sweep cursor are per
+    /// instance, so every caller shares this one.
+    account_media_stores: Arc<Mutex<HashMap<String, AccountMediaStore>>>,
+    /// Closers for handles outside the storage caches; `close_storage` runs
+    /// them all.
+    close_registry: Arc<close_registry::CloseRegistry>,
     account_session_owners: Arc<Mutex<HashSet<String>>>,
     directory_caches: Arc<Mutex<HashMap<String, DirectoryCache>>>,
     /// When each `(account label, cache key)` public event refresh last
@@ -1658,6 +1673,8 @@ impl MarmotApp {
             moderation_reports: Arc::default(),
             block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
+            account_media_stores: Arc::new(Mutex::new(HashMap::new())),
+            close_registry: Default::default(),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
             public_event_refreshes: Arc::default(),
@@ -1753,6 +1770,8 @@ impl MarmotApp {
             moderation_reports: Arc::default(),
             block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
+            account_media_stores: Arc::new(Mutex::new(HashMap::new())),
+            close_registry: Default::default(),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
             public_event_refreshes: Arc::default(),
@@ -2055,6 +2074,7 @@ impl MarmotApp {
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),
             pending_applied_effects: Default::default(),
+            retained_projection_failures: 0,
             pending_resumed_message_notifications: Default::default(),
             pending_push_leaf_reconciliations: Default::default(),
             pending_failed_sync_summary: SyncSummary::default(),
@@ -2084,6 +2104,10 @@ impl MarmotApp {
             delivery_spill: Default::default(),
             #[cfg(test)]
             force_event_group_projection_unavailable: false,
+            #[cfg(test)]
+            strict_quarantined_group_reads: false,
+            #[cfg(test)]
+            fail_drained_effect_checkpoints: false,
             pending_welcome_delivery_events: Vec::new(),
             pending_superseded_change_events: Vec::new(),
             maintenance_failed_backlog: 0,
@@ -6258,6 +6282,13 @@ impl MarmotApp {
                 storage
             })
             .collect::<Vec<_>>();
+        // Registered handles (media stores) close with the databases. Media
+        // files hold no locks; closing stops media I/O at the same instant.
+        closed += self.close_registry.close_all();
+        self.account_media_stores
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         let directory_caches = self
             .directory_caches
             .lock()
@@ -6374,6 +6405,55 @@ impl MarmotApp {
             ));
         }
         self.audit_export_lifecycle.admit(attempt, work).transpose()
+    }
+
+    /// The account's encrypted media store over `storage`, the caller's
+    /// handle on that account's database, in `<account>/media`. It never
+    /// opens a database itself, and `storage` must be the account's current
+    /// cached handle: an evicted one is refused.
+    /// Creation is admitted like a database open: under the storage
+    /// lifecycle guard, so a store either exists before `close_storage`
+    /// closes them all or is refused afterwards. Blocking callers only.
+    pub(crate) fn account_media_store(
+        &self,
+        label: &str,
+        storage: &SqliteAccountStorage,
+    ) -> Result<AccountMediaStore, AppError> {
+        let _lifecycle = self.begin_storage_open("media store")?;
+        let mut stores = self
+            .account_media_stores
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Only the account's current handle may own its store. Removal drops
+        // the cached handle before it evicts the store under this lock, so a
+        // caller still holding an evicted handle can neither recreate a store
+        // after removal nor replace (and close) a reopened account's store.
+        let current = self
+            .account_storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(label)
+            .is_some_and(|cached| cached.shares_connection_with(storage));
+        if !current {
+            return Err(AppError::from(cgka_traits::StorageError::Closed(
+                "media store unavailable: account storage handle was evicted".into(),
+            )));
+        }
+        if let Some(store) = stores.get(label).filter(|store| {
+            !store.is_closed() && store.catalog().storage().shares_connection_with(storage)
+        }) {
+            return Ok(store.clone());
+        }
+        let store = media_store::MediaStore::new(
+            self.account_dir(label).join(media_store::MEDIA_DIRECTORY),
+            storage_sqlite::SqliteMediaCatalog::new(storage.clone()),
+        );
+        // Replacing a store for an older handle closes that one first.
+        let closing = store.clone();
+        self.close_registry
+            .register(media_close_key(label), move || closing.close());
+        stores.insert(label.to_owned(), store.clone());
+        Ok(store)
     }
 
     /// Observe account-open admission before analytics or cache locks; preserve the original storage result.
@@ -7085,6 +7165,16 @@ impl MarmotApp {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(label);
+        {
+            // Evict and close under one lock, so no creator can observe the
+            // empty entry before the latch is tripped.
+            let mut stores = self
+                .account_media_stores
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            stores.remove(label);
+            self.close_registry.close(&media_close_key(label));
+        }
         self.directory_caches
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

@@ -156,6 +156,27 @@ impl MarmotAppRuntime {
         + Send
         + 'static,
     ) -> Result<T, AppError> {
+        self.attachment_read_with(account_ref, move |_, _, storage, loopback| {
+            read(storage, loopback)
+        })
+        .await
+    }
+
+    /// `attachment_read` that also hands the closure the app and the
+    /// account label, for reads that need more than the database (the media
+    /// store). The closure runs on the blocking pool.
+    pub(super) async fn attachment_read_with<T: Send + 'static>(
+        &self,
+        account_ref: &str,
+        read: impl FnOnce(
+            &crate::MarmotApp,
+            &str,
+            storage_sqlite::SqliteAccountStorage,
+            bool,
+        ) -> Result<T, AppError>
+        + Send
+        + 'static,
+    ) -> Result<T, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let app = self.accounts.app.clone();
         let account_ref = account_ref.to_owned();
@@ -178,7 +199,12 @@ impl MarmotAppRuntime {
                     return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
                 }
                 worker_probe.phase(crate::NativeStartupStage::AttachmentLocalRead);
-                read(storage, app.allow_loopback_blob_endpoints())
+                read(
+                    &app,
+                    &account.label,
+                    storage,
+                    app.allow_loopback_blob_endpoints(),
+                )
             })();
             // Keep a failed native phase/version intact until retirement.
             if result.is_ok() {

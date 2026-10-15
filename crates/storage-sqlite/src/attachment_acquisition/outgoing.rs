@@ -216,7 +216,7 @@ impl SqliteAccountStorage {
                 if !eligible {continue;}
                 // The staged bytes already reserve their quota. Convert once the
                 // complete message is processed; repeated slots need extra quota.
-                let (used,partial,already,own_partial):(u64,u64,bool,u64)=conn.query_row("SELECT (SELECT byte_count FROM attachment_retention_usage WHERE id=1),(SELECT reserved_bytes FROM attachment_partial_usage WHERE id=1),EXISTS(SELECT 1 FROM retained_attachment_bytes WHERE token=?1),coalesce((SELECT total FROM attachment_partial WHERE token=?1),0)",[&asset.token],|r|Ok((nonnegative(r,0)?,nonnegative(r,1)?,r.get(2)?,nonnegative(r,3)?))).storage()?;
+                let (used,partial,already,own_partial):(u64,u64,bool,u64)=conn.query_row("SELECT (SELECT byte_count FROM attachment_retention_usage WHERE id=1),(SELECT reserved_bytes FROM attachment_partial_usage WHERE id=1),(EXISTS(SELECT 1 FROM retained_attachment_bytes rb WHERE rb.token=?1) OR EXISTS(SELECT 1 FROM media_file_refs mr JOIN media_files mf ON mf.id=mr.file_id WHERE mr.token=?1 AND mf.state=1)),coalesce((SELECT total FROM attachment_partial WHERE token=?1),0)",[&asset.token],|r|Ok((nonnegative(r,0)?,nonnegative(r,1)?,r.get(2)?,nonnegative(r,3)?))).storage()?;
                 let budget:Option<u64>=conn.query_row("SELECT retained_bytes FROM attachment_download_policy WHERE id=1",[],|r|nonnegative(r,0)).optional().storage()?;
                 let keep_staged=staging_has_unfulfilled_owner(&conn,&token,now,Some((message,entry.attachment_index)))?;
                 let credit=if keep_staged || consumed.contains_key(&token) {0}else{size};
@@ -350,7 +350,7 @@ impl SqliteAccountStorage {
                 }
                 for (message, index) in inspected {
                     conn.execute("UPDATE outgoing_attachment_uploads SET recovery_message_id_hex=?2,recovery_attachment_index=?3 WHERE token=?1",params![token,message,index]).storage()?;
-                    let eligible:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM attachment_history h JOIN app_events a USING(group_id_hex,message_id_hex) WHERE h.group_id_hex=?1 AND h.message_id_hex=?2 AND h.attachment_index=?3 AND h.visible=1 AND a.direction='sent' AND NOT EXISTS(SELECT 1 FROM attachment_acquisition q WHERE q.group_id_hex=h.group_id_hex AND q.message_id_hex=h.message_id_hex AND q.attachment_index=h.attachment_index AND ((q.state=3 AND EXISTS(SELECT 1 FROM retained_attachment_bytes b WHERE b.token=q.token)) OR (?4 AND q.body_completed=1))))",params![group,message,index,quarantined],|r|r.get(0)).storage()?;
+                    let eligible:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM attachment_history h JOIN app_events a USING(group_id_hex,message_id_hex) WHERE h.group_id_hex=?1 AND h.message_id_hex=?2 AND h.attachment_index=?3 AND h.visible=1 AND a.direction='sent' AND NOT EXISTS(SELECT 1 FROM attachment_acquisition q WHERE q.group_id_hex=h.group_id_hex AND q.message_id_hex=h.message_id_hex AND q.attachment_index=h.attachment_index AND ((q.state=3 AND (EXISTS(SELECT 1 FROM retained_attachment_bytes rb WHERE rb.token=q.token) OR EXISTS(SELECT 1 FROM media_file_refs mr JOIN media_files mf ON mf.id=mr.file_id WHERE mr.token=q.token AND mf.state=1))) OR (?4 AND q.body_completed=1))))",params![group,message,index,quarantined],|r|r.get(0)).storage()?;
                     if eligible {
                         candidates.insert((group.clone(), message));
                     }
@@ -596,7 +596,7 @@ fn staging_has_unfulfilled_owner(
         AND NOT EXISTS(SELECT 1 FROM attachment_removal_suppression r WHERE r.group_id_hex=h.group_id_hex AND r.message_id_hex=h.message_id_hex AND r.attachment_index=h.attachment_index)
         AND (u.quarantined=0 OR q.token IS NULL OR q.body_completed=0)
         AND (q.token IS NULL OR (q.cancelled=0 AND (q.state<>4 OR q.body_completed=1)))
-        AND NOT EXISTS(SELECT 1 FROM retained_attachment_bytes b WHERE b.token=q.token AND q.state=3)
+        AND NOT (q.token IS NOT NULL AND q.state=3 AND (EXISTS(SELECT 1 FROM retained_attachment_bytes rb WHERE rb.token=q.token) OR EXISTS(SELECT 1 FROM media_file_refs mr JOIN media_files mf ON mf.id=mr.file_id WHERE mr.token=q.token AND mf.state=1)))
     ) OR EXISTS(
         SELECT 1 FROM outgoing_attachment_uploads u JOIN app_events a ON a.group_id_hex=u.group_id_hex
         WHERE u.token=?1 AND a.direction='sent' AND a.invalidated=0 AND a.source_message_id_hex IS NULL

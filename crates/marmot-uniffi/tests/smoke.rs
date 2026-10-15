@@ -187,6 +187,33 @@ async fn root_lease_is_typed_busy_and_outlives_shutdown_until_handle_drop() {
     drop(reopened);
 }
 
+/// A Kotlin caller can cancel `shutdownAndClose()` after its first poll,
+/// before a runtime worker starts the work. Terminal close must still run and
+/// release the root.
+#[tokio::test]
+async fn shutdown_and_close_survives_a_call_dropped_before_its_task_runs() {
+    install_mock_keyring();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().to_string_lossy().into_owned();
+    let relays = vec!["wss://relay.invalid.test".to_string()];
+    let kit = Marmot::new(root.clone(), relays.clone()).expect("open kit");
+
+    // On this current-thread runtime the spawned work cannot start before the drop.
+    let mut call = Box::pin(kit.__ffi_shutdown_and_close());
+    assert!(futures::poll!(&mut call).is_pending());
+    drop(call);
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !kit.storage_is_closed() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("terminal close runs after the call is dropped");
+    let reopened = Marmot::new(root, relays).expect("closing released the root lease");
+    drop(reopened);
+}
+
 #[tokio::test]
 async fn remove_account_updates_list_accounts() {
     install_mock_keyring();

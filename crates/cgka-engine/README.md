@@ -161,6 +161,29 @@ candidate, then check for remaining work). A content-kind index or invalidation-
 performance work; it must preserve late arrivals, payload replacement, restart, foreign-connection writes, and terminal
 dispositions.
 
+**Canonical apply cost with stored history.** Alice's file-backed SQLCipher ledger grows with Bob's application
+messages; at each size Bob makes five self-update commits and each is timed from Alice's ingest until her epoch matches:
+
+```sh
+cargo test -p cgka-engine --release --test apply_history_cost -- --ignored --nocapture
+APPLY_AGE_COMMITS=6 cargo test -p cgka-engine --release --test apply_history_cost -- --ignored --nocapture
+```
+
+`APPLY_AGE_COMMITS=6` ages the history below the five-commit rewind horizon first, the common case for a long-lived
+group. Medians of ten commits (two runs) on an Apple M4 Max on 2026-10-15, before and after mdk#2326 replaced the full
+pre-apply snapshot (about 570 bytes per stored message) with a savepoint:
+
+| Messages | Ingest to converged, before | After | Applying pass, before | After |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 11.3 ms | 7.5 ms | 9.5 ms | 6.5 ms |
+| 5,000 | 98.8 ms | 34.6 ms | 77.7 ms | 27.6 ms |
+| 20,000 | 373 ms | 109 ms | 296 ms | 60.2 ms |
+| 50,000 | 994 ms | 288 ms | 752 ms | 81.7 ms |
+
+With all 50,000 messages inside the horizon, ingest to converged went from 5.2 s to 2.5 s. Most of what remains is
+each pass decoding every in-horizon message (mdk#2330). These are diagnostic samples, not thresholds; single commits
+at one size vary by up to 4x.
+
 ## Reading order
 
 1. [Target architecture](../../docs/marmot-architecture/overview/target-architecture.md)

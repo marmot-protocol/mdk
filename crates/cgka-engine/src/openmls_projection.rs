@@ -2757,39 +2757,27 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
         } else {
             (Vec::new(), Vec::new())
         };
+    // The anchor refresh, historical rewind, restoration of the complete live
+    // input/queue set, and selected-branch apply are one unit. Canonical apply
+    // changes message dispositions and outbound work, so a failure must return
+    // to the complete pre-apply image, not only canonical group/OpenMLS state,
+    // and leave the caller's transaction usable. A crash commits none of it.
+    // SQLite does this with a savepoint; other backends fall back to a full
+    // pre-apply snapshot that `recover_interrupted_apply_snapshot` restores.
     let snapshot = apply_snapshot_name(group_id, result);
-    // Deliberately full. Unlike temporary replay/probe guards, canonical apply
-    // changes message dispositions and outbound work; error recovery needs the
-    // complete pre-apply image, not only canonical group/OpenMLS state.
-    storage
-        .create_group_snapshot(group_id, &snapshot)
-        .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
+    let mut output = storage.with_group_savepoint(group_id, &snapshot, |storage| {
+        // Refresh the current-epoch anchor only in the case that always did:
+        // there are new commits AND the apply starts at the live tip. The extra
+        // `own_checkpoint_prefix.realized.is_none()` term avoids an
+        // unnecessary epoch-anchor refresh before restoring exact checkpoint
+        // state. `apply_start_epoch > current_epoch` stays skipped as before.
+        if has_new_commits
+            && apply_start_epoch == current_epoch
+            && own_checkpoint_prefix.realized.is_none()
+        {
+            retain_current_group_epoch_snapshot(storage, group_id, max_retained_anchor_rewind)?;
+        }
 
-    // Refresh the current-epoch anchor only in the case that always did:
-    // there are new commits AND the apply starts at the live tip. The extra
-    // `own_checkpoint_prefix.realized.is_none()` term avoids an
-    // unnecessary epoch-anchor refresh before restoring exact checkpoint
-    // state. `apply_start_epoch > current_epoch` stays skipped as before.
-    let prepare_result = if has_new_commits
-        && apply_start_epoch == current_epoch
-        && own_checkpoint_prefix.realized.is_none()
-    {
-        retain_current_group_epoch_snapshot(storage, group_id, max_retained_anchor_rewind)
-            .map_err(OpenMlsProjectionError::from)
-    } else {
-        Ok(())
-    };
-    if let Err(err) = prepare_result {
-        rollback_and_release_group_snapshot(storage, group_id, &snapshot)?;
-        return Err(err);
-    }
-
-    // The historical rewind, restoration of the complete live input/queue set,
-    // selected-branch apply, and apply-snapshot release are one durable unit.
-    // SQLite snapshot rollback joins this outer transaction; a crash or error
-    // therefore returns to the pre-apply live state instead of committing an
-    // older message/queue image and rebuilding it row by row.
-    let apply_result = storage.with_transaction(|storage| {
         if let Some(realized) = own_checkpoint_prefix.realized.as_ref() {
             storage
                 .restore_group_state_checkpoint(group_id, &realized.id)
@@ -2823,25 +2811,13 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
         if apply_start_epoch < current_epoch || restore_own_checkpoint {
             crate::test_crash_hooks::pause_if_requested("historical-apply-before-commit");
         }
-        storage
-            .release_group_snapshot(group_id, &snapshot)
-            .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
-        Ok(observations)
-    });
-
-    match apply_result {
-        Ok(mut output) => {
-            if result.selected_tip.is_some() {
-                retain_current_group_epoch_snapshot(storage, group_id, max_retained_anchor_rewind)?;
-            }
-            attach_late_media_secrets(&mut output.observations, &late_media_secrets)?;
-            Ok(output)
-        }
-        Err(err) => {
-            rollback_and_release_group_snapshot(storage, group_id, &snapshot)?;
-            Err(err)
-        }
+        Ok::<_, OpenMlsProjectionError>(observations)
+    })?;
+    if result.selected_tip.is_some() {
+        retain_current_group_epoch_snapshot(storage, group_id, max_retained_anchor_rewind)?;
     }
+    attach_late_media_secrets(&mut output.observations, &late_media_secrets)?;
+    Ok(output)
 }
 
 /// Encrypted-media secrets of the source epochs of `replay_messages`'
@@ -3174,8 +3150,10 @@ fn rollback_and_release_group_snapshot<S: StorageProvider>(
 /// Restore a pre-apply live snapshot left by a process termination and release
 /// it before the group is hydrated.
 ///
-/// A completed apply releases this snapshot in the same transaction as its
-/// state changes. Consequently any surviving snapshot identifies an
+/// Only the snapshot fallback of `StorageProvider::with_group_savepoint`
+/// writes this snapshot (SQLite uses a savepoint instead), and older versions
+/// wrote it on every apply. A completed apply releases it in the same
+/// transaction as its state changes, so any surviving snapshot identifies an
 /// interrupted apply. Restoring is also safe for snapshots left by older
 /// versions: the captured input records allow convergence to replay any branch
 /// work that had committed immediately before the crash.
@@ -3303,10 +3281,11 @@ fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
     // power loss) mid-merge leaves the persisted group torn (GroupContext/tree
     // at epoch N+1 while group_epoch_secrets/message_secrets lag at epoch N).
     //
-    // The surrounding durable group snapshot (create/rollback/release in
-    // `apply_openmls_canonicalization_result`) intentionally stays OUTSIDE this
-    // boundary: the snapshot guards in-process error returns; this transaction
-    // guards hard crashes mid-merge.
+    // The caller runs this inside `StorageProvider::with_group_savepoint`,
+    // which returns the group to its pre-apply state on an in-process error;
+    // on SQLite this transaction then joins the caller's, and a hard crash
+    // anywhere in the apply commits none of it. The transaction still matters
+    // on its own for backends whose savepoint is the full-snapshot fallback.
     storage.with_transaction(|storage| {
         // No pre-validated own messages here: every own commit on the
         // accepted branch was excluded from `replay_messages` before this

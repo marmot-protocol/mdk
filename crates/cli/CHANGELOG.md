@@ -11,6 +11,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- MarmotKit (Swift and Kotlin) runs MDK on its own multi-thread Tokio runtime: 2–4 worker threads named
+  `marmotkit-rt`. Before, every account worker, relay task and timer shared UniFFI's single
+  `async-compat/tokio-1` fallback thread, and part of each async call ran on the Swift or Kotlin thread awaiting it,
+  which could be the main thread. Generated bindings are unchanged. `SecretStore` and external-signer callbacks,
+  already required to be thread-safe, can now run concurrently on more threads. See the
+  [threading model](../marmot-uniffi/README.md#threading-model).
 - `wn messages edit` refuses, publishing nothing, unless the target is an available chat message this account sent, and reports `invalid_edit_target` in JSON output. Before, it published an edit of another account's message, a reaction or a deleted message that every recipient ignored.
 - Invites and key-package lookups whose relay lookup ran out of time or relay coverage now fail
   with JSON code `directory_lookup_incomplete` and the affected `account_id` instead of
