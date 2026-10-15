@@ -259,12 +259,39 @@ pub struct PendingKeyPackageReplacement {
     pub last_failure_code: Option<String>,
 }
 
+/// How long a consumed KeyPackage's private material outlives confirmed
+/// publication of its replacement. An inviter that fetched the old publication
+/// before the replacement reached it can still be joined (mdk#2344).
+pub const CONSUMED_KEY_PACKAGE_RETENTION_SECS: u64 = 24 * 60 * 60;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetainedKeyPackagePrivateMaterial {
     pub key_package: KeyPackage,
     pub key_package_ref: Vec<u8>,
     pub not_after: Timestamp,
     pub replaced_at: Timestamp,
+    /// A successfully processed Welcome consumed this package, so its private
+    /// material is deleted [`CONSUMED_KEY_PACKAGE_RETENTION_SECS`] after
+    /// `replaced_at`, or at `not_after` if that is earlier.
+    #[serde(default)]
+    pub consumed: bool,
+}
+
+impl RetainedKeyPackagePrivateMaterial {
+    /// When the private material must be deleted.
+    pub fn delete_at(&self) -> Timestamp {
+        if self.consumed {
+            Timestamp(
+                self.not_after.0.min(
+                    self.replaced_at
+                        .0
+                        .saturating_add(CONSUMED_KEY_PACKAGE_RETENTION_SECS),
+                ),
+            )
+        } else {
+            self.not_after
+        }
+    }
 }
 
 /// The one stable replaceable-event slot for an account-device's last-resort
@@ -300,8 +327,11 @@ pub struct KeyPackageLifecycleState {
     pub last_consumed_key_package_ref: Option<Vec<u8>>,
     #[serde(default)]
     pub last_consumed_at: Option<Timestamp>,
-    /// Prior, unconsumed packages remain decryptable until their MLS lifetime
-    /// expires so an invite already in flight can still be processed.
+    /// Prior packages remain decryptable after their replacement so an invite
+    /// already in flight can still be processed: unconsumed ones until their
+    /// MLS lifetime expires, consumed ones for
+    /// [`CONSUMED_KEY_PACKAGE_RETENTION_SECS`]. See
+    /// [`RetainedKeyPackagePrivateMaterial::delete_at`].
     #[serde(default)]
     pub retained_private_material: Vec<RetainedKeyPackagePrivateMaterial>,
     pub pending_replacement: Option<PendingKeyPackageReplacement>,
@@ -378,7 +408,47 @@ pub struct GroupMaintenanceStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::MaintenancePhase;
+    use super::{
+        CONSUMED_KEY_PACKAGE_RETENTION_SECS, MaintenancePhase, RetainedKeyPackagePrivateMaterial,
+    };
+    use crate::engine::KeyPackage;
+    use crate::transport::Timestamp;
+
+    fn retained(not_after: u64, consumed: bool) -> RetainedKeyPackagePrivateMaterial {
+        RetainedKeyPackagePrivateMaterial {
+            key_package: KeyPackage::new(vec![1]),
+            key_package_ref: vec![2],
+            not_after: Timestamp(not_after),
+            replaced_at: Timestamp(1_000),
+            consumed,
+        }
+    }
+
+    #[test]
+    fn retained_key_package_deletion_bound_depends_on_consumption() {
+        let retention_end = 1_000 + CONSUMED_KEY_PACKAGE_RETENTION_SECS;
+        assert_eq!(
+            retained(retention_end + 10, false).delete_at(),
+            Timestamp(retention_end + 10)
+        );
+        assert_eq!(
+            retained(retention_end + 10, true).delete_at(),
+            Timestamp(retention_end)
+        );
+        assert_eq!(
+            retained(retention_end - 10, true).delete_at(),
+            Timestamp(retention_end - 10),
+            "the KeyPackage lifetime still bounds consumed material"
+        );
+    }
+
+    #[test]
+    fn retained_key_package_records_without_consumption_decode_as_unconsumed() {
+        let mut value = serde_json::to_value(retained(5_000, true)).unwrap();
+        value.as_object_mut().unwrap().remove("consumed");
+        let decoded: RetainedKeyPackagePrivateMaterial = serde_json::from_value(value).unwrap();
+        assert!(!decoded.consumed);
+    }
 
     #[test]
     fn maintenance_phase_names_are_stable_snake_case() {

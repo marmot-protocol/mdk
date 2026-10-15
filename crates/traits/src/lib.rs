@@ -88,12 +88,12 @@ pub use ingest::{
     LocalIngestState, PeeledContent, PeeledMessage, ProposalRejectionCategory, StaleReason,
 };
 pub use maintenance::{
-    DurableGroupEvolution, DurableTransportFanout, GroupEvolutionPhase, GroupEvolutionSemantic,
-    GroupMaintenanceState, GroupMaintenanceStatus, KeyPackageLifecycleState, MaintenanceObligation,
-    MaintenancePhase, MaintenanceRandom, MaintenanceRunSummary, MaintenanceTrigger, MonotonicClock,
-    PendingKeyPackageReplacement, PeriodicMaintenancePolicy, RetainedKeyPackagePrivateMaterial,
-    SendMaintenanceDisposition, SignedPublicationArtifact, TransportFanoutAttemptState,
-    TransportFanoutTarget, WallClock,
+    CONSUMED_KEY_PACKAGE_RETENTION_SECS, DurableGroupEvolution, DurableTransportFanout,
+    GroupEvolutionPhase, GroupEvolutionSemantic, GroupMaintenanceState, GroupMaintenanceStatus,
+    KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase, MaintenanceRandom,
+    MaintenanceRunSummary, MaintenanceTrigger, MonotonicClock, PendingKeyPackageReplacement,
+    PeriodicMaintenancePolicy, RetainedKeyPackagePrivateMaterial, SendMaintenanceDisposition,
+    SignedPublicationArtifact, TransportFanoutAttemptState, TransportFanoutTarget, WallClock,
 };
 pub use message::{
     MessageRecord, MessageState, OwnApplicationConvergenceStamp, OwnCommitConvergenceStamp,

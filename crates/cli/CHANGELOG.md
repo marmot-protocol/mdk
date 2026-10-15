@@ -11,6 +11,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- An invite built from a KeyPackage the invitee had just replaced is no longer silently ignored (mdk#2344). After a
+  Welcome consumes a KeyPackage, its private key now stays usable for 24 hours after the replacement is published
+  (or until the KeyPackage expires, if sooner), so a Welcome an inviter built from the old publication can still be
+  joined. Before, the key was deleted as soon as the replacement was published, and the invitee never joined.
 - MarmotKit (Swift and Kotlin) runs MDK on its own multi-thread Tokio runtime: 2–4 worker threads named
   `marmotkit-rt`. Before, every account worker, relay task and timer shared UniFFI's single
   `async-compat/tokio-1` fallback thread, and part of each async call ran on the Swift or Kotlin thread awaiting it,

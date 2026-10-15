@@ -3894,14 +3894,9 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
     accept_group_invite_retrying_busy(&runtime, &bob_id, &group_id)
         .await
         .unwrap();
-    // Bob retires the KeyPackage the first invite consumed once its
-    // replacement is published, and ignores a Welcome built from the retired
-    // one. Replace it now instead of racing his maintenance pass with Alice's
-    // next invite.
-    runtime
-        .rotate_key_package(&bob_id)
-        .await
-        .expect("Bob replaces the KeyPackage the first invite consumed");
+    // Bob's maintenance replaces the KeyPackage the first invite consumed
+    // while Alice's next invite may still be built from it. The replaced key
+    // stays usable for a retention window, so he joins either way (mdk#2344).
 
     let second_group_id = runtime
         .create_group(

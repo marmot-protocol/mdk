@@ -1588,6 +1588,7 @@ mod tests {
             key_package_ref: retained.clone(),
             not_after: Timestamp(2),
             replaced_at: Timestamp(1),
+            consumed: false,
         }];
 
         assert_eq!(

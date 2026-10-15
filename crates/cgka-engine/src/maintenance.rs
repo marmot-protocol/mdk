@@ -66,6 +66,7 @@ impl<S: StorageProvider> Engine<S> {
                         key_package_ref: previous.key_package_ref,
                         not_after: previous.not_after,
                         replaced_at: authored_created_at,
+                        consumed: false,
                     });
             }
             staged.pending_replacement = Some(PendingKeyPackageReplacement {
