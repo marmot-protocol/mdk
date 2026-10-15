@@ -6747,9 +6747,20 @@ async fn app_runtime_declines_pending_invite_by_leaving_and_archiving() {
     .await;
 
     // Drain the leave's remaining projection work before comparing the full
-    // durable row across a rejected stale acceptance.
+    // durable row across a rejected stale acceptance. Alice commits Bob's
+    // removal on her own worker, so wait for it to reach Bob's row as well.
     runtime.catch_up_accounts().await.unwrap();
-    let reloaded = app.group(&bob_label, &group_id_hex).unwrap().unwrap();
+    let reloaded = timeout(Duration::from_secs(10), async {
+        loop {
+            let group = app.group(&bob_label, &group_id_hex).unwrap().unwrap();
+            if group.member_count == Some(1) {
+                break group;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Alice commits Bob's removal");
     assert_eq!(reloaded.self_membership, SelfMembership::Left);
     assert!(!reloaded.pending_confirmation);
     assert!(reloaded.archived);
