@@ -317,6 +317,13 @@ pub(crate) struct SharedConnection {
     inner: Arc<SharedConnectionInner>,
 }
 
+impl SharedConnection {
+    /// Whether both handles are clones of one opened connection.
+    pub(crate) fn same_as(&self, other: &SharedConnection) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
 /// Transient identity without retaining the connection or its database locks.
 #[derive(Clone)]
 pub(crate) struct ConnectionLifetime(std::sync::Weak<SharedConnectionInner>);
@@ -1184,6 +1191,12 @@ impl SqliteAccountStorage {
 
     pub(crate) fn lock(&self) -> StorageResult<ConnectionGuard<'_>> {
         self.connection.lock()
+    }
+
+    /// Whether `other` is a clone of this same opened database handle, not
+    /// merely another connection to the same file.
+    pub fn shares_connection_with(&self, other: &SqliteAccountStorage) -> bool {
+        self.connection.same_as(&other.connection)
     }
 
     /// Checkpoint the WAL and close this account database, releasing every

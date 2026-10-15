@@ -83,7 +83,7 @@ impl MarmotAppRuntime {
                 None => Ok(None),
                 Some(storage_sqlite::RetainedAttachmentRead::Bytes(bytes)) => Ok(Some(bytes)),
                 Some(storage_sqlite::RetainedAttachmentRead::MediaFile(id)) => {
-                    let media = app.account_media_store(label)?;
+                    let media = app.account_media_store(label, &storage)?;
                     let mut bytes = Zeroizing::new(vec![0; limit]);
                     let Some(read) = media
                         .read_at(&id, offset, &mut bytes)

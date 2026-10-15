@@ -6407,22 +6407,32 @@ impl MarmotApp {
         self.audit_export_lifecycle.admit(attempt, work).transpose()
     }
 
-    /// The account's encrypted media store, beside its database in
-    /// `<account>/media`. Blocking: call it, and everything on the store, on
-    /// the blocking pool, never on an async task.
-    pub(crate) fn account_media_store(&self, label: &str) -> Result<AccountMediaStore, AppError> {
-        let storage = self.account_storage(label)?;
+    /// The account's encrypted media store over `storage`, the caller's
+    /// handle on that account's database, in `<account>/media`. It never
+    /// opens a database itself, so it cannot reopen one that removal evicted.
+    /// Creation is admitted like a database open: under the storage
+    /// lifecycle guard, so a store either exists before `close_storage`
+    /// closes them all or is refused afterwards. Blocking callers only.
+    pub(crate) fn account_media_store(
+        &self,
+        label: &str,
+        storage: &SqliteAccountStorage,
+    ) -> Result<AccountMediaStore, AppError> {
+        let _lifecycle = self.begin_storage_open("media store")?;
         let mut stores = self
             .account_media_stores
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(store) = stores.get(label).filter(|store| !store.is_closed()) {
+        if let Some(store) = stores.get(label).filter(|store| {
+            !store.is_closed() && store.catalog().storage().shares_connection_with(storage)
+        }) {
             return Ok(store.clone());
         }
         let store = media_store::MediaStore::new(
             self.account_dir(label).join(media_store::MEDIA_DIRECTORY),
-            storage_sqlite::SqliteMediaCatalog::new(storage),
+            storage_sqlite::SqliteMediaCatalog::new(storage.clone()),
         );
+        // Replacing a store for an older handle closes that one first.
         let closing = store.clone();
         self.close_registry
             .register(media_close_key(label), move || closing.close());
@@ -7139,11 +7149,16 @@ impl MarmotApp {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(label);
-        self.account_media_stores
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(label);
-        self.close_registry.close(&media_close_key(label));
+        {
+            // Evict and close under one lock, so no creator can observe the
+            // empty entry before the latch is tripped.
+            let mut stores = self
+                .account_media_stores
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            stores.remove(label);
+            self.close_registry.close(&media_close_key(label));
+        }
         self.directory_caches
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

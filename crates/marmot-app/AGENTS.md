@@ -63,7 +63,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `MediaFileTransferControl` cancellation/progress handle. Prepare every snapshot before the first PUT, keep chunks
   at 64 KiB, and stage retention through `stage_attachment_upload_files` (never a whole-file `Vec`).
 - Downloaded attachment bodies are retained in the account's encrypted media store (`media-store` crate,
-  `MarmotApp::account_media_store`, one per account; mdk#2314). Every media store call (publish, reuse check, reads,
+  `MarmotApp::account_media_store`, one per account; mdk#2314). Callers pass the database handle they already hold, so
+  creating a store never opens a database; creation is admitted under the storage lifecycle guard like an open. Every media store call (publish, reuse check, reads,
   sweep) runs on the blocking pool, never inline on an account worker or other async task: file I/O, hashing and AEAD
   would stall every account under UniFFI's single runtime thread. The database authorizes and locates each read
   (`retained_attachment_read`) before the store reads the file. Media stores close through `close_registry.rs`, the

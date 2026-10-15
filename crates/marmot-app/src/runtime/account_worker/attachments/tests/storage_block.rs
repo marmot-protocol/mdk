@@ -119,7 +119,7 @@ impl Fixture {
     fn media(&self) -> crate::AccountMediaStore {
         self.client
             .app
-            .account_media_store(&self.client.state.label)
+            .account_media_store(&self.client.state.label, &self.storage)
             .unwrap()
     }
     async fn completion(&mut self) -> MediaHttpDone {

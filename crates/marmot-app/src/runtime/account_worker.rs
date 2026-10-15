@@ -4072,8 +4072,11 @@ async fn complete_media_http(
             // A body is published into the media store on the blocking pool
             // (file I/O, hashing, AEAD); a failure is a database update.
             if result.is_ok() {
-                let storage = client.app.account_storage(&client.state.label);
-                let media = client.app.account_media_store(&client.state.label);
+                let label = &client.state.label;
+                let handles = client.app.account_storage(label).and_then(|storage| {
+                    let media = client.app.account_media_store(label, &storage)?;
+                    Ok((storage, media))
+                });
                 let fallback = super::attachment_controls::default_policy(&client.app.config);
                 let directory = client.app.account_dir(&client.state.label);
                 let tx = media_http.tx.clone();
@@ -4082,10 +4085,10 @@ async fn complete_media_http(
                 // Keep both permits until storage completion, but return to the
                 // worker immediately. Shutdown is checked between stream chunks.
                 tokio::task::spawn_blocking(move || {
-                    let result = storage.and_then(|storage| {
+                    let result = handles.and_then(|(storage, media)| {
                         attachments::complete_acquired_stored(
                             &storage,
-                            &media?,
+                            &media,
                             &fallback,
                             &directory,
                             &job,

@@ -20,6 +20,24 @@ pub struct AttachmentPublication<'a> {
 }
 
 impl SqliteAccountStorage {
+    /// Whether a ready media file already holds this job's content, from the
+    /// database alone (no file check). A scheduler can then attach it before
+    /// download-only gates; the blocking reuse attempt confirms the file.
+    pub fn attachment_media_twin_recorded(
+        &self,
+        reference: &AttachmentAssetRef,
+    ) -> StorageResult<bool> {
+        self.lock()?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM attachment_acquisition q
+                 JOIN media_files mf ON mf.plaintext_digest=q.plaintext_digest
+                 WHERE q.token=?1 AND mf.state=1 AND mf.category=1)",
+                [&reference.token],
+                |row| row.get(0),
+            )
+            .storage()
+    }
+
     /// The media store target for `job`. `clock` gives Unix seconds for the
     /// lease fence at each commit; it must not block.
     pub fn attachment_publication<'a>(

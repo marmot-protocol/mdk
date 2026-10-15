@@ -76,6 +76,11 @@ impl SqliteMediaCatalog {
         Self { storage }
     }
 
+    /// The account database handle this catalog uses.
+    pub fn storage(&self) -> &SqliteAccountStorage {
+        &self.storage
+    }
+
     fn run<T>(&self, f: impl FnOnce(&Connection) -> StorageResult<T>) -> CatalogResult<T> {
         let conn = self.storage.lock().map_err(catalog_error)?;
         f(&conn).map_err(catalog_error)

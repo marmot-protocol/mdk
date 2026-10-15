@@ -217,13 +217,17 @@ pub(super) fn schedule(
         // Reclaim whatever a crash left in the media store before new work.
         spawn_media_sweep(
             admission,
-            client.app.account_media_store(&client.state.label)?,
+            client
+                .app
+                .account_media_store(&client.state.label, &storage)?,
             true,
         );
     } else {
         spawn_media_sweep(
             admission,
-            client.app.account_media_store(&client.state.label)?,
+            client
+                .app
+                .account_media_store(&client.state.label, &storage)?,
             false,
         );
     }
@@ -333,6 +337,62 @@ pub(super) fn schedule(
         } else {
             None
         };
+        let lease_until = now.saturating_add(if explicit {
+            EXPLICIT_LEASE_SECONDS
+        } else {
+            LEASE_SECONDS
+        });
+        // Content another slot already retains needs no download: attach it
+        // before the download-only gates (disk headroom for a new body,
+        // source-key preparation) can defer or fail this job. The database
+        // records the twin; the blocking task confirms its file is on disk.
+        if storage.attachment_media_twin_recorded(&candidate)? {
+            if permission.as_ref().is_some_and(|p| !p.allowed()) {
+                continue;
+            }
+            if host_managed && !explicit {
+                storage.enable_attachment_automatic_history(&candidate)?;
+            }
+            let Some(job) = storage.claim_attachment_acquisition(&candidate, now, lease_until)?
+            else {
+                continue;
+            };
+            let media = client
+                .app
+                .account_media_store(&client.state.label, &storage)?;
+            let storage = storage.clone();
+            let updates = shared.attachment_updates.clone();
+            updates.send_modify(|_| {});
+            spawn_media_http(
+                http,
+                permit,
+                async move {
+                    let attached = {
+                        let job = job.clone();
+                        tokio::task::spawn_blocking(move || {
+                            attach_existing_body(&media, &storage, &job)
+                        })
+                    };
+                    let result = if attached.await.unwrap_or(false) {
+                        Ok(crate::client::AcquiredMediaBody::Retained)
+                    } else {
+                        // The recorded file was gone and is now marked lost:
+                        // retry through the ordinary download path.
+                        Err(AttachmentDownloadFailure::Retry(AppError::BlobStore(
+                            "retained attachment copy unavailable".to_owned(),
+                        )))
+                    };
+                    updates.send_modify(|_| {});
+                    MediaHttpCompletion::Attachment {
+                        job,
+                        result,
+                        background_permit,
+                    }
+                },
+                |completion| completion,
+            );
+            return Ok(more);
+        }
         // References do not declare a trustworthy size. Reserve the configured
         // automatic-sized object even for explicit work, then enforce actual
         // checkpoint/publication capacity as the transfer grows.
@@ -393,19 +453,12 @@ pub(super) fn schedule(
         if host_managed && !explicit {
             storage.enable_attachment_automatic_history(&candidate)?;
         }
-        let Some(job) = storage.claim_attachment_acquisition(
-            &candidate,
-            now,
-            now.saturating_add(if explicit {
-                EXPLICIT_LEASE_SECONDS
-            } else {
-                LEASE_SECONDS
-            }),
-        )?
-        else {
+        let Some(job) = storage.claim_attachment_acquisition(&candidate, now, lease_until)? else {
             continue;
         };
-        let media = client.app.account_media_store(&client.state.label)?;
+        let media = client
+            .app
+            .account_media_store(&client.state.label, &storage)?;
         let resume = crate::media::attachment_resume::AttachmentResume {
             explicit_permission: Default::default(),
             storage: storage.clone(),
@@ -515,7 +568,9 @@ pub(super) fn complete_acquired(
     result: Result<crate::client::AcquiredMediaBody, AttachmentDownloadFailure>,
 ) -> Result<(), AppError> {
     let storage = client.app.account_storage(&client.state.label)?;
-    let media = client.app.account_media_store(&client.state.label)?;
+    let media = client
+        .app
+        .account_media_store(&client.state.label, &storage)?;
     let fallback = super::super::attachment_controls::default_policy(&client.app.config);
     complete_acquired_stored(
         &storage,

@@ -1469,7 +1469,7 @@ pub(super) fn read_retained(
         None => Ok(None),
         Some(storage_sqlite::RetainedAttachmentRead::Bytes(bytes)) => Ok(Some(bytes)),
         Some(storage_sqlite::RetainedAttachmentRead::MediaFile(id)) => {
-            let media = app.account_media_store(label)?;
+            let media = app.account_media_store(label, storage)?;
             let mut bytes = zeroize::Zeroizing::new(vec![0; limit]);
             let Some(read) = media
                 .read_at(&id, offset, &mut bytes)
@@ -1508,4 +1508,161 @@ pub(super) async fn complete_and_settle(
         ));
         complete_media_http(client, retained, shared, http).await;
     }
+}
+
+/// Records a second message carrying the same attachment as `seed`, then
+/// downloads it "elsewhere": its body is retained in the media store directly.
+fn retain_twin(
+    client: &AppClient,
+    storage: &SqliteAccountStorage,
+    reference: &crate::MediaAttachmentReference,
+) {
+    let tag = vec![
+        "imeta".into(),
+        format!("v {}", reference.version),
+        format!("locator blossom-v1 {}", reference.locators[0].value),
+        format!("ciphertext_sha256 {}", reference.ciphertext_sha256),
+        format!("plaintext_sha256 {}", reference.plaintext_sha256),
+        format!("nonce {}", reference.nonce_hex),
+        format!("m {}", reference.media_type),
+        format!("filename {}", reference.file_name),
+    ];
+    let (message, source) = ("44".repeat(32), "55".repeat(32));
+    storage
+        .record_app_event(&StoredAppEvent {
+            group_id_hex: GROUP.into(),
+            message_id_hex: message.clone(),
+            source_message_id_hex: Some(source.clone()),
+            source_epoch: Some(3),
+            direction: "received".into(),
+            sender: "33".repeat(32),
+            plaintext: String::new(),
+            kind: 9,
+            tags: vec![tag],
+            recorded_at: 11,
+            received_at: 11,
+            origin_commit_id: None,
+            moderation_grant: false,
+        })
+        .unwrap();
+    let now = crate::unix_now_seconds();
+    admit_demands(storage, now, false).unwrap();
+    let twin = storage
+        .attachment_transfer_status(GROUP, &message, &source, 0, now, true)
+        .unwrap()
+        .unwrap()
+        .reference
+        .unwrap();
+    let job = storage
+        .claim_attachment_acquisition(&twin, now, now + 600)
+        .unwrap()
+        .unwrap();
+    let body = b"retained worker bytes";
+    let media = client
+        .app
+        .account_media_store(&client.state.label, storage)
+        .unwrap();
+    let clock = crate::unix_now_seconds;
+    assert!(matches!(
+        media
+            .publish(
+                &storage.attachment_publication(&job, &clock),
+                media_store::Category::Retained,
+                &mut std::io::Cursor::new(&body[..]),
+                body.len() as u64,
+                job.plaintext_digest().unwrap(),
+                now,
+                &|| false,
+            )
+            .unwrap(),
+        media_store::PublishOutcome::Published(_)
+    ));
+}
+
+/// Content another slot already retains is attached before the download-only
+/// gates, so neither low disk (no room for a new body) nor missing
+/// source-epoch material (no way to decrypt one) can defer or fail the slot.
+async fn reuse_skips_download_gates(low_disk: bool) {
+    let (dir, mut client, storage, reference) = offline_fixture().await;
+    // The source epoch's key is missing: a download could not be prepared.
+    assert!(
+        client
+            .prepare_background_attachment_download(
+                &GroupId::new(vec![0xab; 16]),
+                reference.clone(),
+                1024
+            )
+            .unwrap()
+            .is_none()
+    );
+    retain_twin(&client, &storage, &reference);
+    if low_disk {
+        crate::media::attachment_resume::test_free_space::set(dir.path(), 0);
+    }
+    let now = crate::unix_now_seconds();
+    admit_demands(&storage, now, false).unwrap();
+    let shared = RuntimeSharedServices::default();
+    let (http, mut completions) = context();
+    let mut admission = Admission::default();
+    schedule(&client, &shared, &http, &mut admission).unwrap();
+    admission.ready().await;
+    schedule(&client, &shared, &http, &mut admission).unwrap();
+    let done = tokio::time::timeout(Duration::from_secs(10), completions.recv())
+        .await
+        .expect("the retained twin is attached without waiting on a download")
+        .unwrap();
+    assert!(matches!(
+        &done.completion,
+        MediaHttpCompletion::Attachment {
+            result: Ok(crate::client::AcquiredMediaBody::Retained),
+            ..
+        }
+    ));
+    complete_and_settle(&mut client, done, &shared, &http, &mut completions).await;
+    let (message, source) = ("11".repeat(32), "22".repeat(32));
+    let status = storage
+        .attachment_transfer_status(GROUP, &message, &source, 0, now, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.state, storage_sqlite::AttachmentTransferState::Ready);
+    assert_eq!(
+        &*read_retained(
+            &storage,
+            &client.app,
+            &client.state.label,
+            &status.reference.unwrap(),
+            crate::unix_now_seconds(),
+            0,
+            100
+        )
+        .unwrap()
+        .unwrap(),
+        b"retained worker bytes"
+    );
+    if low_disk {
+        crate::media::attachment_resume::test_free_space::clear(dir.path());
+    }
+}
+
+#[tokio::test]
+async fn attachment_reuse_attaches_a_retained_twin_despite_low_disk() {
+    reuse_skips_download_gates(true).await;
+}
+
+#[tokio::test]
+async fn attachment_reuse_attaches_a_retained_twin_without_source_epoch_material() {
+    reuse_skips_download_gates(false).await;
+}
+
+/// A media store is created like a database open: refused once storage
+/// closes, even by a caller still holding a database handle, and every store
+/// created before the close is closed with it.
+#[tokio::test]
+async fn media_stores_close_with_storage_and_are_refused_afterwards() {
+    let (_dir, client, storage, _) = offline_fixture().await;
+    let media = client.app.account_media_store("alice", &storage).unwrap();
+    assert!(!media.is_closed());
+    client.app.close_storage().unwrap();
+    assert!(media.is_closed());
+    assert!(client.app.account_media_store("alice", &storage).is_err());
 }
