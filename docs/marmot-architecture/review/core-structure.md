@@ -199,6 +199,22 @@ witness, not the contract the layers above use.
   - NIP-77, NIP-51 and NIP-59 bookkeeping in storage.
 - **Above the transport:** the relay plane, and with it the KeyPackage event format, in `marmot-app`.
 
+### 2.9 Generic SDK or White Noise's app core
+
+MDK is meant to serve any client building a Marmot app, not only White Noise. Most of the stack is generic, but some
+White Noise deployment choices are compiled in:
+- the recovery-operated relays are White Noise's (`crates/marmot-app/src/config.rs:18-21`);
+- directory search defaults to Open Ranking (`config.rs:13-15`);
+- product analytics is written directly against Aptabase (`crates/marmot-app/src/product_analytics/delivery.rs`).
+
+Telemetry and audit delivery already use OTLP, a standard format, and take their endpoints from build-time
+configuration (`config.rs:8-12`), so they are generic enough today. Only audit recording has a trait
+(`ForensicRecorder` in `marmot-forensics`).
+
+Decision for `marmot-observability`: move the code as it is first. The one seam to get right in that move is the
+recording interface `marmot-app` reports through, because that is what any client sees. Exporter traits, such as a
+pluggable analytics provider, can come later, if and when another client needs them.
+
 ## 3. What stays as it is
 
 - The engine's convergence core, its explicit `EpochState`, and the verification around it (engine tests, conformance
@@ -239,7 +255,7 @@ Foundation:   cgka-traits (contracts only)   marmot-components (app component an
 | `transport-nostr` | `transport-nostr-adapter`, `marmot-app` `relay_plane/` | Adapter plus relay plane, routing derivation, coverage evidence (EOSE and paging), and the KeyPackage event format. This is where Pass 1 E's size handling and coverage surface belong. |
 | `directory` (new) | `marmot-app` `directory/`, relay-plane directory code, previews | Discovery, profiles, KeyPackage lookup and search, with the databases it already owns. |
 | `media-store` and media transfer | #2314; `marmot-app` `media/` | The encrypted file store (in progress), plus Blossom transfer, crypto and resume. |
-| `marmot-observability` (new) | `marmot-app` `relay_telemetry_export`, `product_analytics`, `audit_otlp_sender`, audit upload, `collector_host_safety` | The code that ships diagnostics off the device: relay telemetry over OTLP, Aptabase product analytics, audit-log upload and OTLP delivery, and the collector dial-safety checks. The recording points stay in `marmot-app` and report through one observer interface, replacing the 40 `_unobserved` pairs over time. |
+| `marmot-observability` (new) | `marmot-app` `relay_telemetry_export`, `product_analytics`, `audit_otlp_sender`, audit upload, `collector_host_safety` | The code that ships diagnostics off the device: relay telemetry over OTLP, Aptabase product analytics, audit-log upload and OTLP delivery, and the collector dial-safety checks. The recording points stay in `marmot-app` and report through one observer interface, replacing the 40 `_unobserved` pairs over time. Decided 2026-10-15: move it as it is first, and generalize later (§2.9). |
 | `marmot-app` | itself | Composition root and per-account product core, organized by role (writer lane, read path, I/O lanes; [Pass 1 B](b-runtime-concurrency.md)). `AppClient` stops being a public type; only `wn sync` uses it today. |
 
 **Dependency rules for the target:**
@@ -273,7 +289,10 @@ Steps 1, 2, 3 and 6 alone would move about a third of `marmot-app`'s production 
    files give real isolation and remove the engine-cache invalidation and WAL contention, but every coupling in §2.2
    then needs a journal or intent.
 3. Can `AppClient` stop being public? Only `wn sync` and integration tests use it.
-4. Do the names `marmot-device-runtime`, `marmot-components`, `transport-nostr` and `marmot-observability` work for you?
+4. Do the names `marmot-device-runtime`, `marmot-components` and `transport-nostr` work for you? (`marmot-observability`
+   is agreed.)
+5. Should White Noise's deployment defaults (operated relays, directory search provider, analytics provider) move out
+   of the SDK into configuration that hosts pass in (§2.9)?
 
 ## Doc drift found in this pass
 
