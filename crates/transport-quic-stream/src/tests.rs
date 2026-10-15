@@ -452,6 +452,68 @@ fn malformed_certificate_der_fails_without_trust_fallback() {
     ));
 }
 
+/// Chain the production broker presented on 2026-10-15: leaf -> Let's Encrypt
+/// YE2 -> ISRG Root YE -> ISRG Root X2 (the last two are cross-signs).
+const PUBLIC_BROKER_CHAIN_PEM: &[u8] = include_bytes!("../fixtures/quic-broker.ipf.dev-chain.pem");
+const PUBLIC_BROKER_SERVER_NAME: &str = "quic-broker.ipf.dev";
+/// Capture time; inside the leaf's 2026-09-19..2026-12-18 validity window.
+const PUBLIC_BROKER_CHAIN_VERIFIED_AT: Duration = Duration::from_secs(1_792_065_658);
+
+fn public_broker_chain() -> Vec<rustls::pki_types::CertificateDer<'static>> {
+    use rustls::pki_types::pem::PemObject;
+    rustls::pki_types::CertificateDer::pem_slice_iter(PUBLIC_BROKER_CHAIN_PEM)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn verify_with_platform_trust(
+    chain: &[rustls::pki_types::CertificateDer<'static>],
+    server_name: &str,
+) -> Result<(), rustls::Error> {
+    use rustls::client::danger::ServerCertVerifier;
+    let verifier = crate::tls::platform_trust_verifier(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .unwrap();
+    verifier
+        .verify_server_cert(
+            &chain[0],
+            &chain[1..],
+            &rustls::pki_types::ServerName::try_from(server_name.to_owned()).unwrap(),
+            &[],
+            rustls::pki_types::UnixTime::since_unix_epoch(PUBLIC_BROKER_CHAIN_VERIFIED_AT),
+        )
+        .map(|_| ())
+}
+
+#[test]
+fn platform_trust_verifies_ca_signed_public_broker_chain() {
+    // Default trust must verify a CA-signed broker on every platform the SDK
+    // ships to, including Android hosts that never initialize JNI state.
+    verify_with_platform_trust(&public_broker_chain(), PUBLIC_BROKER_SERVER_NAME)
+        .expect("CA-signed broker chain verifies under default trust");
+}
+
+#[test]
+fn platform_trust_rejects_self_signed_and_misnamed_certificates() {
+    let self_signed = rcgen::generate_simple_self_signed(vec![PUBLIC_BROKER_SERVER_NAME.into()])
+        .unwrap()
+        .cert;
+    let err = verify_with_platform_trust(&[self_signed.into()], PUBLIC_BROKER_SERVER_NAME)
+        .expect_err("self-signed certificate must not verify under default trust");
+    assert!(
+        matches!(err, rustls::Error::InvalidCertificate(_)),
+        "{err:?}"
+    );
+
+    let err = verify_with_platform_trust(&public_broker_chain(), "other.ipf.dev")
+        .expect_err("certificate must not verify for another name");
+    assert!(
+        matches!(err, rustls::Error::InvalidCertificate(_)),
+        "{err:?}"
+    );
+}
+
 #[tokio::test]
 async fn quic_receiver_renders_text_deltas_in_order() {
     let receiver = QuicTextStreamReceiver::bind(LOCAL_BIND).unwrap();

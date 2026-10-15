@@ -10,8 +10,7 @@ use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
-use rustls_platform_verifier::BuilderVerifierExt;
-use transport_quic_stream::QuicPreviewTransportProfile;
+use transport_quic_stream::{QuicPreviewTransportProfile, platform_trust_verifier};
 
 use crate::client::BrokerServerTrust;
 use crate::config::{QuicBrokerConfig, QuicBrokerTlsConfig};
@@ -143,8 +142,10 @@ pub(crate) fn broker_rustls_client_config(
         .map_err(|err| QuicBrokerError::ClientConfig(err.to_string()))?;
     let mut crypto = match trust {
         BrokerServerTrust::Platform => builder
-            .with_platform_verifier()
-            .map_err(|err| QuicBrokerError::ClientConfig(err.to_string()))?
+            .with_webpki_verifier(
+                platform_trust_verifier(Arc::clone(&provider))
+                    .map_err(|err| QuicBrokerError::ClientConfig(err.to_string()))?,
+            )
             .with_no_client_auth(),
         BrokerServerTrust::CertificateDer(cert_der) => {
             let mut roots = rustls::RootCertStore::empty();

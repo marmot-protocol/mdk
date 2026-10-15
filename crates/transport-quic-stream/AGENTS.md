@@ -30,7 +30,9 @@ Raw QUIC transport binding for transient Marmot agent text stream previews. Huma
 - `src/publisher_sequence.rs` — durable publisher-sequence reservation boundary (`PublisherSequenceStore`,
   `reserve_publisher_records` (public as `reserve_publisher_records_for_transport`),
   `EphemeralPublisherSequenceStore`).
-- `src/tls.rs` — server/client TLS config, ALPN pinning, and the loopback-only insecure verifier.
+- `src/tls.rs` — server/client TLS config, ALPN pinning, the default-trust verifier (`platform_trust_verifier`:
+  bundled `webpki-roots`, shared with `transport-quic-broker`; never the OS verifier, which panics on Android without
+  JNI setup), and the loopback-only insecure verifier.
 - `src/receive.rs` — `QuicTextStreamReceiver`, the receive loop, and received-stream DTOs (`ServerTrust` lives here).
 - `src/send.rs` — `send_text_stream`, the sender DTOs, and the stream-id / UTF-8 chunk-splitting helpers.
 - `src/limits.rs` — receive-side record/byte limits, the enforcing accumulator, and the limit error.

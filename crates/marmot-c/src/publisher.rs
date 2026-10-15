@@ -44,8 +44,9 @@ pub enum MarmotPublisherTrust {
     AllowLoopback = 1,
 }
 
-/// Borrowed broker options. NULL certificate with zero length selects
-/// platform trust. `trust` is a `MarmotPublisherTrust` discriminant.
+/// Borrowed broker options. NULL certificate with zero length selects the
+/// bundled public-CA roots (not the OS trust store). `trust` is a
+/// `MarmotPublisherTrust` discriminant.
 #[repr(C)]
 pub struct MarmotPublisherOptions {
     pub candidate: *const c_char,
