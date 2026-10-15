@@ -709,6 +709,59 @@ struct EffectProjectionProgress {
     system_row_cursor: usize,
     terminal_frontiers_cleared: bool,
     routes_dirty: bool,
+    /// Quarantined groups whose events in this batch wait for recovery
+    /// (`AppClient::defer_quarantined_group_projection`).
+    deferred_groups: Vec<GroupId>,
+}
+
+/// Retained-batch failures before the held receives are reported, and again
+/// at each doubling, so a stuck batch stays visible without flooding logs.
+const RETAINED_PROJECTION_STALL_WARNING_FAILURES: u32 = 4;
+
+/// The group a strict group read failed on, from the app's own error or the
+/// engine's however the session and account layers wrapped it.
+fn unknown_group_id(error: &AppError) -> Option<GroupId> {
+    use cgka_traits::error::EngineError;
+    let engine = match error {
+        AppError::UnknownGroup(group_id_hex) => {
+            return hex::decode(group_id_hex).ok().map(GroupId::new);
+        }
+        AppError::Account(marmot_account::AccountError::Engine(engine))
+        | AppError::Account(marmot_account::AccountError::Session(
+            cgka_session::SessionError::Engine(engine),
+        ))
+        | AppError::Session(cgka_session::SessionError::Engine(engine)) => engine,
+        _ => return None,
+    };
+    match engine {
+        EngineError::UnknownGroup(group_id) => Some(group_id.clone()),
+        _ => None,
+    }
+}
+
+/// Skip a deferred group's event that is not yet projected. Engine-outbox
+/// events stay unacknowledged so they replay after recovery; the rest still
+/// reach subscribers, without a projection. A projected event keeps its
+/// durable row, so it falls through to stage its acknowledgement again.
+fn defer_event_projection(
+    event: &cgka_traits::engine::GroupEvent,
+    deferred_groups: &[GroupId],
+    projected: bool,
+    summary: &mut SyncSummary,
+) -> bool {
+    if projected
+        || !event_group_id(event).is_some_and(|group_id| deferred_groups.contains(group_id))
+    {
+        return false;
+    }
+    if !matches!(
+        event,
+        cgka_traits::engine::GroupEvent::MessageReceived { .. }
+            | cgka_traits::engine::GroupEvent::GroupJoined { .. }
+    ) {
+        summary.events.push(event.clone());
+    }
+    true
 }
 
 #[derive(Clone, Default)]
@@ -1920,6 +1973,15 @@ impl AppClient {
             if event_progress.completed {
                 continue;
             }
+            if defer_event_projection(
+                event,
+                &progress.deferred_groups,
+                event_progress.projected,
+                summary,
+            ) {
+                event_progress.completed = true;
+                continue;
+            }
             // A replayed application event has no outer relay envelope, but its
             // durable engine outbox key is stable and unique. Use that key as
             // the synthetic source so a crash can replay several pending
@@ -2070,6 +2132,12 @@ impl AppClient {
 
     /// Finish a projected drain while its event progress remains queued.
     async fn checkpoint_drained_effects(&mut self, routes_dirty: bool) -> Result<(), AppError> {
+        #[cfg(test)]
+        if self.fail_drained_effect_checkpoints {
+            return Err(AppError::BlockingTask(
+                "injected drained checkpoint failure".to_owned(),
+            ));
+        }
         // Reconcile transport routes once after the batch drains instead of per
         // membership-changing event. This installs a join's current route and
         // retains any still-live address displaced by a routing rotation.
@@ -2347,13 +2415,25 @@ impl AppClient {
                 summary.merge(batch_summary);
             }
             self.pending_runtime_group_subscription_refresh |= pending.progress.routes_dirty;
+            let deferred = result
+                .as_ref()
+                .is_err_and(|error| self.defer_quarantined_group_projection(error, &mut pending));
             // No await precedes this checkpoint. Cancellation retains native
             // progress and any summary whose outbox acknowledgement is owed.
             *self
                 .pending_applied_effects
                 .front_mut()
                 .expect("queued batch") = pending.clone();
-            routes_dirty |= result?;
+            if deferred {
+                continue;
+            }
+            routes_dirty |= match result {
+                Ok(routes_dirty) => routes_dirty,
+                Err(error) => {
+                    self.note_retained_projection_failure(&error);
+                    return Err(error);
+                }
+            };
             // Only post-engine-success batches own this pin. Projection has
             // settled; release before any checkpoint can seal a newer cursor.
             if let Some(id) = &pending.source_delivery_id {
@@ -2366,13 +2446,68 @@ impl AppClient {
                     .checkpoint_drained_effects(pending.progress.routes_dirty)
                     .await;
                 self.prepend_pending_applied_summary(summary);
-                checkpoint?;
+                // A failed checkpoint keeps this batch retained, and receives
+                // held, just as a failed projection does.
+                if let Err(error) = checkpoint {
+                    self.note_retained_projection_failure(&error);
+                    return Err(error);
+                }
                 self.drain_epoch_stall_escalations(summary);
             }
             summary.merge(pending.uncommitted_summary);
             self.pending_applied_effects.pop_front();
+            self.retained_projection_failures = 0;
         }
         Ok(routes_dirty)
+    }
+
+    /// A strict read of a quarantined group cannot succeed until it rehydrates,
+    /// and the worker reads no delivery while this batch is retained, so one
+    /// such read would hold every conversation's receives (mdk#2318). Defer
+    /// that group's events in this batch and retry the rest. Recovery
+    /// re-derives the group's projection from authoritative state, and its
+    /// unacknowledged outbox events replay. Every other failure, including a
+    /// repeat naming an already deferred group, keeps the batch retained.
+    fn defer_quarantined_group_projection(
+        &self,
+        error: &AppError,
+        pending: &mut PendingAppliedEffects,
+    ) -> bool {
+        let Some(group_id) = unknown_group_id(error) else {
+            return false;
+        };
+        if pending.progress.deferred_groups.contains(&group_id)
+            || !super::group_is_quarantined(&self.runtime, &group_id)
+            || !pending
+                .effects
+                .events
+                .iter()
+                .any(|event| event_group_id(event) == Some(&group_id))
+        {
+            return false;
+        }
+        pending.progress.deferred_groups.push(group_id);
+        tracing::warn!(
+            target: "marmot_app::client",
+            method = "defer_quarantined_group_projection",
+            deferred_groups = pending.progress.deferred_groups.len(),
+            "deferring a quarantined group's projection until it recovers",
+        );
+        true
+    }
+
+    fn note_retained_projection_failure(&mut self, error: &AppError) {
+        self.retained_projection_failures = self.retained_projection_failures.saturating_add(1);
+        let failures = self.retained_projection_failures;
+        if failures >= RETAINED_PROJECTION_STALL_WARNING_FAILURES && failures.is_power_of_two() {
+            tracing::warn!(
+                target: "marmot_app::client",
+                method = "retry_applied_effect_projections",
+                failures,
+                error_kind = error.privacy_safe_kind(),
+                "a retained projection batch is holding the account's receives",
+            );
+        }
     }
 
     /// Commands without a returned summary retain their ordered output for the worker.
@@ -6316,6 +6451,15 @@ impl AppClient {
             if event_progress.completed {
                 continue;
             }
+            if defer_event_projection(
+                event,
+                &progress.deferred_groups,
+                event_progress.projected,
+                summary,
+            ) {
+                event_progress.completed = true;
+                continue;
+            }
             let event_source = event_source_message_id_hex(event, source_message_id_hex);
             // Effects identify authenticated content, not its enclosing relay
             // event. Even a single event can have been released by a later
@@ -6374,7 +6518,7 @@ impl AppClient {
                 let group_projection = if terminal_without_projection {
                     None
                 } else if let Some(group_id) = event_group_id(event)
-                    && super::group_is_quarantined(&self.runtime, group_id)
+                    && self.skips_quarantined_group_reads(group_id)
                 {
                     // A quarantined group's components are unreadable until it
                     // rehydrates. A strict read would retain this batch at the

@@ -315,7 +315,7 @@ impl AppClient {
             return Ok(Vec::new());
         }
         let storage = self.app.account_storage(&self.state.label)?;
-        if super::group_is_quarantined(&self.runtime, group_id) {
+        if self.skips_quarantined_group_reads(group_id) {
             // No live routing component until it rehydrates (mdk#2318). Its
             // delete stored the then-current route, which the engine can
             // keep receiving on: it retains a quarantined group's inbound
