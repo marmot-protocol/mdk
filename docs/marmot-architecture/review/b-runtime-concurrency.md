@@ -248,12 +248,41 @@ Each step ships on its own and can be judged by measurement.
 | Step | Change | Retires |
 | --- | --- | --- |
 | 0. Measure | Thread-name trace of MarmotKit on iOS and Android. Command latency while a convergence pass runs. Snapshot-capture cost. The same flows on the Linux desktop app. | — |
-| 1. Substrate | `marmot-uniffi` owns a multi-thread runtime, documented per binding. Synchronous engine and storage work runs on a per-account blocking executor that stays cancellable, learning from `65f56af60`, and is registered with the close registry from #2323. | Cross-account and relay-plane starvation; most of the 79 `blocking_app_task` sites over time |
+| 1. Substrate | `marmot-uniffi` owns a multi-thread runtime, documented per binding. Synchronous engine and storage work runs on a per-account blocking executor that stays cancellable, learning from `65f56af60`, and is registered with the close registry from #2323. Acceptance criteria are below. | Cross-account and relay-plane starvation; most of the 79 `blocking_app_task` sites over time |
 | 2. Read path | Read-only connections per account. The 15 durable-servable worker reads, and `HistoryNotices`, move off the worker. The writer publishes its small in-memory view after each unit. | Snapshot serving and its O(groups) capture per pass; `NotReady`; the 50 ms authority wait; read timeouts |
 | 3. I/O out of the writer | Fanout waits, KeyPackage discovery and catch-up network run in I/O lanes; the writer only stages and confirms. | The send path's 20 s per-relay hold; media slot parking; long command tails |
 | 4. Per-group readiness | Per-group transport evidence: EOSE per group out of batched REQs, or a per-group comparison. One readiness owner. Durable acknowledgements. A decision on whether application messages respect epoch-gap evidence. | The startup deferred FIFO; the account-wide catch-up holds; `AccountWorkerBusy` for reads |
 | 5. Priority scheduling | The open window and visibility feed a priority class for writer units, I/O, recovery and attachments, with background budgets. | Ad-hoc alternation (`yield_to_convergence`) |
 | 6. Clean up | Remove each workaround once its replacement is measured. | — |
+
+### Step 1 acceptance criteria
+
+**Runtime handoff.**
+
+- Every async export runs its body on the runtime that `marmot-uniffi` owns, never on async-compat's fallback. One way
+  is to spawn the export's future onto the owned runtime and await the `JoinHandle`, which any executor can poll.
+- Synchronous constructors and `start` enter the owned runtime, so code that looks up the current runtime finds it.
+  `spawn_router`, for example, silently does nothing without one (`crates/marmot-app/src/relay_plane/mod.rs:2132-2134`).
+- There is no silent fallback. If the owned runtime cannot be built, construction fails with a typed error rather than
+  running on async-compat's thread.
+- A test checks thread names: account workers, the relay plane and subscription tasks run on the owned runtime's
+  threads, and none run on `async-compat/tokio-1`.
+
+**Cancellation and bounded close.**
+
+- An SQLCipher statement or MLS operation that has started is not interrupted midway. The cancellation boundary is
+  between units: the per-account executor checks a stop flag before each unit, and once stopped it starts no new one.
+- A long SQLite statement that unit size cannot bound, such as the `VACUUM` planned in #2314, must be interruptible
+  through SQLite's interrupt mechanism, so close can stop it.
+- Blocking work that cannot be aborted fails fast. After `close_storage`, every later database call returns
+  `StorageError::Closed`, and close waits only for a statement that has already started
+  (`crates/marmot-app/src/runtime/mod.rs:6105-6121`). Such work therefore stops at its next statement.
+- No writer unit runs longer than the engine's existing budgets: 250 ms in the foreground and 500 ms in the background
+  (`crates/cgka-engine/src/message_processor/mod.rs:273`, `:283`). This is measured at p99 on a mid-range Android device
+  in Step 0. On long histories, meeting it depends on [#2326](https://github.com/marmot-protocol/mdk/issues/2326).
+- `shutdown_and_close` returns within its current graceful budget of 5 s (`crates/marmot-app/src/lib.rs:427`) while a
+  convergence pass and a hydration batch are in flight. When it returns, no connection to any database in the root is
+  open ([#2323](https://github.com/marmot-protocol/mdk/issues/2323)).
 
 These stay under any design: the engine's foreground and background budgets and sliced replay, the writer-side FIFO
 for mutations within a group, typed busy and unknown-completion errors for mutations, and the diagnostics.
