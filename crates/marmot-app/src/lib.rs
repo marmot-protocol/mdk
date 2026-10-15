@@ -4519,7 +4519,7 @@ impl MarmotApp {
         // cache holds. Open and register it under storage-open admission so
         // `close_storage` reaches it while this open is in flight and while
         // the worker later runs on it (mdk#2323).
-        let engine_storage = {
+        let (engine_storage, engine_storage_open) = {
             let lifecycle = self.begin_storage_open("account session")?;
             // load_state/account_storage above completed the first database
             // open. Serialize any remaining key-migration probe with other
@@ -4536,20 +4536,25 @@ impl MarmotApp {
                     SqlcipherDatabaseKind::Session,
                 )?
             };
+            let started = Instant::now();
             let storage = SqliteAccountStorage::open_encrypted(&session_path, &session_key)?;
             self.root_closers.register(&lifecycle, storage.closer());
-            storage
+            (storage, started.elapsed())
         };
         // Optional forensic audit log. Enable `AuditLogSettings` before opening
         // an account session to record per-account/device JSONL at
         // `<account_dir>/audit-<engine_id>-v4.jsonl`. The v4 schema contains
         // privacy-safe derived values only: obfuscated identifiers, digests,
         // lengths, counts, reduced convergence data, and typed outcomes.
-        let mut session_config =
-            SessionConfig::with_storage(engine_storage, account_id.as_slice().to_vec(), peeler)
-                .account_identity_proof_signer(signer.as_proof_signer())
-                .feature_registry(app_feature_registry())
-                .supported_app_components(self.supported_app_component_ids());
+        let mut session_config = SessionConfig::with_storage(
+            engine_storage,
+            engine_storage_open,
+            account_id.as_slice().to_vec(),
+            peeler,
+        )
+        .account_identity_proof_signer(signer.as_proof_signer())
+        .feature_registry(app_feature_registry())
+        .supported_app_components(self.supported_app_component_ids());
         if defer_group_hydration {
             session_config = session_config.defer_group_hydration();
         }

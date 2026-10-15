@@ -1,7 +1,7 @@
 ---
 title: "Local Artifact Safety"
 created: 2026-07-02
-updated: 2026-09-28
+updated: 2026-10-15
 tags: [marmot, overview, security, filesystem, permissions]
 status: overview
 ---

@@ -167,8 +167,10 @@ async fn session_runs_on_a_host_opened_connection_the_host_can_close() {
     let key = SqlCipherKey::new("host-opened session key").unwrap();
     let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let keys = deterministic_nostr_keys(b"alice");
+    let host_open = std::time::Duration::from_secs(3);
     let config = SessionConfig::with_storage(
         storage.clone(),
+        host_open,
         keys.public_key().to_bytes().to_vec(),
         Box::new(MockPeeler),
     )
@@ -176,6 +178,9 @@ async fn session_runs_on_a_host_opened_connection_the_host_can_close() {
     .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
     .feature_registry(FeatureRegistry::new());
     let mut session = AccountDeviceSession::open(config).unwrap();
+    // Open telemetry still covers the storage open the host did itself.
+    let timings = session.open_timings();
+    assert!(timings.storage_open >= host_open && timings.total >= host_open);
 
     session.fresh_key_package().await.unwrap();
     assert_eq!(
