@@ -6409,7 +6409,8 @@ impl MarmotApp {
 
     /// The account's encrypted media store over `storage`, the caller's
     /// handle on that account's database, in `<account>/media`. It never
-    /// opens a database itself, so it cannot reopen one that removal evicted.
+    /// opens a database itself, and `storage` must be the account's current
+    /// cached handle: an evicted one is refused.
     /// Creation is admitted like a database open: under the storage
     /// lifecycle guard, so a store either exists before `close_storage`
     /// closes them all or is refused afterwards. Blocking callers only.
@@ -6423,6 +6424,21 @@ impl MarmotApp {
             .account_media_stores
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Only the account's current handle may own its store. Removal drops
+        // the cached handle before it evicts the store under this lock, so a
+        // caller still holding an evicted handle can neither recreate a store
+        // after removal nor replace (and close) a reopened account's store.
+        let current = self
+            .account_storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(label)
+            .is_some_and(|cached| cached.shares_connection_with(storage));
+        if !current {
+            return Err(AppError::from(cgka_traits::StorageError::Closed(
+                "media store unavailable: account storage handle was evicted".into(),
+            )));
+        }
         if let Some(store) = stores.get(label).filter(|store| {
             !store.is_closed() && store.catalog().storage().shares_connection_with(storage)
         }) {

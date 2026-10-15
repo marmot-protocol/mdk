@@ -1666,3 +1666,30 @@ async fn media_stores_close_with_storage_and_are_refused_afterwards() {
     assert!(media.is_closed());
     assert!(client.app.account_media_store("alice", &storage).is_err());
 }
+
+/// A caller still holding a database handle that removal evicted can neither
+/// recreate the account's media store afterwards nor, once the account is
+/// opened again, replace and close the new store.
+#[tokio::test]
+async fn evicted_database_handles_cannot_create_or_replace_media_stores() {
+    let (_dir, client, stale, _) = offline_fixture().await;
+    let app = &client.app;
+    let evicted = app.account_media_store("alice", &stale).unwrap();
+    app.drop_account_caches("alice");
+    assert!(evicted.is_closed());
+    assert!(app.account_media_store("alice", &stale).is_err());
+
+    let reopened = app.account_storage("alice").unwrap();
+    assert!(!reopened.shares_connection_with(&stale));
+    let current = app.account_media_store("alice", &reopened).unwrap();
+    assert!(app.account_media_store("alice", &stale).is_err());
+    assert!(
+        !current.is_closed(),
+        "a stale handle must not close the current store"
+    );
+    assert!(
+        !app.account_media_store("alice", &reopened)
+            .unwrap()
+            .is_closed()
+    );
+}
