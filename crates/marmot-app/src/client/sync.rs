@@ -739,25 +739,26 @@ fn unknown_group_id(error: &AppError) -> Option<GroupId> {
     }
 }
 
-/// Skip an event of a deferred group. Engine-outbox events stay
-/// unacknowledged so they replay after recovery; the rest still reach
-/// subscribers, without a projection, unless projection already sent them.
+/// Skip a deferred group's event that is not yet projected. Engine-outbox
+/// events stay unacknowledged so they replay after recovery; the rest still
+/// reach subscribers, without a projection. A projected event keeps its
+/// durable row, so it falls through to stage its acknowledgement again.
 fn defer_event_projection(
     event: &cgka_traits::engine::GroupEvent,
     deferred_groups: &[GroupId],
     projected: bool,
     summary: &mut SyncSummary,
 ) -> bool {
-    if !event_group_id(event).is_some_and(|group_id| deferred_groups.contains(group_id)) {
+    if projected
+        || !event_group_id(event).is_some_and(|group_id| deferred_groups.contains(group_id))
+    {
         return false;
     }
-    if !projected
-        && !matches!(
-            event,
-            cgka_traits::engine::GroupEvent::MessageReceived { .. }
-                | cgka_traits::engine::GroupEvent::GroupJoined { .. }
-        )
-    {
+    if !matches!(
+        event,
+        cgka_traits::engine::GroupEvent::MessageReceived { .. }
+            | cgka_traits::engine::GroupEvent::GroupJoined { .. }
+    ) {
         summary.events.push(event.clone());
     }
     true
@@ -2131,6 +2132,12 @@ impl AppClient {
 
     /// Finish a projected drain while its event progress remains queued.
     async fn checkpoint_drained_effects(&mut self, routes_dirty: bool) -> Result<(), AppError> {
+        #[cfg(test)]
+        if self.fail_drained_effect_checkpoints {
+            return Err(AppError::BlockingTask(
+                "injected drained checkpoint failure".to_owned(),
+            ));
+        }
         // Reconcile transport routes once after the batch drains instead of per
         // membership-changing event. This installs a join's current route and
         // retains any still-live address displaced by a routing rotation.
@@ -2439,7 +2446,12 @@ impl AppClient {
                     .checkpoint_drained_effects(pending.progress.routes_dirty)
                     .await;
                 self.prepend_pending_applied_summary(summary);
-                checkpoint?;
+                // A failed checkpoint keeps this batch retained, and receives
+                // held, just as a failed projection does.
+                if let Err(error) = checkpoint {
+                    self.note_retained_projection_failure(&error);
+                    return Err(error);
+                }
                 self.drain_epoch_stall_escalations(summary);
             }
             summary.merge(pending.uncommitted_summary);

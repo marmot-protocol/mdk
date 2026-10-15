@@ -2087,6 +2087,8 @@ impl MarmotApp {
             force_event_group_projection_unavailable: false,
             #[cfg(test)]
             strict_quarantined_group_reads: false,
+            #[cfg(test)]
+            fail_drained_effect_checkpoints: false,
             pending_welcome_delivery_events: Vec::new(),
             pending_superseded_change_events: Vec::new(),
             maintenance_failed_backlog: 0,

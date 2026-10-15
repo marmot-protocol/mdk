@@ -966,6 +966,9 @@ pub struct AppClient {
     /// strictly, standing in for a path that misses `skips_quarantined_group_reads`.
     #[cfg(test)]
     pub(crate) strict_quarantined_group_reads: bool,
+    /// Unit-test fault injection that fails every drained-batch checkpoint.
+    #[cfg(test)]
+    pub(crate) fail_drained_effect_checkpoints: bool,
     /// Welcomes queued for re-delivery during the most recent create/invite.
     /// The runtime account worker drains this after the command and broadcasts a
     /// `WelcomeDeliveryPending` event so callers learn a member is unjoinable

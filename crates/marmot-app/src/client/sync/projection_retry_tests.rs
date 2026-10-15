@@ -1920,3 +1920,113 @@ async fn ordinary_projection_failure_stays_retained_and_counts_toward_stall_warn
     assert!(!client.has_pending_effect_projections());
     assert_eq!(client.retained_projection_failures, 0);
 }
+
+/// A deferred group's event that already projected keeps its durable row, so
+/// it is not skipped: it falls through to stage its outbox acknowledgement
+/// again. Only unprojected events wait, and only non-outbox ones still reach
+/// subscribers (outbox events replay after recovery).
+#[test]
+fn deferral_skips_only_unprojected_events_of_deferred_groups() {
+    let deferred = GroupId::new(vec![0x51; 16]);
+    let healthy = GroupId::new(vec![0x52; 16]);
+    let joined = |group_id: &GroupId| GroupEvent::GroupJoined {
+        group_id: group_id.clone(),
+        via_welcome: cgka_traits::MessageId::new(vec![0x53; 32]),
+        welcomer: None,
+        explicitly_confirmed: false,
+    };
+    let quarantined = GroupEvent::GroupHydrationQuarantined {
+        group_id: deferred.clone(),
+        reason: cgka_traits::engine::GroupHydrationQuarantineReason::OpenMlsLoadFailed,
+    };
+    let groups = std::slice::from_ref(&deferred);
+    let mut summary = SyncSummary::default();
+
+    assert!(defer_event_projection(
+        &joined(&deferred),
+        groups,
+        false,
+        &mut summary
+    ));
+    assert!(summary.events.is_empty(), "an outbox event replays instead");
+    assert!(
+        !defer_event_projection(&joined(&deferred), groups, true, &mut summary),
+        "a projected outbox event must stage its acknowledgement"
+    );
+    assert!(!defer_event_projection(
+        &joined(&healthy),
+        groups,
+        false,
+        &mut summary
+    ));
+    assert!(summary.events.is_empty());
+
+    assert!(defer_event_projection(
+        &quarantined,
+        groups,
+        false,
+        &mut summary
+    ));
+    assert_eq!(
+        summary.events.len(),
+        1,
+        "a non-outbox event still reaches subscribers"
+    );
+    assert!(!defer_event_projection(
+        &quarantined,
+        groups,
+        true,
+        &mut summary
+    ));
+    assert_eq!(
+        summary.events.len(),
+        1,
+        "a projected event is not published twice"
+    );
+}
+
+/// A drained batch whose projection succeeds but whose checkpoint keeps
+/// failing stays retained, holding receives, so it counts toward the warning.
+#[tokio::test]
+async fn failed_drained_checkpoint_counts_toward_stall_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group = client.create_group("checkpoint", &[]).await.unwrap();
+    client.fail_drained_effect_checkpoints = true;
+    let effects = marmot_account::AccountDeviceEffects {
+        events: vec![rename(&group, &account.account_id_hex, 0x78)],
+        ..Default::default()
+    };
+    assert!(
+        client
+            .observe_drained_session_events(&effects)
+            .await
+            .is_err()
+    );
+    for _ in 0..RETAINED_PROJECTION_STALL_WARNING_FAILURES {
+        assert!(
+            client
+                .retry_pending_runtime_group_subscription_refresh()
+                .await
+                .is_err()
+        );
+        assert!(client.has_pending_effect_projections());
+    }
+    assert_eq!(
+        client.retained_projection_failures,
+        RETAINED_PROJECTION_STALL_WARNING_FAILURES + 1
+    );
+    client.fail_drained_effect_checkpoints = false;
+    client
+        .retry_pending_runtime_group_subscription_refresh()
+        .await
+        .unwrap();
+    assert!(!client.has_pending_effect_projections());
+    assert_eq!(client.retained_projection_failures, 0);
+}
