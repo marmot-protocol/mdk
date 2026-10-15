@@ -1663,3 +1663,133 @@ async fn resumed_publication_wakes_after_revival_and_checkpoint() {
         }
     }
 }
+
+/// mdk#2318: a hydration-quarantined group's events must not hold the account's
+/// retained projection queue. Covers both entries that used to retain them
+/// (a locally deleted group, and a healthy send before the first drain),
+/// repeated retries, a restart, and recovery that keeps the delete intact.
+#[tokio::test]
+async fn quarantined_group_events_do_not_retain_account_projection() {
+    use cgka_traits::storage::MessageStorage;
+
+    for (locally_deleted, outgoing_first) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let case = format!("locally_deleted={locally_deleted} outgoing_first={outgoing_first}");
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = app.client("alice").await.unwrap();
+        let broken = client.create_group("quarantined", &[]).await.unwrap();
+        let healthy = client.create_group("healthy", &[]).await.unwrap();
+        if locally_deleted {
+            assert!(client.delete_group_local(&broken).await.unwrap());
+        }
+        drop(client);
+
+        // Two ambiguous apply snapshots make hydration fail with the
+        // production reason without touching the group's stored state.
+        let storage = app.account_storage("alice").unwrap();
+        storage
+            .create_group_snapshot(&broken, "openmls-apply-incident-a")
+            .unwrap();
+        storage
+            .create_group_snapshot(&broken, "openmls-apply-incident-b")
+            .unwrap();
+
+        // Open twice: the second open is a restart that re-quarantines.
+        for _restart in 0..2 {
+            let mut client = app.client("alice").await.unwrap();
+            assert_eq!(client.quarantined_groups().len(), 1, "{case}");
+            assert_eq!(
+                client.quarantined_groups()[0].reason,
+                crate::AppGroupHydrationQuarantineReason::GroupRecordLoadFailed
+            );
+            if outgoing_first {
+                let before = relay.published_event_ids().len();
+                client
+                    .send(&healthy, b"healthy outgoing before drain")
+                    .await
+                    .unwrap();
+                assert!(relay.published_event_ids().len() > before, "{case}");
+            }
+            client.drain_pending_session_events().await.unwrap();
+            assert!(!client.has_pending_effect_projections(), "{case}");
+            assert!(
+                client
+                    .routing
+                    .snapshot()
+                    .group_routes
+                    .iter()
+                    .any(|route| route.group_id == broken),
+                "{case}: a quarantined group keeps its route"
+            );
+            for _ in 0..3 {
+                client
+                    .retry_pending_runtime_group_subscription_refresh()
+                    .await
+                    .unwrap();
+                assert!(!client.has_pending_effect_projections(), "{case}");
+            }
+            // With nothing retained, the next event waits on transport for a
+            // delivery instead of failing on the quarantined group.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), client.next_event())
+                    .await
+                    .is_err(),
+                "{case}: next_event must reach the transport read"
+            );
+            let before = relay.published_event_ids().len();
+            client.send(&healthy, b"healthy outgoing").await.unwrap();
+            assert!(relay.published_event_ids().len() > before, "{case}");
+            assert!(!client.has_pending_effect_projections(), "{case}");
+            assert_eq!(client.quarantined_groups().len(), 1, "{case}");
+            assert_eq!(
+                client.state_group_record(&broken).is_none(),
+                locally_deleted,
+                "{case}"
+            );
+            assert_eq!(
+                client.has_local_group_deletion_frontier(&broken).unwrap(),
+                locally_deleted,
+                "{case}"
+            );
+        }
+
+        // Repair the fixture. Recovery reinstalls the hidden group's route
+        // without resurrecting its chat or dropping its delete intent.
+        storage
+            .release_group_snapshot(&broken, "openmls-apply-incident-a")
+            .unwrap();
+        storage
+            .release_group_snapshot(&broken, "openmls-apply-incident-b")
+            .unwrap();
+        let mut client = app.client("alice").await.unwrap();
+        client.drain_pending_session_events().await.unwrap();
+        assert!(client.quarantined_groups().is_empty(), "{case}");
+        assert!(!client.has_pending_effect_projections(), "{case}");
+        assert_eq!(
+            client.state_group_record(&broken).is_none(),
+            locally_deleted,
+            "{case}"
+        );
+        assert_eq!(
+            client.has_local_group_deletion_frontier(&broken).unwrap(),
+            locally_deleted,
+            "{case}"
+        );
+        assert!(
+            client
+                .routing
+                .snapshot()
+                .group_routes
+                .iter()
+                .any(|route| route.group_id == broken),
+            "{case}: a live hidden group keeps its route"
+        );
+    }
+}

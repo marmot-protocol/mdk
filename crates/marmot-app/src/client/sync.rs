@@ -6373,6 +6373,13 @@ impl AppClient {
                     };
                 let group_projection = if terminal_without_projection {
                     None
+                } else if let Some(group_id) = event_group_id(event)
+                    && super::group_is_quarantined(&self.runtime, group_id)
+                {
+                    // A quarantined group's components are unreadable until it
+                    // rehydrates. A strict read would retain this batch at the
+                    // head of the account queue and stall every receive.
+                    self.event_group_projection_best_effort(group_id, group_metadata.as_ref())
                 } else {
                     event_group_id(event)
                         .map(|group_id| {

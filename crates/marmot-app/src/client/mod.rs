@@ -1203,6 +1203,16 @@ pub(crate) fn group_is_terminal(runtime: &AppRuntime, group_id: &GroupId) -> boo
         .is_ok_and(|group| group.is_terminal())
 }
 
+/// A hydration-quarantined group has no live MLS state, so its routing and
+/// display components cannot be read until it rehydrates (mdk#2318).
+pub(crate) fn group_is_quarantined(runtime: &AppRuntime, group_id: &GroupId) -> bool {
+    runtime.quarantined_group_count() > 0
+        && runtime
+            .quarantined_groups()
+            .iter()
+            .any(|(quarantined, _)| quarantined == group_id)
+}
+
 /// Translate the engine's refusal of an epoch-pinned application message
 /// into the media-boundary error the caller expects. Only media sends pin an
 /// epoch, so the engine variants never reach a host for any other intent.
