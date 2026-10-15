@@ -136,7 +136,10 @@ async fn members_share_real_activity_targets_and_reactions_after_reopen() {
     // published only after the ingest that produced it commits (mdk#2345).
     alice.shutdown_and_close().await.unwrap();
     bob.shutdown_and_close().await.unwrap();
-    for (dir, label) in [(&alice_dir, "alice"), (&bob_dir, "bob")] {
+    for (dir, label, source) in [
+        (&alice_dir, "alice", "Alice's live timeline showed"),
+        (&bob_dir, "bob", "Bob's completed send recorded"),
+    ] {
         let app = open(dir, &url);
         // Read before any runtime starts, so no catch-up can restore it.
         let stored = app
@@ -147,7 +150,7 @@ async fn members_share_real_activity_targets_and_reactions_after_reopen() {
         assert_eq!(
             reactions(&stored),
             heart,
-            "{label}'s store must keep the reaction its timeline showed"
+            "{label}'s store must keep the reaction {source}"
         );
         let runtime = app.runtime();
         runtime.start().await.unwrap();
