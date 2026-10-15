@@ -31,5 +31,10 @@ under `src/`; see [`../../AGENTS.md`](../../AGENTS.md).
   and `deferred_peel` are authoritative and `record` is `NULL`; legacy format-1 rows stay readable and promote
   atomically on mutation. Other Marmot records (for example groups) are serialized `record` blobs so trait shapes can
   evolve through Rust migrations.
+- `openmls_content` / `openmls_epoch` are derived from `payload` in `put_message_on_connection`, the one write path
+  for message rows; never write them anywhere else. Filtered listings may only *leave out* rows they classify, and
+  must return pending (`-1`) and unclassified (`4`) rows.
+- Select state-filtered message rows by id from a covering index, then read them by id in id order
+  (`state_filtered_message_sql`). A plain `ORDER BY insert_order` lets SQLite walk the whole group to skip a sort.
 - Preserve insertion order where replay depends on deterministic ordering.
 - Group delete must remove group-scoped OpenMLS rows too.

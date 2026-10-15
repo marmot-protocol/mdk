@@ -48,6 +48,41 @@ impl ClassifiedConvergenceInput {
         PASS_OPENING_STATES.contains(&self.state)
     }
 
+    /// Whether this is a delivered application that no candidate of a pass
+    /// replaying from `witness_floor` can count or withdraw.
+    ///
+    /// Every candidate forks at the pass's replay start, which is at or
+    /// above `witness_floor`. `attach_app_witnesses` counts an application
+    /// only from an epoch strictly after a candidate's fork, and one at or
+    /// below the replay start is probed on the shared base state before any
+    /// candidate's first commit, so it decrypts on every candidate or on
+    /// none: never a witness, never a `LosingBranch` withdrawal. A delivered
+    /// one also needs no disposition (mdk#2330).
+    ///
+    /// Inert for selection is not inert for replay: decrypting it steps its
+    /// sender's receive ratchet, which a pending application of the same
+    /// epoch may need ([`Self::replays_after_delivered_applications`]).
+    pub(crate) fn is_inert_delivered_witness(self, witness_floor: u64) -> bool {
+        self.role == ConvergencePassMemberRole::AppWitnessCandidate
+            && self.state == MessageState::Processed
+            && self.source_epoch <= witness_floor
+    }
+
+    /// Whether this is an unresolved application replayed on the shared base
+    /// state of a pass with this witness floor, after the delivered
+    /// applications of its epoch.
+    ///
+    /// Replaying those steps each sender's receive ratchet in the anchor
+    /// state, and OpenMLS refuses a generation more than
+    /// `DEFAULT_MAXIMUM_FORWARD_DISTANCE` ahead of it, so the pass keeps that
+    /// epoch's delivered applications for such an input. Locally authored
+    /// applications are exempt: replay never decrypts them.
+    pub(crate) fn replays_after_delivered_applications(self, witness_floor: u64) -> bool {
+        self.role == ConvergencePassMemberRole::AppWitnessCandidate
+            && self.state != MessageState::Processed
+            && self.source_epoch <= witness_floor
+    }
+
     fn can_gate_outbound(self) -> bool {
         OUTBOUND_GATING_STATES.contains(&self.state)
     }

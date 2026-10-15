@@ -326,6 +326,20 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
     `::a_parked_application_whose_branch_never_wins_is_terminalized_undelivered`,
     `::a_commit_awaiting_adjudication_is_adjudicated_before_the_application_drain`, and
     `::an_application_parked_ahead_of_its_commit_is_delivered_beside_a_parked_rival` (blast-radius guard).
+- **A pass holds only the delivered applications that can witness (mdk#2330).** Every candidate a pass materializes
+  forks at its replay start, `attach_app_witnesses` counts only epochs strictly after a candidate's fork, and an
+  application at or below the replay start is probed on the shared base, so it decrypts on every candidate or none. A
+  `Processed` application at or below the pass's witness floor (lowest unresolved commit source epoch in the window,
+  capped by both tip authorities) is therefore inert: seeding leaves it out
+  (`ClassifiedConvergenceInput::is_inert_delivered_witness`) and storage never reads it (`OpenMlsContentFilter`). An
+  admitted commit forking below the floor lowers it, and admission takes the delivered applications in between back
+  into the collecting pass; without that top-up a deeper rival wins over witnessed history. Inert for selection is not
+  inert for replay: decrypting a delivered application steps its sender's receive ratchet in the anchor state, and
+  OpenMLS refuses a generation more than 1,000 ahead, so a pass that holds an unresolved, non-own application at or
+  below the floor keeps every delivered application of that epoch (seeding and admission alike;
+  `ClassifiedConvergenceInput::replays_after_delivered_applications`). If replay ever starts below the lowest
+  unresolved commit, or witnesses start counting shared-prefix epochs, revisit the floor. Pinned by
+  `tests/distributed_convergence/delivered_witnesses.rs`.
 - **Only `NonSelectedEligibleBranch` may drive a withdrawal.** `handle_commit` also returns `MissingCandidateParent`
   when the pass selected no branch at all (the common case); withdrawing there would tombstone a device's applied
   history on a pass that decided nothing — the hazard `emit_superseded_processed_commits` guards with its

@@ -386,7 +386,8 @@ class AndroidArtifactTests(unittest.TestCase):
     def test_release_and_candidate_assembly_commands(self):
         release = (ROOT / ".github/workflows/bindings.yaml").read_text()
         candidate = (ROOT / ".github/workflows/bindings-profile.yml").read_text()
-        self.assertGreaterEqual(candidate.count("- .github/workflows/bindings.yaml"), 2)
+        self.assertIn("- .github/workflows/bindings.yaml", candidate.split("  push:", 1)[1])
+        self.assertIn("if: needs.identity.outputs.run_android == 'true'", candidate)
         self.assertIn("test-android-artifact.py", candidate)
         release_script = extract_run(release, "      - name: Package Android bundle\n")
         candidate_script = extract_run(candidate, "      - name: Assemble and validate Android candidate package\n")

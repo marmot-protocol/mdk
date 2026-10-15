@@ -12,8 +12,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A unique group also protects queued master runs: GitHub otherwise replaces
+  # older pending runs even when cancel-in-progress is false.
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -35,7 +37,16 @@ jobs:
       run_formal: ${{ steps.classify.outputs.run_formal }}
       run_hermes: ${{ steps.classify.outputs.run_hermes }}
       run_installers: ${{ steps.classify.outputs.run_installers }}
-      apple_opt_in: ${{ steps.apple.outputs.apple_opt_in }}
+      apple_opt_in: ${{ steps.labels.outputs.apple_opt_in }}
+      test_profile: ${{ steps.tests.outputs.test_profile }}
+      workspace_filter: ${{ steps.tests.outputs.workspace_filter }}
+      run_tests: ${{ steps.tests.outputs.run_tests }}
+      full_workspace: ${{ steps.tests.outputs.full_workspace }}
+      cli_profile: ${{ steps.tests.outputs.cli_profile }}
+      relay_profile: ${{ steps.tests.outputs.relay_profile }}
+      run_cli: ${{ steps.tests.outputs.run_cli }}
+      run_relay: ${{ steps.tests.outputs.run_relay }}
+      run_simulator: ${{ steps.tests.outputs.run_simulator }}
     permissions:
       contents: read
       pull-requests: read
@@ -47,42 +58,54 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Classify changed paths
-        id: classify
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
-          EVENT_NAME: ${{ github.event_name }}
-        run: |
-          set -euo pipefail
-          if [[ "$EVENT_NAME" == "workflow_dispatch" \
-            || -z "$BASE_SHA" \
-            || "$BASE_SHA" =~ ^0+$ ]] \
-            || ! git cat-file -e "${BASE_SHA}^{commit}"; then
-            python3 scripts/classify_ci_changes.py --all --github-output "$GITHUB_OUTPUT" </dev/null
-          else
-            # Disable rename detection so a code-to-Markdown rename exposes
-            # both the removed code path and the added documentation path.
-            git diff --no-renames --name-only -z "$BASE_SHA" "$GITHUB_SHA" \
-              | python3 scripts/classify_ci_changes.py --github-output "$GITHUB_OUTPUT"
-          fi
-
-      # macOS jobs stay off the pull-request path unless a maintainer adds the
-      # `ci:apple` label. Labels are read live so "Re-run all jobs" picks up a
-      # label added after the push.
-      - name: Check Apple opt-in label
-        id: apple
+      # Read labels live so adding ci:full or ci:apple followed by "Re-run all
+      # jobs" selects the requested coverage without a new source commit.
+      - name: Check CI opt-in labels
+        id: labels
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
-          apple_opt_in=false
-          if [[ -n "$PR_NUMBER" ]] \
-            && gh api "repos/$REPO/issues/$PR_NUMBER/labels" --jq '.[].name' | grep -x 'ci:apple' >/dev/null; then
-            apple_opt_in=true
+          labels='[]'
+          if [[ -n "$PR_NUMBER" ]]; then
+            labels="$(gh api "repos/$REPO/issues/$PR_NUMBER/labels" --jq '[.[].name]')"
           fi
-          echo "apple_opt_in=$apple_opt_in" >> "$GITHUB_OUTPUT"
+          echo "full_ci=$(jq 'index("ci:full") != null' <<<"$labels")" >> "$GITHUB_OUTPUT"
+          echo "apple_opt_in=$(jq 'index("ci:apple") != null or index("ci:full") != null' <<<"$labels")" >> "$GITHUB_OUTPUT"
+
+      - name: Classify changed paths
+        id: classify
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+          FULL_CI: ${{ steps.labels.outputs.full_ci }}
+        run: |
+          set -euo pipefail
+          umask 077
+          paths="$RUNNER_TEMP/ci-changes"
+          : > "$paths"
+          flags=()
+          if [[ "$EVENT_NAME" != "pull_request" || "$FULL_CI" == true \
+            || -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]] \
+            || ! git cat-file -e "${BASE_SHA}^{commit}"; then
+            flags=(--all)
+          else
+            # Include removed paths and rename sources; test selection must
+            # also cover old dependents when a source becomes documentation.
+            git diff --no-renames --name-only -z "$BASE_SHA" "$GITHUB_SHA" > "$paths"
+          fi
+          python3 scripts/classify_ci_changes.py "${flags[@]}" --github-output "$GITHUB_OUTPUT" < "$paths"
+          printf '%s\n' "${flags[@]}" > "$RUNNER_TEMP/ci-test-flags"
+
+      - name: Select affected crate tests
+        id: tests
+        run: |
+          set -euo pipefail
+          flags=()
+          if grep -qx -- --all "$RUNNER_TEMP/ci-test-flags"; then flags=(--all); fi
+          python3 scripts/select_ci_tests.py "${flags[@]}" --github-output "$GITHUB_OUTPUT" --summary "$GITHUB_STEP_SUMMARY" < "$RUNNER_TEMP/ci-changes"
 
   rust-format:
     name: Rust format
@@ -156,6 +179,7 @@ jobs:
           ./scripts/check_convergence_constant_ledger.sh
           python3 scripts/test_check_cargo_audit_ci.py
           python3 scripts/test_classify_ci_changes.py
+          python3 scripts/test_select_ci_tests.py
 
   rust-audit:
     name: Rust audit
@@ -428,9 +452,12 @@ jobs:
   rust-test-build:
     name: Build workspace tests
     needs: changes
-    if: needs.changes.outputs.run_full == 'true'
+    if: needs.changes.outputs.run_tests == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      NEXTEST_PROFILE: ${{ needs.changes.outputs.test_profile }}
+      WORKSPACE_FILTER: ${{ needs.changes.outputs.workspace_filter }}
 
     steps:
       - name: Check out repository
@@ -459,7 +486,7 @@ jobs:
           shared-key: rust-test
 
       - name: Verify workspace shard coverage
-        run: bash scripts/check_ci_partitions.sh 5 --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --timings -E 'not (package(marmot-app) & binary(relay_runtime)) and not (package(wn-cli) & binary(cli))'
+        run: bash scripts/check_ci_partitions.sh 5 --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --timings --profile "$NEXTEST_PROFILE" -E "$WORKSPACE_FILTER"
 
       - name: Upload workspace compiler timings
         if: always()
@@ -471,7 +498,21 @@ jobs:
           retention-days: 7
 
       - name: Archive workspace tests
-        run: cargo nextest archive --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked -E 'not (package(marmot-app) & binary(relay_runtime)) and not (package(wn-cli) & binary(cli))' --archive-file tests.tar.zst
+        run: cargo nextest archive --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --profile "$NEXTEST_PROFILE" -E "$WORKSPACE_FILTER" --archive-file tests.tar.zst
+
+      # CI/config PRs select ci-full. Exercise the actual filtered archive and
+      # ci-pr execution path too, using a small crate already compiled above.
+      - name: Verify PR profile archive execution
+        if: github.event_name == 'pull_request' && needs.changes.outputs.full_workspace == 'true'
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/pr-profile-tests.tar.zst"
+          cargo nextest archive --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --profile ci-pr -E 'package(=agent-control)' --archive-file "$archive"
+          bash scripts/check_ci_partitions.sh 5 --archive-file "$archive" --workspace-remap "$GITHUB_WORKSPACE" --profile ci-pr -E 'package(=agent-control)'
+          for partition in 1 2 3 4 5; do
+            cargo nextest run --archive-file "$archive" --workspace-remap "$GITHUB_WORKSPACE" --profile ci-pr -E 'package(=agent-control)' --partition "count:$partition/5" --no-tests=pass
+          done
+          cargo nextest run --archive-file "$archive" --workspace-remap "$GITHUB_WORKSPACE" --profile ci-pr -E 'none()' --no-tests=pass
 
       - name: Upload test archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -485,9 +526,12 @@ jobs:
 
   rust-test:
     name: Rust tests (${{ matrix.partition }}/5)
-    needs: rust-test-build
+    needs: [changes, rust-test-build]
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      NEXTEST_PROFILE: ${{ needs.changes.outputs.test_profile }}
+      WORKSPACE_FILTER: ${{ needs.changes.outputs.workspace_filter }}
     strategy:
       fail-fast: false
       matrix:
@@ -522,7 +566,7 @@ jobs:
         # The subprocess-heavy `wn-cli::cli` suite runs in its own
         # `cli-e2e` job so its fan-out never starves these fast unit tests
         # (issue #103). `relay_runtime` keeps its own serial job.
-        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --profile ci --partition count:${{ matrix.partition }}/5 -E 'not (package(marmot-app) & binary(relay_runtime)) and not (package(wn-cli) & binary(cli))'
+        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --partition count:${{ matrix.partition }}/5 --no-tests=pass --profile "$NEXTEST_PROFILE" -E "$WORKSPACE_FILTER"
 
   rust-test-extras:
     name: Doctests and diagnostic exporters
@@ -565,9 +609,11 @@ jobs:
   cli-e2e-build:
     name: Build CLI tests
     needs: changes
-    if: needs.changes.outputs.run_full == 'true'
+    if: needs.changes.outputs.run_cli == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      NEXTEST_PROFILE: ${{ needs.changes.outputs.cli_profile }}
 
     steps:
       - name: Check out repository
@@ -596,10 +642,10 @@ jobs:
           shared-key: cli-e2e
 
       - name: Verify CLI shard coverage
-        run: bash scripts/check_ci_partitions.sh 2 -p wn-cli --test cli --features test-policy-overrides --locked -E 'all()'
+        run: bash scripts/check_ci_partitions.sh 2 -p wn-cli --test cli --features test-policy-overrides --locked --profile "$NEXTEST_PROFILE" -E 'all()'
 
       - name: Archive CLI tests
-        run: cargo nextest archive -p wn-cli --test cli --features test-policy-overrides --locked --archive-file tests.tar.zst
+        run: cargo nextest archive -p wn-cli --test cli --features test-policy-overrides --locked --profile "$NEXTEST_PROFILE" --archive-file tests.tar.zst
 
       - name: Upload test archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -613,9 +659,11 @@ jobs:
 
   cli-e2e:
     name: CLI e2e (mock relay, ${{ matrix.partition }}/2)
-    needs: cli-e2e-build
+    needs: [changes, cli-e2e-build]
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      NEXTEST_PROFILE: ${{ needs.changes.outputs.cli_profile }}
     strategy:
       fail-fast: false
       matrix:
@@ -651,14 +699,16 @@ jobs:
         # test-group and the `ci` profile adds retries + a hung-test backstop.
         # The real-relay test self-skips here; it has its own `Relay CLI E2E`
         # job with a docker relay stack.
-        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --partition count:${{ matrix.partition }}/2 --profile ci
+        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --partition count:${{ matrix.partition }}/2 --profile "$NEXTEST_PROFILE"
 
   relay-runtime-build:
     name: Build relay runtime tests
     needs: changes
-    if: needs.changes.outputs.run_full == 'true'
+    if: needs.changes.outputs.run_relay == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      NEXTEST_PROFILE: ${{ needs.changes.outputs.relay_profile }}
 
     steps:
       - name: Check out repository
@@ -687,10 +737,10 @@ jobs:
           shared-key: relay-runtime
 
       - name: Verify relay runtime shard coverage
-        run: bash scripts/check_ci_partitions.sh 2 -p marmot-app --test relay_runtime --test startup_hydration --features test-policy-overrides --locked -E 'binary(relay_runtime)'
+        run: bash scripts/check_ci_partitions.sh 2 -p marmot-app --test relay_runtime --test startup_hydration --features test-policy-overrides --locked --profile "$NEXTEST_PROFILE" -E 'binary(relay_runtime)'
 
       - name: Archive relay runtime tests
-        run: cargo nextest archive -p marmot-app --test relay_runtime --test startup_hydration --features test-policy-overrides --locked --archive-file tests.tar.zst
+        run: cargo nextest archive -p marmot-app --test relay_runtime --test startup_hydration --features test-policy-overrides --locked --profile "$NEXTEST_PROFILE" --archive-file tests.tar.zst
 
       - name: Upload test archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -704,9 +754,11 @@ jobs:
 
   relay-runtime:
     name: Relay runtime tests (${{ matrix.partition }}/2)
-    needs: relay-runtime-build
+    needs: [changes, relay-runtime-build]
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      NEXTEST_PROFILE: ${{ needs.changes.outputs.relay_profile }}
     strategy:
       fail-fast: false
       matrix:
@@ -741,7 +793,7 @@ jobs:
         # Preserve the former cargo-test lane's no-retry behavior.
         env:
           RUST_BACKTRACE: "1"
-        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --profile default --retries 0 --test-threads 1 --partition count:${{ matrix.partition }}/2 -E 'binary(relay_runtime)'
+        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --profile "$NEXTEST_PROFILE" --retries 0 --test-threads 1 --partition count:${{ matrix.partition }}/2 -E 'binary(relay_runtime)'
 
       - name: Run held peer-index upgrade lookup
         if: matrix.partition == 1
@@ -802,9 +854,11 @@ jobs:
   conformance-build:
     name: Build simulator tests
     needs: changes
-    if: needs.changes.outputs.run_conformance == 'true'
+    if: needs.changes.outputs.run_simulator == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      NEXTEST_PROFILE: ${{ needs.changes.outputs.test_profile }}
 
     steps:
       - name: Check out repository
@@ -838,10 +892,10 @@ jobs:
           shared-key: simulator-tests
 
       - name: Verify simulator smoke shard coverage
-        run: bash scripts/check_ci_partitions.sh 2 -p cgka-conformance-simulator --locked -E "$(just --evaluate simulator-smoke-filter) and not binary(offline_catchup_regression)"
+        run: bash scripts/check_ci_partitions.sh 2 -p cgka-conformance-simulator --locked --profile "$NEXTEST_PROFILE" -E "$(just --evaluate simulator-smoke-filter) and not binary(offline_catchup_regression)"
 
       - name: Archive default-feature simulator tests
-        run: cargo nextest archive -p cgka-conformance-simulator --locked --archive-file simulator.tar.zst
+        run: cargo nextest archive -p cgka-conformance-simulator --locked --profile "$NEXTEST_PROFILE" --archive-file simulator.tar.zst
 
       - name: Upload simulator test archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -855,9 +909,11 @@ jobs:
 
   conformance:
     name: Simulator and vectors (${{ matrix.lane }})
-    needs: conformance-build
+    needs: [changes, conformance-build]
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      NEXTEST_PROFILE: ${{ needs.changes.outputs.test_profile }}
     strategy:
       fail-fast: false
       # Three jobs, balanced by measured runtime, keep this matrix off the
@@ -919,21 +975,21 @@ jobs:
           run_group() {
             case "$1" in
               smoke-*)
-                "${nextest[@]}" --profile ci --partition "count:${1#smoke-}/2" \
+                "${nextest[@]}" --profile "$NEXTEST_PROFILE" --partition "count:${1#smoke-}/2" \
                   -E "$(just --evaluate simulator-smoke-filter) and not binary(offline_catchup_regression)"
                 ;;
               offline-history)
-                # Preserve the complete suite, including both 1024-message cases.
-                "${nextest[@]}" --profile ci -E 'binary(=offline_catchup_regression)'
+                # ci-full retains both 1024-message cases; ci-pr keeps smaller history controls.
+                "${nextest[@]}" --profile "$NEXTEST_PROFILE" -E 'binary(=offline_catchup_regression)'
                 ;;
               process)
-                "${nextest[@]}" --profile ci \
+                "${nextest[@]}" --profile "$NEXTEST_PROFILE" \
                   -E "binary(=process_orchestrator) and ($(just --evaluate simulator-process-filter))"
                 ;;
               models)
                 local status=0
                 for binary in route_assurance independent_reference_model lifecycle_model mutation_adequacy protocol_decision_gate semantic_reduction; do
-                  "${nextest[@]}" --profile ci -E "binary(=$binary)" || status=1
+                  "${nextest[@]}" --profile "$NEXTEST_PROFILE" -E "binary(=$binary)" || status=1
                 done
                 return "$status"
                 ;;
@@ -953,7 +1009,7 @@ jobs:
   conformance-extras:
     name: Convergence gates and simulator doctests
     needs: changes
-    if: needs.changes.outputs.run_conformance == 'true'
+    if: needs.changes.outputs.run_simulator == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:

@@ -286,6 +286,7 @@ cargo-audit-policy-gate:
 
 ci-path-classifier-gate:
     python3 scripts/test_classify_ci_changes.py
+    python3 scripts/test_select_ci_tests.py
 
 openclaw-dev-smoke root="":
     #!/usr/bin/env bash

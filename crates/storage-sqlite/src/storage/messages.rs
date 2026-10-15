@@ -8,9 +8,14 @@ use crate::{
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::message::{
     DeferredMessageMetadata, DeferredPeelLifecycle, MessageRecord, MessageState,
+    StoredMessagePayload,
 };
-use cgka_traits::storage::{GroupStateCheckpointRef, MessageStorage, StorageError, StorageResult};
+use cgka_traits::storage::{
+    GroupStateCheckpointRef, MessageStorage, OpenMlsContentFilter, StorageError, StorageResult,
+};
 use cgka_traits::types::{EpochId, GroupId, MessageId};
+use openmls::prelude::tls_codec::Deserialize as _;
+use openmls::prelude::{ContentType, MlsMessageBodyIn, MlsMessageIn, ProtocolMessage};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
@@ -21,6 +26,18 @@ const MESSAGE_FORMAT_PROMOTION_BATCH_MAX: usize = 256;
 
 const MESSAGE_COLUMNS: &str =
     "id, group_id, epoch, state, storage_format, record, payload, deferred_peel";
+
+// `openmls_content` values: what a row's payload carries, derived on every
+// write so convergence listings can filter in SQL (`OpenMlsContentFilter`).
+/// Written before migration 0111 and not derived yet; always listed.
+const OPENMLS_CONTENT_PENDING: i64 = -1;
+/// No OpenMLS wire message in the payload.
+const OPENMLS_CONTENT_NONE: i64 = 0;
+const OPENMLS_CONTENT_COMMIT: i64 = 1;
+const OPENMLS_CONTENT_PROPOSAL: i64 = 2;
+const OPENMLS_CONTENT_APPLICATION: i64 = 3;
+/// OpenMLS wire bytes this backend cannot classify; always listed.
+const OPENMLS_CONTENT_UNCLASSIFIED: i64 = 4;
 
 type MessageColumns = (
     Vec<u8>,
@@ -144,7 +161,10 @@ impl SqliteAccountStorage {
         })
     }
 
-    /// Promote at most `limit` legacy message rows to normalized format 2.
+    /// Bring at most `limit` message rows up to the current row format:
+    /// legacy format-1 rows are promoted to normalized format 2, and rows
+    /// written before migration 0111 gain their derived OpenMLS content
+    /// columns (only those columns are written for them).
     ///
     /// The bounded batch is atomic and idempotent. A malformed row rolls the
     /// whole batch back, so a caller never observes a skipped or half-promoted
@@ -164,11 +184,13 @@ impl SqliteAccountStorage {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .storage()?;
+            // Every format-1 row predates migration 0111, so the rows still
+            // missing their OpenMLS content are a superset of the legacy ones.
             let rows = {
                 let mut statement = tx
                     .prepare_cached(&format!(
                         "SELECT {MESSAGE_COLUMNS} FROM cgka_messages
-                         WHERE storage_format = 1
+                         WHERE openmls_content = {OPENMLS_CONTENT_PENDING}
                          ORDER BY insert_order
                          LIMIT ?1"
                     ))
@@ -186,8 +208,19 @@ impl SqliteAccountStorage {
             #[cfg(test)]
             let mut promoted_so_far = 0;
             for columns in rows {
-                let record = decode_message_columns(columns)?;
-                put_message_on_connection(&tx, None, &record)?;
+                if columns.4 == NORMALIZED_MESSAGE_STORAGE_FORMAT {
+                    let (openmls_content, openmls_epoch) =
+                        openmls_content_columns(columns.6.as_deref().unwrap_or_default());
+                    tx.execute_cached(
+                        "UPDATE cgka_messages SET openmls_content = ?1, openmls_epoch = ?2
+                         WHERE id = ?3",
+                        params![openmls_content, openmls_epoch, columns.0],
+                    )
+                    .storage()?;
+                } else {
+                    let record = decode_message_columns(columns)?;
+                    put_message_on_connection(&tx, None, &record)?;
+                }
                 #[cfg(test)]
                 {
                     promoted_so_far += 1;
@@ -196,9 +229,12 @@ impl SqliteAccountStorage {
             }
             let has_more = tx
                 .query_row_cached(
-                    "SELECT EXISTS(
-                        SELECT 1 FROM cgka_messages WHERE storage_format = 1
-                     )",
+                    &format!(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM cgka_messages
+                            WHERE openmls_content = {OPENMLS_CONTENT_PENDING}
+                         )"
+                    ),
                     [],
                     |row| row.get(0),
                 )
@@ -475,12 +511,7 @@ impl MessageStorage for SqliteAccountStorage {
         if states.is_empty() {
             return Ok(Vec::new());
         }
-        let sql = format!(
-            "SELECT {MESSAGE_COLUMNS} FROM cgka_messages
-             WHERE group_id = ?1 AND epoch >= ?2 AND state IN ({})
-             ORDER BY insert_order",
-            state_placeholders(states)
-        );
+        let sql = state_filtered_message_sql(states);
         let conn = self.lock()?;
         let mut stmt = conn.prepare_cached(&sql).storage()?;
         let records = stmt
@@ -498,6 +529,31 @@ impl MessageStorage for SqliteAccountStorage {
         records.into_iter().map(decode_message_columns).collect()
     }
 
+    fn list_openmls_messages_in_states(
+        &self,
+        group_id: &GroupId,
+        states: &[MessageState],
+        at_or_after_epoch: EpochId,
+        filter: OpenMlsContentFilter,
+    ) -> StorageResult<Vec<MessageRecord>> {
+        let Some((sql, filter_epoch)) = openmls_filtered_message_sql(states, filter) else {
+            return Ok(Vec::new());
+        };
+        let mut bound = vec![
+            rusqlite::types::Value::Blob(group_id.as_slice().to_vec()),
+            rusqlite::types::Value::Integer(epoch_to_i64(at_or_after_epoch)?),
+        ];
+        bound.extend(filter_epoch.map(rusqlite::types::Value::Integer));
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare_cached(&sql).storage()?;
+        let records = stmt
+            .query_map(rusqlite::params_from_iter(bound), message_columns)
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        records.into_iter().map(decode_message_columns).collect()
+    }
+
     fn visit_messages_in_states(
         &self,
         group_id: &GroupId,
@@ -508,12 +564,7 @@ impl MessageStorage for SqliteAccountStorage {
         if states.is_empty() {
             return Ok(());
         }
-        let sql = format!(
-            "SELECT {MESSAGE_COLUMNS} FROM cgka_messages
-             WHERE group_id = ?1 AND epoch >= ?2 AND state IN ({})
-             ORDER BY insert_order",
-            state_placeholders(states)
-        );
+        let sql = state_filtered_message_sql(states);
         let conn = self.lock()?;
         let mut stmt = conn.prepare_cached(&sql).storage()?;
         let rows = stmt
@@ -947,11 +998,13 @@ pub(super) fn put_message_on_connection(
     record: &MessageRecord,
 ) -> StorageResult<()> {
     let deferred_peel = record.deferred_peel.as_ref().map(serialize).transpose()?;
+    let (openmls_content, openmls_epoch) = openmls_content_columns(&record.payload);
     match insert_order {
         None => conn.execute_cached(
             "INSERT INTO cgka_messages (
-                 id, group_id, epoch, state, storage_format, record, payload, deferred_peel
-             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)
+                 id, group_id, epoch, state, storage_format, record, payload, deferred_peel,
+                 openmls_content, openmls_epoch
+             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9)
              ON CONFLICT(id) DO UPDATE SET
                 group_id = excluded.group_id,
                 epoch = excluded.epoch,
@@ -959,7 +1012,9 @@ pub(super) fn put_message_on_connection(
                 storage_format = excluded.storage_format,
                 record = NULL,
                 payload = excluded.payload,
-                deferred_peel = excluded.deferred_peel",
+                deferred_peel = excluded.deferred_peel,
+                openmls_content = excluded.openmls_content,
+                openmls_epoch = excluded.openmls_epoch",
             params![
                 record.id.as_slice(),
                 record.group_id.as_slice(),
@@ -968,13 +1023,15 @@ pub(super) fn put_message_on_connection(
                 NORMALIZED_MESSAGE_STORAGE_FORMAT,
                 &record.payload,
                 deferred_peel,
+                openmls_content,
+                openmls_epoch,
             ],
         ),
         Some(insert_order) => conn.execute_cached(
             "INSERT INTO cgka_messages (
                  insert_order, id, group_id, epoch, state, storage_format,
-                 record, payload, deferred_peel
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8)",
+                 record, payload, deferred_peel, openmls_content, openmls_epoch
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10)",
             params![
                 insert_order,
                 record.id.as_slice(),
@@ -984,11 +1041,173 @@ pub(super) fn put_message_on_connection(
                 NORMALIZED_MESSAGE_STORAGE_FORMAT,
                 &record.payload,
                 deferred_peel,
+                openmls_content,
+                openmls_epoch,
             ],
         ),
     }
     .storage()?;
     Ok(())
+}
+
+/// `(openmls_content, openmls_epoch)` for a stored payload: the content type
+/// and epoch of the OpenMLS message it carries, parsed the way the engine's
+/// `project_mls_message` parses it.
+///
+/// Listings only ever *leave out* rows by these columns, so the derivation
+/// has to be exact for the rows it classifies and may give up on anything
+/// else: whatever it cannot classify is `OPENMLS_CONTENT_UNCLASSIFIED`, which
+/// every listing returns for the engine to judge.
+pub(super) fn openmls_content_columns(payload: &[u8]) -> (i64, Option<i64>) {
+    let Ok(payload) = StoredMessagePayload::decode(payload) else {
+        return (OPENMLS_CONTENT_UNCLASSIFIED, None);
+    };
+    let Some(message) = payload.as_openmls_wire() else {
+        return (OPENMLS_CONTENT_NONE, None);
+    };
+    let Ok(mls) = MlsMessageIn::tls_deserialize_exact(&message.payload) else {
+        return (OPENMLS_CONTENT_UNCLASSIFIED, None);
+    };
+    let protocol: ProtocolMessage = match mls.extract() {
+        MlsMessageBodyIn::PrivateMessage(private) => private.into(),
+        MlsMessageBodyIn::PublicMessage(public) => public.into(),
+        MlsMessageBodyIn::Welcome(_)
+        | MlsMessageBodyIn::GroupInfo(_)
+        | MlsMessageBodyIn::KeyPackage(_) => return (OPENMLS_CONTENT_UNCLASSIFIED, None),
+    };
+    // An epoch SQLite cannot hold as INTEGER cannot be compared in SQL.
+    let Ok(epoch) = i64::try_from(protocol.epoch().as_u64()) else {
+        return (OPENMLS_CONTENT_UNCLASSIFIED, None);
+    };
+    let content = match protocol.content_type() {
+        ContentType::Commit => OPENMLS_CONTENT_COMMIT,
+        ContentType::Proposal => OPENMLS_CONTENT_PROPOSAL,
+        ContentType::Application => OPENMLS_CONTENT_APPLICATION,
+    };
+    (content, Some(epoch))
+}
+
+/// Rows of a group in `states` at or after an epoch (`?1`, `?2`, then one
+/// placeholder per state), in insertion order.
+///
+/// The row ids come from the covering `(group_id, state, epoch)` index and the
+/// rows are then read by id in id order. Asking for the order directly lets
+/// the planner walk every row of the group by `(group_id, insert_order)` to
+/// skip a sort, so a listing of a rare state paid for the group's whole
+/// delivered history. Rows are still read one at a time, so a visitor that
+/// stops early leaves the remaining payloads unread.
+fn state_filtered_message_sql(states: &[MessageState]) -> String {
+    format!(
+        "SELECT {MESSAGE_COLUMNS} FROM cgka_messages
+         WHERE insert_order IN (
+             SELECT insert_order FROM cgka_messages
+             WHERE group_id = ?1 AND state IN ({}) AND epoch >= ?2
+         )
+         ORDER BY insert_order",
+        state_placeholders(states)
+    )
+}
+
+/// SQL for [`MessageStorage::list_openmls_messages_in_states`], binding the
+/// group id (`?1`), the epoch floor (`?2`) and, when the filter has one, the
+/// filter's MLS epoch (`?3`) returned beside it. `None` when no row can match.
+///
+/// Each arm selects row ids from the covering
+/// `(group_id, state, openmls_content, openmls_epoch)` index, so rows the
+/// filter leaves out are never read. Rows whose content is pending (written
+/// before migration 0111) or unclassified match every arm that can return
+/// them, because only the engine can judge them.
+fn openmls_filtered_message_sql(
+    states: &[MessageState],
+    filter: OpenMlsContentFilter,
+) -> Option<(String, Option<i64>)> {
+    let state_list = |states: &[&MessageState]| {
+        states
+            .iter()
+            .map(|state| message_state_to_i64(**state).to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let id_query = |states: &str, contents: &str| {
+        format!(
+            "SELECT insert_order FROM cgka_messages
+             WHERE group_id = ?1 AND state IN ({states}) AND openmls_content IN ({contents})"
+        )
+    };
+    let unknown = format!("{OPENMLS_CONTENT_PENDING}, {OPENMLS_CONTENT_UNCLASSIFIED}");
+    let mut arms = Vec::new();
+    let mut filter_epoch = None;
+    match filter {
+        OpenMlsContentFilter::ApplicationsAt(epoch) => {
+            let all: Vec<_> = states.iter().collect();
+            if all.is_empty() {
+                return None;
+            }
+            let all = state_list(&all);
+            arms.push(id_query(&all, &unknown));
+            // No classified application holds an epoch SQLite cannot store.
+            if let Ok(epoch) = i64::try_from(epoch.0) {
+                filter_epoch = Some(epoch);
+                arms.push(format!(
+                    "{} AND openmls_epoch = ?3",
+                    id_query(&all, &OPENMLS_CONTENT_APPLICATION.to_string())
+                ));
+            }
+        }
+        OpenMlsContentFilter::Commits => {
+            let all: Vec<_> = states.iter().collect();
+            if !all.is_empty() {
+                arms.push(id_query(
+                    &state_list(&all),
+                    &format!("{OPENMLS_CONTENT_COMMIT}, {unknown}"),
+                ));
+            }
+        }
+        OpenMlsContentFilter::WithoutProcessedApplicationsThrough(_)
+        | OpenMlsContentFilter::WithoutProcessedApplications => {
+            let other: Vec<_> = states
+                .iter()
+                .filter(|state| **state != MessageState::Processed)
+                .collect();
+            if !other.is_empty() {
+                arms.push(id_query(
+                    &state_list(&other),
+                    &format!(
+                        "{OPENMLS_CONTENT_COMMIT}, {OPENMLS_CONTENT_PROPOSAL}, \
+                         {OPENMLS_CONTENT_APPLICATION}, {unknown}"
+                    ),
+                ));
+            }
+            if states.contains(&MessageState::Processed) {
+                let processed = state_list(&[&MessageState::Processed]);
+                arms.push(id_query(
+                    &processed,
+                    &format!("{OPENMLS_CONTENT_COMMIT}, {OPENMLS_CONTENT_PROPOSAL}, {unknown}"),
+                ));
+                if let OpenMlsContentFilter::WithoutProcessedApplicationsThrough(epoch) = filter {
+                    // An epoch beyond SQLite's INTEGER range leaves out every
+                    // classified application, all of which hold smaller epochs.
+                    filter_epoch = Some(i64::try_from(epoch.0).unwrap_or(i64::MAX));
+                    arms.push(format!(
+                        "{} AND openmls_epoch > ?3",
+                        id_query(&processed, &OPENMLS_CONTENT_APPLICATION.to_string())
+                    ));
+                }
+            }
+        }
+    }
+    if arms.is_empty() {
+        return None;
+    }
+    Some((
+        format!(
+            "SELECT {MESSAGE_COLUMNS} FROM cgka_messages
+             WHERE insert_order IN ({}) AND epoch >= ?2
+             ORDER BY insert_order",
+            arms.join(" UNION ALL ")
+        ),
+        filter_epoch,
+    ))
 }
 
 /// `?N` placeholder list for a state `IN (...)` clause, numbered after the
@@ -1157,6 +1376,10 @@ fn pending_authority_upgrade(existing: &[u8], incoming: &GroupEvent) -> StorageR
     }
     Ok(false)
 }
+
+#[cfg(test)]
+#[path = "messages/openmls_content_tests.rs"]
+mod openmls_content_tests;
 
 #[cfg(test)]
 mod tests {

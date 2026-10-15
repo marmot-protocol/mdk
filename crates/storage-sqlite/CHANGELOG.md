@@ -4,15 +4,22 @@
 
 ### Breaking changes
 
+- Migration 0111 advances account storage to schema 111 on first open. Older
+  binaries reject the upgraded database; downgrade is unsupported. It adds
+  `cgka_messages.openmls_content` and `openmls_epoch`, which every write
+  derives from the payload (the OpenMLS content type and MLS epoch it
+  carries), plus a covering `(group_id, state, openmls_content,
+  openmls_epoch)` index and a partial index of rows not derived yet. Existing
+  rows take `-1` without a table rewrite (mdk#2330).
 - Migration 0110 advances account storage to schema 110 on first open. Older
   binaries reject the upgraded database; downgrade is unsupported. It adds
   `media_files` (per-file keys and states for the encrypted media store,
   mdk#2314) and `media_file_refs` (attachment slot to ready file), with triggers
   that delete a file's key with its last reference and on a store reset.
-- Migration 0111 advances account storage to schema 111 on first open. Older
+- Migration 0112 advances account storage to schema 112 on first open. Older
   binaries reject the upgraded database; downgrade is unsupported. It discards
   existing download checkpoints (the next attempt starts its body over) and adds
-  `attachment_partial.wire_file_id`: checkpoint ciphertext now lives in a media
+  `attachment_partial.wire_file_id` and `progress_floor`: checkpoint ciphertext now lives in a media
   store `.wire` file and the row keeps only its metadata (mdk#2314).
 - Download checkpoints are metadata only. `begin_attachment_partial` starts one
   and returns its wire file id, `record_attachment_partial` records bytes the
@@ -33,6 +40,10 @@
 
 ### Added
 
+- `MessageStorage::list_openmls_messages_in_states` leaves out, in SQL, the rows
+  an `OpenMlsContentFilter` excludes (delivered applications at or below an
+  epoch, everything but commits, or everything but one epoch's applications);
+  rows not derived yet or unclassified are always returned (mdk#2330).
 - `SqliteMediaCatalog` and `SlotPublication` implement the `media-store` crate's
   `MediaCatalog` and `PublishTarget` traits on the account database;
   `release_media_reference` removes a slot's reference and reports released files.
@@ -63,6 +74,12 @@
 
 ### Fixed
 
+- `list_messages_in_states` and `visit_messages_in_states` take row ids from
+  the `(group_id, state, epoch)` index and read rows by id. Ordering by
+  `insert_order` alone let SQLite walk every row of the group, so listing a
+  rare state cost the group's whole history (mdk#2330).
+- `promote_legacy_message_rows` also derives the OpenMLS content columns of
+  rows written before migration 0111, writing only those columns.
 - `complete_attachment_acquisition` publishes a body larger than one 64 KiB
   staging chunk as a completed chunked file, the layout the file sink's import
   already produces, so no SQLite value holds more than one chunk of it and the

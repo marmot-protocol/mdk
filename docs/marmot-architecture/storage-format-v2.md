@@ -1,7 +1,7 @@
 ---
 title: "Storage Format v2"
 created: 2026-08-13
-updated: 2026-09-08
+updated: 2026-10-15
 tags: [marmot, storage, sqlite, migration, encoding]
 status: current
 ---
@@ -138,6 +138,32 @@ free-space requirement scale with message history. Current writes are format
 2. Updating a legacy row promotes it atomically; updating a format-2 state
 changes only the scalar `state` and, when leaving `PeelDeferred`, clears
 `deferred_peel`. It does not read, decode, copy, or rewrite `payload`.
+
+### Derived OpenMLS content columns
+
+Migration `0111_message_openmls_content` adds two columns that `put_message`
+derives from `payload` on every write (mdk#2330):
+
+| Column | Meaning |
+| --- | --- |
+| `openmls_content` | `1` commit, `2` proposal, `3` application: the content type of the framed public or private MLS message the payload carries. `0`: the payload carries no OpenMLS wire message. `4`: unclassified (undecodable payload, other MLS bodies, an epoch beyond SQLite `INTEGER`). `-1`: not derived yet. |
+| `openmls_epoch` | That message's MLS epoch, for classes `1`–`3`; otherwise `NULL`. |
+
+They are a derived index, never an authority. `list_openmls_messages_in_states`
+uses them to leave out rows its `OpenMlsContentFilter` excludes (delivered
+applications at or below a convergence pass's witness floor, everything but
+commits for the deferred-peel fingerprint, everything but one epoch's
+applications), reading row ids from the covering
+`(group_id, state, openmls_content, openmls_epoch)` index. Classes `-1` and `4`
+are always returned, and the engine re-classifies every returned row from its
+payload, so a derivation gap costs reads, not correctness.
+
+Existing rows take `-1` without a table rewrite. The bounded promotion sweep
+(`promote_legacy_message_rows`) now also derives those rows, writing only the
+two columns; until it reaches a row, listings return it as before. Rows older
+than a pass's rewind horizon are not listed by pass seeding at all, so a
+not-yet-derived history stops costing a pass once a few commits have aged it
+out.
 
 The retained legacy `record` column is a compatibility read path, not an
 ongoing second authority. The storage primitive accepts a caller-selected

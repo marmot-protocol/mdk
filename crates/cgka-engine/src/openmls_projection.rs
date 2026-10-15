@@ -3466,7 +3466,7 @@ pub(crate) const OPENMLS_GRAPH_INPUT_STATES: [MessageState; 5] = [
     MessageState::Processed,
 ];
 
-fn unresolved_commit_state(state: MessageState) -> bool {
+pub(crate) fn unresolved_commit_state(state: MessageState) -> bool {
     matches!(
         state,
         MessageState::Sent

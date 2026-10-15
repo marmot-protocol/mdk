@@ -90,7 +90,7 @@ mod tests {
             before,
             "a rolled-back apply keeps the old trigger"
         );
-        // Through this migration only: 0111 later drops database checkpoints.
+        // Through this migration only: 0112 later drops database checkpoints.
         run(&mut conn, &MIGRATIONS[..109]).unwrap();
         run(&mut conn, &MIGRATIONS[..109]).unwrap();
         let row = conn

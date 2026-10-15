@@ -26,8 +26,9 @@ permissions:
   packages: write
 
 concurrency:
+  # Serialize publishers for a ref so an older build cannot overwrite latest.
   group: quic-broker-image-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   image:

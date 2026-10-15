@@ -79,6 +79,12 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
   - **Owns:** Source-epoch application attribution after removal, replacement leaf reuse, and rejoin; direct
     ingestion and buffered replay after restart, duplicate suppression, and forged replacement-author rejection.
 
+- **File:** `distributed_convergence/delivered_witnesses.rs`
+  - **Owns:** Which delivered applications a convergence pass holds (mdk#2330): inert ones at or below the witness
+    floor are left out, a lower-epoch rival admitted mid-pass takes them back, a pending application keeps its
+    epoch's delivered ones for its sender's receive ratchet, and SQLite's content-filtered listing leaves out exactly
+    what the engine's own projection of real messages would.
+
 - **File:** `distributed_convergence/encrypted_media_source_secret.rs`
   - **Owns:** A replayed media application carries its source-epoch encrypted-media secret on `MessageReceived`
     even when the same pass advances past the anchor horizon and prunes that epoch's retained anchor.

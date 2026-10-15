@@ -43,6 +43,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   they accept it, or pass `--accept-undelivered` to `wn groups` to make the change anyway.
   `wn groups commit-delivery <group-hex>` lists the relays still owed the change. MarmotKit reports
   it as `GroupCommitUndelivered`.
+- Applying a group change no longer slows down with the number of messages delivered since the
+  last few changes (mdk#2330). In a group with 50,000 such messages, ingesting a commit and
+  converging it took about 2.6 s and now takes about 9 ms. Account storage migration 111 adds two
+  indexed columns to message rows; rows written earlier are filled in by background maintenance.
 
 ## [0.13.0] - 2026-10-12
 

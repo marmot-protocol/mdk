@@ -239,6 +239,28 @@ pub struct TransportGroupRoute {
 
 // ── MessageStorage ──────────────────────────────────────────────────────────
 
+/// Rows a backend may leave out of
+/// [`MessageStorage::list_openmls_messages_in_states`].
+///
+/// A row is classified by its payload: the content type and epoch of the
+/// OpenMLS message that [`crate::message::StoredMessagePayload::as_openmls_wire`]
+/// carries. Every variant leaves out rows whose payload carries no OpenMLS
+/// wire message. A row the backend cannot classify (an undecodable payload,
+/// MLS bytes that are not a framed public or private message, an epoch the
+/// backend cannot index) is never left out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenMlsContentFilter {
+    /// Only commits.
+    Commits,
+    /// Every OpenMLS message except `Processed` applications whose epoch is
+    /// at or below this one.
+    WithoutProcessedApplicationsThrough(EpochId),
+    /// Every OpenMLS message except `Processed` applications.
+    WithoutProcessedApplications,
+    /// Only applications whose epoch is this one.
+    ApplicationsAt(EpochId),
+}
+
 /// Messages + epoch-scoped snapshot/rollback hooks.
 ///
 /// Snapshots are name-keyed per-group: the engine's `EpochManager` creates
@@ -306,6 +328,25 @@ pub trait MessageStorage {
             .into_iter()
             .filter(|record| states.contains(&record.state))
             .collect())
+    }
+
+    /// [`Self::list_messages_in_states`], from which the backend may leave out
+    /// the rows `filter` excludes, in the same order.
+    ///
+    /// The filter only narrows what is read: a backend may return rows it
+    /// excludes, and the default returns every row, so callers classify each
+    /// returned row themselves. It must not leave out any other row.
+    /// Convergence pass seeding, the send gate, and the deferred-peel commit
+    /// fingerprint list through this, so a backend that classifies rows does
+    /// not hand them the group's whole delivered history.
+    fn list_openmls_messages_in_states(
+        &self,
+        group_id: &GroupId,
+        states: &[MessageState],
+        at_or_after_epoch: EpochId,
+        _filter: OpenMlsContentFilter,
+    ) -> StorageResult<Vec<MessageRecord>> {
+        self.list_messages_in_states(group_id, states, at_or_after_epoch)
     }
 
     /// Visit matching rows in insertion order (see the trait doc), stopping as

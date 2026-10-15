@@ -1,4 +1,4 @@
-//! Migration 0111: download checkpoints move from SQLCipher chunk rows to
+//! Migration 0112: download checkpoints move from SQLCipher chunk rows to
 //! append-only `.wire` files in the media store (mdk#2314 step 2b). A
 //! checkpoint row now records only the identity, the received length and the
 //! id of its wire file, plus `progress_floor`: the length of the checkpoint it

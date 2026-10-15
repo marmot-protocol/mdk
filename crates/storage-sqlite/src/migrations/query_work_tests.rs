@@ -45,12 +45,105 @@ fn seed_query_history(conn: &rusqlite::Connection, count: i64) {
     .unwrap();
 }
 
+/// Convergence listings over a group whose history is delivered
+/// applications read none of it (mdk#2330): they return only the fixture's
+/// one parked application, and their VM work stays flat as the history grows
+/// sixteenfold.
+#[test]
+fn convergence_listing_query_work() {
+    use cgka_traits::message::MessageState;
+    use cgka_traits::storage::{MessageStorage, OpenMlsContentFilter};
+    use cgka_traits::types::{EpochId, GroupId};
+
+    const GRAPH_STATES: [MessageState; 5] = [
+        MessageState::Sent,
+        MessageState::Created,
+        MessageState::Retryable,
+        MessageState::ConvergenceDeferred,
+        MessageState::Processed,
+    ];
+    const WORKING_STATES: [MessageState; 3] = [
+        MessageState::Created,
+        MessageState::Retryable,
+        MessageState::ConvergenceDeferred,
+    ];
+    let _measurement = QUERY_MEASUREMENT.lock().unwrap();
+    let group = GroupId::new(vec![0xaa]);
+    let mut previous = None;
+    for count in [256, 4_096] {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        seed_query_history(&store.lock().unwrap(), count);
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("UPDATE cgka_messages SET openmls_content = 3, openmls_epoch = epoch;")
+            .unwrap();
+        let tip = EpochId(u64::try_from(count).unwrap());
+
+        let mut steps = Vec::new();
+        for filter in [
+            OpenMlsContentFilter::Commits,
+            OpenMlsContentFilter::WithoutProcessedApplications,
+            OpenMlsContentFilter::WithoutProcessedApplicationsThrough(tip),
+            OpenMlsContentFilter::ApplicationsAt(EpochId(0)),
+        ] {
+            let (rows, work) = measure(&store, || {
+                store
+                    .list_openmls_messages_in_states(&group, &GRAPH_STATES, EpochId(0), filter)
+                    .unwrap()
+            });
+            let expected = usize::from(matches!(
+                filter,
+                OpenMlsContentFilter::WithoutProcessedApplications
+                    | OpenMlsContentFilter::WithoutProcessedApplicationsThrough(_)
+            ));
+            assert_eq!(rows.len(), expected, "{filter:?} read delivered history");
+            steps.push(work);
+        }
+        let (rows, work) = measure(&store, || {
+            store
+                .list_messages_in_states(&group, &WORKING_STATES, EpochId(0))
+                .unwrap()
+        });
+        assert_eq!(rows.len(), 1);
+        steps.push(work);
+        let mut visited = 0;
+        let (_, work) = measure(&store, || {
+            store
+                .visit_messages_in_states(&group, &WORKING_STATES, EpochId(0), &mut |_| {
+                    visited += 1;
+                    true
+                })
+                .unwrap()
+        });
+        assert_eq!(visited, 1);
+        steps.push(work);
+        let (rows, work) = measure(&store, || {
+            store.list_deferred_message_metadata(&group).unwrap()
+        });
+        assert!(rows.is_empty());
+        steps.push(work);
+
+        assert!(steps.iter().all(|work| *work < 500), "{steps:?}");
+        if let Some(previous) = previous.replace(steps.clone()) {
+            assert_eq!(steps, previous, "listing work must not grow with history");
+        }
+    }
+}
+
 #[test]
 fn maintenance_query_work() {
     let _measurement = QUERY_MEASUREMENT.lock().unwrap();
     for count in [256, 4_096] {
         let store = SqliteAccountStorage::in_memory().unwrap();
         seed_query_history(&store.lock().unwrap(), count);
+        // Rows a current writer stored carry their derived OpenMLS content
+        // (`x'00'` classifies as unclassified); nothing is left to promote.
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("UPDATE cgka_messages SET openmls_content = 4;")
+            .unwrap();
 
         let promotion = measured(&store, "legacy promotion", 64, || {
             store.promote_legacy_message_rows(16).unwrap()

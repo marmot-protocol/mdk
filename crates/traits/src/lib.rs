@@ -110,8 +110,8 @@ pub use storage::{
     CapabilityStorage, ConvergencePassStorage, DisbandCandidate, DisbandCandidateStorage,
     DisbandFailureReason, DisbandRequest, DisbandRequestStatus, DisbandRequestStorage,
     DisbandTombstoneStorage, GroupStorage, LeaveRequest, LeaveRequestStorage, MaintenanceStorage,
-    MessageStorage, OutboundFanoutStorage, OutboundIntentStorage, QueuedOutboundIntent,
-    StorageError, StorageProvider, StorageResult, WelcomeStorage,
+    MessageStorage, OpenMlsContentFilter, OutboundFanoutStorage, OutboundIntentStorage,
+    QueuedOutboundIntent, StorageError, StorageProvider, StorageResult, WelcomeStorage,
 };
 pub use transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,

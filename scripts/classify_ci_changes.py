@@ -20,6 +20,8 @@ ROOT_BUILD_PATHS = {
     "Cargo.lock",
     "Cargo.toml",
     "Justfile",
+    "scripts/select_ci_tests.py",
+    "scripts/test_select_ci_tests.py",
     "rust-toolchain.toml",
 }
 

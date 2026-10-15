@@ -303,15 +303,6 @@ pub struct Engine<S: StorageProvider> {
     /// groups as unknown rather than retaining their traffic.
     pub(crate) transport_group_id_index: HashMap<Vec<u8>, GroupId>,
 
-    /// #636: cached hex-encoded snapshot of `seen_message_ids` for the
-    /// convergence `CanonicalizationState`, tagged with the seen-set generation
-    /// it was built from. A convergence drain runs the pass up to 16× and
-    /// previously re-hex-encoded the whole (up to 100k-entry) set every pass;
-    /// this rebuilds only when the set actually changed. `None` until first use.
-    /// `Arc` so a cache hit hands out the snapshot without a deep copy.
-    pub(crate) seen_message_ids_hex_cache:
-        Option<(u64, std::sync::Arc<std::collections::BTreeSet<String>>)>,
-
     /// Per-group deferred-peel performance state: aggregate sweep count and
     /// cached row-count/cap bookkeeping. Correctness-critical completion and
     /// residence bookkeeping lives durably on each MessageRecord.
@@ -654,7 +645,6 @@ impl<S: StorageProvider> EngineBuilder<S> {
             unhydrated_groups: HashSet::new(),
             route_backfill_pending: HashSet::new(),
             transport_group_id_index: HashMap::new(),
-            seen_message_ids_hex_cache: None,
             deferred_peel: HashMap::new(),
             canonical_replays: HashMap::new(),
             peel_replays: HashMap::new(),
