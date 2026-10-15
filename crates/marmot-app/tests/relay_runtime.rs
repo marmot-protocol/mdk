@@ -3894,26 +3894,14 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
     accept_group_invite_retrying_busy(&runtime, &bob_id, &group_id)
         .await
         .unwrap();
-    // Bob retires the KeyPackage the first invite consumed as soon as its
+    // Bob retires the KeyPackage the first invite consumed once its
     // replacement is published, and ignores a Welcome built from the retired
-    // one. Let the replacement land before Alice invites him again.
-    timeout(Duration::from_secs(10), async {
-        loop {
-            let lifecycle = runtime
-                .key_package_maintenance_status(&bob_id)
-                .await
-                .unwrap()
-                .unwrap();
-            if lifecycle.last_consumed_key_package_ref.is_none()
-                && lifecycle.pending_replacement.is_none()
-            {
-                break;
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("Bob replaces the KeyPackage the first invite consumed");
+    // one. Replace it now instead of racing his maintenance pass with Alice's
+    // next invite.
+    runtime
+        .rotate_key_package(&bob_id)
+        .await
+        .expect("Bob replaces the KeyPackage the first invite consumed");
 
     let second_group_id = runtime
         .create_group(
