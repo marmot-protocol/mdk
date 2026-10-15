@@ -223,7 +223,7 @@ shows where seams already exist in practice. These are candidates for Pass 1 to 
    question should be settled with a device trace before anything else is redesigned.
 2. **C, storage, and A, the engine**, in parallel. Themes 2, 3 and 4 run through both.
 3. **D, publish-before-apply**, once A and C have described the rails and the outbox.
-4. **E, transport; F, content acquisition; G, surfaces; H, sidecars.** These are mostly about where the seams in §6
+4. **E, transport** (drafted: [`e-transport.md`](e-transport.md)); **F, content acquisition; G, surfaces; H, sidecars.** These are mostly about where the seams in §6
    should fall.
 
 Measurements to collect early, because several themes depend on numbers:
