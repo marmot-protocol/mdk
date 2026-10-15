@@ -31,7 +31,7 @@ at its `transport_quic_broker::` path. The implementation is split by concern:
 | `src/error.rs` | `QuicBrokerError` |
 | `src/control.rs` | `BrokerStreamKey`, control type/envelope, and envelope encode/decode |
 | `src/frame.rs` | length-prefixed control/record/byte framing, read-deadline, frame-length guard |
-| `src/tls.rs` | QUIC transport/server config, PEM loaders, ALPN-pinned client endpoint, insecure verifier |
+| `src/tls.rs` | QUIC transport/server config, PEM loaders, ALPN-pinned client endpoint (default trust via `transport_quic_stream::platform_trust_verifier`), insecure verifier |
 | `src/state.rs` | `BrokerState` room/backlog engine (private; rooms, queues, retention, cleanup) |
 | `src/handlers.rs` | per-connection publish/subscribe stream handlers |
 | `src/server.rs` | `QuicBrokerServer` bind/accept loop and cert-fingerprint helper |

@@ -82,8 +82,11 @@ wn --account <alice> stream start <group-hex> \
   --stream-id <stream-hex> --quic-candidate quic://broker.example.com:4450
 ```
 
-When the certificate chains to normal platform roots and the candidate host matches the certificate, clients can use the
-default platform verifier. `--insecure-local` is only for loopback development.
+When the certificate chains to a public CA and the candidate host matches the certificate, clients can use default
+trust. Default trust verifies against the Mozilla root set bundled with MDK (`webpki-roots`), the same anchors relays and
+HTTP use, on every platform; it does not consult the OS trust store, so a broker behind a private or enterprise CA
+must be pinned by passing that CA's root certificate as `--server-cert-der-hex` (or the bindings' `server_cert_der`),
+which becomes the only trust anchor. `--insecure-local` is only for loopback development.
 
 ## Production Broker
 
@@ -93,5 +96,5 @@ The shared production broker candidate is:
 quic://quic-broker.ipf.dev:4450
 ```
 
-It uses a certificate for `quic-broker.ipf.dev`, so clients should use normal platform trust and must not pass
+It uses a certificate for `quic-broker.ipf.dev`, so clients should use default trust and must not pass
 `--insecure-local`.

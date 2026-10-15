@@ -52,3 +52,4 @@ pub use receive::{
 pub use send::{
     SendTextStream, SentTextStream, random_stream_id, send_text_stream, split_text_deltas,
 };
+pub use tls::platform_trust_verifier;
