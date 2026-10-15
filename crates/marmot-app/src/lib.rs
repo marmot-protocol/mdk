@@ -2044,6 +2044,7 @@ impl MarmotApp {
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),
             pending_applied_effects: Default::default(),
+            retained_projection_failures: 0,
             pending_resumed_message_notifications: Default::default(),
             pending_push_leaf_reconciliations: Default::default(),
             pending_failed_sync_summary: SyncSummary::default(),
@@ -2073,6 +2074,8 @@ impl MarmotApp {
             delivery_spill: Default::default(),
             #[cfg(test)]
             force_event_group_projection_unavailable: false,
+            #[cfg(test)]
+            strict_quarantined_group_reads: false,
             pending_welcome_delivery_events: Vec::new(),
             pending_superseded_change_events: Vec::new(),
             maintenance_failed_backlog: 0,
