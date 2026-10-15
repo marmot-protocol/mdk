@@ -3281,10 +3281,11 @@ fn apply_openmls_canonicalization_result_inner<S: StorageProvider>(
     // power loss) mid-merge leaves the persisted group torn (GroupContext/tree
     // at epoch N+1 while group_epoch_secrets/message_secrets lag at epoch N).
     //
-    // The surrounding durable group snapshot (create/rollback/release in
-    // `apply_openmls_canonicalization_result`) intentionally stays OUTSIDE this
-    // boundary: the snapshot guards in-process error returns; this transaction
-    // guards hard crashes mid-merge.
+    // The caller runs this inside `StorageProvider::with_group_savepoint`,
+    // which returns the group to its pre-apply state on an in-process error;
+    // on SQLite this transaction then joins the caller's, and a hard crash
+    // anywhere in the apply commits none of it. The transaction still matters
+    // on its own for backends whose savepoint is the full-snapshot fallback.
     storage.with_transaction(|storage| {
         // No pre-validated own messages here: every own commit on the
         // accepted branch was excluded from `replay_messages` before this

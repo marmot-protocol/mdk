@@ -596,6 +596,16 @@ impl SharedConnection {
             }
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            // A nested savepoint whose rollback failed latched the connection
+            // unusable mid-transaction. The callback may have caught that
+            // error, but its abandoned writes are still open: never commit.
+            let result = match (result, self.transaction_unusable_error()) {
+                (Ok(Ok(_)), Some(err)) => {
+                    let _ = self.rollback_boundary_with_retry();
+                    return Err(E::from(err));
+                }
+                (result, _) => result,
+            };
             match result {
             Ok(Ok(value)) => match self.execute_transaction_boundary_with_retry("COMMIT") {
                 Ok(()) => {
@@ -691,9 +701,10 @@ impl SharedConnection {
     }
 
     /// Undo and close the innermost `mdk_savepoint`. A failure leaves the
-    /// transaction in an unknown state that a caller catching the error could
+    /// unit's writes open in a transaction a caller catching the error could
     /// otherwise commit, so it marks the connection unusable, as a failed
-    /// `ROLLBACK` does. A closed connection already rolled everything back.
+    /// `ROLLBACK` does, and the outermost transaction then rolls back instead
+    /// of committing. A closed connection already rolled everything back.
     fn rollback_to_savepoint(&self, wakeups: usize) -> StorageResult<()> {
         // `ROLLBACK TO` discards OpenMLS writes, like `ROLLBACK`.
         self.note_openmls_write();
@@ -2082,6 +2093,44 @@ mod tests {
             .unwrap();
         assert!(store.get_group(&gid(1)).is_err());
         assert!(store.get_group(&gid(2)).is_ok());
+    }
+
+    #[test]
+    fn failed_savepoint_rollback_blocks_a_catching_caller_from_committing() {
+        use crate::storage::test_support::{gid, sample_group};
+        use cgka_traits::storage::GroupStorage;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("savepoint-rollback-failure.db");
+        let key = SqlCipherKey::new("42".repeat(32)).unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+
+        let committed = store.with_transaction(|outer| -> StorageResult<()> {
+            let failed: StorageResult<()> =
+                outer.with_group_savepoint(&gid(1), "unused-fallback", |inner| {
+                    inner.put_group(&sample_group(gid(1), 1, 1))?;
+                    // Releasing early makes `ROLLBACK TO` fail while the
+                    // transaction, and the write above, stay open.
+                    inner
+                        .lock()?
+                        .execute_batch("RELEASE mdk_savepoint")
+                        .storage()?;
+                    Err(StorageError::Backend("abandon the unit".into()))
+                });
+            assert!(failed.is_err());
+            Ok(())
+        });
+
+        assert!(
+            committed.is_err(),
+            "a failed savepoint rollback must fail the enclosing commit"
+        );
+        drop(store);
+        let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert!(
+            reopened.get_group(&gid(1)).is_err(),
+            "the abandoned unit's write must not persist"
+        );
     }
 
     /// The trait default for backends without savepoints: the same contract
