@@ -441,22 +441,20 @@ fn report_ready(
 }
 
 /// Asserts a frame reported at `reported` arrived without waiting out the
-/// progress window that opened at `opened`. When the report itself ran most of
-/// the window, a held frame and a prompt one cannot be told apart, so only a
-/// prompt report is timed.
+/// progress window that opened at `opened`: within 110 ms of its report, well
+/// inside the 250 ms window. Timing from the report keeps a slow database
+/// write from failing a prompt frame.
 fn assert_not_held(
     opened: std::time::Instant,
     reported: std::time::Instant,
     arrived: std::time::Instant,
 ) {
-    if reported - opened < std::time::Duration::from_millis(120) {
-        assert!(
-            arrived - reported < std::time::Duration::from_millis(110),
-            "frame arrived {:?} after its report, {:?} into the window",
-            arrived - reported,
-            arrived - opened
-        );
-    }
+    assert!(
+        arrived - reported < std::time::Duration::from_millis(110),
+        "frame arrived {:?} after its report, {:?} into the window",
+        arrived - reported,
+        arrived - opened
+    );
 }
 
 /// Waits for the next frame of `stream` and returns its only row.
@@ -480,9 +478,13 @@ async fn attachment_transfer_state_change_skips_the_progress_window() {
     let dir = tempfile::tempdir().unwrap();
     let (runtime, store, job, stream) = downloading_subscription(&dir, b"prompt").await;
     let opened = std::time::Instant::now();
+    let pending = tokio::spawn({
+        let stream = stream.clone();
+        async move { next_row(&stream).await }
+    });
     report_ready(&runtime, &store, &job, b"prompt");
     let reported = std::time::Instant::now();
-    let ready = next_row(&stream).await;
+    let ready = pending.await.unwrap();
     assert_eq!(ready.state, AttachmentTransferState::Ready);
     assert_not_held(opened, reported, std::time::Instant::now());
     stream.close();
