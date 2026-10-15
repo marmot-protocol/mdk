@@ -61,7 +61,7 @@ work should target groups within one account, not parallelism across accounts.
 | Pass | Output | Status |
 | --- | --- | --- |
 | 0. System map | [`00-system-map.md`](00-system-map.md) plus the `map-*.md` pages it links | Draft complete, under discussion |
-| 1. System reviews | One page per system, A to H below | Not started |
+| 1. System reviews | One page per system, A to H below | B drafted: [`b-runtime-concurrency.md`](b-runtime-concurrency.md) |
 | 2. Synthesis | Ranked findings and an evolve/refactor/rebuild posture per system | Not started |
 
 Pass 1 systems:
