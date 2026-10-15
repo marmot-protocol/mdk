@@ -9,8 +9,9 @@ The encrypted per-file media store (mdk#2314). Human overview: [`README.md`](REA
   trait that `storage-sqlite` implements. Dependency direction: `fs-private` -> `media-store` -> `storage-sqlite` ->
   `marmot-app`.
 - **Never on async threads.** Every API is synchronous and blocking (file I/O, hashing, AEAD). Callers use the
-  blocking pool (`spawn_blocking`), never an account worker or other async task: under UniFFI every runtime task
-  shares one `async-compat` thread, so inline media work would stall every account.
+  blocking pool (`spawn_blocking`), never an account worker or other async task: account workers, the relay plane and
+  host calls share a few async worker threads (two to four in MarmotKit), so inline media work would stall them all.
+  See the [threading model](../../docs/marmot-architecture/overview/marmot-app-runtime.md#threading-model).
 - **Media files take no locks.** No `flock`/`fcntl`, and not the lock-based `fs-private` publication used for key
   material. Unique random names and one writer per file make locks unnecessary; writers serialize on the catalog row.
   See `docs/marmot-architecture/overview/local-artifact-safety.md`.
