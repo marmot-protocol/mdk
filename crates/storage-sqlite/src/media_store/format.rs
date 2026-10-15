@@ -65,6 +65,8 @@ pub enum MediaFormatError {
     Authentication,
     #[error("media file cipher backend failed")]
     Backend,
+    #[error("media file writer failed earlier and must be discarded")]
+    Poisoned,
 }
 
 impl From<MediaFormatError> for io::Error {
@@ -294,14 +296,18 @@ impl PayloadLayout {
 
 /// Streams plaintext into a media file. Nothing is final until `finish`
 /// seals the last segment; a writer dropped earlier leaves a file that fails
-/// authentication at its last segment. After any error the writer and its
-/// partial file must be discarded.
+/// authentication at its last segment. After any error the writer refuses
+/// further writes and `finish`; it and its partial file must be discarded.
 pub struct MediaFileWriter<W: Write> {
     inner: W,
     cipher: SegmentCipher,
     index: u64,
     buffer: Vec<u8>,
     plaintext_bytes: u64,
+    /// Set while a segment is being sealed and written, cleared on success:
+    /// after a failure the buffer may hold a sealed segment whose nonce was
+    /// used, so it must never be sealed or written again.
+    poisoned: bool,
 }
 
 impl<W: Write> MediaFileWriter<W> {
@@ -328,6 +334,7 @@ impl<W: Write> MediaFileWriter<W> {
             index: 0,
             buffer: Vec::with_capacity(SEGMENT_CIPHERTEXT_BYTES),
             plaintext_bytes: 0,
+            poisoned: false,
         })
     }
 
@@ -337,6 +344,10 @@ impl<W: Write> MediaFileWriter<W> {
     }
 
     fn seal_buffered(&mut self, last: bool) -> MediaFormatResult<()> {
+        if self.poisoned {
+            return Err(MediaFormatError::Poisoned);
+        }
+        self.poisoned = true;
         let tag = self.cipher.seal(self.index, last, &mut self.buffer)?;
         self.buffer.extend_from_slice(&tag);
         self.inner.write_all(&self.buffer)?;
@@ -345,11 +356,12 @@ impl<W: Write> MediaFileWriter<W> {
             .index
             .checked_add(1)
             .ok_or(MediaFormatError::InvalidLength)?;
+        self.poisoned = false;
         Ok(())
     }
 
     /// Seals the final segment and flushes. The caller owns durability
-    /// (`sync_all`, rename, directory sync).
+    /// (syncing the file before anything relies on it).
     pub fn finish(mut self) -> MediaFormatResult<W> {
         self.seal_buffered(true)?;
         self.inner.flush()?;
@@ -359,6 +371,9 @@ impl<W: Write> MediaFileWriter<W> {
 
 impl<W: Write> Write for MediaFileWriter<W> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if self.poisoned {
+            return Err(MediaFormatError::Poisoned.into());
+        }
         if data.is_empty() {
             return Ok(0);
         }

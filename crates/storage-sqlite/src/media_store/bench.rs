@@ -13,16 +13,20 @@
 //! - `file_write_direct`: the same body written straight to its final name and
 //!   only the file synced (plain `fsync` on Apple): no rename, no directory
 //!   sync. This prices relying on the `pending` row instead of a rename.
+//!
+//! The `file_write*` rows are file I/O only: creation, sealing and syncs. The
+//! store's `pending` insert and `ready` commit, which a publication adds, are
+//! not included, whereas `sqlcipher_write*` rows are a whole publication.
 //! - `file_read`: a fresh handle reading the whole body in 1 MiB windows,
 //!   the `read_attachment_asset` window size.
-//! - `file_first_read`: a fresh handle reading the first window only, the
-//!   cost of showing the first image.
+//! - `file_first_read`: a fresh handle reading the first window only, timed
+//!   before any full read of that file. Its throughput counts one window.
 //! - `sqlcipher_write`: today's import, `complete_attachment_acquisition_from_reader`
 //!   (and `complete_attachment_acquisition` for bodies up to 16 MiB, the
 //!   in-memory download path) into an encrypted account database.
 //! - `sqlcipher_read` / `sqlcipher_first_read`: `read_retained_attachment` in
 //!   1 MiB windows; the first-read row reopens the database first so its page
-//!   cache is cold.
+//!   cache is cold, and runs before any full read.
 //!
 //! Each row discards one untimed warmup iteration.
 //!
@@ -144,7 +148,13 @@ fn row(
     samples.sort();
     let median = samples[samples.len() / 2];
     let min = samples[0];
-    let mib_per_s = size as f64 / (1024.0 * 1024.0) / median.as_secs_f64().max(1e-9);
+    // First-window rows move one window, whatever the body size.
+    let moved = if case.ends_with("first_read") {
+        size.min(WINDOW)
+    } else {
+        size
+    };
+    let mib_per_s = moved as f64 / (1024.0 * 1024.0) / median.as_secs_f64().max(1e-9);
     emit(format!(
         "MDK_BENCH media_store case={case} backend={backend} bytes={size} iterations={} median_us={} min_us={} mib_per_s={mib_per_s:.1}",
         samples.len(),
@@ -318,10 +328,7 @@ fn file_rows(
                 write.push(elapsed);
             }
             if mode == WRITE_MODES[0] {
-                let (elapsed, len) = timed(|| read_whole_file(&final_path, &id, backend))?;
-                if len != body.len() as u64 {
-                    return Err("file read length mismatch".into());
-                }
+                // The first window is timed before any full read of the file.
                 let mut window = vec![0; WINDOW.min(body.len()).max(1)];
                 let (first_elapsed, ()) = timed(|| {
                     let file = File::open(&final_path).map_err(error)?;
@@ -330,6 +337,10 @@ fn file_rows(
                     reader.read_at(0, &mut window).map_err(error)?;
                     Ok(())
                 })?;
+                let (elapsed, len) = timed(|| read_whole_file(&final_path, &id, backend))?;
+                if len != body.len() as u64 {
+                    return Err("file read length mismatch".into());
+                }
                 if warm {
                     read.push(elapsed);
                     first.push(first_elapsed);
@@ -540,10 +551,7 @@ fn sqlcipher_rows(
         body.len(),
         database_bytes(&bench.path).saturating_sub(empty)
     ));
-    for reference in &stored {
-        let (elapsed, ()) = timed(|| bench.read_whole(reference, body.len()))?;
-        read.push(elapsed);
-    }
+    // First windows are timed before any full read, each after a reopen.
     for reference in &stored {
         bench.reopen()?;
         let (elapsed, ()) = timed(|| {
@@ -555,6 +563,10 @@ fn sqlcipher_rows(
                 .map(drop)
         })?;
         first.push(elapsed);
+    }
+    for reference in &stored {
+        let (elapsed, ()) = timed(|| bench.read_whole(reference, body.len()))?;
+        read.push(elapsed);
     }
     bench.store.close().map_err(error)?;
     remove_database(&bench.path)?;

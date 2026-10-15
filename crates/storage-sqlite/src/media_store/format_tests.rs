@@ -327,3 +327,39 @@ fn empty_and_whole_segment_plaintexts_have_one_final_segment() {
         ));
     }
 }
+
+/// A sink that accepts `remaining` bytes and then fails like a full disk.
+struct FailingSink {
+    remaining: usize,
+}
+
+impl Write for FailingSink {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Err(std::io::Error::other("disk full"));
+        }
+        let accepted = data.len().min(self.remaining);
+        self.remaining -= accepted;
+        Ok(accepted)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_failed_segment_write_poisons_the_writer() {
+    for backend in CipherBackend::ALL {
+        // Room for the header and part of the first segment only.
+        let sink = FailingSink {
+            remaining: HEADER_BYTES + 100,
+        };
+        let mut writer = MediaFileWriter::new(sink, &key(), &FILE_ID, backend).unwrap();
+        let body = plaintext(3 * SEGMENT);
+        assert!(writer.write_all(&body).is_err());
+        // Neither more data nor `finish` may reseal the failed segment.
+        assert!(writer.write(&body[..10]).is_err());
+        assert!(matches!(writer.finish(), Err(MediaFormatError::Poisoned)));
+    }
+}
