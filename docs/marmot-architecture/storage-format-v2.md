@@ -152,7 +152,8 @@ derives from `payload` on every write (mdk#2330):
 They are a derived index, never an authority. `list_openmls_messages_in_states`
 uses them to leave out rows its `OpenMlsContentFilter` excludes (delivered
 applications at or below a convergence pass's witness floor, everything but
-commits for the deferred-peel fingerprint), reading row ids from the covering
+commits for the deferred-peel fingerprint, everything but one epoch's
+applications), reading row ids from the covering
 `(group_id, state, openmls_content, openmls_epoch)` index. Classes `-1` and `4`
 are always returned, and the engine re-classifies every returned row from its
 payload, so a derivation gap costs reads, not correctness.

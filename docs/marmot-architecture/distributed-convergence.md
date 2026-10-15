@@ -120,7 +120,10 @@ pass's replay start (the lowest source epoch among unresolved commits below the 
 application witnesses a candidate only from an epoch strictly after its fork. One at or below the replay start is probed
 on the shared base state, so it decrypts on every candidate or on none: it can neither change the selection nor be
 withdrawn by it, and the pass leaves it out. When an admitted commit forks below the replay start, the collecting pass
-takes the delivered applications between the old and new start back in before it freezes.
+takes the delivered applications between the old and new start back in before it freezes. Replay still decrypts a
+delivered application to step its sender's receive ratchet, which a pending application of the same epoch can need
+(OpenMLS refuses a generation more than 1,000 ahead), so a pass holding a pending application from another member at
+or below the replay start keeps every delivered application of that epoch.
 
 A collecting pass persists:
 

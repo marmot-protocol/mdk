@@ -176,6 +176,8 @@ enum ConvergenceAdmissionOutcome {
 struct ConvergencePassCandidate {
     member: ConvergencePassMember,
     input: ClassifiedConvergenceInput,
+    /// A locally authored application, which replay never decrypts.
+    own_application: bool,
 }
 
 impl From<StorageError> for FrozenPassVerificationError {
@@ -633,27 +635,14 @@ impl<S: StorageProvider> Engine<S> {
         // own verdict — a CommitEdge is relevant unconditionally, and a
         // Proposal/AppWitness member contributes no commit edge.
         let selection_relevant = scan_selection_relevance(&pass.members, admitted_input);
-        // An unresolved commit forking below the witness floor moves the
-        // replay start down to its source epoch.
-        let witnesses = if admitted_input.role == ConvergencePassMemberRole::CommitEdge
-            && crate::openmls_projection::unresolved_commit_state(admitted_input.state)
-        {
-            let previous_floor = self.pass_witness_floor(&pass)?;
-            if admitted_input.source_epoch < previous_floor {
-                self.delivered_witnesses_above(
-                    &pass,
-                    floor,
-                    admitted_input.source_epoch,
-                    previous_floor,
-                )?
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
+        let delivered = self.delivered_applications_admission_needs(
+            &pass,
+            floor,
+            admitted_input,
+            candidate.own_application,
+        )?;
         pass.members.push(candidate.member);
-        pass.members.extend(witnesses);
+        pass.members.extend(delivered);
         // Restart quiescence only for an input role that can change this
         // batch's deterministic resolution. Ordinary app delivery never
         // reaches this path; a future app without competing candidate edges is
@@ -930,6 +919,7 @@ impl<S: StorageProvider> Engine<S> {
                 if input.is_inert_delivered_witness(witness_floor) {
                     return None;
                 }
+                let own_application = payload.own_application_stamp().is_some();
                 Some(Ok((
                     ConvergencePassMember {
                         message_id: record.id,
@@ -938,22 +928,41 @@ impl<S: StorageProvider> Engine<S> {
                         source_epoch,
                     },
                     input,
+                    own_application,
                 )))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let context =
-            ConvergenceInputContext::from_inputs(projected.iter().map(|(_, input)| *input));
+            ConvergenceInputContext::from_inputs(projected.iter().map(|(_, input, _)| *input));
         let has_terminal_trigger = projected
             .iter()
-            .any(|(member, _)| candidate_ids.contains(&member.message_id));
+            .any(|(member, _, _)| candidate_ids.contains(&member.message_id));
         let has_trigger = has_terminal_trigger
             || projected
                 .iter()
-                .any(|(_, input)| context.opens_pass(*input));
-        Ok((
-            projected.into_iter().map(|(member, _)| member).collect(),
-            has_trigger,
-        ))
+                .any(|(_, input, _)| context.opens_pass(*input));
+        // Delivered applications left out above still step their epoch's
+        // receive ratchets for any pending application replayed after them.
+        let ratchet_epochs: std::collections::BTreeSet<u64> = projected
+            .iter()
+            .filter(|(_, input, own_application)| {
+                !own_application && input.replays_after_delivered_applications(witness_floor)
+            })
+            .map(|(_, input, _)| input.source_epoch)
+            .collect();
+        let mut members: Vec<ConvergencePassMember> =
+            projected.into_iter().map(|(member, _, _)| member).collect();
+        for epoch in ratchet_epochs {
+            let delivered = self.delivered_applications(
+                group_id,
+                floor,
+                &members,
+                OpenMlsContentFilter::ApplicationsAt(EpochId(epoch)),
+                |source_epoch| source_epoch == epoch,
+            )?;
+            members.extend(delivered);
+        }
+        Ok((members, has_trigger))
     }
 
     /// The witness floor of a pass about to be seeded over `[floor, ceiling]`:
@@ -1045,34 +1054,76 @@ impl<S: StorageProvider> Engine<S> {
         }
     }
 
-    /// Delivered applications that become witnesses when an admitted commit
-    /// lowers a collecting pass's witness floor from `previous_floor` to
-    /// `witness_floor`: those in between that the pass does not hold yet.
+    /// The delivered applications a collecting pass must take in when it
+    /// admits `admitted`, which seeding left out as inert.
     ///
-    /// Seeding left them out as inert. The lower replay start makes them
-    /// candidates' witnesses (or `LosingBranch` withdrawals), so the pass
-    /// takes them back before it freezes. They are read as of this
-    /// admission, so one delivered after the pass opened is included too.
-    fn delivered_witnesses_above(
+    /// - An unresolved commit forking below the witness floor moves the replay
+    ///   start down, and the delivered applications between its source epoch
+    ///   and the old floor become witnesses (or `LosingBranch` withdrawals).
+    /// - An unresolved application at or below the floor, unless it is a
+    ///   locally authored one, is replayed after its epoch's delivered
+    ///   applications, which step its sender's receive ratchet.
+    ///
+    /// They are read as of this admission, so one delivered after the pass
+    /// opened is included too.
+    fn delivered_applications_admission_needs(
         &self,
         pass: &DurableConvergencePass,
         floor: u64,
-        witness_floor: u64,
-        previous_floor: u64,
+        admitted: ClassifiedConvergenceInput,
+        own_application: bool,
     ) -> Result<Vec<ConvergencePassMember>, OpenMlsProjectionError> {
-        let held: HashSet<&MessageId> = pass
-            .members
-            .iter()
-            .map(|member| &member.message_id)
-            .collect();
-        let mut witnesses = Vec::new();
+        let commit = admitted.role == ConvergencePassMemberRole::CommitEdge
+            && crate::openmls_projection::unresolved_commit_state(admitted.state);
+        let application = !own_application
+            && admitted.role == ConvergencePassMemberRole::AppWitnessCandidate
+            && admitted.state != MessageState::Processed;
+        if !commit && !application {
+            return Ok(Vec::new());
+        }
+        let witness_floor = self.pass_witness_floor(pass)?;
+        let source_epoch = admitted.source_epoch;
+        if commit && source_epoch < witness_floor {
+            return self.delivered_applications(
+                &pass.group_id,
+                floor,
+                &pass.members,
+                OpenMlsContentFilter::WithoutProcessedApplicationsThrough(EpochId(source_epoch)),
+                |epoch| epoch > source_epoch && epoch <= witness_floor,
+            );
+        }
+        if application && admitted.replays_after_delivered_applications(witness_floor) {
+            return self.delivered_applications(
+                &pass.group_id,
+                floor,
+                &pass.members,
+                OpenMlsContentFilter::ApplicationsAt(EpochId(source_epoch)),
+                |epoch| epoch == source_epoch,
+            );
+        }
+        Ok(Vec::new())
+    }
+
+    /// `Processed` applications of `group_id` at or after `floor` whose MLS
+    /// epoch passes `keep`, as pass members, skipping those already `held`.
+    /// `filter` only narrows what storage reads; `keep` decides.
+    fn delivered_applications(
+        &self,
+        group_id: &GroupId,
+        floor: u64,
+        held: &[ConvergencePassMember],
+        filter: OpenMlsContentFilter,
+        keep: impl Fn(u64) -> bool,
+    ) -> Result<Vec<ConvergencePassMember>, OpenMlsProjectionError> {
+        let held: HashSet<&MessageId> = held.iter().map(|member| &member.message_id).collect();
+        let mut delivered = Vec::new();
         for record in self
             .storage
             .list_openmls_messages_in_states(
-                &pass.group_id,
+                group_id,
                 &[MessageState::Processed],
                 EpochId(floor),
-                OpenMlsContentFilter::WithoutProcessedApplicationsThrough(EpochId(witness_floor)),
+                filter,
             )
             .map_err(storage_projection_error)?
         {
@@ -1089,19 +1140,19 @@ impl<S: StorageProvider> Engine<S> {
                 continue;
             };
             if projection.kind != OpenMlsContentKind::Application
-                || source_epoch <= witness_floor
-                || source_epoch > previous_floor
+                || source_epoch < floor
+                || !keep(source_epoch)
             {
                 continue;
             }
-            witnesses.push(ConvergencePassMember {
+            delivered.push(ConvergencePassMember {
                 message_id: record.id,
                 payload_digest: projection.message_digest,
                 role: ConvergencePassMemberRole::AppWitnessCandidate,
                 source_epoch,
             });
         }
-        Ok(witnesses)
+        Ok(delivered)
     }
 
     fn convergence_pass_candidate(
@@ -1137,6 +1188,7 @@ impl<S: StorageProvider> Engine<S> {
                 source_epoch,
             },
             input,
+            own_application: payload.own_application_stamp().is_some(),
         }))
     }
 

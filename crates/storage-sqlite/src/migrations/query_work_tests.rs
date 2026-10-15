@@ -85,13 +85,18 @@ fn convergence_listing_query_work() {
             OpenMlsContentFilter::Commits,
             OpenMlsContentFilter::WithoutProcessedApplications,
             OpenMlsContentFilter::WithoutProcessedApplicationsThrough(tip),
+            OpenMlsContentFilter::ApplicationsAt(EpochId(0)),
         ] {
             let (rows, work) = measure(&store, || {
                 store
                     .list_openmls_messages_in_states(&group, &GRAPH_STATES, EpochId(0), filter)
                     .unwrap()
             });
-            let expected = usize::from(filter != OpenMlsContentFilter::Commits);
+            let expected = usize::from(matches!(
+                filter,
+                OpenMlsContentFilter::WithoutProcessedApplications
+                    | OpenMlsContentFilter::WithoutProcessedApplicationsThrough(_)
+            ));
             assert_eq!(rows.len(), expected, "{filter:?} read delivered history");
             steps.push(work);
         }

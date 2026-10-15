@@ -28,8 +28,8 @@
 
 - `MessageStorage::list_openmls_messages_in_states` leaves out, in SQL, the rows
   an `OpenMlsContentFilter` excludes (delivered applications at or below an
-  epoch, or everything but commits); rows not derived yet or unclassified are
-  always returned (mdk#2330).
+  epoch, everything but commits, or everything but one epoch's applications);
+  rows not derived yet or unclassified are always returned (mdk#2330).
 - `SqliteMediaCatalog` and `SlotPublication` implement the `media-store` crate's
   `MediaCatalog` and `PublishTarget` traits on the account database;
   `release_media_reference` removes a slot's reference and reports released files.

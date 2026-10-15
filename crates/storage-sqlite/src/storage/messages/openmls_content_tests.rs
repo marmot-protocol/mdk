@@ -280,6 +280,37 @@ fn openmls_listing_leaves_out_only_rows_the_filter_excludes() {
         ["proposal@3", "app@3", "app@4"]
     );
     assert!(listed(&store, &labels, &[], 0, OpenMlsContentFilter::Commits).is_empty());
+    assert_eq!(
+        listed(
+            &store,
+            &labels,
+            &GRAPH_STATES,
+            0,
+            OpenMlsContentFilter::ApplicationsAt(EpochId(3)),
+        ),
+        ["app@3", "unreadable", "pending app@1"]
+    );
+    assert_eq!(
+        listed(
+            &store,
+            &labels,
+            &GRAPH_STATES,
+            0,
+            OpenMlsContentFilter::ApplicationsAt(EpochId(1)),
+        ),
+        ["app@1", "fresh app@1", "unreadable", "pending app@1"]
+    );
+    // No classified application holds an epoch beyond SQLite's INTEGER range.
+    assert_eq!(
+        listed(
+            &store,
+            &labels,
+            &GRAPH_STATES,
+            0,
+            OpenMlsContentFilter::ApplicationsAt(EpochId(u64::MAX)),
+        ),
+        ["unreadable", "pending app@1"]
+    );
     // An epoch bound beyond SQLite's INTEGER range keeps no classified
     // delivered application, as every one of them holds a smaller epoch.
     assert_eq!(

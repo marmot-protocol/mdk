@@ -333,8 +333,12 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   capped by both tip authorities) is therefore inert: seeding leaves it out
   (`ClassifiedConvergenceInput::is_inert_delivered_witness`) and storage never reads it (`OpenMlsContentFilter`). An
   admitted commit forking below the floor lowers it, and admission takes the delivered applications in between back
-  into the collecting pass; without that top-up a deeper rival wins over witnessed history. If replay ever starts
-  below the lowest unresolved commit, or witnesses start counting shared-prefix epochs, revisit the floor. Pinned by
+  into the collecting pass; without that top-up a deeper rival wins over witnessed history. Inert for selection is not
+  inert for replay: decrypting a delivered application steps its sender's receive ratchet in the anchor state, and
+  OpenMLS refuses a generation more than 1,000 ahead, so a pass that holds an unresolved, non-own application at or
+  below the floor keeps every delivered application of that epoch (seeding and admission alike;
+  `ClassifiedConvergenceInput::replays_after_delivered_applications`). If replay ever starts below the lowest
+  unresolved commit, or witnesses start counting shared-prefix epochs, revisit the floor. Pinned by
   `tests/distributed_convergence/delivered_witnesses.rs`.
 - **Only `NonSelectedEligibleBranch` may drive a withdrawal.** `handle_commit` also returns `MissingCandidateParent`
   when the pass selected no branch at all (the common case); withdrawing there would tombstone a device's applied

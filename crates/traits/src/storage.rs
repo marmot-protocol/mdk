@@ -257,6 +257,8 @@ pub enum OpenMlsContentFilter {
     WithoutProcessedApplicationsThrough(EpochId),
     /// Every OpenMLS message except `Processed` applications.
     WithoutProcessedApplications,
+    /// Only applications whose epoch is this one.
+    ApplicationsAt(EpochId),
 }
 
 /// Messages + epoch-scoped snapshot/rollback hooks.

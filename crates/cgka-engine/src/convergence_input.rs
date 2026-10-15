@@ -57,11 +57,29 @@ impl ClassifiedConvergenceInput {
     /// below the replay start is probed on the shared base state before any
     /// candidate's first commit, so it decrypts on every candidate or on
     /// none: never a witness, never a `LosingBranch` withdrawal. A delivered
-    /// one also needs no disposition, so leaving it out of the pass changes
-    /// nothing but the work (mdk#2330).
+    /// one also needs no disposition (mdk#2330).
+    ///
+    /// Inert for selection is not inert for replay: decrypting it steps its
+    /// sender's receive ratchet, which a pending application of the same
+    /// epoch may need ([`Self::replays_after_delivered_applications`]).
     pub(crate) fn is_inert_delivered_witness(self, witness_floor: u64) -> bool {
         self.role == ConvergencePassMemberRole::AppWitnessCandidate
             && self.state == MessageState::Processed
+            && self.source_epoch <= witness_floor
+    }
+
+    /// Whether this is an unresolved application replayed on the shared base
+    /// state of a pass with this witness floor, after the delivered
+    /// applications of its epoch.
+    ///
+    /// Replaying those steps each sender's receive ratchet in the anchor
+    /// state, and OpenMLS refuses a generation more than
+    /// `DEFAULT_MAXIMUM_FORWARD_DISTANCE` ahead of it, so the pass keeps that
+    /// epoch's delivered applications for such an input. Locally authored
+    /// applications are exempt: replay never decrypts them.
+    pub(crate) fn replays_after_delivered_applications(self, witness_floor: u64) -> bool {
+        self.role == ConvergencePassMemberRole::AppWitnessCandidate
+            && self.state != MessageState::Processed
             && self.source_epoch <= witness_floor
     }
 

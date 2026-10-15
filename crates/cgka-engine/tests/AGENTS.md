@@ -81,8 +81,9 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 
 - **File:** `distributed_convergence/delivered_witnesses.rs`
   - **Owns:** Which delivered applications a convergence pass holds (mdk#2330): inert ones at or below the witness
-    floor are left out, a lower-epoch rival admitted mid-pass takes them back, and SQLite's content-filtered listing
-    leaves out exactly what the engine's own projection of real messages would.
+    floor are left out, a lower-epoch rival admitted mid-pass takes them back, a pending application keeps its
+    epoch's delivered ones for its sender's receive ratchet, and SQLite's content-filtered listing leaves out exactly
+    what the engine's own projection of real messages would.
 
 - **File:** `distributed_convergence/encrypted_media_source_secret.rs`
   - **Owns:** A replayed media application carries its source-epoch encrypted-media secret on `MessageReceived`
