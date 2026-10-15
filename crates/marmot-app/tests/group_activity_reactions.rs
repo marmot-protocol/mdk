@@ -159,6 +159,8 @@ async fn members_share_real_activity_targets_and_reactions_after_reopen() {
             .await
             .unwrap()
             .take_snapshot();
+        assert_eq!(snapshot.messages.len(), 1);
+        assert_eq!(snapshot.messages[0].message_id_hex, target);
         assert_eq!(reactions(&snapshot), heart);
         runtime.shutdown_and_close().await.unwrap();
     }
