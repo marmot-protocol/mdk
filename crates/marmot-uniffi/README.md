@@ -1158,9 +1158,11 @@ profile, feature and run provenance, then assembles and validates the Android,
 iOS and macOS candidate packages. Full packaging is opt-in on pull requests:
 `ci:android` selects Kotlin generation and all four Android ABIs, `ci:apple`
 selects the Apple inputs and packages, and `ci:full` selects both platforms.
-Adding a packaging label triggers a new candidate run; re-running a workflow
-also reads the current labels. Ordinary PRs retain Rust compilation/API and
+After adding a packaging label, re-run all candidate-workflow jobs or push a
+new commit; the workflow reads the current labels. Ordinary PRs retain Rust compilation/API and
 packaging-contract checks without building complete candidate bundles.
+Android target compilation, NDK checks and native linking are deferred unless
+explicitly selected, including for changes to the UniFFI crate.
 Matching `master` pushes always build the complete matrix and open an issue
 when it fails; later pushes do not cancel running or queued candidate builds.
 Pull requests restore the trusted release

@@ -144,10 +144,6 @@ def _is_documentation(path: str) -> bool:
     )
     return (
         (path.endswith(".md") and not executable_markdown)
-        # Architecture-review analysis tools do not feed product builds. The
-        # literal-include regression gate still rejects an embedded fixture
-        # accidentally classified as documentation.
-        or (path.startswith("docs/marmot-architecture/review/") and path.endswith(".py"))
         or path.startswith(".github/ISSUE_TEMPLATE/")
         or path.startswith(".github/PULL_REQUEST_TEMPLATE/")
     )

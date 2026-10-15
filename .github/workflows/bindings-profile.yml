@@ -3,7 +3,7 @@ name: MarmotKit Release Profile
 on:
   pull_request:
     # Packaging opt-ins work on any PR, including indirect Rust consumers.
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened]
   push:
     branches:
       - master
@@ -26,8 +26,7 @@ permissions:
   contents: read
 
 concurrency:
-  # An unrelated label event gets its own group so it cannot cancel a real run.
-  group: marmotkit-profile-${{ github.event.pull_request.number || github.run_id }}${{ github.event.action == 'labeled' && !contains(fromJSON('["ci:apple","ci:android","ci:full"]'), github.event.label.name) && format('-ignored-{0}', github.run_id) || '' }}
+  group: marmotkit-profile-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -42,7 +41,6 @@ env:
 jobs:
   identity:
     name: Resolve exact candidate identity
-    if: github.event.action != 'labeled' || contains(fromJSON('["ci:apple","ci:android","ci:full"]'), github.event.label.name)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -569,7 +567,7 @@ jobs:
     name: MarmotKit exact-head packaging
     runs-on: ubuntu-latest
     needs: [identity, android-package, ios-package, macos-package]
-    if: always() && needs.identity.result != 'skipped'
+    if: always()
     timeout-minutes: 5
     permissions:
       contents: read

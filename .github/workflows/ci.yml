@@ -41,7 +41,9 @@ jobs:
       test_profile: ${{ steps.tests.outputs.test_profile }}
       workspace_filter: ${{ steps.tests.outputs.workspace_filter }}
       run_tests: ${{ steps.tests.outputs.run_tests }}
-      allow_empty_tests: ${{ steps.tests.outputs.allow_empty_tests }}
+      full_workspace: ${{ steps.tests.outputs.full_workspace }}
+      cli_profile: ${{ steps.tests.outputs.cli_profile }}
+      relay_profile: ${{ steps.tests.outputs.relay_profile }}
       run_cli: ${{ steps.tests.outputs.run_cli }}
       run_relay: ${{ steps.tests.outputs.run_relay }}
       run_simulator: ${{ steps.tests.outputs.run_simulator }}
@@ -456,7 +458,6 @@ jobs:
     env:
       NEXTEST_PROFILE: ${{ needs.changes.outputs.test_profile }}
       WORKSPACE_FILTER: ${{ needs.changes.outputs.workspace_filter }}
-      CI_ALLOW_EMPTY_TESTS: ${{ needs.changes.outputs.allow_empty_tests }}
 
     steps:
       - name: Check out repository
@@ -499,6 +500,20 @@ jobs:
       - name: Archive workspace tests
         run: cargo nextest archive --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --profile "$NEXTEST_PROFILE" -E "$WORKSPACE_FILTER" --archive-file tests.tar.zst
 
+      # CI/config PRs select ci-full. Exercise the actual filtered archive and
+      # ci-pr execution path too, using a small crate already compiled above.
+      - name: Verify PR profile archive execution
+        if: github.event_name == 'pull_request' && needs.changes.outputs.full_workspace == 'true'
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/pr-profile-tests.tar.zst"
+          cargo nextest archive --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --profile ci-pr -E 'package(=agent-control)' --archive-file "$archive"
+          bash scripts/check_ci_partitions.sh 5 --archive-file "$archive" --workspace-remap "$GITHUB_WORKSPACE" --profile ci-pr -E 'package(=agent-control)'
+          for partition in 1 2 3 4 5; do
+            cargo nextest run --archive-file "$archive" --workspace-remap "$GITHUB_WORKSPACE" --profile ci-pr -E 'package(=agent-control)' --partition "count:$partition/5" --no-tests=pass
+          done
+          cargo nextest run --archive-file "$archive" --workspace-remap "$GITHUB_WORKSPACE" --profile ci-pr -E 'none()' --no-tests=pass
+
       - name: Upload test archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -517,7 +532,6 @@ jobs:
     env:
       NEXTEST_PROFILE: ${{ needs.changes.outputs.test_profile }}
       WORKSPACE_FILTER: ${{ needs.changes.outputs.workspace_filter }}
-      CI_ALLOW_EMPTY_TESTS: ${{ needs.changes.outputs.allow_empty_tests }}
     strategy:
       fail-fast: false
       matrix:
@@ -599,7 +613,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      NEXTEST_PROFILE: ${{ needs.changes.outputs.test_profile }}
+      NEXTEST_PROFILE: ${{ needs.changes.outputs.cli_profile }}
 
     steps:
       - name: Check out repository
@@ -649,7 +663,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      NEXTEST_PROFILE: ${{ needs.changes.outputs.test_profile }}
+      NEXTEST_PROFILE: ${{ needs.changes.outputs.cli_profile }}
     strategy:
       fail-fast: false
       matrix:
@@ -694,7 +708,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      NEXTEST_PROFILE: ${{ needs.changes.outputs.test_profile }}
+      NEXTEST_PROFILE: ${{ needs.changes.outputs.relay_profile }}
 
     steps:
       - name: Check out repository
@@ -744,7 +758,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      NEXTEST_PROFILE: ${{ needs.changes.outputs.test_profile }}
+      NEXTEST_PROFILE: ${{ needs.changes.outputs.relay_profile }}
     strategy:
       fail-fast: false
       matrix:

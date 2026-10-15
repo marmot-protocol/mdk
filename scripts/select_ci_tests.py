@@ -18,6 +18,8 @@ DEDICATED = (
     "not (package(marmot-app) & binary(relay_runtime)) and "
     "not (package(wn-cli) & binary(cli))"
 )
+# This test fixture is shared through include_str!, outside Cargo's graph.
+EXTRA_TEST_DEPENDENCIES = {"transport-nostr-adapter": {"marmot-forensics"}}
 
 
 def workspace_graph(root: Path) -> tuple[dict[str, str], dict[str, set[str]]]:
@@ -48,6 +50,10 @@ def workspace_graph(root: Path) -> tuple[dict[str, str], dict[str, set[str]]]:
                     dependency = declaration.get("package", alias)
                     if dependency in reverse:
                         reverse[dependency].add(name)
+    for consumer, dependencies in EXTRA_TEST_DEPENDENCIES.items():
+        for dependency in dependencies:
+            if consumer in reverse and dependency in reverse:
+                reverse[dependency].add(consumer)
     return directories, reverse
 
 
@@ -55,6 +61,7 @@ def select(paths: list[str], *, root: Path = ROOT, full: bool = False) -> dict:
     directories, reverse = workspace_graph(root)
     paths = sorted(set(paths))
     affected = set()
+    directly_changed = set()
     reason = "changed crates and transitive dependents"
     full_workspace = full or not paths
     for path in paths:
@@ -70,6 +77,7 @@ def select(paths: list[str], *, root: Path = ROOT, full: bool = False) -> dict:
         )
         if owner:
             affected.add(owner)
+            directly_changed.add(owner)
         elif classify([path])["run_full"]:
             full_workspace = True
             reason = "unclassified or shared assurance input"
@@ -98,10 +106,12 @@ def select(paths: list[str], *, root: Path = ROOT, full: bool = False) -> dict:
     package_filter = " | ".join(f"package(={name})" for name in packages) or "none()"
     return {
         "test_profile": profile,
+        "cli_profile": "ci-full" if profile == "ci-full" or "wn-cli" in directly_changed else "ci-pr",
+        "relay_profile": "ci-full" if profile == "ci-full" or "marmot-app" in directly_changed else "ci-pr",
         "test_packages": packages,
         "workspace_filter": f"({package_filter}) & ({DEDICATED})",
         "run_tests": bool(packages),
-        "allow_empty_tests": not full_workspace,
+        "full_workspace": full_workspace,
         "run_cli": "wn-cli" in affected,
         "run_relay": "marmot-app" in affected,
         "run_simulator": "cgka-conformance-simulator" in affected,
@@ -135,6 +145,7 @@ def main() -> None:
             handle.write(
                 "### Native test selection\n\n"
                 f"Profile: `{result['test_profile']}`. {result['selection_reason']}.\n\n"
+                f"CLI profile: `{result['cli_profile']}`; runtime profile: `{result['relay_profile']}`.\n\n"
                 "Workspace test packages: "
                 + (", ".join(f"`{name}`" for name in result["test_packages"]) or "none")
                 + ".\n"
