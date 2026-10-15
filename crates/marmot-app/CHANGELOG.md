@@ -31,10 +31,12 @@
 - Download checkpoints keep their ciphertext in append-only `.wire` files in
   the account's `media/` directory instead of SQLCipher rows (mdk#2314).
   Checkpoints saved by an older build are discarded on upgrade.
-- Download admission and in-memory downloads need the configured disk reserve
-  plus twice the body (its checkpoint and its stored file) instead of four
-  times. Large explicit downloads streamed to a file still need four times
-  until they checkpoint straight into the wire file.
+- Downloads need the configured disk reserve plus twice the body (its
+  ciphertext and its stored file) instead of four times; bytes already
+  checkpointed count once. Large explicit downloads streamed to a file write
+  their ciphertext straight into the `.wire` checkpoint (or, without a strong
+  validator, one private staging file) and publication decrypts it straight
+  into the encrypted store file, so no plaintext copy is written to disk.
 - Publication, hashing and encryption of downloaded bodies run on the blocking
   pool for in-memory bodies too, never on the account worker.
 - Hosts must exclude the account directory, including `media/`, from cloud and

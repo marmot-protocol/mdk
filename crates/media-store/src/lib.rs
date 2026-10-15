@@ -29,7 +29,8 @@ pub use disk::{Admission, DiskPolicy, free_space};
 pub use error::{MediaError, MediaResult};
 pub use format::FileKey;
 pub use store::{
-    MEDIA_DIRECTORY, MediaReader, MediaStore, PublishOutcome, SweepReport, WireFile, sync_file,
+    MEDIA_DIRECTORY, MediaReader, MediaStore, PublishOutcome, SweepReport, WireFile, WireReader,
+    sync_file,
 };
 
 #[cfg(test)]

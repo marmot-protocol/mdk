@@ -2966,7 +2966,7 @@ fn storage_block_parks_until_space_or_retry_and_keeps_checkpoints() {
 }
 
 /// Readmission never outruns admission: a parked row whose target fits is left
-/// parked while free space is still below the reserve plus four transfer
+/// parked while free space is still below the reserve plus two transfer
 /// limits, instead of being bounced back to a retry timer.
 #[test]
 fn storage_readmission_waits_for_admission_capacity() {
@@ -2978,14 +2978,14 @@ fn storage_readmission_waits_for_admission_capacity() {
         .unwrap()
         .unwrap();
     park(&store, &job, 1024, 12);
-    let limit = 2 * 1024 * 1024;
+    let limit = 4 * 1024 * 1024;
     assert!(
-        fits(1024) < 4 * limit,
+        fits(1024) < 2 * limit,
         "the target fits before admission would"
     );
     assert_eq!(
         store
-            .readmit_storage_blocked_attachments(13, 1000, 1000 + 4 * limit - 1, limit, true)
+            .readmit_storage_blocked_attachments(13, 1000, 1000 + 2 * limit - 1, limit, true)
             .unwrap(),
         0
     );
@@ -2995,7 +2995,7 @@ fn storage_readmission_waits_for_admission_capacity() {
     );
     assert_eq!(
         store
-            .readmit_storage_blocked_attachments(13, 1000, 1000 + 4 * limit, limit, true)
+            .readmit_storage_blocked_attachments(13, 1000, 1000 + 2 * limit, limit, true)
             .unwrap(),
         1
     );

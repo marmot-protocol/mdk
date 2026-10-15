@@ -801,6 +801,78 @@ impl<C: MediaCatalog> WireFile<C> {
         }
         Ok(copied)
     }
+
+    /// A reader over the recorded bytes, from the start. It holds the open
+    /// file, so a sweep that unlinks it later does not cut it short, and it
+    /// stops reading once the store or its catalog closes.
+    pub fn into_reader(mut self) -> MediaResult<WireReader<C>> {
+        self.inner.ensure_open()?;
+        self.file
+            .seek(io::SeekFrom::Start(0))
+            .map_err(|e| io_error(&e))?;
+        Ok(WireReader {
+            inner: self.inner,
+            file: self.file,
+            len: self.len,
+            position: 0,
+        })
+    }
+}
+
+/// Reads a wire checkpoint's recorded bytes, never past them. Reads fail
+/// once the store or its catalog closes.
+pub struct WireReader<C> {
+    inner: Arc<Inner<C>>,
+    file: File,
+    len: u64,
+    position: u64,
+}
+
+impl<C: MediaCatalog> WireReader<C> {
+    /// The recorded length.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl<C: MediaCatalog> Read for WireReader<C> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.inner.is_closed() {
+            return Err(io::Error::other("media store is closed"));
+        }
+        let left = self.len.saturating_sub(self.position);
+        let want = out.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+        if want == 0 {
+            return Ok(0);
+        }
+        let read = self.file.read(&mut out[..want])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "wire checkpoint shorter than recorded",
+            ));
+        }
+        self.position += read as u64;
+        Ok(read)
+    }
+}
+
+impl<C: MediaCatalog> Seek for WireReader<C> {
+    fn seek(&mut self, to: io::SeekFrom) -> io::Result<u64> {
+        let target = match to {
+            io::SeekFrom::Start(offset) => Some(offset),
+            io::SeekFrom::End(delta) => self.len.checked_add_signed(delta),
+            io::SeekFrom::Current(delta) => self.position.checked_add_signed(delta),
+        }
+        .filter(|target| *target <= self.len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek outside checkpoint"))?;
+        self.position = self.file.seek(io::SeekFrom::Start(target))?;
+        Ok(self.position)
+    }
 }
 
 /// An open media file that refuses reads once the store or its catalog

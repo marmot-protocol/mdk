@@ -580,7 +580,8 @@ pub(crate) struct EncryptedMediaDownloadHttp {
 
 pub(crate) enum AcquiredMediaBody {
     Memory(MediaDownloadResult),
-    File(crate::media::file_transfer::PrivateMediaFile),
+    /// An authenticated ciphertext that publication decrypts into the store.
+    File(crate::media::file_transfer::DownloadedFileBody),
     /// Completed without a body: identical content was already retained in
     /// the media store, or the job no longer needed one.
     Retained,
@@ -622,7 +623,9 @@ impl EncryptedMediaDownloadHttp {
                     Arc::new(resume.clone()),
                 )
                 .await?;
-                resume.completed_file_body(file.len as usize).await?;
+                resume
+                    .completed_file_body(file.plaintext_len, file.ciphertext.staged_bytes())
+                    .await?;
                 Ok(AcquiredMediaBody::File(file))
             }
             Err(error) => Err(error),

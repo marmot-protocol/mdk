@@ -660,6 +660,11 @@ pub(crate) async fn fetch_blossom_blob_with_transport(
 
 /// File sink for large explicit acquisitions. DNS pinning and redirect
 /// validation use the same transport as bounded in-memory downloads.
+/// Streams a file body without assembling it in memory. A representation
+/// with a strong validator checkpoints straight into the job's `.wire` file,
+/// which is all the disk it takes; one without a validator stages into one
+/// private file. Either way the ciphertext is returned once its digest
+/// matches, for verification and publication to read in place (mdk#2314).
 pub(crate) async fn fetch_blossom_file_with_transport(
     url: &str,
     transport: &BlossomHttpTransport,
@@ -668,9 +673,11 @@ pub(crate) async fn fetch_blossom_file_with_transport(
     max_bytes: u64,
     control: Arc<super::file_transfer::MediaFileTransferControl>,
     observation: Arc<super::attachment_resume::AttachmentResume>,
-) -> Result<super::file_transfer::PrivateMediaFile, AttachmentDownloadFailure> {
+) -> Result<super::file_transfer::DownloadedCiphertext, AttachmentDownloadFailure> {
+    use super::file_transfer::{CiphertextSource, DownloadedCiphertext, PrivateMediaFile};
     use sha2::{Digest, Sha256};
-    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
+    const CHECKPOINT: usize = storage_sqlite::ATTACHMENT_CHECKPOINT_BYTES;
     let mut current = Url::parse(url)
         .map_err(|_| AppError::InvalidEncryptedMedia("media URL is invalid".into()))?;
     validate_blossom_fetch_url(&current, transport.allow_loopback_http)
@@ -681,40 +688,24 @@ pub(crate) async fn fetch_blossom_file_with_transport(
     loop {
         control.check()?;
         let prefix = observation
-            .load_file(&current, max_bytes, directory.to_path_buf())
+            .load_wire(&current, max_bytes, control.clone())
             .await?;
-        let prefix_length = prefix.as_ref().map(|(file, _)| file.len).unwrap_or(0);
+        let prefix_length = prefix.as_ref().map_or(0, |part| part.received);
         // A crash may leave a complete authenticated ciphertext checkpoint.
         // Reuse it after verifying the full digest; never request bytes=total-
         // (which legitimately receives 416 from a Range-capable server).
-        if prefix
+        if let Some(part) = prefix
             .as_ref()
-            .is_some_and(|(_, identity)| prefix_length == identity.total)
+            .filter(|part| part.received == part.identity.total)
         {
-            let (mut file, _) = prefix.expect("complete checkpoint");
-            let mut reader = file.reader()?;
-            let check = control.clone();
-            let digest = tokio::task::spawn_blocking(move || {
-                use std::io::Read;
-                let mut hash = Sha256::new();
-                let mut buffer = vec![0u8; super::file_transfer::FILE_TRANSFER_BUFFER_BYTES];
-                loop {
-                    check.check()?;
-                    let count = reader
-                        .read(&mut buffer)
-                        .map_err(|_| AppError::BlobStore("file checkpoint unavailable".into()))?;
-                    if count == 0 {
-                        break;
-                    }
-                    hash.update(&buffer[..count]);
-                }
-                Ok::<[u8; 32], AppError>(hash.finalize().into())
-            })
-            .await
-            .map_err(|_| AppError::BlockingTask("file checkpoint verification failed".into()))??;
+            let digest: [u8; 32] = part.hash.clone().finalize().into();
             if digest == expected_hash {
-                file.digest = digest;
-                return Ok(file);
+                let wire = observation.completed_wire(&current, prefix_length).await?;
+                return Ok(DownloadedCiphertext {
+                    source: CiphertextSource::Wire(wire),
+                    len: prefix_length,
+                    digest,
+                });
             }
             observation.clear(Some(&current)).await?;
             continue;
@@ -731,10 +722,10 @@ pub(crate) async fn fetch_blossom_file_with_transport(
             .get(current.clone())
             .timeout(transport.transfer_timeout)
             .header(reqwest::header::ACCEPT_ENCODING, "identity");
-        if let Some((_, identity)) = &prefix {
+        if let Some(part) = &prefix {
             request = request
                 .header(reqwest::header::RANGE, format!("bytes={prefix_length}-"))
-                .header(reqwest::header::IF_RANGE, &identity.etag);
+                .header(reqwest::header::IF_RANGE, &part.identity.etag);
         }
         let response = tokio::select! {
             result = tokio::time::timeout_at(startup_deadline,
@@ -796,7 +787,7 @@ pub(crate) async fn fetch_blossom_file_with_transport(
         let limit = max_bytes.min(super::file_transfer::MAX_FILE_MEDIA_CIPHERTEXT_BYTES);
         let etag = super::attachment_resume::strong_etag(response.headers());
         if partial_response {
-            let Some((_, identity)) = &prefix else {
+            let Some(identity) = prefix.as_ref().map(|part| &part.identity) else {
                 return Err(AttachmentDownloadFailure::Stop(AppError::BlobStore(
                     "unexpected file partial response".into(),
                 )));
@@ -838,7 +829,7 @@ pub(crate) async fn fetch_blossom_file_with_transport(
             ));
         }
         let total = if partial_response {
-            prefix.as_ref().map(|(_, identity)| identity.total)
+            prefix.as_ref().map(|part| part.identity.total)
         } else {
             response.content_length()
         };
@@ -856,57 +847,42 @@ pub(crate) async fn fetch_blossom_file_with_transport(
                     etag,
                     total,
                 });
-        // The staging file grows from the restored prefix to the total and,
-        // with a validator, so does the checkpoint; the prefix is staged now.
+        // The ciphertext and the store file, less the checkpoint already on
+        // disk; nothing is held yet.
         observation
             .publication_capacity(
                 total.unwrap_or(0),
-                total.map_or(0, |total| {
-                    let growth = total.saturating_sub(prefix_length);
-                    growth.saturating_add(if identity.is_some() { growth } else { 0 })
-                }),
-                prefix_length,
+                if partial_response { prefix_length } else { 0 },
+                0,
             )
             .await?;
         let mut response = response;
-        let mut output = if partial_response {
-            prefix.expect("validated file prefix").0
-        } else {
-            observation.clear(Some(&current)).await?;
-            super::file_transfer::PrivateMediaFile::create(directory)?
-        };
-        observation.progress(output.len, total, true).await?;
-        let mut writer = tokio::fs::File::from_std(output.writer()?);
-        writer
-            .seek(std::io::SeekFrom::End(0))
-            .await
-            .map_err(|_| AppError::BlobStore("file resume staging failed".into()))?;
-        let mut prefix_reader = output.reader()?;
-        let prefix_control = control.clone();
-        let mut hash = tokio::task::spawn_blocking(move || {
-            use std::io::Read;
-            let mut hash = Sha256::new();
-            let mut buffer = vec![0u8; super::file_transfer::FILE_TRANSFER_BUFFER_BYTES];
-            loop {
-                prefix_control.check()?;
-                let count = prefix_reader
-                    .read(&mut buffer)
-                    .map_err(|_| AppError::BlobStore("file prefix unavailable".into()))?;
-                if count == 0 {
-                    break;
-                }
-                hash.update(&buffer[..count]);
+        let (mut hash, mut len) = match prefix {
+            Some(part) if partial_response => (part.hash, part.received),
+            _ => {
+                observation.clear(Some(&current)).await?;
+                (Sha256::new(), 0)
             }
-            Ok::<_, AppError>(hash)
-        })
-        .await
-        .map_err(|_| AppError::BlockingTask("file prefix verification failed".into()))??;
-        let mut pending = Vec::with_capacity(storage_sqlite::ATTACHMENT_CHECKPOINT_BYTES);
-        let mut saved = output.len as usize;
-        let mut capacity_checked = output.len;
+        };
+        // Without a validator nothing can checkpoint, so the body stages in
+        // one private file instead of the wire file.
+        let mut staged = match identity {
+            Some(_) => None,
+            None => {
+                let file = PrivateMediaFile::create(directory)?;
+                let writer = tokio::fs::File::from_std(file.writer()?);
+                Some((file, writer))
+            }
+        };
+        observation.progress(len, total, true).await?;
+        // Received bytes not yet recorded in the wire checkpoint: under one
+        // checkpoint unit plus a network chunk.
+        let mut pending = Vec::new();
+        let mut saved = len;
+        let mut capacity_checked = len;
         let mut reported = tokio::time::Instant::now();
         let mut body_started = false;
-        // Restoring/hashing a large local prefix must not consume the first
+        // Hashing a large local prefix must not consume the first
         // network-byte allowance; DNS and response headers were already bounded.
         let first_body_deadline =
             deadline.min(tokio::time::Instant::now() + transport.candidate_startup_timeout);
@@ -933,7 +909,9 @@ pub(crate) async fn fetch_blossom_file_with_transport(
                     if let Some(identity) = &identity
                         && !pending.is_empty()
                     {
-                        observation.save(identity.clone(), saved, pending).await?;
+                        observation
+                            .save(identity.clone(), saved as usize, pending)
+                            .await?;
                     }
                     return Err(error);
                 }
@@ -942,8 +920,7 @@ pub(crate) async fn fetch_blossom_file_with_transport(
                 break;
             };
             body_started |= !chunk.is_empty();
-            output.len = output
-                .len
+            len = len
                 .checked_add(chunk.len() as u64)
                 .filter(|length| *length <= limit)
                 .ok_or_else(|| {
@@ -952,78 +929,67 @@ pub(crate) async fn fetch_blossom_file_with_transport(
                         limit + 1,
                     )
                 })?;
-            if total.is_some_and(|total| output.len > total) {
+            if total.is_some_and(|total| len > total) {
                 observation.clear(Some(&current)).await?;
                 return Err(AttachmentDownloadFailure::Stop(AppError::BlobStore(
                     "file response exceeds size bound".into(),
                 )));
             }
-            // Bodies without validators cannot checkpoint, but still consume
-            // private disk space and must preserve the same reserve. An unknown
-            // total projects the body received so far; the staged bytes are
-            // held now, and the checkpoint still grows past the saved prefix.
-            if output.len - capacity_checked >= storage_sqlite::ATTACHMENT_CHECKPOINT_BYTES as u64 {
-                let projected = total.unwrap_or(output.len);
+            // An unknown total projects the body received so far. Staged
+            // bytes are on disk and held by this attempt; checkpointed bytes
+            // are on disk and stay.
+            if len - capacity_checked >= CHECKPOINT as u64 {
+                let projected = total.unwrap_or(len);
+                let (on_disk, held) = if staged.is_some() {
+                    (len, len)
+                } else {
+                    (saved, 0)
+                };
                 observation
-                    .publication_capacity(
-                        projected,
-                        projected.saturating_sub(output.len).saturating_add(
-                            if identity.is_some() {
-                                projected.saturating_sub(saved as u64)
-                            } else {
-                                0
-                            },
-                        ),
-                        output.len,
-                    )
+                    .publication_capacity(projected, on_disk, held)
                     .await?;
-                capacity_checked = output.len;
+                capacity_checked = len;
             }
-            for part in chunk.chunks(super::file_transfer::FILE_TRANSFER_BUFFER_BYTES) {
-                control.check()?;
-                writer
-                    .write_all(part)
-                    .await
-                    .map_err(|_| AppError::BlobStore("file download staging failed".into()))?;
-                hash.update(part);
-                if let Some(identity) = &identity {
-                    pending.extend_from_slice(part);
-                    if pending.len() >= storage_sqlite::ATTACHMENT_CHECKPOINT_BYTES {
-                        writer.flush().await.map_err(|_| {
-                            AppError::BlobStore("file checkpoint staging failed".into())
-                        })?;
-                        let remainder =
-                            pending.split_off(storage_sqlite::ATTACHMENT_CHECKPOINT_BYTES);
-                        let checkpoint = std::mem::replace(&mut pending, remainder);
-                        observation
-                            .save(identity.clone(), saved, checkpoint)
-                            .await?;
-                        saved += storage_sqlite::ATTACHMENT_CHECKPOINT_BYTES;
-                    }
+            hash.update(&chunk);
+            if let Some((_, writer)) = staged.as_mut() {
+                for part in chunk.chunks(super::file_transfer::FILE_TRANSFER_BUFFER_BYTES) {
+                    control.check()?;
+                    writer
+                        .write_all(part)
+                        .await
+                        .map_err(|_| AppError::BlobStore("file download staging failed".into()))?;
                 }
             }
-            control.advance(output.len);
+            if let Some(identity) = &identity {
+                pending.extend_from_slice(&chunk);
+                while pending.len() >= CHECKPOINT {
+                    let remainder = pending.split_off(CHECKPOINT);
+                    let checkpoint = std::mem::replace(&mut pending, remainder);
+                    observation
+                        .save(identity.clone(), saved as usize, checkpoint)
+                        .await?;
+                    saved += CHECKPOINT as u64;
+                }
+            }
+            control.advance(len);
             if reported.elapsed() >= Duration::from_millis(250) {
-                observation.progress(output.len, total, false).await?;
+                observation.progress(len, total, false).await?;
                 reported = tokio::time::Instant::now();
             }
         }
-        writer
-            .flush()
-            .await
-            .map_err(|_| AppError::BlobStore("file download staging failed".into()))?;
-        drop(writer);
         control.check()?;
-        if total.is_some_and(|expected| expected != output.len) {
+        if total.is_some_and(|expected| expected != len) {
             if let Some(identity) = &identity
                 && !pending.is_empty()
             {
-                observation.save(identity.clone(), saved, pending).await?;
+                observation
+                    .save(identity.clone(), saved as usize, pending)
+                    .await?;
             }
             return Err(AppError::BlobStore("file response truncated".into()).into());
         }
-        output.digest = hash.finalize().into();
-        if output.digest != expected_hash {
+        let digest: [u8; 32] = hash.finalize().into();
+        if digest != expected_hash {
             observation.clear(Some(&current)).await?;
             let error = AppError::MediaDownloadFailed("media ciphertext hash mismatch".into());
             // A saved prefix can be stale despite valid Range headers. Clear it
@@ -1034,7 +1000,32 @@ pub(crate) async fn fetch_blossom_file_with_transport(
                 AttachmentDownloadFailure::Stop(error)
             });
         }
-        return Ok(output);
+        let source = match (staged, identity) {
+            (Some((mut file, mut writer)), _) => {
+                writer
+                    .flush()
+                    .await
+                    .map_err(|_| AppError::BlobStore("file download staging failed".into()))?;
+                drop(writer);
+                file.len = len;
+                file.digest = digest;
+                CiphertextSource::Staged(file)
+            }
+            (None, Some(identity)) => {
+                // The tail completes the checkpoint, so verification and
+                // publication read every byte from the wire file.
+                if !pending.is_empty() {
+                    observation.save(identity, saved as usize, pending).await?;
+                }
+                CiphertextSource::Wire(observation.completed_wire(&current, len).await?)
+            }
+            (None, None) => unreachable!("a body without a validator always stages"),
+        };
+        return Ok(DownloadedCiphertext {
+            source,
+            len,
+            digest,
+        });
     }
 }
 

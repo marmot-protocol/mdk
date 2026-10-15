@@ -376,12 +376,13 @@ fn serve(
     })
 }
 
-/// File sink, no validator, free space inside the old loop window
-/// `[4P, 5P)`: the first implementation downloaded until its own staging
-/// tripped the reserve, parked with the bytes received, and was readmitted the
-/// same tick. Now the declared size parks the job before any body byte, the
-/// target includes the staging a retry needs, and the row stays parked until
-/// space frees.
+/// File sink, no validator, free space that admits the job (two transfer
+/// limits) but not the body (its staging plus its store file): the first
+/// implementation downloaded until its own staging tripped the reserve,
+/// parked with the bytes received, and was readmitted the same tick. Now the
+/// declared size parks the job before any body byte, the target is the
+/// staging and store file a retry needs, and the row stays parked until space
+/// frees.
 #[tokio::test]
 async fn file_sink_without_validator_parks_once_inside_the_loop_window() {
     let plain = vec![0x5a; 32 * MIB as usize];
@@ -401,20 +402,19 @@ async fn file_sink_without_validator_parks_once_inside_the_loop_window() {
         stopped,
     );
     let mut fixture = explicit_fixture(&reference, MIB).await;
-    // 4.25 bodies of headroom: enough for the bare publication reserve, not
-    // for the ciphertext file a retry stages on top of it.
-    fixture.set_free(total * 17 / 4);
+    // 1.5 bodies: enough for the store file, not for the staging beside it.
+    fixture.set_free(total * 3 / 2);
     fixture.tick().await;
     let headroom = fixture.park_and_hold(&requests).await;
     assert_eq!(
         headroom,
-        5 * total,
-        "the target is the reserve plus one staged body"
+        2 * total,
+        "the target is the staged body plus its store file"
     );
     // The in-memory sink spends one header-only request before handing the
     // transfer to the file sink, which refuses on the declared length.
     assert_eq!(requests.load(Ordering::SeqCst), 2);
-    fixture.set_free(5 * total + STORAGE_READMIT_MARGIN_BYTES);
+    fixture.set_free(2 * total + STORAGE_READMIT_MARGIN_BYTES);
     fixture.tick().await;
     fixture.publish_file(&plain).await;
     assert_eq!(
@@ -461,7 +461,7 @@ async fn memory_sink_with_validator_publishes_with_twice_the_body_free() {
 
 #[tokio::test]
 async fn unknown_length_parks_record_the_proven_need_and_back_off() {
-    let plain = vec![0x7c; 8 * MIB as usize];
+    let plain = vec![0x7c; 16 * MIB as usize];
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (reference, cipher) = loopback_reference(&listener, &plain);
     let total = cipher.len() as u64;
@@ -478,8 +478,9 @@ async fn unknown_length_parks_record_the_proven_need_and_back_off() {
         stopped,
     );
     let mut fixture = explicit_fixture(&reference, MIB).await;
-    // The reserve alone passes; the staged body trips the check a few MiB in.
-    fixture.set_free(12 * MIB);
+    // Admission (two transfer limits) passes; the staged body trips the
+    // check a few MiB in.
+    fixture.set_free(4 * MIB);
     fixture.tick().await;
     let mut target = fixture.park_and_hold(&requests).await;
     assert_eq!(requests.load(Ordering::SeqCst), 2);
@@ -490,10 +491,10 @@ async fn unknown_length_parks_record_the_proven_need_and_back_off() {
     test_clock::set_now(fixture._dir.path(), clock);
     let mut delays = vec![];
     loop {
-        // The body needs five of itself (staging plus the publication
-        // reserve); no recorded target may ask for more.
+        // The body needs two of itself (its staging and its store file); no
+        // recorded target may ask for more.
         assert!(
-            target <= 5 * total,
+            target <= 2 * total,
             "target {target} exceeds the body's need"
         );
         // One byte short of the recorded target keeps the row parked, which
@@ -681,8 +682,8 @@ async fn park_mid_transfer() -> MidTransferPark {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     // Something else fills the disk: enough left for checkpoint writes, not
-    // for the publication reserve.
-    fixture.set_free(32 * MIB);
+    // for the rest of the body and its store file.
+    fixture.set_free(16 * MIB);
     proceed.send(true).unwrap();
     let done = fixture.completion().await;
     let headroom = parked_headroom(&done);
@@ -721,8 +722,8 @@ async fn mid_transfer_park_readmits_at_its_target_and_resumes() {
     } = park_mid_transfer().await;
     assert_eq!(
         headroom,
-        6 * total - saved,
-        "four bodies, the staging and checkpoint growth, and the held staging"
+        2 * total - saved,
+        "the rest of the checkpoint and the store file; the saved prefix stays on disk"
     );
     let before = requests.load(Ordering::SeqCst);
     // Exactly the recorded target plus the margin, in the worker's frame.
@@ -926,9 +927,9 @@ async fn file_publication_onto_a_full_disk_parks_until_room_returns() {
     .await;
     assert_eq!(fixture.state(), AttachmentTransferState::StorageBlocked);
     assert_eq!(fixture.storage.retained_attachment_byte_count().unwrap(), 0);
-    // The refusal saw the pinned space less the decrypted file it held; the
-    // worker's frame gets that file back, so the target is the refusal's own
-    // free space plus one more body.
+    // The refusal saw the pinned space less the staged ciphertext it held
+    // (no validator, so no wire checkpoint); the worker's frame gets that file
+    // back, so the target is the refusal's own free space plus one more body.
     let target = free + plain.len() as u64;
     fixture.set_free(target + STORAGE_READMIT_MARGIN_BYTES - 1);
     fixture.tick().await;
@@ -968,8 +969,9 @@ async fn transfer_subscribers_see_park_and_readmission_without_the_active_refres
         Arc::clone(&requests),
         stopped,
     );
-    // A transfer limit below the body sends it through the file sink, whose
-    // declared-size check parks it inside 4.25 bodies of free space.
+    // A transfer limit below the body sends it through the file sink. Its
+    // admission (two limits) passes in 1.5 bodies of free space, and its
+    // declared-size check (two bodies) parks it.
     let mut fixture = explicit_fixture(&reference, MIB).await;
     let runtime = fixture.client.app.runtime();
     fixture.shared = runtime.shared.clone();
@@ -992,7 +994,7 @@ async fn transfer_subscribers_see_park_and_readmission_without_the_active_refres
         state(stream.next().await.unwrap().unwrap()),
         AttachmentTransferState::Queued
     );
-    fixture.set_free(total * 17 / 4);
+    fixture.set_free(total * 3 / 2);
     fixture.tick().await;
     let done = fixture.completion().await;
     parked_headroom(&done);

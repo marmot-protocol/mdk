@@ -22,8 +22,9 @@ database, which this crate reaches through a catalog trait implemented by `stora
   and marks a ready row whose file vanished as *lost*. Readers check the close latch on every read.
 - **Download checkpoints** (`WireFile`): a resumable download appends its ciphertext to an append-only
   `<shard>/<id>.wire` file. The catalog's checkpoint row is written before the file and deleted before it, and records
-  how much of the file is durable; reopening truncates any unrecorded tail. The sweep unlinks wire files whose row is
-  gone.
+  how much of the file is durable; reopening truncates any unrecorded tail. `WireReader` reads the recorded bytes in
+  place, so a finished download is verified and published from its wire file. The sweep unlinks wire files whose row
+  is gone.
 - **Disk admission** (`DiskPolicy`): the caller supplies the reserve from its configuration; the crate only measures
   free space (`free_space`) and compares. A download needs the reserve plus twice the body: its wire file and its
   store file.

@@ -11,6 +11,51 @@ fn fixture(directory: &Path, bytes: &[u8]) -> PrivateMediaFile {
     file
 }
 
+/// What download and publication do in turn: authenticate into a discard
+/// sink, then decrypt as the body is read (here into a file instead of the
+/// media store).
+fn decrypt_file(
+    encrypted: &PrivateMediaFile,
+    directory: &Path,
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    plaintext_hash: [u8; 32],
+    control: &MediaFileTransferControl,
+) -> Result<PrivateMediaFile, AppError> {
+    let mut input = encrypted.reader()?;
+    decrypt_file_to_writer(
+        &mut input,
+        encrypted.len,
+        encrypted.digest,
+        key,
+        nonce,
+        aad,
+        plaintext_hash,
+        control,
+        &mut std::io::sink(),
+    )?;
+    let mut reader = DecryptingReader::new(
+        Box::new(encrypted.reader()?),
+        encrypted.len,
+        key,
+        nonce,
+        aad,
+    )?;
+    let mut output = PrivateMediaFile::create(directory)?;
+    std::io::copy(&mut reader, &mut output.file).map_err(staging_error)?;
+    output.file.flush().map_err(staging_error)?;
+    output.len = output
+        .file
+        .as_file()
+        .metadata()
+        .map_err(staging_error)?
+        .len();
+    assert_eq!(output.len, encrypted.len - MEDIA_AEAD_TAG_BYTES);
+    output.digest = plaintext_hash;
+    Ok(output)
+}
+
 fn bytes(file: &PrivateMediaFile) -> Vec<u8> {
     let mut result = Vec::new();
     file.reader().unwrap().read_to_end(&mut result).unwrap();

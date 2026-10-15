@@ -393,3 +393,38 @@ fn consecutive_reads_reuse_one_cached_reader_and_key() {
         Err(MediaError::Closed)
     );
 }
+
+#[test]
+fn a_wire_reader_reads_only_recorded_bytes_and_stops_at_close() {
+    use std::io::{Seek, SeekFrom};
+    let (harness, store) = fixture();
+    let id = harness.begin_wire_partial(0);
+    let mut wire = store.create_wire(&id).unwrap();
+    wire.append(b"recorded").unwrap();
+    wire.append(b"-tail").unwrap();
+    drop(wire);
+    // Only the recorded prefix is readable, and seeks stay inside it.
+    let mut reader = store
+        .open_wire(&id, 8)
+        .unwrap()
+        .unwrap()
+        .into_reader()
+        .unwrap();
+    assert_eq!(reader.len(), 8);
+    assert_eq!(reader.seek(SeekFrom::End(-2)).unwrap(), 6);
+    let mut tail = Vec::new();
+    reader.read_to_end(&mut tail).unwrap();
+    assert_eq!(tail, b"ed");
+    assert!(reader.seek(SeekFrom::Start(9)).is_err());
+    reader.seek(SeekFrom::Start(0)).unwrap();
+    let mut all = Vec::new();
+    reader.read_to_end(&mut all).unwrap();
+    assert_eq!(all, b"recorded");
+    // The open handle outlives an unlink, but not a close.
+    reader.seek(SeekFrom::Start(0)).unwrap();
+    store.remove_wire(&id);
+    let mut byte = [0; 1];
+    assert_eq!(reader.read(&mut byte).unwrap(), 1);
+    store.close();
+    assert!(reader.read(&mut byte).is_err());
+}

@@ -398,72 +398,115 @@ pub(crate) fn encrypt_file(
     Ok(output)
 }
 
-/// Authenticate and hash the complete private ciphertext into a discard sink
-/// before creating a plaintext snapshot. A crash during this first pass leaves
-/// ciphertext only. The second bounded pass rechecks authentication and hashes
-/// before returning the verified snapshot; neither pass retains a whole array.
-pub(crate) fn decrypt_file(
-    encrypted: &PrivateMediaFile,
-    directory: &Path,
-    key: &[u8; 32],
-    nonce: &[u8; 12],
-    aad: &[u8],
-    plaintext_hash: [u8; 32],
-    control: &MediaFileTransferControl,
-) -> Result<PrivateMediaFile, AppError> {
-    decrypt_file_to_writer(
-        encrypted,
-        key,
-        nonce,
-        aad,
-        plaintext_hash,
-        control,
-        &mut std::io::sink(),
-    )?;
-    control.check()?;
-    let mut output = PrivateMediaFile::create(directory)?;
-    decrypt_file_to_writer(
-        encrypted,
-        key,
-        nonce,
-        aad,
-        plaintext_hash,
-        control,
-        &mut output.file,
-    )?;
-    control.check()?;
-    output.file.flush().map_err(staging_error)?;
-    output.len = output
-        .file
-        .as_file()
-        .metadata()
-        .map_err(staging_error)?
-        .len();
-    if output.len != encrypted.len - MEDIA_AEAD_TAG_BYTES {
-        return Err(AppError::InvalidEncryptedMedia(
-            "media plaintext length mismatch".into(),
-        ));
-    }
-    output.digest = plaintext_hash;
-    Ok(output)
+/// A ciphertext source: the job's wire checkpoint or a staging file.
+pub(crate) trait CiphertextRead: Read + Seek + Send {}
+impl<T: Read + Seek + Send> CiphertextRead for T {}
+
+/// Where a downloaded ciphertext sits until publication (mdk#2314).
+pub(crate) enum CiphertextSource {
+    /// The job's `.wire` checkpoint, recorded through its whole length. Its
+    /// row is the job's checkpoint; publication removes the file.
+    Wire(media_store::FileId),
+    /// A private staging file, for a body served without a strong validator,
+    /// which cannot checkpoint.
+    Staged(PrivateMediaFile),
 }
 
-fn decrypt_file_to_writer(
-    encrypted: &PrivateMediaFile,
-    key: &[u8; 32],
-    nonce: &[u8; 12],
-    aad: &[u8],
-    plaintext_hash: [u8; 32],
-    control: &MediaFileTransferControl,
-    output: &mut dyn Write,
-) -> Result<(), AppError> {
-    control.check()?;
-    let body_len = encrypted
-        .len
+/// A complete downloaded ciphertext whose digest matched its reference.
+pub(crate) struct DownloadedCiphertext {
+    pub(crate) source: CiphertextSource,
+    pub(crate) len: u64,
+    pub(crate) digest: [u8; 32],
+}
+
+impl DownloadedCiphertext {
+    /// Staging this ciphertext occupies that the worker's free-space
+    /// measurement will not see once it is dropped. A wire checkpoint stays.
+    pub(crate) fn staged_bytes(&self) -> u64 {
+        match self.source {
+            CiphertextSource::Wire(_) => 0,
+            CiphertextSource::Staged(_) => self.len,
+        }
+    }
+
+    /// The wire file to remove once publication no longer needs it.
+    pub(crate) fn wire_file(&self) -> Option<media_store::FileId> {
+        match self.source {
+            CiphertextSource::Wire(id) => Some(id),
+            CiphertextSource::Staged(_) => None,
+        }
+    }
+
+    /// Opens the ciphertext from the start. Blocking.
+    pub(crate) fn reader(
+        &self,
+        media: &crate::AccountMediaStore,
+    ) -> Result<Box<dyn CiphertextRead>, AppError> {
+        match &self.source {
+            CiphertextSource::Wire(id) => {
+                let unavailable = || AppError::BlobStore("file checkpoint unavailable".into());
+                let wire = media
+                    .open_wire(id, self.len)
+                    .map_err(|_| unavailable())?
+                    .ok_or_else(unavailable)?;
+                Ok(Box::new(wire.into_reader().map_err(|_| unavailable())?))
+            }
+            CiphertextSource::Staged(file) => Ok(Box::new(file.reader()?)),
+        }
+    }
+}
+
+/// A downloaded file body, authenticated before its receipt, with what
+/// publication needs to decrypt it again as it writes the store file. No
+/// plaintext copy is ever written outside the store.
+pub(crate) struct DownloadedFileBody {
+    pub(crate) ciphertext: DownloadedCiphertext,
+    key: Zeroizing<[u8; 32]>,
+    nonce: [u8; 12],
+    aad: Vec<u8>,
+    pub(crate) plaintext_len: u64,
+}
+
+impl DownloadedFileBody {
+    pub(crate) fn new(
+        ciphertext: DownloadedCiphertext,
+        key: [u8; 32],
+        nonce: [u8; 12],
+        aad: Vec<u8>,
+    ) -> Self {
+        Self {
+            plaintext_len: ciphertext.len.saturating_sub(MEDIA_AEAD_TAG_BYTES),
+            ciphertext,
+            key: Zeroizing::new(key),
+            nonce,
+            aad,
+        }
+    }
+
+    /// The plaintext, decrypted as it is read. Authentication was checked
+    /// before the receipt; the tag is checked again at the end, and the store
+    /// checks the plaintext digest. Blocking.
+    pub(crate) fn plaintext_reader(
+        &self,
+        media: &crate::AccountMediaStore,
+    ) -> Result<DecryptingReader, AppError> {
+        DecryptingReader::new(
+            self.ciphertext.reader(media)?,
+            self.ciphertext.len,
+            &self.key,
+            &self.nonce,
+            &self.aad,
+        )
+    }
+}
+
+/// Reads the trailing tag of a `len`-byte ciphertext and rewinds `input`.
+/// Returns the body length and the tag.
+fn ciphertext_tag(input: &mut dyn CiphertextRead, len: u64) -> Result<(u64, [u8; 16]), AppError> {
+    let body_len = len
         .checked_sub(MEDIA_AEAD_TAG_BYTES)
-        .filter(|_| encrypted.len <= MAX_FILE_MEDIA_CIPHERTEXT_BYTES)
+        .filter(|_| len <= MAX_FILE_MEDIA_CIPHERTEXT_BYTES)
         .ok_or_else(|| AppError::InvalidEncryptedMedia("invalid media ciphertext length".into()))?;
-    let mut input = encrypted.reader()?;
     input
         .seek(SeekFrom::Start(body_len))
         .map_err(staging_error)?;
@@ -476,11 +519,41 @@ fn decrypt_file_to_writer(
         ));
     }
     input.rewind().map_err(staging_error)?;
+    Ok((body_len, tag))
+}
+
+fn decryptor(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    tag: &[u8; 16],
+) -> Result<Crypter, AppError> {
     let mut cipher = Crypter::new(Cipher::chacha20_poly1305(), Mode::Decrypt, key, Some(nonce))
         .map_err(crypto_error)?;
     cipher.pad(false);
     cipher.aad_update(aad).map_err(crypto_error)?;
-    cipher.set_tag(&tag).map_err(crypto_error)?;
+    cipher.set_tag(tag).map_err(crypto_error)?;
+    Ok(cipher)
+}
+
+/// Authenticate and hash the complete `len`-byte ciphertext in `input`,
+/// writing the plaintext to `output` (a discard sink when only verifying).
+/// Never retains a whole array.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decrypt_file_to_writer(
+    input: &mut dyn CiphertextRead,
+    len: u64,
+    ciphertext_digest: [u8; 32],
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    plaintext_hash: [u8; 32],
+    control: &MediaFileTransferControl,
+    output: &mut dyn Write,
+) -> Result<(), AppError> {
+    control.check()?;
+    let (body_len, tag) = ciphertext_tag(input, len)?;
+    let mut cipher = decryptor(key, nonce, aad, &tag)?;
     let mut buffer = Zeroizing::new(vec![0; FILE_TRANSFER_BUFFER_BYTES]);
     let mut decrypted = Zeroizing::new(vec![0; FILE_TRANSFER_BUFFER_BYTES + 16]);
     let mut ciphertext_hash = Sha256::new();
@@ -504,7 +577,7 @@ fn decrypt_file_to_writer(
         control.advance(body_len - remaining);
     }
     ciphertext_hash.update(tag);
-    if <[u8; 32]>::from(ciphertext_hash.finalize()) != encrypted.digest {
+    if <[u8; 32]>::from(ciphertext_hash.finalize()) != ciphertext_digest {
         return Err(AppError::InvalidEncryptedMedia(
             "media ciphertext hash mismatch".into(),
         ));
@@ -522,6 +595,74 @@ fn decrypt_file_to_writer(
     }
     control.check()?;
     Ok(())
+}
+
+/// Decrypts a ciphertext as it is read, for publication straight into the
+/// media store. A failed tag at the end is a read error, so the store
+/// abandons the pending file; its plaintext never left the store's own
+/// encryption.
+pub(crate) struct DecryptingReader {
+    input: Box<dyn CiphertextRead>,
+    cipher: Crypter,
+    remaining: u64,
+    finished: bool,
+    buffer: Zeroizing<Vec<u8>>,
+    decrypted: Zeroizing<Vec<u8>>,
+    start: usize,
+    end: usize,
+}
+
+impl DecryptingReader {
+    fn new(
+        mut input: Box<dyn CiphertextRead>,
+        len: u64,
+        key: &[u8; 32],
+        nonce: &[u8; 12],
+        aad: &[u8],
+    ) -> Result<Self, AppError> {
+        let (body_len, tag) = ciphertext_tag(input.as_mut(), len)?;
+        Ok(Self {
+            input,
+            cipher: decryptor(key, nonce, aad, &tag)?,
+            remaining: body_len,
+            finished: false,
+            buffer: Zeroizing::new(vec![0; FILE_TRANSFER_BUFFER_BYTES]),
+            decrypted: Zeroizing::new(vec![0; FILE_TRANSFER_BUFFER_BYTES + 16]),
+            start: 0,
+            end: 0,
+        })
+    }
+}
+
+impl Read for DecryptingReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let invalid =
+            |_| std::io::Error::new(std::io::ErrorKind::InvalidData, "media decryption failed");
+        loop {
+            if self.start < self.end {
+                let count = out.len().min(self.end - self.start);
+                out[..count].copy_from_slice(&self.decrypted[self.start..self.start + count]);
+                self.start += count;
+                return Ok(count);
+            }
+            if self.finished || out.is_empty() {
+                return Ok(0);
+            }
+            self.start = 0;
+            if self.remaining == 0 {
+                self.end = self.cipher.finalize(&mut self.decrypted).map_err(invalid)?;
+                self.finished = true;
+                continue;
+            }
+            let take = self.remaining.min(FILE_TRANSFER_BUFFER_BYTES as u64) as usize;
+            self.input.read_exact(&mut self.buffer[..take])?;
+            self.end = self
+                .cipher
+                .update(&self.buffer[..take], &mut self.decrypted)
+                .map_err(invalid)?;
+            self.remaining -= take as u64;
+        }
+    }
 }
 
 /// Prepare every snapshot and ciphertext (hashing each source before key/AAD
@@ -740,8 +881,10 @@ pub(crate) async fn upload_files_retaining(
     ))
 }
 
-/// Receive without assembling ciphertext or plaintext arrays. The caller
-/// retains source/attempt permission and publishes through bounded storage.
+/// Receive without assembling ciphertext or plaintext arrays, and
+/// authenticate the ciphertext without writing plaintext anywhere. The caller
+/// retains source/attempt permission and publishes the body into the media
+/// store, decrypting it again as it writes.
 #[allow(clippy::too_many_arguments)] // Shared media policy, protected sink and operation controls.
 pub(crate) async fn download_file(
     reference: super::MediaAttachmentReference,
@@ -753,7 +896,7 @@ pub(crate) async fn download_file(
     max_bytes: u64,
     control: Arc<MediaFileTransferControl>,
     observation: Arc<super::attachment_resume::AttachmentResume>,
-) -> Result<PrivateMediaFile, super::AttachmentDownloadFailure> {
+) -> Result<DownloadedFileBody, super::AttachmentDownloadFailure> {
     reference
         .validate(transport.allow_loopback_http)
         .map_err(|error| super::AttachmentDownloadFailure::Stop(AppError::from(error)))?;
@@ -864,34 +1007,35 @@ pub(crate) async fn download_file(
                 continue;
             }
         };
-        // The ciphertext file is this attempt's staging at this point.
-        observation
-            .publication_capacity(
-                encrypted.len.saturating_sub(MEDIA_AEAD_TAG_BYTES),
-                0,
-                encrypted.len,
-            )
-            .await?;
-        let decryption_directory = directory.clone();
+        // Authenticate into a discard sink: nothing is written, and the
+        // receipt is recorded only for a body that verifies.
         let decryption_control = control.clone();
-        let key = key.clone();
-        let aad = aad.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            decrypt_file(
-                &encrypted,
-                &decryption_directory,
-                &key,
-                &nonce,
-                &aad,
-                plaintext_hash,
-                &decryption_control,
-            )
+        let media = observation.media.clone();
+        let verify_key = key.clone();
+        let verify_aad = aad.clone();
+        let (encrypted, result) = tokio::task::spawn_blocking(move || {
+            let result = encrypted.reader(&media).and_then(|mut input| {
+                decrypt_file_to_writer(
+                    input.as_mut(),
+                    encrypted.len,
+                    encrypted.digest,
+                    &verify_key,
+                    &nonce,
+                    &verify_aad,
+                    plaintext_hash,
+                    &decryption_control,
+                    &mut std::io::sink(),
+                )
+            });
+            (encrypted, result)
         })
         .await
         .map_err(|_| AppError::BlockingTask("file media verification failed".into()))?;
         control.check()?;
         match result {
-            Ok(file) => return Ok(file),
+            Ok(()) => {
+                return Ok(DownloadedFileBody::new(encrypted, *key, nonce, aad));
+            }
             Err(_) => failures.push(format!(
                 "locator {}: file integrity verification failed",
                 index + 1
