@@ -509,6 +509,39 @@ fn profile_relay_status(
     status
 }
 
+/// The integration suites drive whole runtimes, so they run on the
+/// multi-thread flavor every production binding uses. A test that needs one
+/// thread says so with `flavor = "current_thread"` and a comment.
+#[test]
+fn integration_suites_choose_their_tokio_flavor() {
+    fn visit(dir: &std::path::Path, bare: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, bare);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let source = std::fs::read_to_string(&path).unwrap();
+                for (index, line) in source.lines().enumerate() {
+                    if line.trim() == "#[tokio::test]" {
+                        bare.push(format!("{}:{}", path.display(), index + 1));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut bare = Vec::new();
+    visit(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests"),
+        &mut bare,
+    );
+    assert!(
+        bare.is_empty(),
+        "use #[tokio::test(flavor = \"multi_thread\", worker_threads = 2)] or an explicit \
+         current_thread flavor: {bare:#?}"
+    );
+}
+
 #[test]
 fn account_profile_publish_endpoint_selection_centralizes_fallback_and_safety() {
     let directory = tempfile::tempdir().unwrap();

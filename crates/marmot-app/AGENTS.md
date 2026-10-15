@@ -335,3 +335,9 @@ cargo test -p marmot-app --features otlp-export
 Tests that require shortened production policy intervals must use
 `#[cfg(feature = "test-policy-overrides")]`; normal test builds deliberately
 ignore those configuration overrides.
+
+The `tests/` integration binaries drive whole runtimes and run on
+`#[tokio::test(flavor = "multi_thread", worker_threads = 2)]`, the flavor every production binding uses; a bare
+`#[tokio::test]` there fails `integration_suites_choose_their_tokio_flavor`. Use `flavor = "current_thread"` only for a
+paused clock or an interleaving that needs one thread, and say why in a comment. When a multi-thread test waits for an
+effect, wait for the state it expects rather than the next event: other tasks run between your steps.

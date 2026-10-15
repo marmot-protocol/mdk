@@ -114,7 +114,7 @@ fn account_sync_failures(runtime: &MarmotAppRuntime) -> u64 {
         .failures
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_group_message_does_not_starve_messages_behind_it() {
     let (_relay, url) = mock_relay().await;
 

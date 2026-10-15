@@ -169,7 +169,7 @@ fn write_valid_v4_audit(dir: &std::path::Path, name: &str) -> std::path::PathBuf
     path
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_audit_log_tracker_update_uses_configured_goggles_contract() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -228,7 +228,7 @@ async fn post_audit_log_tracker_update_uses_configured_goggles_contract() {
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_audit_log_tracker_update_uses_default_endpoint_with_host_token() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -286,7 +286,7 @@ async fn post_audit_log_tracker_update_uses_default_endpoint_with_host_token() {
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_audit_log_tracker_update_continues_after_file_upload_failure() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -338,7 +338,7 @@ async fn post_audit_log_tracker_update_continues_after_file_upload_failure() {
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_audit_log_tracker_update_skips_when_disabled_or_unconfigured() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -409,7 +409,7 @@ fn audit_log_files_lists_local_jsonl_logs() {
     assert!(files[0].size_bytes > 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_audit_log_file_posts_jsonl_body() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -448,7 +448,7 @@ async fn post_audit_log_file_posts_jsonl_body() {
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v5_recorder_file_cannot_be_sent_to_legacy_whole_file_endpoint() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -473,7 +473,7 @@ async fn v5_recorder_file_cannot_be_sent_to_legacy_whole_file_endpoint() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_audit_log_file_rejects_remote_endpoint_without_token() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -498,7 +498,7 @@ async fn post_audit_log_file_rejects_remote_endpoint_without_token() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_audit_log_file_rejects_oversized_files_before_upload() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -519,7 +519,7 @@ async fn post_audit_log_file_rejects_oversized_files_before_upload() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn audit_log_setting_enables_jsonl_recorder_for_opened_accounts() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -544,7 +544,7 @@ async fn audit_log_setting_enables_jsonl_recorder_for_opened_accounts() {
     assert!(files[0].file_name.ends_with(".jsonl"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deferred_runtime_open_records_the_stored_group_baseline() {
     let tmp = tempfile::tempdir().unwrap();
     let account = AccountHome::open(tmp.path())
@@ -621,7 +621,7 @@ async fn deferred_runtime_open_records_the_stored_group_baseline() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn opened_baseline_inventory_exposes_the_64_group_cap() {
     let tmp = tempfile::tempdir().unwrap();
     let account = AccountHome::open(tmp.path())
@@ -663,7 +663,7 @@ async fn opened_baseline_inventory_exposes_the_64_group_cap() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_group_action_writes_human_action_context() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -719,7 +719,7 @@ async fn local_group_action_writes_human_action_context() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_message_send_tags_engine_rows_with_human_action() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -943,7 +943,7 @@ fn checkpoint_path(home: &AccountHome, label: &str) -> std::path::PathBuf {
     home.account_dir(label).join("audit-upload-checkpoint.json")
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acknowledged_audit_files_are_not_re_posted_without_new_rows() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -973,7 +973,7 @@ async fn acknowledged_audit_files_are_not_re_posted_without_new_rows() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn appending_a_suffix_transfers_only_the_changed_file() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -1008,7 +1008,7 @@ async fn appending_a_suffix_transfers_only_the_changed_file() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acknowledgement_survives_restart_and_a_lost_checkpoint_costs_one_repeat() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -1047,7 +1047,7 @@ async fn acknowledgement_survives_restart_and_a_lost_checkpoint_costs_one_repeat
     assert!(sink.take_bodies().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_uploads_retry_while_acknowledged_files_do_not() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -1078,7 +1078,7 @@ async fn failed_uploads_retry_while_acknowledged_files_do_not() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_legacy_file_is_reported_once_and_never_wedges_other_uploads() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -1128,7 +1128,7 @@ async fn oversized_legacy_file_is_reported_once_and_never_wedges_other_uploads()
     assert!(sink.take_bodies().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn endpoint_too_large_verdict_is_recorded_once_and_never_re_posted() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -1180,7 +1180,7 @@ async fn endpoint_too_large_verdict_is_recorded_once_and_never_re_posted() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recorder_segments_upload_once_each_and_stay_under_the_request_ceiling() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -1231,7 +1231,7 @@ async fn recorder_segments_upload_once_each_and_stay_under_the_request_ceiling()
     assert!(sink.take_bodies().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unfinished_upload_tail_is_never_checkpointed_and_later_recovers() {
     use std::io::Write;
     let tmp = tempfile::tempdir().unwrap();
@@ -1272,7 +1272,7 @@ async fn unfinished_upload_tail_is_never_checkpointed_and_later_recovers() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unfinished_first_row_is_deferred_until_complete() {
     use std::io::Write;
     let tmp = tempfile::tempdir().unwrap();
@@ -1321,7 +1321,7 @@ async fn unfinished_first_row_is_deferred_until_complete() {
     assert!(sink.take_bodies().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn custom_json_acknowledgment_is_checkpointed() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -1360,7 +1360,7 @@ async fn custom_json_acknowledgment_is_checkpointed() {
 }
 
 #[cfg(feature = "test-policy-overrides")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn automatic_upload_burst_coalesces_over_real_http_without_overlap() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -1404,7 +1404,7 @@ async fn automatic_upload_burst_coalesces_over_real_http_without_overlap() {
 }
 
 #[cfg(feature = "test-policy-overrides")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn file_growing_past_limit_does_not_stop_other_files_or_accounts() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -1462,7 +1462,7 @@ fn jsonl_row(value: &Value) -> Vec<u8> {
     bytes
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_upload_rejects_legacy_mixed_unknown_and_removed_fields_before_http() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -1533,7 +1533,7 @@ async fn manual_upload_rejects_legacy_mixed_unknown_and_removed_fields_before_ht
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tracker_skips_legacy_files_without_retry_and_uploads_later_v4_files() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -1594,7 +1594,7 @@ async fn tracker_skips_legacy_files_without_retry_and_uploads_later_v4_files() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_audit_log_file_preserves_body_headers_and_rejects_every_redirect() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -1758,7 +1758,7 @@ async fn post_audit_log_file_preserves_body_headers_and_rejects_every_redirect()
     redirect_server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn post_audit_log_file_rejects_unsafe_or_retired_endpoints_without_dialing() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -1842,7 +1842,7 @@ async fn post_audit_log_file_rejects_unsafe_or_retired_endpoints_without_dialing
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redirect_trap_observes_raw_tcp_accept_without_http() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1894,7 +1894,7 @@ async fn wait_for_audit_file_quiesce(path: &str) -> String {
     body
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn enabled_recorder_emits_local_member_ref_before_any_group_mutation() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -1924,7 +1924,7 @@ fn assert_source_linkage(actual: &Value, expected: &Value) {
     assert_eq!(actual["source_ref"], expected["source_ref"]);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reopen_and_toggle_restore_source_row_without_group_mutation() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -2030,7 +2030,7 @@ async fn reopen_and_toggle_restore_source_row_without_group_mutation() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_delete_rotates_and_replays_source_context() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());
@@ -2064,7 +2064,7 @@ async fn live_delete_rotates_and_replays_source_context() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upload_accepts_populated_local_member_ref() {
     let tmp = tempfile::tempdir().unwrap();
     let home = AccountHome::open(tmp.path());

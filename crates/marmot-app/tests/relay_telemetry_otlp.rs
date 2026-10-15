@@ -202,7 +202,7 @@ fn runtime_config_without_endpoint() -> RelayTelemetryRuntimeConfig {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn export_once_pushes_otlp_metrics_over_http() {
     for host in ["127.0.0.1", "[::1]", "localhost"] {
         let bind = if host == "[::1]" {
@@ -261,7 +261,7 @@ async fn export_once_pushes_otlp_metrics_over_http() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn export_retries_transient_collector_failures_within_interval() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -304,7 +304,7 @@ async fn export_retries_transient_collector_failures_within_interval() {
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn running_runtime_pushes_after_telemetry_settings_toggle() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -344,7 +344,7 @@ async fn running_runtime_pushes_after_telemetry_settings_toggle() {
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn running_runtime_pushes_to_default_telemetry_endpoint_when_runtime_endpoint_missing() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -394,7 +394,7 @@ async fn running_runtime_pushes_to_default_telemetry_endpoint_when_runtime_endpo
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_start_pushes_from_persisted_telemetry_settings() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -434,7 +434,7 @@ async fn runtime_start_pushes_from_persisted_telemetry_settings() {
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_telemetry_host_safety_redirect_never_reaches_target() {
     let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let source = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -469,7 +469,7 @@ async fn relay_telemetry_host_safety_redirect_never_reaches_target() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_telemetry_host_safety_stalled_push_keeps_export_window_deadline() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/v1/metrics", listener.local_addr().unwrap());

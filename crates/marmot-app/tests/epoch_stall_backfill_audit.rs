@@ -493,7 +493,7 @@ impl StalledGroup {
 
 /// Arming a backfill records exactly one `epoch_stall_backfill_armed` row,
 /// group-scoped and carrying the stalled epoch and the threshold in force.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn arming_a_backfill_records_one_epoch_stall_backfill_armed_row() {
     let dir_bob = tempfile::tempdir().unwrap();
     let dir_alice = tempfile::tempdir().unwrap();
@@ -558,7 +558,7 @@ async fn arming_a_backfill_records_one_epoch_stall_backfill_armed_row() {
 /// Below-threshold undecryptable traffic never crosses the arm decision, so it
 /// records no `epoch_stall_backfill_armed` row. Guards the
 /// `observe_undecryptable == false` path.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn below_threshold_undecryptable_traffic_records_no_backfill_armed_row() {
     let dir_bob = tempfile::tempdir().unwrap();
     let dir_alice = tempfile::tempdir().unwrap();
@@ -607,7 +607,7 @@ async fn below_threshold_undecryptable_traffic_records_no_backfill_armed_row() {
 /// records no further row: the row inherits the detector's once-per-stalled-epoch
 /// debounce, since the recorder is only reached when `observe_undecryptable`
 /// returns `true`.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_stall_burst_at_the_same_epoch_records_no_further_row() {
     let dir_bob = tempfile::tempdir().unwrap();
     let dir_alice = tempfile::tempdir().unwrap();
@@ -685,7 +685,7 @@ async fn a_second_stall_burst_at_the_same_epoch_records_no_further_row() {
 /// report nothing. This is the field failure the escalation exists for — a
 /// device that armed at three successive stalled epochs and stayed hours behind
 /// with nothing surfaced.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repeated_arming_without_recovery_escalates_exactly_once() {
     let dir_bob = tempfile::tempdir().unwrap();
     let dir_alice = tempfile::tempdir().unwrap();
@@ -784,7 +784,7 @@ async fn repeated_arming_without_recovery_escalates_exactly_once() {
 /// `GroupStall::observe_epoch`; the arithmetic that turns one passage into two
 /// reports is pinned by
 /// `a_spanning_passage_off_the_armed_epoch_ends_the_arm_run`.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_clean_recovery_reported_as_a_passage_ends_the_arm_run() {
     let dir_bob = tempfile::tempdir().unwrap();
     let dir_alice = tempfile::tempdir().unwrap();
@@ -839,7 +839,7 @@ async fn a_clean_recovery_reported_as_a_passage_ends_the_arm_run() {
 /// persisted boundary and therefore travels in the error's completed prefix
 /// when N+1 fails before ingest.
 #[cfg(feature = "test-policy-overrides")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn escalation_from_completed_delivery_survives_later_sync_failure() {
     let dir_bob = tempfile::tempdir().unwrap();
     let dir_alice = tempfile::tempdir().unwrap();
@@ -885,7 +885,7 @@ async fn escalation_from_completed_delivery_survives_later_sync_failure() {
 }
 
 #[cfg(feature = "test-policy-overrides")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compatibility_sync_retains_escalation_after_failure() {
     let dir_bob = tempfile::tempdir().unwrap();
     let dir_alice = tempfile::tempdir().unwrap();
@@ -947,7 +947,7 @@ async fn compatibility_sync_retains_escalation_after_failure() {
 /// outputs, but it must not discard the one-shot escalation raised by a durable
 /// engine outcome in the same batch.
 #[cfg(feature = "test-policy-overrides")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn escalation_survives_failed_projection_checkpoint() {
     let dir_bob = tempfile::tempdir().unwrap();
     let dir_alice = tempfile::tempdir().unwrap();
@@ -998,7 +998,7 @@ async fn escalation_survives_failed_projection_checkpoint() {
 /// run, so `ESCALATION_ARM_THRESHOLD` arms spread across a recovery never
 /// escalate: escalation reports a device that cannot catch up, not one that
 /// needed repair more than once.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_epoch_passed_cleanly_between_arms_never_escalates() {
     let dir_bob = tempfile::tempdir().unwrap();
     let dir_alice = tempfile::tempdir().unwrap();

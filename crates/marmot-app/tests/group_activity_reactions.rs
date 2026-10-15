@@ -20,7 +20,11 @@ fn open(dir: &tempfile::TempDir, relay: &str) -> MarmotApp {
 }
 
 /// Prove member-visible add/retract updates and target stability across independent encrypted-store reopens.
-#[tokio::test]
+// Single-threaded: on parallel workers Alice's live timeline can show the
+// final reaction before her ingest has committed it, so the immediate
+// `shutdown_and_close` leaves it to catch-up after the reopen and the
+// post-reopen read below races that catch-up.
+#[tokio::test(flavor = "current_thread")]
 async fn members_share_real_activity_targets_and_reactions_after_reopen() {
     let relay = MockRelay::run().await.unwrap();
     let url = relay.url().await.to_string();

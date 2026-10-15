@@ -336,7 +336,7 @@ async fn publish_garbage_group_message_at(
         .expect("publish garbage kind-445 test event");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cold_restart_reconciles_backlog_below_since_floor() {
     let (_relay, url) = mock_relay().await;
 
@@ -548,7 +548,7 @@ async fn cold_restart_reconciles_backlog_below_since_floor() {
 /// reconciliation is durable and the epoch detector remains debounced:
 /// ingested event ids persist, so a later cold boot does not trigger another
 /// full-history replay.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stalled_epoch_backfill_still_arms_after_route_reconciliation() {
     let (_relay, url) = mock_relay().await;
 

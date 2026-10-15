@@ -8,7 +8,7 @@ use marmot_account::AccountHome;
 use marmot_app::{MarmotApp, MarmotAppConfig, MarmotAppRuntime};
 use nostr_relay_builder::MockRelay;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explicit_catch_up_syncs_when_group_read_snapshot_fails() {
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();

@@ -162,7 +162,7 @@ async fn acknowledge_one_http_request(listener: TcpListener, observed: oneshot::
         .unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_sync_failure_returns_applied_prefix() {
     let batch = pending_two_message_batch().await;
     let app_bob = batch.bob_app(Some(1));
@@ -205,7 +205,7 @@ async fn direct_sync_failure_returns_applied_prefix() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failure_after_application_event_ack_replays_summary_exactly_once() {
     let batch = pending_message_batch(vec!["applied before projection failure".to_owned()]).await;
     let app_bob = open_store_with_post_ack_failure(&batch.bob_dir, &batch.relay_url);
@@ -241,7 +241,7 @@ async fn failure_after_application_event_ack_replays_summary_exactly_once() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_with_failed_checkpoint_is_excluded_and_replays_exactly_once() {
     let batch = pending_two_message_batch().await;
     let app_bob = open_store_with_boundary_failure(&batch.bob_dir, &batch.relay_url, 1);
@@ -307,7 +307,7 @@ async fn batch_with_failed_checkpoint_is_excluded_and_replays_exactly_once() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_checkpoint_retries_once_on_retained_client() {
     let batch = pending_two_message_batch().await;
     let app_bob = open_store_with_boundary_failure(&batch.bob_dir, &batch.relay_url, 1);
@@ -334,7 +334,7 @@ async fn failed_checkpoint_retries_once_on_retained_client() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn joined_group_replays_once_after_boundary_save_failure_and_restart() {
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -396,7 +396,7 @@ async fn joined_group_replays_once_after_boundary_save_failure_and_restart() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn route_changing_delivery_persists_seen_id_before_later_failure() {
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -461,7 +461,7 @@ async fn route_changing_delivery_persists_seen_id_before_later_failure() {
     assert!(expected_groups.contains(&resumed.joined_groups[0]));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn catch_up_failure_emits_summary_for_earlier_committed_delivery() {
     let mut batch = pending_two_message_batch().await;
     let app_bob_boot2 = MarmotApp::try_with_relays_and_account_home_and_config(
