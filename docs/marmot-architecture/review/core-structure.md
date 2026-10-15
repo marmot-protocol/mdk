@@ -272,7 +272,7 @@ Each step can ship on its own, and later steps depend on the in-flight fixes lan
 | Step | Change | Why this order | Size |
 | --- | --- | --- | --- |
 | 1 | `media-store` crate (#2314) | In progress, and the template for the rest | — |
-| 2 | Relay plane into `transport-nostr` | The most separable seam; gives Pass 1 E's fixes a home | about 5.5k lines move |
+| 2 | Relay plane into `transport-nostr` ([brief](brief-relay-plane.md)) | The most separable seam; gives Pass 1 E's fixes a home | about 5.1k lines move |
 | 3 | Directory crate | Already owns its state; makes no account-storage calls | about 11–13k |
 | 4 | `storage-sqlite` internal boundaries: `protocol/`, `app/` and an explicit `cross/` module listing the 11 couplings | Makes the split reviewable before any crate moves; no behaviour change | Moves only |
 | 5 | Lower stack: merge the session into `marmot-device-runtime`, split off `marmot-account`, move the engine's storage proxy and audit ownership up, re-export config types | After #2338 and #2323 land, since both touch this code | Touches about 10 `marmot-app` files and `marmot-account` |
