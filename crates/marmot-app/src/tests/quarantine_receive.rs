@@ -37,6 +37,30 @@ async fn start_runtime(app: &MarmotApp) -> MarmotAppRuntime {
     runtime
 }
 
+async fn wait_for_joined(
+    events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
+    account_id_hex: &str,
+    group: &GroupId,
+) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match events.recv().await {
+                Ok(MarmotAppEvent::GroupJoined {
+                    account_id_hex: joined_account,
+                    group_id,
+                    ..
+                }) if joined_account == account_id_hex && group_id == *group => break,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("runtime event stream closed before GroupJoined")
+                }
+            }
+        }
+    })
+    .await
+    .expect("bob joins the group");
+}
+
 async fn quarantined_group_does_not_block_account_receives_body(locally_deleted: bool) {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -48,43 +72,19 @@ async fn quarantined_group_does_not_block_account_receives_body(locally_deleted:
     remember_test_member_inbox(&app, &alice.account_id_hex, "wss://relay.example");
     remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
 
-    let broken = {
-        let mut client = app.client("alice").await.unwrap();
-        let broken = client.create_group("quarantined", &[]).await.unwrap();
-        if locally_deleted {
-            assert!(client.delete_group_local(&broken).await.unwrap());
-        }
-        broken
-    };
-
     let runtime = start_runtime(&app).await;
     let mut events = runtime.subscribe();
-    let healthy = runtime
-        .create_group(
-            "alice",
-            "healthy",
-            std::slice::from_ref(&bob.account_id_hex),
-            None,
-        )
+    let bob_members = std::slice::from_ref(&bob.account_id_hex);
+    let broken = runtime
+        .create_group("alice", "quarantined", bob_members, None)
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match events.recv().await {
-                Ok(MarmotAppEvent::GroupJoined {
-                    account_id_hex,
-                    group_id,
-                    ..
-                }) if account_id_hex == bob.account_id_hex && group_id == healthy => break,
-                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    panic!("runtime event stream closed before GroupJoined")
-                }
-            }
-        }
-    })
-    .await
-    .expect("bob joins the healthy group");
+    wait_for_joined(&mut events, &bob.account_id_hex, &broken).await;
+    let healthy = runtime
+        .create_group("alice", "healthy", bob_members, None)
+        .await
+        .unwrap();
+    wait_for_joined(&mut events, &bob.account_id_hex, &healthy).await;
     runtime
         .send_message("alice", &healthy, b"warmup alice".to_vec())
         .await
@@ -95,6 +95,9 @@ async fn quarantined_group_does_not_block_account_receives_body(locally_deleted:
         .await
         .unwrap();
     wait_for_message(&mut events, "alice", "warmup bob").await;
+    if locally_deleted {
+        assert!(runtime.delete_group_local("alice", &broken).await.unwrap());
+    }
     runtime.shutdown().await;
 
     // Two ambiguous apply snapshots make alice's next open quarantine the
@@ -105,6 +108,8 @@ async fn quarantined_group_does_not_block_account_receives_body(locally_deleted:
     }
 
     // The second pass is a restart that re-quarantines the same group.
+    let broken_hex = hex::encode(broken.as_slice());
+    let mut held = Vec::new();
     for pass in 0..2 {
         // A restart is a fresh process: new app, relay plane and workers.
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
@@ -128,14 +133,45 @@ async fn quarantined_group_does_not_block_account_receives_body(locally_deleted:
             .unwrap();
         wait_for_message(&mut events, "bob", &outgoing).await;
 
+        // Bob also writes in the quarantined group. Alice's copy keeps a
+        // route for it, and the engine holds the input until recovery.
+        let quarantined_incoming = format!("bob in quarantined {pass}");
+        runtime
+            .send_message("bob", &broken, quarantined_incoming.clone().into_bytes())
+            .await
+            .unwrap();
+        held.push(quarantined_incoming);
+
         let incoming = format!("bob incoming {pass}");
         runtime
             .send_message("bob", &healthy, incoming.clone().into_bytes())
             .await
             .unwrap();
-        wait_for_message(&mut events, "alice", &incoming).await;
-
-        let broken_hex = hex::encode(broken.as_slice());
+        let mut applied_while_quarantined = false;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match events.recv().await {
+                    Ok(MarmotAppEvent::MessageReceived(update))
+                        if update.account_label == "alice" =>
+                    {
+                        applied_while_quarantined |= held.contains(&update.message.plaintext);
+                        if update.message.plaintext == incoming {
+                            break;
+                        }
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        panic!("runtime event stream closed before MessageReceived")
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("alice never received {incoming:?}"));
+        assert!(
+            !applied_while_quarantined,
+            "pass {pass}: a quarantined group's input waits for recovery"
+        );
         assert_eq!(
             runtime.quarantined_groups("alice").await.unwrap().len(),
             1,
@@ -149,6 +185,27 @@ async fn quarantined_group_does_not_block_account_receives_body(locally_deleted:
         }
         runtime.shutdown().await;
     }
+
+    // Repair the fixture and recover the group in place. What bob sent
+    // while it was quarantined is applied, restoring a deleted chat.
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = start_runtime(&app).await;
+    let mut events = runtime.subscribe();
+    for snapshot in SNAPSHOTS {
+        storage.release_group_snapshot(&broken, snapshot).unwrap();
+    }
+    assert!(
+        runtime
+            .retry_hydrate_quarantined_group("alice", &broken)
+            .await
+            .unwrap()
+    );
+    for message in &held {
+        wait_for_message(&mut events, "alice", message).await;
+    }
+    assert!(app.group("alice", &broken_hex).unwrap().is_some());
+    runtime.shutdown().await;
 }
 
 #[test]

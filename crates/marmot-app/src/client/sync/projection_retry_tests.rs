@@ -1719,6 +1719,15 @@ async fn quarantined_group_events_do_not_retain_account_projection() {
             }
             client.drain_pending_session_events().await.unwrap();
             assert!(!client.has_pending_effect_projections(), "{case}");
+            assert!(
+                client
+                    .routing
+                    .snapshot()
+                    .group_routes
+                    .iter()
+                    .any(|route| route.group_id == broken),
+                "{case}: a quarantined group keeps its route"
+            );
             for _ in 0..3 {
                 client
                     .retry_pending_runtime_group_subscription_refresh()
