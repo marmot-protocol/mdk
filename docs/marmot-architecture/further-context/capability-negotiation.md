@@ -204,6 +204,17 @@ Client runs self-update
   → UI reflects newly available upgrades
 ```
 
+**Implementation status.** App components follow this process today, as the spec's "Enabling a Component in an Existing
+Group" (`app-components/README.md`):
+
+- **Leaf refresh.** A self-update re-advertises every supported app component in the own leaf, keeping every other leaf
+  byte.
+- **Stale leaves.** Account maintenance gives a stale own leaf a self-update at a persisted random time within 5 days.
+- **Activation.** Not implemented yet. Requiring a new component in an existing group (one admin Commit, once every
+  leaf advertises it) lands with its first caller, such as moving `EnableDisbanding` onto the generic path.
+
+MLS capabilities from the feature registry (extension and proposal types) are not yet re-advertised on self-update.
+
 ---
 
 ## Group upgrade: the admin action

@@ -53,8 +53,8 @@ for reconnect/backoff and relay status mechanics.
   account's subscriptions; an orphaned REQ double-delivers because routing is content-keyed.
 - Never leave a REQ live that `account_subscriptions` does not track (#2262):
   - Track a REQ's id before handing it to nostr-sdk, and untrack it only once its CLOSE went out. A failed subscribe
-    registered nothing of its own and closes nothing: group syncs reuse their activation's ids, so the id may belong
-    to another live REQ. `unsubscribe_account` untracks per id as it closes, so a caller dropped mid-sweep leaves the
+    registered nothing of its own and closes nothing: a late or repeated subscribe may name an id another live REQ
+    still holds. `unsubscribe_account` untracks per id as it closes, so a caller dropped mid-sweep leaves the
     rest tracked.
   - Never abort subscribe tasks. `subscribe_all` drains its siblings after an error and detaches them when dropped.
     Every lifecycle operation takes `lock_subscriptions`, which waits for those stragglers to register before any
@@ -121,9 +121,27 @@ for reconnect/backoff and relay status mechanics.
 - Floor history REQs where the caller anchors them: a recovery maintenance session at the `since` it is installed
   with, and a retained route at its `TransportGroupSubscription::retained_since`, never later than the activation's
   `since`. A route with a retained floor is retained wherever it sits; among floorless routes the first per group is
-  the current one and a later distinct one is retained and backfilled in full. Reissue a live retained REQ only when
-  its floor widens (`AccountRoutes::group_since`): a reissue replaces the live REQ under the same id, so a narrower
-  one could cut off history it is still returning.
+  the current one and a later distinct one is retained and backfilled in full. Re-add a live retained route only when
+  its floor widens (`AccountRoutes::group_since`): the repack then issues it at the wider floor.
+- Send group routes as batched REQs, never one REQ per route (#2266): `NostrSubscription::GroupBatch` carries up to
+  `GROUP_BATCH_ROUTES` routes that share normalized endpoints and `since` as one `#h` filter, so an account stays far
+  under a relay's per-connection REQ limit and recovery's one-shot fetches find room. That holds while the routes'
+  batches, counted per relay-set and floor family, stay well under the limit: a repack briefly holds both its old and
+  new batches, so one relay's co-floored routes near 4,900 can reach strfry's 200 during it. `AccountRoutes::batches`
+  always carries exactly `AccountRoutes::groups`. Activation packs every route (`pack_group_batches`) and numbers
+  batches from 0. A group sync that changes the route set repacks every batch (`repacked_group_routes`): each route
+  keeps the floor it was issued at, or starts at the sync's floor when the activation's replay coverage is complete;
+  the new batches enter replay coverage before their REQs go out (`stage_replay_batches`, as activation does, so an
+  early EOSE or stored page counts), go out before the replaced ones close, and the replaced ones leave coverage on
+  commit (`retire_replay_batches`); a failed or cancelled sync retires only its own uncommitted batches. A sync's
+  batches page like an activation's. Never append batches or leave a removed route in a live filter: that
+  fragments batches back to the REQ limit, and a removed route's events still reach the relay client, which then
+  suppresses the re-added route's replay of them. Batch numbers come from `AccountRoutes::next_batch`, which staging
+  spends whether or not the sync commits, so no id is reused within an attempt. Coverage, refusals, lag repair and
+  `account_subscription_ids` are per batch; a clamped batch replay pages its whole filter
+  (`NostrAcquisitionScope::GroupsWindow`) up to `REPLAY_PAGE_MAX_PAGES` per route it carries; a full batch page that
+  cannot move past one second continues one window per route, and the batch counts only once every route's does. Post-join maintenance
+  and one-shot fetches stay per route.
 - Recovery maintenance ids include the owner's durable attempt serial. A duplicate install joins only a live session;
   after failure, cancellation, removal or account reactivation, require a strictly greater serial for that account/group.
   Never clear `maintenance_attempt_high_water` while the adapter lives: CLOSE and route removal cannot recall late EOSE.

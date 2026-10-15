@@ -68,6 +68,24 @@ An obligation stays live until its next deadline is durable. After reopen, the c
 that already committed, so completing their bookkeeping does not publish another MLS commit. Repaired deadlines stay
 within the 24–36-day policy window and do not reuse failed or completed periodic obligation IDs.
 
+## Refreshing stale leaves
+
+A new build can support an app component that existing groups predate. A group can start requiring a component only
+once every member's leaf advertises it (the spec's "Enabling a Component in an Existing Group").
+
+For every live group, enrolled or not, `run_due_maintenance` schedules a leaf refresh when the own leaf advertises fewer
+components than the build supports:
+
+- **When.** The self-update runs at a random time within 5 days, so a release does not make every member of a group
+  commit at once. The due time is stored on the group's maintenance record, so a restart keeps the sampled delay.
+- **How.** The self-update goes through the ordinary obligation pipeline, so every commit hold applies, and it
+  re-advertises the supported set. Any own self-update already in flight satisfies the refresh.
+- **Cost.** The engine is queried for each group at most every ten minutes unless a due time has arrived. A group whose
+  state cannot be read is skipped for that tick without stopping maintenance for the rest of the account.
+
+Maintenance only refreshes leaves. Requiring a component in a group is a separate admin step, and nothing here does
+it.
+
 ## KeyPackage generator upgrades
 
 The lifecycle records the KeyPackage generator revision independently of app versions. Records written before revision

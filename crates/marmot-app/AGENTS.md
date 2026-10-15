@@ -151,7 +151,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   state), `methods.rs` (the split `impl MarmotApp` block: relay-list/profile/key-package/follow-list fetches, the
   public `directory_*`/`*_user_directory` API, directory-cache lifecycle, and in-memory directory-record hydration),
   `cache.rs` (the per-account SQLCipher directory cache, with its independent numbered migration runner in
-  `cache/migrations.rs`, frozen initial schema in `cache/v1.sql`, and populated/interrupted-upgrade
+  `cache/migrations.rs`, frozen initial schema in `cache/v1.sql`, the public event preview table in `cache/v2.sql`, and populated/interrupted-upgrade
   tests in `cache/assurance_tests.rs` using the historical `cache/fixtures/pre_ledger.sql` fixture), and `sync.rs` (the directory-subscription sync worker and
   plan). `mod.rs` re-exports the DTOs so the `marmot_app::...` paths stay stable; private items referenced across these
   files (and from `tests.rs`/sibling test modules) are widened to `pub(crate)`, never narrowed.
@@ -180,7 +180,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   no inline executor. Runtime catch-ups (`SyncMode::Drain`) only drain the live queue and never run a job, so
   they cross a worker-owned job (mdk#2110); `sync()` drains, then runs one job in place; nothing
   re-subscribes to recover history, and only startup, a frozen wake or an unactivated client installs live
-  subscriptions. Explicit full-history repair runs the job in place: one comparison pass over every route of its
+  subscriptions. The job's one non-comparison fetch is the epoch-gap window (`fetch_epoch_gap_window`, mdk#2256): the
+  newest events of an epoch-gap group route from the relays that failed without answering its comparison. Never run it
+  while a compared relay still owes older history (#2086), keep only pages a relay ended itself, and admit the route's
+  comparison and window events together oldest first. Window events (`PendingSource::Window`) must not touch the
+  route's certificate, replay cursor or admission verdict. Explicit full-history repair runs the job in place: one comparison pass over every route of its
   grant inside the repair budget. It never reports complete: history below the retained window is unsearched
   (`BelowRetentionWindow` when the window certified), so never certify explicit history from a window; that
   result closes the request (`close_explicit_history_request`, revision-checked) instead of leaving debt that parks
@@ -282,7 +286,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `moderation_reports/tests.rs`), `history_notices.rs` (public notice DTOs and opaque id codec),
   `notifications.rs` (push platform, triggers, settings), `external_signer.rs` (`ExternalAccountSigner` and the
   internal `AccountSigner`), `nostr_secret.rs` (secret-key shape classification shared with CLI/UniFFI),
-  `nostr_verification.rs` (stateless public-event verification), `profile_pseudonyms.rs` (cosmetic display names; not a
+  `nostr_verification.rs` (stateless public-event verification), `public_event_preview.rs` (verified previews of
+  `nostr:` references, stored in the directory cache; tests in `public_event_preview/tests.rs`), `profile_pseudonyms.rs` (cosmetic display names; not a
   security primitive), `publisher_sequences.rs` (QUIC preview publisher lifecycle state), `agent_streams.rs` (agent
   stream watch DTOs and manager), `root_runtime_lease.rs` (cross-process exclusive root lease), `app_telemetry.rs` +
   `app_telemetry/` (aggregate app-performance telemetry; same privacy model as relay telemetry), `product_analytics/`

@@ -2,6 +2,35 @@ use cgka_traits::error::EngineError;
 use marmot_account::AccountHomeError;
 use marmot_app::AppError;
 
+/// Why a completed KeyPackage lookup found nothing to invite. Describes the
+/// searched relays only; the set only grows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum MissingKeyPackageReasonFfi {
+    /// No KeyPackage publication was found.
+    NotFound,
+    /// Only legacy-profile KeyPackages were found: the recipient must update
+    /// their app and publish a current KeyPackage.
+    ObsoleteOnly,
+}
+
+impl From<marmot_app::MissingKeyPackageReason> for MissingKeyPackageReasonFfi {
+    fn from(value: marmot_app::MissingKeyPackageReason) -> Self {
+        match value {
+            marmot_app::MissingKeyPackageReason::NotFound => Self::NotFound,
+            marmot_app::MissingKeyPackageReason::ObsoleteOnly => Self::ObsoleteOnly,
+        }
+    }
+}
+
+impl std::fmt::Display for MissingKeyPackageReasonFfi {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::NotFound => "not_found",
+            Self::ObsoleteOnly => "obsolete_only",
+        })
+    }
+}
+
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MarmotKitError {
     #[error("user is blocked")]
@@ -23,6 +52,10 @@ pub enum MarmotKitError {
     /// Local per-account cap against runaway clients; retry later.
     #[error("too many moderation reports; try again later")]
     ModerationReportRateLimited,
+    /// The edit target is missing, not a chat message, sent by another
+    /// account, deleted, or withdrawn by convergence; nothing was published.
+    #[error("edit target must be an available self-authored chat message")]
+    InvalidEditTarget,
     #[error("usage and diagnostics consent required")]
     ConsentRequired,
     #[error("invalid product analytics configuration")]
@@ -47,6 +80,8 @@ pub enum MarmotKitError {
     InvalidGroupMembershipPage { max_groups: u64 },
     #[error("cached identity page exceeds the maximum of {max_accounts} accounts")]
     InvalidCachedIdentityPage { max_accounts: u64 },
+    #[error("public event preview batch exceeds the maximum of {max_references} references")]
+    InvalidPublicEventReferences { max_references: u64 },
     /// The group exists but its full hydration has not completed yet
     /// (mdk#1161). Retryable: the runtime's background pipeline promotes the
     /// group shortly after account readiness, and worker-routed reads wait
@@ -107,13 +142,24 @@ pub enum MarmotKitError {
     /// host apps can present a setup/invite state without string matching.
     #[error("invalid key package event: {details}")]
     InvalidKeyPackageEvent { details: String },
-    #[error("missing key package for {account}")]
-    MissingKeyPackage { account: String },
+    /// A completed lookup found no KeyPackage this device may invite. Branch on
+    /// `reason`: `ObsoleteOnly` means the recipient must update their app and
+    /// publish a current KeyPackage; `NotFound` means none was published.
+    #[error("missing key package for {account} [{reason}]")]
+    MissingKeyPackage {
+        account: String,
+        reason: MissingKeyPackageReasonFfi,
+    },
     /// The invite target has no kind-10050 inbox endpoint that this device can
     /// safely use. The account id lets hosts identify the affected selection
     /// without parsing display text.
     #[error("member {account} has no valid Marmot inbox relay")]
     MissingMemberInboxRoute { account: String },
+    /// Relay-list or KeyPackage lookup for `account` ran out of time or relay
+    /// coverage. Nothing is known to be missing; offer retry. Display omits
+    /// the account; read it from the field.
+    #[error("directory lookup did not complete")]
+    DirectoryLookupIncomplete { account: String },
     #[error("publish failed: {details}")]
     Publish { details: String },
     /// No current kind-3 event was found on the account's known outbox/default
@@ -373,6 +419,7 @@ impl From<&AppError> for MarmotKitError {
             AppError::InvalidReportedPublicKey => Self::InvalidReportedPublicKey,
             AppError::CannotReportSelf => Self::CannotReportSelf,
             AppError::ModerationReportRateLimited => Self::ModerationReportRateLimited,
+            AppError::InvalidEditTarget => Self::InvalidEditTarget,
             AppError::ProductAnalytics(marmot_app::ProductAnalyticsError::ConsentRequired) => {
                 Self::ConsentRequired
             }
@@ -444,6 +491,9 @@ impl From<&AppError> for MarmotKitError {
             AppError::InvalidCachedIdentityPage(_) => Self::InvalidCachedIdentityPage {
                 max_accounts: marmot_app::MAX_CACHED_IDENTITY_PAGE_SIZE as u64,
             },
+            AppError::InvalidPublicEventReferences(_) => Self::InvalidPublicEventReferences {
+                max_references: marmot_app::MAX_PUBLIC_EVENT_REFERENCES as u64,
+            },
             AppError::InvalidChatPin(details) => Self::InvalidChatPin {
                 details: details.clone(),
             },
@@ -493,10 +543,14 @@ impl From<&AppError> for MarmotKitError {
             AppError::Hex(err) => Self::InvalidHex {
                 details: err.to_string(),
             },
-            AppError::MissingKeyPackage(account) => Self::MissingKeyPackage {
+            AppError::MissingKeyPackage { account, reason } => Self::MissingKeyPackage {
                 account: account.clone(),
+                reason: (*reason).into(),
             },
             AppError::MissingMemberInboxRoute(account) => Self::MissingMemberInboxRoute {
+                account: account.clone(),
+            },
+            AppError::DirectoryLookupIncomplete(account) => Self::DirectoryLookupIncomplete {
                 account: account.clone(),
             },
             AppError::InvalidPublicKey => Self::InvalidIdentity {
@@ -675,6 +729,10 @@ mod tests {
             MarmotKitError::from(AppError::ModerationReportRateLimited),
             MarmotKitError::ModerationReportRateLimited
         ));
+        assert!(matches!(
+            MarmotKitError::from(AppError::InvalidEditTarget),
+            MarmotKitError::InvalidEditTarget
+        ));
     }
 
     #[test]
@@ -691,6 +749,16 @@ mod tests {
         assert!(matches!(
             ffi,
             MarmotKitError::InvalidGroupMembershipPage { max_groups: 100 }
+        ));
+    }
+
+    #[test]
+    fn oversized_public_event_batch_crosses_ffi_as_typed_variant() {
+        let ffi: MarmotKitError =
+            AppError::InvalidPublicEventReferences("too many references".into()).into();
+        assert!(matches!(
+            ffi,
+            MarmotKitError::InvalidPublicEventReferences { max_references: 16 }
         ));
     }
 
@@ -1010,6 +1078,18 @@ mod tests {
             ),
             "invalid KeyPackage events must not be flattened into InvalidIdentity, got {ffi:?}"
         );
+    }
+
+    #[test]
+    fn directory_lookup_incomplete_crosses_ffi_with_account() {
+        let account = "33".repeat(32);
+        let ffi: MarmotKitError = AppError::DirectoryLookupIncomplete(account.clone()).into();
+        assert!(!ffi.to_string().contains(&account));
+        assert!(matches!(
+            ffi,
+            MarmotKitError::DirectoryLookupIncomplete { account: recipient }
+                if recipient == account
+        ));
     }
 
     #[test]

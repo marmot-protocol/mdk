@@ -1063,9 +1063,7 @@ async fn notification_lag_reissues_reqs_whose_eose_it_may_have_lost() {
     let inbox_id = issued_id(&relay, |subscription| {
         matches!(subscription, NostrSubscription::AccountInbox { .. })
     });
-    let group_id = issued_id(&relay, |subscription| {
-        matches!(subscription, NostrSubscription::Group { .. })
-    });
+    let group_id = issued_id(&relay, NostrSubscription::is_group_route);
     let maintenance_id = relay_plane
         .inner
         .transport
@@ -1191,32 +1189,33 @@ async fn notification_lag_repair_leaves_reqs_issued_after_the_lag() {
         })
         .await
         .unwrap();
-    let group_id = |byte: u8| {
-        issued_id(&relay, |subscription| {
-            matches!(
-                subscription,
-                NostrSubscription::Group { group_id, .. } if group_id.as_slice() == [byte; 16]
-            )
-        })
-    };
+    // The sync repacked both groups into one batch issued after the lag; the
+    // activation's batch it replaced is closed.
+    let live_batch = relay
+        .subscriptions
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|subscription| subscription.carries_group(&GroupId::new(vec![0x52; 16])))
+        .expect("the repacked batch was issued")
+        .subscription_id();
     let inbox_id = issued_id(&relay, |subscription| {
         matches!(subscription, NostrSubscription::AccountInbox { .. })
     });
 
     tokio::time::sleep(NOTIFICATION_LAG_EOSE_REPAIR_SETTLE).await;
-    let mut expected = vec![
-        (inbox_id, vec![endpoint.clone()]),
-        (group_id(0x51), vec![endpoint.clone()]),
-    ];
-    expected.sort();
-    assert_eq!(reissued_reqs(&relay, 2).await, expected);
+    assert_eq!(
+        reissued_reqs(&relay, 1).await,
+        vec![(inbox_id, vec![endpoint.clone()])]
+    );
     assert!(
         !relay
             .reissued
             .lock()
             .unwrap()
             .iter()
-            .any(|(id, _)| id == &group_id(0x52)),
+            .any(|(id, _)| id == &live_batch),
         "the REQ issued after the lag is not restarted"
     );
     relay_plane.shutdown().await;
@@ -1967,7 +1966,15 @@ async fn unsafe_group_routes_isolated() {
         .await
         .unwrap();
     let subscriptions = relay.subscriptions.lock().unwrap().clone();
-    assert_eq!(subscriptions.len(), 3, "inbox and two usable groups");
+    // The two usable groups share the safe relay, so one batch carries both.
+    assert_eq!(subscriptions.len(), 2, "inbox and one batch");
+    let batch = subscriptions
+        .iter()
+        .find(|subscription| subscription.is_group_route())
+        .expect("the usable groups' batch");
+    for (id, usable) in [(0, true), (1, true), (2, false)] {
+        assert_eq!(batch.carries_group(&GroupId::new(vec![id; 16])), usable);
+    }
     for subscription in subscriptions {
         assert_eq!(subscription.endpoints(), std::slice::from_ref(&safe));
     }
@@ -2075,6 +2082,7 @@ async fn relay_plane_deduplicates_canonical_relay_endpoints() {
     assert!(subscriptions.iter().all(|subscription| match subscription {
         NostrSubscription::AccountInbox { endpoints, .. }
         | NostrSubscription::Group { endpoints, .. }
+        | NostrSubscription::GroupBatch { endpoints, .. }
         | NostrSubscription::GroupMaintenance { endpoints, .. } => endpoints.len() == 1,
     }));
 }
@@ -2622,17 +2630,19 @@ async fn group_subscriptions_remain_account_scoped_for_shared_group_routes() {
     let subscriptions = relay.subscriptions.lock().unwrap().clone();
     let group_subscriptions = subscriptions
         .iter()
-        .filter(|subscription| matches!(subscription, NostrSubscription::Group { .. }))
+        .filter(|subscription| subscription.is_group_route())
         .collect::<Vec<_>>();
     assert_eq!(group_subscriptions.len(), 2);
-    assert!(group_subscriptions.iter().any(|subscription| matches!(
-        subscription,
-        NostrSubscription::Group { account_id, .. } if account_id == &alice
-    )));
-    assert!(group_subscriptions.iter().any(|subscription| matches!(
-        subscription,
-        NostrSubscription::Group { account_id, .. } if account_id == &bob
-    )));
+    assert!(
+        group_subscriptions
+            .iter()
+            .any(|subscription| subscription.account_id() == &alice)
+    );
+    assert!(
+        group_subscriptions
+            .iter()
+            .any(|subscription| subscription.account_id() == &bob)
+    );
 }
 
 #[tokio::test]

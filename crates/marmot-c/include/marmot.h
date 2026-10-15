@@ -202,6 +202,20 @@ enum MarmotStatus
    * changes wait while MDK retries them (mdk#2255).
    */
   MARMOT_STATUS_GROUP_COMMIT_UNDELIVERED = 102,
+  /**
+   * A cached public event preview read named more than 16 references.
+   */
+  MARMOT_STATUS_INVALID_PUBLIC_EVENT_REFERENCES = 103,
+  /**
+   * Relay-list or KeyPackage lookup for an account did not complete;
+   * nothing is known to be missing. Retry.
+   */
+  MARMOT_STATUS_DIRECTORY_LOOKUP_INCOMPLETE = 104,
+  /**
+   * The edit target is missing, not a chat message, sent by another
+   * account, deleted, or withdrawn by convergence; nothing was published.
+   */
+  MARMOT_STATUS_INVALID_EDIT_TARGET = 105,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -699,6 +713,28 @@ typedef enum MarmotMatchQuality {
   MARMOT_MATCH_QUALITY_PREFIX,
   MARMOT_MATCH_QUALITY_CONTAINS,
 } MarmotMatchQuality;
+
+/**
+ * Local state of one referenced public event.
+ */
+typedef enum MarmotPublicEventPreviewState {
+  /**
+   * `event_json` is non-NULL and `fetched_at` is set.
+   */
+  MARMOT_PUBLIC_EVENT_PREVIEW_STATE_PRESENT,
+  /**
+   * The author published a NIP-09 deletion request for the event.
+   */
+  MARMOT_PUBLIC_EVENT_PREVIEW_STATE_DELETED,
+  /**
+   * Nothing is cached. Not durable: a refresh may still find it.
+   */
+  MARMOT_PUBLIC_EVENT_PREVIEW_STATE_MISSING,
+  /**
+   * Not a `note`, `nevent`, `naddr` or hex event ID.
+   */
+  MARMOT_PUBLIC_EVENT_PREVIEW_STATE_UNSUPPORTED,
+} MarmotPublicEventPreviewState;
 
 /**
  * Where a prepared group image sits in the upload lifecycle.
@@ -3465,6 +3501,37 @@ typedef struct MarmotCachedIdentityProjectionList {
   struct MarmotCachedIdentityProjection *items;
   uintptr_t len;
 } MarmotCachedIdentityProjectionList;
+
+/**
+ * One result per requested reference, in request order.
+ */
+typedef struct MarmotPublicEventPreview {
+  /**
+   * The reference exactly as the caller passed it.
+   */
+  char *reference;
+  enum MarmotPublicEventPreviewState state;
+  /**
+   * The signature-verified event as NIP-01 JSON; NULL unless `Present`.
+   */
+  char *event_json;
+  /**
+   * When a relay last confirmed the event, in Unix seconds.
+   */
+  bool has_fetched_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t fetched_at;
+} MarmotPublicEventPreview;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotPublicEventPreviewList {
+  struct MarmotPublicEventPreview *items;
+  uintptr_t len;
+} MarmotPublicEventPreviewList;
 
 /**
  * Attachment metadata without the plaintext bytes.
@@ -7371,8 +7438,9 @@ MarmotStatus marmot_delete_message(const struct MarmotClient *client,
                                    struct MarmotSendSummary **out);
 
 /**
- * Edit an own message's content. Free with
- * `marmot_send_summary_free`.
+ * Edit an own message's content. Returns
+ * `MARMOT_STATUS_INVALID_EDIT_TARGET` unless the target is an available
+ * chat message this account sent. Free with `marmot_send_summary_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -8332,6 +8400,38 @@ MarmotStatus marmot_cached_identity_projections(const struct MarmotClient *clien
                                                 const char *const *account_id_hexes,
                                                 uintptr_t account_id_hexes_len,
                                                 struct MarmotCachedIdentityProjectionList **out);
+
+/**
+ * Network-free cached previews of public events referenced from message
+ * content, one row per reference (at most 16) in order. Free with
+ * `marmot_public_event_preview_list_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_cached_public_event_previews(const struct MarmotClient *client,
+                                                 const char *account_ref,
+                                                 const char *const *references,
+                                                 uintptr_t references_len,
+                                                 struct MarmotPublicEventPreviewList **out);
+
+/**
+ * Fetch one referenced public event when it is missing or stale, then
+ * return its local state. Free with `marmot_public_event_preview_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_resolve_public_event_preview(const struct MarmotClient *client,
+                                                 const char *account_ref,
+                                                 const char *reference,
+                                                 struct MarmotPublicEventPreview **out);
 
 /**
  * Every stored draft for the account, attachment metadata only.
@@ -12314,6 +12414,25 @@ void marmot_content_report_page_free(struct MarmotContentReportPage *ptr);
  * this library.
  */
 void marmot_report_dismissal_page_free(struct MarmotReportDismissalPage *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_public_event_preview_free(struct MarmotPublicEventPreview *ptr);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_public_event_preview_list_free(struct MarmotPublicEventPreviewList *list);
 
 /**
  * Free a value of this type returned by this library. NULL

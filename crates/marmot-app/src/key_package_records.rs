@@ -20,7 +20,7 @@ use transport_nostr_adapter::{
 };
 use transport_nostr_peeler::NostrTransportEvent;
 
-use crate::error::AppError;
+use crate::error::{AppError, MissingKeyPackageReason};
 use crate::relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 use crate::{
     AccountKeyPackageInventoryEntry, AccountKeyPackageLocalState, AccountKeyPackageRecord,
@@ -296,12 +296,13 @@ pub(crate) fn latest_fresh_key_package_from_records(
     account_id_hex: &str,
     records: Vec<RelayEventRecord>,
     freshness: DirectoryFreshness,
-) -> Result<DirectorySelection<Option<FetchedKeyPackage>>, AppError> {
+) -> Result<KeyPackageSelection<FetchedKeyPackage>, AppError> {
     let selection =
         preferred_fresh_key_package_from_records(account_id_hex, &records, freshness, None)?;
-    Ok(DirectorySelection {
+    Ok(KeyPackageSelection {
         value: selection.value.map(|selected| selected.fetched),
         rejected_future: selection.rejected_future,
+        legacy_slots: selection.legacy_slots,
     })
 }
 
@@ -310,12 +311,37 @@ pub(crate) struct PreferredKeyPackage {
     pub(crate) priority: u8,
 }
 
+/// Newest-slot KeyPackage selection. `legacy_slots` only explains an empty
+/// selection; it never makes a legacy publication a join candidate.
+pub(crate) struct KeyPackageSelection<T> {
+    pub(crate) value: Option<T>,
+    pub(crate) rejected_future: bool,
+    pub(crate) legacy_slots: bool,
+}
+
+impl<T> KeyPackageSelection<T> {
+    /// Call only after the lookup that produced these records completed: an
+    /// incomplete search can explain neither absence nor obsolescence.
+    pub(crate) fn into_value_or_missing(self, account_id_hex: &str) -> Result<T, AppError> {
+        // A future-dated slot may be a clock-skewed current publication.
+        let reason = if self.legacy_slots && !self.rejected_future {
+            MissingKeyPackageReason::ObsoleteOnly
+        } else {
+            MissingKeyPackageReason::NotFound
+        };
+        self.value.ok_or_else(|| AppError::MissingKeyPackage {
+            account: account_id_hex.to_owned(),
+            reason,
+        })
+    }
+}
+
 pub(crate) fn preferred_fresh_key_package_from_records(
     account_id_hex: &str,
     records: &[RelayEventRecord],
     freshness: DirectoryFreshness,
     requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
-) -> Result<DirectorySelection<Option<PreferredKeyPackage>>, AppError> {
+) -> Result<KeyPackageSelection<PreferredKeyPackage>, AppError> {
     let mut records = records.iter().collect::<Vec<_>>();
     records.sort_by(|a, b| {
         a.event
@@ -328,6 +354,7 @@ pub(crate) fn preferred_fresh_key_package_from_records(
     let mut selected = None;
     let mut selected_priority = 0;
     let mut slots = BTreeSet::new();
+    let mut legacy_slots = false;
     for record in records.into_iter().rev() {
         if record.event.kind != KIND_MARMOT_KEY_PACKAGE || record.event.pubkey != account_id_hex {
             continue;
@@ -350,6 +377,13 @@ pub(crate) fn preferred_fresh_key_package_from_records(
                 fetched
             }
             Ok(_) => continue,
+            // A legacy slot still supersedes its older publications, but is
+            // neither a candidate nor a validation error: it cannot mask a
+            // current slot's rejection, and only a completed lookup reports it.
+            Err(_) if is_legacy_key_package_record(record) => {
+                legacy_slots = true;
+                continue;
+            }
             Err(error) => {
                 newest_error.get_or_insert(error);
                 continue;
@@ -375,9 +409,25 @@ pub(crate) fn preferred_fresh_key_package_from_records(
     {
         return Err(error);
     }
-    Ok(DirectorySelection {
+    Ok(KeyPackageSelection {
         value: selected,
         rejected_future,
+        legacy_slots,
+    })
+}
+
+/// The author's MLS KeyPackage with a legacy-profile account proof. Current
+/// transport tag checks are skipped on purpose: deployed legacy publishers
+/// predate them (MDK 0.8 publishes no `app_components` tag).
+fn is_legacy_key_package_record(record: &RelayEventRecord) -> bool {
+    let Ok(bytes) = BASE64_STANDARD.decode(record.event.content.as_bytes()) else {
+        return false;
+    };
+    // `KeyPackage::new` annotates Legacy, so metadata decoding succeeds only
+    // when the decoded account proof is legacy too.
+    key_package_metadata(&KeyPackage::new(bytes)).is_ok_and(|metadata| {
+        metadata.protocol_profile == ProtocolProfile::Legacy
+            && metadata.credential_identity_hex == record.event.pubkey
     })
 }
 
@@ -474,13 +524,11 @@ fn key_package_event_id_from_hex(event_id_hex: &str) -> Result<MessageId, AppErr
 
 pub(crate) fn fresh_or_cached_key_package(
     account_id_hex: &str,
-    selection: DirectorySelection<Option<FetchedKeyPackage>>,
+    selection: KeyPackageSelection<FetchedKeyPackage>,
     cached_entry: Option<UserDirectoryRecord>,
 ) -> Result<FetchedKeyPackage, AppError> {
-    if let Some(fetched) = selection.value {
-        return Ok(fetched);
-    }
-    if selection.rejected_future
+    if selection.value.is_none()
+        && selection.rejected_future
         && let Some(cached) = cached_entry
             .map(cached_key_package_from_entry)
             .transpose()?
@@ -488,7 +536,7 @@ pub(crate) fn fresh_or_cached_key_package(
     {
         return Ok(cached);
     }
-    Err(AppError::MissingKeyPackage(account_id_hex.to_owned()))
+    selection.into_value_or_missing(account_id_hex)
 }
 
 pub(crate) fn key_package_from_record(

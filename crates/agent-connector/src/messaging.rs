@@ -316,6 +316,30 @@ impl AgentConnector {
         })
     }
 
+    /// Replace the text of a chat message this account sent. Emits a
+    /// kind-1009 edit referencing the target; the chat row keeps its identity
+    /// and returns the edit event's durable message ids.
+    pub(crate) async fn edit_message_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        target_message_id_hex: &str,
+        text: &str,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+        let target_message_id = normalize_hex(target_message_id_hex)?;
+        let summary = self
+            .runtime
+            .edit_message(&account.label, &group_id, &target_message_id, text)
+            .await?;
+        Ok(AgentControlResponse::FinalSent {
+            message_ids_hex: summary.message_ids,
+            maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
+        })
+    }
+
     pub(crate) async fn send_reaction_response(
         &self,
         account_id_hex: &str,

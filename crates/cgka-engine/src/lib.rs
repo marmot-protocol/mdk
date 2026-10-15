@@ -59,6 +59,7 @@ pub mod group_lifecycle;
 pub mod group_state_changes;
 pub mod identity;
 pub mod key_package;
+pub mod leaf_advertisement;
 pub mod maintenance;
 mod membership_effects;
 pub(crate) mod message_disposition;

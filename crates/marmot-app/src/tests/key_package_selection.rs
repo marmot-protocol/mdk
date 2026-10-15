@@ -361,7 +361,7 @@ async fn failed_preference_refetch_preserves_only_usable_current_batch_packages(
                 .err()
                 .expect("unusable batch material must not become a fallback");
             match batch_case {
-                "absent" => assert!(matches!(error, AppError::RelayDirectory(_))),
+                "absent" => assert!(matches!(error, AppError::DirectoryLookupIncomplete(_))),
                 "malformed" => assert!(matches!(error, AppError::InvalidKeyPackageEvent(_))),
                 "incompatible" => assert!(matches!(
                     error,
@@ -580,4 +580,159 @@ async fn publication_client_name_is_opt_in_and_signed_retries_keep_original_tags
         .unwrap();
     let blank: NostrTransportEvent = serde_json::from_slice(&blank.bytes).unwrap();
     assert_eq!(blank.tag_value("client"), None);
+}
+
+/// MDK 0.8 published neither `app_components` nor a current account proof, so
+/// legacy detection must not depend on today's transport tags.
+fn mdk_0_8_publication(
+    account: &AccountSummary,
+    package: KeyPackage,
+    slot: &str,
+    timestamp: u64,
+) -> NostrTransportEvent {
+    let event = candidate(account, package, slot, Some("MDK/0.8.0"), timestamp);
+    let mut tags = event.tags;
+    tags.retain(|tag| tag[0] != "app_components");
+    tags.push(vec!["encoding".into(), "base64".into()]);
+    NostrTransportEvent::new_unsigned_at(event.pubkey, event.kind, tags, event.content, timestamp)
+}
+
+async fn legacy_only_fixture() -> (
+    tempfile::TempDir,
+    MarmotApp,
+    AccountSummary,
+    Arc<MemberResolutionDirectoryFetcher>,
+) {
+    let (dir, app, mut accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let account = accounts.remove(0);
+    let now = unix_now_seconds();
+    let mdk_0_8 = mdk_0_8_publication(
+        &account,
+        fresh_key_package_for_account(&app, &account, true).await,
+        "mdk-0-8",
+        now - 20,
+    );
+    let tagged = candidate(
+        &account,
+        fresh_key_package_for_account(&app, &account, true).await,
+        "tagged-legacy",
+        None,
+        now - 10,
+    );
+    let mut events = fetcher.events.lock().unwrap();
+    events.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    events.extend([mdk_0_8, tagged]);
+    drop(events);
+    (dir, app, account, fetcher)
+}
+
+#[tokio::test]
+async fn completed_legacy_only_lookup_reports_obsolete_only() {
+    let (_dir, app, account, _fetcher) = legacy_only_fixture().await;
+    let error = app
+        .resolve_member_key_packages(&[account.account_id_hex.as_str()])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, AppError::MissingKeyPackage { account: id, reason: crate::MissingKeyPackageReason::ObsoleteOnly } if *id == account.account_id_hex),
+        "unexpected invite diagnosis: {error:?}"
+    );
+    assert!(!error.to_string().contains(&account.account_id_hex));
+
+    let error = app
+        .fetch_latest_key_package_for_account_id(&account.account_id_hex, Vec::new())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AppError::MissingKeyPackage {
+                reason: crate::MissingKeyPackageReason::ObsoleteOnly,
+                ..
+            }
+        ),
+        "directory reads share the diagnosis: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn incomplete_legacy_only_lookup_claims_neither_absence_nor_obsolescence() {
+    let (_dir, app, account, fetcher) = legacy_only_fixture().await;
+    *fetcher.incomplete_endpoint.lock().unwrap() = Some("wss://shared.example".into());
+    *fetcher.incomplete_query_kind.lock().unwrap() = Some(KIND_MARMOT_KEY_PACKAGE);
+    let error = app
+        .resolve_member_key_packages(&[account.account_id_hex.as_str()])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, AppError::DirectoryLookupIncomplete(id) if *id == account.account_id_hex),
+        "an incomplete search stays retryable: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn legacy_slots_never_select_or_mask_current_slots() {
+    let (_dir, app, accounts, _) = member_resolution_fixture(1, false).await;
+    let account = &accounts[0];
+    let now = unix_now_seconds();
+    let legacy = mdk_0_8_publication(
+        account,
+        fresh_key_package_for_account(&app, account, true).await,
+        "legacy",
+        now,
+    );
+    let current = candidate(
+        account,
+        fresh_key_package_for_account(&app, account, false).await,
+        "current",
+        None,
+        now - 10,
+    );
+    let mut malformed = current.clone();
+    malformed.content = BASE64_STANDARD.encode(b"not a key package");
+    let select = |events: &[&NostrTransportEvent]| {
+        let records = events
+            .iter()
+            .map(|event| RelayEventRecord {
+                event: (*event).clone(),
+                endpoints: vec![],
+            })
+            .collect::<Vec<_>>();
+        preferred_fresh_key_package_from_records(
+            &account.account_id_hex,
+            &records,
+            app.directory_freshness(),
+            None,
+        )
+    };
+
+    // A newer legacy slot neither wins nor hides an older current slot.
+    let selection = select(&[&legacy, &current]).unwrap();
+    assert!(selection.legacy_slots);
+    assert_eq!(
+        selection
+            .value
+            .unwrap()
+            .fetched
+            .key_package
+            .protocol_profile,
+        cgka_traits::group::ProtocolProfile::Current
+    );
+    // A current slot's rejection outranks the obsolete diagnosis.
+    assert!(matches!(
+        select(&[&legacy, &malformed]),
+        Err(AppError::InvalidKeyPackageEvent(_))
+    ));
+    // A future-dated slot may be a skewed current publication.
+    let mut future = current.clone();
+    future.created_at = now + 3_600;
+    assert!(matches!(
+        select(&[&legacy, &future])
+            .unwrap()
+            .into_value_or_missing(&account.account_id_hex),
+        Err(AppError::MissingKeyPackage {
+            reason: crate::MissingKeyPackageReason::NotFound,
+            ..
+        })
+    ));
 }

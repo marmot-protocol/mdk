@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 
 use cgka_traits::error::EngineError;
 use marmot_account::AccountHomeError;
-use marmot_app::{AccountRelayListStatus, AppError, MissingRelayListKind};
+use marmot_app::{AccountRelayListStatus, AppError, MissingKeyPackageReason, MissingRelayListKind};
 use serde_json::{Value, json};
 
 use crate::relay_lists_json;
@@ -637,13 +637,22 @@ fn app_error_json(err: &AppError) -> Value {
     }
     match err {
         AppError::AccountHome(err) => account_home_error_json(err),
-        AppError::MissingKeyPackage(account) => json!({
+        AppError::MissingKeyPackage { account, reason } => json!({
             "code": "missing_key_package",
             "message": err.to_string(),
             "account_id": account,
+            "reason": reason.as_str(),
             "repair": {
                 "local": format!("wn --account {account} keys publish"),
-                "remote": "wn keys fetch <npub-or-hex> --bootstrap-relays <relay-url>"
+                // Another fetch cannot find a current package the recipient never published.
+                "remote": match reason {
+                    MissingKeyPackageReason::NotFound => {
+                        "wn keys fetch <npub-or-hex> --bootstrap-relays <relay-url>"
+                    }
+                    MissingKeyPackageReason::ObsoleteOnly => {
+                        "ask the recipient to update their app and publish a current KeyPackage"
+                    }
+                },
             },
         }),
         AppError::MissingMemberInboxRoute(account) => json!({
@@ -652,6 +661,14 @@ fn app_error_json(err: &AppError) -> Value {
             "account_id": account,
             "repair": {
                 "action": "ask the recipient to publish a valid Marmot inbox relay list",
+            },
+        }),
+        AppError::DirectoryLookupIncomplete(account) => json!({
+            "code": "directory_lookup_incomplete",
+            "message": err.to_string(),
+            "account_id": account,
+            "repair": {
+                "action": "retry; nothing is known to be missing",
             },
         }),
         AppError::UnknownGroup(group_id) => json!({
@@ -836,6 +853,13 @@ fn app_error_json(err: &AppError) -> Value {
             "message": err.to_string(),
             "repair": { "action": "retry the original account setup operation" },
         }),
+        AppError::InvalidEditTarget => json!({
+            "code": "invalid_edit_target",
+            "message": err.to_string(),
+            "repair": {
+                "action": "edit only an available chat message this account sent; nothing was published",
+            },
+        }),
         other => json!({
             "code": "command_failed",
             "message": other.to_string(),
@@ -933,20 +957,46 @@ mod tests {
     }
 
     #[test]
+    fn invalid_edit_target_has_a_distinct_code() {
+        let invalid = wn_error_json(&WnError::App(AppError::InvalidEditTarget));
+        assert_eq!(invalid["code"], "invalid_edit_target");
+        assert!(
+            invalid["repair"]["action"]
+                .as_str()
+                .unwrap()
+                .contains("this account sent")
+        );
+    }
+
+    #[test]
     fn missing_key_package_errors_include_repair_guidance() {
         let account = "11".repeat(32);
-        let error = wn_error_json(&WnError::App(AppError::MissingKeyPackage(account.clone())));
+        for (reason, token, remote) in [
+            (
+                MissingKeyPackageReason::NotFound,
+                "not_found",
+                "wn keys fetch <npub-or-hex> --bootstrap-relays <relay-url>",
+            ),
+            (
+                MissingKeyPackageReason::ObsoleteOnly,
+                "obsolete_only",
+                "ask the recipient to update their app and publish a current KeyPackage",
+            ),
+        ] {
+            let error = wn_error_json(&WnError::App(AppError::MissingKeyPackage {
+                account: account.clone(),
+                reason,
+            }));
 
-        assert_eq!(error["code"], "missing_key_package");
-        assert_eq!(error["account_id"], account);
-        assert_eq!(
-            error["repair"]["local"],
-            format!("wn --account {account} keys publish")
-        );
-        assert_eq!(
-            error["repair"]["remote"],
-            "wn keys fetch <npub-or-hex> --bootstrap-relays <relay-url>"
-        );
+            assert_eq!(error["code"], "missing_key_package");
+            assert_eq!(error["account_id"], account);
+            assert_eq!(error["reason"], token);
+            assert_eq!(
+                error["repair"]["local"],
+                format!("wn --account {account} keys publish")
+            );
+            assert_eq!(error["repair"]["remote"], remote);
+        }
     }
 
     #[test]
@@ -962,6 +1012,22 @@ mod tests {
         assert_eq!(
             error["repair"]["action"],
             "ask the recipient to publish a valid Marmot inbox relay list"
+        );
+    }
+
+    #[test]
+    fn incomplete_directory_lookup_identifies_the_account_and_offers_retry() {
+        let account = "33".repeat(32);
+        let error = wn_error_json(&WnError::App(AppError::DirectoryLookupIncomplete(
+            account.clone(),
+        )));
+
+        assert_eq!(error["code"], "directory_lookup_incomplete");
+        assert_eq!(error["account_id"], account);
+        assert!(!error["message"].as_str().unwrap().contains(&account));
+        assert_eq!(
+            error["repair"]["action"],
+            "retry; nothing is known to be missing"
         );
     }
 

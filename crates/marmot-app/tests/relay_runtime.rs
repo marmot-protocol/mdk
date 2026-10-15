@@ -14119,6 +14119,7 @@ async fn partial_outbox_failure_does_not_publish_defaults(external_signer: bool)
         }
     });
     let keys = Keys::generate();
+    let account_id = keys.public_key().to_hex();
     let publisher = signed_sdk_client(keys.clone());
     publisher
         .publish_event(
@@ -14177,7 +14178,7 @@ async fn partial_outbox_failure_does_not_publish_defaults(external_signer: bool)
     let _ = held_outbox.await;
     assert!(matches!(
         result.expect("partial outbox discovery must remain bounded"),
-        Err(AppError::RelayDirectory(_))
+        Err(AppError::DirectoryLookupIncomplete(account)) if account == account_id
     ));
     assert_eq!(
         publications.load(Ordering::SeqCst),

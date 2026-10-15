@@ -604,6 +604,15 @@ impl AccountDeviceSession {
         Ok(self.engine.own_leaf_hash(group_id)?)
     }
 
+    /// Supported component ids this device's own leaf in `group_id` does not
+    /// advertise yet; non-empty means a self-update would refresh the leaf.
+    pub fn own_leaf_missing_app_components(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<AppComponentSet> {
+        Ok(self.engine.own_leaf_missing_app_components(group_id)?)
+    }
+
     pub fn put_transport_fanout(&self, record: &DurableTransportFanout) -> SessionResult<()> {
         Ok(self.engine.put_transport_fanout(record)?)
     }

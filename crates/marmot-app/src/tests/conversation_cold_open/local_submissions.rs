@@ -1243,3 +1243,86 @@ async fn prepared_media_snapshot_rollback_preserves_both_draft_and_admission() {
     drop(store);
     h.app.close_storage().unwrap();
 }
+
+#[tokio::test]
+async fn retained_edit_of_a_deleted_message_is_refused_at_admission() {
+    // The prepared event skips the send preflight, so admission applies the
+    // same rule: an edit of a deleted message would be dropped by recipients.
+    let h = History::new(0).await;
+    let group_hex = hex::encode(h.group.as_slice());
+    let alice = h
+        .app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let (original, _) = h
+        .app
+        .admit_local_message_at(
+            "alice",
+            &h.group,
+            "original-token".into(),
+            LocalMessageRequest {
+                content: "original".into(),
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+            42,
+        )
+        .unwrap();
+    h.app
+        .record_account_app_event(
+            "alice",
+            &crate::AppMessageProjection {
+                authority: None,
+                message_id_hex: "de".repeat(32),
+                source_message_id_hex: None,
+                direction: "sent".into(),
+                group_id_hex: group_hex.clone(),
+                sender: alice,
+                plaintext: String::new(),
+                kind: cgka_traits::app_event::MARMOT_APP_EVENT_KIND_DELETE,
+                tags: vec![vec!["e".into(), original.message_id_hex.clone()]],
+                source_epoch: None,
+                retention: None,
+                recorded_at: Some(43),
+                origin_commit_id: None,
+                moderation_grant: false,
+            },
+        )
+        .unwrap();
+    let storage = h.app.account_storage("alice").unwrap();
+    assert!(
+        storage
+            .timeline_message(&group_hex, &original.message_id_hex)
+            .unwrap()
+            .is_some_and(|row| row.deleted),
+        "fixture must delete the original"
+    );
+
+    let error = h
+        .app
+        .admit_local_message_with_edit_at(
+            "alice",
+            &h.group,
+            "edit-token".into(),
+            LocalMessageRequest {
+                content: "revision".into(),
+                reply_to: None,
+                attachments: vec![],
+            },
+            None,
+            Some("original-token".into()),
+            1_000,
+        )
+        .unwrap_err();
+    assert!(matches!(error, AppError::InvalidEditTarget), "{error:?}");
+    assert!(
+        storage
+            .local_submission(&group_hex, "edit-token")
+            .unwrap()
+            .is_none()
+    );
+    h.app.close_storage().unwrap();
+}

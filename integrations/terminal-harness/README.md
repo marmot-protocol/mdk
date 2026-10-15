@@ -259,6 +259,24 @@ Download timeouts, connector rejections, and local file-validation failures have
 distinct privacy-safe pre-backend replies. The connector never forwards a
 server-provided error string or attachment metadata into those replies.
 
+### Output Limits
+
+Every backend turn has fixed output limits, shared by all terminal harnesses:
+
+| Limit | Value |
+| --- | --- |
+| One stdout JSONL record | 4 MiB |
+| Total stdout for the turn | 64 MiB |
+| Assistant text for the turn | 1 MiB |
+| Reply chunks for the turn | 256 |
+
+Stdout is framed incrementally, so an oversized or newline-free record is
+rejected before it is buffered or parsed. On the first breach the connector
+stops the backend and its process group, sends nothing more from that turn
+(including replies still queued or awaiting a retry), and replies once that the
+turn was stopped. Text already delivered stays delivered. When a backend session is known, the turn is saved for `/retry-last`
+or `/discard-last`, like any other interrupted turn.
+
 ## Admin group profile updates
 
 Codex, Claude Code, OpenCode and Pi receive the same connector-provided control

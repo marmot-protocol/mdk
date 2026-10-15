@@ -150,6 +150,14 @@ pub enum MarmotStatus {
     /// The group's last change has not reached every group relay yet; group
     /// changes wait while MDK retries them (mdk#2255).
     GroupCommitUndelivered = 102,
+    /// A cached public event preview read named more than 16 references.
+    InvalidPublicEventReferences = 103,
+    /// Relay-list or KeyPackage lookup for an account did not complete;
+    /// nothing is known to be missing. Retry.
+    DirectoryLookupIncomplete = 104,
+    /// The edit target is missing, not a chat message, sent by another
+    /// account, deleted, or withdrawn by convergence; nothing was published.
+    InvalidEditTarget = 105,
 }
 
 thread_local! {
@@ -206,6 +214,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::InvalidReportedPublicKey => MarmotStatus::InvalidReportedPublicKey,
         MarmotKitError::CannotReportSelf => MarmotStatus::CannotReportSelf,
         MarmotKitError::ModerationReportRateLimited => MarmotStatus::ModerationReportRateLimited,
+        MarmotKitError::InvalidEditTarget => MarmotStatus::InvalidEditTarget,
         MarmotKitError::ChatWindowInvalidLimit => MarmotStatus::ChatWindowInvalidLimit,
         MarmotKitError::ChatWindowStale => MarmotStatus::ChatWindowStale,
         MarmotKitError::ChatWindowAnchorOutside => MarmotStatus::ChatWindowAnchorOutside,
@@ -224,6 +233,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::InvalidIdentity { .. } => MarmotStatus::InvalidIdentity,
         MarmotKitError::MissingKeyPackage { .. } => MarmotStatus::MissingKeyPackage,
         MarmotKitError::MissingMemberInboxRoute { .. } => MarmotStatus::MissingMemberInboxRoute,
+        MarmotKitError::DirectoryLookupIncomplete { .. } => MarmotStatus::DirectoryLookupIncomplete,
         MarmotKitError::Publish { .. } => MarmotStatus::Publish,
         MarmotKitError::TransportClosed => MarmotStatus::TransportClosed,
         MarmotKitError::RuntimeStopping => MarmotStatus::RuntimeStopping,
@@ -286,6 +296,9 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
             MarmotStatus::CreatedGroupProjectionUnavailable
         }
         MarmotKitError::InvalidCachedIdentityPage { .. } => MarmotStatus::InvalidCachedIdentityPage,
+        MarmotKitError::InvalidPublicEventReferences { .. } => {
+            MarmotStatus::InvalidPublicEventReferences
+        }
         MarmotKitError::ChatPresentationNotReady => MarmotStatus::ChatPresentationNotReady,
         MarmotKitError::DirectConversationIndexNotReady => {
             MarmotStatus::DirectConversationIndexNotReady
@@ -361,6 +374,7 @@ mod tests {
             MarmotKitError::InvalidReportedPublicKey,
             MarmotKitError::CannotReportSelf,
             MarmotKitError::ModerationReportRateLimited,
+            MarmotKitError::InvalidEditTarget,
             MarmotKitError::ChatWindowInvalidLimit,
             MarmotKitError::ChatWindowStale,
             MarmotKitError::ChatWindowAnchorOutside,
@@ -386,6 +400,7 @@ mod tests {
             },
             MarmotKitError::InvalidGroupMembershipPage { max_groups: 1 },
             MarmotKitError::InvalidCachedIdentityPage { max_accounts: 1 },
+            MarmotKitError::InvalidPublicEventReferences { max_references: 1 },
             MarmotKitError::GroupHydrationPending {
                 group_id_hex: "aa".into(),
             },
@@ -421,8 +436,12 @@ mod tests {
             },
             MarmotKitError::MissingKeyPackage {
                 account: "a".into(),
+                reason: marmot_uniffi::MissingKeyPackageReasonFfi::NotFound,
             },
             MarmotKitError::MissingMemberInboxRoute {
+                account: "a".into(),
+            },
+            MarmotKitError::DirectoryLookupIncomplete {
                 account: "a".into(),
             },
             MarmotKitError::Publish {
@@ -523,7 +542,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            93,
+            96,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
@@ -534,6 +553,18 @@ mod tests {
         assert_eq!(
             status_from_error(&MarmotKitError::ModerationReportRateLimited) as i32,
             100
+        );
+        let account = "33".repeat(32);
+        assert_eq!(
+            status_from_error(&MarmotKitError::DirectoryLookupIncomplete {
+                account: account.clone()
+            }) as i32,
+            104
+        );
+        assert!(!take_last_error().unwrap().contains(&account));
+        assert_eq!(
+            status_from_error(&MarmotKitError::InvalidEditTarget) as i32,
+            105
         );
         assert_eq!(
             status_from_error(&MarmotKitError::BlockListUnavailable) as i32,

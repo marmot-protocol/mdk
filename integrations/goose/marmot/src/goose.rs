@@ -5,7 +5,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use marmot_terminal_harness::{
     ApprovalSupport, Backend, ExecutionProfile, ExecutionSupport, HarnessError, Invocation,
-    IsolationSupport, Outcome, ParsedEvent, PromptTransport, Result, RunFailure, RunnerEvent,
+    IsolationSupport, MAX_TURN_TEXT_BYTES, Outcome, ParsedEvent, PromptTransport, Result,
+    RunFailure, RunnerEvent,
     process::{EnvironmentChange, ProcessSpec, bounded_command_output, run_jsonl_process},
 };
 use serde_json::Value;
@@ -288,12 +289,13 @@ impl GooseEventParser {
 
         let is_assistant = role == "assistant";
         // Chunks of one message share an id. Id-less assistant chunks cannot be told apart,
-        // so they are joined until a different message or a terminal event arrives.
+        // so they are joined until a different message or a terminal event arrives. A
+        // message that outgrows the per-turn text limit is flushed early, so the shared
+        // limit sees it instead of this buffer growing.
         let continues_pending = is_assistant
-            && self
-                .pending
-                .as_ref()
-                .is_some_and(|pending| pending.id == id);
+            && self.pending.as_ref().is_some_and(|pending| {
+                pending.id == id && pending.text.len() + text.len() <= MAX_TURN_TEXT_BYTES
+            });
         let flushed = if continues_pending {
             ParsedEvent::Ignored
         } else {
@@ -556,6 +558,30 @@ mod tests {
                 .parse_line(&message("m4", "assistant", &text("late")))
                 .unwrap(),
             ParsedEvent::Ignored
+        );
+    }
+
+    #[test]
+    fn parser_flushes_a_message_before_it_outgrows_the_turn_text_limit() {
+        let mut parser = GooseEventParser::new(SESSION.to_owned());
+        let half = "x".repeat(MAX_TURN_TEXT_BYTES / 2 + 1);
+        assert_eq!(
+            parser
+                .parse_line(&message("m1", "assistant", &text(&half)))
+                .unwrap(),
+            ParsedEvent::Session(SESSION.to_owned())
+        );
+        // The second same-id delta would pass the limit, so the first is released
+        // to the shared limit instead of being retained with it.
+        assert_eq!(
+            parser
+                .parse_line(&message("m1", "assistant", &text(&half)))
+                .unwrap(),
+            ParsedEvent::Text(half.clone())
+        );
+        assert_eq!(
+            parser.parse_line(r#"{"type":"complete"}"#).unwrap(),
+            ParsedEvent::Text(half)
         );
     }
 

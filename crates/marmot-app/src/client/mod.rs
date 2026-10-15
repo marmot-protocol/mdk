@@ -4466,6 +4466,34 @@ impl AppClient {
                 }
                 intent
             }
+            // Fail fast on edits recipients would ignore: the target must be an
+            // available chat message by the same author in this device's view
+            // now. Recipients stay authoritative; a delete or convergence change
+            // landing after this check yields a harmlessly ignored edit, so it is
+            // not re-checked later. Retained edits were checked at admission and
+            // keep their stamped identity; re-rejecting them here would erase
+            // their text. `local_publish_failed` is a local delivery state that
+            // recipients never see, and the row can still be published.
+            AppMessageIntent::Edit {
+                ref target_message_id,
+                ..
+            } if prepared.is_none() => {
+                self.app
+                    .account_storage(&self.state.label)?
+                    .timeline_message(&hex::encode(group_id.as_slice()), target_message_id)?
+                    .filter(|target| {
+                        target.kind == cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT
+                            && target.sender == sender
+                            && !target.deleted
+                            // A failed local publish is retried; recipients
+                            // resolve the edit once the original arrives.
+                            && target.invalidation_status.as_deref().is_none_or(|status| {
+                                status == crate::LOCAL_PUBLISH_FAILED_REASON
+                            })
+                    })
+                    .ok_or(AppError::InvalidEditTarget)?;
+                intent
+            }
             AppMessageIntent::Delete { target_message_id } => {
                 let storage = self.app.account_storage(&self.state.label)?;
                 let target =

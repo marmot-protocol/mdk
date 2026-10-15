@@ -197,6 +197,7 @@ impl AgentConnector {
             | AgentControlRequest::StreamCancel { .. } => Some("control_preview"),
             AgentControlRequest::SendFinal { .. }
             | AgentControlRequest::DeleteMessage { .. }
+            | AgentControlRequest::EditMessage { .. }
             | AgentControlRequest::SendReaction { .. }
             | AgentControlRequest::RemoveReaction { .. }
             | AgentControlRequest::AccountPublishKeyPackage { .. }
@@ -398,6 +399,20 @@ impl AgentConnector {
             } => {
                 self.delete_message_response(&account_id_hex, &group_id_hex, &target_message_id_hex)
                     .await
+            }
+            AgentControlRequest::EditMessage {
+                account_id_hex,
+                group_id_hex,
+                target_message_id_hex,
+                text,
+            } => {
+                self.edit_message_response(
+                    &account_id_hex,
+                    &group_id_hex,
+                    &target_message_id_hex,
+                    &text,
+                )
+                .await
             }
             AgentControlRequest::SendReaction {
                 account_id_hex,

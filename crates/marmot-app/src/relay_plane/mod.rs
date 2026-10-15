@@ -1807,6 +1807,25 @@ impl MarmotRelayPlane {
             .await
     }
 
+    /// Bounded read of public events for a message-content reference. Relay
+    /// hints come from other people's messages, so every endpoint passes the
+    /// discovered-endpoint safety rule; unsafe ones are dropped, not fatal.
+    pub(crate) async fn fetch_public_events(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        filters: Vec<Filter>,
+        max_events: usize,
+    ) -> Result<directory::PublicEventFetch, String> {
+        let endpoints = self
+            .inner
+            .relay_safety
+            .retain_safe_endpoints(endpoints, "public event fetch");
+        if endpoints.is_empty() {
+            return Err("public event fetch: no safe relay endpoints".to_owned());
+        }
+        directory::fetch_public_events(&endpoints, filters, max_events).await
+    }
+
     pub(crate) async fn fetch_directory_events_with_completion(
         &self,
         endpoints: Vec<TransportEndpoint>,
@@ -3586,6 +3605,56 @@ impl MarmotRelayPlaneAccountAdapter {
             .record_reconciliation(&metric)
             .await;
         Ok(Some(result?))
+    }
+
+    /// Fetch the newest kind-445 events of one group route from `endpoints`,
+    /// inside `[since, until]` and `limits`. The answer is investigation, not
+    /// coverage. Relays send the page newest first, so only a page a relay
+    /// ended itself holds its oldest events; a relay cut short by a budget or
+    /// the deadline, and a request the plane refuses, contribute nothing.
+    pub(crate) async fn acquire_group_window(
+        &self,
+        transport_group_id: [u8; 32],
+        endpoints: Vec<TransportEndpoint>,
+        since: u64,
+        until: u64,
+        limits: transport_nostr_adapter::NostrAcquisitionLimits,
+    ) -> Vec<transport_nostr_adapter::NostrRelayEvent> {
+        let request = NostrAcquisitionRequest {
+            account_id: self.account_id.clone(),
+            scope: transport_nostr_adapter::NostrAcquisitionScope::GroupWindow {
+                transport_group_id,
+                since,
+                until,
+                newest: Some(limits.max_received_items_per_endpoint),
+            },
+            endpoints,
+            limits,
+        };
+        let Ok(result) = self
+            .relay_plane
+            .acquire_history(request, NostrAcquisitionCancellation::new())
+            .await
+        else {
+            return Vec::new();
+        };
+        result
+            .endpoints
+            .into_iter()
+            .filter(|answer| {
+                answer.end == transport_nostr_adapter::NostrAcquisitionEnd::RequestPolicySatisfied
+            })
+            .flat_map(|answer| {
+                let endpoint = answer.endpoint;
+                answer.events.into_iter().map(move |event| {
+                    transport_nostr_adapter::NostrRelayEvent {
+                        endpoint: endpoint.clone(),
+                        subscription_id: None,
+                        event,
+                    }
+                })
+            })
+            .collect()
     }
 
     /// This account's deliveries for one owned comparison event. The worker

@@ -349,6 +349,7 @@ mod tests {
             periodic_enrolled: true,
             last_own_leaf_rotation_at: Some(Timestamp(11)),
             next_periodic_rotation_at: Some(Timestamp(12)),
+            leaf_refresh_due_at: Some(Timestamp(13)),
         };
         store.put_group_maintenance(&state).unwrap();
         let obligation = MaintenanceObligation {

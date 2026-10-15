@@ -1413,8 +1413,9 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::Json(_) => "read_marker_failed:json",
         AppError::Sqlite(_) => "read_marker_failed:sqlite",
         AppError::Hex(_) => "read_marker_failed:hex",
-        AppError::MissingKeyPackage(_) => "read_marker_failed:missing_key_package",
+        AppError::MissingKeyPackage { .. } => "read_marker_failed:missing_key_package",
         AppError::MissingMemberInboxRoute(_) => "read_marker_failed:missing_member_inbox_route",
+        AppError::DirectoryLookupIncomplete(_) => "read_marker_failed:directory_lookup_incomplete",
         AppError::GroupCreateIncludesCreator => "read_marker_failed:group_create_includes_creator",
         AppError::UnknownGroup(_) => "read_marker_failed:unknown_group",
         AppError::GroupInviteNotPending => "read_marker_failed:group_invite_not_pending",
@@ -1429,6 +1430,9 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
             "read_marker_failed:direct_conversation_index_not_ready"
         }
         AppError::InvalidCachedIdentityPage(_) => "read_marker_failed:invalid_cached_identity_page",
+        AppError::InvalidPublicEventReferences(_) => {
+            "read_marker_failed:invalid_public_event_references"
+        }
         AppError::InvalidChatPin(_) => "read_marker_failed:invalid_chat_pin",
         AppError::GroupDisbanding(_) => "read_marker_failed:group_disbanding",
         AppError::GroupRemoved(_) => "read_marker_failed:group_removed",
@@ -1540,6 +1544,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::ModerationReportRateLimited => {
             "read_marker_failed:moderation_report_rate_limited"
         }
+        AppError::InvalidEditTarget => "read_marker_failed:invalid_edit_target",
     }
 }
 

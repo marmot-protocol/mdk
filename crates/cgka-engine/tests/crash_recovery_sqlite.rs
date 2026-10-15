@@ -11,9 +11,10 @@ use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use cgka_engine::canonicalization::{CanonicalizationPolicy, CanonicalizationState};
@@ -219,9 +220,50 @@ async fn crash_child_runs_late_commit_convergence() {
     panic!("selected crash point was not reached");
 }
 
-fn run_parent_case(point: &str, stranded_epoch: EpochId, snapshot_prefix: &str) {
-    let dir = tempfile::tempdir().expect("parent temp directory");
-    let database = dir.path().join("carol.sqlite3");
+/// Default bound on how long a parent waits for its child's ready marker.
+///
+/// A child reaches its pause point in one to two seconds in a local debug
+/// build, but partitioned CI runs it beside 30-50 s cgka-engine convergence
+/// tests on shared runners, where a child has needed more than 30 s. The
+/// bound only catches a child wedged before its pause point: one that misses
+/// the point panics and closes stdout, which fails at once.
+const DEFAULT_CRASH_READY_TIMEOUT: Duration = Duration::from_secs(120);
+/// Overrides [`DEFAULT_CRASH_READY_TIMEOUT`] with a whole number of seconds.
+const CRASH_READY_TIMEOUT_ENV: &str = "MDK_CGKA_CRASH_READY_TIMEOUT_SECS";
+
+fn crash_ready_timeout() -> Duration {
+    let Ok(value) = std::env::var(CRASH_READY_TIMEOUT_ENV) else {
+        return DEFAULT_CRASH_READY_TIMEOUT;
+    };
+    let timeout = value
+        .trim()
+        .parse()
+        .ok()
+        .map(Duration::from_secs)
+        // The wait adds the bound to `Instant::now()`; reject one that
+        // cannot be represented rather than overflow there.
+        .filter(|timeout| Instant::now().checked_add(*timeout).is_some());
+    timeout.unwrap_or_else(|| {
+        panic!("{CRASH_READY_TIMEOUT_ENV} must be a representable number of seconds, got {value:?}")
+    })
+}
+
+/// A child test process running toward one crash point.
+struct CrashChild {
+    point: String,
+    ready_timeout: Duration,
+    /// The point plus any extra child environment, for failure messages.
+    label: String,
+    child: Child,
+    lines: mpsc::Receiver<std::io::Result<String>>,
+    stdout_reader: JoinHandle<()>,
+    stderr_reader: JoinHandle<String>,
+}
+
+fn spawn_crash_child(database: &Path, point: &str, extra_env: &[(&str, &str)]) -> CrashChild {
+    // Resolve the bound first: a bad override must not panic with a child
+    // already running.
+    let ready_timeout = crash_ready_timeout();
     let mut child = Command::new(std::env::current_exe().expect("current test executable"))
         .args([
             "--ignored",
@@ -230,65 +272,127 @@ fn run_parent_case(point: &str, stranded_epoch: EpochId, snapshot_prefix: &str) 
             "--nocapture",
         ])
         .env(CHILD_ENV, "1")
-        .env(DATABASE_ENV, &database)
+        .env(DATABASE_ENV, database)
         .env(CRASH_POINT_ENV, point)
+        .envs(extra_env.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn crash child");
-
     let stdout = child.stdout.take().expect("child stdout");
-    let (line_tx, line_rx) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
+    let (line_tx, lines) = mpsc::channel();
+    let stdout_reader = std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
             if line_tx.send(line).is_err() {
                 return;
             }
         }
     });
+    // Drain stderr concurrently so a chatty child can never block on a full
+    // pipe before it reaches its pause point.
+    let mut stderr = child.stderr.take().expect("child stderr");
+    let stderr_reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+    let label = std::iter::once(point.to_owned())
+        .chain(
+            extra_env
+                .iter()
+                .map(|(name, value)| format!("{name}={value}")),
+        )
+        .collect::<Vec<_>>()
+        .join(" ");
+    CrashChild {
+        point: point.to_owned(),
+        ready_timeout,
+        label,
+        child,
+        lines,
+        stdout_reader,
+        stderr_reader,
+    }
+}
 
-    let expected_ready = format!("{READY_PREFIX}{point}");
-    let mut child_output = Vec::new();
-    let ready = loop {
-        match line_rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(Ok(line)) => {
-                let is_ready = line == expected_ready;
-                child_output.push(line);
-                if is_ready {
-                    break true;
+impl CrashChild {
+    /// Waits for the ready marker, kills the paused child, and returns its
+    /// stderr. Panics with the elapsed time and the child's output if the
+    /// child exits or the ready bound passes first.
+    fn kill_when_ready(self) -> String {
+        let Self {
+            point,
+            ready_timeout: timeout,
+            label,
+            mut child,
+            lines,
+            stdout_reader,
+            stderr_reader,
+        } = self;
+        let expected_ready = format!("{READY_PREFIX}{point}");
+        let started = Instant::now();
+        let deadline = started + timeout;
+        let mut stdout = Vec::new();
+        let mut stdout_closed = false;
+        let timed_out =
+            || format!("ready bound {timeout:?} passed (override with {CRASH_READY_TIMEOUT_ENV})");
+        let failure = loop {
+            match lines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(Ok(line)) if line == expected_ready => break None,
+                Ok(Ok(line)) => {
+                    stdout.push(line);
+                    // `recv_timeout` still returns queued output once no time
+                    // remains, so a child that keeps printing would outrun
+                    // the bound without this check. Checking after the
+                    // marker test keeps a marker that arrives at the edge.
+                    if Instant::now() >= deadline {
+                        break Some(timed_out());
+                    }
+                }
+                Ok(Err(error)) => break Some(format!("stdout read failed: {error}")),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    stdout_closed = true;
+                    break Some("child closed stdout without the ready marker".to_owned());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    break Some(timed_out());
                 }
             }
-            Ok(Err(err)) => {
-                child_output.push(format!("stdout error: {err}"));
-                break false;
-            }
-            Err(_) => break false,
+        };
+        let elapsed = started.elapsed();
+        // A child that closed stdout is exiting by itself; wait for its own
+        // status rather than racing a kill against it.
+        if !stdout_closed {
+            let _ = child.kill();
         }
-    };
-    if !ready {
-        let _ = child.kill();
-        let _ = child.wait();
-        drop(line_rx);
-        let _ = reader.join();
-        panic!(
-            "child did not reach {point}; stdout:\n{}",
-            child_output.join("\n")
+        let status = child.wait().expect("wait for crash child");
+        drop(lines);
+        stdout_reader.join().expect("crash child stdout reader");
+        let stderr = stderr_reader.join().expect("crash child stderr reader");
+        if let Some(reason) = failure {
+            let exit = if stdout_closed {
+                format!("child exited with {status}")
+            } else {
+                "killed by the parent".to_owned()
+            };
+            panic!(
+                "crash child did not reach {label} after {elapsed:.1?}: {reason}; {exit}\n\
+                 stdout:\n{}\nstderr:\n{stderr}",
+                stdout.join("\n")
+            );
+        }
+        assert!(
+            !status.success(),
+            "child killed at {label} must not exit successfully; stderr:\n{stderr}"
         );
+        stderr
     }
+}
 
-    child.kill().expect("kill child at crash point");
-    let status = child.wait().expect("wait for killed child");
-    assert!(!status.success(), "killed child must not exit successfully");
-    drop(line_rx);
-    reader.join().expect("stdout reader exits");
-
-    let mut stderr = String::new();
-    child
-        .stderr
-        .take()
-        .expect("child stderr")
-        .read_to_string(&mut stderr)
-        .expect("read child stderr");
+fn run_parent_case(point: &str, stranded_epoch: EpochId, snapshot_prefix: &str) {
+    let dir = tempfile::tempdir().expect("parent temp directory");
+    let database = dir.path().join("carol.sqlite3");
+    let stderr = spawn_crash_child(&database, point, &[]).kill_when_ready();
     assert!(
         database.exists(),
         "child database missing after kill; stderr:\n{stderr}"
@@ -400,77 +504,11 @@ fn run_parent_case(point: &str, stranded_epoch: EpochId, snapshot_prefix: &str) 
 fn run_transition_parent_case(point: &str) {
     let dir = tempfile::tempdir().expect("transition temp directory");
     let database = dir.path().join("carol.sqlite3");
-    let mut child = Command::new(std::env::current_exe().expect("current test executable"))
-        .args([
-            "--ignored",
-            "--exact",
-            "crash_child_runs_late_commit_convergence",
-            "--nocapture",
-        ])
-        .env(CHILD_ENV, "1")
-        .env(DATABASE_ENV, &database)
-        .env(CRASH_POINT_ENV, point)
-        // The incumbent pass exercises each phase once while building the
-        // durable fixture. Kill the second occurrence, in the late competing
-        // pass whose state must survive restart.
-        .env(CRASH_OCCURRENCE_ENV, "2")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn transition crash child");
-
-    let stdout = child.stdout.take().expect("child stdout");
-    let (line_tx, line_rx) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            if line_tx.send(line).is_err() {
-                return;
-            }
-        }
-    });
-    let expected_ready = format!("{READY_PREFIX}{point}");
-    let mut child_output = Vec::new();
-    let ready = loop {
-        match line_rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(Ok(line)) => {
-                let is_ready = line == expected_ready;
-                child_output.push(line);
-                if is_ready {
-                    break true;
-                }
-            }
-            Ok(Err(error)) => {
-                child_output.push(format!("stdout error: {error}"));
-                break false;
-            }
-            Err(_) => break false,
-        }
-    };
-    if !ready {
-        let _ = child.kill();
-        let _ = child.wait();
-        drop(line_rx);
-        let _ = reader.join();
-        panic!(
-            "child did not reach durable transition {point}; stdout:\n{}",
-            child_output.join("\n")
-        );
-    }
-    child.kill().expect("kill child at durable transition");
-    assert!(
-        !child.wait().expect("wait for transition child").success(),
-        "killed transition child must not exit successfully"
-    );
-    drop(line_rx);
-    reader.join().expect("transition stdout reader exits");
-
-    let mut stderr = String::new();
-    child
-        .stderr
-        .take()
-        .expect("transition child stderr")
-        .read_to_string(&mut stderr)
-        .expect("read transition child stderr");
+    // The incumbent pass exercises each phase once while building the durable
+    // fixture. Kill the second occurrence, in the late competing pass whose
+    // state must survive restart.
+    let stderr =
+        spawn_crash_child(&database, point, &[(CRASH_OCCURRENCE_ENV, "2")]).kill_when_ready();
     assert!(
         database.exists(),
         "database missing after kill at {point}; stderr:\n{stderr}"
@@ -804,7 +842,11 @@ async fn run_child_case(database: &Path) {
 }
 
 fn build_memory_client(seed: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
-    let storage = SqliteAccountStorage::in_memory().expect("in-memory storage");
+    // The peers are plain fixtures; the file-backed database is what crashes.
+    // Copying a migrated template keeps their setup from dominating the time a
+    // child needs to reach its pause point.
+    let storage = SqliteAccountStorage::in_memory_from_migrated_template(Default::default())
+        .expect("in-memory storage");
     let engine = build_client_with_storage(seed, storage.clone());
     (engine, storage)
 }
@@ -957,43 +999,12 @@ fn candidate_replay_kill_restores_preprobe_state_without_hydration() {
         for nested in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let database = dir.path().join("probe.sqlite3");
-            let mut child = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--ignored",
-                    "--exact",
-                    "crash_child_runs_late_commit_convergence",
-                    "--nocapture",
-                ])
-                .env(CHILD_ENV, "1")
-                .env(DATABASE_ENV, &database)
-                .env(CRASH_POINT_ENV, point)
-                .env("MDK_CGKA_REPLAY_NESTED", if nested { "1" } else { "0" })
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap();
-            let (send, receive) = mpsc::channel();
-            let stdout = child.stdout.take().unwrap();
-            let reader = std::thread::spawn(move || {
-                for line in BufReader::new(stdout).lines() {
-                    if send.send(line.unwrap()).is_err() {
-                        break;
-                    }
-                }
-            });
-            let ready = loop {
-                match receive.recv_timeout(Duration::from_secs(60)) {
-                    Ok(line) if line == format!("{READY_PREFIX}{point}") => break true,
-                    Ok(_) => {}
-                    Err(_) => break false,
-                }
-            };
-            child.kill().unwrap();
-            let status = child.wait().unwrap();
-            drop(receive);
-            reader.join().unwrap();
-            assert!(ready, "probe child never reached {point}, nested={nested}");
-            assert!(!status.success());
+            spawn_crash_child(
+                &database,
+                point,
+                &[("MDK_CGKA_REPLAY_NESTED", if nested { "1" } else { "0" })],
+            )
+            .kill_when_ready();
             let key = SqlCipherKey::new(DATABASE_KEY).unwrap();
             let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
             let group = storage.list_groups().unwrap().pop().unwrap();
@@ -1137,45 +1148,7 @@ fn resumable_slices_kill_with_live_state_restored_and_restart_from_durable_input
     ] {
         let dir = tempfile::tempdir().unwrap();
         let database = dir.path().join("slice.sqlite3");
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "crash_child_runs_late_commit_convergence",
-                "--nocapture",
-            ])
-            .env(CHILD_ENV, "1")
-            .env(DATABASE_ENV, &database)
-            .env(CRASH_POINT_ENV, point)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let (send, receive) = mpsc::channel();
-        let stdout = child.stdout.take().unwrap();
-        let reader = std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                if send.send(line.unwrap()).is_err() {
-                    break;
-                }
-            }
-        });
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        let ready = loop {
-            match receive
-                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-            {
-                Ok(line) if line == format!("{READY_PREFIX}{point}") => break true,
-                Ok(_) => {}
-                Err(_) => break false,
-            }
-        };
-        let _ = child.kill();
-        let status = child.wait().unwrap();
-        drop(receive);
-        reader.join().unwrap();
-        assert!(ready, "child did not reach {point}");
-        assert!(!status.success());
+        spawn_crash_child(&database, point, &[]).kill_when_ready();
         let storage = SqliteAccountStorage::open_encrypted(
             &database,
             &SqlCipherKey::new(DATABASE_KEY).unwrap(),
@@ -1250,45 +1223,7 @@ fn canonical_application_kill_keeps_ratchet_disposition_and_outbox_atomic() {
     ] {
         let dir = tempfile::tempdir().unwrap();
         let database = dir.path().join("application.sqlite3");
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "crash_child_runs_late_commit_convergence",
-                "--nocapture",
-            ])
-            .env(CHILD_ENV, "1")
-            .env(DATABASE_ENV, &database)
-            .env(CRASH_POINT_ENV, point)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
-        let (send, receive) = mpsc::channel();
-        let stdout = child.stdout.take().unwrap();
-        let reader = std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                if send.send(line.unwrap()).is_err() {
-                    break;
-                }
-            }
-        });
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        let ready = loop {
-            match receive
-                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-            {
-                Ok(line) if line == format!("{READY_PREFIX}{point}") => break true,
-                Ok(_) => {}
-                Err(_) => break false,
-            }
-        };
-        let _ = child.kill();
-        let status = child.wait().unwrap();
-        drop(receive);
-        reader.join().unwrap();
-        assert!(ready, "child did not reach {point}");
-        assert!(!status.success());
+        spawn_crash_child(&database, point, &[]).kill_when_ready();
         let storage = SqliteAccountStorage::open_encrypted(
             &database,
             &SqlCipherKey::new(DATABASE_KEY).unwrap(),

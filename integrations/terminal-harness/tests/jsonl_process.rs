@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use marmot_terminal_harness::{
-    ParsedEvent, PromptTransport, RunnerEvent,
+    HarnessError, ParsedEvent, PromptTransport, RunnerEvent,
     process::{EnvironmentChange, ProcessSpec, run_jsonl_process},
 };
 use serde_json::Value;
@@ -439,6 +439,43 @@ sleep 30
     ));
     assert_eq!(failure.observed_session.as_deref(), Some("wait-idle"));
     assert_eq!(rx.recv().await, Some(RunnerEvent::LivenessUnknown));
+    assert!(rx.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn newline_free_stdout_over_the_record_cap_stops_the_process_group() {
+    let _permit = process_test_permit().await;
+    let root = tempfile::tempdir().unwrap();
+    let script = executable_script(
+        root.path(),
+        "oversized-record-backend",
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' '{{"type":"session","id":"oversized"}}'
+sleep 30 &
+printf '%s' "$!" > background.pid
+head -c {} /dev/zero | tr '\0' x
+wait
+"#,
+            marmot_terminal_harness::process::MAX_BACKEND_RECORD_BYTES + 1
+        ),
+    );
+    let (tx, mut rx) = mpsc::channel(2);
+    let mut spec = process_spec(&script, root.path(), PromptTransport::Stdin(String::new()));
+    spec.total_timeout = Duration::from_secs(20);
+    spec.idle_timeout = Duration::from_secs(20);
+
+    let started = std::time::Instant::now();
+    let failure = run_jsonl_process(spec, tx, parse_event).await.unwrap_err();
+    let background_pid = fs::read_to_string(root.path().join("background.pid")).unwrap();
+    assert!(
+        wait_for_process_exit(background_pid.trim()).await,
+        "descendant survived the output limit"
+    );
+
+    assert!(matches!(failure.error, HarnessError::OutputLimitExceeded));
+    assert_eq!(failure.observed_session.as_deref(), Some("oversized"));
+    assert!(started.elapsed() < Duration::from_secs(10));
     assert!(rx.recv().await.is_none());
 }
 

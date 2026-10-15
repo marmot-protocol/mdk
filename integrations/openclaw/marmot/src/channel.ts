@@ -151,12 +151,11 @@ async function probeMarmotAccount(account: ResolvedMarmotAccount): Promise<Marmo
 
 /** Dependencies the channel-owned message action adapter needs. */
 export interface MarmotMessageActionDeps {
-  /** Resolve a sent message id to its group from the send-time cache. */
-  deleteByMessageId: (
-    targetMessageIdHex: string,
-    resolveCtx: { cfg: unknown; accountId?: string | null },
-  ) => Promise<boolean>;
-  /** Resolve the wn-agent client + Marmot account for the explicit-group fallback. */
+  /** Look up where a message this adapter sent went, without mutating anything. */
+  sentTargetFor?: (
+    messageIdHex: string,
+  ) => { marmotAccountIdHex: string; groupIdHex: string } | undefined;
+  /** Resolve the wn-agent client + Marmot account for a message mutation. */
   resolveTarget: (
     cfg: unknown,
     accountId?: string | null,
@@ -169,6 +168,12 @@ export interface MarmotMessageActionClient {
     accountIdHex: string,
     groupIdHex: string,
     targetMessageIdHex: string,
+  ) => Promise<unknown>;
+  editMessage: (
+    accountIdHex: string,
+    groupIdHex: string,
+    targetMessageIdHex: string,
+    text: string,
   ) => Promise<unknown>;
   sendReaction: (
     accountIdHex: string,
@@ -185,17 +190,22 @@ export interface MarmotMessageActionClient {
 }
 
 /**
- * Channel-owned `delete` action for the shared `message` tool: the agent's
- * `message(action:"delete", messageId, to)` reaches `handleAction`. Prefer the
- * send-time cache (no extra round-trip); fall back to an explicit `to` group.
+ * Channel-owned `delete`, `edit` and `react` actions for the shared `message`
+ * tool: the agent's `message(action:"delete", messageId, to)` reaches
+ * `handleAction`. Delete and edit stay in the host-authorized conversation; see
+ * {@link resolveAuthorizedSentTarget}.
  */
 export function createMarmotMessageActionAdapter(
   deps: MarmotMessageActionDeps,
 ): ChannelMessageActionAdapter {
   return {
-    describeMessageTool: () => ({ actions: ["delete", "react"] }),
-    supportsAction: ({ action }) => action === "delete" || action === "react",
+    describeMessageTool: () => ({ actions: ["delete", "edit", "react"] }),
+    supportsAction: ({ action }) =>
+      action === "delete" || action === "edit" || action === "react",
     handleAction: async (ctx: ChannelMessageActionContext) => {
+      if (ctx.action === "edit") {
+        return handleEditAction(ctx, deps);
+      }
       if (ctx.action === "react") {
         const messageId =
           typeof ctx.params.messageId === "string"
@@ -203,10 +213,10 @@ export function createMarmotMessageActionAdapter(
             : typeof ctx.params.message_id === "string"
               ? ctx.params.message_id
             : String(ctx.toolContext?.currentMessageId ?? "");
-        // `deleteByMessageId` mutates immediately and only returns a boolean;
-        // it cannot safely recover a cached group for a reaction. Current
-        // inbound reactions inherit the tool context, while reactions to an
-        // earlier outbound message therefore require an explicit `to`.
+        // The send-time cache only knows messages this agent sent, so it cannot
+        // route a reaction to someone else's message. Current inbound reactions
+        // inherit the tool context, while reactions to an earlier outbound
+        // message therefore require an explicit `to`.
         const rawTo =
           typeof ctx.params.to === "string"
             ? ctx.params.to
@@ -258,22 +268,126 @@ export function createMarmotMessageActionAdapter(
       if (ctx.action !== "delete") {
         return jsonResult({ ok: false, error: `unsupported action: ${ctx.action}` });
       }
-      const messageId = typeof ctx.params.messageId === "string" ? ctx.params.messageId : "";
-      if (!messageId) {
-        return jsonResult({ ok: false, error: "messageId required" });
-      }
-      if (await deps.deleteByMessageId(messageId, { cfg: ctx.cfg, accountId: ctx.accountId })) {
-        return jsonResult({ ok: true, deleted: true });
-      }
-      const to = typeof ctx.params.to === "string" ? ctx.params.to : undefined;
-      if (to) {
-        const { client, marmotAccountIdHex } = await deps.resolveTarget(ctx.cfg, ctx.accountId ?? null);
-        await client.deleteMessage(marmotAccountIdHex, to, messageId);
-        return jsonResult({ ok: true, deleted: true });
-      }
-      return jsonResult({ ok: false, error: "could not resolve group for this message id" });
+      return handleDeleteAction(ctx, deps);
     },
   };
+}
+
+/**
+ * Resolve the group a delete or edit of `messageId` may act in. The host checks
+ * cross-context policy against the explicit `to` group, and a turn is bound to
+ * its current conversation, so that group always wins; the send-time cache only
+ * fills in a missing target, and a cached message from a different group is
+ * refused rather than mutated there. The host does not infer `to` for a
+ * targetless edit, and a bound Marmot turn carries its group on
+ * `currentChannelId`: Marmot has no threading hook, so the host never sets
+ * `currentMessagingTarget` for it.
+ */
+function resolveAuthorizedSentTarget(
+  ctx: ChannelMessageActionContext,
+  deps: MarmotMessageActionDeps,
+  messageId: string,
+): { groupIdHex: string; cachedAccountIdHex?: string } | { error: string } {
+  // The host treats a blank `to` as absent, so skip blanks rather than let one
+  // hide the binding. A present target that is not a Marmot group is refused,
+  // never replaced by the cache.
+  const rawTo = [
+    ctx.params.to,
+    ctx.toolContext?.currentMessagingTarget,
+    ctx.toolContext?.currentChannelId,
+  ].find((value): value is string => typeof value === "string" && value.trim().length > 0);
+  const authorized = rawTo === undefined ? undefined : normalizeMarmotTarget(rawTo);
+  if (rawTo !== undefined && !authorized) {
+    return { error: `${ctx.action} target is not a Marmot conversation` };
+  }
+  const cached = deps.sentTargetFor?.(messageId);
+  if (authorized && cached && cached.groupIdHex.toLowerCase() !== authorized) {
+    return {
+      error: `this message was sent to a different conversation than the ${ctx.action} target`,
+    };
+  }
+  const groupIdHex = authorized || cached?.groupIdHex;
+  if (!groupIdHex) {
+    return { error: "could not resolve group for this message id" };
+  }
+  return { groupIdHex, cachedAccountIdHex: cached?.marmotAccountIdHex };
+}
+
+/** Channel-owned `delete` action for a message this agent sent. */
+async function handleDeleteAction(
+  ctx: ChannelMessageActionContext,
+  deps: MarmotMessageActionDeps,
+) {
+  const messageId = typeof ctx.params.messageId === "string" ? ctx.params.messageId : "";
+  if (!messageId) {
+    return jsonResult({ ok: false, error: "messageId required" });
+  }
+  const target = resolveAuthorizedSentTarget(ctx, deps, messageId);
+  if ("error" in target) {
+    return jsonResult({ ok: false, error: target.error });
+  }
+  const { client, marmotAccountIdHex } = await deps.resolveTarget(ctx.cfg, ctx.accountId ?? null);
+  await client.deleteMessage(
+    target.cachedAccountIdHex ?? marmotAccountIdHex,
+    target.groupIdHex,
+    messageId,
+  );
+  return jsonResult({ ok: true, deleted: true });
+}
+
+/**
+ * Channel-owned `edit` action: `message(action:"edit", messageId, message)`
+ * replaces the text of a chat message this agent sent, keeping its place in the
+ * conversation (for example a status line updated as work progresses). The
+ * target group is resolved by {@link resolveAuthorizedSentTarget}.
+ */
+async function handleEditAction(
+  ctx: ChannelMessageActionContext,
+  deps: MarmotMessageActionDeps,
+) {
+  const messageId =
+    typeof ctx.params.messageId === "string"
+      ? ctx.params.messageId
+      : typeof ctx.params.message_id === "string"
+        ? ctx.params.message_id
+        : "";
+  if (!messageId) {
+    return jsonResult({ ok: false, error: "messageId required" });
+  }
+  const text =
+    typeof ctx.params.message === "string"
+      ? ctx.params.message
+      : typeof ctx.params.text === "string"
+        ? ctx.params.text
+        : undefined;
+  if (text === undefined || text.trim().length === 0) {
+    return jsonResult({ ok: false, error: "message required: the replacement text" });
+  }
+  const target = resolveAuthorizedSentTarget(ctx, deps, messageId);
+  if ("error" in target) {
+    return jsonResult({ ok: false, error: target.error });
+  }
+  try {
+    const { client, marmotAccountIdHex } = await deps.resolveTarget(
+      ctx.cfg,
+      ctx.accountId ?? null,
+    );
+    await client.editMessage(
+      target.cachedAccountIdHex ?? marmotAccountIdHex,
+      target.groupIdHex,
+      messageId,
+      text,
+    );
+    return jsonResult({ ok: true, edited: true });
+  } catch (error) {
+    if (error instanceof AgentControlError && error.code === "invalid_edit_target") {
+      return jsonResult({
+        ok: false,
+        error: "only an available message this agent sent can be edited",
+      });
+    }
+    return jsonResult({ ok: false, error: "edit failed" });
+  }
 }
 
 /** Build the Marmot channel plugin for registration with OpenClaw. */
@@ -290,11 +404,11 @@ export function createMarmotChannelPlugin() {
   };
 
   // The durable/live message adapter. Captured in a const so the action adapter
-  // can reuse its send-time conversation cache via `deleteByMessageId`.
+  // can look up its send-time conversation cache via `sentTargetFor`.
   const messageAdapter = createMarmotMessageAdapter({ resolveTarget });
 
   const actions = createMarmotMessageActionAdapter({
-    deleteByMessageId: messageAdapter.deleteByMessageId,
+    sentTargetFor: (messageIdHex) => messageAdapter.sentTargets.get(messageIdHex),
     resolveTarget,
   });
 

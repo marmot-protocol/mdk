@@ -333,31 +333,9 @@ export function createMarmotMessageAdapter(deps: MarmotMessageAdapterDeps) {
     ((fileName: string, bytes: Buffer) =>
       defaultWriteTempMedia(fileName, bytes, deps.outboundMediaDir, deps.chmodTempMedia));
   // Lives in the adapter closure: maps each durable message id we return back to
-  // the account+group it was sent to, so an agent delete can be routed by id.
+  // the account+group it was sent to, so an agent delete or edit without an
+  // explicit target can be routed by id (the authorized target still wins).
   const sentTargets = new SentMessageTargetCache();
-
-  /**
-   * Resolve a previously-sent message id to its account+group. Used by a delete
-   * trigger once the SDK exposes a typed adapter delete hook (see Seam 4 note);
-   * exposed here so the cache + lookup is ready to wire.
-   *
-   * `resolveCtx` carries the delete action's own routing context (`cfg` +
-   * `accountId`) so the wn-agent client is resolved for the correct account in a
-   * multi-account deployment, rather than defaulting to whatever account a
-   * context-free resolve would pick.
-   */
-  const deleteByMessageId = async (
-    targetMessageIdHex: string,
-    resolveCtx: { cfg: unknown; accountId?: string | null },
-  ): Promise<boolean> => {
-    const target = sentTargets.get(targetMessageIdHex);
-    if (!target) {
-      return false;
-    }
-    const { client } = await deps.resolveTarget(resolveCtx.cfg, resolveCtx.accountId ?? null);
-    await client.deleteMessage(target.marmotAccountIdHex, target.groupIdHex, targetMessageIdHex);
-    return true;
-  };
 
   const sendDurableText = async (params: {
     cfg: unknown;
@@ -494,7 +472,7 @@ export function createMarmotMessageAdapter(deps: MarmotMessageAdapterDeps) {
     },
   });
 
-  // Expose the cache + delete helper for the delete trigger and for tests
-  // without widening the SDK adapter shape.
-  return Object.assign(adapter, { sentTargets, deleteByMessageId });
+  // Expose the cache for the delete/edit actions and for tests without widening
+  // the SDK adapter shape.
+  return Object.assign(adapter, { sentTargets });
 }

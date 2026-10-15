@@ -46,7 +46,7 @@ pub mod subscriptions;
 
 pub use conversions::conversation_window::*;
 use conversions::group_id_from_hex;
-pub use errors::MarmotKitError;
+pub use errors::{MarmotKitError, MissingKeyPackageReasonFfi};
 pub use external_signer::ExternalAccountSignerFfi;
 pub use markdown::{
     MarkdownAlignmentFfi, MarkdownAutolinkKindFfi, MarkdownBlockFfi, MarkdownCodeBlockKindFfi,
@@ -72,8 +72,8 @@ pub enum RelayPolicyFfi {
 pub use commands::{
     CreateGroupOptionsFfi, InitialGroupImageFfi, LocalSendAcceptanceFfi, LocalSendStatusFfi,
     MediaUploadSubmissionFfi, MemberKeyPackagePrewarmSummaryFfi, OnboardingSubscription,
-    PreparedGroupImageUploadFfi, PreparedGroupImageUploadStateFfi, parse_media_imeta_tag,
-    verify_public_nostr_event_json,
+    PreparedGroupImageUploadFfi, PreparedGroupImageUploadStateFfi, PublicEventPreviewFfi,
+    PublicEventPreviewStateFfi, parse_media_imeta_tag, verify_public_nostr_event_json,
 };
 pub use conversions::{
     AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi, AppGroupMemberIdsFfi,

@@ -1180,7 +1180,7 @@ fn wipe_failure_reason(err: &AppError) -> String {
         AppError::Account(_) | AppError::AccountHome(_) => "account error",
         AppError::Session(_) => "session error",
         AppError::UnknownGroup(_) => "unknown local group",
-        AppError::MissingKeyPackage(_) => "no published key package",
+        AppError::MissingKeyPackage { .. } => "no published key package",
         _ => "operation failed",
     };
     category.to_owned()
@@ -3655,9 +3655,13 @@ impl MarmotAppRuntime {
 
     /// Edit a prior message: publish a kind-1009 event whose single `e` tag
     /// references `target_message_id` and whose content is the replacement
-    /// text. Authorship is enforced on read (an edit is only honored when its
-    /// authenticated author matches the target's author), and the chat-list
-    /// preview is intentionally left untouched so an edit doesn't reorder the
+    /// text. Recipients honor an edit only when its authenticated author
+    /// matches the target's author. As a fail-fast check against this device's
+    /// current view, the send refuses with [`AppError::InvalidEditTarget`]
+    /// unless the target is an available chat message this account sent;
+    /// recipients remain authoritative. Competing edits resolve by `created_at`,
+    /// then the larger event id. The chat-list preview is
+    /// intentionally left untouched so an edit doesn't reorder the
     /// conversation list.
     pub async fn edit_message(
         &self,
@@ -4647,6 +4651,38 @@ impl MarmotAppRuntime {
         follows.sort();
         follows.dedup();
         Ok(follows)
+    }
+
+    /// Network-free cached previews of public events referenced from message
+    /// content, one per reference (at most 16) in input order. Unparseable
+    /// references come back `Unsupported`. A cold call may open the account's
+    /// encrypted cache, so warm it off the UI thread.
+    pub fn cached_public_event_previews(
+        &self,
+        account_ref: &str,
+        references: &[String],
+    ) -> Result<Vec<crate::PublicEventPreviewRead>, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .cached_public_event_previews(&account, references)
+    }
+
+    /// Fetch one referenced public event from relays when it is missing or
+    /// stale, then return its local state. An event-ID preview never refetches
+    /// once every relay answered the fetch that cached it; otherwise, and for
+    /// `naddr` previews, it refetches after 30 minutes. Repeat calls within
+    /// 30 seconds of a finished fetch return local state.
+    pub async fn resolve_public_event_preview(
+        &self,
+        account_ref: &str,
+        reference: &str,
+    ) -> Result<crate::PublicEventPreviewRead, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        self.accounts
+            .app
+            .resolve_public_event_preview(&account, reference)
+            .await
     }
 
     /// Fast, network-free membership check against [`Self::account_follows`].

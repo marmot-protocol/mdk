@@ -2388,9 +2388,9 @@ Run the engine-owned disappearing-message sweep for one account using the suppli
 pub async fn edit_message( &self, account_ref: String, group_id_hex: String, target_message_id: String, content: String, ) -> Result<SendSummaryFfi, MarmotKitError>
 ```
 
-Edit `target_message_id` by publishing a kind-1009 event that references it and carries the replacement plaintext in `content`. Recipients honour the edit only when its authenticated author matches the target's author; MDK ignores mismatched edits.
+Edit `target_message_id` by publishing a kind-1009 event that references it and carries the replacement plaintext in `content`. Recipients honour the edit only when its authenticated author matches the target's author; MDK ignores mismatched edits. It returns `InvalidEditTarget`, publishing nothing, unless the target is an available chat message this account sent. Competing edits resolve by `created_at`, then the larger event id.
 
-[Source](src/commands/message.rs#L190)
+[Source](src/commands/message.rs#L193)
 
 ### `Marmot::send_custom_event`
 
@@ -2402,7 +2402,7 @@ pub async fn send_custom_event( &self, account_ref: String, group_id_hex: String
 
 Send an app-defined event with an arbitrary non-reserved kind. `tags` and `content` pass through verbatim; kinds MDK owns (chat, reaction, edit, delete, agent, group system, push token) are rejected so an app cannot forge protocol events. Custom events appear in the timeline as standalone rows and can be fetched via `Marmot::messages` with a `kinds` filter.
 
-[Source](src/commands/message.rs#L211)
+[Source](src/commands/message.rs#L214)
 
 ### `Marmot::create_poll`
 
@@ -2418,7 +2418,7 @@ poll projection. Creation follows MDK's canonical conversation classification: n
 groups, while unnamed two-member conversations are direct. Polls are neither anonymous nor election-grade. See
 [Polls](POLLS.md).
 
-[Source](src/commands/message.rs#L229)
+[Source](src/commands/message.rs#L232)
 
 ### `Marmot::cast_poll_vote`
 
@@ -2433,7 +2433,7 @@ or one through ten unique ids for multiple choice; use the ids from `TimelineMes
 This is a replacement, not a delta or unvote. MDK revalidates the poll against the response event's actual timestamp at
 send time, and an accepted open poll remains votable after conversation reclassification. See [Polls](POLLS.md).
 
-[Source](src/commands/message.rs#L254)
+[Source](src/commands/message.rs#L257)
 
 ### `Marmot::message_reactions`
 
@@ -2475,7 +2475,7 @@ pub fn messages( &self, account_ref: String, group_id_hex: Option<String>, limit
 
 Initial history fetch for a group (or, when `group_id_hex` is None, the account-wide tail). Used to populate the conversation view before the subscription stream takes over.
 
-[Source](src/commands/message.rs#L275)
+[Source](src/commands/message.rs#L278)
 
 </details>
 
@@ -4591,3 +4591,27 @@ Synchronously clone fixed native phases, monotonic durations and migration progr
 
 </details>
 
+<details>
+<summary>Public event previews</summary>
+
+### `Marmot::cached_public_event_previews`
+
+```rust
+pub fn cached_public_event_previews( &self, account_ref: String, references: Vec<String>, ) -> Result<Vec<PublicEventPreviewFfi>, MarmotKitError>
+```
+
+Network-free read of cached public Nostr events referenced from message content, for first-frame rendering of event cards. Pass up to 16 `note`, `nevent`, `naddr` or hex event-ID references, with or without `nostr:`; each gets one row in input order, duplicates included, echoing the reference. `Present` rows carry the signature-verified event JSON. `Deleted` means the author published a NIP-09 deletion; `Missing` is not durable, so call `resolve_public_event_preview`; `Unsupported` rows never resolve. More than 16 references fails with `InvalidPublicEventReferences`; split the batch. The cache is per account and survives restarts. A cold call may open the account's encrypted cache, so warm it off the UI thread. Read author names and avatars from `cached_identity_projections`.
+
+[Source](src/commands/public_event_preview.rs#L63)
+
+### `Marmot::resolve_public_event_preview`
+
+```rust
+pub async fn resolve_public_event_preview( &self, account_ref: String, reference: String, ) -> Result<PublicEventPreviewFfi, MarmotKitError>
+```
+
+Fetch one referenced event from at most two safe relay hints plus the configured directory relays when it is missing or stale, store it if it verifies and matches, and return the resulting local state. An event-ID preview never refetches once every relay answered the fetch that cached it; otherwise, and for `naddr` previews, it refetches after 30 minutes. `naddr` keeps the newest version. Author-signed NIP-09 deletions apply in either tag form: an `e` tag removes that event (an `naddr` falls back to the previous version), an `a` tag removes every version up to its timestamp. Calls within 30 seconds of a finished fetch for the same reference return local state without network I/O, as does any call while the row is fresh, so call it for every reference a screen shows. A failed or empty fetch keeps prior content and stores no miss.
+
+[Source](src/commands/public_event_preview.rs#L82)
+
+</details>

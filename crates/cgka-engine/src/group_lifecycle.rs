@@ -69,6 +69,7 @@ fn persist_new_group_maintenance<S: StorageProvider>(
         periodic_enrolled,
         last_own_leaf_rotation_at: post_join.is_none().then_some(enrolled_at),
         next_periodic_rotation_at: None,
+        leaf_refresh_due_at: None,
     })?;
     if let Some((welcome_id, sampled_jitter_ms)) = post_join {
         let mut hasher = Sha256::new();
