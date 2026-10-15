@@ -21,7 +21,8 @@ judgements not traced end to end.
 
 1. **`marmot-app` is a product monolith in a runtime's clothing.** Its documented job is "the runtime boundary for
    client applications". Only about 23% of its 107k production lines are runtime orchestration. About 57% are product
-   features, and about 20% are infrastructure and sidecars that belong lower or beside it.
+   features, and about 20% are infrastructure and observability code (audit logs, telemetry, analytics) that belongs
+   lower in the stack or in a crate of its own.
 2. **The real per-account core is an undocumented god object.** `AppClient` has 58 fields and 449 methods, 299 of them
    taking `&mut self`. The docs call it "a lower-level compatibility surface", and they describe a
    `MarmotAccountSession` and `SharedServices` that don't exist. The public runtime mostly forwards calls: 179 of its
@@ -64,7 +65,7 @@ the seams that are already nearly separate: the media store (in progress, #2314)
 | --- | --- | ---: |
 | Runtime orchestration, the stated role | Runtime and lifecycle, `AppClient` core, sync, ingest and cursor, relay plane, group command plumbing | about 23% |
 | Product features | Directory and search (11.9%), media (9.4%), onboarding (7.8%), messaging and timeline (6.9%), history recovery (6.4%), group management, chat list and presentation windows, notifications, drafts, agent streams, moderation | about 57% |
-| Infrastructure and sidecars | Audit, telemetry and analytics (12.2%, the largest single domain), SQLCipher key derivation, the root lease, dial-safety helpers, `marmot-account` trait implementations, the KeyPackage lifecycle, row-to-DTO mapping | about 20% |
+| Infrastructure and observability | Audit, telemetry and analytics (12.2%, the largest single domain), SQLCipher key derivation, the root lease, dial-safety helpers, `marmot-account` trait implementations, the KeyPackage lifecycle, row-to-DTO mapping | about 20% |
 
 The crate grew from 41k lines on 2026-07-15 to 229k lines, tests included, three months later. That is about 21
 lines added for every line removed.
@@ -81,7 +82,7 @@ One reaction, for example, goes `MarmotAppRuntime::react_to_message`, then `Acco
 held in more than one object: `relay_plane` in four, and analytics, the audit tracker configuration and the directory
 sync handle in two each.
 
-**Cross-cutting hooks.** About 550 references to audit, performance and analytics hooks sit outside the sidecar
+**Cross-cutting hooks.** About 550 references to audit, performance and analytics hooks sit outside the observability
 modules. Forty `_unobserved` functions exist only to pair each public operation with an instrumented wrapper. The
 101-variant `AppError` and 47 crate-root re-exports tie every module to the root.
 
@@ -214,7 +215,7 @@ Hosts:        marmot-uniffi   marmot-c   cli   agent-connector
 Runtime:      marmot-app ── composition root; per-account product core
                     │       (messaging, groups, projections and windows, sync + recovery,
                     │        onboarding coordinator, notifications), split by role per Pass 1 B
-App services: directory   media-store + media transfer   app store   sidecars (exporters)
+App services: directory   media-store + media transfer   app store   marmot-observability
                     │
 Account:      marmot-device-runtime (session + publish pipeline + maintenance +
                     │                KeyPackage lifecycle + single routing + one Welcome rail)
@@ -238,7 +239,7 @@ Foundation:   cgka-traits (contracts only)   marmot-components (app component an
 | `transport-nostr` | `transport-nostr-adapter`, `marmot-app` `relay_plane/` | Adapter plus relay plane, routing derivation, coverage evidence (EOSE and paging), and the KeyPackage event format. This is where Pass 1 E's size handling and coverage surface belong. |
 | `directory` (new) | `marmot-app` `directory/`, relay-plane directory code, previews | Discovery, profiles, KeyPackage lookup and search, with the databases it already owns. |
 | `media-store` and media transfer | #2314; `marmot-app` `media/` | The encrypted file store (in progress), plus Blossom transfer, crypto and resume. |
-| Sidecars | `marmot-app` exporters | Telemetry, analytics and audit exporters. The recording points stay and report through one observer interface, replacing the 40 `_unobserved` pairs over time. |
+| `marmot-observability` (new) | `marmot-app` `relay_telemetry_export`, `product_analytics`, `audit_otlp_sender`, audit upload, `collector_host_safety` | The code that ships diagnostics off the device: relay telemetry over OTLP, Aptabase product analytics, audit-log upload and OTLP delivery, and the collector dial-safety checks. The recording points stay in `marmot-app` and report through one observer interface, replacing the 40 `_unobserved` pairs over time. |
 | `marmot-app` | itself | Composition root and per-account product core, organized by role (writer lane, read path, I/O lanes; [Pass 1 B](b-runtime-concurrency.md)). `AppClient` stops being a public type; only `wn sync` uses it today. |
 
 **Dependency rules for the target:**
@@ -259,7 +260,7 @@ Each step can ship on its own, and later steps depend on the in-flight fixes lan
 | 3 | Directory crate | Already owns its state; makes no account-storage calls | about 11–13k |
 | 4 | `storage-sqlite` internal boundaries: `protocol/`, `app/` and an explicit `cross/` module listing the 11 couplings | Makes the split reviewable before any crate moves; no behaviour change | Moves only |
 | 5 | Lower stack: merge the session into `marmot-device-runtime`, split off `marmot-account`, move the engine's storage proxy and audit ownership up, re-export config types | After #2338 and #2323 land, since both touch this code | Touches about 10 `marmot-app` files and `marmot-account` |
-| 6 | Sidecar exporters crate plus an observer interface | Removes the largest `marmot-app` domain | about 7–8k |
+| 6 | `marmot-observability` for the exporters, plus an observer interface | Removes the largest `marmot-app` domain | about 7–8k |
 | 7 | Inside `marmot-app`: break up `AppClient` along Pass 1 B's roles; make sync and recovery one owned subsystem; take onboarding out of `AccountManager`; remove duplicated state | Depends on the runtime work (multi-thread runtime session) | Large |
 | 8 | Split `storage-sqlite` into protocol, app and base crates; move app types into `marmot-components`; inject engine policy | Last, because they need steps 4 and 5 | Large |
 
@@ -272,7 +273,7 @@ Steps 1, 2, 3 and 6 alone would move about a third of `marmot-app`'s production 
    files give real isolation and remove the engine-cache invalidation and WAL contention, but every coupling in §2.2
    then needs a journal or intent.
 3. Can `AppClient` stop being public? Only `wn sync` and integration tests use it.
-4. Do the names `marmot-device-runtime`, `marmot-components` and `transport-nostr` work for you?
+4. Do the names `marmot-device-runtime`, `marmot-components`, `transport-nostr` and `marmot-observability` work for you?
 
 ## Doc drift found in this pass
 
