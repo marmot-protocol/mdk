@@ -490,7 +490,7 @@ async fn attachment_transfer_state_change_skips_the_progress_window() {
 }
 
 /// Byte progress alone is still coalesced: with a write every 20 ms, frames
-/// that only advance progress stay close to the window apart.
+/// that only advance progress stay the window apart.
 #[tokio::test]
 async fn attachment_progress_only_frames_stay_coalesced() {
     let dir = tempfile::tempdir().unwrap();
@@ -521,11 +521,12 @@ async fn attachment_progress_only_frames_stay_coalesced() {
         arrivals.len() >= 3,
         "expected some progress frames: {arrivals:?}"
     );
-    // Uncoalesced frames would follow the 20 ms writes; the slack below the
-    // 250 ms window absorbs a loaded runner timing a frame late.
+    // Frames are delivered at least the 250 ms window apart. This task times
+    // each one just after `next()` returns it, so the 10 ms allowance only
+    // covers that observation, and a window shortened to 200 ms still fails.
     for pair in arrivals.windows(2) {
         assert!(
-            pair[1] - pair[0] >= std::time::Duration::from_millis(175),
+            pair[1] - pair[0] >= std::time::Duration::from_millis(240),
             "progress frames {:?} apart",
             pair[1] - pair[0]
         );
