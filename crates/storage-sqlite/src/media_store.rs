@@ -13,7 +13,7 @@ mod store;
 pub(crate) use store::MediaStoreShared;
 pub use store::{
     MediaCategory, MediaFileId, MediaFileState, MediaFileStore, MediaPublishOutcome,
-    MediaSweepReport,
+    MediaStoreReader, MediaSweepReport,
 };
 
 #[cfg(feature = "media-store-benchmarks")]

@@ -15,7 +15,10 @@
 //! - **Sweep:** a `pending` row no live publish owns is deleted with its file;
 //!   a file with no row is unlinked; a `ready` row whose file is gone becomes
 //!   `lost`. A file is only ever created after its row commits, so the
-//!   database alone decides.
+//!   database alone decides. Batches stay within their limit, even inside
+//!   one shard.
+//! - **Reuse:** identical content is stored once, but a ready row is reused
+//!   only if its file is on disk; a missing one is marked `lost` instead.
 //!
 //! Live publishes register their id in the storage handle's in-flight set so
 //! a concurrent sweep leaves their `pending` row alone. The set is per process
@@ -139,6 +142,8 @@ struct SweepCursor {
     rows_done: bool,
     /// Next shard directory to list.
     shard: u16,
+    /// Last file name checked in that shard, when it needs more batches.
+    name: Option<String>,
 }
 
 /// Removes a live publish from the in-flight set however it ends.
@@ -260,7 +265,29 @@ impl MediaFileStore {
     ) -> StorageResult<Option<MediaFileId>> {
         self.ensure_open()?;
         let conn = self.storage.lock()?;
-        ready_by_digest(&conn, category, digest)
+        self.reusable_by_digest(&conn, category, digest)
+    }
+
+    /// The ready file with this content, but only if its file is on disk. A
+    /// ready row whose file is gone is marked lost on `conn` and not reused,
+    /// so the body in hand is kept instead of being dropped for a missing one.
+    pub(crate) fn reusable_by_digest(
+        &self,
+        conn: &Connection,
+        category: MediaCategory,
+        digest: &[u8; 32],
+    ) -> StorageResult<Option<MediaFileId>> {
+        let Some(id) = ready_by_digest(conn, category, digest)? else {
+            return Ok(None);
+        };
+        match std::fs::symlink_metadata(self.path(&id)) {
+            Ok(_) => Ok(Some(id)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                mark_lost_on(conn, &id)?;
+                Ok(None)
+            }
+            Err(error) => Err(io_error(&error)),
+        }
     }
 
     pub fn file_state(&self, id: &MediaFileId) -> StorageResult<Option<MediaFileState>> {
@@ -350,7 +377,7 @@ impl MediaFileStore {
     ) -> StorageResult<Option<MediaFileId>> {
         self.storage.connection.with_transaction(|| {
             let conn = self.storage.lock()?;
-            let Some(existing) = ready_by_digest(&conn, category, digest)? else {
+            let Some(existing) = self.reusable_by_digest(&conn, category, digest)? else {
                 return Ok(None);
             };
             commit(&conn, existing)?;
@@ -465,7 +492,7 @@ impl MediaFileStore {
             if !pending {
                 return Ok(MediaPublishOutcome::Superseded);
             }
-            if let Some(existing) = ready_by_digest(&conn, category, digest)? {
+            if let Some(existing) = self.reusable_by_digest(&conn, category, digest)? {
                 conn.execute("DELETE FROM media_files WHERE id=?1", [id.0.as_slice()])
                     .storage()?;
                 commit(&conn, existing)?;
@@ -524,8 +551,10 @@ impl MediaFileStore {
     }
 
     /// Opens a ready file for offset reads. `None` means there is no ready
-    /// file; a ready row whose file is missing is marked lost first.
-    pub fn open_reader(&self, id: &MediaFileId) -> StorageResult<Option<MediaFileReader<File>>> {
+    /// file; a ready row whose file is missing is marked lost first. The
+    /// reader stops with the database: after terminal close every read fails
+    /// with `StorageError::Closed`, including reads of a cached segment.
+    pub fn open_reader(&self, id: &MediaFileId) -> StorageResult<Option<MediaStoreReader>> {
         self.ensure_open()?;
         let Some(row) = self.ready_row(id)? else {
             return Ok(None);
@@ -544,7 +573,11 @@ impl MediaFileStore {
                 "media file length differs from its row".into(),
             ));
         }
-        Ok(Some(reader))
+        Ok(Some(MediaStoreReader {
+            storage: self.storage.clone(),
+            reader,
+            position: 0,
+        }))
     }
 
     /// Reads plaintext at `offset` into `out`. `None` means no ready file.
@@ -557,19 +590,12 @@ impl MediaFileStore {
         let Some(mut reader) = self.open_reader(id)? else {
             return Ok(None);
         };
-        reader.read_at(offset, out).map(Some).map_err(format_error)
+        reader.read_at(offset, out).map(Some)
     }
 
     fn mark_lost(&self, id: &MediaFileId) -> StorageResult<bool> {
-        Ok(self
-            .storage
-            .lock()?
-            .execute(
-                "UPDATE media_files SET state=?2,file_key=zeroblob(32) WHERE id=?1 AND state=?3",
-                params![id.0.as_slice(), STATE_LOST, STATE_READY],
-            )
-            .storage()?
-            == 1)
+        let conn = self.storage.lock()?;
+        mark_lost_on(&conn, id)
     }
 
     /// Attaches the slot identified by an acquisition `token` to a ready file.
@@ -737,33 +763,47 @@ impl MediaFileStore {
         Ok(())
     }
 
+    /// Checks up to `limit` of this store's file names, resuming inside a
+    /// shard that needs more than one batch. Listing a shard is a directory
+    /// read; database lookups and unlinks stay within `limit`.
     fn sweep_files(
         &self,
         cursor: &mut SweepCursor,
         limit: usize,
         report: &mut MediaSweepReport,
     ) -> StorageResult<()> {
-        let mut listed = 0;
-        while cursor.shard <= u8::MAX as u16 && listed < limit {
+        let mut budget = limit;
+        while cursor.shard <= u8::MAX as u16 && budget > 0 {
             self.ensure_open()?;
             let shard = cursor.shard as u8;
-            cursor.shard += 1;
             let entries = match std::fs::read_dir(self.shard_dir(shard)) {
                 Ok(entries) => entries,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(io_error(&error)),
-            };
-            for entry in entries {
-                let entry = entry.map_err(|e| io_error(&e))?;
-                listed += 1;
-                report.files_checked += 1;
-                // Only names this store creates are its to judge.
-                let Some(id) = entry.file_name().to_str().and_then(MediaFileId::parse_hex) else {
-                    continue;
-                };
-                if id.0[0] != shard {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    cursor.shard += 1;
+                    cursor.name = None;
                     continue;
                 }
+                Err(error) => return Err(io_error(&error)),
+            };
+            // Only names this store creates are its to judge.
+            let mut names = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|e| io_error(&e))?;
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                let ours = MediaFileId::parse_hex(&name).is_some_and(|id| id.0[0] == shard);
+                if ours && cursor.name.as_ref().is_none_or(|after| &name > after) {
+                    names.push(name);
+                }
+            }
+            names.sort_unstable();
+            let take = names.len().min(budget);
+            for name in &names[..take] {
+                let id = MediaFileId::parse_hex(name).expect("filtered to valid ids");
+                budget -= 1;
+                report.files_checked += 1;
+                cursor.name = Some(name.clone());
                 let has_row: bool = self
                     .storage
                     .lock()?
@@ -773,9 +813,13 @@ impl MediaFileStore {
                         |row| row.get(0),
                     )
                     .storage()?;
-                if !has_row && remove_if_present(&entry.path()).map_err(|e| io_error(&e))? {
+                if !has_row && remove_if_present(&self.path(&id)).map_err(|e| io_error(&e))? {
                     report.orphans_unlinked += 1;
                 }
+            }
+            if take == names.len() {
+                cursor.shard += 1;
+                cursor.name = None;
             }
         }
         if cursor.shard > u8::MAX as u16 {
@@ -784,6 +828,48 @@ impl MediaFileStore {
         }
         Ok(())
     }
+}
+
+/// An open media file that refuses reads once the account database closes.
+pub struct MediaStoreReader {
+    storage: SqliteAccountStorage,
+    reader: MediaFileReader<File>,
+    position: u64,
+}
+
+impl MediaStoreReader {
+    pub fn plaintext_bytes(&self) -> u64 {
+        self.reader.plaintext_bytes()
+    }
+
+    /// Fills `out` from plaintext `offset`; returns 0 at or past the end.
+    pub fn read_at(&mut self, offset: u64, out: &mut [u8]) -> StorageResult<usize> {
+        if self.storage.is_closed() {
+            return Err(StorageError::Closed("media store is closed".into()));
+        }
+        self.reader.read_at(offset, out).map_err(format_error)
+    }
+}
+
+impl Read for MediaStoreReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let read = self
+            .read_at(self.position, out)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        self.position += read as u64;
+        Ok(read)
+    }
+}
+
+/// Marks a ready row lost and zeroes its key.
+fn mark_lost_on(conn: &Connection, id: &MediaFileId) -> StorageResult<bool> {
+    Ok(conn
+        .execute(
+            "UPDATE media_files SET state=?2,file_key=zeroblob(32) WHERE id=?1 AND state=?3",
+            params![id.0.as_slice(), STATE_LOST, STATE_READY],
+        )
+        .storage()?
+        == 1)
 }
 
 fn ready_by_digest(

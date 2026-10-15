@@ -671,3 +671,109 @@ fn a_corrupted_file_fails_verification_instead_of_returning_bytes() {
         Err(StorageError::Corruption(_))
     ));
 }
+
+#[test]
+fn a_reader_held_across_terminal_close_stops_reading() {
+    let fixture = Fixture::new();
+    let content = body(1_000);
+    let id = fixture.published(&content);
+    let mut reader = fixture.store.open_reader(&id).unwrap().unwrap();
+    let mut window = [0; 10];
+    assert_eq!(reader.read_at(0, &mut window).unwrap(), 10);
+    fixture.storage.close().unwrap();
+    // Even the segment it already decrypted is no longer served.
+    assert!(matches!(
+        reader.read_at(0, &mut window),
+        Err(StorageError::Closed(_))
+    ));
+    assert!(reader.read(&mut window).is_err());
+}
+
+#[test]
+fn the_sweep_bounds_its_work_inside_a_single_shard() {
+    let fixture = Fixture::new();
+    let shard = fixture.root.join("ab");
+    fs_private::create_dir_all_private(&shard).unwrap();
+    for n in 0..25_u32 {
+        std::fs::write(shard.join(format!("ab{n:030x}")), b"orphan").unwrap();
+    }
+    let mut unlinked = 0;
+    for _ in 0..10 {
+        let batch = fixture.store.sweep(10).unwrap();
+        assert!(batch.files_checked <= 10, "{batch:?}");
+        assert!(batch.orphans_unlinked <= 10, "{batch:?}");
+        unlinked += batch.orphans_unlinked;
+        if batch.complete {
+            break;
+        }
+    }
+    assert_eq!(unlinked, 25);
+    assert!(fixture.files().is_empty());
+}
+
+#[test]
+fn digest_reuse_skips_a_ready_row_whose_file_is_gone() {
+    let fixture = Fixture::new();
+    let content = body(3_000);
+    let gone = fixture.published(&content);
+    std::fs::remove_file(fixture.store.path(&gone)).unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .ready_file_by_digest(MediaCategory::Retained, &digest(&content))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        fixture.store.file_state(&gone).unwrap(),
+        Some(MediaFileState::Lost)
+    );
+    let fresh = fixture.published(&content);
+    assert_ne!(fresh, gone);
+    assert_eq!(fixture.read_all(&fresh).unwrap(), content);
+}
+
+/// A concurrent publish made the same content ready, and then its file
+/// vanished: this publish keeps its own file rather than dropping it.
+#[test]
+fn a_ready_commit_keeps_its_file_when_the_digest_twin_is_gone() {
+    let fixture = Fixture::new();
+    let content = body(4_000);
+    let (own, key, _in_flight) = fixture
+        .store
+        .insert_pending(
+            MediaCategory::Retained,
+            content.len() as u64,
+            &digest(&content),
+            NOW,
+        )
+        .unwrap();
+    fixture
+        .store
+        .write_body(
+            &own,
+            &key,
+            &mut Cursor::new(&content),
+            content.len() as u64,
+            &digest(&content),
+            &|| false,
+        )
+        .unwrap();
+    let twin = fixture.published(&content);
+    std::fs::remove_file(fixture.store.path(&twin)).unwrap();
+    let outcome = fixture
+        .store
+        .mark_ready(
+            &own,
+            MediaCategory::Retained,
+            &digest(&content),
+            &mut |_, _| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(outcome, MediaPublishOutcome::Published(own));
+    assert_eq!(
+        fixture.store.file_state(&twin).unwrap(),
+        Some(MediaFileState::Lost)
+    );
+    assert_eq!(fixture.read_all(&own).unwrap(), content);
+}
