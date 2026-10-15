@@ -39,6 +39,7 @@ mod encrypted_media_secrets;
 mod local_submissions;
 mod message_drafts;
 pub use local_submissions::LocalSubmission;
+pub mod media_store;
 mod migrations;
 mod moderation_reports;
 pub use moderation_reports::{ModerationReportOutboxEntry, ModerationReportOutboxOutcome};

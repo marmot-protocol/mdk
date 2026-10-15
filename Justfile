@@ -88,6 +88,15 @@ bench-group-image-create:
 bench-storage-upgrade:
     cargo test --release -p storage-sqlite migrations::tests::storage_format_upgrade_benchmark -- --ignored --exact --nocapture --test-threads=1
 
+# Media file store benchmark (mdk#2314 step 0). Times the encrypted media
+# file format (both cipher backends) against today's SQLCipher retained
+# attachment import and reads for 64 KiB, 1 MiB and 100 MiB bodies, and prints
+# stable `MDK_BENCH media_store ...` lines. Override with
+# `MDK_MEDIA_BENCH_SIZES=64K,1M`, `MDK_MEDIA_BENCH_ITERATIONS=<count>` and
+# `MDK_MEDIA_BENCH_DIR=<dir>`.
+bench-media-store:
+    cargo run --release -p storage-sqlite --features media-store-benchmarks --example media_store_bench
+
 # Idle reconciliation regression benchmark (mdk#1380). Builds one agent
 # account with several joined groups, idles a long-lived inbound subscription
 # over many compressed former-intervals, asserts the adaptive safety nets stay
