@@ -630,6 +630,29 @@ export class MarmotAgentControlClient {
     })) as unknown as FinalSentResponse;
   }
 
+  /**
+   * Replace the text of a chat message this account sent (kind-1009 edit). The
+   * connector refuses other targets with `invalid_edit_target`; nothing is
+   * published then.
+   */
+  async editMessage(
+    accountIdHex: string,
+    groupIdHex: string,
+    targetMessageIdHex: string,
+    text: string,
+  ): Promise<FinalSentResponse> {
+    if (typeof text !== "string") {
+      throw new AgentControlError("edit text must be a string", { code: "invalid_request" });
+    }
+    return (await this.request({
+      type: "edit_message",
+      account_id_hex: normalizeHex(accountIdHex, "account_id_hex"),
+      group_id_hex: normalizeHex(groupIdHex, "group_id_hex"),
+      target_message_id_hex: normalizeHex(targetMessageIdHex, "target_message_id_hex"),
+      text,
+    })) as unknown as FinalSentResponse;
+  }
+
   /** Add arbitrary reaction content to a durable group message. */
   async sendReaction(
     accountIdHex: string,

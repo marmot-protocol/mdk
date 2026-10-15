@@ -399,6 +399,19 @@ impl MarmotApp {
                         "pending edit requires an outgoing text message".into(),
                     ));
                 }
+                // The same fail-fast rule as direct edits, applied at admission
+                // because the prepared event skips the send preflight and is not
+                // re-checked at publish. Best-effort against this device's view;
+                // recipients stay authoritative. A failed publish awaiting retry
+                // stays editable.
+                if original_row.deleted
+                    || original_row
+                        .invalidation_status
+                        .as_deref()
+                        .is_some_and(|status| status != crate::LOCAL_PUBLISH_FAILED_REASON)
+                {
+                    return Err(AppError::InvalidEditTarget);
+                }
                 // Edit resolution uses (second, event id), not queue order.
                 // Give rapid local revisions strictly increasing seconds so
                 // the last submitted text remains the effective version.

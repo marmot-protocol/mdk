@@ -533,6 +533,9 @@ fn validate_operational(kind: &crate::audit::AuditEventKind) -> Result<(), Contr
             routes_compared,
             routes_certified,
             routes_uncertified,
+            relays_failed,
+            relays_incomplete,
+            relay_outcomes,
             ..
         } => {
             require(
@@ -542,6 +545,33 @@ fn validate_operational(kind: &crate::audit::AuditEventKind) -> Result<(), Contr
             require(
                 error_kind.is_some() == (*outcome == RecoveryPassOutcome::Failed),
                 "only a failed recovery pass carries an error kind",
+            )?;
+            require(
+                relays_incomplete <= relays_failed,
+                "incomplete relays are a subset of failed relays",
+            )?;
+            require(
+                u64::try_from(relay_outcomes.len()).is_ok_and(|listed| {
+                    listed <= (*relays_failed).min(RECOVERY_AUDIT_MAX_ENDPOINTS as u64)
+                }),
+                "recovery relay outcomes cannot outnumber failed relays or the bound",
+            )?;
+            require(
+                relay_outcomes
+                    .iter()
+                    .map(|relay| relay.relay_url.as_str())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    == relay_outcomes.len(),
+                "recovery relay outcomes must name each relay once",
+            )?;
+            require(
+                relay_outcomes.iter().all(|relay| {
+                    relay.routes > 0
+                        && relay.refusal_category.is_some()
+                            == (relay.failure == crate::audit::RecoveryRelayFailure::NegErr)
+                }),
+                "a recovery relay outcome failed a route and carries a category only for NEG-ERR",
             )
         }
         AuditEventKind::RecoveryObligationReassessed {

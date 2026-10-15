@@ -145,6 +145,7 @@ pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'sta
         AgentControlRequest::TimelineList { .. } => "timeline_list",
         AgentControlRequest::SendFinal { .. } => "send_final",
         AgentControlRequest::DeleteMessage { .. } => "delete_message",
+        AgentControlRequest::EditMessage { .. } => "edit_message",
         AgentControlRequest::SendReaction { .. } => "send_reaction",
         AgentControlRequest::RemoveReaction { .. } => "remove_reaction",
         AgentControlRequest::StreamBegin { .. } => "stream_begin",

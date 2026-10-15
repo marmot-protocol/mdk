@@ -37,6 +37,8 @@ pub use nostr_verification::verify_public_nostr_event_json;
 pub use onboarding::OnboardingSubscription;
 
 mod product_analytics;
+mod public_event_preview;
+pub use public_event_preview::{PublicEventPreviewFfi, PublicEventPreviewStateFfi};
 
 mod presentation;
 

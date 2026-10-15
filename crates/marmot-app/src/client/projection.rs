@@ -314,9 +314,31 @@ impl AppClient {
         if super::group_is_terminal(&self.runtime, group_id) {
             return Ok(Vec::new());
         }
+        let storage = self.app.account_storage(&self.state.label)?;
+        if self.skips_quarantined_group_reads(group_id) {
+            // No live routing component until it rehydrates (mdk#2318). Its
+            // delete stored the then-current route, which the engine can
+            // keep receiving on: it retains a quarantined group's inbound
+            // input as deferred peels and replays them on recovery.
+            let Some(current) = storage
+                .local_group_deletion_prior_nostr_routes(&hex::encode(group_id.as_slice()))?
+                .into_iter()
+                .filter(|route| route.replaced_at.is_none())
+                .max_by_key(|route| route.last_epoch)
+            else {
+                return Ok(Vec::new());
+            };
+            let current = AppPriorNostrRoute {
+                nostr_group_id_hex: current.nostr_group_id_hex,
+                relays: current.relays,
+                last_epoch: current.last_epoch,
+                replaced_at: None,
+            }
+            .subscription(group_id)?;
+            return self.local_deleted_group_subscriptions_from(&storage, group_id, current);
+        }
         let routing = self.nostr_routing_for_group(group_id)?;
         let current = routing.subscription(group_id)?;
-        let storage = self.app.account_storage(&self.state.label)?;
         if storage
             .retain_local_group_deletion_nostr_routes(
                 &hex::encode(group_id.as_slice()),
@@ -343,6 +365,17 @@ impl AppClient {
                 "could not retain the current route for a locally deleted group",
             );
         }
+        self.local_deleted_group_subscriptions_from(&storage, group_id, current)
+    }
+
+    /// The current route first, then each retained prior route still indexed
+    /// for the group, then any legacy route ids paired with the current relays.
+    fn local_deleted_group_subscriptions_from(
+        &self,
+        storage: &storage_sqlite::SqliteAccountStorage,
+        group_id: &GroupId,
+        current: TransportGroupSubscription,
+    ) -> Result<Vec<TransportGroupSubscription>, AppError> {
         let indexed_routes = storage
             .list_transport_group_routes()?
             .into_iter()
@@ -403,12 +436,6 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
     ) -> Result<bool, AppError> {
-        // Startup installs no route for a quarantined hidden group, since it is
-        // not live. Leave that alone instead of failing the whole effects
-        // batch; its `GroupHydrationRecovered` event installs the route.
-        if self.skips_quarantined_group_reads(group_id) {
-            return Ok(false);
-        }
         let subscriptions = self.local_deleted_group_subscriptions(group_id)?;
         Ok(self.routing.replace_group_routes(group_id, subscriptions))
     }
@@ -455,7 +482,18 @@ impl AppClient {
         &self,
         routing: &AppTransportRouting,
     ) -> Result<(), AppError> {
-        for group_id in self.runtime.live_group_ids()? {
+        // A quarantined hidden group is not live but keeps its stored route.
+        let quarantined = self
+            .runtime
+            .quarantined_groups()
+            .into_iter()
+            .map(|(group_id, _)| group_id);
+        for group_id in self
+            .runtime
+            .live_group_ids()?
+            .into_iter()
+            .chain(quarantined)
+        {
             if self.state_group_record(&group_id).is_some()
                 || !self.has_local_group_deletion_frontier(&group_id)?
             {
@@ -1375,8 +1413,9 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::Json(_) => "read_marker_failed:json",
         AppError::Sqlite(_) => "read_marker_failed:sqlite",
         AppError::Hex(_) => "read_marker_failed:hex",
-        AppError::MissingKeyPackage(_) => "read_marker_failed:missing_key_package",
+        AppError::MissingKeyPackage { .. } => "read_marker_failed:missing_key_package",
         AppError::MissingMemberInboxRoute(_) => "read_marker_failed:missing_member_inbox_route",
+        AppError::DirectoryLookupIncomplete(_) => "read_marker_failed:directory_lookup_incomplete",
         AppError::GroupCreateIncludesCreator => "read_marker_failed:group_create_includes_creator",
         AppError::UnknownGroup(_) => "read_marker_failed:unknown_group",
         AppError::GroupInviteNotPending => "read_marker_failed:group_invite_not_pending",
@@ -1391,6 +1430,9 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
             "read_marker_failed:direct_conversation_index_not_ready"
         }
         AppError::InvalidCachedIdentityPage(_) => "read_marker_failed:invalid_cached_identity_page",
+        AppError::InvalidPublicEventReferences(_) => {
+            "read_marker_failed:invalid_public_event_references"
+        }
         AppError::InvalidChatPin(_) => "read_marker_failed:invalid_chat_pin",
         AppError::GroupDisbanding(_) => "read_marker_failed:group_disbanding",
         AppError::GroupRemoved(_) => "read_marker_failed:group_removed",
@@ -1502,6 +1544,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::ModerationReportRateLimited => {
             "read_marker_failed:moderation_report_rate_limited"
         }
+        AppError::InvalidEditTarget => "read_marker_failed:invalid_edit_target",
     }
 }
 

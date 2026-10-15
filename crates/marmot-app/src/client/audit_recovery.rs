@@ -19,7 +19,8 @@ use marmot_forensics::{
     AuditEventContext, AuditEventKind, RECOVERY_AUDIT_MAX_ENDPOINTS,
     RECOVERY_AUDIT_MAX_OBLIGATIONS, RecoveryAttemptScope, RecoveryGoalBound, RecoveryNeedChange,
     RecoveryNextAttempt, RecoveryObligationCause, RecoveryObligationVerdict, RecoveryPassOutcome,
-    RecoveryScopeProgress, TransportCursorTrigger,
+    RecoveryRelayFailure, RecoveryRelayOutcome, RecoveryScopeProgress, SubscriptionRefusalCategory,
+    TransportCursorTrigger,
 };
 use storage_sqlite::{
     RecoveryCause, RecoveryDemandTicket, RecoveryDemandTransition, RecoveryEligibility,
@@ -34,29 +35,105 @@ use crate::AppError;
 
 /// What one compared route's relays returned. Audit-only; settlement never
 /// reads it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RouteAcquisition {
     /// Events the relays handed over.
     pub(crate) retrieved: usize,
     /// Handed-over events that could not be read as a transport message or
     /// no longer routed to this account.
     pub(crate) rejected: usize,
-    pub(crate) relays_failed: usize,
-    /// Failed relays that answered but withheld a claimed event.
-    pub(crate) relays_incomplete: usize,
+    /// The relays that failed this route and why. Account-private: never log.
+    pub(crate) failed: Vec<FailedRelay>,
+    /// Failures the comparison backend did not attribute to a relay.
+    pub(crate) unattributed: usize,
+}
+
+/// One relay that failed one compared route.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FailedRelay {
+    pub(crate) endpoint: String,
+    pub(crate) failure: RecoveryRelayFailure,
+    pub(crate) refusal_category: Option<SubscriptionRefusalCategory>,
+    /// It answered but left claimed events unreturned: withheld, or left by
+    /// the pass's own limits.
+    pub(crate) incomplete: bool,
 }
 
 impl RouteAcquisition {
     pub(crate) fn from_summary(
         summary: &transport_nostr_adapter::NostrReconciliationSummary,
     ) -> Self {
+        let failed = summary
+            .failed_endpoints
+            .iter()
+            .map(|endpoint| {
+                let incomplete = summary.incomplete_endpoints.contains(endpoint);
+                let failure = summary
+                    .endpoint_failures
+                    .iter()
+                    .find(|named| &named.endpoint == endpoint)
+                    .map(|named| named.failure);
+                let (failure, refusal_category) = match failure {
+                    Some(failure) => relay_failure(failure),
+                    None if incomplete => (RecoveryRelayFailure::PassLimit, None),
+                    None => (RecoveryRelayFailure::LocalError, None),
+                };
+                FailedRelay {
+                    endpoint: endpoint.as_str().to_owned(),
+                    failure,
+                    refusal_category,
+                    incomplete,
+                }
+            })
+            .collect::<Vec<_>>();
         Self {
             retrieved: summary.received_items,
             rejected: 0,
-            relays_failed: summary.relays_failed,
-            relays_incomplete: summary.incomplete_endpoints.len(),
+            unattributed: summary.relays_failed.saturating_sub(failed.len()),
+            failed,
         }
     }
+}
+
+/// The audit vocabulary for an adapter failure class, one to one.
+fn relay_failure(
+    failure: transport_nostr_adapter::NostrReconciliationFailure,
+) -> (RecoveryRelayFailure, Option<SubscriptionRefusalCategory>) {
+    use transport_nostr_adapter::NostrReconciliationFailure as Failure;
+    let failure = match failure {
+        Failure::NegErr(category) => {
+            return (
+                RecoveryRelayFailure::NegErr,
+                Some(category.map_or(
+                    SubscriptionRefusalCategory::Unclassified,
+                    super::audit::refusal_category,
+                )),
+            );
+        }
+        Failure::NegCapNotice => RecoveryRelayFailure::NegCapNotice,
+        Failure::NegentropyUnsupported => RecoveryRelayFailure::NegentropyUnsupported,
+        Failure::FirstReplyTimeout => RecoveryRelayFailure::FirstReplyTimeout,
+        Failure::RouteTimeout => RecoveryRelayFailure::RouteTimeout,
+        Failure::NotInPool => RecoveryRelayFailure::NotInPool,
+        Failure::NotOperational => RecoveryRelayFailure::NotOperational,
+        Failure::LimitReached => RecoveryRelayFailure::LimitReached,
+        Failure::IdFetchRefused => RecoveryRelayFailure::IdFetchRefused,
+        Failure::UnrequestedEvent => RecoveryRelayFailure::UnrequestedEvent,
+        Failure::Withheld => RecoveryRelayFailure::Withheld,
+        Failure::PassLimit => RecoveryRelayFailure::PassLimit,
+        Failure::LocalError => RecoveryRelayFailure::LocalError,
+    };
+    (failure, None)
+}
+
+/// One failed relay across a pass's compared routes.
+#[derive(Clone, Debug)]
+struct RelayTally {
+    /// Why it failed the first route it failed.
+    failure: RecoveryRelayFailure,
+    refusal_category: Option<SubscriptionRefusalCategory>,
+    routes: u64,
+    incomplete: bool,
 }
 
 /// What one pass's settlement saw, for its finished row.
@@ -70,31 +147,24 @@ pub(crate) struct RecoveryPassTally {
     routes_unanswered: u64,
     retrieved: u64,
     rejected: u64,
-    relays_failed: u64,
-    relays_incomplete: u64,
+    /// Failed relays by endpoint, each counted once however many routes it
+    /// failed. Account-private: only hashed references leave this tally.
+    failed_relays: std::collections::BTreeMap<String, RelayTally>,
+    /// Failures no backend attributed to a relay, summed per route.
+    unattributed_failures: u64,
 }
 
 impl RecoveryPassTally {
     pub(crate) fn observe_routes(&mut self, compared: &[RouteComparison]) {
-        let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
         for route in compared {
-            self.routes_compared = self.routes_compared.saturating_add(1);
             self.routes_certified = self
                 .routes_certified
                 .saturating_add(u64::from(route.certified));
-            self.routes_unanswered = self.routes_unanswered.saturating_add(u64::from(
-                !route.answered
-                    || route.outcome == storage_sqlite::RecoveryComparisonOutcome::Unsupported,
-            ));
-            let acquired = &route.acquisition;
-            self.retrieved = self.retrieved.saturating_add(count(acquired.retrieved));
-            self.rejected = self.rejected.saturating_add(count(acquired.rejected));
-            self.relays_failed = self
-                .relays_failed
-                .saturating_add(count(acquired.relays_failed));
-            self.relays_incomplete = self
-                .relays_incomplete
-                .saturating_add(count(acquired.relays_incomplete));
+            self.observe_route(
+                route.answered
+                    && route.outcome != storage_sqlite::RecoveryComparisonOutcome::Unsupported,
+                &route.acquisition,
+            );
         }
     }
 
@@ -105,19 +175,62 @@ impl RecoveryPassTally {
         &mut self,
         routes: impl IntoIterator<Item = (bool, RouteAcquisition)>,
     ) {
-        let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
         for (answered, acquired) in routes {
-            self.routes_compared = self.routes_compared.saturating_add(1);
-            self.routes_unanswered = self.routes_unanswered.saturating_add(u64::from(!answered));
-            self.retrieved = self.retrieved.saturating_add(count(acquired.retrieved));
-            self.rejected = self.rejected.saturating_add(count(acquired.rejected));
-            self.relays_failed = self
-                .relays_failed
-                .saturating_add(count(acquired.relays_failed));
-            self.relays_incomplete = self
-                .relays_incomplete
-                .saturating_add(count(acquired.relays_incomplete));
+            self.observe_route(answered, &acquired);
         }
+    }
+
+    fn observe_route(&mut self, answered: bool, acquired: &RouteAcquisition) {
+        self.routes_compared = self.routes_compared.saturating_add(1);
+        self.routes_unanswered = self.routes_unanswered.saturating_add(u64::from(!answered));
+        self.retrieved = self.retrieved.saturating_add(count(acquired.retrieved));
+        self.rejected = self.rejected.saturating_add(count(acquired.rejected));
+        self.unattributed_failures = self
+            .unattributed_failures
+            .saturating_add(count(acquired.unattributed));
+        for relay in &acquired.failed {
+            let tally = self
+                .failed_relays
+                .entry(relay.endpoint.clone())
+                .or_insert(RelayTally {
+                    failure: relay.failure,
+                    refusal_category: relay.refusal_category,
+                    routes: 0,
+                    incomplete: false,
+                });
+            tally.routes = tally.routes.saturating_add(1);
+            tally.incomplete |= relay.incomplete;
+        }
+    }
+
+    /// Distinct failed relays, plus failures no backend attributed.
+    fn relays_failed(&self) -> u64 {
+        count(self.failed_relays.len()).saturating_add(self.unattributed_failures)
+    }
+
+    /// Distinct failed relays that answered but left claimed events
+    /// unreturned on some route.
+    fn relays_incomplete(&self) -> u64 {
+        count(
+            self.failed_relays
+                .values()
+                .filter(|relay| relay.incomplete)
+                .count(),
+        )
+    }
+
+    /// Why each failed relay failed, at most the row's endpoint bound.
+    fn relay_outcomes(&self) -> Vec<RecoveryRelayOutcome> {
+        self.failed_relays
+            .iter()
+            .take(RECOVERY_AUDIT_MAX_ENDPOINTS)
+            .map(|(endpoint, relay)| RecoveryRelayOutcome {
+                relay_url: endpoint.clone(),
+                failure: relay.failure,
+                refusal_category: relay.refusal_category,
+                routes: relay.routes,
+            })
+            .collect()
     }
 
     /// Fold one scope's progress into the pass aggregate.
@@ -487,8 +600,9 @@ impl AppClient {
                 events_refused: counts.refused,
                 relays_required: count(required.len()),
                 relays_admitted: count(admitted.len()),
-                relays_failed: tally.relays_failed,
-                relays_incomplete: tally.relays_incomplete,
+                relays_failed: tally.relays_failed(),
+                relays_incomplete: tally.relays_incomplete(),
+                relay_outcomes: tally.relay_outcomes(),
             },
         );
     }
@@ -686,6 +800,96 @@ mod scenario_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn failed_summary(
+        failures: &[(&str, transport_nostr_adapter::NostrReconciliationFailure)],
+        incomplete: &[&str],
+    ) -> transport_nostr_adapter::NostrReconciliationSummary {
+        let endpoint =
+            |name: &str| cgka_traits::TransportEndpoint(format!("wss://{name}.example/"));
+        transport_nostr_adapter::NostrReconciliationSummary {
+            relays_failed: failures.len(),
+            failed_endpoints: failures.iter().map(|(name, _)| endpoint(name)).collect(),
+            incomplete_endpoints: incomplete.iter().map(|name| endpoint(name)).collect(),
+            endpoint_failures: failures
+                .iter()
+                .map(|(name, failure)| {
+                    transport_nostr_adapter::NostrReconciliationEndpointFailure {
+                        endpoint: endpoint(name),
+                        failure: *failure,
+                    }
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The same two relays failing on every compared route are two failed
+    /// relays, not one per route (mdk#2265: `relays_failed: 5` against
+    /// `relays_required: 2`).
+    #[test]
+    fn pass_tally_counts_each_failed_relay_once() {
+        use transport_nostr_adapter::NostrReconciliationFailure as Failure;
+        let both = failed_summary(
+            &[("a", Failure::NegCapNotice), ("b", Failure::Withheld)],
+            &["b"],
+        );
+        let mut tally = RecoveryPassTally::default();
+        tally.observe_unsettled_routes([
+            (false, RouteAcquisition::from_summary(&both)),
+            (false, RouteAcquisition::from_summary(&both)),
+            (
+                false,
+                RouteAcquisition::from_summary(&failed_summary(
+                    &[("a", Failure::FirstReplyTimeout)],
+                    &[],
+                )),
+            ),
+        ]);
+        assert_eq!(tally.relays_failed(), 2);
+        assert_eq!(tally.relays_incomplete(), 1);
+        assert_eq!(
+            tally.relay_outcomes(),
+            vec![
+                RecoveryRelayOutcome {
+                    relay_url: "wss://a.example/".into(),
+                    failure: RecoveryRelayFailure::NegCapNotice,
+                    refusal_category: None,
+                    routes: 3,
+                },
+                RecoveryRelayOutcome {
+                    relay_url: "wss://b.example/".into(),
+                    failure: RecoveryRelayFailure::Withheld,
+                    refusal_category: None,
+                    routes: 2,
+                },
+            ]
+        );
+        // A NEG-ERR keeps its reason's category, and a failure the backend
+        // did not attribute is counted without a relay to list.
+        let mut refused = RecoveryPassTally::default();
+        let mut unattributed = failed_summary(
+            &[(
+                "c",
+                Failure::NegErr(Some(
+                    cgka_traits::TransportEndpointRejectionCategory::Blocked,
+                )),
+            )],
+            &[],
+        );
+        unattributed.relays_failed += 1;
+        refused.observe_unsettled_routes([(false, RouteAcquisition::from_summary(&unattributed))]);
+        assert_eq!(refused.relays_failed(), 2);
+        assert_eq!(
+            refused.relay_outcomes(),
+            vec![RecoveryRelayOutcome {
+                relay_url: "wss://c.example/".into(),
+                failure: RecoveryRelayFailure::NegErr,
+                refusal_category: Some(SubscriptionRefusalCategory::Blocked),
+                routes: 1,
+            }]
+        );
+    }
 
     #[test]
     fn pass_progress_prefers_progress_then_service() {

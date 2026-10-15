@@ -3,6 +3,12 @@
 //! The commit builder is configured with `force_self_update(true)` and
 //! `consume_proposal_store(false)`: maintenance rotates only this device's
 //! LeafNode and cannot accidentally absorb unrelated proposals.
+//!
+//! When the own leaf advertises fewer app components than this device
+//! supports, the replacement leaf also re-advertises the supported set
+//! (`leaf_advertisement::own_leaf_refresh_extensions`). Without that, a leaf
+//! keeps whatever its KeyPackage advertised for the life of the group, and an
+//! existing group could never become eligible for a new component.
 
 use crate::engine::Engine;
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
@@ -143,10 +149,27 @@ impl<S: StorageProvider> Engine<S> {
         let pre_commit_ctx =
             crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
 
+        let leaf_node_parameters = mls_group
+            .own_leaf_node()
+            .map(|leaf| {
+                crate::leaf_advertisement::own_leaf_refresh_extensions(
+                    leaf,
+                    &self.supported_app_components,
+                )
+            })
+            .transpose()?
+            .flatten()
+            .map(|extensions| {
+                openmls::prelude::LeafNodeParameters::builder()
+                    .with_extensions(extensions)
+                    .build()
+            })
+            .unwrap_or_default();
         let commit_bundle = mls_group
             .commit_builder()
             .consume_proposal_store(false)
             .force_self_update(true)
+            .leaf_node_parameters(leaf_node_parameters)
             .load_psks(provider.storage())
             .map_err(|e| EngineError::Backend(format!("self_update load_psks: {e:?}")))?
             .build(

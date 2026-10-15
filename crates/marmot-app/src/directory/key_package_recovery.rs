@@ -133,7 +133,7 @@ impl MarmotApp {
                 });
             let Some(target) = target else {
                 if !package_coverage {
-                    return Err(recovery_incomplete());
+                    return Err(recovery_incomplete(account));
                 }
                 return Ok(RecoveredKeyPackageRecords {
                     freshness,
@@ -142,7 +142,7 @@ impl MarmotApp {
                 });
             };
             if round == RECOVERY_CANDIDATE_LIMIT || !package_coverage || routes.is_empty() {
-                return Err(recovery_incomplete());
+                return Err(recovery_incomplete(account));
             }
             let queries = vec![
                 DirectoryEventQuery::deletion_reference(
@@ -187,7 +187,7 @@ impl MarmotApp {
                 continue;
             }
             if !deletion_coverage {
-                return Err(recovery_incomplete());
+                return Err(recovery_incomplete(account));
             }
             let (mut records, evidence) =
                 without_revoked_slot_winners(account, observed, &deletions, freshness);
@@ -204,7 +204,7 @@ impl MarmotApp {
                 cache_evidence: Some(evidence),
             });
         }
-        Err(recovery_incomplete())
+        Err(recovery_incomplete(account))
     }
 }
 
@@ -219,10 +219,9 @@ fn distinct_recovery_routes<'a>(
         .collect()
 }
 
-fn recovery_incomplete() -> AppError {
-    AppError::RelayDirectory(
-        "invitation key recovery could not establish complete lookup and deletion coverage".into(),
-    )
+/// Lookup or deletion coverage was not established for this account.
+fn recovery_incomplete(account: &str) -> AppError {
+    AppError::DirectoryLookupIncomplete(account.to_owned())
 }
 
 #[cfg(test)]

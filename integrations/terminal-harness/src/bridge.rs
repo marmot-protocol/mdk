@@ -29,7 +29,8 @@ use crate::store::{
 };
 use crate::{
     ArtifactOutput, ArtifactOutputRequest, ArtifactSupport, Attachment, Backend, Config,
-    Invocation, Outcome, RunFailure, RunnerEvent, TRACE_TARGET, dirs_home,
+    Invocation, MAX_TURN_REPLY_CHUNKS, MAX_TURN_TEXT_BYTES, Outcome, RunFailure, RunnerEvent,
+    TRACE_TARGET, dirs_home,
 };
 
 const DEDUPE_LIMIT: usize = 2048;
@@ -858,7 +859,7 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
         group_id_hex: inbound.group_ref.clone(),
         request_timeout: ctx.cfg.request_timeout,
     };
-    let runner = tokio::spawn(async move {
+    let mut runner = tokio::spawn(async move {
         // The staging lease lives in the backend task so its paths cannot
         // disappear while that task still has access to them.
         let _attachment_batch = attachment_batch;
@@ -878,9 +879,19 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
     let mut delivered_chunks = 0usize;
     let mut delivery_failed = false;
     let mut persist_failed = false;
-    while let Some(event) = rx.recv().await {
+    let mut turn_output = TurnOutput::default();
+    let mut output_limit_exceeded = false;
+    let mut finished_run = None;
+    'events: while let Some(event) = rx.recv().await {
+        if runner_hit_output_limit(&mut runner, &mut finished_run).await {
+            break;
+        }
         match event {
             RunnerEvent::Text(text) => {
+                if !turn_output.admit(&text, ctx.cfg.max_reply_bytes) {
+                    output_limit_exceeded = true;
+                    break;
+                }
                 if buffer_text_for_artifacts {
                     buffered_text.push(text);
                     continue;
@@ -912,6 +923,9 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
                     continue;
                 }
                 for (key, chunk, index) in staged {
+                    if runner_hit_output_limit(&mut runner, &mut finished_run).await {
+                        break 'events;
+                    }
                     if let Err(err) = send_staged_backend_reply(
                         &ctx,
                         &key,
@@ -951,7 +965,34 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
         }
     }
 
-    match runner.await {
+    // The joined artifact caption is split again on delivery, so charge it too.
+    if buffer_text_for_artifacts
+        && split_reply_chunks(&buffered_text.join("\n\n"), ctx.cfg.max_reply_bytes).len()
+            > MAX_TURN_REPLY_CHUNKS
+    {
+        output_limit_exceeded = true;
+    }
+    // Queued output is discarded, and a runner still working sees the closed
+    // channel, stops the backend's process group and returns its session.
+    drop(rx);
+    let run_result = match finished_run {
+        Some(result) => result,
+        None => runner.await,
+    };
+    let run_result = if output_limit_exceeded {
+        let observed_session = match &run_result {
+            Ok(Ok(outcome)) => outcome.observed_session.clone(),
+            Ok(Err(failure)) => failure.observed_session.clone(),
+            Err(_) => None,
+        };
+        Ok(Err(RunFailure {
+            error: HarnessError::OutputLimitExceeded,
+            observed_session,
+        }))
+    } else {
+        run_result
+    };
+    match run_result {
         Ok(Ok(outcome)) => {
             let artifact_delivery_attempted = artifact_setup_failed
                 || artifact_declaration_failed
@@ -1069,16 +1110,28 @@ async fn handle_message(ctx: Arc<BridgeContext>, inbound: InboundPrompt, mut per
                 error_kind = failure.error.privacy_safe_kind(),
                 "backend invocation failed"
             );
-            deliver_buffered_text(
-                &ctx,
-                &inbound,
-                &buffered_text,
-                &mut chunk_index,
-                &mut delivered_chunks,
-                &mut delivery_failed,
-                &mut persist_failed,
-            )
-            .await;
+            // Nothing more from a turn that exceeded an output limit is sent,
+            // including replies staged for later reconciliation.
+            if matches!(failure.error, HarnessError::OutputLimitExceeded) {
+                if let Err(err) = ctx
+                    .deliveries
+                    .discard_reply(&inbound.group_ref, &inbound.message_ref)
+                    .await
+                {
+                    warn!(target: TRACE_TARGET, method = "discard_reply", error_kind = err.privacy_safe_kind(), "failed to discard a limited turn's pending replies");
+                }
+            } else {
+                deliver_buffered_text(
+                    &ctx,
+                    &inbound,
+                    &buffered_text,
+                    &mut chunk_index,
+                    &mut delivered_chunks,
+                    &mut delivery_failed,
+                    &mut persist_failed,
+                )
+                .await;
+            }
             if retrying && let Err(err) = ctx.recovery.reset_retry(&inbound.group_ref).await {
                 warn!(target: TRACE_TARGET, method = "retry_recovery", error_kind = err.privacy_safe_kind(), "failed to restore retryable recovery state");
             }
@@ -1476,6 +1529,45 @@ async fn fifo_is_blocked(ctx: &BridgeContext, group_ref: &str) -> bool {
 struct AttachmentBatch {
     _directory: tempfile::TempDir,
     attachments: Vec<Attachment>,
+}
+
+type RunResult =
+    std::result::Result<std::result::Result<Outcome, RunFailure>, tokio::task::JoinError>;
+
+/// Collects the runner's result once it has finished and reports whether it
+/// stopped on an output limit, so queued output from that turn is not sent.
+async fn runner_hit_output_limit(
+    runner: &mut tokio::task::JoinHandle<std::result::Result<Outcome, RunFailure>>,
+    finished: &mut Option<RunResult>,
+) -> bool {
+    if finished.is_none() && runner.is_finished() {
+        *finished = Some(runner.await);
+    }
+    matches!(
+        finished,
+        Some(Ok(Err(RunFailure {
+            error: HarnessError::OutputLimitExceeded,
+            ..
+        })))
+    )
+}
+
+/// Per-turn assistant-output accounting. Every text event is charged, including
+/// text buffered for an artifact caption, before it is staged, sent or retained.
+#[derive(Default)]
+struct TurnOutput {
+    text_bytes: usize,
+    reply_chunks: usize,
+}
+
+impl TurnOutput {
+    /// Charges `text` and the reply chunks it would stage; returns false once
+    /// the turn would exceed either limit.
+    fn admit(&mut self, text: &str, max_reply_bytes: usize) -> bool {
+        self.text_bytes += text.len();
+        self.reply_chunks += split_reply_chunks(text, max_reply_bytes).len();
+        self.text_bytes <= MAX_TURN_TEXT_BYTES && self.reply_chunks <= MAX_TURN_REPLY_CHUNKS
+    }
 }
 
 struct AbortBackendOnDrop(AbortHandle);
@@ -2158,6 +2250,32 @@ async fn handle_backend_run_failure(
             format!(
                 "[{}] failed to start {}; check {}.",
                 config.spec.reply_prefix, config.spec.display_name, config.spec.bin_env_name
+            )
+        }
+        HarnessError::OutputLimitExceeded => {
+            let stopped = format!(
+                "[{}] {} exceeded its per-turn output limit and was stopped; the rest of its reply was withheld.",
+                config.spec.reply_prefix, config.spec.display_name
+            );
+            let Some(session_id) = resumable_session else {
+                return stopped;
+            };
+            if let Err(err) = persist_recovery_record(
+                recovery,
+                group_ref,
+                prompt,
+                media,
+                cwd,
+                session_id,
+                RecoveryKind::UncertainOutcome,
+            )
+            .await
+            {
+                warn!(target: TRACE_TARGET, method = "recovery_store", error_kind = err.privacy_safe_kind(), "failed to persist recovery record");
+                return stopped;
+            }
+            format!(
+                "{stopped} It may already have acted on the prompt. Review the results, then send `/retry-last` only if replay is safe, or `/discard-last` to abandon it and continue queued work."
             )
         }
         HarnessError::AttachmentInvalid => format!(
@@ -4328,6 +4446,316 @@ mod tests {
             "failure reply must follow the flushed text: {}",
             finals[1]
         );
+    }
+
+    type RecordedRequests = Arc<std::sync::Mutex<Vec<AgentControlRequest>>>;
+
+    /// Acknowledges and records every output request, each after `delay`.
+    /// The first `drop_first` connections are closed without a reply.
+    fn spawn_recording_server(
+        socket: &std::path::Path,
+        delay: Duration,
+        drop_first: usize,
+    ) -> (tokio::task::JoinHandle<()>, RecordedRequests) {
+        let listener = UnixListener::bind(socket).unwrap();
+        let requests = RecordedRequests::default();
+        let recorded = requests.clone();
+        let server = tokio::spawn(async move {
+            let mut dropped = 0;
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                if dropped < drop_first {
+                    dropped += 1;
+                    drop(stream);
+                    continue;
+                }
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                let request: AgentControlEnvelope<AgentControlRequest> =
+                    read_envelope(&mut reader).await.unwrap().unwrap();
+                tokio::time::sleep(delay).await;
+                recorded.lock().unwrap().push(request.payload.clone());
+                let response = AgentControlResponse::FinalSent {
+                    message_ids_hex: vec!["sent".to_owned()],
+                    maintenance_disposition: AgentControlSendMaintenanceDisposition::Ready,
+                };
+                write_frame(
+                    &mut write_half,
+                    &AgentControlEnvelope::request(request.id, response),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        (server, requests)
+    }
+
+    fn recorded_finals(requests: &RecordedRequests) -> Vec<String> {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| match request {
+                AgentControlRequest::SendFinal { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Sends scripted texts as quickly as the channel allows, then reports
+    /// session "session". It never stops on its own.
+    #[derive(Default)]
+    struct ScriptedTextBackend {
+        texts: Vec<String>,
+        /// Ends like a runner that breached a raw stdout limit.
+        then_output_limit: bool,
+        artifact_support: bool,
+        pause_after_first: Duration,
+    }
+
+    #[async_trait]
+    impl Backend for ScriptedTextBackend {
+        fn artifact_support(&self) -> ArtifactSupport {
+            if self.artifact_support {
+                ArtifactSupport::CompletionFile
+            } else {
+                ArtifactSupport::Unsupported
+            }
+        }
+
+        async fn run(
+            &self,
+            _invocation: Invocation,
+            tx: mpsc::Sender<RunnerEvent>,
+        ) -> std::result::Result<Outcome, RunFailure> {
+            for (index, text) in self.texts.iter().enumerate() {
+                if tx.send(RunnerEvent::Text(text.clone())).await.is_err() {
+                    break;
+                }
+                if index == 0 {
+                    tokio::time::sleep(self.pause_after_first).await;
+                }
+            }
+            if self.then_output_limit {
+                return Err(RunFailure {
+                    error: HarnessError::OutputLimitExceeded,
+                    observed_session: Some("session".to_owned()),
+                });
+            }
+            Ok(Outcome {
+                observed_session: Some("session".to_owned()),
+                exit_code: Some(0),
+                error_summary: None,
+                no_side_effects_proven: false,
+                stderr: String::new(),
+                elapsed_ms: 1,
+            })
+        }
+    }
+
+    fn scripted_text_context(
+        root: &std::path::Path,
+        mut config: Config,
+        backend: ScriptedTextBackend,
+        ack_delay: Duration,
+        drop_first: usize,
+    ) -> (
+        Arc<BridgeContext>,
+        tokio::task::JoinHandle<()>,
+        RecordedRequests,
+    ) {
+        let home = root.join("home");
+        if backend.artifact_support {
+            let export_root = root.join("exports");
+            std::fs::create_dir_all(&export_root).unwrap();
+            config.artifact_exports = crate::ArtifactExportConfig::new(
+                true,
+                vec![crate::ArtifactExportGrant {
+                    group_id_hex: "group".to_owned(),
+                    export_root,
+                    ttl_seconds: 300,
+                }],
+                root.join("staging"),
+                root.join("outbox.json"),
+            );
+        }
+        let (server, requests) = spawn_recording_server(&config.socket, ack_delay, drop_first);
+        let ctx = test_context_with_backend(root, &home, config, Arc::new(backend));
+        (ctx, server, requests)
+    }
+
+    fn scripted_texts(texts: Vec<String>) -> ScriptedTextBackend {
+        ScriptedTextBackend {
+            texts,
+            ..Default::default()
+        }
+    }
+
+    const STOPPED: &str = "exceeded its per-turn output limit";
+
+    #[tokio::test]
+    async fn text_byte_limit_stops_the_turn_and_withholds_later_output() {
+        let root = tempfile::tempdir().unwrap();
+        let (ctx, server, requests) = scripted_text_context(
+            root.path(),
+            test_config(root.path()),
+            scripted_texts(vec![
+                "first".to_owned(),
+                "x".repeat(MAX_TURN_TEXT_BYTES),
+                "after".to_owned(),
+            ]),
+            Duration::ZERO,
+            0,
+        );
+
+        assert!(dispatch_test_message(ctx.clone(), "message", "work").await);
+
+        let finals = recorded_finals(&requests);
+        assert_eq!(finals.len(), 2, "{finals:?}");
+        assert_eq!(finals[0], "first");
+        assert!(finals[1].contains(STOPPED));
+        assert!(finals[1].contains("`/retry-last`"));
+        // The session the backend reported before the breach stays recoverable.
+        let record = ctx.recovery.get("group").await.unwrap();
+        assert_eq!(record.kind, RecoveryKind::UncertainOutcome);
+        assert_eq!(record.session_id, "session");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reply_chunk_limit_stops_a_turn_that_floods_small_texts() {
+        let root = tempfile::tempdir().unwrap();
+        let texts = (0..MAX_TURN_REPLY_CHUNKS + 10)
+            .map(|index| format!("t{index}"))
+            .collect();
+        let (ctx, server, requests) = scripted_text_context(
+            root.path(),
+            test_config(root.path()),
+            scripted_texts(texts),
+            Duration::ZERO,
+            0,
+        );
+
+        assert!(dispatch_test_message(ctx.clone(), "message", "work").await);
+
+        let finals = recorded_finals(&requests);
+        assert_eq!(finals.len(), MAX_TURN_REPLY_CHUNKS + 1);
+        assert_eq!(
+            finals[MAX_TURN_REPLY_CHUNKS - 1],
+            format!("t{}", MAX_TURN_REPLY_CHUNKS - 1)
+        );
+        assert!(finals[MAX_TURN_REPLY_CHUNKS].contains(STOPPED));
+        assert_eq!(
+            ctx.recovery.get("group").await.unwrap().session_id,
+            "session"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn runner_breach_discards_replies_still_queued_behind_a_slow_send() {
+        let root = tempfile::tempdir().unwrap();
+        let (ctx, server, requests) = scripted_text_context(
+            root.path(),
+            test_config(root.path()),
+            ScriptedTextBackend {
+                texts: vec!["one".to_owned(), "two".to_owned(), "three".to_owned()],
+                then_output_limit: true,
+                pause_after_first: Duration::from_millis(50),
+                ..Default::default()
+            },
+            // "one" is still awaiting its acknowledgement when the runner breaches.
+            Duration::from_millis(200),
+            0,
+        );
+
+        assert!(dispatch_test_message(ctx.clone(), "message", "work").await);
+
+        let finals = recorded_finals(&requests);
+        assert_eq!(finals.len(), 2, "{finals:?}");
+        assert_eq!(finals[0], "one");
+        assert!(finals[1].contains(STOPPED));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn limited_turn_discards_its_staged_replies_before_reconciliation() {
+        let root = tempfile::tempdir().unwrap();
+        // Every attempt to send "one" fails, so it stays staged for reconciliation;
+        // later text is staged unsent, then the turn breaches the text limit.
+        let (ctx, server, requests) = scripted_text_context(
+            root.path(),
+            test_config(root.path()),
+            scripted_texts(vec![
+                "one".to_owned(),
+                "two".to_owned(),
+                "x".repeat(MAX_TURN_TEXT_BYTES),
+            ]),
+            Duration::ZERO,
+            SEND_RETRY_ATTEMPTS,
+        );
+
+        assert!(dispatch_test_message(ctx.clone(), "message", "work").await);
+        assert!(ctx.deliveries.list().await.is_empty());
+        reconcile_pending_deliveries(&ctx.client, &ctx.deliveries).await;
+
+        let finals = recorded_finals(&requests);
+        assert_eq!(finals.len(), 1, "{finals:?}");
+        assert!(finals[0].contains(STOPPED));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn joined_artifact_caption_is_charged_against_the_chunk_limit() {
+        let _artifact_test_guard = ARTIFACT_DELIVERY_TEST_LOCK.lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let mut config = test_config(root.path());
+        config.max_reply_bytes = 4;
+        // Each text is one chunk alone, but joining them yields about twice as many.
+        let texts = vec!["a\nab".to_owned(); MAX_TURN_REPLY_CHUNKS];
+        let (ctx, server, requests) = scripted_text_context(
+            root.path(),
+            config,
+            ScriptedTextBackend {
+                texts,
+                artifact_support: true,
+                ..Default::default()
+            },
+            Duration::ZERO,
+            0,
+        );
+
+        assert!(dispatch_test_message(ctx.clone(), "message", "work").await);
+
+        let finals = recorded_finals(&requests);
+        assert_eq!(finals.len(), 1, "{finals:?}");
+        assert!(finals[0].contains(STOPPED));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn output_limit_failure_withholds_buffered_artifact_text() {
+        let _artifact_test_guard = ARTIFACT_DELIVERY_TEST_LOCK.lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let (ctx, server, requests) = scripted_text_context(
+            root.path(),
+            test_config(root.path()),
+            ScriptedTextBackend {
+                texts: vec!["buffered caption".to_owned()],
+                then_output_limit: true,
+                artifact_support: true,
+                ..Default::default()
+            },
+            Duration::ZERO,
+            0,
+        );
+
+        assert!(dispatch_test_message(ctx.clone(), "message", "work").await);
+
+        let finals = recorded_finals(&requests);
+        assert_eq!(finals.len(), 1, "{finals:?}");
+        assert!(finals[0].contains(STOPPED));
+        server.abort();
     }
 
     #[tokio::test]

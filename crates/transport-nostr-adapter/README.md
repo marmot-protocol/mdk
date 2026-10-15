@@ -7,7 +7,8 @@ agnostic; the optional `sdk` feature adds a `nostr-sdk` backed `NostrSdkRelayCli
 ## What this crate does
 
 - Activates account inbox subscriptions and group subscriptions, refreshes group subscriptions for an active account,
-  and removes stale group subscriptions when an active account's group set changes.
+  and removes stale group subscriptions when an active account's group set changes. Group routes go out batched, up
+  to `GROUP_BATCH_ROUTES` (50) per REQ, so a 1,000-group account holds about 21 REQs per relay.
 - Converts relay-delivered `NostrTransportEvent` values into account-scoped `TransportDelivery` values.
 - Routes kind `445` group messages by endpoint + transport group id.
 - Routes signed kind `1059` giftwraps through the account-inbox plane.
@@ -137,6 +138,16 @@ return. An endpoint that claimed nothing left behind still succeeds, and
 certify a subset of a route's relays. `incomplete_endpoints` names the failed ones that still
 answered: they finished the comparison and served their exact-ID requests, but this pass did
 not return every ID they claimed. The rest timed out, errored or truncated.
+`endpoint_failures` gives each failed endpoint one `NostrReconciliationFailure`: the first stage that
+failed it, such as a NEG-ERR (with its reason's machine-readable prefix, never the text), no first
+reply, the pass deadline, or an endpoint outside the account's pool. A failure in a later window or
+boundary probe is classified the same way. An incomplete endpoint is `Withheld` only when it reached
+EOSE on an exact-ID fetch without an ID it claimed; one this pass's own budget or ordering left
+unasked or cut short is `PassLimit`.
+strfry answers a NEG-OPEN past its per-connection session cap with a session-less NOTICE (`ERROR: too
+many concurrent NEG requests`) that nostr-sdk ignores, so the comparison waits out its first-reply
+timeout. The client watches the relay while the NEG-OPEN is pending and reports that timeout as
+`NegCapNotice`. It keeps no per-relay rejection state between passes; the caller paces retries.
 
 A group route's gap is fetched from its oldest end. MLS applies commits in order, so fetching IDs in ID order,
 which is effectively random in time, could let commits carry a member's epoch more than the retained-epoch window

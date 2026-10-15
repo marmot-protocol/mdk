@@ -1791,6 +1791,123 @@ async fn connector_socket_requires_configured_auth_token() {
 }
 
 #[tokio::test]
+async fn connector_edit_message_replaces_own_text_and_reports_refusals() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let setup_runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), relay_url.clone()));
+    let agent = setup_runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![crate::validation::endpoint(&relay_url)],
+            bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    let group_id = setup_runtime
+        .create_group(&agent.account.account_id_hex, "agent status", &[], None)
+        .await
+        .unwrap();
+    setup_runtime.shutdown().await;
+
+    let account_id_hex = agent.account.account_id_hex.clone();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let server = tokio::spawn(serve_socket(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay_url],
+        false,
+        false,
+    )));
+    let edit = |target: &str, text: &str| AgentControlRequest::EditMessage {
+        account_id_hex: account_id_hex.clone(),
+        group_id_hex: group_id_hex.clone(),
+        target_message_id_hex: target.to_owned(),
+        text: text.to_owned(),
+    };
+
+    connect_with_retry(&socket).await;
+    let status = send_control_request(
+        &socket,
+        "req-status",
+        AgentControlRequest::SendFinal {
+            account_id_hex: account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            text: "status: starting".to_owned(),
+            reply_to_message_id_hex: None,
+            idempotency_key: None,
+        },
+    )
+    .await;
+    let AgentControlResponse::FinalSent {
+        message_ids_hex, ..
+    } = status.payload
+    else {
+        panic!("expected status send, got {:?}", status.payload);
+    };
+    let status_id = message_ids_hex[0].clone();
+
+    let edited = send_control_request(&socket, "req-edit", edit(&status_id, "status: done")).await;
+    let AgentControlResponse::FinalSent {
+        message_ids_hex, ..
+    } = edited.payload
+    else {
+        panic!("expected edit to publish, got {:?}", edited.payload);
+    };
+    assert_eq!(message_ids_hex.len(), 1);
+    assert_ne!(message_ids_hex[0], status_id, "an edit is its own event");
+    let read = send_control_request(
+        &socket,
+        "req-read",
+        AgentControlRequest::TimelineMessageGet {
+            account_id_hex: account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            message_id_hex: status_id.clone(),
+        },
+    )
+    .await;
+    let AgentControlResponse::TimelineMessage {
+        message: Some(message),
+        ..
+    } = read.payload
+    else {
+        panic!("expected the status row, got {:?}", read.payload);
+    };
+    assert_eq!(message.text.as_deref(), Some("status: done"));
+
+    let refused = send_control_request(
+        &socket,
+        "req-edit-unknown",
+        edit(&"ab".repeat(32), "rewritten"),
+    )
+    .await;
+    let AgentControlResponse::Error {
+        code, retryable, ..
+    } = refused.payload
+    else {
+        panic!("expected an edit refusal, got {:?}", refused.payload);
+    };
+    assert_eq!(code, "invalid_edit_target");
+    assert!(!retryable);
+
+    let malformed =
+        send_control_request(&socket, "req-edit-bad-hex", edit("not-hex", "rewritten")).await;
+    let AgentControlResponse::Error { code, .. } = malformed.payload else {
+        panic!("expected a hex refusal, got {:?}", malformed.payload);
+    };
+    assert_eq!(code, "invalid_hex");
+    server.abort();
+}
+
+#[test]
+fn invalid_edit_target_is_a_final_connector_error() {
+    let error = crate::ConnectorError::App(AppError::InvalidEditTarget);
+    assert_eq!(error.code(), "invalid_edit_target");
+    assert!(!error.retryable());
+}
+
+#[tokio::test]
 async fn connector_socket_subscribes_to_inbound_messages() {
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();

@@ -17,9 +17,18 @@ use std::sync::{
 use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 use transport_nostr_adapter::{
-    NostrReconciliationItem, NostrReconciliationProgress, NostrSdkRelayClient, NostrSubscription,
-    SubscriptionAttempt,
+    NostrReconciliationFailure, NostrReconciliationItem, NostrReconciliationProgress,
+    NostrReconciliationSummary, NostrSdkRelayClient, NostrSubscription, SubscriptionAttempt,
 };
+
+/// Each failed endpoint's class, in endpoint order.
+fn failure_classes(summary: &NostrReconciliationSummary) -> Vec<NostrReconciliationFailure> {
+    summary
+        .endpoint_failures
+        .iter()
+        .map(|failure| failure.failure)
+        .collect()
+}
 
 const ROUTE: [u8; 32] = [0xc3; 32];
 /// The adapter's ordinary per-pass, per-relay result budgets.
@@ -900,6 +909,62 @@ async fn a_gap_larger_than_one_pass_arrives_oldest_first() {
     relay.shutdown();
 }
 
+/// A window fetch that asks for the newest events puts the bound in the REQ,
+/// so the relay sends the newest page and ends it, rather than whatever
+/// prefix of the window the item budget happens to cut (mdk#2256).
+#[tokio::test]
+async fn a_newest_window_asks_the_relay_for_its_newest_events() {
+    use transport_nostr_adapter::NostrRelayClient;
+    let keys = Keys::generate();
+    let database = relay_database();
+    let window = timed_events(&keys, 1_700_000_000, 40, "window", &database).await;
+    let relay = LocalRelay::new(RelayBuilder::default().database(database));
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let sdk = sdk_on(std::slice::from_ref(&url)).await;
+    let result = sdk
+        .acquire_history(
+            transport_nostr_adapter::NostrAcquisitionRequest {
+                account_id: MemberId::new(vec![0xa1; 32]),
+                scope: transport_nostr_adapter::NostrAcquisitionScope::GroupWindow {
+                    transport_group_id: ROUTE,
+                    since: SINCE,
+                    until: UNTIL,
+                    newest: Some(5),
+                },
+                endpoints: vec![TransportEndpoint(url)],
+                limits: transport_nostr_adapter::NostrAcquisitionLimits {
+                    max_endpoints: 1,
+                    max_requested_event_ids: 1,
+                    max_received_items_per_endpoint: 5,
+                    max_serialized_event_bytes_per_endpoint: PASS_BYTE_BUDGET,
+                    max_duration: std::time::Duration::from_secs(5),
+                },
+            },
+            transport_nostr_adapter::NostrAcquisitionCancellation::new(),
+        )
+        .await
+        .unwrap();
+    let answer = &result.endpoints[0];
+    assert_eq!(
+        answer.end,
+        transport_nostr_adapter::NostrAcquisitionEnd::RequestPolicySatisfied,
+        "the relay ends the page itself"
+    );
+    let returned = answer
+        .events
+        .iter()
+        .map(|event| hex::decode(&event.id).unwrap())
+        .collect::<HashSet<_>>();
+    let newest = window[window.len() - 5..]
+        .iter()
+        .map(|item| item.event_id.to_vec())
+        .collect::<HashSet<_>>();
+    assert_eq!(returned, newest);
+    sdk.client().shutdown().await;
+    relay.shutdown();
+}
+
 /// Older history that appears after a backlog is under way, here from a relay
 /// that joins the route, still arrives before newer history: the window
 /// search looks below where the previous pass left off.
@@ -1192,6 +1257,13 @@ async fn an_unproven_delivery_boundary_holds_a_cut_short_pass() {
         .unwrap();
     assert!(first.is_empty(), "no proven prefix, so nothing is returned");
     assert!(summary.order_unproven, "the held pass is counted");
+    // The comparison was answered; the unanswered probes that left the pass
+    // without an order are why the relay failed it, not a withheld event.
+    eprintln!("unproven boundary classes: {:?}", failure_classes(&summary));
+    assert_eq!(
+        failure_classes(&summary),
+        vec![NostrReconciliationFailure::FirstReplyTimeout]
+    );
     // Nor on later passes: the route stays quiet rather than return the
     // window unordered, and the events stay fetchable.
     for pass in 2..=4 {
@@ -1760,6 +1832,12 @@ async fn warm_full_event_cache_resumes_under_combined_result_budget() {
         assert!(events.len() <= 3);
         if seen.len() + events.len() < expected.len() {
             assert_eq!(summary.relays_failed, 2);
+            // Served from the cache, never asked: the pass's own budget left
+            // the rest, not the relays.
+            assert_eq!(
+                failure_classes(&summary),
+                vec![NostrReconciliationFailure::PassLimit; 2]
+            );
         }
         if let Some(newest) = events.iter().map(|event| event.event.created_at).max() {
             assert!(items.iter().all(|item| {
@@ -2192,6 +2270,10 @@ async fn comparison_claim_without_exact_id_bytes_remains_incomplete() {
     assert_eq!(
         summary.incomplete_endpoints, summary.failed_endpoints,
         "a relay that answered without the claimed bytes is incomplete"
+    );
+    assert_eq!(
+        failure_classes(&summary),
+        vec![NostrReconciliationFailure::Withheld]
     );
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].event.id, event_id);

@@ -18,8 +18,8 @@ pub use audit::{
     RECOVERY_AUDIT_MAX_ENDPOINTS, RECOVERY_AUDIT_MAX_OBLIGATIONS, RecipientExpectation,
     RecipientScope, RecoveryAttemptScope, RecoveryGoalBound, RecoveryNeedChange,
     RecoveryNextAttempt, RecoveryObligationCause, RecoveryObligationVerdict, RecoveryPassOutcome,
-    RecoveryScopeProgress, RelayRegistration, SUBSCRIPTION_REFUSAL_AUDIT_MAX_ENTRIES,
-    SubscriptionRefusalCategory, SubscriptionRefusalEntry, SubscriptionRefusalOutcome,
-    SubscriptionRefusalRoute, TransportCursorTrigger, application_send_operation_id,
-    default_jsonl_path, default_v5_jsonl_path, member_ref_hex,
+    RecoveryRelayFailure, RecoveryRelayOutcome, RecoveryScopeProgress, RelayRegistration,
+    SUBSCRIPTION_REFUSAL_AUDIT_MAX_ENTRIES, SubscriptionRefusalCategory, SubscriptionRefusalEntry,
+    SubscriptionRefusalOutcome, SubscriptionRefusalRoute, TransportCursorTrigger,
+    application_send_operation_id, default_jsonl_path, default_v5_jsonl_path, member_ref_hex,
 };

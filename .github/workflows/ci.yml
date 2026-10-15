@@ -35,6 +35,10 @@ jobs:
       run_formal: ${{ steps.classify.outputs.run_formal }}
       run_hermes: ${{ steps.classify.outputs.run_hermes }}
       run_installers: ${{ steps.classify.outputs.run_installers }}
+      apple_opt_in: ${{ steps.apple.outputs.apple_opt_in }}
+    permissions:
+      contents: read
+      pull-requests: read
 
     steps:
       - name: Check out repository
@@ -61,6 +65,24 @@ jobs:
             git diff --no-renames --name-only -z "$BASE_SHA" "$GITHUB_SHA" \
               | python3 scripts/classify_ci_changes.py --github-output "$GITHUB_OUTPUT"
           fi
+
+      # macOS jobs stay off the pull-request path unless a maintainer adds the
+      # `ci:apple` label. Labels are read live so "Re-run all jobs" picks up a
+      # label added after the push.
+      - name: Check Apple opt-in label
+        id: apple
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          apple_opt_in=false
+          if [[ -n "$PR_NUMBER" ]] \
+            && gh api "repos/$REPO/issues/$PR_NUMBER/labels" --jq '.[].name' | grep -x 'ci:apple' >/dev/null; then
+            apple_opt_in=true
+          fi
+          echo "apple_opt_in=$apple_opt_in" >> "$GITHUB_OUTPUT"
 
   rust-format:
     name: Rust format
@@ -312,12 +334,19 @@ jobs:
       - name: Compile and run debug C smoke test (gcc)
         run: ./crates/marmot-c/c-smoke.sh --debug gcc
 
+  # Pull requests run this only with the `ci:apple` label; master pushes and
+  # merge groups always run it, and a master failure opens an issue.
   ios-account-clippy:
     name: iOS account keychain clippy
     needs: changes
-    if: needs.changes.outputs.run_ios == 'true'
-    runs-on: blacksmith-6vcpu-macos-latest
+    if: >-
+      needs.changes.outputs.run_ios == 'true'
+      && (github.event_name != 'pull_request' || needs.changes.outputs.apple_opt_in == 'true')
+    runs-on: macos-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
 
     steps:
       - name: Check out repository
@@ -343,6 +372,24 @@ jobs:
 
       - name: Check iOS account keychain code
         run: cargo clippy -p marmot-account --target aarch64-apple-ios --locked -- -D warnings
+
+      - name: Report master failure
+        if: failure() && github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          title="iOS account keychain clippy failed on master"
+          body="iOS account keychain clippy failed for ${SOURCE_SHA}. Run: ${RUN_URL}"
+          existing="$(gh issue list --repo "$REPO" --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')"
+          if [[ -n "$existing" ]]; then
+            gh issue comment "$existing" --repo "$REPO" --body "$body"
+          else
+            gh issue create --repo "$REPO" --title "$title" --body "$body"
+          fi
 
   # The broader integration matrix explicitly enables test-policy-overrides.
   # This focused default-feature job proves ordinary debug/release consumers

@@ -16,7 +16,9 @@ Read the documentation at the tag matching your binaries; `master` can describe 
 - Accounts and identity: [interactive account onboarding](#interactive-account-onboarding),
   [identity references and profiles](#identity-references-and-profiles),
   [KeyPackage inventory](#keypackage-inventory), [KeyPackage client preference](#keypackage-client-preference),
-  [public Nostr event verification](#public-nostr-event-verification)
+  [invitation lookup outcomes](#invitation-lookup-outcomes),
+  [public Nostr event verification](#public-nostr-event-verification),
+  [public event previews](#public-event-previews)
 - Screens: [selected chat-list presentation](#selected-chat-list-presentation),
   [bounded chat screens](#bounded-chat-screens), [prepared conversation windows](#prepared-conversation-windows),
   [live timeline updates](#live-timeline-updates), [durable avatar access](#durable-avatar-access)
@@ -634,6 +636,21 @@ the actual group's requirements. Device-aware delivery in
 [MDK #1696](https://github.com/marmot-protocol/mdk/issues/1696) is the intended
 replacement for this temporary client ranking.
 
+
+## Invitation lookup outcomes
+
+Creating or inviting looks up each recipient's relay lists and KeyPackage. The
+first recipient that cannot be used ends the call, in request order:
+
+- `MissingKeyPackage { account, reason }`: the lookup completed and found nothing
+  invitable. `reason` is `NotFound`, or `ObsoleteOnly` when the recipient has only
+  outdated KeyPackages and must update their app.
+- `DirectoryLookupIncomplete { account }`: the lookup for `account` ran out of time
+  or relay coverage, so nothing is known to be missing. Offer retry.
+  `fetch_latest_key_package_for_account_id` and relay-list lookups report the same
+  outcome.
+- `MissingMemberInboxRoute { account }`: the recipient has no usable inbox relay.
+
 ## Public Nostr event verification
 
 The stateless `verifyPublicNostrEventJson` helper verifies public events through
@@ -642,6 +659,20 @@ secret key. It checks both the canonical event ID and signature. A host must
 still enforce its own allowed authors, kinds, tags, and input-size limits.
 Malformed input and invalid signatures return `false`; it does not authenticate
 an MLS group message or replace MDK's relay ingestion checks.
+
+## Public event previews
+
+Event cards for `nostr:` references in message content read from an
+account-scoped cache, so a reopened chat renders prior previews in its first
+frame, offline included. Call `cachedPublicEventPreviews` (at most 16
+references, network-free) before layout, then `resolvePublicEventPreview` for
+each reference shown; it touches the network only for missing or stale rows.
+MDK fetches from safe relay hints and the configured directory relays, stores
+only verified events that match the reference, keeps the newest `naddr`
+version, and turns an author's NIP-09 deletion into a `Deleted` row. Event JSON is the signed
+event; shape its content for display on the host. Author names and avatars
+come from `cachedIdentityProjections`. See
+[the method reference](API-REFERENCE.md#marmotcached_public_event_previews).
 
 ## Selected chat-list presentation
 
@@ -1124,11 +1155,10 @@ check, not a comparison benchmark. It builds Kotlin/Swift generation and every
 Android or Apple native target once in parallel, transfers those inputs only
 within the current workflow run, verifies their source, builder, toolchain,
 profile, feature and run provenance, then assembles and validates the Android,
-iOS and macOS candidate packages. Pull requests build the Apple inputs and
-packages only when they change `crates/marmot-uniffi/` (other than Markdown) or a
-MarmotKit bindings workflow, because macOS minutes are expensive; every other pull
-request still builds and validates the Android package, and `master` pushes always
-build the complete matrix. Pull requests restore the trusted release
+iOS and macOS candidate packages. Because macOS runners are scarce, pull requests
+build only the Android package unless a maintainer adds the `ci:apple` label,
+which builds the Apple inputs and packages too. `master` pushes always build the
+complete matrix and open an issue when it fails. Pull requests restore the trusted release
 cache read-only; only runs using the workflow from `master` may update it. A
 weekly scheduled exact-head run on `master` provides drift detection and
 refreshes those trusted cache seeds; it intentionally executes the complete

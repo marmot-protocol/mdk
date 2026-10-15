@@ -2,6 +2,9 @@ name: MarmotKit Release Profile
 
 on:
   pull_request:
+    # `labeled` lets a maintainer opt a pull request into the Apple lanes by
+    # adding the `ci:apple` label; other labels are ignored below.
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - Cargo.toml
       - Cargo.lock
@@ -35,7 +38,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: marmotkit-profile-${{ github.event.pull_request.number || github.ref }}
+  # An unrelated label event gets its own group so it cannot cancel a real run.
+  group: marmotkit-profile-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'ci:apple' && format('-ignored-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -50,6 +54,7 @@ env:
 jobs:
   identity:
     name: Resolve exact candidate identity
+    if: github.event.action != 'labeled' || github.event.label.name == 'ci:apple'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -60,7 +65,7 @@ jobs:
       - name: Check out exact candidate head
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
-          fetch-depth: ${{ github.event_name == 'pull_request' && '0' || '1' }}
+          fetch-depth: 1
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Record exact candidate identity
@@ -79,29 +84,22 @@ jobs:
             echo "source_sha=$source_sha"
             echo "builder_sha=$source_sha"
           } >> "$GITHUB_OUTPUT"
-      # macOS minutes are the most expensive CI lane (Blacksmith-hosted).
-      # Pull requests build the Apple candidates only when MarmotKit or its
-      # workflows change; master pushes, the weekly schedule, and manual runs
-      # always build them, so a dependency or toolchain bump is still covered
-      # when it merges.
+      # Apple lanes are off the pull-request path: the organization shares five
+      # GitHub-hosted macOS runners across every repository, and the Linux
+      # Android lane already builds marmot-uniffi on every pull request. Pull
+      # requests build the Apple candidates only with the `ci:apple` label;
+      # master pushes, the weekly schedule, and manual runs always build them
+      # and open an issue when they fail.
       - name: Select Apple lanes
         id: lanes
         env:
           EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          APPLE_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:apple') }}
         run: |
           set -euo pipefail
           run_apple=true
-          if [[ "$EVENT_NAME" == "pull_request" ]] && git cat-file -e "${BASE_SHA}^{commit}"; then
-            changed="$(git diff --no-renames --name-only "$BASE_SHA...HEAD")"
-            if ! awk '
-              /\.md$/ { next }
-              /^crates\/marmot-uniffi\// { found = 1 }
-              /^\.github\/workflows\/(bindings\.yaml|bindings-profile\.yml|bindings-profile-measurement\.yml)$/ { found = 1 }
-              END { exit !found }
-            ' <<<"$changed"; then
-              run_apple=false
-            fi
+          if [[ "$EVENT_NAME" == "pull_request" && "$APPLE_LABEL" != "true" ]]; then
+            run_apple=false
           fi
           echo "run_apple=$run_apple" >> "$GITHUB_OUTPUT"
       - name: Run inexpensive orchestration regressions
@@ -114,12 +112,13 @@ jobs:
 
   apple-build:
     name: Build Apple candidate input (${{ matrix.part }})
-    runs-on: blacksmith-6vcpu-macos-latest
+    runs-on: macos-latest
     needs: identity
     if: needs.identity.outputs.run_apple == 'true'
     timeout-minutes: 60
     strategy:
       fail-fast: false
+      max-parallel: 3
       matrix:
         include:
           - part: swift
@@ -392,7 +391,7 @@ jobs:
 
   ios-package:
     name: Assemble and validate iOS candidate
-    runs-on: blacksmith-6vcpu-macos-latest
+    runs-on: macos-latest
     needs: [identity, apple-build]
     timeout-minutes: 60
     steps:
@@ -484,7 +483,7 @@ jobs:
 
   macos-package:
     name: Assemble and validate macOS candidate
-    runs-on: blacksmith-6vcpu-macos-latest
+    runs-on: macos-latest
     needs: [identity, apple-build]
     timeout-minutes: 60
     steps:
@@ -572,8 +571,11 @@ jobs:
     name: MarmotKit exact-head packaging
     runs-on: ubuntu-latest
     needs: [identity, android-package, ios-package, macos-package]
-    if: always()
+    if: always() && needs.identity.result != 'skipped'
     timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
     steps:
       - name: Require every candidate package
         env:
@@ -597,3 +599,21 @@ jobs:
             [[ "$result" == success ]] || exit 1
           done
           echo "Validated Android, iOS, and macOS candidate packages for $SOURCE_SHA"
+
+      - name: Report master or scheduled failure
+        if: failure() && github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_SHA: ${{ needs.identity.outputs.source_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          title="MarmotKit release profile failed on master"
+          body="MarmotKit candidate packaging failed for ${SOURCE_SHA}. Run: ${RUN_URL}"
+          existing="$(gh issue list --repo "$REPO" --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')"
+          if [[ -n "$existing" ]]; then
+            gh issue comment "$existing" --repo "$REPO" --body "$body"
+          else
+            gh issue create --repo "$REPO" --title "$title" --body "$body"
+          fi

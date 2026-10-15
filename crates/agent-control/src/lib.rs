@@ -245,6 +245,14 @@ pub enum AgentControlRequest {
         group_id_hex: String,
         target_message_id_hex: String,
     },
+    /// Replace the text of a chat message this account sent. The runtime
+    /// refuses any other target before publication (`invalid_edit_target`).
+    EditMessage {
+        account_id_hex: String,
+        group_id_hex: String,
+        target_message_id_hex: String,
+        text: String,
+    },
     /// Add bounded, control-free, non-blank reaction content to a durable message.
     SendReaction {
         account_id_hex: String,
@@ -1933,6 +1941,15 @@ mod tests {
                     target_message_id_hex: message(),
                 },
                 "delete_message",
+            ),
+            (
+                AgentControlRequest::EditMessage {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    target_message_id_hex: message(),
+                    text: "status: done".to_owned(),
+                },
+                "edit_message",
             ),
             (
                 AgentControlRequest::SendReaction {

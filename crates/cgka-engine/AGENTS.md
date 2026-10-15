@@ -44,6 +44,7 @@ Each module's top-level rustdoc is the source of truth; this is an index.
 | `feature_registry.rs` | Runtime feature → capability-requirement registry |
 | `capabilities.rs` | `cgka_traits::Capability` ↔ OpenMLS `Capabilities` translation |
 | `capability_manager.rs` | `feature_status`, `upgradeable_capabilities`, write-through per-leaf cache population |
+| `leaf_advertisement.rs` | What the own leaf advertises: `own_leaf_refresh_extensions` (a self-update re-advertises every supported component, keeping every other leaf byte), `own_leaf_missing_app_components` (stale only when a self-update would change the leaf), per-component leaf-support blockers |
 | `key_package.rs` | `fresh_key_package`, KeyPackage parse-time lifetime / OpenMLS accepted-range checks (refresh scheduling is a higher-layer concern) |
 | `group_lifecycle.rs` | `do_create_group`, `do_join_welcome`, `retry_rejoins_after_trusted_removal` |
 | `message_processor/` | `mod.rs`: entry points (`do_ingest`, `do_send`, convergence/queue drains, `replay_buffered_messages`), shared helpers, re-exports. `ingest.rs`: inbound path, peel/snapshot recovery, `convergence_ingest_outcome`. `send.rs`: `do_send_*` incl. `do_send_invite` / `do_send_leave`, MIP-03 guards. `store.rs`: durable persistence, dedup classification, stored-message transitions, `retire_raw_wrapper`. `application_replay.rs`: bounded background drain of retained canonical applications |

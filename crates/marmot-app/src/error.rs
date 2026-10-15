@@ -45,6 +45,30 @@ impl std::fmt::Display for AccountCatchUpFailure {
     }
 }
 
+/// Why a completed KeyPackage lookup found nothing usable for joins.
+/// Both reasons describe only the searched relays; neither proves global
+/// absence, and neither relaxes current-profile admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum MissingKeyPackageReason {
+    /// No newest slot held a KeyPackage publication.
+    #[error("no published key package for account")]
+    NotFound,
+    /// Every newest slot held a legacy-profile publication: the account
+    /// must update and publish a current KeyPackage before it can be invited.
+    #[error("account has only obsolete key packages published")]
+    ObsoleteOnly,
+}
+
+impl MissingKeyPackageReason {
+    /// Stable token for CLI JSON and diagnostics.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::ObsoleteOnly => "obsolete_only",
+        }
+    }
+}
+
 /// Why an explicit repair stopped without qualified history completion.
 /// These bounded codes contain no relay, account or event identities. The
 /// comparison job reports `CoverageUnproven`, `BelowRetentionWindow`,
@@ -115,13 +139,21 @@ pub enum AppError {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Hex(#[from] hex::FromHexError),
-    #[error("no published key package for account")]
-    MissingKeyPackage(String),
+    #[error("{reason}")]
+    MissingKeyPackage {
+        account: String,
+        reason: MissingKeyPackageReason,
+    },
     /// The canonical invite target has no Marmot inbox endpoint that survives
     /// this device's relay-safety policy. Kept per-recipient for typed host
     /// presentation, while Display remains identity-free for safe diagnostics.
     #[error("member has no valid Marmot inbox relay")]
     MissingMemberInboxRoute(String),
+    /// Relay-list or KeyPackage lookup for this account ran out of time or
+    /// relay coverage, so neither absence nor a verdict was established.
+    /// Retryable; Display remains identity-free.
+    #[error("account directory lookup did not complete")]
+    DirectoryLookupIncomplete(String),
     /// The creator is already an MLS member and cannot be added again.
     #[error("group members must not include the creator")]
     GroupCreateIncludesCreator,
@@ -147,6 +179,8 @@ pub enum AppError {
     ChatPresentationNotReady,
     #[error("invalid cached identity page: {0}")]
     InvalidCachedIdentityPage(String),
+    #[error("invalid public event reference batch: {0}")]
+    InvalidPublicEventReferences(String),
     #[error("invalid chat pin: {0}")]
     InvalidChatPin(String),
     #[error("group is disbanding or disbanded; outbound work is blocked")]
@@ -232,6 +266,10 @@ pub enum AppError {
     /// The local per-account cap; it guards against runaway clients only.
     #[error("too many moderation reports; try again later")]
     ModerationReportRateLimited,
+    /// An edit must target an available chat message this account sent;
+    /// nothing was published.
+    #[error("edit target must be an available self-authored chat message")]
+    InvalidEditTarget,
     #[error("relay directory fetch failed: {0}")]
     RelayDirectory(String),
     /// An account worker's transport catch-up failed (sync error or timeout).
@@ -452,8 +490,9 @@ impl AppError {
                 _ => "sqlite",
             },
             Self::Hex(_) => "hex",
-            Self::MissingKeyPackage(_) => "missing_key_package",
+            Self::MissingKeyPackage { .. } => "missing_key_package",
             Self::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
+            Self::DirectoryLookupIncomplete(_) => "directory_lookup_incomplete",
             Self::GroupCreateIncludesCreator => "group_create_includes_creator",
             Self::UnknownGroup(_) => "unknown_group",
             Self::GroupInviteNotPending => "group_invite_not_pending",
@@ -462,6 +501,7 @@ impl AppError {
             Self::ChatPresentationNotReady => "chat_presentation_not_ready",
             Self::DirectConversationIndexNotReady => "direct_conversation_index_not_ready",
             Self::InvalidCachedIdentityPage(_) => "invalid_cached_identity_page",
+            Self::InvalidPublicEventReferences(_) => "invalid_public_event_references",
             Self::InvalidChatPin(_) => "invalid_chat_pin",
             Self::GroupDisbanding(_) => "group_disbanding",
             Self::GroupRemoved(_) => "group_removed",
@@ -488,6 +528,7 @@ impl AppError {
             Self::InvalidReportedPublicKey => "invalid_reported_public_key",
             Self::CannotReportSelf => "cannot_report_self",
             Self::ModerationReportRateLimited => "moderation_report_rate_limited",
+            Self::InvalidEditTarget => "invalid_edit_target",
             Self::FollowListUnavailable => "follow_list_unavailable",
             Self::RelayDirectory(_) => "relay_directory",
             Self::AccountCatchUp(_) => "account_catch_up",
@@ -571,7 +612,9 @@ impl AppError {
             Self::Session(error) => session_error_class(error),
             Self::Account(error) => account_sync_error_class(error),
             Self::Transport(error) => transport_error_class(error),
-            Self::RelayDirectory(_) => SyncErrorClass::RelayDirectory,
+            Self::RelayDirectory(_) | Self::DirectoryLookupIncomplete(_) => {
+                SyncErrorClass::RelayDirectory
+            }
             Self::AccountCatchUp(error) => error.classification().error_class,
             Self::FullHistoryRepairIncomplete { reason, .. } => match reason {
                 FullHistoryRepairIncompleteReason::Cancelled => SyncErrorClass::Cancelled,

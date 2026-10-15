@@ -77,6 +77,7 @@ use crate::types::notification::{
     MarmotBackgroundNotificationCollection, MarmotNotificationSettings,
     MarmotNotificationWakeSource,
 };
+use crate::types::public_event_preview::{MarmotPublicEventPreview, MarmotPublicEventPreviewList};
 use crate::types::push::{
     MarmotGroupPushDebugInfo, MarmotPushPlatform, MarmotPushRegistration,
     MarmotPushRegistrationShareOutcome, MarmotPushRegistrationSyncResult,
@@ -879,8 +880,9 @@ c_cmd! {
     /// `marmot_send_summary_free`.
     async fn marmot_delete_message(account_ref: str, group_id_hex: str, target_message_id: str) -> rec(MarmotSendSummary) = delete_message;
 
-    /// Edit an own message's content. Free with
-    /// `marmot_send_summary_free`.
+    /// Edit an own message's content. Returns
+    /// `MARMOT_STATUS_INVALID_EDIT_TARGET` unless the target is an available
+    /// chat message this account sent. Free with `marmot_send_summary_free`.
     async fn marmot_edit_message(account_ref: str, group_id_hex: str, target_message_id: str, content: str) -> rec(MarmotSendSummary) = edit_message;
 
     /// Securely delete this group's expired disappearing messages now.
@@ -1137,6 +1139,15 @@ c_cmd! {
     /// row per request in order. Free with
     /// `marmot_cached_identity_projection_list_free`.
     sync fn marmot_cached_identity_projections(account_id_hexes/account_id_hexes_len: str_arr) -> rec(MarmotCachedIdentityProjectionList) = cached_identity_projections;
+
+    /// Network-free cached previews of public events referenced from message
+    /// content, one row per reference (at most 16) in order. Free with
+    /// `marmot_public_event_preview_list_free`.
+    sync fn marmot_cached_public_event_previews(account_ref: str, references/references_len: str_arr) -> rec(MarmotPublicEventPreviewList) = cached_public_event_previews;
+
+    /// Fetch one referenced public event when it is missing or stale, then
+    /// return its local state. Free with `marmot_public_event_preview_free`.
+    async fn marmot_resolve_public_event_preview(account_ref: str, reference: str) -> rec(MarmotPublicEventPreview) = resolve_public_event_preview;
 
     /// Every stored draft for the account, attachment metadata only.
     /// Free with `marmot_message_draft_summary_list_free`.

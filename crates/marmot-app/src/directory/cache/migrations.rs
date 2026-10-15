@@ -10,13 +10,21 @@ struct Migration {
     apply: fn(&Transaction<'_>) -> Result<(), AppError>,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "0001_directory_cache",
-    apply: version_1,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "0001_directory_cache",
+        apply: version_1,
+    },
+    Migration {
+        version: 2,
+        name: "0002_public_event_previews",
+        apply: version_2,
+    },
+];
 
 const VERSION_1_SQL: &str = include_str!("v1.sql");
+const VERSION_2_SQL: &str = include_str!("v2.sql");
 
 /// Open the cache's independent migration domain without exposing stored values.
 pub(super) fn run_all(conn: &mut Connection) -> Result<(), AppError> {
@@ -124,6 +132,11 @@ fn version_1(tx: &Transaction<'_>) -> Result<(), AppError> {
     tx.execute_batch(VERSION_1_SQL)?;
     validate_version_1(tx)?;
     DirectoryCache::migrate_legacy_json_records(tx)
+}
+
+fn version_2(tx: &Transaction<'_>) -> Result<(), AppError> {
+    tx.execute_batch(VERSION_2_SQL)?;
+    Ok(())
 }
 
 /// IF NOT EXISTS can adopt an existing table without checking its shape. Use
@@ -319,7 +332,12 @@ mod tests {
             },
             Migration {
                 version: 2,
-                name: "0002_test",
+                name: MIGRATIONS[1].name,
+                apply: version_2,
+            },
+            Migration {
+                version: 3,
+                name: "0003_test",
                 apply: |tx| {
                     tx.execute_batch(
                         "CREATE TABLE rollback_probe (value INTEGER);
@@ -347,7 +365,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, 2);
     }
 }
 
