@@ -84,8 +84,8 @@ pub use error::{EngineError, PeelerError};
 pub use group::{DisbandTombstone, Group, Member};
 pub use group_context::{GroupContext, GroupContextSnapshot, SecretBytes};
 pub use ingest::{
-    IngestOutcome, InputRejectionCategory, LocalIngestState, PeeledContent, PeeledMessage,
-    ProposalRejectionCategory, StaleReason,
+    DeferredStallEvidence, DeferredStallRow, IngestOutcome, InputRejectionCategory,
+    LocalIngestState, PeeledContent, PeeledMessage, ProposalRejectionCategory, StaleReason,
 };
 pub use maintenance::{
     DurableGroupEvolution, DurableTransportFanout, GroupEvolutionPhase, GroupEvolutionSemantic,
