@@ -314,9 +314,31 @@ impl AppClient {
         if super::group_is_terminal(&self.runtime, group_id) {
             return Ok(Vec::new());
         }
+        let storage = self.app.account_storage(&self.state.label)?;
+        if super::group_is_quarantined(&self.runtime, group_id) {
+            // No live routing component until it rehydrates (mdk#2318). Its
+            // delete stored the then-current route, which the engine can
+            // keep receiving on: it retains a quarantined group's inbound
+            // input as deferred peels and replays them on recovery.
+            let Some(current) = storage
+                .local_group_deletion_prior_nostr_routes(&hex::encode(group_id.as_slice()))?
+                .into_iter()
+                .filter(|route| route.replaced_at.is_none())
+                .max_by_key(|route| route.last_epoch)
+            else {
+                return Ok(Vec::new());
+            };
+            let current = AppPriorNostrRoute {
+                nostr_group_id_hex: current.nostr_group_id_hex,
+                relays: current.relays,
+                last_epoch: current.last_epoch,
+                replaced_at: None,
+            }
+            .subscription(group_id)?;
+            return self.local_deleted_group_subscriptions_from(&storage, group_id, current);
+        }
         let routing = self.nostr_routing_for_group(group_id)?;
         let current = routing.subscription(group_id)?;
-        let storage = self.app.account_storage(&self.state.label)?;
         if storage
             .retain_local_group_deletion_nostr_routes(
                 &hex::encode(group_id.as_slice()),
@@ -343,6 +365,17 @@ impl AppClient {
                 "could not retain the current route for a locally deleted group",
             );
         }
+        self.local_deleted_group_subscriptions_from(&storage, group_id, current)
+    }
+
+    /// The current route first, then each retained prior route still indexed
+    /// for the group, then any legacy route ids paired with the current relays.
+    fn local_deleted_group_subscriptions_from(
+        &self,
+        storage: &storage_sqlite::SqliteAccountStorage,
+        group_id: &GroupId,
+        current: TransportGroupSubscription,
+    ) -> Result<Vec<TransportGroupSubscription>, AppError> {
         let indexed_routes = storage
             .list_transport_group_routes()?
             .into_iter()
@@ -449,7 +482,18 @@ impl AppClient {
         &self,
         routing: &AppTransportRouting,
     ) -> Result<(), AppError> {
-        for group_id in self.runtime.live_group_ids()? {
+        // A quarantined hidden group is not live but keeps its stored route.
+        let quarantined = self
+            .runtime
+            .quarantined_groups()
+            .into_iter()
+            .map(|(group_id, _)| group_id);
+        for group_id in self
+            .runtime
+            .live_group_ids()?
+            .into_iter()
+            .chain(quarantined)
+        {
             if self.state_group_record(&group_id).is_some()
                 || !self.has_local_group_deletion_frontier(&group_id)?
             {
