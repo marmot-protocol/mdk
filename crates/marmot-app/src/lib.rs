@@ -6225,9 +6225,19 @@ impl MarmotApp {
             // An open generated setup has not projected the NIP-65 list its
             // bootstrap publishes yet. Route to the relays that list declares,
             // not to the app's (mdk#2359).
-            outbox = self
-                .generated_setup_outbox_relays(label)?
-                .unwrap_or_default();
+            outbox = match self.generated_setup_outbox_relays(label)? {
+                Some(relays) => relays,
+                // Setup removes its journal and context only after projecting
+                // its lists, so one that completed since `relay_lists` was
+                // read shows them in a fresh read.
+                None => self
+                    .account_relay_list_status(label)?
+                    .nip65
+                    .relays
+                    .into_iter()
+                    .map(TransportEndpoint)
+                    .collect(),
+            };
         }
         let offered = outbox.len();
         let safe =

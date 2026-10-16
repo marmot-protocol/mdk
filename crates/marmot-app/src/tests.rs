@@ -7550,6 +7550,36 @@ async fn generated_setup_key_packages_stay_on_the_requested_relays() {
     runtime.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn key_package_routing_sees_lists_a_setup_projected_after_the_routing_read() {
+    // mdk#2359: routing read the projection before the setup journal, so a
+    // setup that completed in between left an empty outbox and the app's
+    // relays.
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_nostr_account_for_setup().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(directory.path(), "wss://app-default.example")
+        .with_test_relay_client(relay);
+    let chosen = TransportEndpoint("wss://chosen.example".into());
+    let stale = app.account_relay_list_status(&account.label).unwrap();
+    assert!(stale.nip65.relays.is_empty());
+
+    app.publish_generated_account_bootstrap(
+        &account.label,
+        AccountRelayListBootstrap::new(vec![chosen.clone()], vec![chosen.clone()]),
+        &UserProfileMetadata::default(),
+    )
+    .await
+    .unwrap();
+    home.complete_account_setup(&account.label).unwrap();
+
+    assert_eq!(
+        app.key_package_endpoints(&account.label, &stale).unwrap(),
+        vec![chosen]
+    );
+}
+
 #[tokio::test]
 async fn key_package_generation_upgrade_runs_once_per_account_on_activation() {
     use cgka_traits::maintenance::KEY_PACKAGE_GENERATION_REVISION;
