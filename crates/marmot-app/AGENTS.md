@@ -353,11 +353,12 @@ Tests that require shortened production policy intervals must use
 `#[cfg(feature = "test-policy-overrides")]`; normal test builds deliberately
 ignore those configuration overrides.
 
-The `src/runtime/` and `src/relay_plane/` unit suites and the `tests/` integration binaries drive whole runtimes and run
-on `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]`, the flavor every production binding uses. Use
-`flavor = "current_thread"` only for a paused clock or an interleaving that needs one thread, with a `//` comment on the
-line above saying why; a bare `#[tokio::test]` there, or an unexplained pin, fails
-`runtime_suites_choose_their_tokio_flavor`. When a multi-thread test waits for an effect, wait for the state it expects
-rather than the next event: other tasks run between your steps, and window subscriptions keep only the latest snapshot.
-`Notify::notify_waiters` reaches only waiters already registered, so a fixture signal either uses `notify_one`'s permit
-or the waiter `enable()`s its `notified()` before announcing it waits.
+Async tests in `src/` and `tests/` default to `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]`, the flavor
+every production binding uses; a test that needs more workers sets its own `worker_threads`. Only a test that needs one
+thread stays off it: `#[tokio::test(start_paused = true)]` for a clock paused from the start (Tokio allows that only on
+the current-thread runtime), otherwise `flavor = "current_thread"` with a `//` comment on the line above saying why.
+`async_suites_choose_their_tokio_flavor` rejects a bare `#[tokio::test]` and an uncommented `current_thread` pin. When a
+multi-thread test waits for an effect, wait for the state it expects rather than the next event: other tasks run between
+your steps, and window subscriptions keep only the latest snapshot. `Notify::notify_waiters` reaches only waiters
+already registered, so a fixture signal either uses `notify_one`'s permit or the waiter `enable()`s its `notified()`
+before announcing it waits.

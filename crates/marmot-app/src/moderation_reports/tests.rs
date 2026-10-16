@@ -245,7 +245,7 @@ fn tags(rumor: &UnsignedEvent) -> Vec<Vec<String>> {
         .collect()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn report_is_a_nip59_wrap_of_a_nip56_rumor_for_the_moderation_key() {
     let fixture = Fixture::configured(Mode::Accept);
     let reported = Keys::generate().public_key();
@@ -327,7 +327,7 @@ async fn report_is_a_nip59_wrap_of_a_nip56_rumor_for_the_moderation_key() {
     assert!(UnwrappedGift::from_gift_wrap(&Keys::generate(), &wrap).is_err());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_report_is_wrapped_by_a_fresh_one_time_key() {
     let fixture = Fixture::configured(Mode::Accept);
     for _ in 0..3 {
@@ -351,7 +351,7 @@ async fn every_report_is_wrapped_by_a_fresh_one_time_key() {
     assert!(!wrap_keys.contains(&fixture.reporter.public_key().to_hex()));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn report_rumor_carries_no_conversation_identifiers() {
     let fixture = Fixture::configured(Mode::Accept);
     let reported = Keys::generate().public_key();
@@ -410,7 +410,7 @@ fn explanation_is_trimmed_and_bounded() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn long_explanation_is_bounded_on_the_wire() {
     let fixture = Fixture::configured(Mode::Accept);
     fixture
@@ -429,7 +429,7 @@ async fn long_explanation_is_bounded_on_the_wire() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn config_validation_rejects_the_whole_config() {
     let fixture = Fixture::unconfigured(Mode::Accept);
     let moderation = fixture.moderation.public_key();
@@ -502,7 +502,7 @@ async fn config_validation_rejects_the_whole_config() {
     assert!(!fixture.app.moderation_reporting_available());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn construction_time_config_is_adopted_or_rejected_whole() {
     let dir = tempfile::tempdir().unwrap();
     let moderation = Keys::generate().public_key();
@@ -531,7 +531,7 @@ async fn construction_time_config_is_adopted_or_rejected_whole() {
     assert!(!invalid.moderation_reporting_available());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unconfigured_reporting_is_a_typed_error_and_publishes_nothing() {
     let fixture = Fixture::unconfigured(Mode::Accept);
     let error = fixture
@@ -555,7 +555,7 @@ async fn unconfigured_reporting_is_a_typed_error_and_publishes_nothing() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reports_go_only_to_the_configured_relays() {
     let fixture = Fixture::configured(Mode::Accept);
     fixture
@@ -578,7 +578,7 @@ async fn reports_go_only_to_the_configured_relays() {
     assert_eq!(endpoints, vec![SECOND_REPORT_RELAY, REPORT_RELAY]);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refused_report_is_queued_and_published_on_retry() {
     let fixture = Fixture::configured(Mode::Refuse);
     let reported = Keys::generate().public_key();
@@ -645,7 +645,7 @@ async fn refused_report_is_queued_and_published_on_retry() {
     assert_eq!(summary, ModerationReportRetrySummary::default());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unacknowledged_publish_reports_completion_unknown_and_stays_queued() {
     let fixture = Fixture::configured(Mode::Unacknowledged);
     let outcome = fixture
@@ -661,7 +661,7 @@ async fn unacknowledged_publish_reports_completion_unknown_and_stays_queued() {
     assert_eq!(fixture.pending().len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repeat_inside_the_window_returns_the_existing_outcome() {
     let fixture = Fixture::configured(Mode::Refuse);
     let reported = Keys::generate().public_key().to_hex();
@@ -726,7 +726,7 @@ async fn repeat_inside_the_window_returns_the_existing_outcome() {
     assert_ne!(later.report_id, first.report_id);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_rate_limit_caps_reports_per_account() {
     let fixture = Fixture::configured(Mode::Accept);
     let now = unix_now_ms();
@@ -757,7 +757,7 @@ async fn local_rate_limit_caps_reports_per_account() {
     assert!(!repeated);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reporting_yourself_or_an_invalid_key_is_rejected() {
     let fixture = Fixture::configured(Mode::Accept);
     let own = fixture.reporter.public_key();
@@ -803,7 +803,7 @@ async fn reporting_yourself_or_an_invalid_key_is_rejected() {
     assert!(fixture.publisher.publishes().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signed_out_account_cannot_report() {
     let fixture = Fixture::configured(Mode::Accept);
     fixture
@@ -830,7 +830,7 @@ async fn signed_out_account_cannot_report() {
     assert!(fixture.publisher.publishes().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn purge_cancels_an_in_flight_publish_and_removes_queued_reports() {
     let fixture = Arc::new(Fixture::configured(Mode::Refuse));
     fixture
@@ -879,7 +879,7 @@ async fn purge_cancels_an_in_flight_publish_and_removes_queued_reports() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stalled_retry_pass_blocks_neither_new_reports_nor_purge() {
     let fixture = Arc::new(Fixture::configured(Mode::Refuse));
     fixture
@@ -942,7 +942,7 @@ async fn a_stalled_retry_pass_blocks_neither_new_reports_nor_purge() {
     assert!(fixture.pending().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_teardown_fence_closes_admission_until_the_sign_out_commits() {
     let fixture = Fixture::configured(Mode::Accept);
     let (fence, purged) = fixture.app.fence_moderation_reports("alice").await;
@@ -1020,7 +1020,7 @@ async fn a_teardown_fence_closes_admission_until_the_sign_out_commits() {
     assert!(fixture.publisher.publishes().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_teardown_reopens_admission_when_its_fence_drops() {
     let fixture = Fixture::configured(Mode::Accept);
     let (fence, _) = fixture.app.fence_moderation_reports("alice").await;
@@ -1037,7 +1037,7 @@ async fn a_failed_teardown_reopens_admission_when_its_fence_drops() {
     assert_eq!(outcome.status, ModerationReportStatus::Published);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unacknowledged_report_stays_unknown_after_an_offline_retry() {
     let fixture = Fixture::configured(Mode::Unacknowledged);
     let reported = Keys::generate().public_key().to_hex();
@@ -1059,7 +1059,7 @@ async fn an_unacknowledged_report_stays_unknown_after_an_offline_retry() {
     assert_eq!(repeat.status, ModerationReportStatus::CompletionUnknown);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reports_that_keep_failing_do_not_starve_newer_ones() {
     let fixture = Fixture::configured(Mode::Refuse);
     let now = unix_now_ms();
@@ -1112,7 +1112,7 @@ async fn reports_that_keep_failing_do_not_starve_newer_ones() {
     assert_eq!(fixture.pending().len(), RETRY_BATCH_LIMIT);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dedupe_is_scoped_to_the_configured_recipient() {
     for queued in [true, false] {
         let fixture = Fixture::configured(if queued { Mode::Refuse } else { Mode::Accept });
@@ -1146,7 +1146,7 @@ async fn dedupe_is_scoped_to_the_configured_recipient() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_retry_pass_skips_a_report_that_is_still_publishing() {
     let fixture = Arc::new(Fixture::configured(Mode::Accept));
     fixture.publisher.hang_next.store(true, Ordering::SeqCst);
@@ -1181,7 +1181,7 @@ async fn a_retry_pass_skips_a_report_that_is_still_publishing() {
     submitting.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_stop_leaves_the_report_queued_for_retry() {
     let fixture = Fixture::configured(Mode::Hang);
     let (stop, stopping) = watch::channel(false);
@@ -1242,7 +1242,7 @@ async fn runtime_stop_leaves_the_report_queued_for_retry() {
     assert_eq!(summary.published, 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queued_reports_are_dropped_not_redirected_when_the_recipient_changes() {
     let fixture = Fixture::configured(Mode::Refuse);
     fixture
@@ -1278,7 +1278,7 @@ async fn queued_reports_are_dropped_not_redirected_when_the_recipient_changes() 
     assert_eq!(fixture.publisher.publishes().len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_without_configuration_keeps_reports_queued() {
     let fixture = Fixture::configured(Mode::Refuse);
     fixture
@@ -1385,7 +1385,7 @@ mod runtime {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn catch_up_retries_queued_reports_in_the_background() {
         let fixture = runtime_fixture(Mode::Refuse).await;
         assert!(fixture.runtime.moderation_reporting_available());
@@ -1402,7 +1402,7 @@ mod runtime {
         assert_eq!(fixture.publisher.publishes().len(), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sign_out_purges_the_accounts_queued_reports() {
         let fixture = runtime_fixture(Mode::Refuse).await;
         fixture.queue_one().await;
@@ -1445,7 +1445,7 @@ mod runtime {
         ));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn direct_account_removal_stops_an_in_flight_report() {
         let fixture = Arc::new(runtime_fixture(Mode::Hang).await);
         let submitting = {
@@ -1494,7 +1494,7 @@ mod runtime {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn direct_deactivation_purges_queued_reports() {
         let fixture = runtime_fixture(Mode::Refuse).await;
         fixture.queue_one().await;
@@ -1507,7 +1507,7 @@ mod runtime {
         assert_eq!(fixture.pending_count(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failed_purge_is_reported_by_deactivation_and_sign_out() {
         let fixture = runtime_fixture(Mode::Refuse).await;
         fixture.queue_one().await;
@@ -1546,7 +1546,7 @@ mod runtime {
         assert!(outcome.local_cleanup.reason.is_some());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wipe_removes_the_accounts_queued_reports() {
         let fixture = runtime_fixture(Mode::Refuse).await;
         fixture.queue_one().await;

@@ -783,7 +783,7 @@ fn http_not_found_response() -> Vec<u8> {
     b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upload_encrypted_media_falls_back_to_second_blossom_endpoint() {
     let failing = spawn_http_response(http_status_response(500, "Internal Server Error"));
     let succeeding = spawn_http_response(http_json_response("{}"));
@@ -819,7 +819,7 @@ async fn upload_encrypted_media_falls_back_to_second_blossom_endpoint() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blossom_fallback_reuses_the_identical_encrypted_body() {
     let (failing, first_body) =
         spawn_hashing_upload_response(http_status_response(500, "Internal Server Error"));
@@ -843,7 +843,7 @@ async fn blossom_fallback_reuses_the_identical_encrypted_body() {
     assert_eq!(first_body.recv().unwrap(), second_body.recv().unwrap());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blossom_upload_allows_response_gap_longer_than_read_timeout() {
     let (server, received) = spawn_slow_upload_response(SlowUploadIngest::PauseAfterFirstChunk(
         Duration::from_secs(16),
@@ -864,7 +864,7 @@ async fn blossom_upload_allows_response_gap_longer_than_read_timeout() {
     assert_eq!(received.recv().unwrap(), encrypted.len() as u64);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blossom_upload_allows_continuous_slow_body_ingest() {
     let (server, received) = spawn_slow_upload_response(SlowUploadIngest::Continuous {
         delay_per_chunk: Duration::from_millis(30),
@@ -885,7 +885,7 @@ async fn blossom_upload_allows_continuous_slow_body_ingest() {
     assert_eq!(received.recv().unwrap(), encrypted.len() as u64);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn encrypted_media_round_trip_crosses_the_previous_64_mib_limit() {
     let (server, received) = spawn_roundtrip_blob_server();
     let endpoints = [blossom_endpoint(server)];
@@ -937,7 +937,7 @@ async fn encrypted_media_round_trip_crosses_the_previous_64_mib_limit() {
 
 /// A successful round trip records transport, integrity, and crypto phases
 /// without changing the downloaded result.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn encrypted_media_download_records_network_integrity_and_crypto_phases() {
     let (server, _received) = spawn_roundtrip_blob_server();
     let endpoints = [blossom_endpoint(server)];
@@ -985,7 +985,7 @@ async fn encrypted_media_download_records_network_integrity_and_crypto_phases() 
     assert_eq!(snapshot.media_download_locator_failover.attempts, 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn encrypted_media_v2_upload_emits_v2_and_fresh_nonces() {
     let server = spawn_http_responses(vec![http_json_response("{}"), http_json_response("{}")]);
     let endpoints = [blossom_endpoint(server)];
@@ -1025,7 +1025,7 @@ async fn encrypted_media_v2_upload_emits_v2_and_fresh_nonces() {
     assert_ne!(first.ciphertext_sha256, second.ciphertext_sha256);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blossom_upload_rejects_oversized_descriptor_before_buffering() {
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1051,7 +1051,7 @@ async fn blossom_upload_rejects_oversized_descriptor_before_buffering() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn profile_image_upload_rejects_non_raster_and_oversized_inputs_before_network() {
     let signer = signing_keys();
     let svg = upload_profile_image(
@@ -1082,7 +1082,7 @@ async fn profile_image_upload_rejects_non_raster_and_oversized_inputs_before_net
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn profile_image_upload_rejects_empty_inputs_before_network() {
     let error = upload_profile_image(
         &[],
@@ -1098,7 +1098,7 @@ async fn profile_image_upload_rejects_empty_inputs_before_network() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn profile_image_upload_rejects_mismatched_raster_bytes_before_network() {
     let error = upload_profile_image(
         b"<svg/>",
@@ -1114,7 +1114,7 @@ async fn profile_image_upload_rejects_mismatched_raster_bytes_before_network() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn profile_image_upload_uses_media_extension_and_accepts_test_loopback_policy() {
     let png_header = b"\x89PNG\r\n\x1a\n";
     let server = spawn_http_response(http_json_response("{}"));
@@ -1132,7 +1132,7 @@ async fn profile_image_upload_uses_media_extension_and_accepts_test_loopback_pol
     assert!(!url.ends_with(".bin"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn profile_image_upload_rejects_cross_site_descriptor_url() {
     let png_header = b"\x89PNG\r\n\x1a\n";
     let hash = hex::encode(Sha256::digest(png_header));
@@ -1157,7 +1157,7 @@ async fn profile_image_upload_rejects_cross_site_descriptor_url() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upload_encrypted_media_reports_all_blossom_endpoint_failures() {
     let first = spawn_http_response(http_status_response(500, "Internal Server Error"));
     let second = spawn_http_response(http_status_response(502, "Bad Gateway"));
@@ -1194,7 +1194,7 @@ async fn upload_encrypted_media_reports_all_blossom_endpoint_failures() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upload_encrypted_media_preserves_privacy_safe_blossom_rejection_reason() {
     let rejecting = spawn_http_response(http_error_response(
         415,
@@ -1223,7 +1223,7 @@ async fn upload_encrypted_media_preserves_privacy_safe_blossom_rejection_reason(
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upload_encrypted_media_drops_sensitive_blossom_rejection_reason() {
     let secret_value = "11".repeat(32);
     let rejecting = spawn_http_response(http_error_response(
@@ -1256,7 +1256,7 @@ async fn upload_encrypted_media_drops_sensitive_blossom_rejection_reason() {
     assert!(!message.contains(&secret_value));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upload_encrypted_media_drops_punctuated_hash_rejection_reason() {
     let secret_value = "11".repeat(32);
     let rejecting = spawn_http_response(http_error_response(
@@ -1288,7 +1288,7 @@ async fn upload_encrypted_media_drops_punctuated_hash_rejection_reason() {
     assert!(!message.contains(&secret_value));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upload_encrypted_media_drops_uuid_rejection_reason() {
     let rejecting = spawn_http_response(http_error_response(
         403,
@@ -1319,7 +1319,7 @@ async fn upload_encrypted_media_drops_uuid_rejection_reason() {
     assert!(!message.contains("123e4567"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upload_encrypted_media_drops_non_http_url_scheme_rejection_reason() {
     let rejecting = spawn_http_response(http_error_response(
         403,
@@ -1361,7 +1361,7 @@ fn built_in_blossom_endpoints_are_ciphertext_compatible_fallbacks() {
     assert!(!DEFAULT_BLOSSOM_SERVER_URLS.contains(&"https://blossom.primal.net"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explicit_blossom_server_override_skips_default_endpoint_failover() {
     let override_server = spawn_http_response(http_status_response(500, "Internal Server Error"));
     let default_server = spawn_http_response(http_json_response("{}"));
@@ -1571,7 +1571,7 @@ fn loopback_reference() -> MediaAttachmentReference {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn download_prepare_stays_local() {
     let dir = tempfile::tempdir().unwrap();
     marmot_account::AccountHome::open(dir.path())
@@ -1693,7 +1693,7 @@ fn loopback_locator_validation_follows_runtime_flag_not_build_profile() {
     assert!(media_imeta_tags_are_valid(tags, true));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn production_config_does_not_fetch_loopback_endpoint() {
     // With the dev/test gate off, a loopback-HTTP locator is dropped from the
     // candidate set, so no GET is issued and the fetch fails as "no supported
@@ -1713,7 +1713,7 @@ async fn production_config_does_not_fetch_loopback_endpoint() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loopback_fallback_endpoint_is_skipped_in_production() {
     // The same gate applies to remote-admin policy fallback endpoints. With
     // no supported locator on the message, a loopback-HTTP fallback is the
@@ -1751,7 +1751,7 @@ async fn loopback_fallback_endpoint_is_skipped_in_production() {
     )));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn out_of_policy_blossom_locator_is_unfetchable_not_a_hard_error() {
     // PR #328 review Finding 2: when the group's CURRENT policy does not allow
     // `blossom-v1`, a blossom locator is out of policy and this client cannot
@@ -1916,7 +1916,7 @@ fn blob_reference_for_servers(body: &[u8], servers: &[String]) -> MediaAttachmen
     reference
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn renewed_lease_keeps_pool() {
     let (server_url, accepted, server) = spawn_keep_alive_http_server(b"hello", 2).await;
     let transport = BlossomHttpTransport::for_test(true, Duration::ZERO, Duration::from_secs(1));
@@ -1933,7 +1933,7 @@ async fn renewed_lease_keeps_pool() {
     assert_eq!(accepted.load(Ordering::SeqCst), 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uploads_reuse_renewed_pool() {
     let (url, accepted, server) = spawn_keep_alive_http_server(b"{}", 2).await;
     let transport = BlossomHttpTransport::for_test(true, Duration::ZERO, Duration::from_secs(1));
@@ -1952,7 +1952,7 @@ async fn uploads_reuse_renewed_pool() {
     assert_eq!(accepted.load(Ordering::SeqCst), 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repeated_same_origin_downloads_reuse_one_vetted_connection() {
     let (server_url, accepted, server) = spawn_keep_alive_http_server(b"hello", 2).await;
     let transport =
@@ -1980,7 +1980,7 @@ async fn repeated_same_origin_downloads_reuse_one_vetted_connection() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_same_origin_client_setup_resolves_and_vets_once() {
     let resolutions = Arc::new(AtomicUsize::new(0));
     let resolver_resolutions = resolutions.clone();
@@ -2009,7 +2009,7 @@ async fn concurrent_same_origin_client_setup_resolves_and_vets_once() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn separate_download_transports_do_not_share_connections() {
     let (server_url, accepted, server) = spawn_keep_alive_http_server(b"hello", 2).await;
     let first =
@@ -2033,7 +2033,7 @@ async fn separate_download_transports_do_not_share_connections() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn expired_origin_lease_is_resolved_and_vetted_again() {
     let resolutions = Arc::new(AtomicUsize::new(0));
     let resolver_resolutions = resolutions.clone();
@@ -2065,7 +2065,7 @@ async fn expired_origin_lease_is_resolved_and_vetted_again() {
     assert!(error.to_string().contains("public unicast"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stalled_first_locator_reaches_healthy_fallback_within_startup_bound() {
     let body = b"healthy ciphertext";
     let (stalled_url, stalled_server) = spawn_stalled_http_server().await;
@@ -2088,7 +2088,7 @@ async fn stalled_first_locator_reaches_healthy_fallback_within_startup_bound() {
 }
 
 /// Stalled locators reserve time for the remaining fallback candidates.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn locator_failover_shares_one_end_to_end_transfer_deadline() {
     const TRANSFER_DEADLINE: Duration = Duration::from_millis(130);
 
@@ -2121,7 +2121,7 @@ async fn locator_failover_shares_one_end_to_end_transfer_deadline() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slow_progressing_locator_is_not_cut_off_by_equal_fallback_share() {
     const GLOBAL_DEADLINE: Duration = Duration::from_millis(600);
     const FORMER_EQUAL_SHARE: Duration = Duration::from_millis(200);
@@ -2169,7 +2169,7 @@ async fn slow_progressing_locator_is_not_cut_off_by_equal_fallback_share() {
     assert_eq!(fallback_b_requests.load(Ordering::SeqCst), 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn media_download_client_does_not_short_circuit_the_body_idle_policy() {
     use super::attachment_resume::BODY_IDLE_TIMEOUT;
 
@@ -2211,7 +2211,7 @@ async fn media_download_client_does_not_short_circuit_the_body_idle_policy() {
 
 /// Expiring the shared deadline while a later locator is active must leave a
 /// failed sample for the transport phase that consumed the remaining budget.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shared_deadline_timeout_records_the_active_later_locator_phase() {
     let body = b"healthy ciphertext";
     let (first_url, first_server) = spawn_stalled_http_server().await;
@@ -2245,7 +2245,7 @@ async fn shared_deadline_timeout_records_the_active_later_locator_phase() {
     assert_eq!(response_headers.failures, 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transient_get_retries_once() {
     for first_status in [502, 503] {
         let server = spawn_http_responses(vec![
@@ -2276,7 +2276,7 @@ async fn transient_get_retries_once() {
     assert!(error.to_string().contains("HTTP 503"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trickle_yields_to_fallback() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2317,7 +2317,7 @@ async fn trickle_yields_to_fallback() {
     assert_eq!(downloaded, body);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn corrupt_first_locator_does_not_prevent_integrity_valid_fallback() {
     let body = b"integrity-valid ciphertext";
     let corrupt_url = spawn_http_response(http_ok_response(b"corrupt"));
@@ -2335,7 +2335,7 @@ async fn corrupt_first_locator_does_not_prevent_integrity_valid_fallback() {
     assert_eq!(downloaded, body);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fetch_blossom_blob_follows_hashless_redirect_targets() {
     let final_server = spawn_http_response(http_ok_response(b"hello"));
     let final_url = format!("{final_server}/signed/opaque-key?X-Amz-Signature=test");
@@ -2349,7 +2349,7 @@ async fn fetch_blossom_blob_follows_hashless_redirect_targets() {
     assert_eq!(bytes, b"hello");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fetch_blossom_blob_rejects_redirect_chain_over_limit() {
     let responses = (0..6)
         .map(|idx| http_redirect_response(&format!("/hop-{idx}/{}.bin", valid_hash())))
@@ -2361,7 +2361,7 @@ async fn fetch_blossom_blob_rejects_redirect_chain_over_limit() {
     assert!(err.to_string().contains("exceeded 5 hops"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fetch_blossom_blob_rejects_redirect_without_location() {
     let server = spawn_http_response(
         b"HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
@@ -2375,7 +2375,7 @@ async fn fetch_blossom_blob_rejects_redirect_without_location() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fetch_blossom_blob_reports_terminal_status_after_redirect() {
     let server = spawn_http_responses(vec![
         http_redirect_response("/missing-opaque-key"),
@@ -2390,7 +2390,7 @@ async fn fetch_blossom_blob_reports_terminal_status_after_redirect() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fetch_blossom_blob_follows_redirect_target_with_different_path_hash() {
     let final_server = spawn_http_response(http_ok_response(b"hello"));
     let final_url = format!("{final_server}/{}.bin", "22".repeat(32));
@@ -2404,7 +2404,7 @@ async fn fetch_blossom_blob_follows_redirect_target_with_different_path_hash() {
     assert_eq!(bytes, b"hello");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fetch_blossom_blob_rejects_oversized_content_length() {
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -2419,7 +2419,7 @@ async fn fetch_blossom_blob_rejects_oversized_content_length() {
 
 /// Rejecting a declared oversized body happens before transfer and must not
 /// contribute an artificial zero-duration sample to the transfer histogram.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_content_length_does_not_record_body_transfer_timing() {
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -2442,7 +2442,7 @@ async fn oversized_content_length_does_not_record_body_transfer_timing() {
 
 /// EOF before any body bytes is a failed first-byte phase, not a successful
 /// zero-duration transfer.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_response_records_first_byte_failure_without_body_transfer_timing() {
     let server = spawn_http_response(
         b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
@@ -2464,7 +2464,7 @@ async fn empty_response_records_first_byte_failure_without_body_transfer_timing(
     assert_eq!(snapshot.media_download_body_transfer.attempts, 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::disallowed_methods)]
 async fn limited_body_reader_rejects_chunked_body_over_cap() {
     let server = spawn_http_response(
@@ -2913,7 +2913,7 @@ fn media_attachment_outcomes_agree_between_tags_and_media_json() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ciphertext_mismatch_on_every_locator_is_a_download_failure_not_a_reference_error() {
     // The reference is structurally valid and its locator is fetchable; only
     // the bytes served do not verify. Per encrypted-media.md that is an
@@ -2936,7 +2936,7 @@ async fn ciphertext_mismatch_on_every_locator_is_a_download_failure_not_a_refere
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transport_rejection_is_a_download_failure() {
     let body = b"never served";
     let missing_url = spawn_http_response(http_not_found_response());
@@ -2955,7 +2955,7 @@ async fn transport_rejection_is_a_download_failure() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn decryption_failure_is_a_download_failure_not_a_reference_error() {
     let (server, _received) = spawn_roundtrip_blob_server();
     let endpoints = [blossom_endpoint(server)];
@@ -2992,7 +2992,7 @@ async fn decryption_failure_is_a_download_failure_not_a_reference_error() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_attempted_download_failure_outranks_an_unusable_locator_in_either_order() {
     // A permitted server was contacted and answered 503; a sibling locator
     // commits to a different blob and is never dialed. The attachment's class
@@ -3038,7 +3038,7 @@ fn private_address_resolver() -> DnsResolver {
     })
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dns_destination_policy_rejection_is_unfetchable_not_a_download_failure() {
     // The locator's hostname passes the literal-host prefilter, but DNS resolves
     // it to a private address, so the dial policy refuses it before any request
@@ -3062,7 +3062,7 @@ async fn dns_destination_policy_rejection_is_unfetchable_not_a_download_failure(
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dns_lookup_failure_is_a_download_failure() {
     let resolver: DnsResolver = Arc::new(move |_domain, _port| {
         Box::pin(async move { Err(AppError::BlobStore("media host DNS lookup failed".into())) })
@@ -3086,7 +3086,7 @@ async fn dns_lookup_failure_is_a_download_failure() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn policy_refused_and_attempted_candidates_classify_as_a_download_failure() {
     // One locator is refused by destination policy (DNS -> private address),
     // the other is a permitted loopback server answering 503. Because a server
@@ -3170,7 +3170,7 @@ async fn redirect_loop_with_policy_refusal_at(refused_hop: usize) -> AppError {
     .expect_err("a refused hop must fail the fetch")
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn policy_refusal_on_a_redirect_hop_is_a_download_failure_not_unfetchable() {
     // The origin server was contacted and answered with a redirect whose target
     // resolves to a forbidden address. Hosts must not be told nothing was
@@ -3189,7 +3189,7 @@ async fn policy_refusal_on_a_redirect_hop_is_a_download_failure_not_unfetchable(
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn policy_refusal_on_the_first_hop_stays_unfetchable() {
     let err = redirect_loop_with_policy_refusal_at(0).await;
     assert!(
@@ -3241,7 +3241,7 @@ pub(crate) fn attachment_worker_fixture_with_secret(
     )
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn automatic_attachment_classifies_integrity_and_streaming_size_failures_without_changing_explicit_limit()
  {
     let allowed = [BLOSSOM_LOCATOR_KIND_V1.into()];
@@ -3313,7 +3313,7 @@ async fn automatic_attachment_classifies_integrity_and_streaming_size_failures_w
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn automatic_attachment_stops_only_when_every_locator_reports_the_blob_missing() {
     let allowed = [BLOSSOM_LOCATOR_KIND_V1.into()];
     let status = |line: &str| {

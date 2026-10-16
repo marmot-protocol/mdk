@@ -597,7 +597,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn background_rebuild_requests_are_coalesced_until_worker_takes_command() {
         let (commands, mut rx) = mpsc::channel(32);
         let task = tokio::spawn(std::future::pending::<()>());
@@ -631,7 +631,7 @@ mod tests {
         task.abort();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn worker_clears_background_rebuild_flag_when_dequeuing_command() {
         let dir = tempfile::tempdir().unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
@@ -649,7 +649,7 @@ mod tests {
         handle.shutdown().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn full_rebuild_channel_coalesces_with_pending_foreground_rebuild() {
         let (commands, mut rx) = mpsc::channel(1);
         let task = tokio::spawn(std::future::pending::<()>());
@@ -685,7 +685,7 @@ mod tests {
 
         task.abort();
     }
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn blocked_account_lock_does_not_stall_directory_drain_or_rebuild_completion() {
         use crate::relay_plane::{DirectoryRelayEventRecord, DirectoryRelayPlaneEvent};
         use std::time::Duration;

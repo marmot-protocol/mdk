@@ -30,7 +30,7 @@ fn timeline(app: &MarmotApp, group: &GroupId) -> crate::TimelinePage {
     .unwrap()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restored_copy_retry_preserves_a_new_pending_send() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
@@ -99,12 +99,12 @@ async fn restored_copy_retry_preserves_a_new_pending_send() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repaired_activity_is_returned_before_its_newer_withdrawal() {
     assert_repaired_activity_precedes_withdrawal(false).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn checkpoint_retry_returns_older_activity_before_retained_withdrawal() {
     assert_repaired_activity_precedes_withdrawal(true).await;
 }
@@ -198,7 +198,7 @@ async fn assert_repaired_activity_precedes_withdrawal(checkpoint_retry: bool) {
     assert!(buffered.projection_updates.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn quiet_public_clients_return_repaired_activity_once() {
     for next_event in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -266,7 +266,7 @@ async fn quiet_public_clients_return_repaired_activity_once() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_drain_checkpoint_retains_progress_and_notifications() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
@@ -341,7 +341,7 @@ async fn cancelled_drain_checkpoint_retains_progress_and_notifications() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_commit_keeps_output() {
     #[derive(Clone, Copy, Debug)]
     enum Observer {
@@ -496,7 +496,7 @@ async fn cancelled_commit_keeps_output() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn partial_sync_failure_transfers_the_committed_prefix_once() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
@@ -543,7 +543,7 @@ async fn partial_sync_failure_transfers_the_committed_prefix_once() {
     assert!(client.sync().await.unwrap().projection_updates.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn committed_cleanup_retries_conversion_without_sweeping_new_sends() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -618,7 +618,7 @@ async fn committed_cleanup_retries_conversion_without_sweeping_new_sends() {
     assert!(summary.projection_updates.iter().flat_map(|update| &update.timeline_changes).any(|change| matches!(change, crate::TimelineMessageChange::Upsert { message, .. } if message.message_id_hex == old.message_id_hex && message.invalidation_status.is_some())), "the original cleanup notification must survive conversion failure");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelling_public_waits_keeps_repaired_notifications() {
     for next_event in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -714,7 +714,7 @@ async fn cancelling_public_waits_keeps_repaired_notifications() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_message_projection_does_not_duplicate_its_deferred_summary() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
@@ -771,7 +771,7 @@ async fn failed_message_projection_does_not_duplicate_its_deferred_summary() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelling_public_sync_while_waiting_for_recovery_keeps_repaired_activity() {
     use crate::runtime::account_worker::recovery_credits;
     let dir = tempfile::tempdir().unwrap();
@@ -861,7 +861,7 @@ async fn cancelling_public_sync_while_waiting_for_recovery_keeps_repaired_activi
     assert_eq!(count_activity(&client.sync().await.unwrap()), 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn second_local_delete_discards_retry_that_crossed_the_old_frontier() {
     for drained in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -965,7 +965,7 @@ async fn second_local_delete_discards_retry_that_crossed_the_old_frontier() {
 
 /// A fresh winner may describe the same activity as a withdrawn sibling commit.
 /// Its adoption and revival must be atomic, and stale loser replay is harmless.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn identical_fork_activity_adopts_canonical_origin_atomically() {
     use cgka_traits::{MessageRecord, MessageState, MessageStorage};
     let dir = tempfile::tempdir().unwrap();
@@ -1072,7 +1072,7 @@ async fn identical_fork_activity_adopts_canonical_origin_atomically() {
 
 /// Metadata-only failures are queued too; conversion failure must not lose a
 /// committed invalidation or repeat a previously returned prefix.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn eventless_failed_messages_retry_committed_conversion_and_prefix_once() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
@@ -1149,7 +1149,7 @@ async fn eventless_failed_messages_retry_committed_conversion_and_prefix_once() 
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn never_projected_terminal_group_does_not_stall_live_effects() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
@@ -1204,7 +1204,7 @@ async fn never_projected_terminal_group_does_not_stall_live_effects() {
     assert_eq!(timeline(&app, &healthy).messages.len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn early_bookkeeping_failure_retains_native_effects() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
@@ -1236,7 +1236,7 @@ async fn early_bookkeeping_failure_retains_native_effects() {
     assert_eq!(timeline(&app, &group).messages.len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accepted_own_group_command_retains_failed_activity_without_republishing() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -1275,7 +1275,7 @@ async fn accepted_own_group_command_retains_failed_activity_without_republishing
 
 /// A committed rename remains an activity even when the command's later local
 /// profile refresh fails. Its canonical event will not be emitted again.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accepted_own_activity_survives_later_local_refresh_failure() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -1318,7 +1318,7 @@ async fn accepted_own_activity_survives_later_local_refresh_failure() {
     assert_eq!(relay.published_event_ids().len(), published);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accepted_source_finalization_rolls_back_when_revival_conversion_fails() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
@@ -1383,7 +1383,7 @@ async fn accepted_source_finalization_rolls_back_when_revival_conversion_fails()
 
 /// A resumed accepted send owes its recipient wake after revival and checkpoint,
 /// including when either step has to finish on a later worker pass.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resumed_publication_wakes_after_revival_and_checkpoint() {
     for kind in [MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_POLL] {
         for fault in [
@@ -1668,7 +1668,7 @@ async fn resumed_publication_wakes_after_revival_and_checkpoint() {
 /// retained projection queue. Covers both entries that used to retain them
 /// (a locally deleted group, and a healthy send before the first drain),
 /// repeated retries, a restart, and recovery that keeps the delete intact.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn quarantined_group_events_do_not_retain_account_projection() {
     use cgka_traits::storage::MessageStorage;
 
@@ -1797,7 +1797,7 @@ async fn quarantined_group_events_do_not_retain_account_projection() {
 /// mdk#2318 hardening: a path that still reads a quarantined group strictly
 /// defers that group's events instead of retaining the batch at the head of
 /// the account queue, where it would hold every conversation's receives.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn strict_quarantined_group_read_defers_instead_of_holding_receives() {
     use cgka_traits::storage::MessageStorage;
 
@@ -1873,7 +1873,7 @@ async fn strict_quarantined_group_read_defers_instead_of_holding_receives() {
 /// Deferral is only for quarantined groups. Any other projection failure
 /// keeps its batch retained, and repeated failures are counted for the
 /// held-receive warning until the batch settles.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ordinary_projection_failure_stays_retained_and_counts_toward_stall_warning() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
@@ -1987,7 +1987,7 @@ fn deferral_skips_only_unprojected_events_of_deferred_groups() {
 
 /// A drained batch whose projection succeeds but whose checkpoint keeps
 /// failing stays retained, holding receives, so it counts toward the warning.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_drained_checkpoint_counts_toward_stall_warning() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())

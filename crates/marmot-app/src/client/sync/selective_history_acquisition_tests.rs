@@ -7,7 +7,7 @@ use std::sync::Arc;
 use storage_sqlite::TransportReconciliationRoute;
 use transport_nostr_adapter::NostrReconciliationSummary;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unfinished_selected_id_suffix_stays_pending_and_owner_paced() {
     let dir = tempfile::tempdir().unwrap();
     crate::AccountHome::open(dir.path())

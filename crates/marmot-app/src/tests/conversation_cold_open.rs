@@ -72,7 +72,7 @@ impl History {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_window_observes_pending_send_while_relay_publish_is_blocked() {
     check_pending_send(false, false).await;
     check_pending_send(true, false).await;
@@ -280,7 +280,7 @@ async fn check_pending_send(draft: bool, fail: bool) {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cold_open_renders_large_history_during_stalled_initial_sync() {
     for count in [200, 5_000] {
         let h = History::new(count).await;
@@ -370,7 +370,7 @@ async fn cold_open_renders_large_history_during_stalled_initial_sync() {
 }
 
 #[cfg(feature = "test-policy-overrides")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cold_open_before_hydration_and_after_runtime_restart_keeps_history_local() {
     let h = History::new(5_000).await;
     for _ in 0..2 {
@@ -423,7 +423,7 @@ async fn cold_open_before_hydration_and_after_runtime_restart_keeps_history_loca
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "diagnostic retained-history hydration timing matrix"]
 async fn cold_open_storage_and_hydration_timings() {
     for count in [200, 5_000] {
@@ -457,7 +457,7 @@ async fn cold_open_storage_and_hydration_timings() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn return_to_latest_from_history_uses_send_checkpoint_before_relay_release() {
     let h = History::new(60).await;
     let runtime = MarmotAppRuntime::new(h.app.clone());

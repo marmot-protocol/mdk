@@ -65,7 +65,7 @@ fn assert_no_session_connection_remains(root: &SuspensionRoot) {
     drop(MarmotRootRuntimeLease::try_acquire(&root.root).expect("root lease must be released"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_and_close_releases_an_idle_worker_engine_connection() {
     let (root, group_id) = open_suspension_root().await;
     let runtime = root.app.runtime();
@@ -84,7 +84,7 @@ async fn shutdown_and_close_releases_an_idle_worker_engine_connection() {
 /// A worker inside a command still owns its engine, so graceful shutdown
 /// cannot drop it before the budget runs out. The engine's connection must
 /// already be closed when the call returns.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_and_close_releases_a_busy_worker_engine_connection() {
     let (root, group_id) = open_suspension_root().await;
     let runtime = root.app.runtime();
@@ -121,7 +121,7 @@ async fn shutdown_and_close_releases_a_busy_worker_engine_connection() {
 /// An account open that has built its engine but not yet handed the client to
 /// its worker is the same exposure: the engine's connection exists and nothing
 /// the app caches holds it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_and_close_releases_the_engine_of_an_account_open_in_flight() {
     use crate::runtime::account_worker::AccountStartupStage;
 

@@ -1769,7 +1769,7 @@ mod tests {
         assert!(owner.maintenance_observations.contains_key(&group));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_later_grant_keeps_an_installed_maintenance_boundary_checkpointable() {
         use storage_sqlite::{
             RecoveryEndpointCheckpoint, RecoveryRequest, RecoveryScopeCheckpoint,
@@ -2123,7 +2123,7 @@ mod tests {
         assert_eq!(storage.recovery_retry_state().unwrap().attempt_serial, 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rejected_plan_preserves_observations_and_unspent_override() {
         let dir = tempfile::tempdir().unwrap();
         crate::AccountHome::open(dir.path())
@@ -2512,7 +2512,7 @@ mod tests {
         );
         assert_eq!(storage.pending_recovery_demands().unwrap().len(), 1);
     }
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn completed_known_event_metadata_waits_for_grant_release_then_is_reclaimed() {
         use storage_sqlite::{RecoveryEligibility, RecoveryRequest, RecoveryScopeCheckpoint};
         let dir = tempfile::tempdir().unwrap();
@@ -2638,7 +2638,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn post_join_boundary_completes_only_its_predicate_and_keeps_grace_fixed() {
         verify_post_join_boundary_and_grace().await;
     }
@@ -2794,7 +2794,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn frozen_wake_preserves_recovery_debt_and_cost_until_explicit_full_repair() {
         use crate::tests::{
             ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
@@ -2850,7 +2850,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn maintenance_boundary_installs_only_its_own_request() {
         verify_maintenance_boundary_request(true).await;
         verify_maintenance_boundary_request(false).await;
@@ -2860,7 +2860,7 @@ mod tests {
     /// the copy, less the clock-skew allowance, and never at the local join. A
     /// member that was offline joins from an old Welcome; the commits it must
     /// see before its first self-update were made after that Welcome.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn post_join_maintenance_req_is_floored_at_its_welcome_not_the_join() {
         use crate::tests::{
             ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
@@ -3145,7 +3145,7 @@ mod tests {
 
     /// Paused maintenance files no post-join boundary and drops an installed
     /// session; resuming files it again.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn paused_post_join_sweep_requests_nothing_and_drops_its_session() {
         use crate::tests::{
             ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
@@ -3258,7 +3258,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unknown_history_is_bounded_while_epoch_input_remains_retryable() {
         use crate::tests::{
             ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
@@ -3418,7 +3418,7 @@ mod tests {
     /// cause is still pending. Retiring that other cause must not strand it:
     /// the acknowledgment needs the attempt it was proven against, so the
     /// qualified loss is rearmed and the fence stays until it is proven again.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn retiring_the_last_pending_loss_rearms_a_deferred_acknowledgment() {
         use crate::client::history_notices::{park_recovery_for_test, settle_recovery_for_test};
         use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
@@ -3516,7 +3516,7 @@ mod tests {
 
     // Synthetic exhaustive backend evidence, independent of EOSE. Production
     // legacy reconciliation cannot manufacture these endpoint certificates.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn qualified_loss_completion_rolls_back_all_causes_after_plane_ack_failure() {
         use crate::tests::{
             ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
@@ -3718,7 +3718,7 @@ mod tests {
         assert_eq!(storage.restore_unacknowledged_recovery_loss().unwrap(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn recovery_inventory_is_frozen_before_io_and_excludes_future_items() {
         use crate::tests::{
             ScriptedPushRelayClient, bounded_epoch_backfill_config, client_on_app_relay_plane,
@@ -4117,7 +4117,7 @@ mod tests {
             .map(|demand| demand.eligibility)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn automatic_loss_completes_on_certified_comparisons_without_unfloored_replay() {
         let (_dir, relay, app, mut client, _pump) = certified_loss_fixture().await;
         let storage = app.account_storage("alice").unwrap();
@@ -4156,7 +4156,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn later_passes_keep_certificates_from_earlier_passes() {
         let (_dir, _relay, app, mut client, _pump) = certified_loss_fixture().await;
         let storage = app.account_storage("alice").unwrap();
@@ -4200,7 +4200,7 @@ mod tests {
     /// Creating a group changes the account's routes. That is not new
     /// evidence about history: routes whose own goal is unchanged keep their
     /// certificates, and only uncertified routes are compared again (mdk#2110).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_new_route_keeps_certificates_of_unchanged_routes() {
         let (_dir, _relay, app, mut client, _pump) = certified_loss_fixture().await;
         let storage = app.account_storage("alice").unwrap();
@@ -4255,7 +4255,7 @@ mod tests {
         assert_eq!(queue_loss(&storage), None);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn served_passes_that_certify_nothing_park_the_obligation() {
         // No known start: every served comparison finishes, none can certify.
         let (_dir, _relay, app, mut client, _pump) = loss_fixture(None).await;
@@ -4288,7 +4288,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn all_required_relay_outages_keep_retrying_without_spending_budget() {
         let (_dir, _relay, app, mut client, _pump) = loss_fixture(None).await;
         let storage = app.account_storage("alice").unwrap();
@@ -4311,7 +4311,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn partial_required_relay_failures_park_after_exactly_six_passes() {
         let (_dir, _relay, app, mut client, _pump) = loss_fixture_with_relays(
             None,
@@ -4374,7 +4374,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_permanently_unfetchable_id_parks_after_quiet_passes() {
         // The relays finish every comparison, but one ID they claim can never
         // be fetched: over the single-event ceiling, or always withheld.
@@ -4405,7 +4405,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_parked_history_debt_leaves_no_comparison_slot_retrying() {
         use crate::tests::{
             ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
@@ -4451,7 +4451,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn comparison_compares_routes_added_after_its_join_through_their_debt() {
         use crate::tests::{
             ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
@@ -4553,7 +4553,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn comparison_executes_against_the_rebuilt_endpoint_set_without_false_coverage() {
         use crate::tests::{
             ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
@@ -4648,7 +4648,7 @@ mod tests {
         assert!(!storage.recovery_comparison().unwrap().pending());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn full_history_completion_releases_comparison_and_other_recovery() {
         let (_dir, _relay, app, mut client, _pump) = certified_loss_fixture().await;
         let storage = app.account_storage("alice").unwrap();
@@ -4720,7 +4720,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn incremental_recovery_follows_replaced_inbox_relays_without_a_comparison_request() {
         use crate::tests::{
             ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
@@ -4787,7 +4787,7 @@ mod tests {
         assert_eq!(debt.scopes[0].goal.admitted_endpoints, vec![replacement]);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn quiet_slices_park_only_after_every_route_was_compared() {
         let (_dir, _relay, app, mut client, _pump) = loss_fixture(None).await;
         for index in 0..4 {
@@ -4825,7 +4825,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn best_effort_relay_failure_completes_on_the_operated_relay() {
         use crate::tests::{
             ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
@@ -4953,7 +4953,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn comparison_runtime_retries_failed_route_without_reissuing_successful_sibling() {
         use crate::tests::{
             ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
@@ -5086,7 +5086,7 @@ mod tests {
         assert_eq!(storage.recovery_retry_state().unwrap(), cost);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_comparison_executor_keeps_intent_cost_and_coverage() {
         use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
         let dir = tempfile::tempdir().unwrap();
@@ -5140,7 +5140,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn absent_comparison_backend_stays_parked_across_new_startup_requests() {
         use crate::tests::{
             ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
@@ -5189,7 +5189,7 @@ mod tests {
         assert!(storage.recovery_comparison().unwrap().pending());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn comparison_quantum_keeps_interrupted_route_retryable_and_unattempted_coverage_pending()
     {
         use crate::tests::{

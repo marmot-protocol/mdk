@@ -549,7 +549,7 @@ fn build_export_batch_appends_unlabeled_app_performance_metrics() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn telemetry_exporter_is_gated_and_builds_population_only_batch() {
     let relay_plane = MarmotRelayPlane::full_history();
 
@@ -897,7 +897,7 @@ fn runtime_metrics_keep_first_observation_and_export_live_gauges_without_labels(
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_publish_counters_are_unlabeled_population_points() {
     use crate::relay_plane::publish_accounting_tests::{AccountPublishFixture, PublishScript};
 
