@@ -177,6 +177,17 @@ impl Harness for SqliteHarness {
             .unwrap()
     }
 
+    fn record_wire_partial(&self, slot: u32, received: u64) {
+        self.storage
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE attachment_partial SET received=?2 WHERE token=?1",
+                rusqlite::params![self.token(slot), received as i64],
+            )
+            .unwrap();
+    }
+
     fn end_wire_partial(&self, slot: u32) {
         self.sql(
             "DELETE FROM attachment_partial WHERE token=?1",

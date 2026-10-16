@@ -25,7 +25,7 @@ struct State {
     refs: HashMap<u32, FileId>,
     superseded: HashSet<u32>,
     /// Wire files owned by a checkpoint row, by slot.
-    wires: HashMap<u32, FileId>,
+    wires: HashMap<u32, (FileId, u64)>,
 }
 
 impl State {
@@ -137,10 +137,20 @@ impl MemoryCatalog {
     /// Records a checkpoint row owning a new wire file for `slot`, replacing
     /// any earlier one, as a download's first checkpoint does.
     pub fn begin_wire_partial(&self, slot: u32, id: FileId) {
-        self.state().expect("catalog open").wires.insert(slot, id);
+        self.state()
+            .expect("catalog open")
+            .wires
+            .insert(slot, (id, 0));
     }
 
     /// Deletes `slot`'s checkpoint row, as completion, expiry or cleanup do.
+    /// Records that `slot`'s checkpoint holds `received` bytes.
+    pub fn record_wire_partial(&self, slot: u32, received: u64) {
+        if let Some(wire) = self.state().expect("catalog open").wires.get_mut(&slot) {
+            wire.1 = received;
+        }
+    }
+
     pub fn end_wire_partial(&self, slot: u32) {
         self.state().expect("catalog open").wires.remove(&slot);
     }
@@ -201,8 +211,13 @@ impl MediaCatalog for MemoryCatalog {
         Ok(self.state()?.mark_lost(id))
     }
 
-    fn wire_partial_exists(&self, id: FileId) -> CatalogResult<bool> {
-        Ok(self.state()?.wires.values().any(|wire| *wire == id))
+    fn wire_partial_received(&self, id: FileId) -> CatalogResult<Option<u64>> {
+        Ok(self
+            .state()?
+            .wires
+            .values()
+            .find(|(wire, _)| *wire == id)
+            .map(|(_, received)| *received))
     }
 
     fn page(&self, after: Option<FileId>, limit: usize) -> CatalogResult<Vec<(FileId, FileState)>> {

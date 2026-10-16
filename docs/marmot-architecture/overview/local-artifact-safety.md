@@ -102,7 +102,8 @@ account database stays the authority: each file's random key and state live in i
 - **Download checkpoints are `.wire` files.** A resumable download appends the received Blossom ciphertext (already
   encrypted to the group, never plaintext) to `<shard>/<id>.wire`, created at 0600. Its `attachment_partial` row
   commits before the file exists and is deleted before the file is unlinked; bytes are synced before the row records
-  them, and reopening truncates any unrecorded tail. The sweep unlinks wire files whose row is gone.
+  them, and reopening truncates any unrecorded tail, as does the sweep while no writer holds the file. The sweep
+  unlinks wire files whose row is gone.
 - **Terminal close covers media.** Once the account database closes, or the store's own close latch is tripped, media
   reads (including open readers), writes and sweeps fail with `Closed`. The store joins the runtime's close path; it
   never adds a second one.

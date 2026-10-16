@@ -163,13 +163,14 @@ impl MediaCatalog for SqliteMediaCatalog {
         self.run(|conn| mark_lost_in(conn, id))
     }
 
-    fn wire_partial_exists(&self, id: FileId) -> CatalogResult<bool> {
+    fn wire_partial_received(&self, id: FileId) -> CatalogResult<Option<u64>> {
         self.run(|conn| {
             conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM attachment_partial WHERE wire_file_id=?1)",
+                "SELECT received FROM attachment_partial WHERE wire_file_id=?1",
                 [id.as_bytes().as_slice()],
-                |row| row.get(0),
+                |row| crate::chat_presentation::nonnegative(row, 0),
             )
+            .optional()
             .storage()
         })
     }
