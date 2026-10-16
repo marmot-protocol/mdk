@@ -850,7 +850,7 @@ async fn mid_transfer_park_readmits_at_its_target_and_resumes() {
 /// the write is refused and the job parks for what its next attempt still
 /// writes (the rest of the body and its store file), instead of retrying on
 /// a timer that worker admission would keep refusing.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_checkpoint_write_parks_instead_of_retrying() {
     let plain = vec![0x34; (3 * MIB + 7) as usize];
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1046,7 +1046,7 @@ async fn memory_publication_onto_a_full_disk_parks_until_room_returns() {
 /// bounded below by the refusal's own free space plus a body, never four
 /// bodies: with little room left the job readmits as soon as that space is
 /// back, and resumes from its checkpoint.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn memory_publication_onto_a_full_disk_with_a_checkpoint_parks_for_the_store_file() {
     let plain = vec![0x46; (3 * MIB + 5) as usize];
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
