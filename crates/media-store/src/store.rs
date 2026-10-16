@@ -79,6 +79,8 @@ pub struct SweepReport {
     pub pending_removed: u64,
     pub orphans_unlinked: u64,
     pub lost_marked: u64,
+    /// Wire checkpoints cut back to their recorded length.
+    pub wire_tails_trimmed: u64,
     /// The batch finished a full pass over rows and shard directories.
     pub complete: bool,
 }
@@ -110,6 +112,8 @@ struct Inner<C> {
     readers: Mutex<Vec<CachedReader>>,
     #[cfg(any(test, feature = "test-support"))]
     full_disk_for_test: AtomicBool,
+    #[cfg(any(test, feature = "test-support"))]
+    full_wire_for_test: AtomicBool,
 }
 
 impl<C: MediaCatalog> Inner<C> {
@@ -228,6 +232,8 @@ impl<C: MediaCatalog> MediaStore<C> {
                 readers: Mutex::new(Vec::new()),
                 #[cfg(any(test, feature = "test-support"))]
                 full_disk_for_test: AtomicBool::new(false),
+                #[cfg(any(test, feature = "test-support"))]
+                full_wire_for_test: AtomicBool::new(false),
             }),
         }
     }
@@ -251,6 +257,13 @@ impl<C: MediaCatalog> MediaStore<C> {
     #[cfg(any(test, feature = "test-support"))]
     pub fn simulate_full_disk_for_test(&self, full: bool) {
         self.inner.full_disk_for_test.store(full, Ordering::Release);
+    }
+
+    /// Makes every wire checkpoint create and append fail as if the disk
+    /// were full, until reset. Test support only.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn simulate_full_wire_for_test(&self, full: bool) {
+        self.inner.full_wire_for_test.store(full, Ordering::Release);
     }
 
     fn forget_reader(&self, id: &FileId) {
@@ -549,6 +562,10 @@ impl<C: MediaCatalog> MediaStore<C> {
     /// replacing anything left at that name.
     pub fn create_wire(&self, id: &FileId) -> MediaResult<WireFile<C>> {
         self.inner.ensure_open()?;
+        #[cfg(any(test, feature = "test-support"))]
+        if self.inner.full_wire_for_test.load(Ordering::Acquire) {
+            return Err(MediaError::Capacity);
+        }
         fs_private::create_dir_all_private(&self.shard_dir(id.0[0])).map_err(|e| io_error(&e))?;
         let path = self.wire_path(id);
         remove_if_present(&path).map_err(|e| io_error(&e))?;
@@ -558,6 +575,7 @@ impl<C: MediaCatalog> MediaStore<C> {
         let file = options.open(&path).map_err(|e| io_error(&e))?;
         Ok(WireFile {
             inner: self.inner.clone(),
+            id: self.wire_in_flight(id),
             file,
             len: 0,
         })
@@ -586,9 +604,19 @@ impl<C: MediaCatalog> MediaStore<C> {
         }
         Ok(Some(WireFile {
             inner: self.inner.clone(),
+            id: self.wire_in_flight(id),
             file,
             len: received,
         }))
+    }
+
+    /// Marks the wire file `id` as open for writing, so the sweep leaves its
+    /// tail alone. Taken before the handle can append, under the in-flight
+    /// lock that the sweep holds from its check through any trim, so a trim
+    /// never cuts bytes a live handle wrote.
+    fn wire_in_flight(&self, id: &FileId) -> FileId {
+        lock(&self.inner.in_flight).insert(*id);
+        *id
     }
 
     /// Unlinks a wire file whose checkpoint row is already gone. Best
@@ -622,13 +650,19 @@ impl<C: MediaCatalog> MediaStore<C> {
         if cursor.rows_done {
             self.sweep_files(&mut cursor, limit, &mut report)?;
         }
-        if report.pending_removed + report.orphans_unlinked + report.lost_marked > 0 {
+        if report.pending_removed
+            + report.orphans_unlinked
+            + report.lost_marked
+            + report.wire_tails_trimmed
+            > 0
+        {
             tracing::info!(
                 target: TRACE_TARGET,
                 method = "sweep",
                 pending_removed = report.pending_removed,
                 orphans_unlinked = report.orphans_unlinked,
                 lost_marked = report.lost_marked,
+                wire_tails_trimmed = report.wire_tails_trimmed,
                 "media store sweep reclaimed state"
             );
         }
@@ -723,11 +757,27 @@ impl<C: MediaCatalog> MediaStore<C> {
                 {
                     // A checkpoint row is written before its wire file and
                     // deleted before it: no row means nothing will resume it.
-                    if !self.inner.catalog.wire_partial_exists(id)?
-                        && remove_if_present(&self.wire_path(&id)).map_err(|e| io_error(&e))?
-                    {
-                        report.orphans_unlinked += 1;
+                    // Bytes past the recorded length (a crash between append
+                    // and record) are dropped, unless a writer holds the file.
+                    let in_flight = lock(&self.inner.in_flight);
+                    if in_flight.contains(&id) {
+                        continue;
                     }
+                    match self.inner.catalog.wire_partial_received(id)? {
+                        None => {
+                            if remove_if_present(&self.wire_path(&id)).map_err(|e| io_error(&e))? {
+                                report.orphans_unlinked += 1;
+                            }
+                        }
+                        Some(received) => {
+                            if trim_wire(&self.wire_path(&id), received)
+                                .map_err(|e| io_error(&e))?
+                            {
+                                report.wire_tails_trimmed += 1;
+                            }
+                        }
+                    }
+                    drop(in_flight);
                     continue;
                 }
                 let Some(id) = FileId::parse_hex(name).filter(|id| id.0[0] == shard) else {
@@ -759,8 +809,31 @@ impl<C: MediaCatalog> MediaStore<C> {
 /// Every operation stops once the store or its catalog closes.
 pub struct WireFile<C> {
     inner: Arc<Inner<C>>,
+    /// Held in the in-flight set until this handle drops.
+    id: FileId,
     file: File,
     len: u64,
+}
+
+impl<C> Drop for WireFile<C> {
+    fn drop(&mut self) {
+        lock(&self.inner.in_flight).remove(&self.id);
+    }
+}
+
+/// Cuts a wire file longer than `received` back to it. A missing or shorter
+/// file is left for the next open to discard.
+fn trim_wire(path: &Path, received: u64) -> io::Result<bool> {
+    let file = match std::fs::OpenOptions::new().write(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if file.metadata()?.len() <= received {
+        return Ok(false);
+    }
+    file.set_len(received)?;
+    Ok(true)
 }
 
 impl<C: MediaCatalog> WireFile<C> {
@@ -777,12 +850,27 @@ impl<C: MediaCatalog> WireFile<C> {
     /// records the new length in the checkpoint row.
     pub fn append(&mut self, bytes: &[u8]) -> MediaResult<()> {
         self.inner.ensure_open()?;
+        #[cfg(any(test, feature = "test-support"))]
+        if self.inner.full_wire_for_test.load(Ordering::Acquire) {
+            return Err(MediaError::Capacity);
+        }
         self.file
             .seek(io::SeekFrom::Start(self.len))
             .and_then(|_| self.file.write_all(bytes))
             .map_err(|e| io_error(&e))?;
         sync_file(&self.file).map_err(|e| io_error(&e))?;
         self.len += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Drops bytes past `len` that the caller could not record, so they stop
+    /// taking disk space. `len` must not exceed what is on disk.
+    pub fn truncate(&mut self, len: u64) -> MediaResult<()> {
+        self.inner.ensure_open()?;
+        if len < self.len {
+            self.file.set_len(len).map_err(|e| io_error(&e))?;
+            self.len = len;
+        }
         Ok(())
     }
 
@@ -802,18 +890,17 @@ impl<C: MediaCatalog> WireFile<C> {
         Ok(copied)
     }
 
-    /// A reader over the recorded bytes, from the start. It holds the open
-    /// file, so a sweep that unlinks it later does not cut it short, and it
-    /// stops reading once the store or its catalog closes.
+    /// A reader over the recorded bytes, from the start. It keeps this
+    /// handle, so the file stays in flight (the sweep leaves it alone) and a
+    /// later unlink does not cut it short; it stops reading once the store or
+    /// its catalog closes.
     pub fn into_reader(mut self) -> MediaResult<WireReader<C>> {
         self.inner.ensure_open()?;
         self.file
             .seek(io::SeekFrom::Start(0))
             .map_err(|e| io_error(&e))?;
         Ok(WireReader {
-            inner: self.inner,
-            file: self.file,
-            len: self.len,
+            wire: self,
             position: 0,
         })
     }
@@ -822,34 +909,32 @@ impl<C: MediaCatalog> WireFile<C> {
 /// Reads a wire checkpoint's recorded bytes, never past them. Reads fail
 /// once the store or its catalog closes.
 pub struct WireReader<C> {
-    inner: Arc<Inner<C>>,
-    file: File,
-    len: u64,
+    wire: WireFile<C>,
     position: u64,
 }
 
 impl<C: MediaCatalog> WireReader<C> {
     /// The recorded length.
     pub fn len(&self) -> u64 {
-        self.len
+        self.wire.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.wire.len == 0
     }
 }
 
 impl<C: MediaCatalog> Read for WireReader<C> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if self.inner.is_closed() {
+        if self.wire.inner.is_closed() {
             return Err(io::Error::other("media store is closed"));
         }
-        let left = self.len.saturating_sub(self.position);
+        let left = self.wire.len.saturating_sub(self.position);
         let want = out.len().min(usize::try_from(left).unwrap_or(usize::MAX));
         if want == 0 {
             return Ok(0);
         }
-        let read = self.file.read(&mut out[..want])?;
+        let read = self.wire.file.read(&mut out[..want])?;
         if read == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -865,12 +950,12 @@ impl<C: MediaCatalog> Seek for WireReader<C> {
     fn seek(&mut self, to: io::SeekFrom) -> io::Result<u64> {
         let target = match to {
             io::SeekFrom::Start(offset) => Some(offset),
-            io::SeekFrom::End(delta) => self.len.checked_add_signed(delta),
+            io::SeekFrom::End(delta) => self.wire.len.checked_add_signed(delta),
             io::SeekFrom::Current(delta) => self.position.checked_add_signed(delta),
         }
-        .filter(|target| *target <= self.len)
+        .filter(|target| *target <= self.wire.len)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek outside checkpoint"))?;
-        self.position = self.file.seek(io::SeekFrom::Start(target))?;
+        self.position = self.wire.file.seek(io::SeekFrom::Start(target))?;
         Ok(self.position)
     }
 }

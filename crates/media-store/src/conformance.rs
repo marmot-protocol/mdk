@@ -41,6 +41,8 @@ pub trait Harness {
     /// Records a download checkpoint row for `slot` owning a new wire file,
     /// and returns that file's id. The file does not exist yet.
     fn begin_wire_partial(&self, slot: u32) -> FileId;
+    /// Records that `slot`'s checkpoint holds `received` bytes.
+    fn record_wire_partial(&self, slot: u32, received: u64);
     /// Deletes `slot`'s checkpoint row (completion, expiry, cleanup).
     fn end_wire_partial(&self, slot: u32);
 }
@@ -484,25 +486,37 @@ pub fn the_sweep_leaves_live_publishes_alone<H: Harness>(harness: H) {
 }
 
 /// A wire checkpoint survives the sweep while its row exists and is unlinked
-/// once the row goes; a wire file no row owns is unlinked. Reopening keeps
+/// once the row goes; a wire file no row owns is unlinked. The sweep trims an
+/// unrecorded tail back to the recorded length, except while the file is open
+/// for writing. Reopening keeps
 /// only the recorded length, and a file shorter than recorded cannot resume.
 pub fn wire_checkpoints_live_exactly_as_long_as_their_rows<H: Harness>(harness: H) {
     let store = store(&harness);
     let id = harness.begin_wire_partial(0);
     let mut wire = store.create_wire(&id).unwrap();
     wire.append(b"recorded").unwrap();
+    harness.record_wire_partial(0, 8);
     wire.append(b"-unrecorded").unwrap();
+    // A writer still holds the file: its tail may be recorded next.
+    assert_eq!(sweep_all(&store), (0, 0, 0));
+    assert_eq!(std::fs::metadata(store.wire_path(&id)).unwrap().len(), 19);
     drop(wire);
     let stray = FileId([0x7a; 16]);
     store.create_wire(&stray).unwrap().append(b"stray").unwrap();
 
     assert_eq!(sweep_all(&store), (0, 1, 0));
     assert!(!store.wire_path(&stray).exists());
+    assert_eq!(
+        std::fs::metadata(store.wire_path(&id)).unwrap().len(),
+        8,
+        "the unrecorded tail no longer takes disk space"
+    );
     let mut reopened = store.open_wire(&id, 8).unwrap().unwrap();
     assert_eq!(reopened.len(), 8);
     let mut prefix = Vec::new();
     reopened.copy_to(&mut prefix).unwrap();
     assert_eq!(prefix, b"recorded");
+    drop(reopened);
     assert!(
         store.open_wire(&id, 9).unwrap().is_none(),
         "shorter than recorded"

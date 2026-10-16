@@ -155,7 +155,9 @@ pub(crate) mod checkpoint_hooks {
 /// checkpoint, replacing any earlier one: its row commits before its file is
 /// created. Bytes reach the file and are synced before the row records them,
 /// so a crash leaves at most an unrecorded tail that the next open truncates.
-/// `false` means the attempt no longer owns a matching checkpoint.
+/// `false` means the attempt no longer owns a matching checkpoint. Bytes it
+/// appended but could not record are cut off again, so they do not hold disk
+/// the next attempt's admission needs.
 /// Blocking.
 pub(crate) fn write_checkpoint(
     storage: &SqliteAccountStorage,
@@ -165,7 +167,7 @@ pub(crate) fn write_checkpoint(
     offset: u64,
     bytes: &[u8],
     now: u64,
-) -> Result<bool, AppError> {
+) -> Result<bool, CheckpointWriteError> {
     let _lock = CheckpointLock::acquire(job);
     let (id, mut wire) = if offset == 0 {
         let previous = storage.load_attachment_partial(job, now, u64::MAX, None)?;
@@ -175,7 +177,7 @@ pub(crate) fn write_checkpoint(
         if let Some(previous) = previous {
             media.remove_wire(&previous.wire_file);
         }
-        (id, media.create_wire(&id).map_err(media_error)?)
+        (id, media.create_wire(&id).map_err(wire_error)?)
     } else {
         let expected = (&identity.ciphertext_digest, &identity.locator_digest);
         let Some(part) = storage.load_attachment_partial(job, now, u64::MAX, Some(expected))?
@@ -189,15 +191,47 @@ pub(crate) fn write_checkpoint(
         checkpoint_hooks::run(&job.reference);
         let Some(wire) = media
             .open_wire(&part.wire_file, offset)
-            .map_err(media_error)?
+            .map_err(wire_error)?
         else {
             return Ok(false);
         };
         (part.wire_file, wire)
     };
-    wire.append(bytes).map_err(media_error)?;
+    if let Err(error) = wire.append(bytes) {
+        // A short write (a full volume) may have left part of `bytes`.
+        let _ = wire.truncate(offset);
+        return Err(wire_error(error));
+    }
     let received = offset.saturating_add(bytes.len() as u64);
-    Ok(storage.record_attachment_partial(job, identity, &id, received, now)?)
+    let recorded = storage.record_attachment_partial(job, identity, &id, received, now)?;
+    if !recorded {
+        // Still under this job's lock: nothing else wrote this file since
+        // the lookup, so `offset` is its recorded length.
+        let _ = wire.truncate(offset);
+    }
+    Ok(recorded)
+}
+
+/// Why a checkpoint write failed.
+#[derive(Debug)]
+pub(crate) enum CheckpointWriteError {
+    /// The volume refused the checkpoint's bytes: the job parks for space.
+    Full,
+    /// Any other storage or file failure: a transient retry.
+    Failed,
+}
+
+impl From<cgka_traits::StorageError> for CheckpointWriteError {
+    fn from(_: cgka_traits::StorageError) -> Self {
+        Self::Failed
+    }
+}
+
+fn wire_error(error: media_store::MediaError) -> CheckpointWriteError {
+    match error {
+        media_store::MediaError::Capacity => CheckpointWriteError::Full,
+        _ => CheckpointWriteError::Failed,
+    }
 }
 
 /// The current checkpoint and its recorded prefix, read from its wire file.
@@ -621,12 +655,14 @@ impl AttachmentResume {
             let disk = DiskPolicy {
                 reserve_bytes: this.policy.disk_reserve,
             };
+            let body = identity
+                .total
+                .saturating_sub(super::file_transfer::MEDIA_AEAD_TAG_BYTES);
             if disk.admit(free, bytes.len() as u64) != Admission::Admitted {
-                let body = identity
-                    .total
-                    .saturating_sub(super::file_transfer::MEDIA_AEAD_TAG_BYTES);
                 return Err(storage_blocked(download_bytes(body, offset as u64)));
             }
+            // The volume can still fill between the measurement and the
+            // write: a refused write parks the same way.
             write_checkpoint(
                 &this.storage,
                 &this.media,
@@ -636,7 +672,10 @@ impl AttachmentResume {
                 &bytes,
                 crate::unix_now_seconds(),
             )
-            .map_err(|_| retry("partial checkpoint write failed"))
+            .map_err(|error| match error {
+                CheckpointWriteError::Full => storage_blocked(download_bytes(body, offset as u64)),
+                CheckpointWriteError::Failed => retry("partial checkpoint write failed"),
+            })
         })
         .await
         .map_err(|_| retry("partial checkpoint task failed"))??;

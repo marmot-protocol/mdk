@@ -1564,6 +1564,97 @@ async fn attachment_resume_complete_small_body_does_not_write_checkpoint() {
     server.await.unwrap();
 }
 
+/// A checkpoint write the volume refuses after free space was measured parks
+/// the job for the rest of the body and its store file, like a refusal at the
+/// measurement, instead of a timer retry that admission would keep refusing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_resume_full_disk_during_checkpoint_write_parks() {
+    let plain = vec![0x4e; ATTACHMENT_CHECKPOINT_BYTES + 71];
+    let (listener, reference, cipher) = listener_fixture(&plain).await;
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        headers(&mut socket).await;
+        // The parked client may close before reading the whole body.
+        let _ = socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n",
+                    cipher.len()
+                )
+                .as_bytes(),
+            )
+            .await;
+        let _ = socket.write_all(&cipher).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (client, store) = client_at(dir.path(), &reference, true).await;
+    let job = claim(&store);
+    let context = resume_context(&store, &job, dir.path(), &reference);
+    context.media.simulate_full_wire_for_test(true);
+    let prepared = client
+        .prepare_background_attachment_download(
+            &GroupId::new(vec![0xab; 16]),
+            reference.clone(),
+            64 * 1024 * 1024,
+        )
+        .unwrap()
+        .unwrap();
+    let result = prepared.run_classified(context).await;
+    assert!(
+        matches!(
+            &result,
+            Err(AttachmentDownloadFailure::StorageBlocked { headroom, .. })
+                if *headroom == 2 * plain.len() as u64
+        ),
+        "{:?}",
+        result.as_ref().err()
+    );
+    server.await.unwrap();
+}
+
+/// Bytes a checkpoint write appended but could not record, because a newer
+/// attempt took the job between its lookup and its record, are cut off again
+/// so they do not hold disk the job's admission needs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_checkpoint_record_drops_its_appended_tail() {
+    let (_listener, reference, _cipher) = listener_fixture(b"refused record").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_client, store) = client_at(dir.path(), &reference, true).await;
+    let old = claim(&store);
+    let identity = AttachmentPartialIdentity {
+        ciphertext_digest: [1; 32],
+        locator_digest: [2; 32],
+        etag: "\"v1\"".into(),
+        total: 10,
+    };
+    let now = crate::unix_now_seconds();
+    assert!(checkpoint(&store, dir.path(), &old, &identity, b"abc", now));
+    let claimer = store.clone();
+    crate::media::attachment_resume::checkpoint_hooks::after_lookup(&old.reference, move || {
+        claim(&claimer);
+    });
+    let media = test_media(&store, dir.path());
+    assert!(
+        !crate::media::attachment_resume::write_checkpoint(
+            &store, &media, &old, &identity, 3, b"old", now
+        )
+        .unwrap(),
+        "the newer attempt fences the old record"
+    );
+    let job = claim(&store);
+    let part = store
+        .load_attachment_partial(&job, now, 64 * 1024 * 1024, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(part.received, 3);
+    assert_eq!(
+        std::fs::metadata(media.wire_path(&part.wire_file))
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_resume_disabled_acquisition_still_prunes_expired_checkpoints() {
     let (dir, mut client, store, reference) = offline_fixture().await;

@@ -37,7 +37,9 @@ The encrypted per-file media store (mdk#2314). Human overview: [`README.md`](REA
 - A `.wire` checkpoint lives exactly as long as its catalog row: the row commits before the file is created and is
   deleted before the file is unlinked. Bytes are appended and synced before the row records them, and opening a
   wire file truncates it to the recorded length (a shorter file is not opened). The sweep unlinks any wire file
-  `wire_partial_exists` does not claim.
+  `wire_partial_received` does not claim and trims an unrecorded tail back to the recorded length. An open `WireFile`
+  is in the in-flight set from before its first append until it drops; the sweep skips in-flight wire files and holds
+  the in-flight lock from that check through any trim.
 - `PublishTarget` commits are one transaction each in the implementing catalog. Any change to their contract changes
   `conformance.rs` in the same commit, and every catalog (`storage-sqlite`, the in-memory one) must keep passing it.
 - One `MediaStore` (and its clones) per account: the in-flight set that protects live publishes from the sweep is

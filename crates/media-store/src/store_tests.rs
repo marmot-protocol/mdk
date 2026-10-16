@@ -64,6 +64,10 @@ impl Harness for MemoryHarness {
         id
     }
 
+    fn record_wire_partial(&self, slot: u32, received: u64) {
+        self.catalog.record_wire_partial(slot, received);
+    }
+
     fn end_wire_partial(&self, slot: u32) {
         self.catalog.end_wire_partial(slot);
     }
