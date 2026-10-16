@@ -85,7 +85,9 @@ sample. These measurements do not include host rendering or every subsequent eng
 
 **Shutdown.** Hosts whose process can be suspended must call `MarmotAppRuntime::shutdown_and_close`, which closes every
 database and releases file locks; `shutdown` alone does not. See
-[local artifact safety](../../docs/marmot-architecture/overview/local-artifact-safety.md).
+[local artifact safety](../../docs/marmot-architecture/overview/local-artifact-safety.md). A projection update
+reaches live subscriptions only after the write behind it has committed, so an update a host received that way is
+still stored after `shutdown_and_close`.
 
 For where the code lives (`src/runtime/`, `src/client/`, `src/directory/`, `src/media/`, and so on) see
 [`AGENTS.md`](AGENTS.md).

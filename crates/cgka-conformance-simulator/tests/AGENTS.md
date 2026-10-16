@@ -184,6 +184,8 @@ determinism, reachability, interaction-coverage, and promotion checks when addin
 ## Verification
 
 ```sh
-cargo test -p cgka-conformance-simulator
-cargo test -p cgka-conformance-simulator --features conformance-slow
+cargo test -p cgka-conformance-simulator --test <file>   # the file you changed
+just simulator-smoke                                     # PR-lane selection
 ```
+
+`--features conformance-slow` is the pre-release pass; run it locally only when asked.

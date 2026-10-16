@@ -783,6 +783,18 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
     }
 }
 
+/// Register for a fixture's release before the held call is announced. The
+/// tests release with `notify_waiters`, which reaches only registered waiters,
+/// and on a multi-thread runtime the test can observe the announcement and
+/// release before the held call's first poll.
+fn registered_release(
+    release: &tokio::sync::Notify,
+) -> std::pin::Pin<Box<tokio::sync::futures::Notified<'_>>> {
+    let mut released = Box::pin(release.notified());
+    released.as_mut().enable();
+    released
+}
+
 impl ScriptedPushRelayClient {
     fn script(&self, results: impl IntoIterator<Item = bool>) {
         *self.publish_results.lock().unwrap() = results.into_iter().collect();
@@ -1160,10 +1172,11 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                 .block_next_subscribe
                 .swap(false, std::sync::atomic::Ordering::SeqCst);
         if blocked {
+            let released = registered_release(&self.subscribe_release);
             self.blocked_subscribe_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.subscribe_started.notify_one();
-            self.subscribe_release.notified().await;
+            released.await;
             if self
                 .fail_blocked_subscribe
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -1185,8 +1198,9 @@ impl NostrRelayClient for ScriptedPushRelayClient {
             .block_next_unsubscribe
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
+            let released = registered_release(&self.unsubscribe_release);
             self.unsubscribe_started.notify_one();
-            self.unsubscribe_release.notified().await;
+            released.await;
         }
         Ok(())
     }
@@ -1240,11 +1254,9 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                 .iter()
                 .any(|endpoint| endpoint.0 == "wss://index.example")
         {
-            // Register for release before signalling the start, as below.
-            let mut release = std::pin::pin!(self.indexer_publish_release.notified());
-            release.as_mut().enable();
+            let released = registered_release(&self.indexer_publish_release);
             self.indexer_publish_started.notify_one();
-            release.await;
+            released.await;
         }
         let unavailable = self.unavailable_endpoints.lock().unwrap().clone();
         if self
@@ -1284,15 +1296,11 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                 .block_next_publish
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            // Register for release before signalling the start, so a test
-            // that releases as soon as it sees the start cannot miss this
-            // publication (`notify_waiters` only reaches registered waiters).
-            let mut release = std::pin::pin!(self.publish_release.notified());
-            release.as_mut().enable();
+            let released = registered_release(&self.publish_release);
             self.blocked_publish_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.publish_started.notify_one();
-            release.await;
+            released.await;
         }
         if self
             .reject_next_publish

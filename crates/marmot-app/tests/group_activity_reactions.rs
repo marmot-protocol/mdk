@@ -4,7 +4,10 @@
 use std::time::Duration;
 
 use marmot_account::AccountHome;
-use marmot_app::{MarmotApp, MarmotAppConfig, MarmotAppEvent, TimelineMessageQuery};
+use marmot_app::{
+    MarmotApp, MarmotAppConfig, MarmotAppEvent, RuntimeTimelineMessagesSubscription,
+    TimelineMessageQuery, TimelinePage,
+};
 use nostr_relay_builder::MockRelay;
 
 /// Open an isolated account home against the fixture relay without development settlement delays.
@@ -19,7 +22,8 @@ fn open(dir: &tempfile::TempDir, relay: &str) -> MarmotApp {
     )
 }
 
-/// Prove member-visible add/retract updates and target stability across independent encrypted-store reopens.
+/// Prove member-visible add/retract updates and target stability across independent encrypted-store reopens,
+/// and that a reaction a live timeline showed survives a close made right after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn members_share_real_activity_targets_and_reactions_after_reopen() {
     let relay = MockRelay::run().await.unwrap();
@@ -107,92 +111,83 @@ async fn members_share_real_activity_targets_and_reactions_after_reopen() {
         .subscribe_timeline_messages("alice", query.clone())
         .await
         .unwrap();
-    for (runtime, label, other) in [
-        (&alice, "alice", &mut bob_timeline),
-        (&bob, "bob", &mut alice_timeline),
+    for (runtime, label, reactor, other) in [
+        (&alice, "alice", &alice_id, &mut bob_timeline),
+        (&bob, "bob", &bob_id, &mut alice_timeline),
     ] {
         runtime
             .react_to_message(label, &group, &target, "👍")
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(15), async {
-            while other.take_snapshot().messages[0]
-                .reactions
-                .user_reactions
-                .is_empty()
-            {
-                other.recv().await.unwrap();
-            }
-        })
-        .await
-        .unwrap();
+        wait_for_reactions(other, &[(reactor, "👍")]).await;
         runtime
             .unreact_from_message(label, &group, &target)
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(15), async {
-            while !other.take_snapshot().messages[0]
-                .reactions
-                .user_reactions
-                .is_empty()
-            {
-                other.recv().await.unwrap();
-            }
-        })
-        .await
-        .unwrap();
+        wait_for_reactions(other, &[]).await;
     }
     // Keep a member-authored reaction live across both encrypted-store reopens.
     bob.react_to_message("bob", &group, &target, "❤️")
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(15), async {
-        while alice_timeline.take_snapshot().messages[0]
-            .reactions
-            .user_reactions
-            .is_empty()
-        {
-            alice_timeline.recv().await.unwrap();
-        }
-    })
-    .await
-    .unwrap();
-    // Alice's live timeline can show the reaction before her ingest commits it,
-    // and `shutdown_and_close` rolls an uncommitted write back. Close only once
-    // both stores hold it, so the reopen below checks durable state.
-    tokio::time::timeout(Duration::from_secs(15), async {
-        for (app, label) in [(&alice_app, "alice"), (&bob_app, "bob")] {
-            while app
-                .timeline_messages_with_query(label, query.clone())
-                .unwrap()
-                .messages[0]
-                .reactions
-                .user_reactions
-                .is_empty()
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }
-    })
-    .await
-    .expect("both stores commit the reaction");
+    let heart = [(bob_id.as_str(), "❤️")];
+    wait_for_reactions(&mut alice_timeline, &heart).await;
+    // Close the moment Alice's timeline shows the reaction. A live update is
+    // published only after the ingest that produced it commits (mdk#2345).
     alice.shutdown_and_close().await.unwrap();
     bob.shutdown_and_close().await.unwrap();
-    for (dir, label) in [(&alice_dir, "alice"), (&bob_dir, "bob")] {
+    for (dir, label, source) in [
+        (&alice_dir, "alice", "Alice's live timeline showed"),
+        (&bob_dir, "bob", "Bob's completed send recorded"),
+    ] {
         let app = open(dir, &url);
+        // Read before any runtime starts, so no catch-up can restore it.
+        let stored = app
+            .timeline_messages_with_query(label, query.clone())
+            .unwrap();
+        assert_eq!(stored.messages.len(), 1);
+        assert_eq!(stored.messages[0].message_id_hex, target);
+        assert_eq!(
+            reactions(&stored),
+            heart,
+            "{label}'s store must keep the reaction {source}"
+        );
         let runtime = app.runtime();
         runtime.start().await.unwrap();
-        let rows = runtime
+        let snapshot = runtime
             .subscribe_timeline_messages(label, query.clone())
             .await
             .unwrap()
-            .take_snapshot()
-            .messages;
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].message_id_hex, target);
-        assert_eq!(rows[0].reactions.user_reactions.len(), 1);
-        assert_eq!(rows[0].reactions.user_reactions[0].sender, bob_id);
-        assert_eq!(rows[0].reactions.user_reactions[0].emoji, "❤️");
+            .take_snapshot();
+        assert_eq!(snapshot.messages.len(), 1);
+        assert_eq!(snapshot.messages[0].message_id_hex, target);
+        assert_eq!(reactions(&snapshot), heart);
         runtime.shutdown_and_close().await.unwrap();
     }
+}
+
+/// The `(sender, emoji)` reactions on the timeline's one row.
+fn reactions(page: &TimelinePage) -> Vec<(&str, &str)> {
+    page.messages[0]
+        .reactions
+        .user_reactions
+        .iter()
+        .map(|reaction| (reaction.sender.as_str(), reaction.emoji.as_str()))
+        .collect()
+}
+
+/// Wait until the live timeline shows exactly `expected`. A timeline also
+/// receives its own account's reactions, so a looser check such as "any
+/// reaction" can pass on an update left over from an earlier step.
+async fn wait_for_reactions(
+    timeline: &mut RuntimeTimelineMessagesSubscription,
+    expected: &[(&str, &str)],
+) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while reactions(&timeline.take_snapshot()) != expected {
+            timeline.recv().await.unwrap();
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timeline never showed reactions {expected:?}"));
 }

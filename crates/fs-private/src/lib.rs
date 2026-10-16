@@ -898,6 +898,9 @@ pub fn create_new_private(path: &Path) -> io::Result<std::fs::File> {
 
 /// Ensure a file exists at `path` with mode 0600: created atomically at 0600
 /// if missing, tightened to 0600 if pre-existing. Contents are untouched.
+///
+/// Opens and closes a descriptor on the file. Never use it for a SQLite
+/// database or sidecar: use [`ensure_private_db_files`].
 pub fn ensure_private_file(path: &Path) -> io::Result<()> {
     let mut options = OpenOptions::new();
     options.write(true).create(true);
@@ -907,7 +910,10 @@ pub fn ensure_private_file(path: &Path) -> io::Result<()> {
 }
 
 /// Tighten an existing file at `path` to 0600; `Ok(())` when it does not
-/// exist (for optional sidecars such as `-wal`/`-shm`).
+/// exist.
+///
+/// Opens and closes a descriptor on the file. Never use it for a SQLite
+/// database or sidecar: use [`ensure_private_db_files`].
 pub fn tighten_existing_private_file(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -927,19 +933,150 @@ pub fn tighten_existing_private_file(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Serializes [`ensure_private_db_files`] within the process.
+static DB_FILE_PREPARATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Make a SQLite database owner-only before SQLite can create it at the
-/// process umask: pre-create the main file 0600 (SQLite then copies its mode
-/// onto the `-wal`/`-shm`/journal sidecars it creates) and tighten any
-/// sidecars left behind by earlier permissive builds — SQLite does not
-/// rewrite pre-existing sidecar modes when the main file's mode changes.
+/// process umask, without disturbing connections this process already holds
+/// to it.
+///
+/// A missing main file is created 0600 (`O_CREAT | O_EXCL`); SQLite then
+/// copies its mode onto the `-wal`/`-shm`/journal sidecars it creates. An
+/// existing main file, and sidecars left behind by earlier permissive builds,
+/// are tightened by path: SQLite does not rewrite pre-existing sidecar modes
+/// when the main file's mode changes.
+///
+/// This never opens a descriptor on a file that already exists. On POSIX,
+/// closing any descriptor on a file releases every `fcntl` lock the process
+/// holds on it, so an open and close here would silently drop a live
+/// connection's SHARED lock and `-shm` read locks while SQLite still believes
+/// it holds them (SQLite "How To Corrupt", section 2.2). Another process could
+/// then take the database exclusively, checkpoint the WAL, or reinitialise
+/// `-shm` under that connection. The one descriptor opened here belongs to a
+/// file this call just created, and the in-process mutex keeps a concurrent
+/// preparer of the same path from returning, and letting SQLite lock the new
+/// file, until that descriptor is closed.
 pub fn ensure_private_db_files(path: &Path) -> io::Result<()> {
-    ensure_private_file(path)?;
+    let _preparing = DB_FILE_PREPARATION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    set_private_file_mode(&mut options);
+    match options.open(path) {
+        Ok(created) => set_handle_private(&created)?,
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            if !tighten_db_file_in_place(path)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "SQLite database file disappeared while it was being prepared",
+                ));
+            }
+        }
+        Err(err) => return Err(err),
+    }
     for suffix in ["-wal", "-shm", "-journal"] {
         let mut sidecar = path.as_os_str().to_owned();
         sidecar.push(suffix);
-        tighten_existing_private_file(Path::new(&sidecar))?;
+        tighten_db_file_in_place(Path::new(&sidecar))?;
     }
     Ok(())
+}
+
+/// Tighten an existing database file to 0600 by path, without opening it.
+/// Returns whether the file exists. Refuses symlinks and non-regular files.
+fn tighten_db_file_in_place(path: &Path) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err),
+        };
+        if !metadata.file_type().is_file() {
+            return Err(not_a_regular_db_file());
+        }
+        if metadata.permissions().mode() & MAX_MODE != PRIVATE_FILE_MODE {
+            chmod_private_no_follow(path)?;
+        }
+        Ok(true)
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(path.exists())
+    }
+}
+
+#[cfg(unix)]
+fn not_a_regular_db_file() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "SQLite database files must be regular files, not symlinks",
+    )
+}
+
+/// `chmod` that does not follow a final symlink and opens no lockable
+/// descriptor: native on Apple platforms; Linux libcs emulate it with an
+/// `O_PATH` descriptor, which takes no part in POSIX record locks.
+#[cfg(unix)]
+fn chmod_private_no_follow(path: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    // SAFETY: `c_path` is a valid NUL-terminated string that outlives the call.
+    let result = unsafe {
+        libc::fchmodat(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            PRIVATE_FILE_MODE as libc::mode_t,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    // glibc before 2.32 has no no-follow chmod, so do what later libcs do.
+    // A plain path chmod would follow a symlink swapped in after `lstat`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if matches!(err.raw_os_error(), Some(code) if code == libc::EOPNOTSUPP || code == libc::ENOTSUP)
+    {
+        return chmod_private_through_o_path(&c_path);
+    }
+    Err(err)
+}
+
+/// Bind the chmod to one inode: an `O_PATH | O_NOFOLLOW` descriptor names the
+/// directory entry itself, even a symlink, so a swap after validation cannot
+/// redirect it, and closing an `O_PATH` descriptor releases no POSIX record
+/// locks. Needs `/proc`; fails closed without it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn chmod_private_through_o_path(c_path: &std::ffi::CStr) -> io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::PermissionsExt;
+
+    // SAFETY: `c_path` is a valid NUL-terminated string that outlives the call.
+    let raw = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a descriptor this call just opened and nothing else owns.
+    let entry = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+    if !entry.metadata()?.file_type().is_file() {
+        return Err(not_a_regular_db_file());
+    }
+    // `/proc/self/fd/N` resolves to this descriptor's inode, not to the path.
+    std::fs::set_permissions(
+        format!("/proc/self/fd/{}", entry.as_raw_fd()),
+        std::fs::Permissions::from_mode(PRIVATE_FILE_MODE),
+    )
 }
 
 fn set_handle_private(file: &std::fs::File) -> io::Result<()> {
@@ -1429,6 +1566,170 @@ mod unix_tests {
         let fresh = dir.path().join("fresh.sqlite");
         ensure_private_db_files(&fresh).unwrap();
         assert_eq!(mode_of(&fresh), 0o600);
+    }
+
+    #[test]
+    fn ensure_private_db_files_refuses_symlinks_without_touching_targets() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, b"unchanged").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        for (index, suffix) in ["", "-wal", "-shm", "-journal"].into_iter().enumerate() {
+            let db = dir.path().join(format!("{index}.sqlite"));
+            if !suffix.is_empty() {
+                std::fs::write(&db, b"").unwrap();
+            }
+            let mut link = db.as_os_str().to_owned();
+            link.push(suffix);
+            symlink(&target, &link).unwrap();
+            assert!(ensure_private_db_files(&db).is_err(), "suffix {suffix:?}");
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+        assert_eq!(mode_of(&target), 0o644);
+    }
+
+    /// The chmod must not follow a symlink that replaced a database file after
+    /// `lstat` validated it.
+    #[test]
+    fn db_chmod_after_a_symlink_swap_leaves_the_target_alone() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, b"unchanged").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let swapped = dir.path().join("db.sqlite-wal");
+        symlink(&target, &swapped).unwrap();
+
+        // Apple platforms change the link's own mode; Linux refuses.
+        let _ = chmod_private_no_follow(&swapped);
+        assert_eq!(mode_of(&target), 0o644);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let c_path = std::ffi::CString::new(swapped.as_os_str().as_bytes()).unwrap();
+            assert!(chmod_private_through_o_path(&c_path).is_err());
+            assert_eq!(mode_of(&target), 0o644);
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn o_path_chmod_tightens_a_regular_file() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite");
+        std::fs::write(&path, b"x").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        chmod_private_through_o_path(&c_path).unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    const DB_LOCK_PROBE_PATH: &str = "FS_PRIVATE_DB_LOCK_PROBE_PATH";
+    const DB_FILE_SUFFIXES: [&str; 4] = ["", "-wal", "-shm", "-journal"];
+
+    fn db_file(db: &Path, suffix: &str) -> PathBuf {
+        let mut path = db.as_os_str().to_owned();
+        path.push(suffix);
+        PathBuf::from(path)
+    }
+
+    /// Take a nonblocking whole-file POSIX record lock, as SQLite does.
+    fn fcntl_lock(file: &std::fs::File, lock_type: libc::c_int) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `flock` is plain old data; all-zero is a valid value.
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = lock_type as _;
+        lock.l_whence = libc::SEEK_SET as _;
+        // SAFETY: the descriptor is open for the call and `lock` is valid.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) } == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Child half of `ensure_private_db_files_keeps_live_posix_locks`: every
+    /// database file must still refuse a write lock.
+    #[test]
+    fn db_lock_probe_child() {
+        let Some(db) = std::env::var_os(DB_LOCK_PROBE_PATH) else {
+            return;
+        };
+        for suffix in DB_FILE_SUFFIXES {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(db_file(Path::new(&db), suffix))
+                .unwrap();
+            let err = fcntl_lock(&file, libc::F_WRLCK as _)
+                .expect_err("the parent's read lock must still be held");
+            assert!(
+                matches!(err.raw_os_error(), Some(libc::EAGAIN | libc::EACCES)),
+                "suffix {suffix:?}: {err}"
+            );
+        }
+    }
+
+    /// Closing any descriptor on a file drops every `fcntl` lock the process
+    /// holds on it, so preparing a database that has a live connection must
+    /// not open and close the database or its sidecars.
+    #[test]
+    fn ensure_private_db_files_keeps_live_posix_locks() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("live.sqlite");
+        let held: Vec<std::fs::File> = DB_FILE_SUFFIXES
+            .iter()
+            .map(|suffix| {
+                let path = db_file(&db, suffix);
+                std::fs::write(&path, b"x").unwrap();
+                // Permissive, so the tightening path runs under the lock.
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+                let file = OpenOptions::new().read(true).open(&path).unwrap();
+                fcntl_lock(&file, libc::F_RDLCK as _).unwrap();
+                file
+            })
+            .collect();
+
+        ensure_private_db_files(&db).unwrap();
+        for suffix in DB_FILE_SUFFIXES {
+            assert_eq!(mode_of(&db_file(&db, suffix)), 0o600, "suffix {suffix:?}");
+        }
+        // The old-glibc fallback must be just as lock-safe.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        for suffix in DB_FILE_SUFFIXES {
+            use std::os::unix::ffi::OsStrExt;
+            let path = db_file(&db, suffix);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            chmod_private_through_o_path(&c_path).unwrap();
+            assert_eq!(mode_of(&path), 0o600, "suffix {suffix:?}");
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "unix_tests::db_lock_probe_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(DB_LOCK_PROBE_PATH, &db)
+            .output()
+            .expect("run lock probe child test process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "preparing a locked database dropped this process's locks:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("1 passed"), "the probe must run");
+        drop(held);
     }
 
     #[test]

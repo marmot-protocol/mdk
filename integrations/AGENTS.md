@@ -198,8 +198,9 @@ just agent-install-docs-gate
 just naming-gate
 ```
 
-For shared connector or release-workflow changes, run `just fast-ci` before
-pushing and let GitHub run the full CI matrix.
+For release-workflow changes, run `just fast-ci` once before pushing. For
+shared connector changes, follow `crates/agent-connector/AGENTS.md`. GitHub CI
+runs the rest.
 
 ## Adding A New Integration
 

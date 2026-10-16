@@ -3034,6 +3034,103 @@ mod tests {
         drop(store);
     }
 
+    #[cfg(unix)]
+    const TAKEOVER_PROBE_PATH: &str = "MDK_STORAGE_TEST_TAKEOVER_PROBE_PATH";
+    #[cfg(unix)]
+    const TAKEOVER_PROBE_KEY: &str = "posix lock retention key";
+
+    /// Child half of [`reopening_a_live_database_keeps_its_posix_locks`]: try
+    /// to take the database exclusively and write. Passes only when SQLite
+    /// refuses with `SQLITE_BUSY` because the parent still holds its locks.
+    #[test]
+    #[cfg(unix)]
+    fn exclusive_takeover_probe_child() {
+        let Some(path) = std::env::var_os(TAKEOVER_PROBE_PATH) else {
+            return;
+        };
+        let key = SqlCipherKey::new(TAKEOVER_PROBE_KEY.to_owned()).unwrap();
+        let connection = rusqlite::Connection::open(path).unwrap();
+        apply_cipher_pragmas(&connection, &SqliteStorageOptions::default()).unwrap();
+        apply_sqlcipher_key(&connection, &key).unwrap();
+        connection.busy_timeout(Duration::ZERO).unwrap();
+        connection
+            .pragma_update(None, "locking_mode", "EXCLUSIVE")
+            .unwrap();
+        let error = connection
+            .execute_batch("CREATE TABLE takeover_probe (id INTEGER)")
+            .expect_err("a database another process holds open must refuse an exclusive writer");
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn assert_exclusive_takeover_refused(path: &Path, stage: &str) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "connection::tests::exclusive_takeover_probe_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(TAKEOVER_PROBE_PATH, path)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stage}: another process took the database exclusively while this process held \
+             it open:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("1 passed"), "{stage}: the probe must run");
+    }
+
+    /// On POSIX, closing any descriptor on a file drops every `fcntl` lock this
+    /// process holds on it, and SQLite never notices. Opening a database that
+    /// already has a live connection must therefore not open and close the
+    /// database or its sidecars outside SQLite, or another process (the iOS
+    /// Notification Service Extension) could take the database exclusively,
+    /// checkpoint the WAL or reinitialise `-shm` under the live connection.
+    #[test]
+    #[cfg(unix)]
+    fn reopening_a_live_database_keeps_its_posix_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let key = SqlCipherKey::new(TAKEOVER_PROBE_KEY.to_owned()).unwrap();
+        let live = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        // A WAL write so the -wal/-shm sidecars exist and the next open's file
+        // preparation reaches them too.
+        live.lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE lock_probe (id INTEGER); INSERT INTO lock_probe VALUES (1);",
+            )
+            .unwrap();
+        assert_exclusive_takeover_refused(&path, "one live connection");
+
+        let second = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert_exclusive_takeover_refused(&path, "after a second open of the same database");
+
+        drop(second);
+        let rows: i64 = live
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM lock_probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert_exclusive_takeover_refused(&path, "after the second connection closed");
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+            assert!(
+                sidecar.exists(),
+                "{suffix} must survive while a connection is open"
+            );
+        }
+    }
+
     #[test]
     fn encrypted_connection_pins_cipher_pragmas_before_keying() {
         let _guard = TRACE_TEST_LOCK.lock().unwrap();
