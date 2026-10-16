@@ -12,6 +12,7 @@
 #[path = "support/limit_relay.rs"]
 mod limit_relay;
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -23,7 +24,10 @@ use cgka_traits::{
 use limit_relay::{LimitConfig, LimitRelay, LimitStats, NegFault, RejectStyle, ReqOutcome, reason};
 use nostr_relay_builder::prelude::{MemoryDatabase, MemoryDatabaseOptions, NostrDatabase};
 use nostr_relay_builder::{LocalRelay, RelayBuilder};
-use nostr_sdk::prelude::{Client, EventBuilder, FinalizeEvent, Keys, Kind, RelayOptions, Tag};
+use nostr_sdk::prelude::{
+    Client, ClientMessage, EventBuilder, FinalizeEvent, Keys, Kind, RelayOptions, SubscriptionId,
+    Tag,
+};
 use tokio::task::JoinHandle;
 use transport_nostr_adapter::{
     GROUP_BATCH_ROUTES, NostrReconciliationFailure, NostrReconciliationProgress, NostrRelayClient,
@@ -1087,8 +1091,39 @@ async fn connected_fixture(config: LimitConfig, events: usize) -> (Fixture, Stri
     (fx, url)
 }
 
-/// Live NEG sessions left on the relay once a pass's cleanup frames land.
+/// Wait until the relay has handled every frame the client queued so far. One
+/// connection is FIFO, so a marker queued now arrives after all of them.
+async fn flush_client_frames(fx: &Fixture) {
+    let mark = format!(
+        "{}{}",
+        limit_relay::FLUSH_PREFIX,
+        SubscriptionId::generate()
+    );
+    fx.sdk
+        .client()
+        .relay(fx.limit.url())
+        .await
+        .unwrap()
+        .expect("the limit relay is in the pool")
+        .send_msg(ClientMessage::Close(Cow::Owned(SubscriptionId::new(&mark))))
+        .await
+        .unwrap();
+    assert!(
+        fx.limit
+            .wait_for(SETTLE_TIMEOUT, |s| s.flushes.contains(&mark))
+            .await,
+        "the relay never handled the flush marker"
+    );
+}
+
+/// Live NEG sessions left on the relay once a pass's cleanup frames land. A
+/// dropped pass closes its session from a task nostr-sdk spawns, so its
+/// NEG-OPEN can still be in flight here. Read too early, the relay shows no
+/// session, and that open lands later and can take the slot the next pass
+/// needs. Flush first: every open the client queued then sits on the relay,
+/// each followed by its close, so a zero count is final.
 async fn neg_sessions_after_pass(fx: &Fixture) -> usize {
+    flush_client_frames(fx).await;
     fx.limit
         .wait_for(Duration::from_secs(1), |s| s.neg_active_now() == 0)
         .await;

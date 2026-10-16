@@ -47,6 +47,11 @@ pub mod reason {
 pub const REQ_LIMIT_CLAMP: u64 = 500;
 /// Largest `limit` strfry accepts on a NEG-OPEN filter.
 pub const NEG_MAX_LIMIT: u64 = 5_000_000;
+/// A CLOSE whose id starts with this is a test's flush marker: the proxy
+/// records it in `LimitStats::flushes` and drops it. One connection is FIFO,
+/// so once a marker is recorded, every frame its client queued earlier has
+/// been handled.
+pub const FLUSH_PREFIX: &str = "limit-relay-flush-";
 
 /// Negentropy v1 message: version 0x61, one range up to infinity (timestamp
 /// 0, empty id prefix) in Fingerprint mode (1) with a fingerprint no set has.
@@ -190,6 +195,8 @@ pub struct LimitStats {
     pub neg_disallowed_kinds_seen: BTreeSet<u64>,
     pub forced_drops: usize,
     pub req_log: Vec<ReqRecord>,
+    /// Flush markers (`FLUSH_PREFIX`) the proxy has handled.
+    pub flushes: BTreeSet<String>,
 }
 
 impl LimitStats {
@@ -705,6 +712,10 @@ fn inspect_client_frame(
                     }
                 }
             }
+        }
+        "CLOSE" if id.starts_with(FLUSH_PREFIX) => {
+            shared.stats.flushes.insert(id);
+            Verdict::Swallow
         }
         "CLOSE" => {
             shared.stats.closes += 1;

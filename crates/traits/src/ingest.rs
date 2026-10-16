@@ -97,6 +97,33 @@ pub enum DeferralLineage {
     ContestedFork,
 }
 
+/// Durable evidence that a group has moved past this device: the undecryptable
+/// transport objects it retained while stuck at its current epoch.
+///
+/// Live ingest reports the same evidence one deferral at a time, but only to
+/// the process that ingested it. A process that does not track stalls (a
+/// short notification wake, say) still retains each object as a
+/// `PeelDeferred` row, so a later process can rebuild the evidence from
+/// storage instead of losing it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeferredStallEvidence {
+    /// The group's current local epoch. Only rows deferred at this epoch count.
+    pub epoch: EpochId,
+    /// The group's deferral lineage, as a live deferral would report it.
+    pub lineage: DeferralLineage,
+    /// Rows retained at `epoch`, in storage order, up to the requested limit.
+    pub rows: Vec<DeferredStallRow>,
+}
+
+/// One retained undecryptable transport object.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeferredStallRow {
+    pub message_id: MessageId,
+    /// The outer transport timestamp the object arrived with, so callers can
+    /// apply the same "predates this copy" filter live ingest applies.
+    pub transport_timestamp: crate::transport::Timestamp,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InputRejectionCategory {
     Duplicate,

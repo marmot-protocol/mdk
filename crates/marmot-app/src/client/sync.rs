@@ -3878,8 +3878,10 @@ impl AppClient {
     /// never recovers the group escalates onto the next successful sync summary,
     /// the seam every worker surface already publishes. Only observed under
     /// `CursorPersistence::Advance`: a `Frozen` wake-collection pass must not
-    /// own recovery, and the main app sees the same evidence on its own next
-    /// sync.
+    /// own recovery. Its deferrals still reach the detector, but not on the
+    /// main app's next sync, where they arrive as duplicates: the next
+    /// `Advance` open rebuilds them from the retained rows instead
+    /// ([`Self::seed_epoch_stall_from_deferred_rows`]).
     fn detect_epoch_stall(
         &mut self,
         group_id_hint: Option<cgka_traits::GroupId>,
@@ -3969,6 +3971,58 @@ impl AppClient {
             decision,
             crate::client::epoch_stall::backfill_trigger_for(outcome),
         );
+    }
+
+    /// Rebuild undecryptable-traffic evidence from durable deferred rows.
+    ///
+    /// [`Self::detect_epoch_stall`] counts only deferrals this process ingests
+    /// in `Advance` mode. A `Frozen` wake (an iOS notification extension) still
+    /// retains each undecryptable object as a `PeelDeferred` row, but when the
+    /// main app next syncs those objects arrive as duplicates, so live
+    /// detection never sees them. A device woken mostly by notifications then
+    /// arms only when one app session happens to see enough live traffic
+    /// (mdk#2257). This feeds the rows retained at each group's current epoch
+    /// through the same detector and filters instead, for groups the detector
+    /// has not already signalled at that epoch. It changes no durable state
+    /// unless the detector arms.
+    pub(crate) fn seed_epoch_stall_from_deferred_rows(&mut self) {
+        if self.app.cursor_persistence() != CursorPersistence::Advance {
+            return;
+        }
+        let limit = self.epoch_stall.threshold();
+        let groups = self
+            .state
+            .groups
+            .iter()
+            .filter_map(|group| hex::decode(&group.group_id_hex).ok())
+            .map(GroupId::new)
+            .collect::<Vec<_>>();
+        for group_id in groups {
+            let Ok(evidence) = self.runtime.deferred_stall_evidence(&group_id, limit) else {
+                continue;
+            };
+            // Retained rows supply only the first arm. Once this group has
+            // signalled at the evidence epoch, here or in the durable state
+            // restored before hydration, rows replayed on every later open are
+            // not fresh traffic and must not pace re-arms or end the run.
+            if evidence.rows.is_empty()
+                || self.epoch_stall.has_signalled_at(&group_id, evidence.epoch)
+            {
+                continue;
+            }
+            let outcome = IngestOutcome::TransportDeferred {
+                group_id: group_id.clone(),
+                lineage: evidence.lineage,
+            };
+            for row in evidence.rows {
+                self.detect_epoch_stall(
+                    Some(group_id.clone()),
+                    &hex::encode(row.message_id.as_slice()),
+                    &outcome,
+                    row.transport_timestamp,
+                );
+            }
+        }
     }
 
     /// Apply an epoch-stall backfill decision: arm the replay, and record an

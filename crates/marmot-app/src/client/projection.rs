@@ -654,6 +654,9 @@ impl AppClient {
             }
         }
         self.reconcile_disband_drafts();
+        // Live group state is readable from here on either open path, and the
+        // durable stall evidence was restored before this seam.
+        self.seed_epoch_stall_from_deferred_rows();
         self.backfill_self_membership_once()?;
         self.backfill_direct_conversation_members_once()
     }

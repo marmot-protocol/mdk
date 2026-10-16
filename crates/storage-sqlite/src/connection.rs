@@ -1661,6 +1661,15 @@ impl StorageProvider for SqliteAccountStorage {
         self.connection.with_savepoint(|| f(self))
     }
 
+    fn rollback_group_state_keeping_live_records(
+        &self,
+        group_id: &cgka_traits::types::GroupId,
+        name: &str,
+    ) -> StorageResult<()> {
+        // Restores canonical state only, even from a full snapshot.
+        cgka_traits::storage::MessageStorage::rollback_group_state_to_snapshot(self, group_id, name)
+    }
+
     fn backend(&self) -> Backend {
         Backend::Sqlite
     }

@@ -3173,6 +3173,66 @@ impl<S: StorageProvider> Engine<S> {
         Ok(self.storage.get_group(group_id)?)
     }
 
+    /// The undecryptable transport objects this device retained for a group
+    /// while stuck at its current epoch, up to `limit`, with the group's
+    /// deferral lineage.
+    ///
+    /// Live ingest reports each deferral to the process that ingested it. This
+    /// lets a later process rebuild the same evidence from the durable
+    /// `PeelDeferred` rows, for example after a notification wake retained
+    /// them without tracking stalls. Rows deferred at another epoch, rows
+    /// whose payload is not a raw transport object, and rows older than this
+    /// copy's Welcome (`Group::transport_message_predates_local_copy`, the
+    /// filter live detection applies) are skipped before `limit` counts. The
+    /// lineage scan runs only when at least one row qualifies.
+    pub fn deferred_stall_evidence(
+        &mut self,
+        group_id: &GroupId,
+        limit: usize,
+    ) -> Result<cgka_traits::DeferredStallEvidence, EngineError> {
+        self.ensure_group_live(group_id)?;
+        let group = self.storage.get_group(group_id)?;
+        let epoch = group.epoch;
+        let mut rows = Vec::new();
+        if limit > 0 {
+            for metadata in self.storage.list_deferred_message_metadata(group_id)? {
+                if metadata.epoch != epoch {
+                    continue;
+                }
+                // Best-effort evidence: a row that cannot be read now is
+                // skipped, as one retired between the listing and this read is.
+                let Ok(record) = self.storage.get_message(&metadata.id) else {
+                    continue;
+                };
+                let Ok(cgka_traits::message::StoredMessagePayload::RawTransport(message)) =
+                    cgka_traits::message::StoredMessagePayload::decode(&record.payload)
+                else {
+                    continue;
+                };
+                if group.transport_message_predates_local_copy(message.timestamp) {
+                    continue;
+                }
+                rows.push(cgka_traits::DeferredStallRow {
+                    message_id: metadata.id,
+                    transport_timestamp: message.timestamp,
+                });
+                if rows.len() >= limit {
+                    break;
+                }
+            }
+        }
+        let lineage = if rows.is_empty() {
+            cgka_traits::ingest::DeferralLineage::Uncontested
+        } else {
+            self.deferral_lineage(group_id)?
+        };
+        Ok(cgka_traits::DeferredStallEvidence {
+            epoch,
+            lineage,
+            rows,
+        })
+    }
+
     /// Profile selected for newly emitted KeyPackages and newly created groups.
     pub fn new_protocol_profile(&self) -> ProtocolProfile {
         self.new_protocol_profile

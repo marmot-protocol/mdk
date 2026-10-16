@@ -709,6 +709,16 @@ impl AccountDeviceSession {
         Ok(self.engine.group_record(group_id)?)
     }
 
+    /// Undecryptable objects retained while stuck at the group's current
+    /// epoch; see `Engine::deferred_stall_evidence`.
+    pub fn deferred_stall_evidence(
+        &mut self,
+        group_id: &GroupId,
+        limit: usize,
+    ) -> SessionResult<cgka_traits::DeferredStallEvidence> {
+        Ok(self.engine.deferred_stall_evidence(group_id, limit)?)
+    }
+
     pub fn new_protocol_profile(&self) -> ProtocolProfile {
         self.engine.new_protocol_profile()
     }

@@ -336,7 +336,7 @@ fn with_anchor<S: StorageProvider, T>(
         &rewind_probe_snapshot_suffix(group, epoch),
     )?;
     let result = match storage
-        .rollback_group_state_to_snapshot(group, &retained_anchor_snapshot_name(epoch))
+        .rollback_group_state_keeping_live_records(group, &retained_anchor_snapshot_name(epoch))
     {
         Ok(()) => {
             crate::test_crash_hooks::pause_if_requested(if peel {
