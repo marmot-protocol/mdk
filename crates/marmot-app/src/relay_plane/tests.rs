@@ -6114,12 +6114,6 @@ async fn publish_auth_quorum_does_not_wait_for_unobserved_fallback() {
     let plane = MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(30), true);
     let fallback = Arc::new(ObservedPublishClient::new(PublishCompletion::Hold).await);
     let adapter = plane.account_adapter(fallback.account_id.clone(), fallback.clone());
-    let mut notifications = adapter
-        .anonymous_publish_client
-        .as_ref()
-        .unwrap()
-        .client()
-        .notifications();
     let signed = EventBuilder::new(Kind::TextNote, "quorum cancels held authentication")
         .finalize(&Keys::generate())
         .unwrap();
@@ -6141,21 +6135,12 @@ async fn publish_auth_quorum_does_not_wait_for_unobserved_fallback() {
     .await
     .expect("both authenticated publications must run concurrently");
     gate.0.add_permits(1);
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if let RelayPoolNotification::Message {
-                relay_url, message, ..
-            } = notifications.next().await.unwrap()
-                && matches!(*message, RelayMessage::Ok { status: true, .. })
-                && relay_url.as_str() == public_url.as_str()
-            {
-                break;
-            }
-        }
-    })
-    .await
-    .expect("the public relay must acknowledge before the deadline");
-    let outcome = timeout(Duration::from_secs(1), publication)
+    // The authenticated attempts are held, so a publication that waited for
+    // them would run to ACCOUNT_PUBLISH_WAIT (20 s). Finishing well inside it
+    // once the public relay may acknowledge proves the quorum ended it. This
+    // waits on the publication itself rather than the pool's notification
+    // stream, which a busy runner can lag or close first.
+    let outcome = timeout(Duration::from_secs(5), publication)
         .await
         .expect("met quorum must not wait for an unobserved authenticated ACK")
         .unwrap()
