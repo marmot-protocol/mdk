@@ -2744,9 +2744,9 @@ async fn full_account_queue_spills_before_it_omits() {
             .map(|delivery| {
                 if spill.len() < 2 {
                     spill.push(delivery.clone());
-                    storage_sqlite::DeliverySpillDisposition::Stored
+                    DeliverySpillDisposition::Stored
                 } else {
-                    storage_sqlite::DeliverySpillDisposition::Full
+                    DeliverySpillDisposition::Full
                 }
             })
             .collect())
@@ -2906,10 +2906,7 @@ async fn transient_spill_store_failures_are_retried_instead_of_lost() {
         if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
             return Err(AccountDeliveryRecoveryMarkerError::Retryable);
         }
-        Ok(vec![
-            storage_sqlite::DeliverySpillDisposition::Stored;
-            deliveries.len()
-        ])
+        Ok(vec![DeliverySpillDisposition::Stored; deliveries.len()])
     });
     let adapter = relay_plane.account_adapter_with_recovery_marker(
         alice.clone(),
@@ -2947,10 +2944,7 @@ async fn replaced_adapter_wakes_when_an_earlier_spill_write_commits() {
         while !gate.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(5));
         }
-        Ok(vec![
-            storage_sqlite::DeliverySpillDisposition::Stored;
-            deliveries.len()
-        ])
+        Ok(vec![DeliverySpillDisposition::Stored; deliveries.len()])
     });
     let first = relay_plane.account_adapter_with_recovery_marker(
         alice.clone(),
@@ -3020,10 +3014,7 @@ async fn replacement_after_retirement_shares_an_in_flight_spill_write() {
                 std::thread::sleep(Duration::from_millis(5));
             }
             if outcome == Outcome::Commit {
-                Ok(vec![
-                    storage_sqlite::DeliverySpillDisposition::Stored;
-                    deliveries.len()
-                ])
+                Ok(vec![DeliverySpillDisposition::Stored; deliveries.len()])
             } else {
                 Err(AccountDeliveryRecoveryMarkerError::Closed)
             }
@@ -3119,12 +3110,8 @@ async fn pending_spill_wakeup_wins_over_a_ready_live_queue() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
     let alice = MemberId::new(vec![0xA1; 32]);
-    let store: AccountDeliverySpillStore = Arc::new(|deliveries| {
-        Ok(vec![
-            storage_sqlite::DeliverySpillDisposition::Stored;
-            deliveries.len()
-        ])
-    });
+    let store: AccountDeliverySpillStore =
+        Arc::new(|deliveries| Ok(vec![DeliverySpillDisposition::Stored; deliveries.len()]));
     let adapter = relay_plane.account_adapter_with_recovery_marker(
         alice.clone(),
         relay.clone(),
@@ -3152,10 +3139,7 @@ async fn spill_hand_off_bounds_deliveries_with_empty_payloads() {
         while !gate.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(5));
         }
-        Ok(vec![
-            storage_sqlite::DeliverySpillDisposition::Stored;
-            deliveries.len()
-        ])
+        Ok(vec![DeliverySpillDisposition::Stored; deliveries.len()])
     });
     let spill = delivery_spill::AccountDeliverySpill::new(
         store,
@@ -3252,10 +3236,7 @@ fn recording_spill_store() -> (
     let spill = kept.clone();
     let store: AccountDeliverySpillStore = Arc::new(move |deliveries| {
         spill.lock().unwrap().extend(deliveries.iter().cloned());
-        Ok(vec![
-            storage_sqlite::DeliverySpillDisposition::Stored;
-            deliveries.len()
-        ])
+        Ok(vec![DeliverySpillDisposition::Stored; deliveries.len()])
     });
     (store, kept)
 }

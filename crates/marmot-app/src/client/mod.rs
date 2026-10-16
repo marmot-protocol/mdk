@@ -70,7 +70,7 @@ mod audit;
 mod audit_recovery;
 mod audit_v5_app_update;
 pub(crate) mod audit_v5_probe;
-mod delivery_spill;
+pub(crate) mod delivery_spill;
 pub(crate) mod epoch_stall;
 pub(crate) mod history_notices;
 mod invite_recovery;

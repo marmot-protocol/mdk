@@ -52,7 +52,16 @@ pub use telemetry::{
     EngineReorgMetrics, RelayRollupEntry, RelayTelemetryRollup, RelayTelemetrySnapshot,
 };
 
-pub(crate) use delivery_spill::{ACCOUNT_DELIVERY_SPILL_LIMITS, AccountDeliverySpillStore};
+/// Every relay client the plane builds routes through the process SOCKS5
+/// configuration: the same builder `crate::network_proxy::nostr_builder`
+/// returns, called here so the plane does not reach into the app for it.
+pub(crate) fn nostr_builder() -> nostr_sdk::prelude::ClientBuilder {
+    transport_nostr_adapter::network_proxy::nostr_builder(
+        transport_nostr_adapter::network_proxy::socks5_proxy(),
+    )
+}
+
+pub(crate) use delivery_spill::{AccountDeliverySpillStore, DeliverySpillDisposition};
 pub(crate) use directory::{
     DirectoryEventQuery, DirectoryFetchOutcome, DirectoryFetchRequest, DirectoryInspectionError,
     DirectoryRelayEventRecord, DirectoryRelayFetcher, DirectoryRelayPlane, DirectoryRelayStats,
@@ -1423,7 +1432,7 @@ impl MarmotRelayPlane {
             .transport
             .sdk_relay_client
             .as_ref()
-            .map(|_| NostrSdkRelayClient::from_builder(crate::network_proxy::nostr_builder()));
+            .map(|_| NostrSdkRelayClient::from_builder(nostr_builder()));
         MarmotRelayPlaneAccountAdapter {
             account_id,
             relay_plane: self.clone(),
