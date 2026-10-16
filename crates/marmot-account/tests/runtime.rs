@@ -2346,6 +2346,63 @@ async fn publish_migrates_a_legacy_retained_consumption_marker_before_clearing_i
 }
 
 #[tokio::test]
+async fn welcome_for_current_package_migrates_a_legacy_retained_marker_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("marmot kp legacy marker ingest key").unwrap();
+    let now = unix_now();
+    let wall = Arc::new(TestWallClock::new(now));
+    let mut runtime = AccountDeviceRuntime::new(
+        session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![])
+            .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(43)),
+    );
+    let alice_id = runtime.session().self_id();
+    let first = runtime.publish_fresh_key_package().await.unwrap();
+    let second = runtime.publish_fresh_key_package().await.unwrap();
+    let mut lifecycle = runtime.key_package_maintenance_status().unwrap().unwrap();
+    lifecycle.last_consumed_key_package_ref = Some(key_package_ref(&first));
+    lifecycle.last_consumed_at = Some(Timestamp(now));
+    runtime
+        .session()
+        .put_key_package_lifecycle(&lifecycle)
+        .unwrap();
+
+    // A Welcome for the current package lands before any sweep or
+    // publication could migrate the old record's marker.
+    let mut bob = session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let welcome = welcome_for_key_package(&mut bob, &alice_id, second.clone(), "current").await;
+    runtime.session_mut().ingest(welcome).await.unwrap();
+    let lifecycle = runtime.key_package_maintenance_status().unwrap().unwrap();
+    assert!(retained_entry(&lifecycle, &first).consumed);
+    assert_eq!(
+        lifecycle.last_consumed_key_package_ref,
+        Some(key_package_ref(&second))
+    );
+
+    let delete_at = retained_entry(&lifecycle, &first).delete_at();
+    wall.set(delete_at.0);
+    assert_eq!(
+        runtime
+            .sweep_expired_key_package_private_material()
+            .unwrap(),
+        1
+    );
+    assert!(
+        !runtime
+            .durably_owned_key_packages()
+            .unwrap()
+            .contains(&first)
+    );
+}
+
+#[tokio::test]
 async fn pending_replacement_consumed_before_acknowledgement_is_due_after_promotion() {
     let dir = tempfile::tempdir().unwrap();
     let alice_database = dir.path().join("alice.sqlite");

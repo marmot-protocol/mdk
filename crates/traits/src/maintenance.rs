@@ -328,10 +328,10 @@ pub struct KeyPackageLifecycleState {
     /// MLS Welcome. This comes from the Welcome's encrypted-group-secrets
     /// entries matched against local bundles, never from a transport tag.
     ///
-    /// It names the current package, whose consumption makes a replacement
-    /// due. A pending or retained package records its own consumption, so a
-    /// delayed Welcome for one cannot overwrite this marker; see
-    /// [`Self::record_consumed_key_package`].
+    /// It names only the current package, whose consumption makes a
+    /// replacement due. A pending or retained package records its own
+    /// consumption, so a delayed Welcome for one cannot overwrite this marker;
+    /// see [`Self::record_consumed_key_package`].
     #[serde(default)]
     pub last_consumed_key_package_ref: Option<Vec<u8>>,
     #[serde(default)]
@@ -374,19 +374,12 @@ impl KeyPackageLifecycleState {
 
     /// Record that a successfully processed Welcome consumed `key_package_ref`.
     pub fn record_consumed_key_package(&mut self, key_package_ref: &[u8], consumed_at: Timestamp) {
-        if let Some(material) = self
-            .retained_private_material
-            .iter_mut()
-            .find(|material| material.key_package_ref == key_package_ref)
+        // An older record may keep a replaced or pending package's consumption
+        // only in the marker this can overwrite.
+        self.migrate_legacy_consumption_marker();
+        if !self.mark_replaced_or_pending_consumed(key_package_ref, consumed_at)
+            && self.current_key_package_ref.as_deref() == Some(key_package_ref)
         {
-            material.consumed = true;
-        } else if let Some(pending) = self
-            .pending_replacement
-            .as_mut()
-            .filter(|pending| pending.key_package_ref == key_package_ref)
-        {
-            pending.consumed_at.get_or_insert(consumed_at);
-        } else {
             self.last_consumed_key_package_ref = Some(key_package_ref.to_vec());
             self.last_consumed_at = Some(consumed_at);
         }
@@ -399,21 +392,37 @@ impl KeyPackageLifecycleState {
         let Some(consumed) = self.last_consumed_key_package_ref.clone() else {
             return false;
         };
-        let names_replaced_or_pending = self
-            .retained_private_material
-            .iter()
-            .any(|material| material.key_package_ref == consumed)
-            || self
-                .pending_replacement
-                .as_ref()
-                .is_some_and(|pending| pending.key_package_ref == consumed);
-        if !names_replaced_or_pending {
+        let consumed_at = self.last_consumed_at.unwrap_or(Timestamp(0));
+        if !self.mark_replaced_or_pending_consumed(&consumed, consumed_at) {
             return false;
         }
         self.last_consumed_key_package_ref = None;
-        let consumed_at = self.last_consumed_at.take().unwrap_or(Timestamp(0));
-        self.record_consumed_key_package(&consumed, consumed_at);
+        self.last_consumed_at = None;
         true
+    }
+
+    fn mark_replaced_or_pending_consumed(
+        &mut self,
+        key_package_ref: &[u8],
+        consumed_at: Timestamp,
+    ) -> bool {
+        if let Some(material) = self
+            .retained_private_material
+            .iter_mut()
+            .find(|material| material.key_package_ref == key_package_ref)
+        {
+            material.consumed = true;
+            return true;
+        }
+        if let Some(pending) = self
+            .pending_replacement
+            .as_mut()
+            .filter(|pending| pending.key_package_ref == key_package_ref)
+        {
+            pending.consumed_at.get_or_insert(consumed_at);
+            return true;
+        }
+        false
     }
 }
 
@@ -536,6 +545,36 @@ mod tests {
             lifecycle.pending_replacement.unwrap().consumed_at,
             Some(Timestamp(12))
         );
+    }
+
+    #[test]
+    fn current_consumption_migrates_a_legacy_marker_before_replacing_it() {
+        let mut replaced = lifecycle();
+        replaced.last_consumed_key_package_ref = Some(vec![2]);
+        replaced.last_consumed_at = Some(Timestamp(10));
+        replaced.record_consumed_key_package(&[1], Timestamp(20));
+        assert!(replaced.retained_private_material[0].consumed);
+        assert_eq!(replaced.last_consumed_key_package_ref, Some(vec![1]));
+        assert_eq!(replaced.last_consumed_at, Some(Timestamp(20)));
+
+        let mut pending = lifecycle();
+        pending.last_consumed_key_package_ref = Some(vec![3]);
+        pending.last_consumed_at = Some(Timestamp(10));
+        pending.record_consumed_key_package(&[1], Timestamp(20));
+        assert_eq!(
+            pending.pending_replacement.as_ref().unwrap().consumed_at,
+            Some(Timestamp(10))
+        );
+        assert_eq!(pending.last_consumed_key_package_ref, Some(vec![1]));
+    }
+
+    #[test]
+    fn untracked_consumption_leaves_the_current_marker() {
+        let mut lifecycle = lifecycle();
+        lifecycle.record_consumed_key_package(&[1], Timestamp(10));
+        lifecycle.record_consumed_key_package(&[9], Timestamp(11));
+        assert_eq!(lifecycle.last_consumed_key_package_ref, Some(vec![1]));
+        assert_eq!(lifecycle.last_consumed_at, Some(Timestamp(10)));
     }
 
     #[test]
