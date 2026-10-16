@@ -190,9 +190,11 @@ Core files: `canonical_scenarios.rs` (scripted + portable scenarios, `ScenarioSp
 faults), `proptest_invariants.rs` (property tests), `canonicalization_contract.rs`, `candidate_state_graph.rs`.
 
 ```sh
-cargo test -p cgka-conformance-simulator                            # quick
-cargo test -p cgka-conformance-simulator --features conformance-slow # pre-release
+cargo test -p cgka-conformance-simulator --test <file>   # the file you changed
+just simulator-smoke                                     # PR-lane selection
 ```
+
+`--features conformance-slow` is the pre-release pass; run it locally only when asked.
 
 ## Workspace-wide
 

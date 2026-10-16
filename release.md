@@ -297,8 +297,9 @@ storage artifact:
 Storage migrations do not require a workspace version bump during feature
 development. The eventual release version remains a manual release operation.
 
-Before pushing, run `just fast-ci`. Let GitHub CI run the full `just ci` test
-matrix.
+Before pushing, run `cargo test -p storage-sqlite` and the fixture and
+failure-injection checks above on top of the root `AGENTS.md` pre-push steps.
+GitHub CI runs the tests of every crate that depends on `storage-sqlite`.
 
 ## Whole-Workspace Release
 
