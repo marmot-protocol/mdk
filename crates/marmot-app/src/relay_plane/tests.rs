@@ -1376,12 +1376,7 @@ async fn managed_account_worker_keeps_its_session_through_notification_lag() {
         "a lag neither reopens the session nor re-subscribes"
     );
     assert_eq!(
-        relay_plane
-            .inner
-            .transport
-            .notification_forwarder_health
-            .snapshot()
-            .unexpected_exits,
+        relay_plane.notification_forwarder_unexpected_exits_for_test(),
         0
     );
 
@@ -4989,26 +4984,17 @@ async fn notification_loss_is_durable_and_survives_receiver_replacement() {
             .unwrap()
             .is_none()
     );
-    let prior = client.adapter.delivery_overflow.clone();
+    let prior = client.adapter.delivery_overflow_identity_for_test();
     drop(client);
     let mut replacement = client_on_app_relay_plane(&app, "alice").await;
-    assert!(Arc::ptr_eq(&prior, &replacement.adapter.delivery_overflow));
+    assert!(prior.same_as(&replacement.adapter.delivery_overflow_identity_for_test()));
     let attempt = replacement
         .adapter
         .start_delivery_overflow_recovery(loss.marker_token);
     // An unexpected consumer exit still closes the route.
     app.relay_plane
         .simulate_notification_consumer_exit_for_test();
-    assert_eq!(
-        replacement
-            .adapter
-            .delivery_overflow
-            .inner
-            .lock()
-            .unwrap()
-            .notification_losses,
-        1
-    );
+    assert_eq!(replacement.adapter.notification_losses_for_test(), 1);
     // A lag whose control record cannot reach the closed queue, and whose
     // floor is unknown.
     app.relay_plane.simulate_notification_lag_for_test(
@@ -5250,7 +5236,7 @@ async fn sdk_account_worker_keeps_serving_through_notification_lag() {
         .unwrap();
     runtime.group_members(&alice.label, &group).await.unwrap();
     let plane = runtime.shared_services().relay_plane().clone();
-    let sdk = plane.inner.transport.sdk_relay_client.clone().unwrap();
+    let sdk = plane.sdk_relay_client_for_test().unwrap();
     let floor = sdk.notification_loss_floor_for_account(&account).await;
     assert!(
         matches!(floor, NostrNotificationLossFloor::Since(_)),
@@ -5382,7 +5368,7 @@ async fn notification_lag_while_post_join_maintenance_is_live_stays_bounded() {
     );
 
     let plane = app.relay_plane.clone();
-    let sdk = plane.inner.transport.sdk_relay_client.clone().unwrap();
+    let sdk = plane.sdk_relay_client_for_test().unwrap();
     let floor = sdk.notification_loss_floor_for_account(&account).await;
     assert_eq!(
         floor,
@@ -5457,13 +5443,7 @@ async fn notification_lag_with_a_legacy_retained_route_stays_bounded() {
     let app = crate::MarmotApp::with_relay_and_config(dir.path(), url, config());
     let mut client = crate::tests::client_on_app_relay_plane(&app, &alice.label).await;
     client.prepare_transport().await.unwrap();
-    let sdk = app
-        .relay_plane
-        .inner
-        .transport
-        .sdk_relay_client
-        .clone()
-        .unwrap();
+    let sdk = app.relay_plane.sdk_relay_client_for_test().unwrap();
     let floor = sdk.notification_loss_floor_for_account(&account).await;
     assert!(
         matches!(floor, NostrNotificationLossFloor::Since(_)),
@@ -5672,7 +5652,7 @@ async fn cancelled_reopen_retirement_cannot_remove_a_replacement_context() {
     use nostr_sdk::prelude::Keys;
 
     let plane = MarmotRelayPlane::from_sdk(None, true);
-    let sdk = plane.inner.transport.sdk_relay_client.clone().unwrap();
+    let sdk = plane.sdk_relay_client_for_test().unwrap();
     let keys = Keys::generate();
     let alice = MemberId::new(keys.public_key().to_bytes().to_vec());
     sdk.register_account(alice.clone(), Arc::new(keys.clone()))

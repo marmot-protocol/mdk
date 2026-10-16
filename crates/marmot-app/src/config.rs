@@ -1046,7 +1046,7 @@ mod tests {
         ];
         let gates = configs
             .iter()
-            .map(|config| RelayExportGate::export_allowed(config))
+            .map(RelayExportGate::export_allowed)
             .collect::<Vec<_>>();
         assert_eq!(gates, [false, false, true]);
         for config in &configs {

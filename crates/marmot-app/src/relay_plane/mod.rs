@@ -323,6 +323,17 @@ pub(crate) enum AccountDeliveryWait {
     Closed,
 }
 
+/// Keeps one account's delivery-loss state alive and compares it by identity.
+#[cfg(test)]
+pub(crate) struct DeliveryOverflowIdentity(Arc<AccountDeliveryOverflowState>);
+
+#[cfg(test)]
+impl DeliveryOverflowIdentity {
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 #[derive(Default)]
 struct AccountDeliveryOverflowState {
     inner: std::sync::Mutex<AccountDeliveryOverflowInner>,
@@ -2322,6 +2333,23 @@ impl MarmotRelayPlane {
             .eose_repair_settle_ms
             .store(settle.as_millis() as u64, Ordering::Relaxed);
     }
+
+    /// The SDK relay client the plane runs on, for tests that build a whole
+    /// app and so cannot reach the plane's private state.
+    #[cfg(test)]
+    pub(crate) fn sdk_relay_client_for_test(&self) -> Option<NostrSdkRelayClient> {
+        self.inner.transport.sdk_relay_client.clone()
+    }
+
+    /// Unexpected notification-consumer exits the plane has recorded.
+    #[cfg(test)]
+    pub(crate) fn notification_forwarder_unexpected_exits_for_test(&self) -> u64 {
+        self.inner
+            .transport
+            .notification_forwarder_health
+            .snapshot()
+            .unexpected_exits
+    }
 }
 
 impl RelayPlaneHealth {
@@ -3944,6 +3972,24 @@ impl MarmotRelayPlaneAccountAdapter {
 
     pub(crate) fn pending_delivery_overflow(&self) -> Option<AccountDeliveryOverflow> {
         self.delivery_overflow.pending_snapshot()
+    }
+
+    /// This account's delivery-loss state, so a test can check that a
+    /// replacement adapter inherited it rather than starting fresh.
+    #[cfg(test)]
+    pub(crate) fn delivery_overflow_identity_for_test(&self) -> DeliveryOverflowIdentity {
+        DeliveryOverflowIdentity(self.delivery_overflow.clone())
+    }
+
+    /// Notification losses this account's delivery route has recorded,
+    /// whether or not a loss is still pending.
+    #[cfg(test)]
+    pub(crate) fn notification_losses_for_test(&self) -> u64 {
+        self.delivery_overflow
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .notification_losses
     }
 
     /// Begin (or resume after process restart) the recovery job required by a
