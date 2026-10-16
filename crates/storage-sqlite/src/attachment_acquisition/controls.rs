@@ -49,6 +49,11 @@ pub enum AttachmentTransferState {
 /// Free space beyond a parked job's recorded target before it is readmitted,
 /// so measurement noise cannot flip a row between parked and queued each tick.
 pub const STORAGE_READMIT_MARGIN_BYTES: u64 = 4 * ATTACHMENT_CHECKPOINT_BYTES as u64;
+/// Worker admission for the parked row `q`, given `?3` free bytes beyond the
+/// reserve, `?4` the transfer limit's download bytes and `?5` the limit: the
+/// download bytes less the row's checkpoint, never less than the limit.
+const ADMITTED: &str = "max(?4-coalesce((SELECT p.received FROM attachment_partial p
+    WHERE p.token=q.token),0),?5)<=?3";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttachmentTransferStatus {
     pub reference: Option<AttachmentAssetRef>,
@@ -641,9 +646,10 @@ impl SqliteAccountStorage {
 
     /// Readmit at most one bounded page of storage-parked jobs whose recorded
     /// headroom now fits below `free` less the policy reserve and a fixed
-    /// margin, provided admission itself (`disk_reserve` plus
-    /// [`media_store::DiskPolicy::download_bytes`] of `transfer_limit`) would
-    /// pass, so a readmitted row is not bounced back to a timer. The
+    /// margin, provided worker admission would pass for that row (`disk_reserve`
+    /// plus [`media_store::DiskPolicy::download_bytes`] of `transfer_limit`,
+    /// less the row's own checkpoint and never less than the limit), so a
+    /// readmitted row is not bounced back to a timer. The
     /// margin keeps measurement noise from flipping a row every tick, and a job
     /// that parked more than once waits out its park streak (15 s doubling to
     /// an hour) before it is due again, so free space that oscillates around a
@@ -658,22 +664,29 @@ impl SqliteAccountStorage {
         transfer_limit: u64,
         automatic: bool,
     ) -> StorageResult<usize> {
-        if free
-            < disk_reserve.saturating_add(media_store::DiskPolicy::download_bytes(transfer_limit))
-        {
+        // Worker admission needs the transfer limit's download bytes less the
+        // job's own checkpoint, never less than the limit: no row can pass
+        // below the limit itself.
+        let Some(available) = free
+            .checked_sub(disk_reserve)
+            .filter(|available| *available >= transfer_limit)
+        else {
             return Ok(0);
-        }
+        };
         let Some(headroom) =
             free.checked_sub(disk_reserve.saturating_add(STORAGE_READMIT_MARGIN_BYTES))
         else {
             return Ok(0);
         };
         let headroom = u64_to_i64(headroom.min(i64::MAX as u64))?;
+        let available = u64_to_i64(available.min(i64::MAX as u64))?;
+        let download = u64_to_i64(media_store::DiskPolicy::download_bytes(transfer_limit))?;
+        let limit = u64_to_i64(transfer_limit)?;
         // The common tick is a read-only index probe for a row that fits.
         let fits: bool = self.lock()?.query_row(
-            "SELECT EXISTS(SELECT 1 FROM attachment_acquisition WHERE state=4 AND storage_blocked_headroom IS NOT NULL
-                AND cancelled=0 AND (explicit_request=1 OR ?1) AND storage_blocked_headroom<=?2)",
-            params![automatic, headroom], |row| row.get(0),
+            &format!("SELECT EXISTS(SELECT 1 FROM attachment_acquisition q WHERE state=4 AND storage_blocked_headroom IS NOT NULL
+                AND cancelled=0 AND (explicit_request=1 OR ?1) AND storage_blocked_headroom<=?2 AND {ADMITTED})"),
+            params![automatic, headroom, available, download, limit], |row| row.get(0),
         ).storage()?;
         if !fits {
             return Ok(0);
@@ -681,15 +694,22 @@ impl SqliteAccountStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let tokens: Vec<Vec<u8>> = conn
-                .prepare(
-                    "SELECT token FROM attachment_acquisition
+                .prepare(&format!(
+                    "SELECT token FROM attachment_acquisition q
                     WHERE state=4 AND storage_blocked_headroom IS NOT NULL AND cancelled=0
-                    AND (explicit_request=1 OR ?1) AND storage_blocked_headroom<=?2
-                    ORDER BY priority_at DESC,token LIMIT ?3",
-                )
+                    AND (explicit_request=1 OR ?1) AND storage_blocked_headroom<=?2 AND {ADMITTED}
+                    ORDER BY priority_at DESC,token LIMIT ?6"
+                ))
                 .storage()?
                 .query_map(
-                    params![automatic, headroom, ATTACHMENT_ACQUISITION_BATCH_LIMIT as i64],
+                    params![
+                        automatic,
+                        headroom,
+                        available,
+                        download,
+                        limit,
+                        ATTACHMENT_ACQUISITION_BATCH_LIMIT as i64
+                    ],
                     |row| row.get(0),
                 )
                 .storage()?

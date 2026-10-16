@@ -3001,6 +3001,45 @@ fn storage_readmission_waits_for_admission_capacity() {
     );
 }
 
+/// Readmission credits a parked row's checkpoint as worker admission does: a
+/// job whose saved bytes cover most of the limit is readmitted with free
+/// space below two transfer limits once its own discounted need fits, while a
+/// row without a checkpoint keeps waiting for the whole two limits.
+#[test]
+fn storage_readmission_credits_the_saved_checkpoint() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "saved");
+    let asset = request(&store, "saved");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    let limit = 8 * 1024 * 1024;
+    let saved = 6 * 1024 * 1024;
+    let identity = partial_identity(limit);
+    assert!(checkpoint(&store, &job, &identity, 0, &vec![7; saved as usize], 12).unwrap());
+    park(&store, &job, 1024, 12);
+    // Discounted admission: two limits less the checkpoint.
+    let needed = 2 * limit - saved;
+    assert!(needed < 2 * limit && fits(1024) < needed);
+    assert_eq!(
+        store
+            .readmit_storage_blocked_attachments(13, 1000, 1000 + needed - 1, limit, true)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .readmit_storage_blocked_attachments(13, 1000, 1000 + needed, limit, true)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        transfer(&store, "saved", true).state,
+        AttachmentTransferState::Queued
+    );
+}
+
 /// Cancelling a storage-parked job clears its marker, so the kept prefix
 /// expires and is pruned like any other cancelled checkpoint instead of
 /// pinning quota forever.

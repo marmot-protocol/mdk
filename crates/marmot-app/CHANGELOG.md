@@ -34,7 +34,10 @@
 - Download admission and in-memory downloads need the configured disk reserve
   plus twice the body (its checkpoint and its stored file) instead of four
   times. Large explicit downloads streamed to a file still need four times
-  until they checkpoint straight into the wire file.
+  until they checkpoint straight into the wire file. A checkpoint write the
+  disk cannot take, or a full disk while publishing an in-memory body, parks
+  the job as `StorageBlocked` for what its retry still writes, never on a
+  retry timer.
 - Publication, hashing and encryption of downloaded bodies run on the blocking
   pool for in-memory bodies too, never on the account worker.
 - Hosts must exclude the account directory, including `media/`, from cloud and
