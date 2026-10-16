@@ -6306,7 +6306,7 @@ impl MarmotApp {
             .collect::<Vec<_>>();
         // Registered handles (media stores) close with the databases. Media
         // files hold no locks; closing stops media I/O at the same instant.
-        closed += self.close_registry.close_all();
+        let registered_closed = self.close_registry.close_all();
         self.account_media_stores
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -6328,6 +6328,7 @@ impl MarmotApp {
         // opened, including each account engine's own `session.sqlite`
         // connection, which no cache holds (mdk#2323).
         let (closed, first_error) = self.root_closers.close_all();
+        let closed = closed + registered_closed;
         drop((account_storages, directory_caches, shared_storage));
 
         // Last: the lease guards the databases, so it outlives them.
