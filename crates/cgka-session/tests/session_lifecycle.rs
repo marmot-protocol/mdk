@@ -158,6 +158,45 @@ fn config(
     .feature_registry(FeatureRegistry::new())
 }
 
+/// mdk#2323: a host that opened the session's connection can close it at a
+/// known instant. The session then fails closed rather than reopening.
+#[tokio::test]
+async fn session_runs_on_a_host_opened_connection_the_host_can_close() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("host-opened session key").unwrap();
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let keys = deterministic_nostr_keys(b"alice");
+    let host_open = std::time::Duration::from_secs(3);
+    let config = SessionConfig::with_storage(
+        storage.clone(),
+        host_open,
+        keys.public_key().to_bytes().to_vec(),
+        Box::new(MockPeeler),
+    )
+    .legacy_compatibility_profile()
+    .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
+    .feature_registry(FeatureRegistry::new());
+    let mut session = AccountDeviceSession::open(config).unwrap();
+    // Open telemetry still covers the storage open the host did itself.
+    let timings = session.open_timings();
+    assert!(timings.storage_open >= host_open && timings.total >= host_open);
+
+    session.fresh_key_package().await.unwrap();
+    assert_eq!(
+        storage.stored_key_package_bundles().unwrap().len(),
+        1,
+        "the session writes through the host's connection"
+    );
+
+    storage.closer().close().unwrap();
+    assert!(
+        session.fresh_key_package().await.is_err(),
+        "the session must stop with the host's connection, not reopen storage"
+    );
+    assert!(storage.is_closed());
+}
+
 fn selfremove_registry() -> FeatureRegistry {
     let mut registry = FeatureRegistry::new();
     registry.register(

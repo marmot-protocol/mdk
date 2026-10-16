@@ -93,12 +93,12 @@ impl Drop for ProbeGuard {
 
 /// Both queued commands and confirmed secondary retries precede this durable
 /// send. Overdue local passes must eventually give the durable owner a turn.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overdue_secondary_groups_service_durable_send_after_deferred_predecessors() {
     overdue_secondary_groups_service_durable_send(2).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overdue_secondary_groups_service_durable_send_after_buffered_predecessors() {
     overdue_secondary_groups_service_durable_send(0).await;
 }
@@ -258,6 +258,23 @@ async fn overdue_secondary_groups_service_durable_send(deferred_count: usize) {
     tail.wait().await;
     // Repeated optional passes must preserve the ordinary 100ms gate-contention backoff.
     sleep(Duration::from_millis(700)).await;
+    // A loaded machine may fit fewer drains into that sleep than the
+    // assertions below need; hold admission until two have run.
+    timeout(Duration::from_secs(5), async {
+        while probe
+            .observations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, Observation::Drain(_)))
+            .count()
+            < 2
+        {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the held admission gate makes the durable drain retry");
     let admission_released = TokioInstant::now();
     drop(held_admission);
     let observed = timeout(Duration::from_secs(3), async {

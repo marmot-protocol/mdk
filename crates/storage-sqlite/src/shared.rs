@@ -177,6 +177,13 @@ impl SqliteSharedStorage {
         self.conn.is_closed()
     }
 
+    /// A [`DatabaseCloser`][crate::DatabaseCloser] for this database, shared
+    /// by every clone.
+    #[must_use]
+    pub fn closer(&self) -> crate::DatabaseCloser {
+        self.conn.closer()
+    }
+
     fn from_connection(mut conn: rusqlite::Connection) -> StorageResult<Self> {
         conn.busy_timeout(Duration::from_millis(SHARED_BUSY_TIMEOUT_MS))
             .storage()?;

@@ -228,7 +228,7 @@ async fn group_events(
         .collect()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::disallowed_methods)]
 async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
@@ -993,7 +993,7 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     healthy_relay.shutdown();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn startup_comparison_waits_for_credit_before_reserving_retry() {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let relay = LocalRelay::new(RelayBuilder::default());
@@ -1036,7 +1036,7 @@ async fn startup_comparison_waits_for_credit_before_reserving_retry() {
     relay.shutdown();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn startup_inline_wait_releases_unused_comparison_credit() {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let gate = HeldBroadQuery::default();
@@ -1123,7 +1123,7 @@ async fn startup_inline_wait_releases_unused_comparison_credit() {
     relay.shutdown();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn startup_comparison_shutdown_reaps_owned_request_and_keeps_debt() {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let gate = HeldCommitRequest::default();
@@ -1446,7 +1446,7 @@ async fn startup_comparison_shutdown_reaps_owned_request_and_keeps_debt() {
     relay.shutdown();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unhydrated_durable_send_waits_for_safety_and_survives_terminal_close() {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
