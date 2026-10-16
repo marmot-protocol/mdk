@@ -3260,6 +3260,41 @@ fn recording_spill_store() -> (
     (store, kept)
 }
 
+/// Holds a gated spill store's writer until opened. Dropping it opens it, so a
+/// failing test never strands the writer on the blocking pool.
+struct SpillGate(Arc<AtomicBool>);
+
+impl SpillGate {
+    fn open(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for SpillGate {
+    fn drop(&mut self) {
+        self.open();
+    }
+}
+
+/// A recording spill store whose writer waits for the returned gate, so a
+/// hand-off stays unsettled however soon the runtime runs the writer.
+fn gated_recording_spill_store() -> (
+    AccountDeliverySpillStore,
+    Arc<StdMutex<Vec<TransportDelivery>>>,
+    SpillGate,
+) {
+    let (record, kept) = recording_spill_store();
+    let gate = SpillGate(Arc::new(AtomicBool::new(false)));
+    let opened = gate.0.clone();
+    let store: AccountDeliverySpillStore = Arc::new(move |deliveries| {
+        while !opened.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        record(deliveries)
+    });
+    (store, kept, gate)
+}
+
 fn cursor_floor_adapter(
     store: Option<AccountDeliverySpillStore>,
     marker: Option<AccountDeliveryRecoveryMarker>,
@@ -3732,7 +3767,7 @@ async fn a_replaced_adapter_cannot_promote_the_cursor() {
 /// settled floor: what only that promotion exposed is still spilled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_fenced_settled_commit_keeps_spilling_what_live_promotion_exposed() {
-    let (store, kept) = recording_spill_store();
+    let (store, kept, gate) = gated_recording_spill_store();
     let (relay_plane, adapter, alice) = cursor_floor_adapter(Some(store), None);
     let promoted = Some(OPENED_CURSOR + 2_000);
     assert_eq!(adapter.seal_transport_cursor(promoted), promoted);
@@ -3746,6 +3781,7 @@ async fn a_fenced_settled_commit_keeps_spilling_what_live_promotion_exposed() {
     let reached = adapter.seal_transport_cursor(Some(OPENED_CURSOR + 3_000));
     assert_eq!(reached, None);
     adapter.settle_transport_cursor(reached);
+    gate.open();
     timeout(Duration::from_secs(5), async {
         while adapter.delivery_loss_blocks_cursor() {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -5682,13 +5718,23 @@ async fn cancelled_reopen_retirement_cannot_remove_a_replacement_context() {
     sdk.register_account(alice.clone(), Arc::new(keys.clone()))
         .await
         .unwrap();
+    // A forwarder still winding down: running blocking work ignores abort, so
+    // the retirement is still waiting on it at its first poll, however soon
+    // another runtime thread handles the abort. Dropping `release` ends it.
+    let (started, running) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let forwarder = tokio::task::spawn_blocking(move || {
+        let _ = started.send(());
+        let _ = released.recv();
+    });
+    running.await.unwrap();
     plane
         .inner
         .transport
         .account_notification_forwarders
         .lock()
         .await
-        .insert(alice.clone(), tokio::spawn(std::future::pending::<()>()));
+        .insert(alice.clone(), forwarder);
 
     // The reopening worker is cancelled after its first poll.
     assert!(
@@ -5707,6 +5753,7 @@ async fn cancelled_reopen_retirement_cannot_remove_a_replacement_context() {
         sdk.notification_loss_for_account(&alice).await.is_ok(),
         "no retirement outlives the cancelled worker"
     );
+    drop(release);
     sdk.shutdown_accounts().await;
 }
 
@@ -6114,12 +6161,11 @@ async fn publish_auth_quorum_does_not_wait_for_unobserved_fallback() {
     let plane = MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(30), true);
     let fallback = Arc::new(ObservedPublishClient::new(PublishCompletion::Hold).await);
     let adapter = plane.account_adapter(fallback.account_id.clone(), fallback.clone());
-    let mut notifications = adapter
-        .anonymous_publish_client
-        .as_ref()
-        .unwrap()
-        .client()
-        .notifications();
+    // The pool shuts down when its last handle drops. Met quorum ends the
+    // publication task, and with it the adapter, possibly before the public
+    // relay's OK reaches this stream; keep a handle as adapter clones do.
+    let anonymous = adapter.anonymous_publish_client.clone().unwrap();
+    let mut notifications = anonymous.client().notifications();
     let signed = EventBuilder::new(Kind::TextNote, "quorum cancels held authentication")
         .finalize(&Keys::generate())
         .unwrap();
@@ -6181,6 +6227,7 @@ async fn publish_auth_quorum_does_not_wait_for_unobserved_fallback() {
         assert_eq!(failure.kind, TransportEndpointFailureKind::PossiblyExposed);
         assert_eq!(failure.rejection_category, None);
     }
+    anonymous.client().shutdown().await;
     fallback.inner.shutdown_accounts().await;
     fallback.inner.client().shutdown().await;
     plane.shutdown().await;
