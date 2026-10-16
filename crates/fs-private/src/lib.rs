@@ -1022,7 +1022,6 @@ fn not_a_regular_db_file() -> io::Error {
 #[cfg(unix)]
 fn chmod_private_no_follow(path: &Path) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::PermissionsExt;
 
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
@@ -1039,17 +1038,45 @@ fn chmod_private_no_follow(path: &Path) -> io::Result<()> {
         return Ok(());
     }
     let err = io::Error::last_os_error();
-    // glibc before 2.32, or a Linux system without /proc, cannot chmod without
-    // following symlinks. Re-check that the entry is still a regular file and
-    // fall back to a plain path chmod.
-    if !matches!(err.raw_os_error(), Some(code) if code == libc::EOPNOTSUPP || code == libc::ENOTSUP)
+    // glibc before 2.32 has no no-follow chmod, so do what later libcs do.
+    // A plain path chmod would follow a symlink swapped in after `lstat`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if matches!(err.raw_os_error(), Some(code) if code == libc::EOPNOTSUPP || code == libc::ENOTSUP)
     {
-        return Err(err);
+        return chmod_private_through_o_path(&c_path);
     }
-    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+    Err(err)
+}
+
+/// Bind the chmod to one inode: an `O_PATH | O_NOFOLLOW` descriptor names the
+/// directory entry itself, even a symlink, so a swap after validation cannot
+/// redirect it, and closing an `O_PATH` descriptor releases no POSIX record
+/// locks. Needs `/proc`; fails closed without it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn chmod_private_through_o_path(c_path: &std::ffi::CStr) -> io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::PermissionsExt;
+
+    // SAFETY: `c_path` is a valid NUL-terminated string that outlives the call.
+    let raw = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a descriptor this call just opened and nothing else owns.
+    let entry = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+    if !entry.metadata()?.file_type().is_file() {
         return Err(not_a_regular_db_file());
     }
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+    // `/proc/self/fd/N` resolves to this descriptor's inode, not to the path.
+    std::fs::set_permissions(
+        format!("/proc/self/fd/{}", entry.as_raw_fd()),
+        std::fs::Permissions::from_mode(PRIVATE_FILE_MODE),
+    )
 }
 
 fn set_handle_private(file: &std::fs::File) -> io::Result<()> {
@@ -1563,6 +1590,46 @@ mod unix_tests {
         assert_eq!(mode_of(&target), 0o644);
     }
 
+    /// The chmod must not follow a symlink that replaced a database file after
+    /// `lstat` validated it.
+    #[test]
+    fn db_chmod_after_a_symlink_swap_leaves_the_target_alone() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, b"unchanged").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let swapped = dir.path().join("db.sqlite-wal");
+        symlink(&target, &swapped).unwrap();
+
+        // Apple platforms change the link's own mode; Linux refuses.
+        let _ = chmod_private_no_follow(&swapped);
+        assert_eq!(mode_of(&target), 0o644);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let c_path = std::ffi::CString::new(swapped.as_os_str().as_bytes()).unwrap();
+            assert!(chmod_private_through_o_path(&c_path).is_err());
+            assert_eq!(mode_of(&target), 0o644);
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn o_path_chmod_tightens_a_regular_file() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite");
+        std::fs::write(&path, b"x").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        chmod_private_through_o_path(&c_path).unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
     const DB_LOCK_PROBE_PATH: &str = "FS_PRIVATE_DB_LOCK_PROBE_PATH";
     const DB_FILE_SUFFIXES: [&str; 4] = ["", "-wal", "-shm", "-journal"];
 
@@ -1634,6 +1701,16 @@ mod unix_tests {
         ensure_private_db_files(&db).unwrap();
         for suffix in DB_FILE_SUFFIXES {
             assert_eq!(mode_of(&db_file(&db, suffix)), 0o600, "suffix {suffix:?}");
+        }
+        // The old-glibc fallback must be just as lock-safe.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        for suffix in DB_FILE_SUFFIXES {
+            use std::os::unix::ffi::OsStrExt;
+            let path = db_file(&db, suffix);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            chmod_private_through_o_path(&c_path).unwrap();
+            assert_eq!(mode_of(&path), 0o600, "suffix {suffix:?}");
         }
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
