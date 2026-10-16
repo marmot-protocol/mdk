@@ -114,7 +114,7 @@ adapter (per-relay raw)  ->  relay plane (aggregate across accounts)  ->  export
 - **Exporter** is a new, opt-in component that converts the rollup into the export series and pushes them. It is the only
   code that resolves relay identity into a label, and it enforces the contract (no client labels, aggregate only).
   Implemented as `marmot_app::RelayTelemetryExporter`, constructed only through the opt-in gate
-  `MarmotRelayPlane::telemetry_exporter`. The privacy-critical mapping (`build_export_batch`) lives in the default build
+  `RelayTelemetryExporter::new`. The privacy-critical mapping (`build_export_batch`) lives in the default build
   and is fully tested; the OTLP protobuf encoding and HTTP `POST` to the configured full metrics URL are behind the
   `otlp-export` feature. Exporter construction requires the persisted opt-in settings plus host-supplied full metrics
   URL, bearer auth, and resource metadata; these runtime values are not persisted by Marmot. The export batch is a flat

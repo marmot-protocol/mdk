@@ -282,14 +282,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Do not print or log account ids, group ids, relay URLs, message ids, pubkeys, payloads, ciphertext, plaintext, or key
   material.
 - Keep the relay-telemetry export path in the `src/relay_plane/` module (rollup in `relay_plane/telemetry.rs`) and
-  `relay_telemetry_export.rs` (exporter, including the `MarmotRelayPlane::telemetry_exporter` constructor). It is
-  opt-in and off by default: `MarmotRelayPlane::telemetry_exporter` is the single construction gate, relay-identity
-  resolution requires it, and export points carry only a `relay` label. Keep the OTLP wire encoding and HTTP push behind
+  `relay_telemetry_export.rs` (exporter, including the `RelayTelemetryExporter::new` constructor). It is
+  opt-in and off by default: `RelayTelemetryExporter::new` is the single construction gate, relay-identity
+  resolution requires it (through the plane's `RelayExportGate`, which the export config implements), and export
+  points carry only a `relay` label. Keep the OTLP wire encoding and HTTP push behind
   the `otlp-export` feature; keep the privacy-critical mapping (`build_export_batch`) and the opt-in gate in the default
   build. Keep per-attempt collector DNS validation and pinning in `collector_host_safety.rs`: validate
   every address, pin reqwest, disable redirects/system proxies, and retain TLS verification. Explicit SOCKS5 routing
   must send the validated IP rather than delegate HTTP DNS to the proxy. Build every relay client with
-  `network_proxy::nostr_builder()` and every HTTP client through `network_proxy::http_builder()`; `clippy.toml` rejects
+  `network_proxy::nostr_builder()` (inside `relay_plane/`, its own `nostr_builder()`, which calls the same adapter
+  builder) and every HTTP client through `network_proxy::http_builder()`; `clippy.toml` rejects
   direct `nostr_sdk`/`reqwest` constructors. Allow that lint only where a fresh reqwest builder goes straight into
   `http_builder()` or in local test fixtures. Only exact `localhost` or a
   loopback IP literal is a local-test endpoint, and all its addresses must be loopback. The default build includes this

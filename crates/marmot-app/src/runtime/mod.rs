@@ -725,7 +725,9 @@ impl RuntimeSharedServices {
             let Some(executor) = self.diagnostics_executor() else {
                 return;
             };
-            if let Some(exporter) = self.relay_plane.telemetry_exporter(config, permit) {
+            if let Some(exporter) =
+                crate::RelayTelemetryExporter::new(&self.relay_plane, config, permit)
+            {
                 let shutdown = self.lifecycle.subscribe_shutdown();
                 let app_performance_telemetry = self.app_performance_telemetry.clone();
                 let handle = executor

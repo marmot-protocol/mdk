@@ -34,7 +34,6 @@ use transport_nostr_adapter::{
     SubscriptionAttempt,
 };
 
-use crate::config::RelayTelemetryExportConfig;
 use transport_nostr_peeler::NostrTransportEvent;
 
 use crate::directory::DirectorySyncPlan;
@@ -51,6 +50,15 @@ pub use safety::{RelayEndpointClassification, RelayEndpointPolicy, retired_relay
 pub use telemetry::{
     EngineReorgMetrics, RelayRollupEntry, RelayTelemetryRollup, RelayTelemetrySnapshot,
 };
+
+/// The opt-in that relay-identity resolution requires. The app's export
+/// configuration implements it, so the plane does not depend on the app's
+/// config types.
+pub(crate) trait RelayExportGate: Send + Sync {
+    /// Export is opted in with a TLS (or loopback) endpoint, authorization
+    /// and resource metadata.
+    fn export_allowed(&self) -> bool;
+}
 
 /// Every relay client the plane builds routes through the process SOCKS5
 /// configuration: the same builder `crate::network_proxy::nostr_builder`
@@ -1756,19 +1764,19 @@ impl MarmotRelayPlane {
     /// boundary.
     ///
     /// Crate-private and reachable only through the exporter. It returns `None`
-    /// unless [`RelayTelemetryExportConfig::export_allowed`] holds (the same
-    /// gate as [`MarmotRelayPlane::telemetry_exporter`]); only then does it mint
+    /// unless [`RelayExportGate::export_allowed`] holds (the same gate the
+    /// app's exporter constructor applies); only then does it mint
     /// a [`RelayExportConsent`] and ask the adapter to reverse-map indices to
     /// relay URLs. No other code path turns a device-local index into a relay
     /// URL. See the privacy contract in `relay-observability.md`.
     pub(crate) async fn resolve_relay_labels(
         &self,
-        config: &RelayTelemetryExportConfig,
+        gate: &dyn RelayExportGate,
     ) -> Option<RelayLabelResolution> {
-        // Same gate as `telemetry_exporter`: resolution cannot happen unless
-        // export is opted in with a TLS/loopback endpoint, auth, and resource
-        // metadata.
-        if !config.export_allowed() {
+        // Same gate as the exporter constructor: resolution cannot happen
+        // unless export is opted in with a TLS/loopback endpoint, auth, and
+        // resource metadata.
+        if !gate.export_allowed() {
             return None;
         }
         let consent = RelayExportConsent::affirm();

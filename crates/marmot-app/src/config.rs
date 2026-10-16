@@ -884,8 +884,8 @@ impl RelayTelemetryExportConfig {
     /// only for loopback collectors used in local testing, so the privacy
     /// contract's TLS requirement holds for anything that leaves the device.
     ///
-    /// This is the single gate condition shared by `telemetry_exporter` and
-    /// relay-identity resolution.
+    /// This is the single gate condition shared by the exporter constructor
+    /// (`RelayTelemetryExporter::new`) and relay-identity resolution.
     pub(crate) fn export_allowed(&self) -> bool {
         self.enabled
             && self
@@ -900,6 +900,12 @@ impl RelayTelemetryExportConfig {
                 .resource
                 .as_ref()
                 .is_some_and(RelayTelemetryResource::has_required_attributes)
+    }
+}
+
+impl crate::relay_plane::RelayExportGate for RelayTelemetryExportConfig {
+    fn export_allowed(&self) -> bool {
+        RelayTelemetryExportConfig::export_allowed(self)
     }
 }
 
@@ -1023,6 +1029,31 @@ mod tests {
                 os_version: "17.5".to_owned(),
                 device_model_identifier: None,
             }),
+        }
+    }
+
+    #[test]
+    fn relay_export_gate_is_the_export_allowed_check() {
+        use crate::relay_plane::RelayExportGate;
+        let configs = [
+            RelayTelemetryExportConfig::disabled(),
+            RelayTelemetryExportConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            RelayTelemetryExportConfig::enabled("https://otlp.example/v1/metrics")
+                .with_runtime_config(runtime_config()),
+        ];
+        let gates = configs
+            .iter()
+            .map(|config| RelayExportGate::export_allowed(config))
+            .collect::<Vec<_>>();
+        assert_eq!(gates, [false, false, true]);
+        for config in &configs {
+            assert_eq!(
+                RelayExportGate::export_allowed(config),
+                config.export_allowed()
+            );
         }
     }
 

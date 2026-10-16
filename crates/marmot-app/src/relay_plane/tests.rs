@@ -30,26 +30,9 @@ use tokio::sync::Notify;
 use transport_nostr_adapter::{NostrRelayEvent, NostrSubscription};
 use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NOSTR_SOURCE, NostrPeelerError};
 
-use crate::config::{RelayTelemetryResource, RelayTelemetryRuntimeConfig};
 use crate::directory::DirectorySyncBatch;
 
 use super::*;
-
-fn relay_telemetry_runtime_config() -> RelayTelemetryRuntimeConfig {
-    RelayTelemetryRuntimeConfig {
-        otlp_endpoint: Some("https://otlp.example.org/v1/metrics".to_owned()),
-        authorization_bearer_token: Some("token".to_owned()),
-        resource: Some(RelayTelemetryResource {
-            service_version: "1.4.2".to_owned(),
-            service_instance_id: "8e1ca50b-05a2-4c31-a31c-1e69c75a9366".to_owned(),
-            deployment_environment: "staging".to_owned(),
-            tenant: "mdk-ios".to_owned(),
-            os_type: "ios".to_owned(),
-            os_version: "17.5".to_owned(),
-            device_model_identifier: None,
-        }),
-    }
-}
 
 #[test]
 fn subscription_rebuild_since_treats_future_cursor_as_corrupted() {
@@ -2330,6 +2313,16 @@ async fn telemetry_rollup_is_empty_without_observed_relay_traffic() {
     assert!(rollup.engine.is_none());
 }
 
+/// Stands in for the app's export configuration, which is either opted in
+/// or not; `config.rs` tests what makes it so.
+struct TestExportGate(bool);
+
+impl RelayExportGate for TestExportGate {
+    fn export_allowed(&self) -> bool {
+        self.0
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_label_resolution_is_gated_behind_opt_in() {
     let relay = Arc::new(RecordingRelayClient::default());
@@ -2348,30 +2341,18 @@ async fn relay_label_resolution_is_gated_behind_opt_in() {
         .await
         .unwrap();
 
-    // Off by default: no opt-in means no relay-identity resolution at all.
-    let disabled = RelayTelemetryExportConfig::disabled();
-    assert!(relay_plane.resolve_relay_labels(&disabled).await.is_none());
-
-    // Opted in but no endpoint: still no resolution (same gate as the
-    // exporter).
-    let no_endpoint = RelayTelemetryExportConfig {
-        enabled: true,
-        ..Default::default()
-    };
+    // Not opted in: no relay-identity resolution at all.
     assert!(
         relay_plane
-            .resolve_relay_labels(&no_endpoint)
+            .resolve_relay_labels(&TestExportGate(false))
             .await
             .is_none()
     );
 
-    // Opted in with a TLS endpoint and runtime metadata: the export boundary
-    // resolves the opaque index for the activated inbox endpoint back to its
-    // relay URL.
-    let enabled = RelayTelemetryExportConfig::enabled("https://otlp.example/v1/metrics")
-        .with_runtime_config(relay_telemetry_runtime_config());
+    // Opted in: the export boundary resolves the opaque index for the
+    // activated inbox endpoint back to its relay URL.
     let resolution = relay_plane
-        .resolve_relay_labels(&enabled)
+        .resolve_relay_labels(&TestExportGate(true))
         .await
         .expect("opt-in resolves labels");
     assert!(!resolution.is_empty());
