@@ -103,10 +103,9 @@ several files in the same crate); methods shared across those files are `pub(cra
 
 ## Verification
 
-Before pushing connector changes, run the repo-wide pre-push gate plus this crate's tests:
+Before pushing connector changes, run this crate's tests on top of the root `AGENTS.md` pre-push steps:
 
 ```sh
-just fast-ci
 cargo test -p agent-connector
 cargo check -p agent-connector --bin wn-agent
 ```
@@ -126,4 +125,16 @@ just opencode-installer-test
 just pi-installer-test
 ```
 
-When editing `README.md`, run `just agent-install-docs-gate`. GitHub CI runs the full `just ci` workspace suite.
+When editing `README.md`, run `just agent-install-docs-gate`.
+
+GitHub CI runs the tests of this crate's Cargo dependents only. The terminal harnesses (`wn-claude`, `wn-codex`,
+`wn-opencode`, `wn-pi`, `wn-goose`) drive `wn-agent` as a separate process, so they are not Cargo dependents, and their
+connector E2E tests are `#[ignore]`d and run in no CI workflow. For connector behavior changes, run them locally:
+
+```sh
+just claude-dev-e2e-connector
+just codex-dev-e2e-connector
+just opencode-dev-e2e-connector
+just pi-dev-e2e-connector
+just goose-dev-e2e-connector
+```

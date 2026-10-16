@@ -25,7 +25,7 @@ impl NostrReconciliationProgress for ComparisonCursor {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn comparison_result_waits_for_worker_submission_before_durable_admission() {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let relay = MockRelay::run().await.unwrap();

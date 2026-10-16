@@ -202,7 +202,7 @@ async fn acquire_exact_with_client(
     (sdk, result)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exact_no_data_has_an_absolute_text_budget_and_no_retained_input() {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let (left_url, left) = counted_exact_relay(None, 0, true).await;
@@ -238,7 +238,7 @@ async fn exact_no_data_has_an_absolute_text_budget_and_no_retained_input() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_missing_eose_returns_partial_input_and_incomplete_endpoint() {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let (event, id) = signed_event(128);
@@ -270,7 +270,7 @@ async fn one_missing_eose_returns_partial_input_and_incomplete_endpoint() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn duplicate_notifications_spend_item_budget_before_retention_deduplication() {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let (event, id) = signed_event(128);
@@ -332,7 +332,7 @@ async fn duplicate_notifications_spend_item_budget_before_retention_deduplicatio
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_event_exhausts_byte_budget_without_retention() {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let (event, id) = signed_event(4096);

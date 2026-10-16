@@ -21,7 +21,7 @@ fn cached_diagnostic_runtime() -> (tempfile::TempDir, std::sync::Arc<MarmotAppRu
 }
 
 /// Drive the same public policy boundary as startup, rather than only its nested storage cache.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cached_attachment_policy_reads_preserve_first_open_history() {
     let (_dir, runtime, account) = cached_diagnostic_runtime();
     let before = runtime.accounts.app.startup_diagnostics_snapshot();
@@ -206,7 +206,7 @@ fn add(store: &SqliteAccountStorage, i: usize) {
         })
         .unwrap();
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_discovery_traverses_sparse_albums_without_engine_or_network() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
@@ -271,7 +271,7 @@ async fn attachment_discovery_traverses_sparse_albums_without_engine_or_network(
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_discovery_fences_changes_isolates_accounts_and_closes() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -461,7 +461,7 @@ fn attachment_discovery_legacy_epoch_and_categories_preserve_parser_verdicts() {
 }
 
 /// Mixed and emoji-only messages remain pageable outside any conversation window.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_discovery_roles_preserve_slots_and_refresh() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())

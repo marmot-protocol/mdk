@@ -636,7 +636,7 @@ mod tests {
         })
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn epoch_change_closes_only_the_matching_group_preview() {
         let (events, mut receiver) = tokio::sync::broadcast::channel(4);
         let group = GroupId::new(vec![1; 16]);
@@ -661,7 +661,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn losing_branch_invalidation_withdraws_only_the_matching_start() {
         let (events, mut receiver) = tokio::sync::broadcast::channel(4);
         let group = GroupId::new(vec![1; 16]);
@@ -690,7 +690,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lagged_runtime_events_withdraw_the_preview_fail_closed() {
         let (events, mut receiver) = tokio::sync::broadcast::channel(1);
         let group = GroupId::new(vec![1; 16]);

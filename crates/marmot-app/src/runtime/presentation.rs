@@ -37,7 +37,7 @@ mod tests {
     use std::sync::Arc;
     use storage_sqlite::{ChatPresentationRead, StoredAccountState};
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn composed_maintenance_drains_reinserted_groups_and_defers_rejected_rows() {
         let dir = tempfile::tempdir().unwrap();
         let account = AccountHome::open(dir.path())

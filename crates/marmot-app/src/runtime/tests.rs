@@ -11,7 +11,7 @@ use crate::AppMessageProjection;
 use crate::publish_endpoints_from_bootstrap;
 use crate::tests::{ScriptedPushRelayClient, remember_test_member_inbox};
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_lookup_skips_reconcile() {
     let root = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relays(root.path(), vec![]);
@@ -93,7 +93,7 @@ async fn worker_lookup_skips_reconcile() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn message_journey_early_errors() {
     let root = tempfile::tempdir().unwrap();
     let runtime = MarmotApp::with_relays(root.path(), vec![]).runtime();
@@ -136,7 +136,7 @@ async fn message_journey_early_errors() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cast_poll_vote_rejects_unknown_closed_and_invalid_selections_before_send() {
     let root = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relays(root.path(), vec![]);
@@ -241,7 +241,7 @@ async fn cast_poll_vote_rejects_unknown_closed_and_invalid_selections_before_sen
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn polls_can_be_created_and_voted_in_direct_and_group_conversations() {
     let root = tempfile::tempdir().unwrap();
     let home = marmot_account::AccountHome::open(root.path());
@@ -431,7 +431,7 @@ async fn polls_can_be_created_and_voted_in_direct_and_group_conversations() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_diagnostics_executor_keeps_exporters_stopped() {
     let root = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relays(root.path(), vec![]);
@@ -509,36 +509,43 @@ fn profile_relay_status(
     status
 }
 
-/// The integration suites drive whole runtimes, so they run on the
-/// multi-thread flavor every production binding uses. A test that needs one
-/// thread says so with `flavor = "current_thread"` and a comment.
+/// The runtime, relay-plane and integration suites drive whole runtimes, so
+/// they run on the multi-thread flavor every production binding uses. A test
+/// that needs one thread (a paused clock, or an interleaving it builds by never
+/// yielding) says so with `flavor = "current_thread"` and a `//` comment on the
+/// line above saying why.
 #[test]
-fn integration_suites_choose_their_tokio_flavor() {
-    fn visit(dir: &std::path::Path, bare: &mut Vec<String>) {
+fn runtime_suites_choose_their_tokio_flavor() {
+    fn visit(dir: &std::path::Path, offenders: &mut Vec<String>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
             if path.is_dir() {
-                visit(&path, bare);
+                visit(&path, offenders);
             } else if path.extension().is_some_and(|ext| ext == "rs") {
                 let source = std::fs::read_to_string(&path).unwrap();
+                let mut previous = "";
                 for (index, line) in source.lines().enumerate() {
-                    if line.trim() == "#[tokio::test]" {
-                        bare.push(format!("{}:{}", path.display(), index + 1));
+                    let line = line.trim();
+                    let unexplained_pin = line == "#[tokio::test(flavor = \"current_thread\")]"
+                        && (!previous.starts_with("//") || previous.starts_with("///"));
+                    if line == "#[tokio::test]" || unexplained_pin {
+                        offenders.push(format!("{}:{}", path.display(), index + 1));
                     }
+                    previous = line;
                 }
             }
         }
     }
 
-    let mut bare = Vec::new();
-    visit(
-        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests"),
-        &mut bare,
-    );
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut offenders = Vec::new();
+    for suite in ["src/runtime", "src/relay_plane", "tests"] {
+        visit(&root.join(suite), &mut offenders);
+    }
     assert!(
-        bare.is_empty(),
-        "use #[tokio::test(flavor = \"multi_thread\", worker_threads = 2)] or an explicit \
-         current_thread flavor: {bare:#?}"
+        offenders.is_empty(),
+        "use #[tokio::test(flavor = \"multi_thread\", worker_threads = 2)], or an explicit \
+         current_thread flavor under a `//` comment saying why: {offenders:#?}"
     );
 }
 
@@ -632,7 +639,7 @@ fn account_profile_publish_endpoint_selection_matches_canonical_outbox_fallback(
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_owned_profile_publish_rejects_signed_out_and_stopped_accounts() {
     let directory = tempfile::tempdir().unwrap();
     let home = AccountHome::open(directory.path());
@@ -720,7 +727,7 @@ fn generated_account_birth_marks_cutover_scan_complete_before_session_open() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_import_relay_discovery_does_not_publish_default_lists() {
     let directory = tempfile::tempdir().unwrap();
     let home = AccountHome::open(directory.path());
@@ -984,7 +991,7 @@ fn newest_user_profile_keeps_newer_cached_extra_fields() {
     assert_eq!(selected, cached);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn managed_account_worker_shutdown_aborts_unresponsive_task_after_timeout() {
     struct DropSignal(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
@@ -1021,7 +1028,7 @@ async fn managed_account_worker_shutdown_aborts_unresponsive_task_after_timeout(
     assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn message_subscription_recv_ends_when_runtime_shutdown_begins() {
     let lifecycle = RuntimeLifecycle::new();
     let (updates_tx, updates) = mpsc::channel(1);
@@ -1254,7 +1261,7 @@ fn timeline_subscription_with(
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn timeline_subscription_recv_ends_when_runtime_shutdown_begins() {
     let lifecycle = RuntimeLifecycle::new();
     let store = ScriptedTimelineStore::default();
@@ -1273,7 +1280,7 @@ async fn timeline_subscription_recv_ends_when_runtime_shutdown_begins() {
     drop(updates_tx);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_stream_watch_recv_prioritizes_terminal_update() {
     let lifecycle = RuntimeLifecycle::new();
     let (updates_tx, updates) = mpsc::channel(1);
@@ -1608,7 +1615,7 @@ fn apply_projection_scopes_global_window_changes_by_group() {
     assert_eq!(window.messages[0].message_id_hex, "shared-id");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn paginate_backwards_extends_window_and_clears_more_before() {
     let store = ScriptedTimelineStore::new(vec![timeline_test_page(
         &[("a", 10), ("b", 20)],
@@ -1637,7 +1644,7 @@ async fn paginate_backwards_extends_window_and_clears_more_before() {
     assert_eq!(queries[0].pagination.limit, Some(2));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn paginate_backwards_is_noop_without_more_before() {
     // Empty response queue: a store call would panic, proving none is made.
     let store = ScriptedTimelineStore::new(Vec::new());
@@ -1650,7 +1657,7 @@ async fn paginate_backwards_is_noop_without_more_before() {
     assert!(store.recorded_queries().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn paginate_forwards_reaching_head_reanchors() {
     let store = ScriptedTimelineStore::new(vec![timeline_test_page(
         &[("c", 30), ("d", 40)],
@@ -1674,7 +1681,7 @@ async fn paginate_forwards_reaching_head_reanchors() {
     assert_eq!(queries[0].pagination.after_message_id.as_deref(), Some("b"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn paginate_backwards_caps_window_and_opens_head_gap() {
     // A small window cap forces trimming the newest rows when older history
     // is loaded, opening a gap to the head (has_more_after).
@@ -1696,7 +1703,7 @@ async fn paginate_backwards_caps_window_and_opens_head_gap() {
     assert!(page.has_more_after);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn paginate_does_not_block_on_a_parked_receiver() {
     // Regression for the FFI-equivalent contention: a subscription parked in
     // recv() (no live updates) must not block pagination through the handle.
@@ -1730,7 +1737,7 @@ async fn paginate_does_not_block_on_a_parked_receiver() {
     let _ = recv.await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recv_projection_applies_to_window() {
     let lifecycle = RuntimeLifecycle::new();
     let store = ScriptedTimelineStore::default();
@@ -1761,7 +1768,7 @@ async fn recv_projection_applies_to_window() {
     assert_eq!(timeline_ids(&subscription.take_snapshot()), vec!["a", "b"]);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recv_refresh_rematerializes_anchored_head() {
     let lifecycle = RuntimeLifecycle::new();
     let store = ScriptedTimelineStore::new(vec![timeline_test_page(
@@ -1796,7 +1803,7 @@ async fn recv_refresh_rematerializes_anchored_head() {
     assert_eq!(queries[0].pagination.after, None);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recv_refresh_detached_issues_inclusive_upper_cursor() {
     let lifecycle = RuntimeLifecycle::new();
     // The store itself excludes newer same-second rows via the inclusive
@@ -1838,7 +1845,7 @@ async fn recv_refresh_detached_issues_inclusive_upper_cursor() {
     assert!(queries[0].pagination.before_inclusive);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pagination_refreshes_head_when_canonical_cursor_was_pruned() {
     let store = ScriptedTimelineStore::new_results(vec![
         Err(AppError::Storage(
@@ -1878,7 +1885,7 @@ async fn pagination_refreshes_head_when_canonical_cursor_was_pruned() {
     assert_eq!(queries[1].pagination.limit, Some(2));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refresh_install_is_dropped_when_window_paginated_during_query() {
     // Deterministic model of the P1(b) race: a refresh captures the window
     // generation before its store read; a pagination completes during that
@@ -1948,7 +1955,7 @@ fn refresh_query_for_anchored_window_targets_head() {
     assert_eq!(query.pagination.limit, Some(2));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chat_list_remove_update_is_sent_once_for_visible_rows() {
     let (updates_tx, mut updates_rx) = mpsc::channel(1);
     let visible_row = chat_list_test_row("group", "visible");
@@ -1986,7 +1993,7 @@ async fn chat_list_remove_update_is_sent_once_for_visible_rows() {
     assert!(updates_rx.try_recv().is_err());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chat_list_snapshot_reconciliation_updates_changed_rows_and_removes_missing_rows() {
     let (updates_tx, mut updates_rx) = mpsc::channel(2);
     let initial_row = chat_list_test_row("group", "before");
@@ -2028,7 +2035,7 @@ async fn chat_list_snapshot_reconciliation_updates_changed_rows_and_removes_miss
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pin_order_changes_are_sent_as_one_atomic_snapshot() {
     let (updates_tx, mut updates_rx) = mpsc::channel(1);
     let stale = chat_list_test_row("stale", "old");
@@ -2438,7 +2445,7 @@ fn lifecycle_refuses_account_open_after_shutdown_begins() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn member_key_package_prewarm_refuses_work_after_shutdown_begins() {
     let directory = tempfile::tempdir().unwrap();
     let account = AccountHome::open(directory.path())
@@ -2458,7 +2465,7 @@ async fn member_key_package_prewarm_refuses_work_after_shutdown_begins() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lifecycle_waits_for_account_opens_to_drain() {
     let lifecycle = RuntimeLifecycle::new();
     let permit = lifecycle
@@ -2479,7 +2486,7 @@ async fn lifecycle_waits_for_account_opens_to_drain() {
     assert!(waiter.await.expect("drain waiter should complete"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_manager_shutdown_drains_worker_inserted_by_in_flight_catch_up() {
     let dir = tempfile::tempdir().unwrap();
     let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), "wss://relay.example"));
@@ -2576,7 +2583,7 @@ fn invite_catch_up_is_not_spawned_after_shutdown_stops_accepting_tasks() {
 // Sender-controlled broker candidates must clear the shared dial-safety gate
 // at resolve time: literal-IP authorities resolve without DNS, so these cover
 // the canonical non-public classes end to end (issue #331).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn broker_resolve_rejects_non_public_candidates_without_dev_opt_in() {
     for authority in [
         "10.0.0.5:4433",      // private
@@ -2595,7 +2602,7 @@ async fn broker_resolve_rejects_non_public_candidates_without_dev_opt_in() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn broker_resolve_dev_opt_in_admits_loopback_only() {
     let addr = agent_stream_watch::resolve_broker_addr("127.0.0.1:4433", true)
         .await
@@ -2760,7 +2767,7 @@ fn account_setup_validation_rejects_nsec_in_identity_field() {
     assert!(matches!(err, AppError::UnexpectedPrivateKey));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_setup_rejects_conflicting_identity_and_import_nsec_before_mutation() {
     use nostr::prelude::ToBech32;
     let dir = tempfile::tempdir().unwrap();
@@ -2797,7 +2804,7 @@ fn account_setup_validation_accepts_matching_identity_and_import_nsec() {
         .expect("matching keys");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_setup_login_rejects_import_nsec_sidecar() {
     use nostr::prelude::ToBech32;
     let dir = tempfile::tempdir().unwrap();
@@ -2814,7 +2821,7 @@ async fn account_setup_login_rejects_import_nsec_sidecar() {
     assert!(matches!(err, AppError::UnexpectedPrivateKey));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_setup_login_rejects_nsec_shaped_identity_argument() {
     let dir = tempfile::tempdir().unwrap();
     let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), "wss://relay.example"));
@@ -2828,7 +2835,7 @@ async fn account_setup_login_rejects_nsec_shaped_identity_argument() {
     assert!(matches!(err, AppError::UnexpectedPrivateKey));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_setup_create_identity_rejects_import_nsec_sidecar() {
     let dir = tempfile::tempdir().unwrap();
     let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), "wss://relay.example"));
@@ -2892,7 +2899,7 @@ async fn open_runtime_local_test_client(
         .expect("open local test client")
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_startup_is_reaped() {
     let dir = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relays(dir.path(), vec![]);
@@ -2928,7 +2935,7 @@ async fn cancelled_startup_is_reaped() {
     runtime.shutdown().await;
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn finished_worker_is_replaced_on_first_requested_lookup() {
     let dir = tempfile::tempdir().expect("tempdir");
     let app = MarmotApp::with_relays(dir.path(), vec![]);
@@ -2936,8 +2943,13 @@ async fn finished_worker_is_replaced_on_first_requested_lookup() {
     let runtime = app.runtime();
     let manager = runtime.accounts();
     let handle = tokio::spawn(async {});
-    tokio::task::yield_now().await;
-    assert!(handle.is_finished());
+    timeout(Duration::from_secs(2), async {
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("stand-in worker finishes");
     let (shutdown, _shutdown_rx) = oneshot::channel();
     let (old_commands, _old_receiver) = mpsc::channel(1);
     manager.workers.lock().await.insert(
@@ -2960,7 +2972,7 @@ async fn finished_worker_is_replaced_on_first_requested_lookup() {
     runtime.shutdown().await;
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn finished_worker_is_replaced_on_first_batch_reconcile() {
     let dir = tempfile::tempdir().expect("tempdir");
     let app = MarmotApp::with_relays(dir.path(), vec![]);
@@ -2968,8 +2980,13 @@ async fn finished_worker_is_replaced_on_first_batch_reconcile() {
     let runtime = app.runtime();
     let manager = runtime.accounts();
     let handle = tokio::spawn(async {});
-    tokio::task::yield_now().await;
-    assert!(handle.is_finished());
+    timeout(Duration::from_secs(2), async {
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("stand-in worker finishes");
     let (shutdown, _shutdown_rx) = oneshot::channel();
     let (old_commands, _old_receiver) = mpsc::channel(1);
     manager.workers.lock().await.insert(
@@ -2995,7 +3012,7 @@ async fn finished_worker_is_replaced_on_first_batch_reconcile() {
     runtime.shutdown().await;
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reconcile_failure_waits_for_sibling_and_preserves_its_session() {
     let dir = tempfile::tempdir().expect("tempdir");
     marmot_account::AccountHome::open(dir.path())
@@ -3084,7 +3101,7 @@ async fn wait_for_startup_stages_to_settle(runtime: &MarmotAppRuntime) {
     .expect("every startup stage span ends");
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_ready_worker_completes_one_span_per_startup_stage() {
     let dir = tempfile::tempdir().expect("tempdir");
     let app = MarmotApp::with_relays(dir.path(), vec![]);
@@ -3112,7 +3129,7 @@ async fn a_ready_worker_completes_one_span_per_startup_stage() {
     runtime.shutdown().await;
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_non_worker_open_records_no_startup_stage_spans() {
     let dir = tempfile::tempdir().expect("tempdir");
     let app = MarmotApp::with_relays(dir.path(), vec![]);
@@ -3135,6 +3152,7 @@ async fn a_non_worker_open_records_no_startup_stage_spans() {
     runtime.shutdown().await;
 }
 
+// Pauses the clock, which needs the current-thread runtime.
 #[tokio::test(flavor = "current_thread")]
 async fn startup_timeout_reports_the_stage_the_worker_was_blocked_in() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -3183,6 +3201,7 @@ async fn startup_timeout_reports_the_stage_the_worker_was_blocked_in() {
     runtime.shutdown().await;
 }
 
+// Pauses the clock, which needs the current-thread runtime.
 #[tokio::test(flavor = "current_thread")]
 async fn a_timed_out_open_stays_in_flight_beside_its_replacement() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -3256,7 +3275,7 @@ async fn a_timed_out_open_stays_in_flight_beside_its_replacement() {
     runtime.shutdown().await;
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_account_startup_preserves_ready_sibling() {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = marmot_account::AccountHome::open(dir.path());
@@ -3309,7 +3328,7 @@ async fn failed_account_startup_preserves_ready_sibling() {
     runtime.shutdown().await;
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_worker_startup_is_suppressed_until_explicit_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
     let app = MarmotApp::with_relays(dir.path(), vec![]);
@@ -3380,7 +3399,7 @@ async fn failed_worker_startup_is_suppressed_until_explicit_restart() {
     runtime.shutdown().await;
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explicit_retry_keeps_backoff_reset_and_reconcile_in_one_transaction() {
     let dir = tempfile::tempdir().expect("tempdir");
     let app = MarmotApp::with_relays(dir.path(), vec![]);
@@ -3421,7 +3440,7 @@ async fn explicit_retry_keeps_backoff_reset_and_reconcile_in_one_transaction() {
     runtime.shutdown().await;
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signed_out_account_stays_gated_until_explicit_sign_in() {
     let dir = tempfile::tempdir().expect("tempdir");
     let app = MarmotApp::with_relays(dir.path(), vec![]);
@@ -3460,7 +3479,7 @@ async fn signed_out_account_stays_gated_until_explicit_sign_in() {
     runtime.shutdown().await;
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stuck_worker_reap_does_not_block_a_healthy_account() {
     let dir = tempfile::tempdir().expect("tempdir");
     let app = MarmotApp::with_relays(dir.path(), vec![]);
@@ -3540,7 +3559,7 @@ async fn stuck_worker_reap_does_not_block_a_healthy_account() {
     runtime.shutdown().await;
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deactivation_waits_for_worker_abort_before_committing_sign_out() {
     let dir = tempfile::tempdir().expect("tempdir");
     let app = MarmotApp::with_relays(dir.path(), vec![]);
@@ -3580,7 +3599,7 @@ async fn deactivation_waits_for_worker_abort_before_committing_sign_out() {
     runtime.shutdown().await;
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_reconcile_keeps_ready_worker_and_suppresses_failed_account() {
     let dir = tempfile::tempdir().expect("tempdir");
     let alice = marmot_account::AccountHome::open(dir.path())
@@ -3656,7 +3675,7 @@ async fn concurrent_reconcile_keeps_ready_worker_and_suppresses_failed_account()
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_worker_response_deadline_reports_unknown_completion() {
     let (_respond, response) = tokio::sync::oneshot::channel::<Result<(), AppError>>();
     let error = account_worker_response_with_wait(response, Duration::from_millis(1))
@@ -3675,7 +3694,7 @@ fn transient_transport_catch_up_failure() -> AccountCatchUpFailure {
     )
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn catch_up_retries_only_the_worker_with_a_transient_transport_failure() {
     let (flaky_tx, mut flaky_rx) = mpsc::channel(4);
     let flaky = tokio::spawn(async move {
@@ -3718,7 +3737,7 @@ async fn catch_up_retries_only_the_worker_with_a_transient_transport_failure() {
     assert_eq!(healthy.await.unwrap(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn catch_up_returns_after_transient_retry_budget_is_exhausted() {
     let (worker_tx, mut worker_rx) = mpsc::channel(8);
     let worker = tokio::spawn(async move {
@@ -3748,7 +3767,7 @@ async fn catch_up_returns_after_transient_retry_budget_is_exhausted() {
     assert_eq!(worker.await.unwrap(), 3);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn catch_up_does_not_retry_a_closed_worker_response() {
     let (worker_tx, mut worker_rx) = mpsc::channel(2);
     let worker = tokio::spawn(async move {
@@ -3774,7 +3793,7 @@ async fn catch_up_does_not_retry_a_closed_worker_response() {
     worker.await.unwrap();
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn catch_up_error_from_ready_account_takes_precedence_over_sibling_backoff() {
     let dir = tempfile::tempdir().expect("tempdir");
     let app = MarmotApp::with_relays(dir.path(), vec![]);
@@ -3870,7 +3889,9 @@ fn key_package_deletion_relay_failures_dedupe_privacy_safe_publish_endpoint_cate
     assert!(!failures[0].reason.contains("attacker-controlled"));
 }
 
-#[tokio::test]
+// Overflows the event broadcast without yielding so the timeline forwarder
+// must recover from lag; only one thread guarantees it cannot drain meanwhile.
+#[tokio::test(flavor = "current_thread")]
 async fn message_journey_overflow() {
     let root = tempfile::tempdir().unwrap();
     let account = marmot_account::AccountHome::open(root.path())
@@ -3932,7 +3953,9 @@ async fn message_journey_overflow() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+// Overflows the event broadcast without yielding so the chat-list forwarder
+// must recover from lag; only one thread guarantees it cannot drain meanwhile.
+#[tokio::test(flavor = "current_thread")]
 async fn accepted_edit_emits_content_row_and_recovered_snapshot_without_activity() {
     let root = tempfile::tempdir().unwrap();
     let account = AccountHome::open(root.path())
@@ -4216,7 +4239,7 @@ fn recovery_preserves_persisted_authority_after_reopen() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn system_reactions_update_live_timeline_through_existing_commands() {
     use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, group_system_event_material};
     use cgka_traits::engine::{GroupEvent, GroupStateChange};
@@ -4339,7 +4362,7 @@ async fn system_reactions_update_live_timeline_through_existing_commands() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deletion_provenance_only_change_wakes_chat_list_subscribers() {
     let (tx, mut rx) = mpsc::channel(2);
     let mut row = chat_list_test_row("group", "title");
@@ -4387,7 +4410,7 @@ async fn deletion_provenance_only_change_wakes_chat_list_subscribers() {
     assert!(rx.try_recv().is_err());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chat_preview_retention_only_change_wakes_subscribers() {
     let (tx, mut rx) = mpsc::channel(2);
     let mut row = chat_list_test_row("group", "title");

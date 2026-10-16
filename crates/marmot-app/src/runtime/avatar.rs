@@ -141,7 +141,7 @@ mod tests {
     use std::sync::Arc;
     use storage_sqlite::PublicDirectoryUserRecord;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn requested_identity_avatar_tracks_later_profile_without_an_open_window() {
         let dir = tempfile::tempdir().unwrap();
         let account = AccountHome::open(dir.path())

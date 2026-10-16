@@ -2356,7 +2356,7 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn catch_up_uses_mutation_worker() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = super::super::MarmotAppRuntime::new(crate::MarmotApp::with_relay(
@@ -2381,7 +2381,7 @@ mod tests {
         assert!(manager.workers.lock().await.is_empty(), "no reconciliation");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn diagnostic_reads_reject_saturated_worker_queue() {
         use super::super::{ManagedAccountWorker, MarmotAppRuntime};
         let dir = tempfile::tempdir().unwrap();
@@ -2435,7 +2435,7 @@ mod tests {
         runtime.shutdown().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn diagnostic_reads_do_not_start_or_reconcile_workers() {
         use super::super::{ManagedAccountWorker, MarmotAppRuntime};
         let dir = tempfile::tempdir().unwrap();

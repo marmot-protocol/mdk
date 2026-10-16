@@ -109,7 +109,7 @@ fn seed(store: &SqliteAccountStorage, bytes: &[u8]) {
         storage_sqlite::AttachmentPublishResult::Published
     );
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_local_access_is_bounded_offline_and_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -226,7 +226,7 @@ async fn attachment_local_access_is_bounded_offline_and_survives_reopen() {
     assert!(runtime.accounts.workers.lock().await.is_empty());
     runtime.shutdown_and_close().await.unwrap();
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_local_access_rejects_unbounded_inputs_without_starting_workers() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -313,7 +313,7 @@ async fn attachment_local_access_rejects_unbounded_inputs_without_starting_worke
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_progress_stream_observes_removal_without_network_or_erasing_ready_on_cancel() {
     use crate::{AttachmentControl, AttachmentTransferState};
     let dir = tempfile::tempdir().unwrap();

@@ -1808,7 +1808,7 @@ impl MarmotApp {
         {
             return Ok(cache);
         }
-        let _lifecycle = self.begin_storage_open("directory cache")?;
+        let lifecycle = self.begin_storage_open("directory cache")?;
         let _span = tracing::debug_span!(
             target: "marmot_app::directory",
             "directory_cache_handle_open",
@@ -1847,8 +1847,9 @@ impl MarmotApp {
         #[cfg(test)]
         self.directory_cache_open_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // Publishing under `_lifecycle` is what keeps this cache reachable by a
-        // later `close_storage`; see `MarmotApp::begin_storage_open`.
+        // Registering under `lifecycle` is what keeps this cache reachable by
+        // a later `close_storage`; see `MarmotApp::begin_storage_open`.
+        self.root_closers.register(&lifecycle, cache.closer());
         let mut caches = self
             .directory_caches
             .lock()

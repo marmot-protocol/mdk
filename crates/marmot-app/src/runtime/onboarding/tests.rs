@@ -103,7 +103,7 @@ impl DirectoryRelayFetcher for Network {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onboarding_older_checkpoint_restores_retry_hints_and_conservative_package_validity() {
     let (directory, first, network, _keys, id) = fixture().await;
     let manager = first.accounts();
@@ -157,7 +157,7 @@ async fn onboarding_older_checkpoint_restores_retry_hints_and_conservative_packa
     reopened.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn single_device_ignores_unusable_owned_slots_but_preserves_foreign_evidence() {
     let (_directory, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -210,7 +210,7 @@ async fn single_device_ignores_unusable_owned_slots_but_preserves_foreign_eviden
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onboarding_legacy_setup_admission_does_not_mutate_account() {
     let directory = tempfile::tempdir().unwrap();
     let network = Arc::new(Network::default());
@@ -254,7 +254,7 @@ async fn onboarding_legacy_setup_admission_does_not_mutate_account() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onboarding_legacy_import_rejects_before_reactivating_the_identity() {
     let (_dir, runtime, network, keys, id) = fixture().await;
     let home = runtime.accounts().app.account_home();
@@ -273,7 +273,7 @@ async fn onboarding_legacy_import_rejects_before_reactivating_the_identity() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onboarding_retry_preserves_declined_steps_and_invalidates_device_evidence() {
     let (_directory, runtime, _network, _keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -349,7 +349,7 @@ async fn onboarding_retry_preserves_declined_steps_and_invalidates_device_eviden
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onboarding_partial_discovery_and_off_filter_noise_have_distinct_results() {
     let (_directory, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -394,7 +394,7 @@ async fn onboarding_partial_discovery_and_off_filter_noise_have_distinct_results
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mixed_health_relay_declarations_pass_without_rewriting_signed_metadata() {
     let (_directory, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -447,7 +447,7 @@ async fn mixed_health_relay_declarations_pass_without_rewriting_signed_metadata(
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mixed_health_relay_steps_advance_the_checkpoint_without_publication() {
     let (_directory, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -503,7 +503,7 @@ async fn mixed_health_relay_steps_advance_the_checkpoint_without_publication() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transient_endpoint_failures_are_warnings_when_another_declared_route_completes() {
     use crate::relay_plane::DirectoryInspectionError;
 
@@ -556,7 +556,7 @@ async fn transient_endpoint_failures_are_warnings_when_another_declared_route_co
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_completed_read_route_can_prove_inspection_when_the_declared_write_route_times_out() {
     use crate::relay_plane::DirectoryInspectionError;
 
@@ -600,7 +600,7 @@ async fn a_completed_read_route_can_prove_inspection_when_the_declared_write_rou
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_directionality_and_inconclusive_checks_never_produce_false_readiness() {
     use crate::relay_plane::DirectoryInspectionError;
 
@@ -734,7 +734,7 @@ fn relay_status_keeps_the_inspection_cap_advisory_only_after_a_completed_check()
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onboarding_cancellation_retries_local_intent_and_allows_explicit_restart() {
     let (directory, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -772,7 +772,7 @@ async fn onboarding_cancellation_retries_local_intent_and_allows_explicit_restar
     reopened.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onboarding_completed_checkpoint_does_not_hide_or_clear_later_setup() {
     let (_dir, runtime, _network, keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -951,7 +951,7 @@ fn retired_relay_fixture_endpoint() -> String {
     )
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn minimal_relay_repair_retains_a_currently_allowed_damus_declaration() {
     let (_dir, runtime, _network, keys, _id) = fixture().await;
     let tags = vec![vec!["r".into(), "wss://relay.damus.io".into()]];
@@ -972,7 +972,7 @@ async fn minimal_relay_repair_retains_a_currently_allowed_damus_declaration() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn minimal_relay_repair_preserves_exact_custom_tags_and_removes_only_policy_rejected() {
     let (_dir, runtime, _network, keys, _id) = fixture().await;
     let before = vec![
@@ -1024,7 +1024,7 @@ async fn minimal_relay_repair_preserves_exact_custom_tags_and_removes_only_polic
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn minimal_relay_repair_retains_unsafe_routes_while_removing_retired_route() {
     let (_dir, runtime, _network, keys, _id) = fixture().await;
     let tags = vec![
@@ -1060,7 +1060,7 @@ async fn minimal_relay_repair_retains_unsafe_routes_while_removing_retired_route
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn minimal_relay_repair_matches_default_by_normalized_relay_key() {
     let (_dir, runtime, _network, keys, _id) = fixture().await;
     let event = signed(
@@ -1087,7 +1087,7 @@ async fn minimal_relay_repair_matches_default_by_normalized_relay_key() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn minimal_relay_repair_adds_only_missing_role_and_preserves_unmarked_duplicates() {
     let (_dir, runtime, _network, keys, _id) = fixture().await;
     let read_only = signed(
@@ -1135,7 +1135,7 @@ async fn minimal_relay_repair_adds_only_missing_role_and_preserves_unmarked_dupl
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn minimal_relay_repair_falls_back_to_unapprovable_manual_review() {
     let (_dir, runtime, _network, keys, id) = fixture().await;
     let malformed = signed(
@@ -1218,7 +1218,7 @@ async fn minimal_relay_repair_falls_back_to_unapprovable_manual_review() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inspection_failures_never_select_allowed_endpoints_for_removal() {
     let (_dir, runtime, _network, keys, id) = fixture().await;
     let source = signed(
@@ -1264,7 +1264,7 @@ async fn inspection_failures_never_select_allowed_endpoints_for_removal() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mixed_case_additive_repair() {
     for marker in ["READ", "rEaD"] {
         let (_dir, runtime, network, keys, id) = fixture().await;
@@ -1340,7 +1340,7 @@ async fn mixed_case_additive_repair() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn passed_relay_step_with_retired_finding_offers_consent_gated_removal_only_repair() {
     let (_dir, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -1444,12 +1444,12 @@ async fn passed_relay_step_with_retired_finding_offers_consent_gated_removal_onl
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_removal_only_cleanup_preserves_readiness() {
     cancel_removal_only_cleanup(false).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn typed_relay_preview_preserves_another_steps_pending_proposal() {
     let (_directory, runtime, network, _keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -1485,7 +1485,7 @@ async fn typed_relay_preview_preserves_another_steps_pending_proposal() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_required_relay_repair_remains_pending() {
     let (_directory, runtime, network, _keys, id) = fixture().await;
     missing_relays(&runtime, &id).await;
@@ -1512,7 +1512,7 @@ async fn cancel_required_relay_repair_remains_pending() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsigned_cleanup_is_cleared_on_signed_out_reimport() {
     for restart in [false, true] {
         let (directory, first, network, keys, id) = fixture().await;
@@ -1585,7 +1585,7 @@ async fn unsigned_cleanup_is_cleared_on_signed_out_reimport() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_removal_only_cleanup_after_restart_preserves_readiness() {
     cancel_removal_only_cleanup(true).await;
 }
@@ -1683,7 +1683,7 @@ async fn cancel_removal_only_cleanup(restart: bool) {
     reopened.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn removal_only_preview_is_unapprovable_when_no_route_completed_inspection() {
     let (_dir, runtime, network, keys, id) = fixture().await;
     let source = signed(
@@ -1768,7 +1768,7 @@ async fn removal_only_preview_is_unapprovable_when_no_route_completed_inspection
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn typed_relay_repair_checkpoint_fences_pre_preview_readers() {
     let (_dir, runtime, _network, keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -1824,7 +1824,7 @@ fn older_repair_proposal_without_typed_preview_remains_readable() {
     assert_eq!(restored, proposal);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn minimal_relay_repair_restart_preserves_preview_and_retries_exact_signed_event() {
     let (directory, first, network, keys, id) = fixture().await;
     let source = signed(
@@ -1901,7 +1901,7 @@ async fn minimal_relay_repair_restart_preserves_preview_and_retries_exact_signed
     third.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn minimal_relay_repair_rejects_modified_preview_without_publication() {
     let (_directory, runtime, network, keys, id) = fixture().await;
     let source = signed(
@@ -1966,7 +1966,7 @@ async fn minimal_relay_repair_rejects_modified_preview_without_publication() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn approved_unsigned_relay_repair_rejects_modified_checkpoint_before_signing() {
     let (_directory, runtime, network, keys, id) = fixture().await;
     let source = signed(
@@ -2041,7 +2041,7 @@ async fn approved_unsigned_relay_repair_rejects_modified_checkpoint_before_signi
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn minimal_inbox_relay_repair_uses_separate_defaults_through_approval_and_restart() {
     for inbox_relays in [vec!["wss://inbox-default.example".into()], Vec::new()] {
         let directory = tempfile::tempdir().unwrap();
@@ -2151,7 +2151,7 @@ async fn minimal_inbox_relay_repair_uses_separate_defaults_through_approval_and_
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn minimal_relay_repair_rejects_changed_source_without_publication() {
     let (_directory, runtime, network, keys, id) = fixture().await;
     let source = signed(
@@ -2226,7 +2226,7 @@ async fn missing_relays(runtime: &MarmotAppRuntime, id: &str) {
         .unwrap();
     assert_eq!(snapshot.steps[2].status, OnboardingStatus::NeedsInput);
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn defaults_append_relay_roles() {
     let (_dir, runtime, _network, keys, id) = fixture().await;
     for step in [OnboardingStep::Relays, OnboardingStep::InboxRelays] {
@@ -2352,7 +2352,7 @@ async fn defaults_append_relay_roles() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recommended_inbox_relays_use_the_separate_inbox_defaults() {
     let dir = tempfile::tempdir().unwrap();
     let network = Arc::new(Network::default());
@@ -2401,7 +2401,7 @@ async fn recommended_inbox_relays_use_the_separate_inbox_defaults() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onboarding_rejects_unsafe_inbox_defaults() {
     let dir = tempfile::tempdir().unwrap();
     let runtime = runtime(dir.path(), Arc::new(Network::default()));
@@ -2420,7 +2420,7 @@ async fn onboarding_rejects_unsafe_inbox_defaults() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn defaults_preserve_relay_tags() {
     for step in [OnboardingStep::Relays, OnboardingStep::InboxRelays] {
         let (dir, runtime, network, keys, id) = fixture().await;
@@ -2523,7 +2523,7 @@ async fn defaults_preserve_relay_tags() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn append_checkpoint_fences_old() {
     for epoch in [None, Some("ab".repeat(32))] {
         let (dir, runtime, network, keys, id) = fixture().await;
@@ -2597,7 +2597,7 @@ async fn append_checkpoint_fences_old() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inherited_roles_offer_edit() {
     for role in ["read", "future-role"] {
         let (_dir, runtime, network, keys, id) = fixture().await;
@@ -2660,7 +2660,7 @@ async fn inherited_roles_offer_edit() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proposal_requires_route() {
     let (_dir, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -2741,7 +2741,7 @@ async fn proposal_requires_route() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn partial_lookup_is_not_fresh() {
     for step in [OnboardingStep::Relays, OnboardingStep::InboxRelays] {
         let (_dir, runtime, network, keys, id) = fixture().await;
@@ -2792,7 +2792,7 @@ async fn partial_lookup_is_not_fresh() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn partial_lookup_is_not_absence() {
     let (_dir, runtime, network, _keys, id) = fixture().await;
     missing_relays(&runtime, &id).await;
@@ -2819,7 +2819,7 @@ async fn partial_lookup_is_not_absence() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_lists_published_only_on_public_indexers_are_not_missing() {
     // Imported identities usually publish to general-purpose relays. Absence
     // on the host's own relays must not read as "missing" and invite a
@@ -2879,7 +2879,7 @@ fn fail_public_indexers(network: &Network) {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_indexers_are_dialed_outside_the_inspection_cap() {
     let (_dir, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -2946,7 +2946,7 @@ async fn public_indexers_are_dialed_outside_the_inspection_cap() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unanswered_public_indexer_blocks_repair_approval() {
     for step in [OnboardingStep::Relays, OnboardingStep::InboxRelays] {
         let (_dir, runtime, network, keys, id) = fixture().await;
@@ -2990,7 +2990,7 @@ async fn unanswered_public_indexer_blocks_repair_approval() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explicit_discovery_relays_bypass_unreachable_public_indexers() {
     let (_dir, runtime, network, _keys, id) = fixture().await;
     fail_public_indexers(&network);
@@ -3024,7 +3024,7 @@ async fn explicit_discovery_relays_bypass_unreachable_public_indexers() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repairs_publish_to_host_and_declared_relays_never_to_indexers() {
     let (dir, first, network, _keys, id) = fixture().await;
     missing_relays(&first, &id).await;
@@ -3118,7 +3118,7 @@ fn public_indexers_join_discovery_except_on_loopback_routes() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_discovery_never_authorizes_default_replacement() {
     let (_dir, runtime, network, _keys, id) = fixture().await;
     network.fail_reads.store(true, Ordering::SeqCst);
@@ -3145,7 +3145,7 @@ async fn failed_discovery_never_authorizes_default_replacement() {
     assert!(network.attempts.lock().is_empty());
     runtime.shutdown_and_close().await.unwrap();
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn newest_malformed_profile_is_not_hidden_by_older_valid_metadata() {
     let (_dir, runtime, network, keys, id) = fixture().await;
     network.events.lock().extend([
@@ -3166,7 +3166,7 @@ async fn newest_malformed_profile_is_not_hidden_by_older_valid_metadata() {
     assert_eq!(result.steps[0].status, OnboardingStatus::NeedsInput);
     runtime.shutdown_and_close().await.unwrap();
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn future_dated_record_is_inconclusive_and_cannot_be_repaired_automatically() {
     let (_dir, runtime, network, keys, id) = fixture().await;
     network
@@ -3186,7 +3186,7 @@ async fn future_dated_record_is_inconclusive_and_cannot_be_repaired_automaticall
     );
     runtime.shutdown_and_close().await.unwrap();
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zero_ack_repair_survives_restart_and_retries_exact_signed_bytes() {
     let (dir, first, network, _keys, id) = fixture().await;
     missing_relays(&first, &id).await;
@@ -3228,7 +3228,7 @@ async fn zero_ack_repair_survives_restart_and_retries_exact_signed_bytes() {
     );
     second.shutdown_and_close().await.unwrap();
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_publication_retains_approval_and_signed_bytes() {
     let (_dir, runtime, network, _keys, id) = fixture().await;
     missing_relays(&runtime, &id).await;
@@ -3264,7 +3264,7 @@ async fn cancelled_publication_retains_approval_and_signed_bytes() {
     );
     runtime.shutdown_and_close().await.unwrap();
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn optional_repairs_preserve_unknown_profile_fields_and_follow_tag_metadata() {
     let (_dir, runtime, _network, keys, id) = fixture().await;
     let mut c = runtime
@@ -3324,7 +3324,7 @@ async fn optional_repairs_preserve_unknown_profile_fields_and_follow_tag_metadat
     assert_eq!(content, "opaque legacy content");
     runtime.shutdown_and_close().await.unwrap();
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn corrupt_or_future_checkpoint_fails_closed() {
     let (_dir, runtime, _network, _keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -3341,7 +3341,7 @@ async fn corrupt_or_future_checkpoint_fails_closed() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interactive_import_without_detailed_checkpoint_remains_gated() {
     let directory = tempfile::tempdir().unwrap();
     let network = Arc::new(Network::default());
@@ -3371,7 +3371,7 @@ async fn interactive_import_without_detailed_checkpoint_remains_gated() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn completed_checkpoint_resumes_interrupted_journal_cleanup() {
     let (_directory, runtime, _network, _keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -3417,7 +3417,7 @@ async fn completed_checkpoint_resumes_interrupted_journal_cleanup() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn profile_url_validation_and_explicit_clear_preserve_unrelated_fields() {
     let (_directory, runtime, _network, keys, id) = fixture().await;
     let mut c = runtime
@@ -3457,7 +3457,7 @@ async fn profile_url_validation_and_explicit_clear_preserve_unrelated_fields() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn single_device_notice_distinguishes_empty_failed_and_invalid_discovery_without_publishing()
 {
     let (_directory, runtime, network, keys, id) = fixture().await;
@@ -3535,7 +3535,7 @@ async fn single_device_notice_distinguishes_empty_failed_and_invalid_discovery_w
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_notice_checkpoint_upgrade_gates_incomplete_publication_and_preserves_completed_accounts()
  {
     let (_directory, runtime, _network, _keys, id) = fixture().await;
@@ -3583,7 +3583,7 @@ fn repair_archive_bytes(root: &std::path::Path, id: &str) -> Vec<Vec<u8>> {
     .collect()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn approved_repair_cancellation_preserves_evidence_and_requires_fresh_approval() {
     let (dir, first, network, keys, id) = fixture().await;
     missing_relays(&first, &id).await;
@@ -3639,7 +3639,7 @@ async fn approved_repair_cancellation_preserves_evidence_and_requires_fresh_appr
     reopened.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ready_onboarding_can_be_cancelled_before_open_chats() {
     let (_dir, runtime, _network, _keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -3657,7 +3657,7 @@ async fn ready_onboarding_can_be_cancelled_before_open_chats() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn successive_cancellations_replace_latest_even_if_publication_is_uncertain() {
     let (dir, runtime, network, keys, id) = fixture().await;
     missing_relays(&runtime, &id).await;
@@ -3713,7 +3713,7 @@ async fn successive_cancellations_replace_latest_even_if_publication_is_uncertai
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_during_blocked_publish_does_not_start_another_send() {
     let (_dir, runtime, network, _keys, id) = fixture().await;
     missing_relays(&runtime, &id).await;
@@ -3740,7 +3740,7 @@ async fn cancel_during_blocked_publish_does_not_start_another_send() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_cancellation_blocks_begin_until_cleanup_finishes() {
     let (_dir, runtime, _network, keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -3769,7 +3769,7 @@ async fn pending_cancellation_blocks_begin_until_cleanup_finishes() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_account_is_not_auto_signed_in_on_reopen() {
     let (dir, first, network, _keys, id) = fixture().await;
     first.accounts().cancel_onboarding(&id).await.unwrap();
@@ -4269,7 +4269,7 @@ fn mark_ready(c: &mut OnboardingCheckpoint) {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_ready_cleanup_after_cancel_retains_setup_journal() {
     let (_dir, runtime, _network, _keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -4402,7 +4402,7 @@ async fn cancel_during_ready_cleanup_hold_retains_setup() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_key_package_setup_after_cancel_does_not_mutate_setup() {
     let (_dir, runtime, _network, _keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -4783,7 +4783,7 @@ fn write_cancelled_checkpoint(dir: &std::path::Path, id: &str, value: serde_json
     std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_checkpoint_validation_rejects_malformed_archives() {
     let (dir, runtime, _network, keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -4841,7 +4841,7 @@ async fn cancelled_checkpoint_validation_rejects_malformed_archives() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_v1_and_v2_archives_migrate_and_overflow_fails_closed() {
     let (dir, runtime, _network, keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -4904,7 +4904,7 @@ async fn cancelled_v1_and_v2_archives_migrate_and_overflow_fails_closed() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_checkpoint_updates_fail_without_replacing_input_or_stored_bytes() {
     let (_dir, runtime, _, _, id) = fixture().await;
     let manager = runtime.accounts();
@@ -4939,7 +4939,7 @@ async fn pending_checkpoint_updates_fail_without_replacing_input_or_stored_bytes
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_hold_retains_release_before_the_wait_is_registered() {
     let (_dir, runtime, _, _, _) = fixture().await;
     let hold = runtime.accounts().install_onboarding_activation_hold();
@@ -4993,7 +4993,7 @@ fn controlled_reap_worker() -> (
     )
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn duplicate_reapers_own_pending_and_completed_workers_until_destruction() {
     for previous_complete in [false, true] {
         let (_dir, runtime, _, _, id) = fixture().await;
@@ -5097,7 +5097,7 @@ async fn shutdown_joins_late_reaper_after_owned_cancellation_times_out() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explicit_recovery_preserves_opaque_evidence_and_rejects_stale_approval_epochs() {
     for fault in ["malformed", "future", "exhausted"] {
         let (dir, runtime, network, keys, id) = fixture().await;
@@ -5222,7 +5222,7 @@ async fn explicit_recovery_preserves_opaque_evidence_and_rejects_stale_approval_
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unreadable_cancelled_evidence_does_not_block_live_cancellation_intent() {
     let (dir, runtime, _, _, id) = fixture().await;
     let path = dir
@@ -5239,7 +5239,7 @@ async fn unreadable_cancelled_evidence_does_not_block_live_cancellation_intent()
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_recovery_resumes_after_intent_or_tombstone_write_on_reopen() {
     for tombstone_written in [false, true] {
         let (dir, first, network, keys, id) = fixture().await;
@@ -5304,7 +5304,7 @@ async fn pending_recovery_resumes_after_intent_or_tombstone_write_on_reopen() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_of_unreadable_recovery_journal_preserves_its_bytes() {
     let (_dir, runtime, _, keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -5422,7 +5422,7 @@ async fn recovery_retires_blocked_external_signer_and_survives_dropped_caller() 
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reap_waiter_captured_before_duplicate_registration_waits_for_both_workers() {
     let (_dir, runtime, _, _, id) = fixture().await;
     let manager = runtime.accounts();
@@ -5450,7 +5450,7 @@ async fn reap_waiter_captured_before_duplicate_registration_waits_for_both_worke
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_device_acknowledgment_requires_the_displayed_epoch() {
     let (dir, runtime, _, keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -5525,7 +5525,7 @@ async fn recovery_device_acknowledgment_requires_the_displayed_epoch() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repeated_recovery_changes_epoch_even_when_attempt_numbers_repeat() {
     let (dir, runtime, _, keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -5578,7 +5578,7 @@ async fn repeated_recovery_changes_epoch_even_when_attempt_numbers_repeat() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exhausted_active_proposals_fail_closed_and_can_be_explicitly_recovered() {
     let (dir, runtime, _, keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -5633,7 +5633,7 @@ async fn exhausted_active_proposals_fail_closed_and_can_be_explicitly_recovered(
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_during_recovery_reap_leaves_intent_for_the_next_runtime() {
     let (dir, first, network, keys, id) = fixture().await;
     let manager = first.accounts();
@@ -5686,7 +5686,7 @@ async fn shutdown_during_recovery_reap_leaves_intent_for_the_next_runtime() {
     second.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_sign_out_refreshes_attention_before_worker_reap_finishes() {
     let (dir, runtime, _network, _keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -5731,7 +5731,7 @@ async fn recovery_sign_out_refreshes_attention_before_worker_reap_finishes() {
     removed.expect("signed-out account must disappear before worker cleanup finishes");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_relay_edit_restart_preserves_preview_and_retries_exact_signed_event() {
     let (directory, first, network, keys, id) = fixture().await;
     let source = signed(
@@ -5928,7 +5928,7 @@ fn manual_relay_edit_matches_equivalent_urls_without_rewriting_signed_tags() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_relay_edit_inbox_preview_preserves_extensions_and_rejects_tampering() {
     let (_dir, runtime, network, keys, id) = fixture().await;
     let source = signed(
@@ -6025,7 +6025,7 @@ async fn manual_relay_edit_inbox_preview_preserves_extensions_and_rejects_tamper
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_relay_edit_unchanged_selection_cannot_publish() {
     let (_dir, runtime, network, keys, id) = fixture().await;
     let source = signed(
