@@ -40,7 +40,9 @@ fn sustained_command_traffic_does_not_starve_the_hydration_pipeline() {
         .name("startup-hydration-flood".to_owned())
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
-            let test_runtime = tokio::runtime::Builder::new_current_thread()
+            let test_runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(8 * 1024 * 1024)
                 .enable_all()
                 .build()
                 .unwrap();
@@ -135,7 +137,9 @@ fn chat_list_is_readable_and_group_reads_wait_per_group_while_hydration_is_held(
         .name("startup-hydration-hold".to_owned())
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
-            let test_runtime = tokio::runtime::Builder::new_current_thread()
+            let test_runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(8 * 1024 * 1024)
                 .enable_all()
                 .build()
                 .unwrap();
@@ -350,7 +354,9 @@ fn existing_direct_conversation_is_not_a_miss_while_upgrade_backfill_is_held() {
         .name("startup-hydration-direct-index".to_owned())
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
-            let test_runtime = tokio::runtime::Builder::new_current_thread()
+            let test_runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(8 * 1024 * 1024)
                 .enable_all()
                 .build()
                 .unwrap();

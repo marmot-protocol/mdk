@@ -3673,6 +3673,7 @@ where
 {
     run_composed_app_runtime(
         thread_name,
+        // The caller's `//` comment says why it needs one thread.
         tokio::runtime::Builder::new_current_thread(),
         body,
     );
@@ -24354,6 +24355,8 @@ pub(crate) mod alloc_audit {
     pub(crate) fn measure<F: std::future::Future>(future: F) -> F::Output {
         static LOCK: Mutex<()> = Mutex::new(());
         let _serial = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // One thread keeps a measured peak reproducible: the fixture's tasks
+        // never hold allocations at the same instant on parallel workers.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .on_thread_start(measure_current_thread)

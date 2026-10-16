@@ -174,7 +174,9 @@ fn frozen_wake_collection_ingests_without_moving_the_durable_cursor() {
         .name("frozen-cursor-persistence".to_owned())
         .stack_size(4 * 1024 * 1024)
         .spawn(|| {
-            let test_runtime = tokio::runtime::Builder::new_current_thread()
+            let test_runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(4 * 1024 * 1024)
                 .enable_all()
                 .build()
                 .unwrap();

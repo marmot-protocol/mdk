@@ -147,14 +147,17 @@ async fn run_case(case: &str, existing_chats: usize) {
     );
 }
 
-/// Bench bodies compose many app boots and MLS commits; debug builds need
-/// more than libtest's default 2 MiB stack (same shape as `startup_scaling`).
+/// Bench bodies compose many app boots and MLS commits on the multi-thread
+/// flavor every production binding uses; debug builds need more than libtest's
+/// default 2 MiB stack on every thread (same shape as `startup_scaling`).
 fn run_bench(name: &'static str, existing_chats: usize) {
     std::thread::Builder::new()
         .name(name.to_owned())
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(8 * 1024 * 1024)
                 .enable_all()
                 .build()
                 .unwrap()

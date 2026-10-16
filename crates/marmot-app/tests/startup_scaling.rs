@@ -222,15 +222,17 @@ async fn run_case(groups: usize, roster: usize, messages_per_group: usize) -> Be
     report
 }
 
-/// Bench bodies compose many app boots and MLS commits; debug builds need
-/// more than libtest's default 2 MiB stack (same shape as
-/// `cursor_persistence.rs`).
+/// Bench bodies compose many app boots and MLS commits on the multi-thread
+/// flavor every production binding uses; debug builds need more than libtest's
+/// default 2 MiB stack on every thread (same shape as `cursor_persistence.rs`).
 fn run_bench(name: &'static str, groups: usize, roster: usize, messages_per_group: usize) {
     let thread = std::thread::Builder::new()
         .name(name.to_owned())
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
-            let test_runtime = tokio::runtime::Builder::new_current_thread()
+            let test_runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(8 * 1024 * 1024)
                 .enable_all()
                 .build()
                 .unwrap();

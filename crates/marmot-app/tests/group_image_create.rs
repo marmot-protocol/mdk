@@ -253,7 +253,9 @@ fn run_benchmark(name: &'static str, body: impl FnOnce() + Send + 'static) {
 #[ignore = "group-image create benchmark; run via `just bench-group-image-create`"]
 fn prepared_group_image_create_measurement_matrix() {
     run_benchmark("group-image-create-bench", || {
-        tokio::runtime::Builder::new_current_thread()
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_stack_size(8 * 1024 * 1024)
             .enable_all()
             .build()
             .unwrap()
