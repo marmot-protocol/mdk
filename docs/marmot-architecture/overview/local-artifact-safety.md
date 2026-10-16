@@ -26,7 +26,18 @@ mdk#357, mdk#367, mdk#396).
 - **Databases are pre-created 0600.** The DB file is created 0600 *before* the path is handed to
   rusqlite/SQLCipher; SQLite then copies that mode onto the `-wal`/`-shm`/journal sidecars it creates. Sidecars from
   older builds are tightened on open. This applies to encrypted databases too: sidecars and the unencrypted shared
-  cache have no cipher protecting them.
+  cache have no cipher protecting them. Use `fs_private::ensure_private_db_files`, never the general file helpers.
+- **Never open a database file outside SQLite** (mdk#2351). On POSIX, closing *any* descriptor on a file releases
+  every `fcntl` lock the process holds on it, and SQLite never notices (SQLite "How To Corrupt", section 2.2). An `open`/`close` of
+  the database or a `-wal`/`-shm`/`-journal` sidecar while this process holds a connection to it silently drops that
+  connection's SHARED lock and `-shm` read locks. Another process, such as the iOS Notification Service Extension
+  sharing the App Group root, can then take the database exclusively, checkpoint or truncate the WAL, or reinitialise
+  `-shm` under the live connection. So `ensure_private_db_files` creates only a *missing* main file through a
+  descriptor (`O_CREAT | O_EXCL`, serialized in-process so a concurrent preparer cannot let SQLite lock the new file
+  before that descriptor closes) and tightens existing files by path (`lstat` + no-follow `chmod`), never by opening
+  them. Reading, copying or hashing a database file through `std::fs` while this process may hold a connection to it
+  is forbidden for the same reason; go through SQLite (`VACUUM INTO`, the backup API) instead. Cross-process lock
+  probes are only trustworthy because of this rule.
 - **Must-precede-data PRAGMAs are applied before data.** Durability/privacy PRAGMAs that only affect subsequent
   writes (`secure_delete`, cipher settings) are applied at connection open — or, when toggled around an operation,
   set on the connection *before* `BEGIN` and restored after commit/rollback. SQLite does not guarantee zero-on-free
@@ -35,8 +46,9 @@ mdk#357, mdk#367, mdk#396).
 ## The helpers
 
 `crates/fs-private` owns the shared implementations: `write_private`, `open_private_append`, `create_new_private`,
-`ensure_private_file`, `tighten_existing_private_file`, `create_dir_all_private`, `set_private_file_mode`,
-`parse_octal_mode`, `bind_unix_listener_private`, and `rename_noreplace_with_lock`.
+`ensure_private_file`, `tighten_existing_private_file`, `ensure_private_db_files` (SQLite databases only),
+`create_dir_all_private`, `set_private_file_mode`, `parse_octal_mode`, `bind_unix_listener_private`, and
+`rename_noreplace_with_lock`.
 
 **Coverage rule:** new code that creates a local file, socket, or database calls these helpers (or proves equivalent
 restrictive-by-construction posture with an on-disk mode test) instead of re-deriving umask/chmod/PRAGMA ordering.
@@ -178,3 +190,8 @@ rules live in [`observability.md`](./observability.md).
 On-disk mode tests accompany each artifact path: `fs-private` unit tests, the daemon/connector socket tests, the
 `storage-sqlite` DB/sidecar and media-store mode tests, the `marmot-forensics` audit-file tests, and the `marmot-app`
 device-id/key-reveal/salt/cache tests. All assert `mode & 0o777` on the real files.
+
+Lock retention has cross-process tests: `fs-private` holds `fcntl` read locks on a database and its sidecars, runs
+`ensure_private_db_files`, and has a child process confirm every lock still blocks a writer; `storage-sqlite`
+(`reopening_a_live_database_keeps_its_posix_locks`) holds a WAL account connection, opens the same database again,
+and has a child process confirm it still cannot take the database exclusively.

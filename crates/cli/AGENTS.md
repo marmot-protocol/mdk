@@ -150,11 +150,5 @@ cargo test -p marmot-app
 just e2e-test
 ```
 
-Then widen before checkpointing cross-crate changes:
-
-```sh
-just fmt-check
-just check
-just clippy
-just test
-```
+For cross-crate changes, widen as the root `AGENTS.md` Verification section describes; GitHub CI runs the
+dependents' tests.

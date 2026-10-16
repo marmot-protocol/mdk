@@ -58,6 +58,11 @@ not "fix" it into the per-account database.
 - Accept raw SQLCipher keys only. Key derivation and recovery live above this crate.
 - Apply privacy/durability defaults unless callers opt out with `SqliteStorageOptions`.
 - Keep invalidated message records. Applications decide whether to show them.
+- Prepare every database file with `fs_private::ensure_private_db_files` before `Connection::open`, and never open,
+  read or copy a database or `-wal`/`-shm`/`-journal` sidecar through `std::fs` while this process may hold a
+  connection to it: closing that descriptor drops the connection's POSIX locks and lets another process take the
+  database under it. `connection::tests::reopening_a_live_database_keeps_its_posix_locks` guards this. See
+  `docs/marmot-architecture/overview/local-artifact-safety.md`.
 - Build every long-lived connection on `CloseableConnection` so a host can release the database's file locks at a known
   instant, and give its handle a `closer()` (`DatabaseCloser`, a weak reference) so a host can close it without keeping
   it open. Closing is terminal: surviving clones return `StorageError::Closed`, and nothing reopens implicitly. See
