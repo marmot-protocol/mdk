@@ -107,10 +107,10 @@ Each PR is green on its own and changes no behaviour.
    - Put the test hooks behind `cfg(any(test, feature = "test-support"))`.
    - Add the narrow test-support accessors that the eight app-level tests need. Some read private plane fields, for
      example `notification_lag_with_a_legacy_retained_route_stays_bounded` reads
-     `app.relay_plane.inner.transport.sdk_relay_client` (`relay_plane/tests.rs:5435-5446`). Rewrite those assertions
+     `app.relay_plane.inner.transport.sdk_relay_client` (`relay_plane/tests.rs:5500-5506`). Rewrite those assertions
      to use the accessors, so PR 2 can move the tests without dropping any.
    - Adapt `relay_label_resolution_is_gated_behind_opt_in` to the new export-gate trait. Today it builds the app's
-     `RelayTelemetryRuntimeConfig` from `crate::config` (`relay_plane/tests.rs:33-51`, `:2338-2358`).
+     `RelayTelemetryRuntimeConfig` from `crate::config` (`relay_plane/tests.rs:33-51`, `:2352-2360`).
    - Proof: `relay_plane/` has no production `crate::` or `storage_sqlite::` imports.
 2. **Move the eight tests that build a whole `MarmotApp` or runtime** out of `relay_plane/tests.rs` into the app's
    tests, using the accessors from PR 1. Tests only.
@@ -120,7 +120,13 @@ Each PR is green on its own and changes no behaviour.
      `#[cfg(test)] pub(crate)` module (`relay_plane/mod.rs:45-46`) that disappears once the plane is another crate.
 3. **Create `crates/transport-nostr` and `git mv` the files.**
    - In `marmot-app`, `mod relay_plane { pub use transport_nostr::*; }` keeps every existing path and re-export, so
-     the move touches nothing else.
+     callers do not change.
+   - The shim re-exports only `pub` items. Widen to `pub` every `pub(crate)` item the rest of `marmot-app` names
+     today: the account adapter's methods, the other plane methods the app calls, and types such as
+     `AccountDeliveryReceive` and `RelaySafetyPolicy`.
+   - `cfg(test)` is set only on the crate under test, never on its dependencies. Enable `test-support` through
+     `marmot-app`'s dev-dependency on `transport-nostr`, so `cargo test -p marmot-app` compiles the hooks and
+     accessors its tests call, while a normal build, and so the shipped library, leaves them out.
    - Add the crate's README, AGENTS.md and clippy disallowed-methods list.
    - Update the root README crate map, the root AGENTS.md "Where to go" table, and the adapter and app AGENTS files.
 4. **Repoint callers to `transport_nostr::` and delete the shim.** Mechanical.
@@ -135,7 +141,7 @@ All six must pass on each of PRs 3–6:
 1. The moved tests keep their names and pass under `cargo test -p transport-nostr --features test-support`.
 2. `cargo test -p marmot-app` passes for the library, `--features test-policy-overrides` (which runs feature-gated
    relay regressions such as `offline_member_post_join_catch_up_sees_the_commit_made_before_its_join`,
-   `relay_plane/tests.rs:5469-5474`), `--test relay_runtime`, and
+   `relay_plane/tests.rs:5533-5535`), `--test relay_runtime`, and
    `--features otlp-export --test relay_telemetry_otlp`. `relay_runtime` is flaky on some local machines, so CI is the
    authority for it.
 3. `cargo test -p wn-cli --features test-policy-overrides` passes.
@@ -162,7 +168,9 @@ These build on the moved crate, each as its own design brief:
 - a transport-neutral coverage surface beside `TransportAdapter`, with per-route EOSE and paging and stable batches
   (Pass 1 E recommendations 11 and 12, Pass 1 B step 4);
 - typed size handling and pre-publish checks (#2334);
-- routing derivation, merging `AppTransportRouting` with `marmot-account`'s copy;
+- routing derivation: the `NostrRoutingV1` decode the engine does today, which goes to `transport-nostr`;
+- merging `AppTransportRouting` with `marmot-account`'s `StaticTransportRouting` into the one routing implementation
+  on `marmot-device-runtime`;
 - the KeyPackage event format;
 - the directory crate (step 3);
 - folding the adapter's SDK client into `transport-nostr`.
