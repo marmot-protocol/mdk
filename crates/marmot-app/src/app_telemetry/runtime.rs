@@ -542,7 +542,7 @@ mod tests {
                 .all(|s| s.started == 0 && s.duration_ms.buckets.len() == 27)
         );
     }
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn aborted_caller_records_cancellation_without_a_completion_callback() {
         let t = AppPerformanceTelemetry::default();
         let copy = t.clone();

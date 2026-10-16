@@ -17,7 +17,7 @@ fn candidate(
     NostrTransportEvent::new_unsigned_at(event.pubkey, event.kind, tags, event.content, timestamp)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_preference_ranks_only_valid_current_slots_and_preserves_recency() {
     let (_dir, app, accounts, _) = member_resolution_fixture(1, false).await;
     let account = &accounts[0];
@@ -118,7 +118,7 @@ async fn client_preference_ranks_only_valid_current_slots_and_preserves_recency(
     assert_eq!(select(vec![not_exact, other.clone()]), other.id);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_replacement_suppresses_older_package_in_the_same_slot() {
     let (_dir, app, accounts, _) = member_resolution_fixture(1, false).await;
     let account = &accounts[0];
@@ -190,7 +190,7 @@ async fn malformed_replacement_suppresses_older_package_in_the_same_slot() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_preference_is_used_in_batch_and_single_author_fallback() {
     for (reject_batch, truncate_batch) in [(false, false), (true, false), (false, true)] {
         let (_dir, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
@@ -256,7 +256,7 @@ async fn client_preference_is_used_in_batch_and_single_author_fallback() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_preference_refetch_preserves_only_usable_current_batch_packages() {
     for batch_case in ["valid", "absent", "malformed", "incompatible"] {
         let (_dir, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
@@ -375,7 +375,7 @@ async fn failed_preference_refetch_preserves_only_usable_current_batch_packages(
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn per_author_refetch_preserves_slot_replacements_seen_in_batch() {
     let (_dir, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
     fetcher
@@ -428,7 +428,7 @@ async fn per_author_refetch_preserves_slot_replacements_seen_in_batch() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_preference_skips_incompatible_whitenoise_for_create_and_invite() {
     let (_dir, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let bob = &accounts[0];
@@ -523,7 +523,7 @@ async fn client_preference_skips_incompatible_whitenoise_for_create_and_invite()
     assert_eq!(alice.members(&no_fallback).unwrap().len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn publication_client_name_is_opt_in_and_signed_retries_keep_original_tags() {
     let dir = tempfile::tempdir().unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -626,7 +626,7 @@ async fn legacy_only_fixture() -> (
     (dir, app, account, fetcher)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn completed_legacy_only_lookup_reports_obsolete_only() {
     let (_dir, app, account, _fetcher) = legacy_only_fixture().await;
     let error = app
@@ -655,7 +655,7 @@ async fn completed_legacy_only_lookup_reports_obsolete_only() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incomplete_legacy_only_lookup_claims_neither_absence_nor_obsolescence() {
     let (_dir, app, account, fetcher) = legacy_only_fixture().await;
     *fetcher.incomplete_endpoint.lock().unwrap() = Some("wss://shared.example".into());
@@ -670,7 +670,7 @@ async fn incomplete_legacy_only_lookup_claims_neither_absence_nor_obsolescence()
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_slots_never_select_or_mask_current_slots() {
     let (_dir, app, accounts, _) = member_resolution_fixture(1, false).await;
     let account = &accounts[0];

@@ -12,7 +12,7 @@ fn pending_edit_request_decoder_preserves_legacy_local_sends() {
     assert!(dependency.is_none());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retained_submission_preserves_noncanonical_json_bytes_for_engine_handoff() {
     use cgka_traits::storage::{OutboundIntentStorage, QueuedOutboundIntent};
     use sha2::{Digest, Sha256};
@@ -76,7 +76,7 @@ async fn retained_submission_preserves_noncanonical_json_bytes_for_engine_handof
     h.app.close_storage().unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn durable_admission_is_atomic_correlated_and_retry_stable() {
     let h = History::new(0).await;
     let group = hex::encode(h.group.as_slice());
@@ -227,7 +227,7 @@ async fn durable_admission_is_atomic_correlated_and_retry_stable() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_edit_is_durable_while_original_publication_is_blocked() {
     let h = History::new(0).await;
     let runtime = MarmotAppRuntime::new(h.app.clone());
@@ -291,7 +291,7 @@ async fn pending_edit_is_durable_while_original_publication_is_blocked() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_edit_requires_an_existing_local_original() {
     let h = History::new(0).await;
     let group_hex = hex::encode(h.group.as_slice());
@@ -323,7 +323,7 @@ async fn pending_edit_requires_an_existing_local_original() {
     h.app.close_storage().unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rapid_edit_limit_reports_a_stable_retryable_error() {
     let h = History::new(0).await;
     h.app
@@ -367,7 +367,7 @@ async fn rapid_edit_limit_reports_a_stable_retryable_error() {
     h.app.close_storage().unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multiple_rapid_pending_edits_survive_restart_and_target_the_original_send() {
     let h = History::new(0).await;
     let group_hex = hex::encode(h.group.as_slice());
@@ -517,7 +517,7 @@ async fn multiple_rapid_pending_edits_survive_restart_and_target_the_original_se
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rejected_original_cannot_publish_a_retained_pending_edit() {
     let h = History::new(0).await;
     let group_hex = hex::encode(h.group.as_slice());
@@ -596,7 +596,7 @@ async fn rejected_original_cannot_publish_a_retained_pending_edit() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn durable_admission_proceeds_while_relay_publication_is_blocked() {
     let h = History::new(0).await;
     let runtime = MarmotAppRuntime::new(h.app.clone());
@@ -655,7 +655,7 @@ async fn durable_admission_proceeds_while_relay_publication_is_blocked() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn durable_admission_is_drained_by_a_new_worker() {
     let h = History::new(0).await;
     let (accepted, _) = h
@@ -758,7 +758,7 @@ async fn durable_admission_is_drained_by_a_new_worker() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rejected_submission_requires_a_new_token_after_restart() {
     let h = History::new(0).await;
     let request = LocalMessageRequest {
@@ -825,7 +825,7 @@ async fn rejected_submission_requires_a_new_token_after_restart() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn completion_write_failure_does_not_stall_later_submissions() {
     let h = History::new(0).await;
     // Admit before worker startup, so later admission wakeups cannot hide a stall.
@@ -953,7 +953,7 @@ fn prepared_media_snapshot_fixture(
     )
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prepared_media_snapshot_runtime_consumes_and_replays_without_clearing_a_new_draft() {
     let h = History::new(0).await;
     let group = hex::encode(h.group.as_slice());
@@ -998,7 +998,7 @@ async fn prepared_media_snapshot_runtime_consumes_and_replays_without_clearing_a
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prepared_media_snapshot_consumption_survives_restart_before_host_cleanup() {
     use crate::local_submissions::LocalDraftAdmission;
     let h = History::new(0).await;
@@ -1066,7 +1066,7 @@ async fn prepared_media_snapshot_consumption_survives_restart_before_host_cleanu
     reopened.close_storage().unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prepared_media_snapshot_preserves_changed_cleared_and_identical_newer_drafts() {
     use crate::local_submissions::LocalDraftAdmission;
     for change in 0..4 {
@@ -1153,7 +1153,7 @@ async fn prepared_media_snapshot_preserves_changed_cleared_and_identical_newer_d
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prepared_media_snapshot_rejects_unrelated_payload_without_consuming_the_draft() {
     use crate::local_submissions::LocalDraftAdmission;
     let h = History::new(0).await;
@@ -1196,7 +1196,7 @@ async fn prepared_media_snapshot_rejects_unrelated_payload_without_consuming_the
     h.app.close_storage().unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prepared_media_snapshot_rollback_preserves_both_draft_and_admission() {
     use crate::local_submissions::LocalDraftAdmission;
     use cgka_traits::storage::StorageProvider;
@@ -1244,7 +1244,7 @@ async fn prepared_media_snapshot_rollback_preserves_both_draft_and_admission() {
     h.app.close_storage().unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retained_edit_of_a_deleted_message_is_refused_at_admission() {
     // The prepared event skips the send preflight, so admission applies the
     // same rule: an edit of a deleted message would be dropped by recipients.

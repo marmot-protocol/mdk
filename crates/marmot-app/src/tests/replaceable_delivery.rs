@@ -84,7 +84,7 @@ async fn assert_completed_to_slow_relay(relay: &ScriptedPushRelayClient, kinds: 
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn profile_save_completes_quorum_cancelled_relays() {
     let (_directory, app, relay, label) = quorum_app();
 
@@ -102,7 +102,7 @@ async fn profile_save_completes_quorum_cancelled_relays() {
     assert_completed_to_slow_relay(&relay, &[KIND_NOSTR_METADATA]).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn follow_list_save_completes_quorum_cancelled_relays() {
     let (_directory, app, relay, label) = quorum_app();
 
@@ -113,7 +113,7 @@ async fn follow_list_save_completes_quorum_cancelled_relays() {
     assert_completed_to_slow_relay(&relay, &[KIND_NOSTR_CONTACT_LIST]).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_list_save_completes_quorum_cancelled_relays() {
     let (_directory, app, relay, label) = quorum_app();
 
@@ -128,7 +128,7 @@ async fn relay_list_save_completes_quorum_cancelled_relays() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn generated_bootstrap_completes_quorum_cancelled_relays() {
     let (_directory, app, relay, label) = quorum_app();
     let profile = UserProfileMetadata {
@@ -153,7 +153,7 @@ async fn generated_bootstrap_completes_quorum_cancelled_relays() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fully_acknowledged_profile_save_schedules_no_completion() {
     let directory = tempfile::tempdir().unwrap();
     let account = AccountHome::open(directory.path())
@@ -180,7 +180,7 @@ async fn fully_acknowledged_profile_save_schedules_no_completion() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn successive_saves_of_one_kind_author_strictly_increasing_timestamps() {
     let (_directory, app, relay, label) = quorum_app();
 
@@ -217,7 +217,7 @@ async fn successive_saves_of_one_kind_author_strictly_increasing_timestamps() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rapid_profile_saves_cache_the_authored_timestamp() {
     let (_directory, app, relay, label) = quorum_app();
     let runtime = crate::MarmotAppRuntime::new(app.clone());
@@ -267,7 +267,7 @@ async fn rapid_profile_saves_cache_the_authored_timestamp() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reopened_app_authors_after_previously_published_versions() {
     let (directory, app, relay, label) = quorum_app();
     let runtime = crate::MarmotAppRuntime::new(app.clone());
@@ -361,7 +361,7 @@ async fn wait_for_slow_acceptance(relay: &ScriptedPushRelayClient, kinds: &[u64]
     });
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_list_batch_completes_acknowledged_records_when_another_fails() {
     for (failing, acknowledged) in [
         (KIND_MARMOT_INBOX_RELAY_LIST, KIND_NIP65_RELAY_LIST),
@@ -378,7 +378,7 @@ async fn relay_list_batch_completes_acknowledged_records_when_another_fails() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bootstrap_batch_completes_acknowledged_records_when_another_fails() {
     let (_directory, app, relay, label) = quorum_app();
     relay.fail_publishes_of_kind(KIND_NIP65_RELAY_LIST);
@@ -408,7 +408,7 @@ async fn bootstrap_batch_completes_acknowledged_records_when_another_fails() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repeated_bootstrap_caches_the_authored_profile_timestamp() {
     let (_directory, app, relay, label) = quorum_app();
     let profile = UserProfileMetadata {
@@ -451,7 +451,7 @@ fn newest_authored(relay: &ScriptedPushRelayClient, kind: u64) -> u64 {
         .unwrap()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reopened_app_authors_follow_lists_after_previous_versions() {
     let (directory, app, relay, label) = quorum_app();
     let followed = "22".repeat(32);
@@ -477,7 +477,7 @@ async fn reopened_app_authors_follow_lists_after_previous_versions() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reopened_app_authors_after_versions_from_failed_batches() {
     let (directory, app, relay, label) = quorum_app();
     relay.fail_publishes_of_kind(KIND_NIP65_RELAY_LIST);
@@ -517,7 +517,7 @@ async fn reopened_app_authors_after_versions_from_failed_batches() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resumed_indexer_copy_authors_after_the_persisted_floor() {
     let (_directory, app, relay, label) = quorum_app();
     app.publish_account_relay_lists(&label, two_relay_bootstrap())

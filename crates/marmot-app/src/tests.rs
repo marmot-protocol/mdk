@@ -67,7 +67,7 @@ fn one_pixel_png() -> Vec<u8> {
     bytes
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rejoin_eviction_invalidates_both_group_projections_without_mls_reads() {
     use cgka_traits::storage::WelcomeStorage;
     use cgka_traits::welcome::{PendingWelcome, RejoinWelcome};
@@ -122,7 +122,7 @@ async fn rejoin_eviction_invalidates_both_group_projections_without_mls_reads() 
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rejoin_decline_does_not_require_live_mls_state() {
     use cgka_traits::storage::{GroupStorage, MessageStorage, WelcomeStorage};
     use cgka_traits::welcome::{PendingWelcome, RejoinWelcome};
@@ -171,7 +171,7 @@ async fn rejoin_decline_does_not_require_live_mls_state() {
     assert!(client.pending_recovery_status_updates.contains(&group_id));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn send_finalizes_once() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -218,7 +218,7 @@ async fn send_finalizes_once() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "diagnostic history-size timing matrix"]
 async fn send_history_timings() {
     let dir = tempfile::tempdir().unwrap();
@@ -2216,7 +2216,7 @@ fn recovery_warning_requires_qualified_local_observations_and_survives_local_com
     });
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_warning_is_hidden_for_terminal_groups_but_not_repairable_groups() {
     use cgka_traits::storage::GroupStorage;
     let dir = tempfile::tempdir().unwrap();
@@ -4221,7 +4221,7 @@ async fn inbound_disband_candidate_blocks_local_delete_body() {
     assert!(app.group("alice", &group_id_hex).unwrap().is_none());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_disband_keeps_a_worker_wakeup_after_acceptance_and_reopen() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -4271,7 +4271,7 @@ async fn pending_disband_keeps_a_worker_wakeup_after_acceptance_and_reopen() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_or_unrecoverable_disband_does_not_create_an_idle_poll_loop() {
     use cgka_traits::storage::{DisbandRequestStorage, GroupStorage};
 
@@ -5323,7 +5323,7 @@ async fn disable_native_push_removal_body() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn push_registration_update_retry_survives_failure_partial_success_and_restart() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -5390,7 +5390,7 @@ async fn push_registration_update_retry_survives_failure_partial_success_and_res
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn foreground_push_registration_preserves_completed_gossip_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -5885,7 +5885,7 @@ async fn push_registration_removal_retry_body() {
     reopened_runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn generated_account_bootstrap_separates_operational_and_indexer_batches() {
     let directory = tempfile::tempdir().unwrap();
     let account = AccountHome::open(directory.path())
@@ -5992,7 +5992,7 @@ async fn generated_account_bootstrap_separates_operational_and_indexer_batches()
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn profile_and_relay_list_updates_copy_to_indexers_without_adopting_them() {
     let directory = tempfile::tempdir().unwrap();
     let account = AccountHome::open(directory.path())
@@ -6065,7 +6065,7 @@ async fn profile_and_relay_list_updates_copy_to_indexers_without_adopting_them()
     assert!(!status.bootstrap_relays.contains(&indexer.0));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unavailable_indexer_does_not_undo_acknowledged_account_bootstrap() {
     let directory = tempfile::tempdir().unwrap();
     let account = AccountHome::open(directory.path())
@@ -6100,7 +6100,7 @@ async fn unavailable_indexer_does_not_undo_acknowledged_account_bootstrap() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsafe_indexer_is_skipped_without_blocking_account_bootstrap() {
     let directory = tempfile::tempdir().unwrap();
     let account = AccountHome::open(directory.path())
@@ -6126,7 +6126,7 @@ async fn unsafe_indexer_is_skipped_without_blocking_account_bootstrap() {
     assert_eq!(relay.attempted_publish_routes.lock().unwrap().len(), 4);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loopback_account_relays_suppress_public_indexer_copies() {
     let directory = tempfile::tempdir().unwrap();
     let account = AccountHome::open(directory.path())
@@ -6168,7 +6168,7 @@ async fn loopback_account_relays_suppress_public_indexer_copies() {
     assert!(mixed.indexer_copy.is_none());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mixed_loopback_declarations_suppress_profile_and_relay_list_indexer_copies() {
     let directory = tempfile::tempdir().unwrap();
     let account = AccountHome::open(directory.path())
@@ -6200,7 +6200,7 @@ async fn mixed_loopback_declarations_suppress_profile_and_relay_list_indexer_cop
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replacing_loopback_outbox_copies_new_public_relay_lists_to_indexer() {
     let directory = tempfile::tempdir().unwrap();
     let account = AccountHome::open(directory.path())
@@ -6251,7 +6251,7 @@ async fn replacing_loopback_outbox_copies_new_public_relay_lists_to_indexer() {
     .expect("replacement public lists must reach the indexer on the first edit");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn confirmed_bootstrap_retry_republishes_public_indexer_copies() {
     let directory = tempfile::tempdir().unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -6321,7 +6321,7 @@ async fn confirmed_bootstrap_retry_republishes_public_indexer_copies() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resumed_indexer_copy_preserves_directional_nip65_roles() {
     let directory = tempfile::tempdir().unwrap();
     let account = AccountHome::open(directory.path())
@@ -6366,7 +6366,7 @@ async fn resumed_indexer_copy_preserves_directional_nip65_roles() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stalled_indexer_does_not_delay_generated_account_network_readiness() {
     let directory = tempfile::tempdir().unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -6407,7 +6407,7 @@ async fn stalled_indexer_does_not_delay_generated_account_network_readiness() {
     relay.indexer_publish_release.notify_waiters();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_shutdown_cancels_pending_indexer_copies() {
     let directory = tempfile::tempdir().unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -6454,7 +6454,7 @@ async fn runtime_shutdown_cancels_pending_indexer_copies() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_removal_cancels_pending_indexer_copies() {
     let directory = tempfile::tempdir().unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -6506,7 +6506,7 @@ async fn account_removal_cancels_pending_indexer_copies() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stalled_indexer_does_not_delay_profile_publish_return() {
     let directory = tempfile::tempdir().unwrap();
     let account = AccountHome::open(directory.path())
@@ -6550,7 +6550,7 @@ async fn stalled_indexer_does_not_delay_profile_publish_return() {
     relay.indexer_publish_release.notify_waiters();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn generated_account_setup_records_distinct_network_ready_phases() {
     let directory = tempfile::tempdir().unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -6603,7 +6603,7 @@ async fn generated_account_setup_records_distinct_network_ready_phases() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn initial_setup_key_package_publishes_before_stalled_initial_sync_finishes() {
     let directory = tempfile::tempdir().unwrap();
     let home = AccountHome::open(directory.path());
@@ -6660,7 +6660,7 @@ async fn initial_setup_key_package_publishes_before_stalled_initial_sync_finishe
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_list_zero_ack_does_not_advance_the_local_projection() {
     let directory = tempfile::tempdir().unwrap();
     let account = AccountHome::open(directory.path())
@@ -6691,7 +6691,7 @@ async fn relay_list_zero_ack_does_not_advance_the_local_projection() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn partial_generated_bootstrap_keeps_the_journaled_identity_for_retry() {
     let directory = tempfile::tempdir().unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -6791,7 +6791,7 @@ fn profile_content(profile: &Option<UserProfileMetadata>) -> Option<UserProfileM
     })
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn generated_identity_publishes_supplied_initial_profile_as_first_kind0() {
     let directory = tempfile::tempdir().unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -6866,7 +6866,7 @@ async fn generated_identity_publishes_supplied_initial_profile_as_first_kind0() 
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn initial_profile_retry_returns_the_profile_a_running_bootstrap_publishes() {
     let directory = tempfile::tempdir().unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -6958,7 +6958,7 @@ async fn initial_profile_retry_returns_the_profile_a_running_bootstrap_publishes
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn generated_identity_returns_before_bootstrap_publication_unblocks() {
     let directory = tempfile::tempdir().unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -7053,7 +7053,7 @@ async fn generated_identity_returns_before_bootstrap_publication_unblocks() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_ready_result_does_not_report_an_unrequested_key_package_publication() {
     let directory = tempfile::tempdir().unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -7107,7 +7107,7 @@ async fn local_ready_result_does_not_report_an_unrequested_key_package_publicati
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compatibility_create_identity_waits_for_network_readiness() {
     let directory = tempfile::tempdir().unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -7130,7 +7130,7 @@ async fn compatibility_create_identity_waits_for_network_readiness() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn generated_setup_resume_context_failures_do_not_block_runtime_start() {
     for (remove_context, expected_kind) in [
         (true, "setup_context_missing"),
@@ -7192,7 +7192,7 @@ async fn generated_setup_resume_context_failures_do_not_block_runtime_start() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn generated_identity_restart_resumes_every_durable_setup_phase() {
     for phase in [
         marmot_account::AccountSetupPhase::LocalStateCreated,
@@ -7305,7 +7305,7 @@ async fn generated_identity_restart_resumes_every_durable_setup_phase() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_generated_identity_calls_converge_on_one_local_attempt() {
     let directory = tempfile::tempdir().unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -7341,7 +7341,10 @@ async fn concurrent_generated_identity_calls_converge_on_one_local_attempt() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+// The account worker's setup KeyPackage path and the setup bootstrap both
+// publish missing relay lists (mdk#2359). On one thread the first to finish
+// records the projection the other checks; on two, both publish.
+#[tokio::test(flavor = "current_thread")]
 async fn confirmed_generated_bootstrap_republishes_when_projection_is_missing() {
     let directory = tempfile::tempdir().unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -7405,7 +7408,7 @@ async fn confirmed_generated_bootstrap_republishes_when_projection_is_missing() 
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn key_package_generation_upgrade_runs_once_per_account_on_activation() {
     use cgka_traits::maintenance::KEY_PACKAGE_GENERATION_REVISION;
     let directory = tempfile::tempdir().unwrap();
@@ -7505,7 +7508,7 @@ async fn key_package_generation_upgrade_runs_once_per_account_on_activation() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn key_package_cutover_replacement_intent_survives_cache_retirement_and_restart() {
     let directory = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
@@ -7552,7 +7555,7 @@ async fn key_package_cutover_replacement_intent_survives_cache_retirement_and_re
     assert!(!reopened.key_package_cutover_replacement_pending(label));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn key_package_deletion_batch_preserves_partial_results_and_cache_ownership() {
     let directory = tempfile::tempdir().unwrap();
     let account = AccountHome::open(directory.path())
@@ -7612,7 +7615,7 @@ async fn key_package_deletion_batch_preserves_partial_results_and_cache_ownershi
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_key_package_deletion_uses_batch_and_requires_ack_before_cache_removal() {
     let directory = tempfile::tempdir().unwrap();
     let account = AccountHome::open(directory.path())
@@ -7663,7 +7666,7 @@ async fn manual_key_package_deletion_uses_batch_and_requires_ack_before_cache_re
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn key_package_deletion_routes_endpoints_through_relay_safety_policy() {
     let directory = tempfile::tempdir().unwrap();
     let account = AccountHome::open(directory.path())
@@ -7754,7 +7757,7 @@ fn configured_directory_relays_stay_separate_from_operational_relays() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn key_package_cutover_retains_current_cache_without_scheduling_replacement() {
     let directory = tempfile::tempdir().unwrap();
     let home = AccountHome::open(directory.path());
@@ -7786,7 +7789,7 @@ async fn key_package_cutover_retains_current_cache_without_scheduling_replacemen
     assert!(!app.key_package_cutover_replacement_pending(&account.label));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn key_package_cutover_imports_stable_slot_before_cache_retirement() {
     let directory = tempfile::tempdir().unwrap();
     let home = AccountHome::open(directory.path());
@@ -7824,7 +7827,7 @@ async fn key_package_cutover_imports_stable_slot_before_cache_retirement() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn key_package_cutover_repairs_empty_welcome_slot_without_losing_consumed_reference() {
     let directory = tempfile::tempdir().unwrap();
     let home = AccountHome::open(directory.path());
@@ -7945,7 +7948,7 @@ fn durable_incomplete_setup_can_provision_slot_after_database_creation() {
     assert_eq!(lifecycle.stable_slot_id.len(), 64);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_ambiguous_setup_requires_consent_before_reset() {
     let directory = tempfile::tempdir().unwrap();
     let home = AccountHome::open(directory.path());
@@ -7998,7 +8001,7 @@ async fn legacy_ambiguous_setup_requires_consent_before_reset() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unpublished_legacy_session_bundle_schedules_replacement_before_open() {
     let directory = tempfile::tempdir().unwrap();
     let home = AccountHome::open(directory.path());
@@ -8139,7 +8142,7 @@ pub(crate) fn remember_test_member_inbox(app: &MarmotApp, account_id_hex: &str, 
         .unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn member_key_package_skips_local_legacy_cache() {
     let directory = tempfile::tempdir().unwrap();
     let home = AccountHome::open(directory.path());
@@ -8180,7 +8183,7 @@ async fn member_key_package_skips_local_legacy_cache() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn member_key_package_falls_back_to_current_directory_for_local_account() {
     let directory = tempfile::tempdir().unwrap();
     let home = AccountHome::open(directory.path());
@@ -8236,7 +8239,7 @@ async fn member_key_package_falls_back_to_current_directory_for_local_account() 
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn member_key_package_set_canonicalizes_and_deduplicates_in_input_order() {
     let (_directory, app, accounts, _fetcher) = member_resolution_fixture(2, false).await;
     let bob = accounts[0].clone();
@@ -8360,7 +8363,7 @@ pub(crate) async fn member_resolution_fixture(
     (directory, app, accounts, fetcher)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 /// Relay-list resolution follows the target account's NIP-65 write relay for
 /// kind 10050 instead of treating a successful first-hop miss as absence.
 async fn member_inbox_is_resolved_on_discovered_outbox() {
@@ -8429,7 +8432,7 @@ async fn member_inbox_is_resolved_on_discovered_outbox() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_outbox_route_cap_keeps_usable_first_hop_metadata() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let account_id = accounts[0].account_id_hex.clone();
@@ -8478,7 +8481,7 @@ async fn account_outbox_route_cap_keeps_usable_first_hop_metadata() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incomplete_discovery_is_not_cleared_by_an_empty_cached_outbox() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let account_id = accounts[0].account_id_hex.clone();
@@ -8514,7 +8517,7 @@ async fn incomplete_discovery_is_not_cleared_by_an_empty_cached_outbox() {
     }));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 /// A found inbox list naming only retired relays is named in the error, which
 /// still reports the incomplete outbox hop rather than a final verdict.
 async fn member_inbox_of_only_retired_relays_is_reported_distinctly() {
@@ -8538,7 +8541,7 @@ async fn member_inbox_of_only_retired_relays_is_reported_distinctly() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 /// A cached retired-only inbox list stays retryable when the refresh fails,
 /// and a completed refresh replaces it with the member's newer usable list.
 async fn cached_retired_inbox_with_failed_refresh_remains_retryable() {
@@ -8566,7 +8569,7 @@ async fn cached_retired_inbox_with_failed_refresh_remains_retryable() {
         .expect("a completed refresh finds the newer usable inbox without republication");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn directory_relay_persistence_preserves_newer_signed_empty_lists() {
     let (_directory, app, accounts, _fetcher) = member_resolution_fixture(1, false).await;
     let id = &accounts[0].account_id_hex;
@@ -8590,7 +8593,7 @@ async fn directory_relay_persistence_preserves_newer_signed_empty_lists() {
     assert!(persisted.relay_lists.inbox.relays.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_outbox_route_cap_without_inbox_remains_unknown() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let id = &accounts[0].account_id_hex;
@@ -8622,7 +8625,7 @@ async fn account_outbox_route_cap_without_inbox_remains_unknown() {
     assert_eq!(fetcher.requests.lock().unwrap().len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_signed_empty_inbox_with_incomplete_outbox_remains_unknown() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let id = &accounts[0].account_id_hex;
@@ -8660,7 +8663,7 @@ async fn account_signed_empty_inbox_with_incomplete_outbox_remains_unknown() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_read_only_nip65_returns_typed_missing_write_routes() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let id = &accounts[0].account_id_hex;
@@ -8700,7 +8703,7 @@ async fn account_read_only_nip65_returns_typed_missing_write_routes() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn future_dated_inbox_is_unknown_for_account_and_member_resolution() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let id = &accounts[0].account_id_hex;
@@ -8728,7 +8731,7 @@ async fn future_dated_inbox_is_unknown_for_account_and_member_resolution() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_group_create_resolves_local_member_aliases_with_fresh_relay_packages() {
     let (directory, app, accounts, _fetcher) = member_resolution_fixture(1, false).await;
     let member = &accounts[0];
@@ -8760,7 +8763,7 @@ async fn runtime_group_create_resolves_local_member_aliases_with_fresh_relay_pac
     drop(directory);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_group_create_rejects_creator_aliases_before_group_mutation() {
     let (_directory, app, accounts, _fetcher) = member_resolution_fixture(1, false).await;
     let creator = &accounts[0];
@@ -8805,7 +8808,7 @@ async fn runtime_group_create_rejects_creator_aliases_before_group_mutation() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 /// A cached NIP-65 list must not suppress independent kind-10050 discovery.
 async fn missing_inbox_is_discovered_when_nip65_is_cached() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
@@ -8856,7 +8859,7 @@ async fn missing_inbox_is_discovered_when_nip65_is_cached() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 /// Unsafe cached inbox endpoints must be replaced before readiness succeeds.
 async fn unsafe_cached_inbox_is_refreshed_before_member_resolution_succeeds() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
@@ -8911,7 +8914,7 @@ async fn unsafe_cached_inbox_is_refreshed_before_member_resolution_succeeds() {
     }));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 /// Existing-group invitations reject unrouteable members before MLS mutation.
 async fn invite_with_key_package_but_no_inbox_route_fails_before_commit() {
     let (directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
@@ -8965,7 +8968,7 @@ async fn invite_with_key_package_but_no_inbox_route_fails_before_commit() {
     }));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 /// Founding creates reject unrouteable members before persisting a group.
 async fn create_group_with_key_package_but_no_inbox_route_fails_before_group_creation() {
     let (directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
@@ -9019,7 +9022,7 @@ async fn create_group_with_key_package_but_no_inbox_route_fails_before_group_cre
     }));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 /// A mixed roster fails atomically without consuming any valid KeyPackage.
 async fn mixed_invite_route_readiness_does_not_consume_key_packages_or_mutate_membership() {
     let (directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
@@ -9087,7 +9090,7 @@ async fn mixed_invite_route_readiness_does_not_consume_key_packages_or_mutate_me
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 /// Repeated ready batches continue to converge with a large directory cache.
 async fn thirty_incremental_invites_with_large_directory_cache_converge_without_false_success() {
     let (directory, app, accounts, _fetcher) = member_resolution_fixture(30, false).await;
@@ -9127,7 +9130,7 @@ async fn thirty_incremental_invites_with_large_directory_cache_converge_without_
 
 /// The public directory is shared by accounts on a device. Its old package may
 /// still validate cryptographically even after the recipient has rotated it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn member_key_package_resolution_refreshes_shared_directory_and_prewarm() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let recipient = &accounts[0];
@@ -9214,7 +9217,7 @@ async fn member_key_package_resolution_refreshes_shared_directory_and_prewarm() 
     assert_eq!(requests[0].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn member_key_package_resolution_fails_closed_after_cached_prewarm() {
     for relay_failure in [false, true] {
         let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
@@ -9255,7 +9258,7 @@ async fn member_key_package_resolution_fails_closed_after_cached_prewarm() {
 
 /// Invitations and prewarming must not resurrect a cached package when relays only return
 /// future-dated records, including when the batch falls back to single authors.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn member_key_package_resolution_never_falls_back_to_cached_key_packages() {
     for reject_batch in [false, true] {
         let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
@@ -9335,7 +9338,7 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(8, false).await;
     let members = accounts
@@ -9401,7 +9404,7 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn member_key_package_prewarm_does_not_renew_routes_after_incomplete_discovery() {
     for incomplete in ["wss://directory.example", "wss://shared.example"] {
         let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
@@ -9433,7 +9436,7 @@ async fn member_key_package_prewarm_does_not_renew_routes_after_incomplete_disco
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
     for event in fetcher.events.lock().unwrap().iter_mut() {
@@ -9474,7 +9477,7 @@ async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn member_key_package_set_falls_back_when_multi_author_queries_are_rejected() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
     fetcher
@@ -9507,7 +9510,7 @@ async fn member_key_package_set_falls_back_when_multi_author_queries_are_rejecte
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn member_key_package_set_falls_back_when_multi_author_queries_are_incomplete() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
     fetcher
@@ -9540,7 +9543,7 @@ async fn member_key_package_set_falls_back_when_multi_author_queries_are_incompl
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_list_fallback_failure_preserves_valid_siblings_and_input_order() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(3, false).await;
     fetcher
@@ -9579,7 +9582,7 @@ async fn relay_list_fallback_failure_preserves_valid_siblings_and_input_order() 
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn member_key_package_set_reports_missing_packages_in_input_order() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
     fetcher
@@ -9603,7 +9606,7 @@ async fn member_key_package_set_reports_missing_packages_in_input_order() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_batch_member_does_not_discard_valid_member_prewarm() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
     let malformed_account = accounts[1].account_id_hex.clone();
@@ -9639,7 +9642,7 @@ async fn malformed_batch_member_does_not_discard_valid_member_prewarm() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn member_key_package_resolution_ignores_older_malformed_publication() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let account_id = accounts[0].account_id_hex.clone();
@@ -9666,7 +9669,7 @@ async fn member_key_package_resolution_ignores_older_malformed_publication() {
     assert_eq!(summary.network_resolved_members, 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn member_key_package_resolution_rejects_superseded_slot_after_malformed_replacement() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let account_id = accounts[0].account_id_hex.clone();
@@ -9692,7 +9695,7 @@ async fn member_key_package_resolution_rejects_superseded_slot_after_malformed_r
     assert!(matches!(error, AppError::InvalidKeyPackageEvent(_)));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_member_prewarm_does_not_admit_or_reserve_results() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     *fetcher.stalled_endpoint.lock().unwrap() = Some("wss://directory.example".to_owned());
@@ -9732,7 +9735,7 @@ async fn cancelled_member_prewarm_does_not_admit_or_reserve_results() {
     assert!(fetcher.requests.lock().unwrap().len() > requests_before_retry);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "member-resolution scaling benchmark; reports request count and wall clock"]
 async fn member_key_package_resolution_scaling_report() {
     let mut report = vec!["invitees,scenario,requests,wall_ms,outcome".to_owned()];
@@ -11056,7 +11059,7 @@ fn warm_directory_storage_opens_shared_and_local_directory_handles() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn register_external_signer_requires_matching_external_account() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -11963,7 +11966,7 @@ fn encrypted_media_v2_round_trips_through_account_projection() {
     assert_eq!(restored.encrypted_media, group.encrypted_media);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn key_package_capabilities_advertise_every_supported_group_component() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -13494,7 +13497,7 @@ fn ingest_applies_owner_signed_transitive_448_and_drops_spoof() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn own_relay_echo_requires_known_event_id_not_just_pubkey() {
     let dir = tempfile::tempdir().unwrap();
     let local_pubkey = AccountHome::open(dir.path())
@@ -15309,7 +15312,7 @@ fn sweeping_a_terminal_group_stops_a_held_send_from_claiming_pending() {
 /// completed — a crash, or a batch that failed after the engine had already
 /// drained the event one-shot. If this seam skips the sweep, a send the engine
 /// accepted but never published survives the restart still claiming `Pending`.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_drained_disband_sweeps_the_held_send_its_first_pass_never_reached() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
@@ -15389,7 +15392,7 @@ async fn a_drained_disband_sweeps_the_held_send_its_first_pass_never_reached() {
 /// ever disbanded — forever. Hydration owes exactly one belt-and-braces replay
 /// (the reconciler for a live delivery the application never projected) and
 /// silence after that.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reopening_an_account_replays_a_disband_once_and_then_stays_silent() {
     use cgka_traits::storage::DisbandTombstoneStorage;
 
@@ -15485,7 +15488,7 @@ async fn reopening_an_account_replays_a_disband_once_and_then_stays_silent() {
 /// So the sweep now reads the immortal guard rows instead: this test hands the
 /// next open an *already announced* guard — no replay is coming, ever — and
 /// still expects the held send to be resolved.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_open_heals_a_held_send_from_an_already_announced_guard() {
     use cgka_traits::storage::DisbandTombstoneStorage;
 
@@ -15607,7 +15610,7 @@ fn drained_seam_push_token(
 /// departure. A departure that only ever reaches the drained seam — the live
 /// projection crashed before it ran — owes the same cleanup, or the records
 /// survive the restart with nothing left to sweep them.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_drained_member_departure_removes_that_members_group_push_tokens() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -15666,7 +15669,7 @@ async fn a_drained_member_departure_removes_that_members_group_push_tokens() {
 /// move it, and a drained re-join must move it back — otherwise a crash during
 /// a leave leaves the badge inflated forever, and a crash during a re-add
 /// leaves a live group's unread permanently suppressed.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_drained_self_departure_and_rejoin_move_stored_self_membership() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
@@ -15740,7 +15743,7 @@ async fn a_drained_self_departure_and_rejoin_move_stored_self_membership() {
 /// A peer joining the group says nothing about this device's own membership.
 /// The arrival test is the same self-subject test the departure path uses, so
 /// the two cannot disagree about who arrived.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_peer_member_added_leaves_stored_self_membership_alone() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
@@ -15802,7 +15805,7 @@ async fn a_peer_member_added_leaves_stored_self_membership_alone() {
 /// subscription refresh off it, so a self-departure that leaves it clear defers
 /// its own route teardown to whatever runs next. A peer's departure changes no
 /// routing for this device.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_self_departure_marks_transport_routes_dirty() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -15862,7 +15865,7 @@ async fn a_self_departure_marks_transport_routes_dirty() {
 /// disbanded group's subscriptions outright. This test pins the push sweep.
 /// The batch starts with a buffered departure after the engine's terminal
 /// guard already prevents live membership queries; projection must still finish.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_drained_disband_performs_the_terminal_push_sweep() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -15958,7 +15961,7 @@ async fn a_drained_disband_performs_the_terminal_push_sweep() {
 /// drained seam is where it lands after a crash, so skipping the dispatch
 /// leaves a message the canonical branch never carried rendered as live
 /// history.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_drained_invalidation_event_withdraws_the_timeline_record() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
@@ -16041,7 +16044,7 @@ async fn a_drained_invalidation_event_withdraws_the_timeline_record() {
 /// must therefore be safe to apply twice — an absent push token, a membership
 /// already at its target value, and an already-queued registration removal all
 /// converge rather than accumulate.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replaying_a_drained_batch_the_seam_already_applied_is_a_no_op() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
@@ -16133,7 +16136,7 @@ async fn replaying_a_drained_batch_the_seam_already_applied_is_a_no_op() {
 /// projection loop and never called the synthesizer. Nothing else writes those
 /// rows, and a drained batch is one-shot, so a crash-replayed rename or
 /// membership change lost its timeline row permanently and silently.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_drained_state_change_synthesizes_the_system_row_the_live_seam_does() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
@@ -16231,7 +16234,7 @@ async fn a_drained_state_change_synthesizes_the_system_row_the_live_seam_does() 
 /// `Failed` forever — nothing else clears `invalidated`. The send intent is the
 /// missing evidence, so `record_send_intent_projection` clears the retraction.
 ///
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_retained_event_resend_revives_the_row_its_failed_send_retracted() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
@@ -16435,7 +16438,7 @@ mod superseded_system_row_shapes {
 /// synthesized the row.
 ///
 /// See [`superseded_system_row_shapes`] for why one batch can carry both.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_drained_batch_leaves_no_live_system_row_for_a_commit_it_supersedes() {
     use superseded_system_row_shapes::{SUPERSEDED, batch, renamed, superseded, system_row};
 
@@ -16554,7 +16557,7 @@ async fn a_drained_batch_leaves_no_live_system_row_for_a_commit_it_supersedes() 
 /// The crash is modelled the only way it can be — durable engine state advanced,
 /// announcement never delivered — by writing the disposition the apply
 /// transaction would have committed and never handing the app the event.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_open_repairs_a_branch_selection_announcement_a_crash_lost() {
     use cgka_traits::storage::MessageStorage;
 
@@ -16693,7 +16696,7 @@ async fn account_open_repairs_a_branch_selection_announcement_a_crash_lost() {
 /// #1593 shape, because with no pre-existing row the dispatch loop has nothing
 /// to tombstone). Revalidated-last must leave one, or the re-adoption has no
 /// row to be entitled to.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_batch_that_flips_its_verdict_projects_the_last_one() {
     use superseded_system_row_shapes::{
         SUPERSEDED, batch, renamed, revalidated, superseded, system_row,
@@ -16795,7 +16798,7 @@ async fn a_batch_that_flips_its_verdict_projects_the_last_one() {
 /// `observe_account_device_effects`, and carries the identical defect today.
 /// Fixing it at the call site would leave this failing, which is why the filter
 /// belongs in `project_group_system_rows`.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_live_batch_leaves_no_live_system_row_for_a_commit_it_supersedes() {
     use superseded_system_row_shapes::{SUPERSEDED, batch, renamed, superseded, system_row};
 
@@ -17073,7 +17076,7 @@ fn installed_group_routes(client: &AppClient, group_id: &GroupId) -> usize {
 /// pipeline, whose completion reconciles the route away. Pin both halves: no
 /// subscription is ever published for the departed group, and the route is
 /// gone once the pipeline finishes.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_deferred_open_never_subscribes_a_departed_groups_route() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -17173,7 +17176,7 @@ async fn a_deferred_open_never_subscribes_a_departed_groups_route() {
 
 /// A voluntary leave keeps its durable attribution after convergence and reopen.
 /// Routing uses the engine's terminal marker for both departures and evictions.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_committed_leave_stops_routing_the_group_across_a_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -17257,7 +17260,7 @@ async fn a_committed_leave_stops_routing_the_group_across_a_reopen() {
 /// leave into a newer epoch when an unrelated commit lands first — needs the
 /// group's transport route, so account open must keep seeding it while the
 /// engine's own terminal marker is still clear.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pending_leave_request_keeps_its_group_route_across_a_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -17325,7 +17328,7 @@ async fn a_pending_leave_request_keeps_its_group_route_across_a_reopen() {
 ///
 /// The kept group is the negative space: the same refresh must not disturb a
 /// group this device is still a member of.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_admin_removal_clears_the_removed_devices_group_routes() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -17449,7 +17452,7 @@ async fn an_admin_removal_clears_the_removed_devices_group_routes() {
 /// local delete) rebuilds the whole table from `routing_for`, which filters only
 /// disband tombstones. The removed group is still in `state.groups`, so the
 /// rebuild seeded its subscriptions back and handed them straight to the adapter.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn key_package_publication_never_issues_a_full_history_subscription() {
     // An unfloored activation replays every held event on every route and
     // leaves a notification lag's loss unbounded. Publishing or rotating a
@@ -17485,7 +17488,7 @@ async fn key_package_publication_never_issues_a_full_history_subscription() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_routing_rebuild_after_a_removal_does_not_resubscribe_the_removed_group() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -17589,7 +17592,7 @@ async fn a_routing_rebuild_after_a_removal_does_not_resubscribe_the_removed_grou
 /// permanent "failed" row in a group it can never send to again. The send
 /// preflight only knew about disband tombstones, so `Group::removed` walked
 /// straight past it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_removed_device_fails_a_composer_send_before_projecting_a_row() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -17689,7 +17692,7 @@ async fn a_removed_device_fails_a_composer_send_before_projecting_a_row() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_delete_compensation_preserves_primary_error_and_attempts_route_restore() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -17732,7 +17735,7 @@ async fn local_delete_compensation_preserves_primary_error_and_attempts_route_re
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_delete_restart_preserves_rotated_route_relay_pairs_for_resurrection() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -17902,7 +17905,7 @@ async fn local_delete_restart_preserves_rotated_route_relay_pairs_for_resurrecti
     assert_eq!(resurrected_routes, routes);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
     for fresh_first in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -18010,7 +18013,7 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_open_recovers_first_fresh_chat_after_protocol_projection_crash() {
     use cgka_traits::storage::MessageStorage;
 
@@ -18094,7 +18097,7 @@ async fn account_open_recovers_first_fresh_chat_after_protocol_projection_crash(
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_open_keeps_first_fresh_chat_pending_when_group_projection_is_unavailable() {
     use cgka_traits::storage::MessageStorage;
 
@@ -18222,7 +18225,7 @@ fn account_routing_skips_malformed_groups_without_discarding_valid_routes() {
 /// the pub(crate) stand-in for "the detector escalated inside a pass whose
 /// later fallible step errored" — driving three real arms needs three real
 /// epoch advances, and the loss does not depend on how the run got there.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_escalation_recorded_before_a_failing_sync_is_reported_by_the_next_sync() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -18341,7 +18344,7 @@ pub(crate) fn armed_group_ids(client: &crate::AppClient) -> Vec<cgka_traits::Gro
 /// `release_deferred_peel_row` buffers one refusal per released deferred row.
 /// A terminal copy has no servable history, so arming there could only mint a
 /// durable intent and a forensic row for work that is never coming.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_resource_refusal_for_a_terminal_group_arms_no_recovery() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -18419,7 +18422,7 @@ fn audit_rows_of_kind(app: &MarmotApp, kind: &str) -> usize {
 /// does not arm on is unrecoverable: no later pass can re-observe it. The two
 /// conditions are positively correlated rather than independent, because this
 /// drain publishes: the failure and the refusal ride the same effects.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_publish_failure_in_the_session_event_drain_still_arms_recovery() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -18508,7 +18511,7 @@ fn a_refusal_riding_a_rolled_back_publish(
 /// once, and the refusal was buffered only after its durable retention row was
 /// deleted. The account worker calls this seam per group, so a failing advance
 /// that returned before arming would drop the refusal for good.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_publish_failure_after_scheduled_convergence_still_arms_recovery() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -18549,7 +18552,7 @@ async fn a_publish_failure_after_scheduled_convergence_still_arms_recovery() {
 /// A corrupt retained intent fails invitation recovery after committed effects
 /// arrive. Both account seams must still observe those effects and preserve the
 /// original result, including a convergence publish failure.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_failure_preserves_committed_effects_and_results() {
     for (maintenance, failed_publish) in [(true, false), (false, false), (false, true)] {
         let dir = tempfile::tempdir().unwrap();
@@ -18892,13 +18895,13 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_send_mixed_batch_preserves_the_current_delivered_message() {
     assert_mixed_publish_batch_finalizes_successful_message(MixedPublishObservation::DirectSend)
         .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_send_mixed_batch_finalizes_successful_sibling_before_current_error() {
     assert_mixed_publish_batch_finalizes_successful_message(
         MixedPublishObservation::DirectSendCurrentFailed,
@@ -18906,23 +18909,23 @@ async fn direct_send_mixed_batch_finalizes_successful_sibling_before_current_err
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drained_mixed_publish_batch_finalizes_success_before_failure() {
     assert_mixed_publish_batch_finalizes_successful_message(MixedPublishObservation::Drained).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scheduled_mixed_publish_batch_finalizes_success_before_failure() {
     assert_mixed_publish_batch_finalizes_successful_message(MixedPublishObservation::Scheduled)
         .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retry_mixed_publish_batch_finalizes_success_before_failure() {
     assert_mixed_publish_batch_finalizes_successful_message(MixedPublishObservation::Retry).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(feature = "test-policy-overrides")]
 async fn published_message_acknowledgement_failure_retries_cleanup_without_republishing() {
     let dir = tempfile::tempdir().unwrap();
@@ -19006,7 +19009,7 @@ async fn published_message_acknowledgement_failure_retries_cleanup_without_repub
 }
 
 /// A failed source write retains the accepted fanout for cleanup-only replay.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accepted_projection_retries() {
     for trigger in [
         "CREATE TRIGGER fail_projection BEFORE UPDATE ON app_events
@@ -19115,7 +19118,7 @@ async fn accepted_projection_retries() {
 /// The retry seam folds and publishes exactly like the scheduled one, so it
 /// carries the same refusals under the same one-shot loss — and a host that
 /// retries a stuck group is the case where the recovery evidence matters most.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_publish_failure_during_a_convergence_retry_still_arms_recovery() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -19189,7 +19192,7 @@ fn a_refusal_riding_a_confirmed_but_partial_publish(
 /// row was deleted, and delivered to the app exactly once. A gate that returned
 /// before arming dropped it for good, and no send-path observer downstream of
 /// the gate arms.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_publish_failure_on_the_send_path_still_arms_recovery() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -19227,7 +19230,7 @@ async fn a_publish_failure_on_the_send_path_still_arms_recovery() {
 /// Arming ahead of the send gate must not change what the gate accepts: a
 /// confirmed-but-partial publish still passes (mdk#428), and the refusal riding
 /// it is observed all the same.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_confirmed_but_partial_send_publish_still_passes_the_arming_gate() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -19268,7 +19271,7 @@ async fn a_confirmed_but_partial_send_publish_still_passes_the_arming_gate() {
 /// failure in the same batch says nothing about it. Retracting it would
 /// tombstone a row the queued-outbound drain later delivers: the group sees the
 /// message while the sender sees `failed`, and a poll loses its projection.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_queued_send_is_not_failed_by_an_unrelated_failure_in_its_batch() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -19327,7 +19330,7 @@ async fn a_queued_send_is_not_failed_by_an_unrelated_failure_in_its_batch() {
 /// row: otherwise the group has the message while the sender's row says
 /// `failed` forever, and a poll's projection stays dropped. A terminal group
 /// keeps the sweep's verdict.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_relay_accepted_send_revives_its_local_publish_failure() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
@@ -19476,7 +19479,7 @@ async fn a_relay_accepted_send_revives_its_local_publish_failure() {
 /// The arming gate is observation plus the unchanged publish check: for every
 /// classification it must return exactly what the bare check returns, so no
 /// caller's error path is widened or narrowed by arming ahead of it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_arming_publish_gate_classifies_exactly_as_the_bare_publish_check() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -19579,7 +19582,7 @@ fn a_convergence_reorg(
 /// while convergence was busy adjudicating a fork read as one unrecovered run
 /// and escalate a device onto the wrong recovery: relay backfill cannot supply
 /// the branch adoption that fork-side traffic is waiting for.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_convergence_reorg_ends_the_unrecovered_arm_run() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -19638,7 +19641,7 @@ async fn a_convergence_reorg_ends_the_unrecovered_arm_run() {
 /// the *next* passage a peer fold reports cannot end the run either: its
 /// `from + 1` lands on the armed epoch and decides nothing. Two unrelated stalls
 /// later, a recovered device is escalated.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_maintenance_tick_reports_its_own_epoch_passage_to_the_stall_detector() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -19709,7 +19712,7 @@ async fn a_maintenance_tick_reports_its_own_epoch_passage_to_the_stall_detector(
 /// nothing armed at. This pins that both halves land, and that the publishing
 /// seams carry the first one — the delivery-driven seams never see an own
 /// confirm.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_confirmed_local_publish_reports_its_epoch_passage_through_the_publish_gate() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -19774,7 +19777,7 @@ async fn a_confirmed_local_publish_reports_its_epoch_passage_through_the_publish
 /// account worker feeds every delivery it receives through it — and its `Ok` is
 /// what the worker publishes escalations from. The other escalation tests all
 /// deliver through `sync()`, so this pins the receive seam's own drain.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_escalation_recorded_during_a_received_delivery_rides_that_seam() {
     let dir = tempfile::tempdir().unwrap();
     let account_id_hex = AccountHome::open(dir.path())
@@ -19824,21 +19827,21 @@ async fn an_escalation_recorded_during_a_received_delivery_rides_that_seam() {
 /// seen-events index on failure, so the reused client would silently skip the
 /// event when the relay redelivers it.
 #[cfg(feature = "test-policy-overrides")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_ingest_leaves_the_delivery_retryable_on_the_reused_client() {
     assert_failed_delivery_cursor_pin(FailedDeliveryRecovery::Redelivery).await;
 }
 
 /// Projection repair must release its taken delivery without relay redelivery.
 #[cfg(feature = "test-policy-overrides")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn quiet_projection_retry_releases_the_failed_delivery_cursor_pin() {
     assert_failed_delivery_cursor_pin(FailedDeliveryRecovery::QuietProjectionRetry).await;
 }
 
 /// A failure before engine admission still needs a real ingest before release.
 #[cfg(feature = "test-policy-overrides")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_engine_ingest_failure_keeps_the_delivery_cursor_pin() {
     assert_failed_delivery_cursor_pin(FailedDeliveryRecovery::BeforeEngine).await;
 }
@@ -20869,7 +20872,7 @@ fn close_storage_is_idempotent() {
 
 /// `shutdown_and_close` must work as the host's single call, with or without a
 /// preceding `shutdown`, and must stay safe when repeated.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_shutdown_and_close_is_idempotent_with_or_without_prior_shutdown() {
     let directory = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relays_and_account_home(
@@ -20971,7 +20974,7 @@ fn assert_suspension_storage_closed(
 /// Every graceful subsystem can stop making progress. Terminal suspension
 /// close must already have released SQLite and the root lease, and the outer
 /// graceful budget must still bound the call.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_shutdown_and_close_bounds_every_graceful_shutdown_phase() {
     use crate::runtime::ShutdownTestPhase;
 
@@ -21023,7 +21026,7 @@ async fn runtime_shutdown_and_close_bounds_every_graceful_shutdown_phase() {
 
 /// Dropping the awaiting future models a host/UniFFI owner being cancelled.
 /// The runtime-owned terminal task must continue and close storage anyway.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelling_shutdown_and_close_cannot_strand_storage_open() {
     use crate::runtime::ShutdownTestPhase;
 
@@ -21058,7 +21061,7 @@ async fn cancelling_shutdown_and_close_cannot_strand_storage_open() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_runtime_shutdown_and_close_calls_are_safe() {
     let temp = tempfile::tempdir().unwrap();
     let (app, runtime, session, shared, directory, session_path, shared_path) =
@@ -21102,7 +21105,7 @@ fn shutdown_and_close_allows_another_process_to_open_root_child() {
     app.close_storage().unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_and_close_allows_another_process_to_open_root() {
     let temp = tempfile::tempdir().unwrap();
     let (app, runtime, ..) = open_suspension_shutdown_fixture(temp.path());
@@ -21145,7 +21148,7 @@ fn a_retained_send_reports_accepted_pending_rather_than_an_empty_publish() {
 /// The published half of #1177's criterion, end to end: a send that reaches the
 /// transport must report `Published`, so `AcceptedPending` stays a signal a host
 /// can act on rather than the value every send happens to carry.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_send_that_reaches_the_transport_reports_published() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -21177,7 +21180,7 @@ async fn a_send_that_reaches_the_transport_reports_published() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unavailable_send_retries_the_exact_event_after_transport_recovers() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -21287,7 +21290,7 @@ async fn unavailable_send_retries_the_exact_event_after_transport_recovers() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connectivity_restored_wakes_a_retained_send_before_the_retry_timer() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -21366,12 +21369,12 @@ async fn connectivity_restored_wakes_a_retained_send_before_the_retry_timer() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connectivity_restored_during_reconnect_wakes_the_retained_send() {
     retained_send_recovers_after_reconnect(true).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn consumer_exit_automatically_reactivates_and_retries_the_retained_send() {
     retained_send_recovers_after_reconnect(false).await;
 }
@@ -21472,7 +21475,7 @@ async fn retained_send_recovers_after_reconnect(host_wake: bool) {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn eventless_drain_projects_every_retained_send_it_publishes() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -21559,7 +21562,7 @@ async fn eventless_drain_projects_every_retained_send_it_publishes() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_unavailable_sends_retry_once_in_order_after_transport_recovers() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -21633,7 +21636,7 @@ async fn two_unavailable_sends_retry_once_in_order_after_transport_recovers() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unavailable_group_invite_retries_the_exact_commit_after_transport_recovers() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -22534,7 +22537,7 @@ fn dev_maintenance_timing_is_honored_only_in_test_policy_builds() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dev_maintenance_timing_reaches_the_account_runtime_only_in_test_policy_builds() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -22559,7 +22562,7 @@ async fn dev_maintenance_timing_reaches_the_account_runtime_only_in_test_policy_
 }
 
 #[cfg(feature = "product-analytics-export")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backend_maintenance_collects_without_host_tracking_and_frozen_stays_silent() {
     for frozen in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -22623,12 +22626,12 @@ async fn backend_maintenance_collects_without_host_tracking_and_frozen_stays_sil
 /// Exercise a real processed SelfRemove behind a persisted failed publication.
 /// A due lifecycle timer must not turn the account worker into a 10 ms poller
 /// while the transport's frozen event is still in retry backoff.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn due_peer_leave_preserves_the_outbound_fanout_retry_barrier() {
     assert_peer_leave_behind_fanout(false).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn removed_device_retires_peer_leave_timer_after_input_only_convergence() {
     assert_peer_leave_behind_fanout(true).await;
 }
@@ -22700,12 +22703,15 @@ async fn assert_peer_leave_behind_fanout(remove_observer: bool) {
         .unwrap()
         .remove(0);
     // Preserve the real failed event, but model several unavailable attempts
-    // so this assertion is independent of sub-second machine scheduling.
+    // dated an hour ahead. An unavailable target retries a fixed 5 s after its
+    // last attempt, which a loaded run can outlast; only an explicit wake may
+    // release it here.
+    let held_attempt_ms = u64::try_from(notifications::unix_now_ms()).unwrap() + 60 * 60 * 1_000;
     for index in fanout.outstanding_target_indexes() {
         let failure = fanout.target_failure(index).unwrap().clone();
         for _ in 0..6 {
             fanout
-                .mark_attempt_started_at(index, notifications::unix_now_ms().try_into().unwrap())
+                .mark_attempt_started_at(index, held_attempt_ms)
                 .unwrap();
             fanout
                 .record_target_failure(index, failure.clone())
@@ -22820,7 +22826,7 @@ async fn assert_peer_leave_behind_fanout(remove_observer: bool) {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn voluntary_left_classification_survives_reopen_but_resets_on_rejoin() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -22863,7 +22869,7 @@ async fn voluntary_left_classification_survives_reopen_but_resets_on_rejoin() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(feature = "test-policy-overrides")]
 async fn due_peer_leave_does_not_shorten_a_collecting_convergence_pass() {
     let dir = tempfile::tempdir().unwrap();
@@ -22955,7 +22961,7 @@ async fn due_peer_leave_does_not_shorten_a_collecting_convergence_pass() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn diagnostics_maintenance_reuses_failed_obligation_levels_across_ticks() {
     let root = tempfile::tempdir().unwrap();
     AccountHome::open(root.path())
@@ -23211,7 +23217,7 @@ fn assert_group_catching_up<T: std::fmt::Debug>(
 /// past its local epoch. Any commit it authors from there forks the group, so
 /// every group change is refused and the maintenance self-update waits, unless
 /// the user accepts the fork risk for that epoch.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn group_changes_refuse_while_epoch_gap_recovery_holds_the_group() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -23392,7 +23398,7 @@ async fn group_changes_refuse_while_epoch_gap_recovery_holds_the_group() {
 /// group relay still owes it, the next group change is refused unless the user
 /// accepts that members on that relay may not follow, and the app can ask
 /// which relays are owed.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn group_changes_refuse_while_the_last_commit_is_owed_to_a_relay() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -23475,7 +23481,7 @@ async fn group_changes_refuse_while_the_last_commit_is_owed_to_a_relay() {
 /// mdk#2255: the first publish cuts slower relays off at the first
 /// acknowledgement and retries them 30 s later, so a quick follow-up change
 /// is not refused while that retry is still pending.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_quick_follow_up_change_is_not_refused_within_the_delivery_grace() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -23507,7 +23513,7 @@ async fn a_quick_follow_up_change_is_not_refused_within_the_delivery_grace() {
 /// mdk#2255 with mdk#2258: a change refused by both advisory gates can be
 /// acknowledged past each in turn. Passing one gate must not spend its
 /// acknowledgement while the other still refuses the attempt.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn both_advisory_gates_can_be_acknowledged_in_turn() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -23567,7 +23573,7 @@ async fn both_advisory_gates_can_be_acknowledged_in_turn() {
 
 /// mdk#2258: gap evidence armed at an epoch the device has since left does not
 /// hold the group; only an unresolved gap at or above the local epoch does.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn epoch_gap_below_the_local_epoch_does_not_hold_group_changes() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -23595,7 +23601,7 @@ async fn epoch_gap_below_the_local_epoch_does_not_hold_group_changes() {
         .unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forget_group_local_stops_work_and_survives_reopen() {
     use cgka_traits::storage::GroupStorage;
     let dir = tempfile::tempdir().unwrap();
@@ -23663,7 +23669,7 @@ async fn forget_group_local_stops_work_and_survives_reopen() {
     assert!(reopened.runtime.group_record(&kept).is_ok());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forget_group_local_rejects_old_welcome_then_rejoins_from_fresh_invitation() {
     for initially_joined in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -24029,7 +24035,7 @@ fn legacy_directory_label() {
     assert_eq!(entry.local_account.unwrap().label, "alice");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authenticated_system_previews_keep_actor_subject_and_multi_commit_row_identity() {
     use cgka_traits::engine::{GroupEvent, GroupStateChange};
     let dir = tempfile::tempdir().unwrap();
@@ -24162,7 +24168,7 @@ mod conversation_cold_open;
 /// compose time, so a message drained from the offline outbox can look old
 /// while being perfectly live. Dropping one piece of stall evidence is free —
 /// every other undecryptable message that device receives still arms.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn undecryptable_traffic_older_than_this_copys_welcome_does_not_arm_a_backfill() {
     use cgka_traits::storage::GroupStorage;
     let dir = tempfile::tempdir().unwrap();

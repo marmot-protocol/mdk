@@ -158,7 +158,7 @@ mod tests {
     use crate::directory::records::public_directory_user_record;
     use crate::{UserDirectoryLocalAccount, UserProfileMetadata};
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn connected_searcher_ignores_another_accounts_stale_follows() {
         let dir = tempfile::tempdir().unwrap();
         let app = MarmotApp::with_relay_and_config(

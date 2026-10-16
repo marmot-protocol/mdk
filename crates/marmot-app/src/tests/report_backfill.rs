@@ -1,6 +1,6 @@
 use super::*;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn report_backfill_retries_entire_batch_after_projection_failure() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())

@@ -1606,7 +1606,7 @@ mod tests {
         .expect("generated identity bootstrap must become network-ready");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropping_a_search_stops_both_pending_sources() {
         let (tx, rx) = mpsc::channel(1);
         let (graph_started, graph_ready) = tokio::sync::oneshot::channel();
@@ -1646,7 +1646,7 @@ mod tests {
         assert!(provider_dropped.await.is_err());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_membership_keeps_cached_results_and_completes_graph() {
         let dir = tempfile::tempdir().unwrap();
         let app = MarmotApp::with_relay_and_config(
@@ -1686,7 +1686,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cached_matches_arrive_before_blocked_membership_and_cancel_it() {
         let dir = tempfile::tempdir().unwrap();
         let app = MarmotApp::with_relay_and_config(
@@ -1735,7 +1735,7 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn provider_results_stream_before_graph_and_later_provenance_replaces_them() {
         let (tx, mut rx) = mpsc::channel(8);
         let mut emitter = SearchEmitter::new(tx.clone());
@@ -1806,7 +1806,7 @@ mod tests {
         assert_eq!(followed.total_result_count, 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rejects_a_radius_deeper_than_the_producer_answers() {
         let dir = tempfile::tempdir().unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
@@ -1824,7 +1824,7 @@ mod tests {
         assert!(matches!(error, AppError::InvalidDirectorySearch(_)));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rejects_an_inverted_radius_window() {
         let dir = tempfile::tempdir().unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
@@ -1838,7 +1838,7 @@ mod tests {
         assert!(matches!(error, AppError::InvalidDirectorySearch(_)));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_empty_query_completes_without_matching_everybody() {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
@@ -1867,7 +1867,7 @@ mod tests {
         assert_eq!(updates[0].total_result_count, 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn streams_a_cached_radius_zero_match_through_the_full_update_sequence() {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
@@ -1924,7 +1924,7 @@ mod tests {
     /// match them from there rather than paying for the relay round trip again.
     /// `MarmotApp::with_relay` points at an address nothing answers, so a
     /// result here can only have come from the cache.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_search_matches_a_stranger_cached_in_the_un_promoted_tier() {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
@@ -1979,7 +1979,7 @@ mod tests {
     /// shared ingest bounds in both the streamed result and the un-promoted
     /// search-graph cache. The stranger must not be promoted into directory_users
     /// or its per-author subscriptions (mdk#418).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_profile_resolved_from_a_relay_is_cached_without_promoting_the_stranger() {
         let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
         let relay_url = relay.url().await.to_string();
@@ -2074,7 +2074,7 @@ mod tests {
     /// device, so the whole traversal must complete against an unreachable
     /// relay -- that is what "Pass 1 reads cached follows" buys, and it is the
     /// only reason a second radius is affordable.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn radius_two_expands_through_cached_follow_edges_without_a_relay() {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
@@ -2136,7 +2136,7 @@ mod tests {
     /// *unknown*, not be recorded as following nobody. Recording the guess
     /// turns a relay hiccup into a permanent dead end, because cached follow
     /// edges do not expire.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unanswered_contact_list_is_not_cached_as_following_nobody() {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
@@ -2189,7 +2189,7 @@ mod tests {
         assert_eq!(tally.unresolved, 4);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cached_discovery_receives_provider_rank_and_a_fresher_profile() {
         let (tx, mut rx) = mpsc::channel(4);
         let mut emitter = SearchEmitter::new(tx);
@@ -2247,7 +2247,7 @@ mod tests {
         assert_eq!(rows[0].account_id_hex, id);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn discovery_does_not_repeat_a_graph_result() {
         let (updates_tx, mut updates_rx) = mpsc::channel(2);
         let mut emitter = SearchEmitter::new(updates_tx);
@@ -2303,7 +2303,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn open_ranking_profiles_keep_graph_provenance_and_stay_ephemeral() {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
@@ -2375,7 +2375,7 @@ mod tests {
     /// has followed the other, so a caller can seed them into radius 1. The
     /// seeded account here is in no follow list at all -- only the seed puts
     /// them within reach.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_seeded_account_is_searchable_at_radius_one_without_being_followed() {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
@@ -2421,7 +2421,7 @@ mod tests {
 
     /// The searcher is radius 0. A seed naming them must not re-report them a
     /// layer out, and must not make the traversal revisit them.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn seeding_the_searcher_does_not_duplicate_them_at_radius_one() {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
@@ -2455,7 +2455,7 @@ mod tests {
     /// list is the map to it. Here the searcher and the stranger share no relay
     /// at all, so the only route to the profile is via the published write
     /// relay -- if the search finds them, tier 5 did the work.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_profile_only_on_its_authors_write_relay_is_still_found() {
         let searcher_relay = nostr_relay_builder::MockRelay::run().await.unwrap();
         let searcher_relay_url = searcher_relay.url().await.to_string();
@@ -2535,7 +2535,7 @@ mod tests {
     /// traversal somewhere to start -- but those people are not one hop from
     /// the searcher, they are not on the searcher's graph at all, so they are
     /// reported off-graph rather than dressed up as follows.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_empty_graph_falls_back_to_the_configured_seed_and_says_so() {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
@@ -2596,7 +2596,7 @@ mod tests {
 
     /// Cached profiles remain searchable, but the fallback graph is traversed
     /// only when the searcher's own graph is empty.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_searcher_with_follows_never_reaches_the_fallback_seed() {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
@@ -2683,7 +2683,7 @@ mod tests {
     /// corner case. If the profile-less row masks the cached one, every search
     /// re-fetches those people from relays and the warm path never fires for
     /// exactly the accounts the user interacts with most.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_promoted_row_without_a_profile_does_not_mask_the_cached_one() {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
@@ -2745,7 +2745,7 @@ mod tests {
     /// still finds a follow who publishes no profile. It must not mean the
     /// account is reported twice when the outbox tier later supplies the
     /// profile: one person, one result, however many tiers it took to resolve.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_npub_match_resolved_by_the_outbox_tier_is_reported_once() {
         let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
         let relay_url = relay.url().await.to_string();
@@ -2830,7 +2830,7 @@ mod tests {
     /// fetch that rejects its whole batch on one unparseable id. Rejecting the
     /// request names the bad input instead of failing the search for reasons a
     /// caller cannot see.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_malformed_seed_is_rejected_rather_than_failing_the_traversal() {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
@@ -2848,7 +2848,7 @@ mod tests {
         assert!(matches!(error, AppError::InvalidPublicKey), "{error:?}");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cached_searcher_outside_the_radius_window_reports_no_matches() {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());

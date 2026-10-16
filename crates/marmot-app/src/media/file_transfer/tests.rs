@@ -402,7 +402,7 @@ fn staged_files(staging: &Path) -> usize {
         .unwrap_or(0)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn file_upload_fails_over_413_then_500_then_succeeds_with_identical_ciphertext() {
     let directory = tempfile::tempdir().unwrap();
     let staging = directory.path().join("staging");
@@ -451,7 +451,7 @@ async fn file_upload_fails_over_413_then_500_then_succeeds_with_identical_cipher
     assert_eq!(staged_files(&staging), 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn file_upload_fails_over_missing_or_mismatched_descriptor_and_reports_all_failures() {
     let directory = tempfile::tempdir().unwrap();
     let staging = directory.path().join("staging");
@@ -496,7 +496,7 @@ async fn file_upload_fails_over_missing_or_mismatched_descriptor_and_reports_all
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_or_invalid_file_requests_never_dial_and_leave_no_files() {
     let directory = tempfile::tempdir().unwrap();
     let staging = directory.path().join("staging");

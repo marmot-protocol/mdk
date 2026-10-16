@@ -1889,7 +1889,7 @@ mod tests {
         assert_eq!(snapshot.host_foreground_local_ready.duration_ms.sum_ms, 200);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bounded_advisory_step_returns_the_value_and_records_success() {
         let telemetry = AppPerformanceTelemetry::default();
         let value =
@@ -1902,7 +1902,7 @@ mod tests {
         assert_eq!(snapshot.account_setup_advisory_step.failures, 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bounded_advisory_step_caps_a_stalled_future_and_records_the_cap() {
         let telemetry = AppPerformanceTelemetry::default();
         let value: Option<()> = bounded_advisory_step(

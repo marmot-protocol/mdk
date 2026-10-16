@@ -199,7 +199,7 @@ async fn same_slot_events(
     )
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_key_package_records_collapses_lagging_relay_events() {
     let (_dir, app, account, fetcher, relay) = inventory_fixture().await;
     let (older, newer, other) = same_slot_events(&app, &account).await;
@@ -277,7 +277,7 @@ async fn account_key_package_records_collapses_lagging_relay_events() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_history_unions_duplicate_event_ids_across_endpoints() {
     let (_dir, app, account, fetcher, _relay) = inventory_fixture().await;
     let (older, newer, _other) = same_slot_events(&app, &account).await;
@@ -313,7 +313,7 @@ async fn relay_history_unions_duplicate_event_ids_across_endpoints() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn superseded_key_package_event_remains_deletable() {
     let (_dir, app, account, fetcher, relay) = inventory_fixture().await;
     let (older, newer, _other) = same_slot_events(&app, &account).await;
@@ -370,7 +370,7 @@ async fn superseded_key_package_event_remains_deletable() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bulk_key_package_cleanup_includes_superseded_events() {
     let directory = tempfile::tempdir().unwrap();
     let fetcher = Arc::new(MemberResolutionDirectoryFetcher::default());
@@ -429,7 +429,7 @@ async fn bulk_key_package_cleanup_includes_superseded_events() {
     assert!(!deleted.iter().any(|id| id.is_empty()));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wipe_bulk_cleanup_includes_superseded_events() {
     let directory = tempfile::tempdir().unwrap();
     let fetcher = Arc::new(MemberResolutionDirectoryFetcher::default());
@@ -474,7 +474,7 @@ async fn wipe_bulk_cleanup_includes_superseded_events() {
     assert!(outcome.key_packages_deleted >= 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn listing_does_not_publish_and_partial_deletion_still_uses_explicit_targets() {
     let (_dir, app, account, fetcher, relay) = inventory_fixture().await;
     let (older, newer, _other) = same_slot_events(&app, &account).await;
@@ -560,6 +560,25 @@ fn published_key_package_events(relay: &ScriptedPushRelayClient) -> Vec<NostrTra
         .filter(|event| event.kind == KIND_MARMOT_KEY_PACKAGE)
         .cloned()
         .collect()
+}
+
+/// KeyPackage lookups the directory fetcher has served. The runtime's
+/// directory sync reconciles the account's block list in the background, so a
+/// local-only read is judged by the KeyPackage queries it would have needed,
+/// not by every fetch that happens to land meanwhile.
+fn key_package_fetches(fetcher: &MemberResolutionDirectoryFetcher) -> usize {
+    fetcher
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| {
+            request
+                .queries
+                .iter()
+                .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)
+        })
+        .count()
 }
 
 fn assert_local_only_invariants(entries: &[crate::AccountKeyPackageInventoryEntry]) {
@@ -672,7 +691,7 @@ fn assert_coherent_rotation_inventory(
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_inventory_reports_current_then_retained_after_rotation() {
     let (_dir, runtime, account, fetcher, _relay) = runtime_inventory_fixture().await;
     let before = runtime
@@ -682,7 +701,7 @@ async fn local_inventory_reports_current_then_retained_after_rotation() {
     assert_eq!(before[0].local_state, AccountKeyPackageLocalState::Current);
     assert_local_only_invariants(&before);
     let current_ref = before[0].record.key_package_ref_hex.clone();
-    assert_eq!(fetcher.requests.lock().unwrap().len(), 0);
+    assert_eq!(key_package_fetches(&fetcher), 0);
 
     runtime
         .rotate_key_package(&account.account_id_hex)
@@ -705,11 +724,11 @@ async fn local_inventory_reports_current_then_retained_after_rotation() {
     assert_ne!(current.record.key_package_ref_hex, current_ref);
     assert_eq!(retained.record.key_package_ref_hex, current_ref);
     assert!(retained.record.key_package_event_id.is_empty());
-    assert_eq!(fetcher.requests.lock().unwrap().len(), 0);
+    assert_eq!(key_package_fetches(&fetcher), 0);
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_inventory_reports_signed_pending_replacement() {
     let directory = tempfile::tempdir().unwrap();
     let fetcher = Arc::new(MemberResolutionDirectoryFetcher::default());
@@ -754,22 +773,22 @@ async fn local_inventory_reports_signed_pending_replacement() {
     assert!(local[0].record.local);
     assert!(!local[0].record.relay);
     assert!(!local[0].record.key_package_event_id.is_empty());
-    assert_eq!(fetcher.requests.lock().unwrap().len(), 0);
+    assert_eq!(key_package_fetches(&fetcher), 0);
     relay.release_publish();
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cache_metadata_without_owned_bundle_is_not_local() {
     let (_dir, app, account, fetcher, _relay) = inventory_fixture().await;
     write_key_package_cache(&app, &account, SLOT, "cache-only-ref", "event-cache");
     let runtime = MarmotAppRuntime::new(app);
     let listing = runtime.local_account_key_packages(&account.label).unwrap();
     assert!(listing.is_empty());
-    assert_eq!(fetcher.requests.lock().unwrap().len(), 0);
+    assert_eq!(key_package_fetches(&fetcher), 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refresh_merges_current_echo_and_keeps_retained_local_only() {
     let (_dir, runtime, account, fetcher, relay) = runtime_inventory_fixture().await;
     runtime
@@ -820,7 +839,7 @@ async fn refresh_merges_current_echo_and_keeps_retained_local_only() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_refresh_does_not_mutate_or_delete_local_inventory() {
     let (_dir, runtime, account, fetcher, _relay) = runtime_inventory_fixture().await;
     let before = runtime
@@ -842,7 +861,7 @@ async fn failed_refresh_does_not_mutate_or_delete_local_inventory() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_bootstrap_refresh_still_queries_the_network() {
     let (_dir, runtime, account, fetcher, _relay) = runtime_inventory_fixture().await;
     seed_fetcher(&fetcher, &account, Vec::new(), &[DIRECTORY]);
@@ -857,7 +876,7 @@ async fn empty_bootstrap_refresh_still_queries_the_network() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_refresh_uses_post_rotation_local_snapshot() {
     let (_dir, runtime, account, fetcher, relay) = runtime_inventory_fixture().await;
     let before = runtime
@@ -896,7 +915,7 @@ async fn concurrent_refresh_uses_post_rotation_local_snapshot() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_inventory_uses_post_rotation_snapshot_and_matches_typed_records() {
     let (_dir, runtime, account, fetcher, relay) = runtime_inventory_fixture().await;
     let before = runtime
@@ -1100,7 +1119,7 @@ async fn inventory_stays_coherent_when_rotation_interleaves_ownership_and_lifecy
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signed_out_and_unknown_account_local_reads() {
     let (_dir, runtime, account, fetcher, _relay) = runtime_inventory_fixture().await;
     runtime
@@ -1118,7 +1137,7 @@ async fn signed_out_and_unknown_account_local_reads() {
         .unwrap();
     assert_eq!(local.len(), 1);
     assert_eq!(local[0].local_state, AccountKeyPackageLocalState::Current);
-    assert_eq!(fetcher.requests.lock().unwrap().len(), 0);
+    assert_eq!(key_package_fetches(&fetcher), 0);
     assert!(
         runtime
             .local_account_key_packages("missing-account")
@@ -1127,7 +1146,7 @@ async fn signed_out_and_unknown_account_local_reads() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_read_rejects_terminal_close_without_reopening() {
     let (_dir, runtime, account, _fetcher, _relay) = runtime_inventory_fixture().await;
     runtime.shutdown_and_close().await.unwrap();

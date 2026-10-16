@@ -36,7 +36,7 @@ async fn queued_messages(app: &MarmotApp) -> (AppClient, cgka_traits::GroupId, V
     (client, group, ids)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queued_publication_projects_first_message_before_later_publish_finishes() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -149,7 +149,7 @@ fn projection_connection(app: &MarmotApp) -> rusqlite::Connection {
 
 /// Projection failure cannot discard the unstaged publication tail. Retained
 /// receipts repair both rows after reopen without publishing their bytes again.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queued_publication_projection_failure_reopens_without_republishing() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -244,7 +244,7 @@ async fn queued_publication_projection_failure_reopens_without_republishing() {
 }
 
 /// Cancelling a batch must drop its callback as well as its network wait.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queued_publication_cancel_removes_scoped_observer() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -287,7 +287,7 @@ async fn queued_publication_cancel_removes_scoped_observer() {
 
 /// An early acceptance updates source metadata only; it cannot recreate an
 /// absent event or clear a convergence withdrawal.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queued_publication_progress_does_not_revive_deleted_or_withdrawn_rows() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -335,7 +335,7 @@ async fn queued_publication_progress_does_not_revive_deleted_or_withdrawn_rows()
 
 /// A mixed batch error must not place an early source snapshot after the
 /// finalizer's newer guarded revival of the same local row.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queued_publication_mixed_failure_keeps_progress_before_revival() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -422,7 +422,7 @@ async fn queued_publication_mixed_failure_keeps_progress_before_revival() {
 
 /// Dropping a later network wait must retain already committed publication
 /// updates for the next public consumer without sending accepted bytes again.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queued_publication_cancel_retains_committed_progress_once() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -500,7 +500,7 @@ async fn queued_publication_cancel_retains_committed_progress_once() {
 
 /// The finalizer can suspend after guarded revival. Cancellation must keep the
 /// older source snapshot before that revival in the shared retained summary.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queued_publication_cancel_finalizer_keeps_progress_before_revival() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -592,7 +592,7 @@ async fn queued_publication_cancel_finalizer_keeps_progress_before_revival() {
 
 /// The primary selected-conversation stream must expose a committed source while
 /// the real worker is still waiting on a later publication in the same pass.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queued_publication_updates_live_window_before_later_publish_finishes() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
@@ -712,7 +712,7 @@ async fn queued_publication_updates_live_window_before_later_publish_finishes() 
 }
 
 /// A due, confirmed replica retry cannot retain the owner while a new durable send waits.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn durable_send_interrupts_due_secondary_retry_and_updates_live_window() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())

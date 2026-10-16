@@ -166,7 +166,7 @@ mod tests {
     use marmot_account::AccountHome;
     use std::sync::Arc;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn receipt_access_retires_lost_releases_without_caller_reconciliation() {
         for (boundary, fail_reload) in [
             ("duplicate", false),
@@ -277,7 +277,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn receipt_access_propagates_closed_storage() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
@@ -295,7 +295,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn receipt_empty_journal_access_keeps_cache_and_reload_idle() {
         for ring_size in [0, crate::MAX_SEEN_EVENT_IDS] {
             let dir = tempfile::tempdir().unwrap();

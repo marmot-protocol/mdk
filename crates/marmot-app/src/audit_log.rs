@@ -1255,7 +1255,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn audit_helper_failures_are_context_free() {
         let marker = "https://secret.example/path?token=secret-query";
         let errors = [
@@ -1314,7 +1314,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn invalid_structure_never_resolves() {
         for endpoint in [
             "http://public.example/ingest",
@@ -1374,7 +1374,7 @@ mod tests {
         assert_privacy_safe(&error);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn upload_snapshot_excludes_unfinished_tail_and_recovers_it_later() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit-active.jsonl");
@@ -1406,7 +1406,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn upload_snapshot_keeps_the_opened_file_across_path_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit-active.jsonl");
@@ -1639,7 +1639,7 @@ mod tests {
         assert!(!first_line.contains("alice"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn size_rotated_audit_segments_keep_configured_source_in_validated_body() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())

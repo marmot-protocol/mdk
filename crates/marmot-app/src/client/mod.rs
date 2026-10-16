@@ -7615,7 +7615,7 @@ mod post_canonical_create_tests {
         assert_eq!(successful, 7);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bounded_create_group_lookups_scale_for_cached_and_delayed_sources() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7673,7 +7673,7 @@ mod post_canonical_create_tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bounded_create_group_work_reports_errors_in_input_order() {
         use tokio::time::{Duration, sleep};
 
@@ -7778,7 +7778,7 @@ mod self_membership_backfill_tests {
     }
 
     /// A projected roster from `PendingPublish` cannot complete or mutate the backfill.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pending_publish_defers_self_membership_backfill() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
@@ -7830,7 +7830,7 @@ mod self_membership_backfill_tests {
     }
 
     /// Ordinary roster reads must preserve membership even when live members are incomplete.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn incomplete_ordinary_roster_read_never_persists_a_removal() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())

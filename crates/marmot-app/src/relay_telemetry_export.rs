@@ -2237,7 +2237,7 @@ mod otlp {
             }
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn relay_telemetry_host_safety_rejects_before_any_connection() {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -2275,7 +2275,7 @@ mod otlp {
             );
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn relay_telemetry_host_safety_incomplete_config_never_resolves_or_sends() {
             use crate::config::RelayTelemetryExportConfig;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2463,7 +2463,7 @@ mod otlp {
             assert_eq!(point.sum, Some(123.0));
         }
 
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn account_publish_counters_round_trip_as_unlabeled_cumulative_sums() {
             use std::time::UNIX_EPOCH;
 

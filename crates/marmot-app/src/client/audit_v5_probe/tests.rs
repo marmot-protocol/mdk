@@ -62,7 +62,7 @@ fn app(path: &Path, relay: &str) -> MarmotApp {
     app
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn opened_inventory_selects_current_groups_before_the_64_group_cap() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -124,7 +124,7 @@ async fn opened_inventory_selects_current_groups_before_the_64_group_cap() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn normal_opt_in_records_real_welcome_and_operational_v5_rows() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let relay = MockRelay::run().await.unwrap();
@@ -448,7 +448,7 @@ impl Scenario {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn duplicate_delivery_does_not_rejoin() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let mut scenario = Scenario::new().await;
@@ -487,7 +487,7 @@ async fn duplicate_delivery_does_not_rejoin() {
     .expect("bounded duplicate Welcome scenario");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn join_row_uses_install_anchor_and_omits_ambiguous_replacement() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let mut scenario = Scenario::new().await;
@@ -530,7 +530,7 @@ async fn join_row_uses_install_anchor_and_omits_ambiguous_replacement() {
     .expect("bounded join-anchor scenario");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let mut scenario = Scenario::new().await;
@@ -793,7 +793,7 @@ async fn real_welcome_pending_then_accepted_checkpoint_and_volume() {
     .expect("bounded local Welcome scenario");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn founding_preparation_matches_two_recipients_without_order_inference() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let mut scenario = Scenario::new().await;
@@ -997,7 +997,7 @@ async fn founding_preparation_matches_two_recipients_without_order_inference() {
     .expect("bounded two-recipient preparation");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hash_valid_unsigned_gift_wrap_is_observed_then_rejected_without_inner_refs() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let mut scenario = Scenario::new().await;
@@ -1094,7 +1094,7 @@ async fn hash_valid_unsigned_gift_wrap_is_observed_then_rejected_without_inner_r
     .expect("bounded invalid-signature scenario");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ambiguous_nip59_decrypt_error_is_failed_without_inner_refs() {
     let sender = nostr::prelude::Keys::generate();
     let recipient = nostr::prelude::Keys::generate();
@@ -1145,7 +1145,7 @@ async fn ambiguous_nip59_decrypt_error_is_failed_without_inner_refs() {
     assert!(row.key_package_event_ref.is_none());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn engine_join_survives_app_checkpoint_failure_without_false_success() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let mut scenario = Scenario::new().await;
@@ -1237,7 +1237,7 @@ async fn engine_join_survives_app_checkpoint_failure_without_false_success() {
     .expect("bounded failed-checkpoint scenario");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offworker_startup_receive_retains_join_after_checkpoint_failure() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let mut scenario = Scenario::new().await;
@@ -1311,7 +1311,7 @@ async fn offworker_startup_receive_retains_join_after_checkpoint_failure() {
     .expect("bounded startup receive checkpoint scenario");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_op_welcome_replay_does_not_label_unrelated_checkpoint() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let mut scenario = Scenario::new().await;
@@ -1351,7 +1351,7 @@ async fn no_op_welcome_replay_does_not_label_unrelated_checkpoint() {
     .expect("bounded no-op replay scenario");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn welcome_checkpoint_with_distinct_application_ack_keeps_generic_outcome() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let mut scenario = Scenario::new().await;
@@ -1408,7 +1408,7 @@ async fn welcome_checkpoint_with_distinct_application_ack_keeps_generic_outcome(
     .expect("bounded mixed Welcome and application checkpoint");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_acceptance_has_one_checkpoint_result_and_restores_origin() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let mut scenario = Scenario::new().await;
@@ -1492,7 +1492,7 @@ fn probe_bounds_and_unknown_checkpoint_do_not_fabricate_success() {
     assert_eq!(capture.invalid, 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn baseline_marks_an_invalid_or_duplicate_member_identity_as_partial() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let mut scenario = Scenario::new().await;

@@ -117,7 +117,7 @@ fn generation_never_revives() {
     assert!(c.permit().unwrap().valid());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(feature = "product-analytics-export")]
 async fn custom_host_timing_events() {
     use crate::HostPerformanceOutcome::{Failure, Success};
@@ -307,7 +307,7 @@ fn failed_persistence_cannot_restore_a_grant_in_process() {
     assert!(app.restore_usage_diagnostics().is_err());
 }
 #[cfg(feature = "product-analytics-export")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stock_wire_batch_preserves_prefix_and_never_contains_diagnostic_identity() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -526,7 +526,7 @@ fn launch_reason_account_boundary_and_idle_rotation_are_finite() {
 }
 
 #[cfg(feature = "product-analytics-export")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_shutdown_closes_storage_before_analytics_drain() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -633,7 +633,7 @@ fn stale_backlog_sample_cannot_enter_new_grant() {
 }
 
 #[cfg(feature = "product-analytics-export")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rejection_suspends_only_product_and_ambiguous_failure_is_not_retried() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     for (status, expire_during_retry) in [
@@ -739,7 +739,7 @@ async fn rejection_suspends_only_product_and_ambiguous_failure_is_not_retried() 
 }
 
 #[cfg(feature = "product-analytics-export")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bounded_flush_drains_multiple_batches_without_reviving_old_senders() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1085,7 +1085,7 @@ fn invalid_optional_host_environment_preserves_an_existing_diagnostic_grant() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unreadable_optional_consent_does_not_abort_runtime_start() {
     let root = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relays(root.path(), vec![]);

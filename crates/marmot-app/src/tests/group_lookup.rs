@@ -48,7 +48,7 @@ fn group_connection(app: &MarmotApp) -> rusqlite::Connection {
     connection
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn keyed_group_matches_list() {
     let (_dir, app, group_id, _) = group_fixture().await;
     let id_hex = hex::encode(group_id.as_slice());
@@ -124,7 +124,7 @@ async fn keyed_group_matches_list() {
     assert!(app.group("alice", "missing' OR 1=1 --").unwrap().is_none());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn group_reads_skip_seen_events() {
     let (_dir, app, group_id, _) = group_fixture().await;
     let id_hex = hex::encode(group_id.as_slice());
@@ -143,7 +143,7 @@ async fn group_reads_skip_seen_events() {
     assert!(app.group("alice", &id_hex).unwrap() == keyed);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn keyed_read_ignores_other_rows() {
     let (_dir, app, group_id, other_id) = group_fixture().await;
     let id_hex = hex::encode(group_id.as_slice());

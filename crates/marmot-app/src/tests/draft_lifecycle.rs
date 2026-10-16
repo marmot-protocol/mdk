@@ -1,6 +1,19 @@
 use super::*;
 
-#[tokio::test]
+/// The window keeps only its latest snapshot, so a refresh queued before the
+/// change may be observed on its own; wait for the window that reflects it.
+async fn next_window_where(
+    window: &mut crate::RuntimeChatListWindowSubscription,
+    reflects: impl Fn(&crate::ChatListWindowSnapshot) -> bool,
+) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !reflects(&window.recv().await.unwrap().unwrap()) {}
+    })
+    .await
+    .expect("the chat list window must reflect the change");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn draft_send_acceptance_is_durable_before_relay_io_and_survives_cancellation() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -44,15 +57,10 @@ async fn draft_send_acceptance_is_durable_before_relay_io_and_survives_cancellat
         .expect("acceptance must notify before relay I/O completes");
     assert_eq!(update.account_label, "alice");
     assert_eq!(update.group_id_hex, hex);
-    let accepted = tokio::time::timeout(Duration::from_secs(5), window.recv())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert!(!matches!(
-        accepted.rows[0].preview,
-        SelectedChatPreview::Draft(_)
-    ));
+    next_window_where(&mut window, |accepted| {
+        !matches!(accepted.rows[0].preview, SelectedChatPreview::Draft(_))
+    })
+    .await;
 
     app.save_message_draft("alice", &hex, "new composer", None, vec![])
         .unwrap();
@@ -62,14 +70,10 @@ async fn draft_send_acceptance_is_durable_before_relay_io_and_survives_cancellat
         app.selected_message_draft("alice", &hex).unwrap().revision,
         newer.revision
     );
-    let edited = tokio::time::timeout(Duration::from_secs(5), window.recv())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert!(
+    next_window_where(&mut window, |edited| {
         matches!(&edited.rows[0].preview, SelectedChatPreview::Draft(d) if d.text == "new composer")
-    );
+    })
+    .await;
     relay.release_publish();
     client.retry_group_convergence(&group).await.unwrap();
     assert_eq!(
@@ -80,7 +84,7 @@ async fn draft_send_acceptance_is_durable_before_relay_io_and_survives_cancellat
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn editing_after_submission_preserves_the_newer_draft_and_sends_captured_content() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -143,7 +147,7 @@ async fn editing_after_submission_preserves_the_newer_draft_and_sends_captured_c
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn draft_metadata_and_conditional_commands_remain_available_through_runtime() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -183,7 +187,7 @@ async fn draft_metadata_and_conditional_commands_remain_available_through_runtim
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_draft_reply_validates_references_before_clearing() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -299,7 +303,7 @@ async fn attachment_draft_reply_validates_references_before_clearing() {
     assert!(message.tags.contains(&vec!["q".into(), reply]));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn draft_conflict_and_missing_group_have_distinct_codes() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())

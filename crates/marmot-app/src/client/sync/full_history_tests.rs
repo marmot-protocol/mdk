@@ -66,7 +66,7 @@ fn control<'a>(
 /// No comparison searched below that floor, so a certified window must not
 /// report full history: the repair names the unsearched history instead, and
 /// closes its request rather than leaving debt that parks into a notice.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn certified_window_closes_the_request_and_names_the_history_below_it() {
     let (_dir, app, relay) = fixture();
     let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -135,7 +135,7 @@ async fn certified_window_closes_the_request_and_names_the_history_below_it() {
 /// A comparison that returns just inside the budget can hand over a large
 /// batch. Admission stops at the first turn boundary past the deadline: the
 /// admitted prefix stays durable and the repair reports the deadline.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_deadline_stops_admission_at_a_turn_boundary() {
     const FETCHED: usize = 200;
     let (_dir, app, _relay) = fixture();
@@ -195,7 +195,7 @@ async fn the_deadline_stops_admission_at_a_turn_boundary() {
     assert!(explicit_pending(&app), "an expired repair keeps its debt");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uncertified_repair_reports_unproven_coverage_and_keeps_its_debt() {
     let (_dir, app, relay) = fixture();
     let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -219,7 +219,7 @@ async fn uncertified_repair_reports_unproven_coverage_and_keeps_its_debt() {
     assert_eq!(relay.subscription_count(), before);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_before_start_requests_nothing_and_keeps_overflow() {
     let (_dir, app, relay) = fixture();
     let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -252,7 +252,7 @@ async fn cancelled_before_start_requests_nothing_and_keeps_overflow() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_deadline_bounds_the_comparison_pass() {
     let (_dir, app, _relay) = fixture();
     let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -273,7 +273,7 @@ async fn the_deadline_bounds_the_comparison_pass() {
     assert!(explicit_pending(&app), "a timed-out route keeps its debt");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancellation_stops_the_comparison_and_keeps_debt_and_cost() {
     let (_dir, app, relay) = fixture();
     let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -305,7 +305,7 @@ async fn cancellation_stops_the_comparison_and_keeps_debt_and_cost() {
     assert_eq!(relay.subscription_count(), before);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unfinished_overflow_repair_survives_reopen() {
     let (dir, app, relay) = fixture();
     let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -330,7 +330,7 @@ async fn unfinished_overflow_repair_survives_reopen() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_failed_required_relay_cannot_complete_full_history_repair() {
     let (_dir, app, relay) = fixture_with_relays(vec![
         "wss://fast.example".to_owned(),
@@ -355,7 +355,7 @@ async fn one_failed_required_relay_cannot_complete_full_history_repair() {
     assert_eq!(relay.subscription_count(), before);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropped_explicit_future_detaches_urgency_without_losing_other_debt_or_retry() {
     let (_dir, app, relay) = fixture();
     let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -421,7 +421,7 @@ async fn dropped_explicit_future_detaches_urgency_without_losing_other_debt_or_r
     drop(reopened);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loss_handoff_active_attempt_does_not_advance_the_durable_cursor() {
     let (_dir, app, _relay) = fixture();
     let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -455,7 +455,7 @@ async fn loss_handoff_active_attempt_does_not_advance_the_durable_cursor() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn qualified_loss_acknowledgment_persists_admitted_cursor_only_after_handoff() {
     let (_dir, app, relay) = fixture();
     let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -494,7 +494,7 @@ async fn qualified_loss_acknowledgment_persists_admitted_cursor_only_after_hando
 /// Explicit synthetic backend evidence is separate from what a comparison
 /// certifies. Empty finite endpoint inventories qualify; incomplete endpoint
 /// admission/exhaustiveness or an omitted required endpoint must not qualify.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn qualified_repair_requires_every_endpoint_and_complete_admission() {
     use super::super::recovery::{TestRecoveryEvidence, empty_finite_history};
     let cases: [(TestRecoveryEvidence, bool); 4] = [
@@ -552,7 +552,7 @@ async fn qualified_repair_requires_every_endpoint_and_complete_admission() {
 /// A sync whose recovery debt no grant can select, here because the account
 /// has no relay recovery may contact, never waits for a process credit, so a
 /// busy pool cannot hold it behind another account's comparison.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sync_with_nothing_to_select_takes_no_recovery_credit() {
     use crate::runtime::account_worker::recovery_credits;
     let (_dir, app, _relay) = fixture_with_relays(Vec::new());
@@ -579,7 +579,7 @@ async fn a_sync_with_nothing_to_select_takes_no_recovery_credit() {
 
 /// An in-place job counts against the process pool until its admission and
 /// checkpoint finish, not only while its network request runs.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_in_place_job_holds_its_credit_through_admission() {
     use crate::runtime::account_worker::recovery_credits;
     const FETCHED: usize = 12;
@@ -648,7 +648,7 @@ async fn the_in_place_job_holds_its_credit_through_admission() {
 /// A route the pass never compared, here a group whose only relay recovery
 /// may not contact, keeps the explicit request open even while every compared
 /// route certifies: no window was searched there at all.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_uncompared_scope_keeps_the_explicit_request_open() {
     let (_dir, app, _relay) = fixture();
     let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -705,7 +705,7 @@ async fn an_uncompared_scope_keeps_the_explicit_request_open() {
 /// when the deadline ends the pass. The finished route's events are admitted
 /// inside the admission reserve, the repair reports the deadline, and the
 /// debt stays open.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pass_cut_by_the_network_deadline_admits_what_it_fetched() {
     const FETCHED: usize = 6;
     let (_dir, app, _relay) = fixture();
@@ -773,7 +773,7 @@ async fn a_pass_cut_by_the_network_deadline_admits_what_it_fetched() {
 /// while admitting. The certified window wins over the clock: the repair
 /// reports the unsearched history below it and closes its request, not
 /// `Deadline`.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_early_pass_admitted_past_the_network_cutoff_is_not_a_deadline() {
     const FETCHED: usize = 24;
     let (_dir, app, _relay) = fixture();
@@ -848,7 +848,7 @@ async fn an_early_pass_admitted_past_the_network_cutoff_is_not_a_deadline() {
 /// The credit wait does not eat the job's budget. A repair that waits past
 /// its own network cutoff for a credit still runs a whole pass once it holds
 /// one, and a certified window closes the request.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_long_credit_wait_still_closes_a_certified_pass() {
     use crate::runtime::account_worker::recovery_credits;
     let (_dir, app, _relay) = fixture();
@@ -890,7 +890,7 @@ async fn a_long_credit_wait_still_closes_a_certified_pass() {
 /// slice whose window certifies is kept, off the quiet streak, and once every
 /// route's window is certified the request closes: it never parks into a
 /// "history may be incomplete" notice.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn owner_passes_close_a_certified_explicit_request_without_a_notice() {
     let (_dir, app, _relay) = fixture();
     let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -949,7 +949,7 @@ async fn owner_passes_close_a_certified_explicit_request_without_a_notice() {
 /// A route the network cutoff times out lost what it collected with its
 /// future, even though the adapter already saved a cursor past it. It
 /// admitted nothing, so its stored replay cursor must not move.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_route_the_cutoff_timed_out_keeps_its_replay_cursor() {
     let (_dir, app, _relay) = fixture();
     let mut client = client_on_app_relay_plane(&app, "alice").await;

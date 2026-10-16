@@ -10,12 +10,12 @@ use cgka_traits::{
 use marmot_account::AccountHome;
 use std::sync::Arc;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restarted_safe_queued_send_does_not_inherit_secondary_retry_cutoff() {
     assert_restart_schedule(1).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restarted_below_quorum_send_keeps_required_retry_cutoff() {
     assert_restart_schedule(2).await;
 }
@@ -157,7 +157,7 @@ async fn assert_restart_schedule(required_acks: usize) {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn publication_barrier_rejects_unhydrated_inventory() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -202,7 +202,7 @@ async fn publication_barrier_rejects_unhydrated_inventory() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn publication_barrier_keeps_pending_mls_after_quorum() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
