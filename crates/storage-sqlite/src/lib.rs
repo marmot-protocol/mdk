@@ -70,11 +70,12 @@ pub use account_projection::{
 pub use attachment_acquisition::{
     ATTACHMENT_ACQUISITION_BATCH_LIMIT, ATTACHMENT_CHECKPOINT_BYTES,
     ATTACHMENT_STAGING_CHUNK_BYTES, AttachmentAcquisition, AttachmentAcquisitionSource,
-    AttachmentAcquisitionState, AttachmentAcquisitionStatus, AttachmentAssetRef, AttachmentDemand,
-    AttachmentPartial, AttachmentPartialIdentity, AttachmentPermissionCategory,
-    AttachmentPublication, AttachmentPublishResult, AttachmentUploadSource, AttachmentWorkerDemand,
-    MAX_ATTACHMENT_LOCAL_READ_BYTES, MAX_RETAINED_ATTACHMENT_BYTES,
-    MAX_RETAINED_FILE_ATTACHMENT_BYTES, RetainedAttachmentAsset, RetainedAttachmentRead,
+    AttachmentAcquisitionState, AttachmentAcquisitionStatus, AttachmentAssetRef,
+    AttachmentCheckpoint, AttachmentDemand, AttachmentPartial, AttachmentPartialIdentity,
+    AttachmentPermissionCategory, AttachmentPublication, AttachmentPublishResult,
+    AttachmentUploadSource, AttachmentWorkerDemand, MAX_ATTACHMENT_LOCAL_READ_BYTES,
+    MAX_RETAINED_ATTACHMENT_BYTES, MAX_RETAINED_FILE_ATTACHMENT_BYTES, RetainedAttachmentAsset,
+    RetainedAttachmentRead,
 };
 pub use attachment_history::{
     AccountAttachmentCursor, AccountAttachmentEntry, AccountAttachmentHistoryError,

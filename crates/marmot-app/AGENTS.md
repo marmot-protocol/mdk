@@ -58,14 +58,15 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (`blossom.rs`, `crypto.rs`, `group_image.rs`, `host_safety.rs`, `avatar.rs` for downloaded avatar admission).
   `media/attachment_resume.rs` adapts attempt-fenced checkpoints (metadata rows in storage, ciphertext in the media
   store's `.wire` files) to the shared safe HTTP path, and admits disk use through `media_store::DiskPolicy` built
-  from the configured reserve. Every checkpoint read, write and clear holds the job's `CheckpointLock` from the
-  metadata lookup through the file change, so a cancelled attempt's blocking task cannot touch a newer attempt's file;
+  from the configured reserve. Checkpoint reads, writes and clears go through the media store's checkpoint API with
+  the job's `AttachmentCheckpoint` target; never open or truncate a wire file here. Every download disk check uses
+  `DiskPolicy::download_need` (worker admission, readmission and the attempt's checks share `capacity`);
   keep Range validation, protected partials and complete-body authentication separate from native progress/access.
   `media/file_transfer.rs` owns file-backed upload preparation: private owner-only snapshots under the account's
   `media-staging/`, streaming EVP ChaCha20-Poly1305 that reproduces the in-memory wire bytes, the download side's
-  `DownloadedFileBody` (ciphertext in the job's `.wire` checkpoint, or one staging file without a validator,
-  authenticated into a discard sink before the receipt and decrypted by `DecryptingReader` straight into the store
-  publish; never write a plaintext file for a download), and the
+  `DownloadedFileBody` (ciphertext in the job's `.wire` checkpoint, held open by the store's `CheckpointReader`, or
+  one staging file without a validator; authenticated into a discard sink before the receipt and decrypted by
+  `DecryptingReader` straight into the store publish; never write a plaintext file for a download), and the
   `MediaFileTransferControl` cancellation/progress handle. Prepare every snapshot before the first PUT, keep chunks
   at 64 KiB, and stage retention through `stage_attachment_upload_files` (never a whole-file `Vec`).
 - Downloaded attachment bodies are retained in the account's encrypted media store (`media-store` crate,

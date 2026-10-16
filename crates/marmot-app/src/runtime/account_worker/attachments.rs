@@ -5,7 +5,7 @@
 use super::*;
 use crate::AccountMediaStore;
 use crate::media::AttachmentDownloadFailure;
-use media_store::{Category, MediaError, PublishOutcome};
+use media_store::{Category, MediaError};
 use storage_sqlite::{
     ATTACHMENT_ACQUISITION_BATCH_LIMIT, AttachmentAcquisition, SqliteAccountStorage,
 };
@@ -118,21 +118,27 @@ fn admit_demands(
 }
 
 /// Admits a download of up to `max` body bytes under the app's
-/// [`media_store::DiskPolicy`]: the reserve plus room for its wire checkpoint
-/// and its store file, less the `checkpointed` bytes already on disk, and
-/// never less than the store file.
+/// [`media_store::DiskPolicy`]: the reserve plus what
+/// [`DiskPolicy::download_need`](media_store::DiskPolicy::download_need) says
+/// the download still writes. A job with a checkpoint (`recorded` bytes) is
+/// credited one more append ([`media_store::CHECKPOINT_APPEND_MAX`]): a crash
+/// between an append and its record can leave that much on disk unrecorded,
+/// and free space already excludes it. The attempt cuts any such tail off
+/// before its own checks, which use the exact length; worker admission and
+/// readmission both decide through this function.
 fn capacity(
     policy: &storage_sqlite::AttachmentDownloadPolicy,
     max: u64,
-    checkpointed: u64,
+    recorded: Option<u64>,
     free: u64,
 ) -> bool {
     let disk = media_store::DiskPolicy {
         reserve_bytes: policy.disk_reserve,
     };
-    let needed = media_store::DiskPolicy::download_bytes(max)
-        .saturating_sub(checkpointed)
-        .max(max);
+    let on_disk = recorded.map_or(0, |recorded| {
+        recorded.saturating_add(media_store::CHECKPOINT_APPEND_MAX as u64)
+    });
+    let needed = media_store::DiskPolicy::download_need(max, on_disk);
     max > 0
         && max <= crate::media::MAX_ENCRYPTED_MEDIA_BLOB_BYTES
         && disk.admit(free, needed) == media_store::Admission::Admitted
@@ -298,8 +304,8 @@ pub(super) fn schedule(
             now,
             policy.disk_reserve,
             free,
-            policy.transfer_limit,
             policy.automatic,
+            &|recorded| capacity(&policy, policy.transfer_limit, recorded, free),
         )?,
         None => 0,
     };
@@ -412,8 +418,8 @@ pub(super) fn schedule(
         // automatic-sized object even for explicit work, then enforce actual
         // checkpoint/publication capacity as the transfer grows.
         let reservation = policy.transfer_limit;
-        let checkpointed = storage.attachment_checkpoint_bytes(&candidate)?;
-        if !capacity(&policy, reservation, checkpointed, free) {
+        let recorded = storage.attachment_checkpoint_recorded(&candidate)?;
+        if !capacity(&policy, reservation, recorded, free) {
             storage.finish_attachment_preparation(&candidate, now, Some(now.saturating_add(15)))?;
             continue;
         }
@@ -662,21 +668,19 @@ pub(super) fn complete_acquired_stored(
     let digest = job.plaintext_digest()?;
     let clock = crate::unix_now_seconds;
     let target = storage.attachment_publication(job, &clock);
-    // A retried attempt needs its store file and whatever of its ciphertext
-    // is not checkpointed: the checkpoint stays on disk, staging does not. A
-    // file body's staging is held until the headroom is measured below.
+    // A retried attempt of either sink needs its store file and whatever of
+    // its ciphertext is not checkpointed: the checkpoint stays on disk, a
+    // file body's staging does not. That staging is held until the headroom
+    // is measured below.
     let saved = storage
-        .attachment_checkpoint_bytes(&job.reference)
+        .attachment_checkpoint_recorded(&job.reference)
+        .ok()
+        .flatten()
         .unwrap_or(0);
-    let required = |len: u64| {
-        media_store::DiskPolicy::download_bytes(len)
-            .saturating_sub(saved)
-            .max(len)
-    };
-    let (published, len, required, held, _staged) = match body {
-        crate::client::AcquiredMediaBody::File(file) => {
+    let (published, len, held, staged) = match body {
+        crate::client::AcquiredMediaBody::File(mut file) => {
             let len = file.plaintext_len;
-            let published = match file.plaintext_reader(media) {
+            let published = match file.plaintext_reader() {
                 Ok(mut reader) => media.publish(
                     &target,
                     Category::Retained,
@@ -686,19 +690,10 @@ pub(super) fn complete_acquired_stored(
                     now,
                     cancelled,
                 ),
-                // The checkpoint went away under the receipt; retry the job.
-                Err(_) => Err(MediaError::Io(std::io::ErrorKind::NotFound)),
+                Err(_) => Err(MediaError::Io(std::io::ErrorKind::InvalidData)),
             };
-            // Published or reused: the job's checkpoint row went with it.
-            if matches!(
-                published,
-                Ok(PublishOutcome::Published(_) | PublishOutcome::Existing(_))
-            ) && let Some(wire) = file.ciphertext.wire_file()
-            {
-                media.remove_wire(&wire);
-            }
             let held = file.ciphertext.staged_bytes();
-            (published, len, required(len), held, Some(file))
+            (published, len, held, Some(file))
         }
         crate::client::AcquiredMediaBody::Memory(result) => {
             let plaintext = zeroize::Zeroizing::new(result.plaintext);
@@ -712,7 +707,7 @@ pub(super) fn complete_acquired_stored(
                 now,
                 cancelled,
             );
-            (published, len, required(len), 0, None)
+            (published, len, 0, None)
         }
         crate::client::AcquiredMediaBody::Retained => return Ok(()),
     };
@@ -724,6 +719,7 @@ pub(super) fn complete_acquired_stored(
         }
         // The disk (or database) is full: park, never retry on a timer.
         Err(MediaError::Capacity) => {
+            let required = media_store::DiskPolicy::download_need(len, saved);
             let headroom = full_disk_headroom(directory, &policy, len, required, held);
             storage.block_attachment_storage(job, headroom, now)?;
         }
@@ -732,6 +728,11 @@ pub(super) fn complete_acquired_stored(
         Err(_) => {
             storage.fail_attachment_acquisition(job, Some(retry_at(storage, job, now)))?;
         }
+    }
+    // Only now, with the job's outcome recorded: a published job's wire file
+    // goes (its row went with the publication), staging is deleted.
+    if let Some(file) = staged {
+        file.ciphertext.finish();
     }
     Ok(())
 }

@@ -1127,6 +1127,8 @@ pub use partial::{
     STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS,
 };
 
+mod checkpoint;
+pub use checkpoint::AttachmentCheckpoint;
 mod file_import;
 mod file_staging;
 mod media;

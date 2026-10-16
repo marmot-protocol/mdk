@@ -2687,7 +2687,7 @@ impl<S: StorageProvider> Engine<S> {
         EngineError,
     > {
         self.storage
-            .rollback_group_state_to_snapshot(group_id, snapshot_name)?;
+            .rollback_group_state_keeping_live_records(group_id, snapshot_name)?;
         crate::test_crash_hooks::pause_if_requested("past-peel-after-rewind");
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
         let mls_gid = openmls::group::GroupId::from_slice(group_id.as_slice());

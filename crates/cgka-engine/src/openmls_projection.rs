@@ -1632,7 +1632,8 @@ fn canonicalize_stored_openmls_messages_from_retained_anchor<S: StorageProvider>
     .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
 
     let anchor_snapshot = retained_anchor_snapshot_name(work.replay_start_epoch);
-    let result = match storage.rollback_group_state_to_snapshot(group_id, &anchor_snapshot) {
+    let rewound = storage.rollback_group_state_keeping_live_records(group_id, &anchor_snapshot);
+    let result = match rewound {
         Ok(()) => {
             crate::test_crash_hooks::pause_if_requested("retained-anchor-after-rewind");
             canonicalize_stored_openmls_messages_from_current(storage, group_id, work)
@@ -2073,7 +2074,8 @@ pub(crate) fn candidate_branch_peel<S: StorageProvider>(
         CandidateBranchPeelFailure::new(OpenMlsProjectionError::Snapshot(format!("{error:?}")), 0)
     })?;
     let anchor_snapshot = retained_anchor_snapshot_name(inputs.replay_start_epoch);
-    let contexts = match storage.rollback_group_state_to_snapshot(group_id, &anchor_snapshot) {
+    let rewound = storage.rollback_group_state_keeping_live_records(group_id, &anchor_snapshot);
+    let contexts = match rewound {
         Ok(()) => {
             crate::test_crash_hooks::pause_if_requested("candidate-branch-after-rewind");
             candidate_branch_peel_contexts_from_current(
@@ -2744,24 +2746,11 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
     } else {
         BTreeMap::new()
     };
-    let (live_message_records, live_queued_outbound) =
-        if rewind_to_retained_anchor && !restore_own_checkpoint {
-            (
-                storage
-                    .list_messages(group_id, EpochId(0))
-                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?,
-                storage
-                    .list_queued_outbound_intents(group_id)
-                    .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?,
-            )
-        } else {
-            (Vec::new(), Vec::new())
-        };
-    // The anchor refresh, historical rewind, restoration of the complete live
-    // input/queue set, and selected-branch apply are one unit. Canonical apply
-    // changes message dispositions and outbound work, so a failure must return
-    // to the complete pre-apply image, not only canonical group/OpenMLS state,
-    // and leave the caller's transaction usable. A crash commits none of it.
+    // The anchor refresh, historical rewind and selected-branch apply are one
+    // unit. Canonical apply changes message dispositions and outbound work, so
+    // a failure must return to the complete pre-apply image, not only
+    // canonical group/OpenMLS state, and leave the caller's transaction
+    // usable. A crash commits none of it.
     // SQLite does this with a savepoint; other backends fall back to a full
     // pre-apply snapshot that `recover_interrupted_apply_snapshot` restores.
     let snapshot = apply_snapshot_name(group_id, result);
@@ -2789,15 +2778,13 @@ pub(crate) fn apply_openmls_canonicalization_result_with_profile_policy<S: Stora
                 &realized.expected_epoch_authenticator,
             )?;
         } else if rewind_to_retained_anchor {
+            // The selected branch replays over the live input and queue rows,
+            // never over an older copy in an anchor captured before
+            // state-scoped capture.
             let anchor_snapshot = retained_anchor_snapshot_name(apply_start_epoch);
             storage
-                .rollback_group_to_snapshot(group_id, &anchor_snapshot)
+                .rollback_group_state_keeping_live_records(group_id, &anchor_snapshot)
                 .map_err(|e| OpenMlsProjectionError::Snapshot(format!("{e:?}")))?;
-            restore_live_message_and_queue_records(
-                storage,
-                &live_message_records,
-                &live_queued_outbound,
-            )?;
         }
 
         let observations = apply_openmls_canonicalization_result_inner(
@@ -3180,24 +3167,6 @@ pub(crate) fn recover_interrupted_apply_snapshot<S: StorageProvider>(
     rollback_and_release_group_snapshot(storage, group_id, snapshot)
 }
 
-fn restore_live_message_and_queue_records<S: StorageProvider>(
-    storage: &S,
-    messages: &[MessageRecord],
-    queued_outbound: &[cgka_traits::storage::QueuedOutboundIntent],
-) -> Result<(), OpenMlsProjectionError> {
-    for message in messages {
-        storage
-            .put_message(message)
-            .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-    }
-    for queued in queued_outbound {
-        storage
-            .put_queued_outbound_intent(queued)
-            .map_err(|e| OpenMlsProjectionError::Storage(format!("{e:?}")))?;
-    }
-    Ok(())
-}
-
 pub(crate) fn retain_current_group_epoch_snapshot<S: StorageProvider>(
     storage: &S,
     group_id: &GroupId,
@@ -3208,8 +3177,8 @@ pub(crate) fn retain_current_group_epoch_snapshot<S: StorageProvider>(
     // only ever consumed as an OpenMLS/group-state rewind base. The message
     // ledger is deliberately not captured — the convergence probe works from
     // pre-seeded inputs (`seed_stored_openmls_graph_inputs` runs before the
-    // rewind), and the historical apply restores the live message/queue sets
-    // over the rollback anyway (`restore_live_message_and_queue_records`).
+    // rewind), and the historical apply keeps the live message/queue rows
+    // (`rollback_group_state_keeping_live_records`).
     // Capturing them would make every applied commit O(retained bytes).
     storage.create_group_state_snapshot(group_id, &retained_anchor_snapshot_name(epoch))?;
     prune_retained_anchor_snapshots(storage, group_id, epoch, max_retained_anchor_rewind)?;
@@ -4572,7 +4541,7 @@ fn read_retained_anchor_group<S: StorageProvider, T>(
     epoch: EpochId,
     read: impl FnOnce(&MlsGroup, &EngineOpenMlsProvider<'_, S>) -> Result<Option<T>, EngineError>,
 ) -> Result<Option<T>, EngineError> {
-    match storage.rollback_group_state_to_snapshot(group_id, snapshot_name) {
+    match storage.rollback_group_state_keeping_live_records(group_id, snapshot_name) {
         Ok(()) => {}
         Err(StorageError::SnapshotMissing(_)) => return Ok(None),
         Err(error) => return Err(error.into()),

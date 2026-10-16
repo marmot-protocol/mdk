@@ -2091,6 +2091,344 @@ async fn failed_canonical_apply_rolls_back_inside_a_committing_caller_without_a_
     );
 }
 
+/// One co-admin of [`reorg_onto_a_legacy_full_anchor`] on SQLite.
+fn sqlite_reorg_side(
+    id: &[u8],
+) -> (
+    cgka_engine::Engine<SqliteAccountStorage>,
+    SqliteAccountStorage,
+) {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    (
+        build_selfremove_client_on_storage(id, storage.clone()),
+        storage,
+    )
+}
+
+/// `FaultStorage` keeps the generic rewind: it does not delegate
+/// `rollback_group_state_keeping_live_records`, so its retained anchor rolls
+/// back as a full image.
+fn generic_reorg_side(id: &[u8]) -> (cgka_engine::Engine<FaultStorage>, SqliteAccountStorage) {
+    build_fault_selfremove_client(id, PutGroupFault::default())
+}
+
+/// Replace the retained anchor of `epoch` with a full snapshot, the shape
+/// anchors had before state-scoped capture: the group state of `epoch`, and
+/// the message ledger and outbound queue as they are now.
+fn plant_legacy_full_anchor(handle: &SqliteAccountStorage, group_id: &GroupId, epoch: u64) {
+    let anchor = format!("openmls-retained-anchor-{epoch}");
+    let live = "test-legacy-anchor-live-state";
+    handle.create_group_state_snapshot(group_id, live).unwrap();
+    handle
+        .rollback_group_state_to_snapshot(group_id, &anchor)
+        .unwrap();
+    handle.create_group_snapshot(group_id, &anchor).unwrap();
+    handle
+        .rollback_group_state_to_snapshot(group_id, live)
+        .unwrap();
+    handle.release_group_snapshot(group_id, live).unwrap();
+}
+
+async fn send_chat<S: StorageProvider + 'static>(
+    engine: &mut cgka_engine::Engine<S>,
+    group_id: &GroupId,
+    text: &str,
+) -> TransportMessage {
+    use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
+    let payload = MarmotAppEvent::new(
+        hex::encode(engine.self_id().as_slice()),
+        1_700_000_000,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        text,
+    )
+    .encode()
+    .unwrap();
+    match engine
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload,
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg, .. } => TransportMessage {
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: group_id.as_slice().to_vec(),
+            },
+            ..msg
+        },
+        other => panic!("expected an application message, got {other:?}"),
+    }
+}
+
+async fn published_invite<S: StorageProvider + 'static>(
+    engine: &mut cgka_engine::Engine<S>,
+    group_id: &GroupId,
+    invitee: cgka_traits::engine::KeyPackage,
+) -> TransportMessage {
+    match engine
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![invitee],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution { msg, pending, .. } => {
+            engine.confirm_published(pending).await.unwrap();
+            msg
+        }
+        other => panic!("expected GroupEvolution, got {other:?}"),
+    }
+}
+
+fn pending_message_ids(handle: &SqliteAccountStorage) -> Vec<MessageId> {
+    handle
+        .list_pending_application_events()
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event {
+            cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. } => Some(message_id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// mdk#2330: a reorg's probes read the fork's retained anchor, and its apply
+/// rewinds to it and replays the selected branch over the live message
+/// ledger and outbound queue. Anchors captured before state-scoped capture
+/// also hold an older image of those rows, and no rewind may restore it: an
+/// application delivered after the capture keeps its pending app-visible
+/// output (its only durable copy until the app projects it), and a row or
+/// queued intent removed after the capture stays removed. Both the SQLite
+/// rewind and the generic one that puts the live rows back must hold this.
+#[tokio::test]
+async fn reorg_onto_a_legacy_full_anchor_keeps_live_records() {
+    reorg_onto_a_legacy_full_anchor("sqlite", sqlite_reorg_side, None).await;
+    reorg_onto_a_legacy_full_anchor("generic", generic_reorg_side, None).await;
+}
+
+/// A probe that reads the anchor holds only its snapshot guard, which puts
+/// rows back but not pending app-visible output. When a write fails part way
+/// through the generic rewind, after its full rollback has deleted the late
+/// application's pending output, the rewind must undo itself as one unit:
+/// the output stays durable for a restart, and the retried pass reorgs.
+#[tokio::test]
+async fn a_failed_generic_rewind_keeps_pending_app_output() {
+    let fault = LeaveWriteFault::default();
+    let sides = fault.clone();
+    reorg_onto_a_legacy_full_anchor(
+        "generic-faulted",
+        move |id: &[u8]| build_leave_write_fault_client(id, sides.clone(), Box::new(MockPeeler)),
+        Some(&fault),
+    )
+    .await;
+}
+
+/// Fork two co-admins at epoch 1 and reorg the loser onto a legacy full
+/// anchor of epoch 1. With `fault_first_put`, the loser's first convergence
+/// attempt fails at its first `put_message` and the retry settles.
+async fn reorg_onto_a_legacy_full_anchor<S: StorageProvider + 'static>(
+    label: &str,
+    build: impl Fn(&[u8]) -> (cgka_engine::Engine<S>, SqliteAccountStorage),
+    fault_first_put: Option<&LeaveWriteFault>,
+) {
+    let alice_id = format!("alice-{label}");
+    let bob_id = format!("bob-{label}");
+    let (mut alice, alice_handle) = build(alice_id.as_bytes());
+    let (mut bob, bob_handle) = build(bob_id.as_bytes());
+    let mut david = build_selfremove_client(format!("david-{label}").as_bytes());
+    let mut eve = build_selfremove_client(format!("eve-{label}").as_bytes());
+
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, create) = alice
+        .create_group(CreateGroupRequest {
+            name: label.into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let welcome = match create {
+        SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } => {
+            alice.confirm_published(pending).await.unwrap();
+            welcomes.remove(0)
+        }
+        other => panic!("expected GroupCreated, got {other:?}"),
+    };
+    bob.join_welcome(welcome).await.unwrap();
+
+    // Each co-admin sends an application at epoch 1, then commits an invite
+    // from epoch 1 without seeing the other's commit.
+    let alice_app = send_chat(&mut alice, &group_id, "alice at epoch 1").await;
+    let bob_app = send_chat(&mut bob, &group_id, "bob at epoch 1").await;
+    let david_kp = david.fresh_key_package().await.unwrap();
+    let eve_kp = eve.fresh_key_package().await.unwrap();
+    let alice_commit = published_invite(&mut alice, &group_id, david_kp).await;
+    let bob_commit = published_invite(&mut bob, &group_id, eve_kp).await;
+    let ordering_key = |committer: MemberId, commit: &TransportMessage| {
+        CommitOrderingKey::from_commit_bytes(
+            EpochId(1),
+            CommitOrderingPriority::Privileged,
+            committer,
+            &commit.payload,
+        )
+    };
+    let bob_wins =
+        ordering_key(bob.self_id(), &bob_commit) < ordering_key(alice.self_id(), &alice_commit);
+    let (mut loser, handle, loser_id, winner_app, winner_commit) = if bob_wins {
+        (alice, alice_handle, alice_id, bob_app, bob_commit)
+    } else {
+        (bob, bob_handle, bob_id, alice_app, alice_commit)
+    };
+    assert_eq!(loser.epoch(&group_id).unwrap(), EpochId(2));
+
+    // A message row and a queued intent that exist when the legacy anchor is
+    // captured and are removed afterwards.
+    let template = handle
+        .list_messages(&group_id, EpochId(0))
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("the loser stores its own messages");
+    let removed_row = MessageId::new(format!("removed-after-capture-{label}").into_bytes());
+    handle
+        .put_message(&MessageRecord {
+            id: removed_row.clone(),
+            state: MessageState::Failed,
+            ..template
+        })
+        .unwrap();
+    let removed_intent = MessageId::new(format!("dequeued-after-capture-{label}").into_bytes());
+    handle
+        .put_queued_outbound_intent(&QueuedOutboundIntent {
+            id: removed_intent.clone(),
+            group_id: group_id.clone(),
+            intent: SendIntent::SelfUpdate {
+                group_id: group_id.clone(),
+            },
+            created_at_ms: 0,
+            reissue_attempts: 0,
+        })
+        .unwrap();
+    plant_legacy_full_anchor(&handle, &group_id, 1);
+    handle.delete_message(&removed_row).unwrap();
+    handle
+        .delete_queued_outbound_intent(&removed_intent)
+        .unwrap();
+
+    // The rival's epoch-1 application arrives after the capture. It is valid
+    // on both branches, so the reorg keeps it delivered.
+    let late_app = MessageId::new(hex::decode(content_hex(&winner_app)).unwrap());
+    assert!(matches!(
+        loser.ingest(winner_app).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    assert!(pending_message_ids(&handle).contains(&late_app));
+
+    let routed_winner = TransportMessage {
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+        ..winner_commit
+    };
+    assert!(matches!(
+        loser.ingest(routed_winner.clone()).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    let mut rows_before = handle
+        .list_messages(&group_id, EpochId(0))
+        .unwrap()
+        .into_iter()
+        .map(|row| row.id)
+        .collect::<Vec<_>>();
+    rows_before.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    let pending_before = pending_message_ids(&handle);
+    let queued_before = handle.list_queued_outbound_intents(&group_id).unwrap();
+    let sorted_rows = || {
+        let mut rows = handle
+            .list_messages(&group_id, EpochId(0))
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+        rows
+    };
+
+    if let Some(fault) = fault_first_put {
+        fault.arm_on_write(1);
+        let failed = loser.converge_stored_openmls_messages_at(&group_id, u64::MAX);
+        assert!(
+            failed.is_err(),
+            "{label}: the injected write failure must surface, got {failed:?}"
+        );
+        assert_eq!(fault.remaining(), 0, "{label}: the fault never fired");
+        assert_eq!(
+            pending_message_ids(&handle),
+            pending_before,
+            "{label}: a failed rewind dropped pending app output"
+        );
+        assert_eq!(sorted_rows(), rows_before, "{label}");
+        assert_eq!(
+            handle.list_queued_outbound_intents(&group_id).unwrap(),
+            queued_before,
+            "{label}"
+        );
+        // A restart seeds app output from the durable pending events.
+        let mut reopened = build_selfremove_client_on_storage(loser_id.as_bytes(), handle.clone());
+        assert!(
+            reopened.drain_events().iter().any(|event| matches!(
+                event,
+                cgka_traits::engine::GroupEvent::MessageReceived { message_id, .. }
+                    if *message_id == late_app
+            )),
+            "{label}: a reopened engine must still surface the late application"
+        );
+    }
+
+    let result = loser
+        .converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    assert!(
+        result
+            .accepted_commits
+            .contains(&content_hex(&routed_winner)),
+        "{label}: the rival must win and rewind the loser to the epoch-1 anchor"
+    );
+    assert_eq!(loser.members(&group_id).unwrap().len(), 3, "{label}");
+
+    assert_eq!(
+        handle.get_message(&late_app).unwrap().state,
+        MessageState::Processed,
+        "{label}"
+    );
+    let pending_after = pending_message_ids(&handle);
+    assert!(
+        pending_before.iter().all(|id| pending_after.contains(id)),
+        "{label}: the rewind dropped pending app output: before {pending_before:?}, after {pending_after:?}"
+    );
+    assert_eq!(
+        sorted_rows(),
+        rows_before,
+        "{label}: the rewind must neither drop live rows nor restore removed ones"
+    );
+    assert_eq!(
+        handle.list_queued_outbound_intents(&group_id).unwrap(),
+        queued_before,
+        "{label}: the rewind must not restore a dequeued intent"
+    );
+}
+
 /// A failure refreshing self capabilities occurs after the MLS merge and group
 /// record write. All inbound projections must roll back together, and the
 /// retained commit must be handed to stored convergence for retry (mdk#794).

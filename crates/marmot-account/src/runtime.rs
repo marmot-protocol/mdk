@@ -533,6 +533,16 @@ where
         Ok(self.session.group_record(group_id)?)
     }
 
+    /// Undecryptable objects retained while stuck at the group's current
+    /// epoch; see `Engine::deferred_stall_evidence`.
+    pub fn deferred_stall_evidence(
+        &mut self,
+        group_id: &GroupId,
+        limit: usize,
+    ) -> AccountResult<cgka_traits::DeferredStallEvidence> {
+        Ok(self.session.deferred_stall_evidence(group_id, limit)?)
+    }
+
     pub fn epoch_state(&self, group_id: &GroupId) -> Option<cgka_traits::EpochState> {
         self.session.epoch_state(group_id)
     }

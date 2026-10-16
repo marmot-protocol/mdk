@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use marmot_account::AccountHome;
-use marmot_app::{AuditLogSettings, MarmotApp, MarmotAppConfig};
+use marmot_app::{AuditLogSettings, CursorPersistence, MarmotApp, MarmotAppConfig};
 use nostr_relay_builder::MockRelay;
 use nostr_sdk::prelude::{
     Client as NostrSdkClient, EventBuilder, FinalizeEvent, Keys, Kind, Tag,
@@ -552,6 +552,86 @@ async fn arming_a_backfill_records_one_epoch_stall_backfill_armed_row() {
                 .as_str()
         ),
         "the row is group-scoped via group_ref, not a duplicated field: {row}"
+    );
+}
+
+/// A device woken mostly by notifications ingests its group's undecryptable
+/// traffic in `Frozen` wakes, which track no stalls. When the main app next
+/// syncs, that traffic arrives as duplicates, so live detection never counts
+/// it (mdk#2257). The next `Advance` open must rebuild the evidence from the
+/// retained deferred rows and arm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undecryptable_traffic_ingested_only_while_frozen_arms_on_the_next_advance_open() {
+    let dir_bob = tempfile::tempdir().unwrap();
+    let dir_alice = tempfile::tempdir().unwrap();
+    let StalledGroup {
+        _relay,
+        app_bob,
+        bob,
+        alice: _alice,
+        relay_url,
+        group_id,
+        nostr_group_id_hex,
+    } = stalled_bob_in_a_live_group(&dir_bob, &dir_alice).await;
+    let stalled_epoch = bob.group_mls_state(&group_id).unwrap().epoch;
+    let mut audit_rows = AuditRowTracker::default();
+    let _setup_rows = audit_rows.new_rows(&app_bob, "bob");
+    drop(bob);
+    drop(app_bob);
+
+    // A notification wake: a Frozen client over the same store ingests the
+    // whole burst and retains each object as a deferred row.
+    let app_frozen = open_store_with_config(
+        &dir_bob,
+        &relay_url,
+        MarmotAppConfig::default().with_cursor_persistence(CursorPersistence::Frozen),
+    );
+    let mut frozen = app_frozen.client("bob").await.unwrap();
+    let created_at = test_unix_now_seconds();
+    for arm in 0..BACKFILL_THRESHOLD {
+        publish_garbage_group_message_at(
+            &relay_url,
+            &nostr_group_id_hex,
+            created_at,
+            &format!("frozen-{arm}"),
+        )
+        .await;
+    }
+    for _ in 0..BACKFILL_THRESHOLD {
+        timeout(NEXT_EVENT_DEADLINE, frozen.next_event())
+            .await
+            .expect("next_event must return for each frozen deferred delivery")
+            .expect("next_event should not error");
+    }
+    let frozen_rows = audit_rows.new_rows(&app_frozen, "bob");
+    assert!(
+        rows_of_kind(&frozen_rows, "epoch_stall_backfill_armed").is_empty(),
+        "a Frozen wake tracks no stalls: {frozen_rows:?}"
+    );
+    assert_eq!(
+        ingested_message_ids(&frozen_rows).len(),
+        BACKFILL_THRESHOLD,
+        "the Frozen wake ingested the whole burst"
+    );
+    drop(frozen);
+    drop(app_frozen);
+
+    // The main app opens in Advance mode and arms from the retained rows,
+    // without any of that traffic being delivered again.
+    let app_advance = open_store(&dir_bob, &relay_url);
+    let _advance = app_advance.client("bob").await.unwrap();
+    let rows = audit_rows.new_rows(&app_advance, "bob");
+    let armed = rows_of_kind(&rows, "epoch_stall_backfill_armed");
+    assert_eq!(
+        armed.len(),
+        1,
+        "the Advance open arms from the deferred rows: {rows:?}"
+    );
+    assert_eq!(
+        armed[0]["kind"]["stalled_epoch"].as_u64(),
+        Some(stalled_epoch),
+        "the arm carries the epoch bob was stalled at: {}",
+        armed[0]
     );
 }
 

@@ -1,6 +1,7 @@
 use super::*;
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
+use std::io::SeekFrom;
 
 fn fixture(directory: &Path, bytes: &[u8]) -> PrivateMediaFile {
     let mut file = PrivateMediaFile::create(directory).unwrap();

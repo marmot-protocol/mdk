@@ -20,16 +20,19 @@ database, which this crate reaches through a catalog trait implemented by `stora
   transaction with its reference. Identical content is stored once, but only reused if its file is on disk. Deleting
   the catalog row erases the key; the file is unlinked after. A bounded sweep reclaims anything a crash left behind,
   and marks a ready row whose file vanished as *lost*. Readers check the close latch on every read.
-- **Download checkpoints** (`WireFile`): a resumable download appends its ciphertext to an append-only
-  `<shard>/<id>.wire` file. The catalog's checkpoint row is written before the file and deleted before it, and records
-  how much of the file is durable; reopening, or the sweep while no writer holds the file, truncates any unrecorded
-  tail. `WireReader` reads the recorded bytes in place, so a finished download is verified and published from its
-  wire file. The sweep unlinks wire files whose row is gone.
+- **Download checkpoints** (`checkpoint_append`, `checkpoint_restore`, `checkpoint_clear`): a resumable download's
+  ciphertext goes to an append-only `<shard>/<id>.wire` file. The store owns every step, as it does for publishing:
+  the catalog's checkpoint row commits before the file exists and is deleted before the file is, each append is
+  synced before the row records it, a refused or failed append is cut off at once, and operations on one checkpoint
+  serialize. An append is at most `CHECKPOINT_APPEND_MAX` bytes, so a crash can leave at most that much unrecorded;
+  reopening and the sweep cut it off. A finished checkpoint is read in place through `checkpoint_reader`, which keeps
+  its file open (the sweep and an unlink leave it alone) until `finish` unlinks a file whose row is gone.
 - **Disk admission** (`DiskPolicy`): the caller supplies the reserve from its configuration; the crate only measures
-  free space (`free_space`) and compares. A download needs the reserve plus twice the body: its wire file and its
-  store file.
-- **The catalog traits**: `MediaCatalog` (store-wide rows) and `PublishTarget` (one publication's commit), implemented
-  on the account database by `storage-sqlite`. The `catalog-conformance` feature exports the suite every
+  free space (`free_space`) and compares. `DiskPolicy::download_need` is the one rule for what a download still
+  writes: the rest of its wire file and its store file, less what is already checkpointed, never less than the store
+  file.
+- **The catalog traits**: `MediaCatalog` (store-wide rows), `PublishTarget` (one publication's commit) and
+  `CheckpointTarget` (one download checkpoint's row), implemented on the account database by `storage-sqlite`. The `catalog-conformance` feature exports the suite every
   implementation must pass, and an in-memory catalog.
 
 Later steps of mdk#2314 add handoff leases and the evictable cache category, and move the rest of attachments onto

@@ -8,20 +8,32 @@ fn attachment_capacity_reserves_disk_overhead_and_never_evicts() {
     assert_eq!(p.transfer_limit, 64 * 1024 * 1024);
     // The reserve plus a wire checkpoint and a store file (mdk#2314).
     let free = p.disk_reserve + 2 * p.transfer_limit;
-    assert!(capacity(&p, p.transfer_limit, 0, free));
-    assert!(!capacity(&p, p.transfer_limit, 0, free - 1));
-    assert!(!capacity(&p, u64::MAX, 0, u64::MAX));
-    // A saved checkpoint is already on disk: a resumed download needs only
-    // the rest of it plus the store file, never less than the store file.
+    assert!(capacity(&p, p.transfer_limit, None, free));
+    assert!(!capacity(&p, p.transfer_limit, None, free - 1));
+    assert!(!capacity(&p, u64::MAX, None, u64::MAX));
+    // A checkpoint is already on disk, and so may be one unrecorded append
+    // a crash left: a resumed download is credited both, and needs at least
+    // its store file.
     let saved = p.transfer_limit / 2;
-    assert!(capacity(&p, p.transfer_limit, saved, free - saved));
-    assert!(!capacity(&p, p.transfer_limit, saved, free - saved - 1));
-    let floor = p.disk_reserve + p.transfer_limit;
-    assert!(capacity(&p, p.transfer_limit, 2 * p.transfer_limit, floor));
+    let credit = saved + media_store::CHECKPOINT_APPEND_MAX as u64;
+    assert!(capacity(&p, p.transfer_limit, Some(saved), free - credit));
     assert!(!capacity(
         &p,
         p.transfer_limit,
-        2 * p.transfer_limit,
+        Some(saved),
+        free - credit - 1
+    ));
+    let floor = p.disk_reserve + p.transfer_limit;
+    assert!(capacity(
+        &p,
+        p.transfer_limit,
+        Some(2 * p.transfer_limit),
+        floor
+    ));
+    assert!(!capacity(
+        &p,
+        p.transfer_limit,
+        Some(2 * p.transfer_limit),
         floor - 1
     ));
 }

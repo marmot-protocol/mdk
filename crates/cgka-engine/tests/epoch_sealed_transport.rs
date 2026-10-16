@@ -890,3 +890,84 @@ async fn a_welcome_dated_in_the_future_is_clamped_to_this_devices_clock() {
         "and nothing arriving now may look like this copy's history"
     );
 }
+
+/// Retained undecryptable rows are durable stall evidence a later process can
+/// rebuild (mdk#2257). They carry the same filter live detection applies: a row
+/// older than this copy's Welcome is expected history, not evidence this device
+/// is behind, so it is skipped before the limit counts.
+#[tokio::test]
+async fn deferred_stall_evidence_lists_current_epoch_rows_newer_than_the_welcome() {
+    let (mut alice, mut bob, bob_storage, group_id) = alice_and_a_removed_bob(b"evidence").await;
+
+    let welcome = readd(&mut alice, &mut bob, &group_id, WELCOME_CREATED_AT).await;
+    bob.join_welcome(welcome).await.unwrap();
+    bob.drain_events();
+    let bob_epoch = bob.group_record(&group_id).unwrap().epoch;
+
+    // Alice advances with the commit withheld, so nothing she says next peels
+    // on bob's copy.
+    let _withheld = evolve(
+        &mut alice,
+        SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        },
+    )
+    .await;
+    let predating = route_at(
+        chat(&mut alice, &group_id, "from before this copy").await,
+        &group_id,
+        WELCOME_CREATED_AT - 4 * 3600,
+    );
+    let first = route_at(
+        chat(&mut alice, &group_id, "first after this copy").await,
+        &group_id,
+        WELCOME_CREATED_AT + 60,
+    );
+    let second = route_at(
+        chat(&mut alice, &group_id, "second after this copy").await,
+        &group_id,
+        WELCOME_CREATED_AT + 90,
+    );
+    for msg in [&predating, &first, &second] {
+        assert!(matches!(
+            bob.ingest(msg.clone()).await.unwrap(),
+            IngestOutcome::TransportDeferred { .. }
+        ));
+    }
+    assert_eq!(deferred_rows(&bob_storage, &group_id), 3);
+
+    let evidence = bob.deferred_stall_evidence(&group_id, 8).unwrap();
+    assert_eq!(evidence.epoch, bob_epoch);
+    assert_eq!(
+        evidence.lineage,
+        cgka_traits::ingest::DeferralLineage::Uncontested
+    );
+    let mut ids = evidence
+        .rows
+        .iter()
+        .map(|row| row.message_id.as_slice().to_vec())
+        .collect::<Vec<_>>();
+    ids.sort();
+    let mut expected = vec![first.id.as_slice().to_vec(), second.id.as_slice().to_vec()];
+    expected.sort();
+    assert_eq!(
+        ids, expected,
+        "only rows newer than the Welcome are evidence"
+    );
+    assert!(
+        evidence
+            .rows
+            .iter()
+            .all(|row| row.transport_timestamp.0 > WELCOME_CREATED_AT),
+        "each row carries its transport timestamp"
+    );
+
+    assert_eq!(
+        bob.deferred_stall_evidence(&group_id, 1)
+            .unwrap()
+            .rows
+            .len(),
+        1,
+        "the limit bounds the rows returned"
+    );
+}

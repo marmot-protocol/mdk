@@ -468,15 +468,15 @@ pub trait MessageStorage {
 
     /// Restore only canonical group state from a named snapshot, ignoring any
     /// message-ledger or outbound-queue image the snapshot may contain. This is
-    /// the restore counterpart to [`Self::create_group_state_snapshot`] and is
-    /// required when a temporary probe reads a legacy full snapshot: the probe
-    /// must not rewrite live input/work rows merely because the persisted
-    /// anchor predates state-scoped capture.
+    /// the restore counterpart to [`Self::create_group_state_snapshot`]: a
+    /// rewind must not rewrite live input/work rows merely because the
+    /// persisted anchor predates state-scoped capture.
     ///
     /// Backends that cannot distinguish snapshot fields may restore the full
-    /// image. Callers pair this with a live group-state guard; the default
-    /// state-snapshot implementation is also full, so the fallback remains
-    /// correct even though it forfeits the narrower write bound.
+    /// image. Rewinds onto a retained anchor therefore go through
+    /// [`StorageProvider::rollback_group_state_keeping_live_records`], whose
+    /// default builds on this method and puts the live rows back; a guard
+    /// restoring its own capture of live state may call this directly.
     fn rollback_group_state_to_snapshot(
         &self,
         group_id: &GroupId,
@@ -1128,7 +1128,137 @@ pub trait StorageProvider:
         with_group_snapshot_rollback(self, group_id, fallback_snapshot, f)
     }
 
+    /// Roll `group_id`'s canonical state back to the snapshot `name` and leave
+    /// its message ledger, outbound queue and pending app-visible outputs as
+    /// they are, even when `name` is a full snapshot whose image of those rows
+    /// is older (a retained anchor captured before state-scoped capture).
+    /// Every rewind onto a retained anchor goes this way: probes read the
+    /// anchor's state, and a historical apply replays the selected branch
+    /// over the live rows.
+    ///
+    /// The default is [`rollback_group_state_and_put_back_live_records`]: it
+    /// reads those rows, calls
+    /// [`MessageStorage::rollback_group_state_to_snapshot`] (which may restore
+    /// the full image), and writes the live rows back, so its cost grows with
+    /// the group's stored history. SQLite overrides this with its
+    /// canonical-state-only restore, which touches none of those rows.
+    fn rollback_group_state_keeping_live_records(
+        &self,
+        group_id: &GroupId,
+        name: &str,
+    ) -> StorageResult<()>
+    where
+        Self: Sized,
+    {
+        rollback_group_state_and_put_back_live_records(self, group_id, name)
+    }
+
     fn backend(&self) -> Backend;
+}
+
+/// [`StorageProvider::rollback_group_state_keeping_live_records`] for backends
+/// whose [`MessageStorage::rollback_group_state_to_snapshot`] may restore a
+/// full image.
+///
+/// Reads `group_id`'s message rows, queued outbound intents and pending
+/// app-visible outputs, then, as one [`StorageProvider::with_group_savepoint`]
+/// unit, rolls back, removes the rows and intents the image brought back, and
+/// puts the read ones back. A full image deletes the pending outputs of
+/// messages it lacks, so those are put back after their rows. The unit matters
+/// to probes, whose snapshot guard restores rows but not pending outputs.
+/// Snapshots hold no pending outputs either, so when the unit fails on a
+/// backend that undoes it from a snapshot, the missing outputs are put back
+/// once more before the error returns; a crash inside the unit on such a
+/// backend still loses them.
+pub fn rollback_group_state_and_put_back_live_records<S: StorageProvider>(
+    storage: &S,
+    group_id: &GroupId,
+    name: &str,
+) -> StorageResult<()> {
+    let messages = storage.list_messages(group_id, EpochId(0))?;
+    let queued = storage.list_queued_outbound_intents(group_id)?;
+    let pending = pending_application_events_of(storage, group_id)?;
+    let unit = format!("keep-live-records-{name}");
+    let result = storage.with_group_savepoint(group_id, &unit, |storage| {
+        storage.rollback_group_state_to_snapshot(group_id, name)?;
+        let live = messages
+            .iter()
+            .map(|message| &message.id)
+            .collect::<std::collections::HashSet<_>>();
+        for restored in storage.list_messages(group_id, EpochId(0))? {
+            if !live.contains(&restored.id) {
+                storage.delete_message(&restored.id)?;
+            }
+        }
+        for message in &messages {
+            storage.put_message(message)?;
+        }
+        let live = queued
+            .iter()
+            .map(|intent| &intent.id)
+            .collect::<std::collections::HashSet<_>>();
+        for restored in storage.list_queued_outbound_intents(group_id)? {
+            if !live.contains(&restored.id) {
+                storage.delete_queued_outbound_intent(&restored.id)?;
+            }
+        }
+        for intent in &queued {
+            storage.put_queued_outbound_intent(intent)?;
+        }
+        put_back_pending_application_events(storage, group_id, &pending)
+    });
+    if result.is_err() {
+        // Best effort on the way out: the unit's own error is the one to
+        // report, and a savepoint backend has nothing left to put back.
+        let _ = put_back_pending_application_events(storage, group_id, &pending);
+    }
+    result
+}
+
+/// Put back the outputs of `pending` that `group_id` no longer holds.
+fn put_back_pending_application_events<S: MessageStorage>(
+    storage: &S,
+    group_id: &GroupId,
+    pending: &[(MessageId, GroupEvent)],
+) -> StorageResult<()> {
+    let kept = pending_application_events_of(storage, group_id)?
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect::<std::collections::HashSet<_>>();
+    for (id, event) in pending {
+        if !kept.contains(id) {
+            storage.put_pending_application_event(event)?;
+        }
+    }
+    Ok(())
+}
+
+/// `group_id`'s pending app-visible outputs, keyed as
+/// [`MessageStorage::put_pending_application_event`] keys them.
+fn pending_application_events_of<S: MessageStorage>(
+    storage: &S,
+    group_id: &GroupId,
+) -> StorageResult<Vec<(MessageId, GroupEvent)>> {
+    Ok(storage
+        .list_pending_application_events()?
+        .into_iter()
+        .filter_map(|event| {
+            let (group, id) = match &event {
+                GroupEvent::MessageReceived {
+                    group_id: group,
+                    message_id: id,
+                    ..
+                }
+                | GroupEvent::GroupJoined {
+                    group_id: group,
+                    via_welcome: id,
+                    ..
+                } => (group, id),
+                _ => return None,
+            };
+            (group == group_id).then(|| (id.clone(), event.clone()))
+        })
+        .collect())
 }
 
 /// [`StorageProvider::with_group_savepoint`] for backends without savepoints.

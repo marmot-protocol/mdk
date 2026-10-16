@@ -4,8 +4,8 @@
 //! file each. This crate owns the file side end to end: the format, the
 //! publish/delete/sweep lifecycle and its crash ordering, and the layout.
 //! Metadata (each file's random key, state and references) stays in the
-//! account database, reached through [`MediaCatalog`] and [`PublishTarget`];
-//! this crate never touches SQL.
+//! account database, reached through [`MediaCatalog`], [`PublishTarget`] and
+//! [`CheckpointTarget`]; this crate never touches SQL.
 //!
 //! Everything here is synchronous and blocking. Run it on a blocking thread
 //! pool, never inline on an async task.
@@ -22,15 +22,16 @@ pub mod conformance;
 pub mod memory;
 
 pub use catalog::{
-    CatalogError, CatalogResult, Category, ExistingOutcome, FileId, FilePresence, FileState,
-    MediaCatalog, NewFile, Presence, PublishTarget, ReadyFile, ReadyOutcome,
+    CatalogError, CatalogResult, Category, CheckpointStart, CheckpointTarget, ExistingOutcome,
+    FileId, FilePresence, FileState, MediaCatalog, NewFile, Presence, PublishTarget, ReadyFile,
+    ReadyOutcome,
 };
 pub use disk::{Admission, DiskPolicy, free_space};
 pub use error::{MediaError, MediaResult};
 pub use format::FileKey;
 pub use store::{
-    MEDIA_DIRECTORY, MediaReader, MediaStore, PublishOutcome, SweepReport, WireFile, WireReader,
-    sync_file,
+    CHECKPOINT_APPEND_MAX, CheckpointReader, MEDIA_DIRECTORY, MediaReader, MediaStore,
+    PublishOutcome, SweepReport, sync_file,
 };
 
 #[cfg(test)]

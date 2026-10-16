@@ -1,6 +1,9 @@
 //! Catalog conformance suite. A `MediaCatalog` and its `PublishTarget`s pass
 //! when every crash point of the publish/delete table converges through the
-//! sweep, reuse never adopts a missing file, and deletions release files.
+//! sweep, reuse never adopts a missing file, and deletions release files. Its
+//! `CheckpointTarget`s pass when a download checkpoint's file lives exactly
+//! as long as its row, never holds unrecorded bytes once an operation or the
+//! sweep has run, and a fenced attempt cannot change it.
 //!
 //! The in-memory catalog runs it in this crate's tests; `storage-sqlite` runs
 //! it against the account database (feature `catalog-conformance`). Each
@@ -12,8 +15,8 @@ use std::path::PathBuf;
 use sha2::{Digest, Sha256};
 
 use crate::catalog::{
-    CatalogError, Category, ExistingOutcome, FileId, FileState, MediaCatalog, PublishTarget,
-    ReadyOutcome,
+    CatalogError, Category, CheckpointTarget, ExistingOutcome, FileId, FileState, MediaCatalog,
+    PublishTarget, ReadyOutcome,
 };
 use crate::format::MediaFileWriter;
 use crate::store::{MediaStore, PublishOutcome};
@@ -38,13 +41,14 @@ pub trait Harness {
     fn reset(&self);
     /// Process death and restart: reopen the catalog.
     fn restart(&mut self);
-    /// Records a download checkpoint row for `slot` owning a new wire file,
-    /// and returns that file's id. The file does not exist yet.
-    fn begin_wire_partial(&self, slot: u32) -> FileId;
-    /// Records that `slot`'s checkpoint holds `received` bytes.
-    fn record_wire_partial(&self, slot: u32, received: u64);
-    /// Deletes `slot`'s checkpoint row (completion, expiry, cleanup).
-    fn end_wire_partial(&self, slot: u32);
+    /// The checkpoint target of `slot`'s current download attempt.
+    fn checkpoint(&self, slot: u32) -> Box<dyn CheckpointTarget + '_>;
+    /// A newer attempt takes `slot`'s download: targets from older attempts
+    /// are fenced.
+    fn supersede_checkpoint(&self, slot: u32);
+    /// Deletes `slot`'s checkpoint row without touching its file, as
+    /// completion, expiry or a terminal failure do in the domain.
+    fn end_checkpoint(&self, slot: u32);
 }
 
 const NOW: u64 = 1_000;
@@ -156,7 +160,13 @@ pub fn run_all<H: Harness>(make: &dyn Fn() -> H) {
     supersession_during_the_write_keeps_nothing(make());
     reset_during_the_write_keeps_nothing(make());
     the_sweep_leaves_live_publishes_alone(make());
+    checkpoints_append_restore_and_clear(make());
+    a_new_checkpoint_replaces_the_old_file(make());
+    a_fenced_attempt_cannot_change_the_checkpoint(make());
+    a_crash_between_append_and_record_is_cut_off(make());
+    a_missing_or_short_wire_file_discards_the_checkpoint(make());
     wire_checkpoints_live_exactly_as_long_as_their_rows(make());
+    a_checkpoint_reader_reads_the_recorded_bytes_and_outlives_its_row(make());
 }
 
 pub fn publish_reads_back_and_reuses_identical_content<H: Harness>(harness: H) {
@@ -485,44 +495,264 @@ pub fn the_sweep_leaves_live_publishes_alone<H: Harness>(harness: H) {
     assert_eq!(sweep_all(&store), (1, 0, 0));
 }
 
+/// The wire file and recorded length of `slot`'s checkpoint.
+fn checkpoint_wire<H: Harness>(harness: &H, slot: u32) -> Option<(FileId, u64)> {
+    harness.checkpoint(slot).current().unwrap()
+}
+
+fn restored<C: MediaCatalog>(
+    store: &MediaStore<C>,
+    target: &dyn CheckpointTarget,
+) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    store
+        .checkpoint_restore(target, &mut bytes)
+        .unwrap()
+        .map(|len| {
+            assert_eq!(len, bytes.len() as u64);
+            bytes
+        })
+}
+
+fn wire_len<C: MediaCatalog>(store: &MediaStore<C>, id: &FileId) -> Option<u64> {
+    std::fs::metadata(store.wire_path(id))
+        .ok()
+        .map(|metadata| metadata.len())
+}
+
+/// Appends grow the checkpoint only at its recorded length; a restore reads
+/// back exactly what was recorded; a clear removes the row, then the file.
+pub fn checkpoints_append_restore_and_clear<H: Harness>(harness: H) {
+    let store = store(&harness);
+    let target = harness.checkpoint(0);
+    assert!(store.checkpoint_append(target.as_ref(), 0, b"abc").unwrap());
+    assert!(store.checkpoint_append(target.as_ref(), 3, b"def").unwrap());
+    let (id, received) = checkpoint_wire(&harness, 0).unwrap();
+    assert_eq!(received, 6);
+    assert!(
+        !store.checkpoint_append(target.as_ref(), 4, b"x").unwrap(),
+        "an append that does not start at the recorded length is refused"
+    );
+    assert_eq!(wire_len(&store, &id), Some(6));
+    assert_eq!(restored(&store, target.as_ref()).unwrap(), b"abcdef");
+    store.checkpoint_clear(target.as_ref()).unwrap();
+    assert_eq!(checkpoint_wire(&harness, 0), None);
+    assert_eq!(wire_len(&store, &id), None);
+    assert_eq!(restored(&store, target.as_ref()), None);
+}
+
+/// Starting over at offset zero replaces the checkpoint with a new wire file
+/// and unlinks the old one.
+pub fn a_new_checkpoint_replaces_the_old_file<H: Harness>(harness: H) {
+    let store = store(&harness);
+    let target = harness.checkpoint(0);
+    assert!(store.checkpoint_append(target.as_ref(), 0, b"old").unwrap());
+    let (old, _) = checkpoint_wire(&harness, 0).unwrap();
+    assert!(
+        store
+            .checkpoint_append(target.as_ref(), 0, b"new!")
+            .unwrap()
+    );
+    let (new, received) = checkpoint_wire(&harness, 0).unwrap();
+    assert_ne!(old, new);
+    assert_eq!(received, 4);
+    assert_eq!(wire_len(&store, &old), None);
+    assert_eq!(restored(&store, target.as_ref()).unwrap(), b"new!");
+}
+
+/// A target from an older attempt can neither grow, restart, read nor clear
+/// the checkpoint a newer attempt owns, and leaves its file as it is.
+pub fn a_fenced_attempt_cannot_change_the_checkpoint<H: Harness>(harness: H) {
+    let store = store(&harness);
+    let stale = harness.checkpoint(0);
+    assert!(store.checkpoint_append(stale.as_ref(), 0, b"abc").unwrap());
+    let (id, _) = checkpoint_wire(&harness, 0).unwrap();
+    harness.supersede_checkpoint(0);
+    assert!(!store.checkpoint_append(stale.as_ref(), 3, b"old").unwrap());
+    assert!(!store.checkpoint_append(stale.as_ref(), 0, b"old").unwrap());
+    assert_eq!(restored(&store, stale.as_ref()), None);
+    store.checkpoint_clear(stale.as_ref()).unwrap();
+    assert_eq!(wire_len(&store, &id), Some(3));
+    let current = harness.checkpoint(0);
+    assert_eq!(restored(&store, current.as_ref()).unwrap(), b"abc");
+    assert!(
+        store
+            .checkpoint_append(current.as_ref(), 3, b"new")
+            .unwrap()
+    );
+    assert_eq!(restored(&store, current.as_ref()).unwrap(), b"abcnew");
+}
+
+/// A crash after an append synced but before its record leaves bytes the row
+/// never recorded. The sweep cuts them off, and so does the next restore.
+pub fn a_crash_between_append_and_record_is_cut_off<H: Harness>(harness: H) {
+    let store = store(&harness);
+    let target = harness.checkpoint(0);
+    assert!(
+        store
+            .checkpoint_append(target.as_ref(), 0, b"recorded")
+            .unwrap()
+    );
+    let (id, _) = checkpoint_wire(&harness, 0).unwrap();
+    let unrecorded_tail = || {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(store.wire_path(&id))
+            .unwrap()
+            .write_all(b"-unrecorded")
+            .unwrap();
+    };
+    unrecorded_tail();
+    assert_eq!(sweep_all(&store), (0, 0, 0));
+    assert_eq!(wire_len(&store, &id), Some(8), "the sweep cuts the tail");
+    unrecorded_tail();
+    assert_eq!(restored(&store, target.as_ref()).unwrap(), b"recorded");
+    assert_eq!(wire_len(&store, &id), Some(8), "so does a restore");
+}
+
+/// A wire file that vanished or is shorter than its row records cannot
+/// resume: restoring clears the checkpoint instead of returning bytes.
+pub fn a_missing_or_short_wire_file_discards_the_checkpoint<H: Harness>(harness: H) {
+    let store = store(&harness);
+    let target = harness.checkpoint(0);
+    assert!(
+        store
+            .checkpoint_append(target.as_ref(), 0, b"abcdef")
+            .unwrap()
+    );
+    let (id, _) = checkpoint_wire(&harness, 0).unwrap();
+    std::fs::remove_file(store.wire_path(&id)).unwrap();
+    assert_eq!(restored(&store, target.as_ref()), None);
+    assert_eq!(checkpoint_wire(&harness, 0), None);
+
+    assert!(
+        store
+            .checkpoint_append(target.as_ref(), 0, b"abcdef")
+            .unwrap()
+    );
+    let (id, _) = checkpoint_wire(&harness, 0).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(store.wire_path(&id))
+        .unwrap()
+        .set_len(2)
+        .unwrap();
+    assert_eq!(restored(&store, target.as_ref()), None);
+    assert_eq!(checkpoint_wire(&harness, 0), None);
+    assert_eq!(wire_len(&store, &id), None);
+}
+
 /// A wire checkpoint survives the sweep while its row exists and is unlinked
-/// once the row goes; a wire file no row owns is unlinked. The sweep trims an
-/// unrecorded tail back to the recorded length, except while the file is open
-/// for writing. Reopening keeps
-/// only the recorded length, and a file shorter than recorded cannot resume.
+/// once the domain deletes the row; a wire file no row owns is unlinked.
 pub fn wire_checkpoints_live_exactly_as_long_as_their_rows<H: Harness>(harness: H) {
     let store = store(&harness);
-    let id = harness.begin_wire_partial(0);
-    let mut wire = store.create_wire(&id).unwrap();
-    wire.append(b"recorded").unwrap();
-    harness.record_wire_partial(0, 8);
-    wire.append(b"-unrecorded").unwrap();
-    // A writer still holds the file: its tail may be recorded next.
-    assert_eq!(sweep_all(&store), (0, 0, 0));
-    assert_eq!(std::fs::metadata(store.wire_path(&id)).unwrap().len(), 19);
-    drop(wire);
+    let target = harness.checkpoint(0);
+    assert!(
+        store
+            .checkpoint_append(target.as_ref(), 0, b"recorded")
+            .unwrap()
+    );
+    let (id, _) = checkpoint_wire(&harness, 0).unwrap();
     let stray = FileId([0x7a; 16]);
-    store.create_wire(&stray).unwrap().append(b"stray").unwrap();
+    let stray_path = store.wire_path(&stray);
+    std::fs::create_dir_all(stray_path.parent().unwrap()).unwrap();
+    std::fs::write(&stray_path, b"stray").unwrap();
 
     assert_eq!(sweep_all(&store), (0, 1, 0));
-    assert!(!store.wire_path(&stray).exists());
-    assert_eq!(
-        std::fs::metadata(store.wire_path(&id)).unwrap().len(),
-        8,
-        "the unrecorded tail no longer takes disk space"
-    );
-    let mut reopened = store.open_wire(&id, 8).unwrap().unwrap();
-    assert_eq!(reopened.len(), 8);
-    let mut prefix = Vec::new();
-    reopened.copy_to(&mut prefix).unwrap();
-    assert_eq!(prefix, b"recorded");
-    drop(reopened);
-    assert!(
-        store.open_wire(&id, 9).unwrap().is_none(),
-        "shorter than recorded"
-    );
+    assert!(!stray_path.exists());
+    assert_eq!(wire_len(&store, &id), Some(8));
 
-    harness.end_wire_partial(0);
+    harness.end_checkpoint(0);
     assert_eq!(sweep_all(&store), (0, 1, 0));
     assert!(!store.wire_path(&id).exists());
+}
+
+/// A checkpoint reader reads exactly the recorded bytes, from the start and
+/// again after a rewind. It keeps the file it opened: the sweep leaves it
+/// alone and the row's deletion does not cut the read short. A fenced
+/// attempt or a missing row gets no reader, a short file is discarded, and
+/// reads stop at close.
+pub fn a_checkpoint_reader_reads_the_recorded_bytes_and_outlives_its_row<H: Harness>(harness: H) {
+    use std::io::Read;
+    let store = store(&harness);
+    assert!(
+        store
+            .checkpoint_reader(harness.checkpoint(0).as_ref())
+            .unwrap()
+            .is_none()
+    );
+    let target = harness.checkpoint(0);
+    assert!(
+        store
+            .checkpoint_append(target.as_ref(), 0, b"recorded")
+            .unwrap()
+    );
+    let (id, _) = checkpoint_wire(&harness, 0).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(store.wire_path(&id))
+        .unwrap()
+        .write_all(b"-unrecorded")
+        .unwrap();
+    let mut reader = store.checkpoint_reader(target.as_ref()).unwrap().unwrap();
+    assert_eq!(reader.len(), 8);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"recorded");
+    // The domain deletes the row (completion); the open reader still reads.
+    harness.end_checkpoint(0);
+    assert_eq!(
+        sweep_all(&store),
+        (0, 0, 0),
+        "the sweep leaves an open reader alone"
+    );
+    reader.rewind().unwrap();
+    bytes.clear();
+    reader.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"recorded");
+    reader.finish().unwrap();
+    assert!(
+        !store.wire_path(&id).exists(),
+        "finishing unlinks a file whose row is gone"
+    );
+
+    // While the row remains, finishing keeps the file for its attempt.
+    let kept = harness.checkpoint(3);
+    assert!(store.checkpoint_append(kept.as_ref(), 0, b"kept").unwrap());
+    let (kept_id, _) = checkpoint_wire(&harness, 3).unwrap();
+    let reader = store.checkpoint_reader(kept.as_ref()).unwrap().unwrap();
+    reader.finish().unwrap();
+    assert_eq!(wire_len(&store, &kept_id), Some(4));
+
+    // A fenced attempt gets no reader; a short file is discarded.
+    let stale = harness.checkpoint(1);
+    assert!(
+        store
+            .checkpoint_append(stale.as_ref(), 0, b"abcdef")
+            .unwrap()
+    );
+    harness.supersede_checkpoint(1);
+    assert!(store.checkpoint_reader(stale.as_ref()).unwrap().is_none());
+    let current = harness.checkpoint(1);
+    let (id, _) = checkpoint_wire(&harness, 1).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(store.wire_path(&id))
+        .unwrap()
+        .set_len(2)
+        .unwrap();
+    assert!(store.checkpoint_reader(current.as_ref()).unwrap().is_none());
+    assert_eq!(checkpoint_wire(&harness, 1), None);
+
+    // Reads stop once the store closes.
+    let target = harness.checkpoint(2);
+    assert!(
+        store
+            .checkpoint_append(target.as_ref(), 0, b"closing")
+            .unwrap()
+    );
+    let mut reader = store.checkpoint_reader(target.as_ref()).unwrap().unwrap();
+    store.close();
+    let mut byte = [0; 1];
+    assert!(reader.read(&mut byte).is_err());
 }

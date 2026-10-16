@@ -7,8 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::catalog::{
-    CatalogError, CatalogResult, Category, ExistingOutcome, FileId, FilePresence, FileState,
-    MediaCatalog, NewFile, Presence, PublishTarget, ReadyFile, ReadyOutcome,
+    CatalogError, CatalogResult, Category, CheckpointStart, CheckpointTarget, ExistingOutcome,
+    FileId, FilePresence, FileState, MediaCatalog, NewFile, Presence, PublishTarget, ReadyFile,
+    ReadyOutcome,
 };
 
 struct Row {
@@ -24,8 +25,11 @@ struct State {
     rows: BTreeMap<FileId, Row>,
     refs: HashMap<u32, FileId>,
     superseded: HashSet<u32>,
-    /// Wire files owned by a checkpoint row, by slot.
-    wires: HashMap<u32, (FileId, u64)>,
+    /// Download checkpoint rows by slot: wire file and recorded length.
+    checkpoints: HashMap<u32, (FileId, u64)>,
+    /// Each slot's current download attempt; older attempts are fenced.
+    attempts: HashMap<u32, u32>,
+    wires_made: u64,
 }
 
 impl State {
@@ -134,25 +138,40 @@ impl MemoryCatalog {
         state.refs.clear();
     }
 
-    /// Records a checkpoint row owning a new wire file for `slot`, replacing
-    /// any earlier one, as a download's first checkpoint does.
-    pub fn begin_wire_partial(&self, slot: u32, id: FileId) {
-        self.state()
+    /// The checkpoint target of `slot`'s current download attempt.
+    pub fn checkpoint(&self, slot: u32) -> MemoryCheckpoint {
+        let attempt = self
+            .state()
             .expect("catalog open")
-            .wires
-            .insert(slot, (id, 0));
-    }
-
-    /// Deletes `slot`'s checkpoint row, as completion, expiry or cleanup do.
-    /// Records that `slot`'s checkpoint holds `received` bytes.
-    pub fn record_wire_partial(&self, slot: u32, received: u64) {
-        if let Some(wire) = self.state().expect("catalog open").wires.get_mut(&slot) {
-            wire.1 = received;
+            .attempts
+            .get(&slot)
+            .copied()
+            .unwrap_or(0);
+        MemoryCheckpoint {
+            catalog: self.clone(),
+            slot,
+            attempt,
+            key: slot.to_be_bytes().to_vec(),
         }
     }
 
-    pub fn end_wire_partial(&self, slot: u32) {
-        self.state().expect("catalog open").wires.remove(&slot);
+    /// A newer attempt takes `slot`'s download: older targets are fenced.
+    pub fn supersede_checkpoint(&self, slot: u32) {
+        *self
+            .state()
+            .expect("catalog open")
+            .attempts
+            .entry(slot)
+            .or_default() += 1;
+    }
+
+    /// Deletes `slot`'s checkpoint row without touching its file, as
+    /// completion, expiry or a terminal failure do in the domain.
+    pub fn end_checkpoint(&self, slot: u32) {
+        self.state()
+            .expect("catalog open")
+            .checkpoints
+            .remove(&slot);
     }
 
     /// Deletes a row directly, as a committed key-first deletion does.
@@ -214,7 +233,7 @@ impl MediaCatalog for MemoryCatalog {
     fn wire_partial_received(&self, id: FileId) -> CatalogResult<Option<u64>> {
         Ok(self
             .state()?
-            .wires
+            .checkpoints
             .values()
             .find(|(wire, _)| *wire == id)
             .map(|(_, received)| *received))
@@ -295,5 +314,73 @@ impl PublishTarget for MemoryTarget {
         }
         state.attach(self.slot, id);
         Ok(ReadyOutcome::Ready)
+    }
+}
+
+/// One download attempt's checkpoint in a `MemoryCatalog` slot.
+pub struct MemoryCheckpoint {
+    catalog: MemoryCatalog,
+    slot: u32,
+    attempt: u32,
+    key: Vec<u8>,
+}
+
+impl MemoryCheckpoint {
+    /// Whether this attempt still owns the slot's download.
+    fn owns(&self, state: &State) -> bool {
+        state.attempts.get(&self.slot).copied().unwrap_or(0) == self.attempt
+            && !state.superseded.contains(&self.slot)
+    }
+}
+
+impl CheckpointTarget for MemoryCheckpoint {
+    fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    fn current(&self) -> CatalogResult<Option<(FileId, u64)>> {
+        let state = self.catalog.state()?;
+        if !self.owns(&state) {
+            return Ok(None);
+        }
+        Ok(state.checkpoints.get(&self.slot).copied())
+    }
+
+    fn begin(&self) -> CatalogResult<Option<CheckpointStart>> {
+        let mut state = self.catalog.state()?;
+        if !self.owns(&state) {
+            return Ok(None);
+        }
+        state.wires_made += 1;
+        let mut id = [0xc7; 16];
+        id[..8].copy_from_slice(&state.wires_made.to_be_bytes());
+        let wire = FileId(id);
+        let replaced = state
+            .checkpoints
+            .insert(self.slot, (wire, 0))
+            .map(|(old, _)| old);
+        Ok(Some(CheckpointStart { wire, replaced }))
+    }
+
+    fn record(&self, wire: FileId, received: u64) -> CatalogResult<bool> {
+        let mut state = self.catalog.state()?;
+        if !self.owns(&state) {
+            return Ok(false);
+        }
+        match state.checkpoints.get_mut(&self.slot) {
+            Some(checkpoint) if checkpoint.0 == wire && received > checkpoint.1 => {
+                checkpoint.1 = received;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn clear(&self) -> CatalogResult<Option<FileId>> {
+        let mut state = self.catalog.state()?;
+        if !self.owns(&state) {
+            return Ok(None);
+        }
+        Ok(state.checkpoints.remove(&self.slot).map(|(wire, _)| wire))
     }
 }

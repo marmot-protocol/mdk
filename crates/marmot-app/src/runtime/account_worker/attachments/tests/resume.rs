@@ -104,25 +104,43 @@ fn test_media(store: &SqliteAccountStorage, dir: &std::path::Path) -> crate::Acc
     )
 }
 
-/// Saves `bytes` as a new checkpoint at offset zero.
+/// `.wire` checkpoint files in the account's media directory.
+fn wire_files(dir: &std::path::Path) -> usize {
+    let root = AccountHome::open(dir)
+        .account_dir("alice")
+        .join(media_store::MEDIA_DIRECTORY);
+    std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|shard| shard.path().is_dir())
+        .flat_map(|shard| {
+            std::fs::read_dir(shard.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+        })
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".wire"))
+        .count()
+}
+
+/// Saves `bytes` as a new checkpoint at offset zero, at the time `clock`
+/// reports.
 fn checkpoint(
     store: &SqliteAccountStorage,
     dir: &std::path::Path,
     job: &AttachmentAcquisition,
     identity: &AttachmentPartialIdentity,
     bytes: &[u8],
-    now: u64,
+    clock: fn() -> u64,
 ) -> bool {
-    crate::media::attachment_resume::write_checkpoint(
-        store,
-        &test_media(store, dir),
-        job,
-        identity,
-        0,
-        bytes,
-        now,
-    )
-    .unwrap()
+    test_media(store, dir)
+        .checkpoint_append(
+            &store.attachment_checkpoint(job, identity.clone(), clock),
+            0,
+            bytes,
+        )
+        .unwrap()
 }
 
 /// The ciphertext prefix the job's checkpoint holds, read from its wire file.
@@ -230,9 +248,13 @@ async fn file_attachment_resume_survives_irregular_chunks_and_publishes_authenti
     let downloaded = fetch().await.unwrap();
     assert_eq!(downloaded.len, plain.len() as u64 + 16);
     assert!(
-        downloaded.wire_file().is_some(),
+        matches!(
+            downloaded.source,
+            crate::media::file_transfer::CiphertextSource::Wire(_)
+        ),
         "a validated body stays in its wire file"
     );
+    assert_eq!(wire_files(dir.path()), 1);
     let plain_hash = Sha256::digest(&plain).into();
     let version = crate::EncryptedMediaVersion::V2;
     let key = crate::media::derive_media_file_key(
@@ -249,7 +271,6 @@ async fn file_attachment_resume_survives_irregular_chunks_and_publishes_authenti
         &reference.media_type,
         &reference.file_name,
     );
-    let wire = context.media.wire_path(&downloaded.wire_file().unwrap());
     let file = crate::media::file_transfer::DownloadedFileBody::new(downloaded, key, [3; 12], aad);
     // A final ciphertext update precedes decryption on a slow transfer. The
     // production completion seam must not move that progress backwards.
@@ -292,93 +313,9 @@ async fn file_attachment_resume_survives_irregular_chunks_and_publishes_authenti
     );
     // Publication decrypted from the wire file and then removed it; no
     // plaintext or ciphertext copy was ever staged.
-    assert!(!wire.exists());
+    assert_eq!(wire_files(dir.path()), 0);
     assert_eq!(std::fs::read_dir(&staging).map_or(0, |d| d.count()), 0);
     server.await.unwrap();
-}
-
-/// A cancelled download does not stop a checkpoint write already on the
-/// blocking pool. Held between its metadata lookup and its file change while
-/// a newer attempt claims the job and saves more, the stale write must leave
-/// the newer bytes intact: it neither truncates the recorded suffix nor
-/// writes over it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stale_checkpoint_write_cannot_overwrite_a_newer_attempt() {
-    let (_listener, reference, _cipher) = listener_fixture(b"stale checkpoint").await;
-    let dir = tempfile::tempdir().unwrap();
-    let (_client, store) = client_at(dir.path(), &reference, true).await;
-    let old = claim(&store);
-    let identity = AttachmentPartialIdentity {
-        ciphertext_digest: [1; 32],
-        locator_digest: [2; 32],
-        etag: "\"v1\"".into(),
-        total: 10,
-    };
-    assert!(checkpoint(
-        &store,
-        dir.path(),
-        &old,
-        &identity,
-        b"abc",
-        crate::unix_now_seconds()
-    ));
-    let (entered, waiting) = std::sync::mpsc::channel();
-    let (release, resume) = std::sync::mpsc::channel::<()>();
-    crate::media::attachment_resume::checkpoint_hooks::after_lookup(&old.reference, move || {
-        entered.send(()).unwrap();
-        resume.recv_timeout(Duration::from_secs(10)).unwrap();
-    });
-    let stale = {
-        let (store, dir, old, identity) = (
-            store.clone(),
-            dir.path().to_path_buf(),
-            old.clone(),
-            identity.clone(),
-        );
-        std::thread::spawn(move || {
-            crate::media::attachment_resume::write_checkpoint(
-                &store,
-                &test_media(&store, &dir),
-                &old,
-                &identity,
-                3,
-                b"old",
-                crate::unix_now_seconds(),
-            )
-            .unwrap()
-        })
-    };
-    waiting.recv_timeout(Duration::from_secs(10)).unwrap();
-    let job = claim(&store);
-    let newer = {
-        let (store, dir, job, identity) = (
-            store.clone(),
-            dir.path().to_path_buf(),
-            job.clone(),
-            identity.clone(),
-        );
-        std::thread::spawn(move || {
-            crate::media::attachment_resume::write_checkpoint(
-                &store,
-                &test_media(&store, &dir),
-                &job,
-                &identity,
-                3,
-                b"new",
-                crate::unix_now_seconds(),
-            )
-            .unwrap()
-        })
-    };
-    // Give the newer write the chance to run first if nothing serializes it.
-    std::thread::sleep(Duration::from_millis(200));
-    release.send(()).unwrap();
-    assert!(!stale.join().unwrap(), "the stale attempt is fenced");
-    assert!(newer.join().unwrap(), "the newer attempt records its bytes");
-    assert_eq!(
-        saved_prefix(&store, dir.path(), &job).as_deref(),
-        Some(&b"abcnew"[..])
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -401,7 +338,7 @@ async fn file_attachment_complete_checkpoint_is_verified_without_network() {
         &job,
         &identity,
         &cipher,
-        crate::unix_now_seconds()
+        crate::unix_now_seconds
     ));
     let result = crate::media::fetch_blossom_file_with_transport(
         url.as_str(),
@@ -498,7 +435,7 @@ async fn file_attachment_invalid_range_restarts_without_mixing_representations()
             &job,
             &identity,
             &valid_cipher[..8],
-            crate::unix_now_seconds()
+            crate::unix_now_seconds
         ));
         let file = crate::media::fetch_blossom_file_with_transport(
             url.as_str(),
@@ -582,7 +519,7 @@ async fn check_resume_failure(failure: ResumeFailure) {
         &job,
         &identity,
         &prefix,
-        crate::unix_now_seconds()
+        crate::unix_now_seconds
     ));
     let staging = dir.path().join("media-staging");
     let transport = crate::media::BlossomHttpTransport::new(true);
@@ -1106,7 +1043,7 @@ async fn attachment_resume_validates_ranges_and_restarts_incompatible_responses(
             &job,
             &identity,
             &saved,
-            crate::unix_now_seconds(),
+            crate::unix_now_seconds,
         );
         let prepared = client
             .prepare_background_attachment_download(
@@ -1325,7 +1262,7 @@ async fn attachment_resume_failover_does_not_mix_locator_validators() {
         &job,
         &identity,
         &saved,
-        crate::unix_now_seconds(),
+        crate::unix_now_seconds,
     );
     let prepared = client
         .prepare_background_attachment_download(
@@ -1442,7 +1379,7 @@ async fn attachment_resume_failed_fallback_preserves_prefix_across_reopen() {
                 total: total as u64,
             },
             &prefix,
-            crate::unix_now_seconds()
+            crate::unix_now_seconds
         ));
         let prepared = client
             .prepare_background_attachment_download(
@@ -1567,6 +1504,8 @@ async fn attachment_resume_complete_small_body_does_not_write_checkpoint() {
 /// A checkpoint write the volume refuses after free space was measured parks
 /// the job for the rest of the body and its store file, like a refusal at the
 /// measurement, instead of a timer retry that admission would keep refusing.
+/// The part of the chunk that reached the file before the refusal is cut off
+/// again, so the park's target is what the disk really holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_resume_full_disk_during_checkpoint_write_parks() {
     let plain = vec![0x4e; ATTACHMENT_CHECKPOINT_BYTES + 71];
@@ -1591,6 +1530,7 @@ async fn attachment_resume_full_disk_during_checkpoint_write_parks() {
     let job = claim(&store);
     let context = resume_context(&store, &job, dir.path(), &reference);
     context.media.simulate_full_wire_for_test(true);
+    let media = context.media.clone();
     let prepared = client
         .prepare_background_attachment_download(
             &GroupId::new(vec![0xab; 16]),
@@ -1609,50 +1549,24 @@ async fn attachment_resume_full_disk_during_checkpoint_write_parks() {
         "{:?}",
         result.as_ref().err()
     );
-    server.await.unwrap();
-}
-
-/// Bytes a checkpoint write appended but could not record, because a newer
-/// attempt took the job between its lookup and its record, are cut off again
-/// so they do not hold disk the job's admission needs.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn refused_checkpoint_record_drops_its_appended_tail() {
-    let (_listener, reference, _cipher) = listener_fixture(b"refused record").await;
-    let dir = tempfile::tempdir().unwrap();
-    let (_client, store) = client_at(dir.path(), &reference, true).await;
-    let old = claim(&store);
-    let identity = AttachmentPartialIdentity {
-        ciphertext_digest: [1; 32],
-        locator_digest: [2; 32],
-        etag: "\"v1\"".into(),
-        total: 10,
-    };
-    let now = crate::unix_now_seconds();
-    assert!(checkpoint(&store, dir.path(), &old, &identity, b"abc", now));
-    let claimer = store.clone();
-    crate::media::attachment_resume::checkpoint_hooks::after_lookup(&old.reference, move || {
-        claim(&claimer);
-    });
-    let media = test_media(&store, dir.path());
-    assert!(
-        !crate::media::attachment_resume::write_checkpoint(
-            &store, &media, &old, &identity, 3, b"old", now
-        )
-        .unwrap(),
-        "the newer attempt fences the old record"
-    );
-    let job = claim(&store);
     let part = store
-        .load_attachment_partial(&job, now, 64 * 1024 * 1024, None)
+        .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
         .unwrap()
         .unwrap();
-    assert_eq!(part.received, 3);
+    assert_eq!(part.received, 0);
     assert_eq!(
         std::fs::metadata(media.wire_path(&part.wire_file))
             .unwrap()
             .len(),
-        3
+        0,
+        "the refused partial write is cut off"
     );
+    server.await.unwrap();
+}
+
+/// A day and a second ago: a checkpoint saved then has expired.
+fn earlier_clock() -> u64 {
+    crate::unix_now_seconds() - 86401
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1675,7 +1589,7 @@ async fn attachment_resume_disabled_acquisition_still_prunes_expired_checkpoints
         &job,
         &identity,
         b"abc",
-        earlier
+        earlier_clock
     ));
     assert!(
         store
@@ -1754,7 +1668,7 @@ async fn attachment_resume_hash_failure_clears_redirected_replacement() {
             total: total as u64,
         },
         &prefix,
-        crate::unix_now_seconds()
+        crate::unix_now_seconds
     ));
     let prepared = client
         .prepare_background_attachment_download(
@@ -1841,7 +1755,7 @@ async fn attachment_resume_hash_miss_retries_from_zero_after_reopen() {
                 &job,
                 &identity,
                 &saved,
-                crate::unix_now_seconds()
+                crate::unix_now_seconds
             ));
             let prepared = client
                 .prepare_background_attachment_download(
@@ -2511,14 +2425,16 @@ async fn attachment_disk_pressure_parks_before_receipt_and_readmits_when_space_f
     let free = fs4::available_space(dir.path()).unwrap();
     assert_eq!(
         store
-            .readmit_storage_blocked_attachments(now, unavailable_reserve, free, 1, true)
+            .readmit_storage_blocked_attachments(now, unavailable_reserve, free, true, &|_| {
+                free >= unavailable_reserve
+            })
             .unwrap(),
         0,
         "still parked while the reserve stays out of reach"
     );
     assert_eq!(
         store
-            .readmit_storage_blocked_attachments(now, 0, free, 1, true)
+            .readmit_storage_blocked_attachments(now, 0, free, true, &|_| true)
             .unwrap(),
         1
     );

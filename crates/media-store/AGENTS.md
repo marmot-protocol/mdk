@@ -23,24 +23,34 @@ The encrypted per-file media store (mdk#2314). Human overview: [`README.md`](REA
 | Path | Owns |
 | --- | --- |
 | `src/format.rs` | File format: header, header-salted HKDF payload key, 64 KiB OpenSSL ChaCha20-Poly1305 segments, streaming writer (poisoned after a failure), offset reader. |
-| `src/catalog.rs` | `FileId`, `Category`, `FileState`, and the two traits other crates implement: `MediaCatalog` (store-wide rows) and `PublishTarget` (one publication's one-transaction commits). |
-| `src/store.rs` | `MediaStore`: intent-first publish, presence-checked reuse, `attach_existing` (reuse before a download), close-checked readers that hold their key, a small idle-limited reader cache for `read_at`, `unlink_released`, `.wire` download checkpoints (`WireFile`: create, open at the recorded length, append-and-sync, copy out; `WireReader`: bounded, seekable, close-checked reads of the recorded bytes), the bounded sweep, the close latch and in-flight set. `sync_file` (plain `fsync` on Apple). |
-| `src/disk.rs` | `DiskPolicy` admission (reserve plus the bytes a write needs; downloads need twice the body) and `free_space`. The reserve comes from the caller's config; the crate never chooses one. |
+| `src/catalog.rs` | `FileId`, `Category`, `FileState`, and the traits other crates implement: `MediaCatalog` (store-wide rows), `PublishTarget` (one publication's one-transaction commits) and `CheckpointTarget` (one download checkpoint's row: current, begin, record, clear). |
+| `src/store.rs` | `MediaStore`: intent-first publish, presence-checked reuse, `attach_existing` (reuse before a download), close-checked readers that hold their key, a small idle-limited reader cache for `read_at`, `unlink_released`, `.wire` download checkpoints (`checkpoint_append`/`restore`/`clear`/`reader` over a `CheckpointTarget`, with a per-checkpoint lock; `CheckpointReader` reads a finished checkpoint in place and `finish` unlinks it once its row is gone; the private `WireFile` handle), the bounded sweep, the close latch and in-flight set. `sync_file` (plain `fsync` on Apple). |
+| `src/disk.rs` | `DiskPolicy` admission (reserve plus the bytes a write needs), `DiskPolicy::download_need` (the one rule for what a download still writes) and `free_space`. The reserve comes from the caller's config; the crate never chooses one. |
 | `src/error.rs` | `MediaError`: fixed, privacy-safe messages. |
-| `src/memory.rs`, `src/conformance.rs` | `catalog-conformance` feature: an in-memory catalog and the conformance suite every catalog must pass (crash table, reuse of a lost twin, release, supersession and reset during a write). |
+| `src/memory.rs`, `src/conformance.rs` | `catalog-conformance` feature: an in-memory catalog and the conformance suite every catalog must pass (publish crash table, reuse of a lost twin, release, supersession and reset during a write; checkpoint append/restore/clear, replacement, attempt fencing, crash tails and missing files). |
 | `src/format_tests.rs`, `src/store_tests.rs`, `testdata/age/` | Vendored C2SP CCTV age payload vectors; format tests; the in-memory conformance run and store tests (modes, close, sweep bounds, corruption). |
 
 ## Rules
 
 - Order is the crash-safety guarantee: catalog row before file, one sync before the ready commit, abandon (row, then
   file) on failure, delete the key before the unlink. A file whose row is `pending` is never adopted.
-- A `.wire` checkpoint lives exactly as long as its catalog row: the row commits before the file is created and is
-  deleted before the file is unlinked. Bytes are appended and synced before the row records them, and opening a
-  wire file truncates it to the recorded length (a shorter file is not opened). The sweep unlinks any wire file
-  `wire_partial_received` does not claim and trims an unrecorded tail back to the recorded length. An open `WireFile`
-  is in the in-flight set from before its first append until it drops; the sweep skips in-flight wire files and holds
-  the in-flight lock from that check through any trim.
-- `PublishTarget` commits are one transaction each in the implementing catalog. Any change to their contract changes
+- The store owns the checkpoint protocol; callers never touch a wire file. A `.wire` checkpoint lives exactly as long
+  as its catalog row: the row commits before the file is created and is deleted before the file is unlinked. Bytes
+  are appended and synced before the row records them; an append that fails, or whose record fails or is refused,
+  is cut back to the recorded length before the call returns. Opening a wire file truncates it to the recorded
+  length (a shorter file discards the checkpoint). Every checkpoint operation holds that checkpoint's lock (keyed by
+  `CheckpointTarget::key`) from the row lookup through the file change and the record. An append is at most
+  `CHECKPOINT_APPEND_MAX` bytes: that bound is the unrecorded slack callers allow when they measure free space.
+- `checkpoint_reader` is the only way to read a checkpoint outside a restore. It holds the checkpoint lock only while
+  it resolves the row and opens the file, never while the caller reads, so it cannot deadlock a later checkpoint
+  operation on the same job. The reader's open `WireFile` keeps the file in flight; `finish` unlinks it only once its
+  row is gone, deciding under the in-flight lock as the sweep does.
+- The sweep unlinks any wire file `wire_partial_received` does not claim and trims an unrecorded tail back to the
+  recorded length. A `WireFile` is in the in-flight set from before its first append until it drops; the sweep skips
+  in-flight wire files and holds the in-flight lock from that check through any trim.
+- Every download disk check goes through `DiskPolicy::download_need`. Do not add another formula for what a download
+  still writes.
+- `PublishTarget` commits and `CheckpointTarget` calls are one transaction each in the implementing catalog. Any change to their contract changes
   `conformance.rs` in the same commit, and every catalog (`storage-sqlite`, the in-memory one) must keep passing it.
 - One `MediaStore` (and its clones) per account: the in-flight set that protects live publishes from the sweep is
   per instance.

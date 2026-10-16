@@ -481,6 +481,91 @@ mod tests {
         );
     }
 
+    /// mdk#2330: a historical apply rewinds to its retained anchor with
+    /// `rollback_group_state_keeping_live_records`. SQLite restores canonical
+    /// state only, from a state-scoped or a legacy full anchor, so the rewind's
+    /// work does not grow with the live ledger, pending outputs or queue.
+    #[test]
+    fn rewind_keeping_live_records_does_not_grow_with_history() {
+        use crate::query_work_test_support::{QUERY_MEASUREMENT, measure};
+        use cgka_traits::types::MessageId;
+
+        let _measurement = QUERY_MEASUREMENT.lock().unwrap();
+        let anchors = ["state-scoped-anchor", "legacy-full-anchor"];
+        let mut steps_by_anchor = [None, None];
+        for history in [256u32, 4_096] {
+            let store = SqliteAccountStorage::in_memory().unwrap();
+            let g0 = sample_group(gid(1), 0, 1);
+            let mls_group_id = openmls::group::GroupId::from_slice(g0.id.as_slice());
+            store.put_group(&g0).unwrap();
+            store
+                .put_message(&sample_message(mid(1), g0.id.clone(), 0))
+                .unwrap();
+            store
+                .put_queued_outbound_intent(&sample_queued_intent(mid(10), g0.id.clone()))
+                .unwrap();
+            store
+                .mls_storage()
+                .write_group_state(&mls_group_id, &TestGroupState(b"epoch-0".to_vec()))
+                .unwrap();
+            store
+                .create_group_state_snapshot(&g0.id, anchors[0])
+                .unwrap();
+            store.create_group_snapshot(&g0.id, anchors[1]).unwrap();
+
+            store.put_group(&sample_group(gid(1), 1, 2)).unwrap();
+            store
+                .mls_storage()
+                .write_group_state(&mls_group_id, &TestGroupState(b"epoch-1".to_vec()))
+                .unwrap();
+            for n in 0..history {
+                let message =
+                    sample_message(MessageId::new(n.to_be_bytes().to_vec()), g0.id.clone(), 1);
+                store.put_message(&message).unwrap();
+                store
+                    .put_pending_application_event(&GroupEvent::MessageReceived {
+                        authority: None,
+                        group_id: g0.id.clone(),
+                        message_id: message.id,
+                        sender: MemberId::new(vec![7; 32]),
+                        epoch: EpochId(1),
+                        payload: b"authenticated chat".to_vec(),
+                        retention: None,
+                        encrypted_media_secret: None,
+                    })
+                    .unwrap();
+            }
+            store.delete_queued_outbound_intent(&mid(10)).unwrap();
+            store
+                .put_queued_outbound_intent(&sample_queued_intent(mid(11), g0.id.clone()))
+                .unwrap();
+            let messages = store.list_messages(&g0.id, EpochId(0)).unwrap();
+            let pending = store.list_pending_application_events().unwrap();
+            let queued = store.list_queued_outbound_intents(&g0.id).unwrap();
+
+            for (anchor, previous) in anchors.into_iter().zip(&mut steps_by_anchor) {
+                let ((), steps) = measure(&store, || {
+                    store
+                        .rollback_group_state_keeping_live_records(&g0.id, anchor)
+                        .unwrap()
+                });
+                assert_eq!(store.get_group(&g0.id).unwrap(), g0, "{anchor}");
+                let state: Option<TestGroupState> =
+                    store.mls_storage().group_state(&mls_group_id).unwrap();
+                assert_eq!(state, Some(TestGroupState(b"epoch-0".to_vec())));
+                assert_eq!(store.list_messages(&g0.id, EpochId(0)).unwrap(), messages);
+                assert_eq!(store.list_pending_application_events().unwrap(), pending);
+                assert_eq!(store.list_queued_outbound_intents(&g0.id).unwrap(), queued);
+                if let Some(previous) = previous.replace(steps) {
+                    assert_eq!(
+                        steps, previous,
+                        "{anchor}: rewind VM work must not grow with history"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn legacy_full_snapshot_blob_with_plain_array_fields_still_restores() {
         // Blobs written before state-scoped snapshots serialized `messages`

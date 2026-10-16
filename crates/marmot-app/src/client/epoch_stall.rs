@@ -925,6 +925,20 @@ impl EpochStallDetector {
         self.groups.remove(group);
     }
 
+    /// Whether this detector has already signalled a backfill for `group` at
+    /// `epoch`, in this process or in the durable evidence a restart restored.
+    ///
+    /// The deferred-row seeding on open asks this so retained rows can supply
+    /// only a group's *first* arm. Rows a previous open already replayed are not
+    /// fresh traffic, so replaying them again must not refill the undecryptable
+    /// set and spend a paced re-arm, which past the run continuation window
+    /// would also end the run and zero its persisted fruitless completions.
+    pub(crate) fn has_signalled_at(&self, group: &GroupId, epoch: EpochId) -> bool {
+        self.groups
+            .get(group)
+            .is_some_and(|stall| stall.fired_at_epoch == Some(epoch))
+    }
+
     /// The durable frozen-epoch evidence for `group`, for the storage row that
     /// carries it across a restart. `None` for a group with no stall history.
     pub(crate) fn wedge_evidence(&self, group: &GroupId) -> Option<EpochStallEvidence> {
@@ -1033,6 +1047,23 @@ mod tests {
             );
             assert_eq!(reopened.wedge_evidence(&group), Some(evidence));
         }
+    }
+
+    #[test]
+    fn has_signalled_at_reports_restored_and_live_arms_at_their_epoch_only() {
+        let (mut detector, restored, _) = restored_evidence(false);
+        assert!(detector.has_signalled_at(&restored, EpochId(10)));
+        assert!(!detector.has_signalled_at(&restored, EpochId(11)));
+
+        let fresh = group(2);
+        assert!(!detector.has_signalled_at(&fresh, EpochId(4)));
+        assert_eq!(
+            detector.observe_undecryptable(fresh.clone(), "m".into(), EpochId(4), T0),
+            BackfillDecision::Arm
+        );
+        assert!(detector.has_signalled_at(&fresh, EpochId(4)));
+        detector.observe_group_epoch(&fresh, EpochId(5));
+        assert!(!detector.has_signalled_at(&fresh, EpochId(5)));
     }
 
     #[test]
