@@ -999,6 +999,8 @@ where
             .session
             .key_package_lifecycle()?
             .expect("prepared lifecycle is durable");
+        // Promotion clears the marker, so move an old record's marker first.
+        lifecycle.migrate_legacy_consumption_marker();
 
         let pending = lifecycle
             .pending_replacement
@@ -1129,8 +1131,13 @@ where
         };
         lifecycle.upgrade_rotation_recorded = true;
         lifecycle.generation_revision = replacement.generation_revision;
-        lifecycle.last_consumed_key_package_ref = None;
-        lifecycle.last_consumed_at = None;
+        // A Welcome can consume the replacement before its acknowledgement,
+        // which makes the new current package due for replacement in turn.
+        lifecycle.last_consumed_key_package_ref = lifecycle
+            .current_key_package_ref
+            .clone()
+            .filter(|_| replacement.consumed_at.is_some());
+        lifecycle.last_consumed_at = replacement.consumed_at;
         self.session
             .promote_key_package_lifecycle(&retired, &lifecycle)?;
         Ok(replacement.key_package)
@@ -1325,17 +1332,9 @@ where
             lifecycle.phase = cgka_traits::MaintenancePhase::Failed;
             retired.push(expired.key_package);
         }
-        // Records written before the engine marked retained material at
-        // consumption carry the marker only in `last_consumed_key_package_ref`.
-        let consumed_ref = lifecycle.last_consumed_key_package_ref.as_deref();
-        let mut consumed_retained_marked = false;
+        let marker_migrated = lifecycle.migrate_legacy_consumption_marker();
         let mut retained = Vec::with_capacity(lifecycle.retained_private_material.len());
-        for mut material in lifecycle.retained_private_material.drain(..) {
-            if consumed_ref.is_some_and(|consumed| consumed == material.key_package_ref.as_slice())
-            {
-                material.consumed = true;
-                consumed_retained_marked = true;
-            }
+        for material in lifecycle.retained_private_material.drain(..) {
             if material.delete_at() <= now {
                 retired.push(material.key_package);
             } else {
@@ -1343,12 +1342,8 @@ where
             }
         }
         lifecycle.retained_private_material = retained;
-        if consumed_retained_marked {
-            lifecycle.last_consumed_key_package_ref = None;
-            lifecycle.last_consumed_at = None;
-        }
         let deleted = retired.len();
-        if deleted > 0 || consumed_retained_marked {
+        if deleted > 0 || marker_migrated {
             self.session
                 .promote_key_package_lifecycle(&retired, &lifecycle)?;
             let mut activity = self

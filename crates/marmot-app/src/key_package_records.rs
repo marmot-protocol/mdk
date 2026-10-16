@@ -1582,6 +1582,7 @@ mod tests {
             targets: Vec::new(),
             attempt_count: 0,
             last_failure_code: None,
+            consumed_at: None,
         });
         lifecycle.retained_private_material = vec![RetainedKeyPackagePrivateMaterial {
             key_package: KeyPackage::new(vec![1]),
