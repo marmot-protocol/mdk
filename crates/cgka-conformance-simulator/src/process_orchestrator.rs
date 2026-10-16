@@ -323,6 +323,16 @@ pub struct ProcessOrchestrator {
     /// A relay that lost an action's quorum race can still admit its copy
     /// later; that copy must not count toward the next action.
     attributed_relay_publications: BTreeSet<String>,
+    /// Each action's relay cursors and publication identities. A relay that
+    /// admits an action's copy after attribution is re-read on demand, so the
+    /// copy stays addressable through the original action selector.
+    relay_action_attributions: BTreeMap<String, RelayActionAttribution>,
+}
+
+struct RelayActionAttribution {
+    cursors: BTreeMap<String, usize>,
+    include_welcomes: bool,
+    tokens: BTreeSet<String>,
 }
 
 struct NodeProcess {
@@ -504,6 +514,7 @@ impl ProcessOrchestrator {
             expected_outcomes: Vec::new(),
             accepted_publications: BTreeMap::new(),
             attributed_relay_publications: BTreeSet::new(),
+            relay_action_attributions: BTreeMap::new(),
         };
         for client in &clients {
             orchestrator.launch_participant(client, "launch").await?;
@@ -685,14 +696,14 @@ impl ProcessOrchestrator {
         expected_event_ids: &[String],
     ) -> Result<(), ProcessOrchestratorError> {
         let mut controls = Vec::with_capacity(cursors.len());
-        for (relay, before) in cursors {
-            let control = self.relay_controls.get(&relay).ok_or_else(|| {
+        for (relay, before) in &cursors {
+            let control = self.relay_controls.get(relay).ok_or_else(|| {
                 ProcessOrchestratorError::new(
                     "relay_control_unavailable",
                     "the process adapter does not own the selected relay control",
                 )
             })?;
-            controls.push((Arc::clone(control), before));
+            controls.push((Arc::clone(control), *before));
         }
         let Some((first, _)) = controls.first() else {
             return Ok(());
@@ -758,7 +769,16 @@ impl ProcessOrchestrator {
                 .await
                 .map_err(process_relay_control_error)?;
         }
-        self.attributed_relay_publications.extend(action_tokens);
+        self.attributed_relay_publications
+            .extend(action_tokens.iter().cloned());
+        self.relay_action_attributions.insert(
+            action_id.to_owned(),
+            RelayActionAttribution {
+                cursors,
+                include_welcomes,
+                tokens: action_tokens,
+            },
+        );
         Ok(())
     }
 
@@ -794,6 +814,22 @@ impl ProcessOrchestrator {
                 "the process adapter does not own the selected relay control",
             )
         })?;
+        // A relay that lost the action's quorum race may have admitted its
+        // copy only after attribution; refresh this relay's copies first.
+        if let Some(action_id) = selector.action_id.as_deref()
+            && let Some(attribution) = self.relay_action_attributions.get(action_id)
+            && let Some(before) = attribution.cursors.get(relay)
+        {
+            control
+                .record_action_publications(
+                    action_id,
+                    *before,
+                    attribution.include_welcomes,
+                    &attribution.tokens,
+                )
+                .await
+                .map_err(process_relay_control_error)?;
+        }
         control
             .set_action_event_visibility(selector, visible)
             .await
@@ -2290,6 +2326,7 @@ mod tests {
             expected_outcomes: Vec::new(),
             accepted_publications: BTreeMap::new(),
             attributed_relay_publications: BTreeSet::new(),
+            relay_action_attributions: BTreeMap::new(),
         };
         let report = orchestrator.run().await.unwrap();
         let path = artifacts.path().join("report.json");
@@ -2460,6 +2497,7 @@ mod tests {
     struct FakeRelayControl {
         log: std::sync::Mutex<Vec<(String, bool)>>,
         recorded: std::sync::Mutex<BTreeMap<String, Vec<String>>>,
+        hidden: std::sync::Mutex<BTreeSet<String>>,
     }
 
     impl FakeRelayControl {
@@ -2519,10 +2557,32 @@ mod tests {
 
         async fn set_action_event_visibility(
             &self,
-            _selector: &crate::ScenarioMessageSelectorV2,
-            _visible: bool,
+            selector: &crate::ScenarioMessageSelectorV2,
+            visible: bool,
         ) -> Result<(), ProcessRelayControlError> {
-            unreachable!("relay attribution never changes visibility")
+            let token = selector
+                .action_id
+                .as_deref()
+                .and_then(|action_id| {
+                    self.recorded
+                        .lock()
+                        .unwrap()
+                        .get(action_id)?
+                        .get(selector.occurrence)
+                        .cloned()
+                })
+                .ok_or_else(|| ProcessRelayControlError {
+                    code: "relay_event_not_found".into(),
+                    message: "no recorded event matched the action selector".into(),
+                })?;
+            let mut hidden = self.hidden.lock().unwrap();
+            let changed = if visible {
+                hidden.remove(&token)
+            } else {
+                hidden.insert(token)
+            };
+            assert!(changed, "visibility must toggle");
+            Ok(())
         }
     }
 
@@ -2532,7 +2592,7 @@ mod tests {
         let spec = ScenarioSpec {
             name: "relay-attribution".into(),
             spec_version: "2".into(),
-            clients: vec!["alice".into()],
+            clients: Vec::new(),
             topology: Default::default(),
             steps: vec![ScenarioStep::DeliverAll],
         };
@@ -2563,6 +2623,7 @@ mod tests {
             expected_outcomes: Vec::new(),
             accepted_publications: BTreeMap::new(),
             attributed_relay_publications: BTreeSet::new(),
+            relay_action_attributions: BTreeMap::new(),
         }
     }
 
@@ -2598,6 +2659,23 @@ mod tests {
             .unwrap();
         assert!(relay_a.recorded("invite").is_empty());
         assert_eq!(relay_b.recorded("invite"), ["commit"]);
+
+        // The late relay:b copy stays addressable through its original action.
+        let selector = crate::ScenarioMessageSelectorV2 {
+            action_id: Some("create".into()),
+            ..Default::default()
+        };
+        orchestrator
+            .set_relay_event_visibility("relay:b", &selector, &[], false)
+            .await
+            .unwrap();
+        assert_eq!(relay_b.recorded("create"), ["welcome"]);
+        assert!(relay_b.hidden.lock().unwrap().contains("welcome"));
+        orchestrator
+            .set_relay_event_visibility("relay:b", &selector, &[], true)
+            .await
+            .unwrap();
+        assert!(relay_b.hidden.lock().unwrap().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
