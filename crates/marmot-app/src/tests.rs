@@ -1240,8 +1240,11 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                 .iter()
                 .any(|endpoint| endpoint.0 == "wss://index.example")
         {
+            // Register for release before signalling the start, as below.
+            let mut release = std::pin::pin!(self.indexer_publish_release.notified());
+            release.as_mut().enable();
             self.indexer_publish_started.notify_one();
-            self.indexer_publish_release.notified().await;
+            release.await;
         }
         let unavailable = self.unavailable_endpoints.lock().unwrap().clone();
         if self
@@ -1281,10 +1284,15 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                 .block_next_publish
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
+            // Register for release before signalling the start, so a test
+            // that releases as soon as it sees the start cannot miss this
+            // publication (`notify_waiters` only reaches registered waiters).
+            let mut release = std::pin::pin!(self.publish_release.notified());
+            release.as_mut().enable();
             self.blocked_publish_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.publish_started.notify_one();
-            self.publish_release.notified().await;
+            release.await;
         }
         if self
             .reject_next_publish
