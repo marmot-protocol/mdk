@@ -1567,6 +1567,8 @@ async fn attachment_resume_complete_small_body_does_not_write_checkpoint() {
 /// A checkpoint write the volume refuses after free space was measured parks
 /// the job for the rest of the body and its store file, like a refusal at the
 /// measurement, instead of a timer retry that admission would keep refusing.
+/// The part of the chunk that reached the file before the refusal is cut off
+/// again, so the park's target is what the disk really holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_resume_full_disk_during_checkpoint_write_parks() {
     let plain = vec![0x4e; ATTACHMENT_CHECKPOINT_BYTES + 71];
@@ -1591,6 +1593,7 @@ async fn attachment_resume_full_disk_during_checkpoint_write_parks() {
     let job = claim(&store);
     let context = resume_context(&store, &job, dir.path(), &reference);
     context.media.simulate_full_wire_for_test(true);
+    let media = context.media.clone();
     let prepared = client
         .prepare_background_attachment_download(
             &GroupId::new(vec![0xab; 16]),
@@ -1609,7 +1612,36 @@ async fn attachment_resume_full_disk_during_checkpoint_write_parks() {
         "{:?}",
         result.as_ref().err()
     );
+    let part = store
+        .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(part.received, 0);
+    assert_eq!(
+        std::fs::metadata(media.wire_path(&part.wire_file))
+            .unwrap()
+            .len(),
+        0,
+        "the refused partial write is cut off"
+    );
     server.await.unwrap();
+}
+
+/// The database filling up while it starts or records a checkpoint
+/// (`SQLITE_FULL`, which storage reports as `StorageError::Capacity`) is a
+/// full disk too, so the download parks instead of retrying on a timer. Other
+/// storage failures stay transient.
+#[test]
+fn checkpoint_metadata_on_a_full_database_reports_a_full_disk() {
+    use crate::media::attachment_resume::CheckpointWriteError;
+    assert!(matches!(
+        CheckpointWriteError::from(cgka_traits::StorageError::Capacity("full".into())),
+        CheckpointWriteError::Full
+    ));
+    assert!(matches!(
+        CheckpointWriteError::from(cgka_traits::StorageError::Busy("busy".into())),
+        CheckpointWriteError::Failed
+    ));
 }
 
 /// Bytes a checkpoint write appended but could not record, because a newer

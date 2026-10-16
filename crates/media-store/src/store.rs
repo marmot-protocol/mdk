@@ -259,8 +259,9 @@ impl<C: MediaCatalog> MediaStore<C> {
         self.inner.full_disk_for_test.store(full, Ordering::Release);
     }
 
-    /// Makes every wire checkpoint create and append fail as if the disk
-    /// were full, until reset. Test support only.
+    /// Makes every wire checkpoint append fail as if the disk filled midway:
+    /// half the chunk reaches the file, then the write is refused. Until
+    /// reset. Test support only.
     #[cfg(any(test, feature = "test-support"))]
     pub fn simulate_full_wire_for_test(&self, full: bool) {
         self.inner.full_wire_for_test.store(full, Ordering::Release);
@@ -562,10 +563,6 @@ impl<C: MediaCatalog> MediaStore<C> {
     /// replacing anything left at that name.
     pub fn create_wire(&self, id: &FileId) -> MediaResult<WireFile<C>> {
         self.inner.ensure_open()?;
-        #[cfg(any(test, feature = "test-support"))]
-        if self.inner.full_wire_for_test.load(Ordering::Acquire) {
-            return Err(MediaError::Capacity);
-        }
         fs_private::create_dir_all_private(&self.shard_dir(id.0[0])).map_err(|e| io_error(&e))?;
         let path = self.wire_path(id);
         remove_if_present(&path).map_err(|e| io_error(&e))?;
@@ -850,8 +847,14 @@ impl<C: MediaCatalog> WireFile<C> {
     /// records the new length in the checkpoint row.
     pub fn append(&mut self, bytes: &[u8]) -> MediaResult<()> {
         self.inner.ensure_open()?;
+        // A short write: part of the chunk reaches the file, then the volume
+        // refuses the rest.
         #[cfg(any(test, feature = "test-support"))]
         if self.inner.full_wire_for_test.load(Ordering::Acquire) {
+            let _ = self
+                .file
+                .seek(io::SeekFrom::Start(self.len))
+                .and_then(|_| self.file.write_all(&bytes[..bytes.len() / 2]));
             return Err(MediaError::Capacity);
         }
         self.file
@@ -864,10 +867,13 @@ impl<C: MediaCatalog> WireFile<C> {
     }
 
     /// Drops bytes past `len` that the caller could not record, so they stop
-    /// taking disk space. `len` must not exceed what is on disk.
+    /// taking disk space. This cuts the file itself, not just this handle's
+    /// length: a failed `append` may have left part of its chunk on disk
+    /// without advancing the handle. `len` past the handle's length is a
+    /// no-op.
     pub fn truncate(&mut self, len: u64) -> MediaResult<()> {
         self.inner.ensure_open()?;
-        if len < self.len {
+        if len <= self.len {
             self.file.set_len(len).map_err(|e| io_error(&e))?;
             self.len = len;
         }

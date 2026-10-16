@@ -1143,6 +1143,46 @@ fn attachment_partial_reopen_preserves_prefix_and_fences_old_attempts() {
     assert_eq!(partial_usage(&store), 0);
     assert!(!checkpoint(&store, &job, &identity, 0, b"late", 13).unwrap());
 }
+/// A checkpoint record the database has no room for fails with
+/// `StorageError::Capacity`, which the app parks as a full disk, and leaves
+/// the recorded length unchanged.
+#[test]
+fn attachment_partial_record_on_a_full_database_reports_capacity() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    seed(&store, "full");
+    let asset = request(&store, "full");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    let identity = partial_identity(10);
+    let wire = store
+        .begin_attachment_partial(&job, &identity, 12)
+        .unwrap()
+        .unwrap();
+    // Recording the length needs more pages than the database may grow.
+    sql(
+        &store,
+        "CREATE TABLE filler(b BLOB);
+         CREATE TRIGGER fill_on_record AFTER UPDATE OF received ON attachment_partial
+         BEGIN INSERT INTO filler VALUES(zeroblob(1048576)); END;",
+    );
+    store.limit_database_pages_for_test(16).unwrap();
+    assert!(matches!(
+        store.record_attachment_partial(&job, &identity, &wire, 3, 12),
+        Err(StorageError::Capacity(_))
+    ));
+    store.limit_database_pages_for_test(1 << 30).unwrap();
+    assert_eq!(
+        store
+            .load_attachment_partial(&job, 12, 10, None)
+            .unwrap()
+            .unwrap()
+            .received,
+        0
+    );
+}
+
 #[test]
 fn attachment_partial_record_rollback_and_terminal_cleanup() {
     let store = SqliteAccountStorage::in_memory().unwrap();

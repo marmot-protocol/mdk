@@ -195,13 +195,20 @@ pub(crate) fn write_checkpoint(
         return Err(wire_error(error));
     }
     let received = offset.saturating_add(bytes.len() as u64);
-    let recorded = storage.record_attachment_partial(job, identity, &id, received, now)?;
-    if !recorded {
-        // Still under this job's lock: nothing else wrote this file since
-        // the lookup, so `offset` is its recorded length.
-        let _ = wire.truncate(offset);
+    // Still under this job's lock: nothing else wrote this file since the
+    // lookup, so `offset` is its recorded length whenever the record does
+    // not commit.
+    match storage.record_attachment_partial(job, identity, &id, received, now) {
+        Ok(true) => Ok(true),
+        Ok(false) => {
+            let _ = wire.truncate(offset);
+            Ok(false)
+        }
+        Err(error) => {
+            let _ = wire.truncate(offset);
+            Err(error.into())
+        }
     }
-    Ok(recorded)
 }
 
 /// Why a checkpoint write failed.
@@ -214,8 +221,13 @@ pub(crate) enum CheckpointWriteError {
 }
 
 impl From<cgka_traits::StorageError> for CheckpointWriteError {
-    fn from(_: cgka_traits::StorageError) -> Self {
-        Self::Failed
+    /// The database's own full disk (`SQLITE_FULL`) parks like a full wire
+    /// file; anything else is a transient retry.
+    fn from(error: cgka_traits::StorageError) -> Self {
+        match error {
+            cgka_traits::StorageError::Capacity(_) => Self::Full,
+            _ => Self::Failed,
+        }
     }
 }
 
