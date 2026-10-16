@@ -196,11 +196,8 @@ cargo test -p cgka-conformance-simulator --features conformance-slow # pre-relea
 
 ## Workspace-wide
 
-```sh
-cargo test --workspace
-```
-
-Run before checkpointing broad storage/engine changes.
+For broad storage/engine changes, run CI's workspace lint once (root `AGENTS.md` Verification) and let GitHub CI run
+the dependents' tests. Run `cargo test --workspace` locally only when asked.
 
 ## When adding a new test
 

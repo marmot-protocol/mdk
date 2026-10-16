@@ -103,10 +103,9 @@ several files in the same crate); methods shared across those files are `pub(cra
 
 ## Verification
 
-Before pushing connector changes, run the repo-wide pre-push gate plus this crate's tests:
+Before pushing connector changes, run this crate's tests on top of the root `AGENTS.md` pre-push steps:
 
 ```sh
-just fast-ci
 cargo test -p agent-connector
 cargo check -p agent-connector --bin wn-agent
 ```
@@ -126,4 +125,5 @@ just opencode-installer-test
 just pi-installer-test
 ```
 
-When editing `README.md`, run `just agent-install-docs-gate`. GitHub CI runs the full `just ci` workspace suite.
+When editing `README.md`, run `just agent-install-docs-gate`. GitHub CI runs the tests of every crate that depends
+on this one.

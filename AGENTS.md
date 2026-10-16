@@ -106,7 +106,42 @@ before adding behavior or bindings.
 
 ## Verification
 
-Run `just fast-ci` before pushing; let GitHub CI run the full `just ci` test matrix.
+GitHub CI is the full gate. Local verification proves your change and stays scoped to it: several agents usually
+build on the same machine, so workspace-wide builds and suites run locally only when a rule below calls for one. On
+every PR, CI runs fmt, the static gates, clippy (default and `--all-features`), and the tests of each changed crate plus
+its transitive dependents (`scripts/select_ci_tests.py`); the `ci:full` label runs the whole matrix.
+
+While iterating, run only the test you are working on. Before each push, run once:
+
+```sh
+cargo fmt --all
+cargo clippy -p <crate> --all-targets --all-features --locked -- -D warnings   # each crate you changed
+cargo nextest run -p <crate> -E 'test(<area>)'                                 # tests covering the change
+```
+
+- Take test scope and required features from the nearest `AGENTS.md` Verification section. Run the tests you added
+  or edited plus the test binary or module covering the code you changed; run a whole crate's suite only when the
+  change is crate-wide.
+- Run the `just` gates the nearest `AGENTS.md` names for the files you touched. Outside crates:
+  `.github/workflows/` and CI scripts → `just ci-path-classifier-gate`; installers and install docs →
+  `just agent-install-docs-gate` and `just install-example-sha256-gate`; new or renamed paths → `just naming-gate`.
+- When CI fails, reproduce the failing test by name (`cargo nextest run -p <crate> -E 'test(=<name>)'`) instead of
+  rerunning a suite or the whole gate.
+
+Widen only for these changes:
+
+- A `pub` item other crates use (type, field, enum variant, trait, signature, feature): run CI's lint once,
+  `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`. It compiles every dependent and the
+  feature-gated test targets (`test-crash-hooks`, `test-policy-overrides`) that default builds skip. Test only the
+  dependents whose behavior you changed.
+- Shared build inputs (`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `Justfile`, `vendor/`) or
+  `.github/workflows/`: `just fast-ci` once.
+- Convergence, delivery, branch-selection, or multi-client behavior: `just simulator-smoke` (the PR-lane selection).
+- Formal model: `just tamarin`.
+
+Do not run `just ci`, `just test`, `cargo test --workspace`, `--features conformance-slow`, benchmarks, or the
+convergence lanes locally unless the user asks; they duplicate CI. `just fast-ci` is fmt, the static gates, and CI's
+two workspace clippy passes, so it is not a per-push default.
 
 Exception: for an initial cohort-release PR limited to version fields, workspace package versions in `Cargo.lock`,
 vector `conformance_version` values, changelogs, release/integration documentation, README/install version pins, and
@@ -116,39 +151,7 @@ artifact builds before opening that PR. If preparing the release exposes an impl
 in a separate PR with the normal targeted verification instead of expanding the metadata PR. After the metadata PR is
 merged and required CI succeeds, run `just release-all <version>` to build and publish the cohort.
 
-`just fast-ci` covers formatting, compile-time checks, and clippy across the workspace (including OTLP feature builds).
-It intentionally skips `just test`, which is the slow part of CI.
-
-For crate-local changes, add targeted tests on top of `just fast-ci`:
-
-```sh
-just fast-ci
-cargo test -p <crate-you-touched>
-```
-
-Full local parity with GitHub CI (slow):
-
-```sh
-just ci
-```
-
-Individual gates:
-
-```sh
-just fmt-check
-just check
-just clippy
-just test
-just install-example-sha256-gate
-```
-
 The install-example gate renders all six installer `--help` surfaces and checks
 release guidance plus workflow-generated notes for download, sibling `.sha256`
 verification (`shasum` or `sha256sum`), then local execution. It also rejects
 new download-to-shell examples in tracked Markdown, shell, and workflow files.
-
-For formal-model changes:
-
-```sh
-just tamarin
-```

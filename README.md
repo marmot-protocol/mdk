@@ -166,7 +166,7 @@ provider to use `libcrux-kem 0.0.10`, fixing RUSTSEC-2026-0330 and RUSTSEC-2026-
 Its backport notes record provenance, regression commands and the removal condition.
 
 ```sh
-just fast-ci                 # formatting, doc/naming gates, compile checks, clippy; skips the `just test` matrix
+just fast-ci                 # formatting, static gates, CI's two clippy passes; skips the `just test` matrix
 cargo test -p <crate>        # targeted tests for the crate you changed
 just ci                      # full local parity with GitHub CI (slow)
 ```
