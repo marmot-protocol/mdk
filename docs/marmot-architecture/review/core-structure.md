@@ -1,7 +1,7 @@
 ---
 title: "Review — Core Crate Structure"
 created: 2026-10-15
-updated: 2026-10-15
+updated: 2026-10-16
 tags: [marmot, architecture, review, structure, crates]
 status: draft for discussion
 ---
@@ -316,7 +316,7 @@ Foundation:   cgka-traits (contracts only)   marmot-components (app component an
 | --- | --- | --- |
 | `cgka-traits` | itself | Keeps the engine, storage, transport and capability contracts and the protocol component codec, about 7.5k lines. App types move to `marmot-components`; Nostr routing and EOSE move to `transport-nostr`. |
 | `marmot-components` (new) | `traits` | App component and payload types: media, avatar, polls, reporting, agent-stream descriptors. It sits below the engine, because the engine validates components. |
-| `cgka-engine` | itself | Protocol core only. Product rules (media-secret export, moderation authority, routing decode) come in through a small policy interface. The account-record storage proxy and audit-recorder ownership move up. `openmls_projection` gets a name that says what it does. |
+| `cgka-engine` | itself | Protocol core only. Product rules (media-secret export, moderation authority, routing decode, the post-join maintenance target) come in through a small policy interface. The join transaction still writes the post-join obligation, so it stays atomic with the join (§2.5); only its 24-hour target comes from the policy, and `marmot-device-runtime` takes the obligation over from there. The account-record storage proxy and audit-recorder ownership move up. `openmls_projection` gets a name that says what it does. |
 | Protocol store | `storage-sqlite` | `StorageProvider` and OpenMLS storage. The app tables move out, and the cross-domain writes become explicit hooks or journals. |
 | App store | `storage-sqlite` | Projections, product state and the recovery ledger. Transport-specific bookkeeping moves to `transport-nostr` or the directory. |
 | `marmot-device-runtime` (new) | `cgka-session`, `marmot-account` runtime | One layer that owns the engine and its own account-record store handle: publish pipeline, maintenance, KeyPackage lifecycle, one routing implementation, one Welcome path. It re-exports the config types callers need. |

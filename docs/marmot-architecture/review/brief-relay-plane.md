@@ -1,7 +1,7 @@
 ---
 title: "Extraction Brief — Relay Plane into transport-nostr"
 created: 2026-10-15
-updated: 2026-10-15
+updated: 2026-10-16
 tags: [marmot, architecture, review, extraction-brief, transport, nostr]
 status: proposed, needs approval before implementation
 ---
@@ -31,8 +31,8 @@ merging into the adapter.
 
 - The relay plane already compiles against the adapter's public API, because it lives in another crate today, so the
   move needs no adapter changes.
-- The adapter keeps an SDK-free core behind its `sdk` feature, which `cgka-session`'s test harness uses without the SDK.
-  Merging the relay plane in would make that core carry the whole relay plane. (`marmot-c` depends on the adapter
+- The adapter keeps an SDK-free core, available with its `sdk` feature disabled (the default), which `cgka-session`'s
+  test harness uses. Merging the relay plane in would make that core carry the whole relay plane. (`marmot-c` depends on the adapter
   with `sdk` enabled, only for its proxy helper, so it is unaffected either way.)
 - It matches the target map in [core-structure §4](core-structure.md#4-proposed-target-structure).
 
@@ -65,7 +65,8 @@ follow-up. It is out of scope here.
 | `storage_sqlite::{DeliverySpillDisposition, DeliverySpillLimits}` (`relay_plane/delivery_spill.rs:19`) | Define plane-owned types, and map them in the closure `open_account` builds. No storage crate may depend on the transport crate. |
 
 The relay plane reaches storage only through two closures built in `open_account`: the delivery-loss marker and the
-spill store. Those closures already form the interface, and they stay as they are for the move.
+spill store. Those closures remain the interface for the move. Only the spill-store closure changes, to map between
+the storage types and the plane-owned types above.
 
 ## The surface the crate exports
 
