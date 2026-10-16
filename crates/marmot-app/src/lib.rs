@@ -4791,7 +4791,7 @@ impl MarmotApp {
 
         Ok(AppTransportRouting::new(AppRoutingState {
             local_inbox_endpoints: self.account_inbox_endpoints(&state.label, &relay_lists),
-            key_package_endpoints: self.key_package_endpoints(&relay_lists),
+            key_package_endpoints: self.key_package_endpoints(&state.label, &relay_lists)?,
             inbox_routes,
             group_routes,
             required_acks: 1,
@@ -5457,8 +5457,11 @@ impl MarmotApp {
                 }
             };
             let endpoints = if target.source_relays.is_empty() {
-                match self.account_relay_list_status_for_account_id(&account_id_hex) {
-                    Ok(relay_lists) => self.key_package_endpoints(&relay_lists),
+                match self
+                    .account_relay_list_status_for_account_id(&account_id_hex)
+                    .and_then(|relay_lists| self.key_package_endpoints(label, &relay_lists))
+                {
+                    Ok(endpoints) => endpoints,
                     Err(error) => {
                         results[index].result = Err(error);
                         continue;
@@ -6203,26 +6206,34 @@ impl MarmotApp {
 
     fn key_package_endpoints(
         &self,
+        label: &str,
         relay_lists: &AccountRelayListStatus,
-    ) -> Vec<TransportEndpoint> {
+    ) -> Result<Vec<TransportEndpoint>, AppError> {
         // KeyPackages publish to (and are fetched from) the account's NIP-65
         // (kind 10002) outbox relays; there is no dedicated KeyPackage relay
         // list. Fall back to the configured default relays when the account has
         // no usable NIP-65 relay. This runtime fallback is not published as a
         // replacement for the account's relay list.
-        let offered = relay_lists.nip65.relays.len();
-        let safe = self.retain_safe_discovered_endpoints(
-            relay_lists
-                .nip65
-                .relays
-                .iter()
-                .cloned()
-                .map(TransportEndpoint)
-                .collect(),
-            "local account key package routing",
-        );
+        let mut outbox = relay_lists
+            .nip65
+            .relays
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect::<Vec<_>>();
+        if outbox.is_empty() {
+            // An open generated setup has not projected the NIP-65 list its
+            // bootstrap publishes yet. Route to the relays that list declares,
+            // not to the app's (mdk#2359).
+            outbox = self
+                .generated_setup_outbox_relays(label)?
+                .unwrap_or_default();
+        }
+        let offered = outbox.len();
+        let safe =
+            self.retain_safe_discovered_endpoints(outbox, "local account key package routing");
         if !safe.is_empty() {
-            return safe;
+            return Ok(safe);
         }
         let fallback = self.relay_endpoints();
         if offered > 0 {
@@ -6234,7 +6245,28 @@ impl MarmotApp {
                 "published account outbox has no usable endpoints; using configured defaults"
             );
         }
-        fallback
+        Ok(fallback)
+    }
+
+    /// The NIP-65 relays an open generated setup declares. `None` once setup
+    /// completes, or when its context is missing or unreadable.
+    fn generated_setup_outbox_relays(
+        &self,
+        label: &str,
+    ) -> Result<Option<Vec<TransportEndpoint>>, AppError> {
+        let home = self.account_home();
+        if !home
+            .account_setup_state(label)?
+            .is_some_and(|state| state.kind == AccountSetupKind::GeneratedIdentity)
+        {
+            return Ok(None);
+        }
+        Ok(home
+            .account_setup_context(label)?
+            .and_then(|bytes| {
+                serde_json::from_slice::<runtime::GeneratedAccountSetupContext>(&bytes).ok()
+            })
+            .map(|context| context.outbox_relays()))
     }
 
     fn transport_label(&self) -> &'static str {

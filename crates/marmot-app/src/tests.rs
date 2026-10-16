@@ -7485,6 +7485,71 @@ async fn generated_setup_publishes_only_the_requested_relay_lists() {
     runtime.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generated_setup_key_packages_stay_on_the_requested_relays() {
+    // mdk#2359: until the bootstrap projects its NIP-65 list, KeyPackage
+    // routing fell back to the app's relays.
+    let directory = tempfile::tempdir().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    // The bootstrap never lands, so its NIP-65 list is never projected.
+    relay.fail_publishes_of_kind(KIND_NIP65_RELAY_LIST);
+    let app = MarmotApp::with_relay(directory.path(), "wss://app-default.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let chosen = TransportEndpoint("wss://chosen.example".into());
+    let local = runtime
+        .create_identity_local_ready(AccountSetupRequest {
+            default_relays: vec![chosen.clone()],
+            bootstrap_relays: vec![chosen.clone()],
+            inbox_relays: vec![chosen.clone()],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    let label = local.account.label.clone();
+    // The worker's setup lane publishes the prepared initial KeyPackage.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while app
+            .account_storage(&label)
+            .unwrap()
+            .key_package_lifecycle()
+            .unwrap()
+            .is_none_or(|lifecycle| lifecycle.current_key_package.is_none())
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the setup lane must publish the initial KeyPackage");
+
+    // A republish routes from the projection, which still has no NIP-65.
+    runtime.publish_key_package(&label).await.unwrap();
+    assert!(
+        app.account_relay_list_status(&label)
+            .unwrap()
+            .nip65
+            .relays
+            .is_empty()
+    );
+    let key_package_routes = relay
+        .attempted_publish_routes
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(kind, _)| *kind == KIND_MARMOT_KEY_PACKAGE)
+        .map(|(_, route)| route.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        key_package_routes.len() >= 2,
+        "the initial publication and the republish both reached the relay"
+    );
+    for route in key_package_routes {
+        assert_eq!(route, vec![chosen.clone()]);
+    }
+    runtime.shutdown().await;
+}
+
 #[tokio::test]
 async fn key_package_generation_upgrade_runs_once_per_account_on_activation() {
     use cgka_traits::maintenance::KEY_PACKAGE_GENERATION_REVISION;

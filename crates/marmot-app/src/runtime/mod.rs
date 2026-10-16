@@ -1322,7 +1322,7 @@ pub enum AccountSetupReadiness {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct GeneratedAccountSetupContext {
+pub(crate) struct GeneratedAccountSetupContext {
     default_relays: Vec<String>,
     bootstrap_relays: Vec<String>,
     // Absent from contexts persisted before separate inbox relays existed.
@@ -1392,6 +1392,16 @@ impl GeneratedAccountSetupContext {
             publish_missing_relay_lists: self.publish_missing_relay_lists,
             publish_initial_key_package: self.publish_initial_key_package,
         }
+    }
+
+    /// The NIP-65 relays this setup's bootstrap declares, which its prepared
+    /// initial KeyPackage also targets.
+    pub(crate) fn outbox_relays(&self) -> Vec<TransportEndpoint> {
+        self.default_relays
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect()
     }
 }
 
