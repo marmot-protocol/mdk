@@ -10,8 +10,9 @@ status: proposed, needs approval before implementation
 
 Step 2 of the [core structure plan](core-structure.md#5-sequencing). It moves the relay plane out of `marmot-app` into
 a new `transport-nostr` crate, without changing behaviour. Line counts are production code, measured at baseline
-`b76b5338e`, which includes the multi-thread runtime from #2340. `path:line` citations are at `15c4b4aab`, the
-master that #2346 merged, after #2341, #2354 and #2361. Following the [review's evidence rules](README.md#evidence-rules),
+`b76b5338e`, which includes the multi-thread runtime from #2340. `path:line` citations are at `15c4b4aab` (#2361 on
+master, after #2341 and #2354), which #2346's branch merged in before it landed. Following the
+[review's evidence rules](README.md#evidence-rules),
 statements are observed in source unless marked (hypothesis).
 
 ## Why this seam first
