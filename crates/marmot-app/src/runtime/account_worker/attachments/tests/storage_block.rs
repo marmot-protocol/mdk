@@ -812,12 +812,12 @@ async fn park_mid_transfer() -> MidTransferPark {
 }
 
 /// File sink with a strong validator, end to end: free space drops while the
-/// body is mid-transfer, so the mid-transfer check parks with `6T - S` in the
-/// worker's frame (four bodies, the staging and checkpoint still to grow, and
-/// the staging already held). Readmitted at exactly that target plus the
-/// margin, the attempt restores the saved prefix, finishes with one Range
-/// request and publishes without parking again. A target that dropped the
-/// held staging or the remaining checkpoint growth would re-park here.
+/// body is mid-transfer, so the mid-transfer check parks with `2T - S` in the
+/// worker's frame (the rest of the checkpoint and the store file; the saved
+/// prefix stays on disk and nothing is staged). Readmitted at exactly that
+/// target plus the margin, the attempt restores the saved prefix, finishes
+/// with one Range request and publishes without parking again. A target that
+/// dropped the remaining checkpoint growth would re-park here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mid_transfer_park_readmits_at_its_target_and_resumes() {
     let MidTransferPark {
@@ -1112,9 +1112,11 @@ async fn memory_publication_onto_a_full_disk_with_a_checkpoint_parks_for_the_sto
     server.await.unwrap();
 }
 
-/// A full disk during file-sink publication parks as well: the decrypted
-/// file this attempt held is counted into the target, the remembered file sink
-/// skips the header probe on readmission, and the retried attempt publishes.
+/// A full disk during file-sink publication parks as well. This body has no
+/// validator, so its ciphertext was staged rather than checkpointed: the
+/// staging this attempt held is counted into the target, the readmitted
+/// attempt probes through the in-memory sink and stages the body again, and
+/// the retried attempt publishes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn file_publication_onto_a_full_disk_parks_until_room_returns() {
     let plain = vec![0x45; (3 * MIB + 5) as usize];
