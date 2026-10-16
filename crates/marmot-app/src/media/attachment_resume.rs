@@ -612,13 +612,20 @@ impl AttachmentResume {
         let this = self.clone();
         let saved = tokio::task::spawn_blocking(move || {
             // A checkpoint write keeps the reserve free, like every other
-            // write on the account's volume.
-            let free = available_space(&this.directory).unwrap_or(0);
+            // write on the account's volume. A shortage parks the job with
+            // what its next attempt needs: the rest of the body beyond the
+            // saved `offset`, and its store file. Space that cannot be
+            // measured is a transient failure, not a full disk.
+            let free = available_space(&this.directory)
+                .map_err(|_| retry("free disk space unavailable"))?;
             let disk = DiskPolicy {
                 reserve_bytes: this.policy.disk_reserve,
             };
             if disk.admit(free, bytes.len() as u64) != Admission::Admitted {
-                return Ok(false);
+                let body = identity
+                    .total
+                    .saturating_sub(super::file_transfer::MEDIA_AEAD_TAG_BYTES);
+                return Err(storage_blocked(download_bytes(body, offset as u64)));
             }
             write_checkpoint(
                 &this.storage,
@@ -629,10 +636,10 @@ impl AttachmentResume {
                 &bytes,
                 crate::unix_now_seconds(),
             )
+            .map_err(|_| retry("partial checkpoint write failed"))
         })
         .await
-        .map_err(|_| retry("partial checkpoint task failed"))?
-        .map_err(|_| retry("partial checkpoint write failed"))?;
+        .map_err(|_| retry("partial checkpoint task failed"))??;
         if !saved {
             return Err(retry("partial checkpoint no longer admitted"));
         }

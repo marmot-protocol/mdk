@@ -599,8 +599,8 @@ pub(super) fn complete_acquired(
 }
 
 /// Headroom a job records when the disk filled while publishing a
-/// `plaintext`-byte body. The target is the download need of a retried
-/// attempt in the worker's frame (its ciphertext and store file), but never less
+/// `plaintext`-byte body. The target is the `required` space a retried
+/// attempt needs beyond the reserve in the worker's frame, but never less
 /// than the free space measured at the refusal plus one more body:
 /// readmission then waits until the volume has actually gained room, rather
 /// than refetching onto the same full disk whenever free space looked
@@ -610,9 +610,9 @@ fn full_disk_headroom(
     directory: &std::path::Path,
     policy: &storage_sqlite::AttachmentDownloadPolicy,
     plaintext: u64,
+    required: u64,
     held: u64,
 ) -> u64 {
-    let required = media_store::DiskPolicy::download_bytes(plaintext);
     match crate::media::attachment_resume::available_space(directory) {
         Ok(free) => required.max(
             free.saturating_add(held)
@@ -662,10 +662,18 @@ pub(super) fn complete_acquired_stored(
     let digest = job.plaintext_digest()?;
     let clock = crate::unix_now_seconds;
     let target = storage.attachment_publication(job, &clock);
-    // A retried attempt needs its ciphertext and the store file: two bodies.
-    // A file body's staging (none for a wire checkpoint, which stays) is held
-    // until the headroom is measured below.
-    let (published, len, held, _staged) = match body {
+    // A retried attempt needs its store file and whatever of its ciphertext
+    // is not checkpointed: the checkpoint stays on disk, staging does not. A
+    // file body's staging is held until the headroom is measured below.
+    let saved = storage
+        .attachment_checkpoint_bytes(&job.reference)
+        .unwrap_or(0);
+    let required = |len: u64| {
+        media_store::DiskPolicy::download_bytes(len)
+            .saturating_sub(saved)
+            .max(len)
+    };
+    let (published, len, required, held, _staged) = match body {
         crate::client::AcquiredMediaBody::File(file) => {
             let len = file.plaintext_len;
             let published = match file.plaintext_reader(media) {
@@ -689,7 +697,8 @@ pub(super) fn complete_acquired_stored(
             {
                 media.remove_wire(&wire);
             }
-            (published, len, file.ciphertext.staged_bytes(), Some(file))
+            let held = file.ciphertext.staged_bytes();
+            (published, len, required(len), held, Some(file))
         }
         crate::client::AcquiredMediaBody::Memory(result) => {
             let plaintext = zeroize::Zeroizing::new(result.plaintext);
@@ -703,7 +712,7 @@ pub(super) fn complete_acquired_stored(
                 now,
                 cancelled,
             );
-            (published, len, 0, None)
+            (published, len, required(len), 0, None)
         }
         crate::client::AcquiredMediaBody::Retained => return Ok(()),
     };
@@ -715,7 +724,7 @@ pub(super) fn complete_acquired_stored(
         }
         // The disk (or database) is full: park, never retry on a timer.
         Err(MediaError::Capacity) => {
-            let headroom = full_disk_headroom(directory, &policy, len, held);
+            let headroom = full_disk_headroom(directory, &policy, len, required, held);
             storage.block_attachment_storage(job, headroom, now)?;
         }
         // Shutting down: the durable lease lets the next worker resume it.

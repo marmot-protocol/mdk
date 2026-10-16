@@ -36,7 +36,10 @@
   checkpointed count once. Large explicit downloads streamed to a file write
   their ciphertext straight into the `.wire` checkpoint (or, without a strong
   validator, one private staging file) and publication decrypts it straight
-  into the encrypted store file, so no plaintext copy is written to disk.
+  into the encrypted store file, so no plaintext copy is written to disk. A
+  checkpoint write the disk cannot take, or a full disk while publishing a
+  body, parks the job as `StorageBlocked` for what its retry still writes,
+  never on a retry timer.
 - Publication, hashing and encryption of downloaded bodies run on the blocking
   pool for in-memory bodies too, never on the account worker.
 - Hosts must exclude the account directory, including `media/`, from cloud and

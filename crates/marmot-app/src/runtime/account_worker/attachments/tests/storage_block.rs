@@ -840,6 +840,56 @@ async fn mid_transfer_park_readmits_at_its_target_and_resumes() {
     server.abort();
 }
 
+/// Space shrinks mid-transfer below what the next checkpoint write needs:
+/// the write is refused and the job parks for what its next attempt still
+/// writes (the rest of the body and its store file), instead of retrying on
+/// a timer that worker admission would keep refusing.
+#[tokio::test]
+async fn a_refused_checkpoint_write_parks_instead_of_retrying() {
+    let plain = vec![0x34; (3 * MIB + 7) as usize];
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (reference, cipher) = loopback_reference(&listener, &plain);
+    let (go, proceed) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        request_headers(&mut socket).await;
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n",
+                    cipher.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let first = (MIB + 4096) as usize;
+        socket.write_all(&cipher[..first]).await.unwrap();
+        proceed.await.unwrap();
+        let _ = socket.write_all(&cipher[first..]).await;
+    });
+    let mut fixture = explicit_fixture(&reference, 64 * MIB).await;
+    fixture.tick().await;
+    let started = tokio::time::Instant::now();
+    while fixture.storage.attachment_partial_bytes_for_test().unwrap() < MIB {
+        assert!(started.elapsed() < Duration::from_secs(10));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // Less than one checkpoint unit left.
+    fixture.set_free(MIB / 2);
+    go.send(()).unwrap();
+    let done = fixture.completion().await;
+    assert_eq!(
+        parked_headroom(&done),
+        2 * plain.len() as u64 - MIB,
+        "the rest of the body beyond the saved prefix, and its store file"
+    );
+    complete_media_http(&mut fixture.client, done, &fixture.shared, &fixture.http).await;
+    assert_eq!(fixture.state(), AttachmentTransferState::StorageBlocked);
+    assert_eq!(fixture.status().retry_at, None, "no retry timer runs");
+    server.abort();
+}
+
 /// Space shrinks after the whole body has arrived: the in-memory sink
 /// checkpoints the complete ciphertext, the job parks, and the readmitted
 /// attempt verifies and publishes locally without a second request.
@@ -981,6 +1031,76 @@ async fn memory_publication_onto_a_full_disk_parks_until_room_returns() {
     fixture.tick().await;
     fixture.publish_memory(&plain).await;
     assert_eq!(requests.load(Ordering::SeqCst), 2);
+    stop.send(()).unwrap();
+    server.await.unwrap();
+}
+
+/// A full disk while publishing an in-memory body whose checkpoint is on disk
+/// parks for what a retry still writes (the store file and the unsaved tail),
+/// bounded below by the refusal's own free space plus a body, never four
+/// bodies: with little room left the job readmits as soon as that space is
+/// back, and resumes from its checkpoint.
+#[tokio::test]
+async fn memory_publication_onto_a_full_disk_with_a_checkpoint_parks_for_the_store_file() {
+    let plain = vec![0x46; (3 * MIB + 5) as usize];
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (reference, cipher) = loopback_reference(&listener, &plain);
+    let total = cipher.len() as u64;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let (stop, stopped) = oneshot::channel();
+    let server = serve(
+        listener,
+        cipher,
+        Framing {
+            etag: true,
+            chunked: false,
+        },
+        Arc::clone(&requests),
+        stopped,
+    );
+    let mut fixture = explicit_fixture(&reference, total).await;
+    let free = 2 * total + MIB;
+    fixture.set_free(free);
+    fixture.tick().await;
+    let done = fixture.completion().await;
+    assert!(matches!(
+        &done.completion,
+        MediaHttpCompletion::Attachment {
+            result: Ok(crate::client::AcquiredMediaBody::Memory(_)),
+            ..
+        }
+    ));
+    let saved = fixture.storage.attachment_partial_bytes_for_test().unwrap();
+    assert_eq!(saved, 3 * MIB, "every whole checkpoint unit is on disk");
+    fixture.media().simulate_full_disk_for_test(true);
+    complete_and_settle(
+        &mut fixture.client,
+        done,
+        &fixture.shared,
+        &fixture.http,
+        &mut fixture.completions,
+    )
+    .await;
+    assert_eq!(fixture.state(), AttachmentTransferState::StorageBlocked);
+    // The refusal measured the pinned space less the checkpoint.
+    let target = free - saved + plain.len() as u64;
+    assert!(
+        target < 4 * plain.len() as u64,
+        "the 4x-era target would wait for four bodies"
+    );
+    fixture.set_free(target + STORAGE_READMIT_MARGIN_BYTES - 1);
+    fixture.tick().await;
+    assert!(fixture.completions.try_recv().is_err());
+    assert_eq!(fixture.state(), AttachmentTransferState::StorageBlocked);
+    fixture.media().simulate_full_disk_for_test(false);
+    fixture.set_free(target + STORAGE_READMIT_MARGIN_BYTES);
+    fixture.tick().await;
+    fixture.publish_memory(&plain).await;
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        2,
+        "the readmitted attempt resumes its checkpoint with one Range request"
+    );
     stop.send(()).unwrap();
     server.await.unwrap();
 }
