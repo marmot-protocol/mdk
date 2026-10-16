@@ -62,8 +62,9 @@
   a completed-body receipt that publication could not use, and advances a park
   streak (a permission-owned park does not). `readmit_storage_blocked_attachments`
   requeues up to 64 parked jobs whose target fits the supplied free space less
-  `STORAGE_READMIT_MARGIN_BYTES` once admission (`disk_reserve + 4 *
-  transfer_limit`) would pass, delays a repeated park by its streak, and skips
+  `STORAGE_READMIT_MARGIN_BYTES` once worker admission (`disk_reserve + 2 *
+  transfer_limit`, less the job's checkpoint and never less than one limit)
+  would pass, delays a repeated park by its streak, and skips
   automatic rows while automatic acquisition is disabled; its probe is
   read-only until a row fits. Explicit retry, readmission, completion and
   cancellation clear the parked marker; both explicit retry APIs refresh a
