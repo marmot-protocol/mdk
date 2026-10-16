@@ -64,7 +64,8 @@ not "fix" it into the per-account database.
   database under it. `connection::tests::reopening_a_live_database_keeps_its_posix_locks` guards this. See
   `docs/marmot-architecture/overview/local-artifact-safety.md`.
 - Build every long-lived connection on `CloseableConnection` so a host can release the database's file locks at a known
-  instant. Closing is terminal: surviving clones return `StorageError::Closed`, and nothing reopens implicitly. See
+  instant, and give its handle a `closer()` (`DatabaseCloser`, a weak reference) so a host can close it without keeping
+  it open. Closing is terminal: surviving clones return `StorageError::Closed`, and nothing reopens implicitly. See
   `docs/marmot-architecture/overview/local-artifact-safety.md`.
 - The media file lifecycle belongs to the `media-store` crate; this crate holds its metadata and never touches media
   files. Every `PublishTarget::commit_ready`/`commit_existing` is one transaction (fences, presence-checked reuse,

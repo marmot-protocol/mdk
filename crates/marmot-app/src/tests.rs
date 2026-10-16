@@ -10,6 +10,7 @@ mod publication_progress;
 mod quarantine_receive;
 mod replaceable_delivery;
 mod report_backfill;
+mod suspension_close;
 mod user_blocks;
 
 use super::*;

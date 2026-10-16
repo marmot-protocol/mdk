@@ -125,6 +125,7 @@ mod projection;
 mod publisher_sequences;
 mod relay_plane;
 mod relay_telemetry_export;
+mod root_closers;
 mod root_runtime_lease;
 mod runtime;
 mod sqlcipher;
@@ -515,6 +516,10 @@ pub struct MarmotApp {
     /// [`Self::close_storage`] holds the write side across its whole teardown.
     /// See [`Self::begin_storage_open`].
     storage_lifecycle: Arc<RwLock<()>>,
+    /// What [`Self::close_storage`] closes: every resource in the root that
+    /// can hold a file lock, registered when it opens under
+    /// `storage_lifecycle`. The handle caches below only serve lookups.
+    root_closers: root_closers::RootClosers,
     audit_export_lifecycle: audit_export_lifecycle::AuditExportLifecycle,
     relay_urls: Vec<String>,
     account_home: AccountHome,
@@ -1664,6 +1669,7 @@ impl MarmotApp {
             storage_closed: Arc::new(AtomicBool::new(false)),
             storage_close_completed: Arc::new(AtomicBool::new(false)),
             storage_lifecycle: Arc::new(RwLock::new(())),
+            root_closers: root_closers::RootClosers::default(),
             audit_export_lifecycle: audit_export_lifecycle::AuditExportLifecycle::default(),
             relay_urls,
             relay_plane,
@@ -1760,6 +1766,7 @@ impl MarmotApp {
             storage_closed: Arc::new(AtomicBool::new(false)),
             storage_close_completed: Arc::new(AtomicBool::new(false)),
             storage_lifecycle: Arc::new(RwLock::new(())),
+            root_closers: root_closers::RootClosers::default(),
             audit_export_lifecycle: audit_export_lifecycle::AuditExportLifecycle::default(),
             relay_urls,
             account_home,
@@ -4532,12 +4539,18 @@ impl MarmotApp {
                 slot: audit_v5_peel_slot.clone(),
             });
         let session_path = self.account_dir(label).join(SESSION_DB_FILE);
-        // load_state/account_storage above completed the first database open.
-        // Serialize any remaining key-migration probe with other openers.
-        let session_key = {
+        // The engine gets its own connection to `session.sqlite`, which no
+        // cache holds. Open and register it under storage-open admission so
+        // `close_storage` reaches it while this open is in flight and while
+        // the worker later runs on it (mdk#2323).
+        let (engine_storage, engine_storage_open) = {
+            let lifecycle = self.begin_storage_open("account session")?;
+            // load_state/account_storage above completed the first database
+            // open. Serialize any remaining key-migration probe with other
+            // openers.
             let lock = sqlcipher::database_open_lock(&session_path);
             let database = lock.lock();
-            if let AccountSigner::Local(keys) = &signer {
+            let session_key = if let AccountSigner::Local(keys) = &signer {
                 self.sqlcipher_key_locked(label, keys, &database, SqlcipherDatabaseKind::Session)?
             } else {
                 self.external_sqlcipher_key(
@@ -4546,16 +4559,20 @@ impl MarmotApp {
                     &database,
                     SqlcipherDatabaseKind::Session,
                 )?
-            }
+            };
+            let started = Instant::now();
+            let storage = SqliteAccountStorage::open_encrypted(&session_path, &session_key)?;
+            self.root_closers.register(&lifecycle, storage.closer());
+            (storage, started.elapsed())
         };
         // Optional forensic audit log. Enable `AuditLogSettings` before opening
         // an account session to record per-account/device JSONL at
         // `<account_dir>/audit-<engine_id>-v4.jsonl`. The v4 schema contains
         // privacy-safe derived values only: obfuscated identifiers, digests,
         // lengths, counts, reduced convergence data, and typed outcomes.
-        let mut session_config = SessionConfig::new(
-            session_path,
-            session_key,
+        let mut session_config = SessionConfig::with_storage(
+            engine_storage,
+            engine_storage_open,
             account_id.as_slice().to_vec(),
             peeler,
         )
@@ -6225,11 +6242,12 @@ impl MarmotApp {
     /// runtime lease, so nothing this process owns holds a file lock inside the
     /// Marmot root.
     ///
-    /// Callers must quiesce first — this closes databases out from under any
-    /// work still running (see [`SqliteAccountStorage::close`] for what that
-    /// does to in-flight transactions). [`MarmotAppRuntime::shutdown_and_close`]
-    /// is the sequenced entry point host apps should use; it drains the account
-    /// workers before calling this.
+    /// This closes databases out from under any work still running, including
+    /// a running account engine (see [`SqliteAccountStorage::close`] for what
+    /// that does to in-flight transactions).
+    /// [`MarmotAppRuntime::shutdown_and_close`] is the sequenced entry point
+    /// host apps should use; it stops admitting runtime work before calling
+    /// this and drains the workers afterwards.
     ///
     /// **Terminal.** [`Self::storage_is_closed`] latches, and every database
     /// accessor then fails with
@@ -6244,10 +6262,13 @@ impl MarmotApp {
     /// Group container shared with the Notification Service Extension, and a
     /// process suspended while holding *any* lock there is killed with
     /// `0xdead10cc` — which a WAL connection does for its whole lifetime, and
-    /// the root lease does by design. Dropping handles cannot fix that: the
-    /// databases sit behind `Arc`s reachable from the engine, the OpenMLS
-    /// adapter, and app projections, so the host can neither observe nor await
-    /// the last clone going away.
+    /// the root lease does by design. Dropping handles cannot fix that: a
+    /// connection sits behind `Arc`s shared with the OpenMLS adapter and
+    /// projections, so the host can neither observe nor await the last clone
+    /// going away. And the app's caches do not hold every connection: each
+    /// account engine opens its own connection to `session.sqlite`. So every
+    /// lock-holding resource registers a closer when it opens, and this closes
+    /// all of them.
     ///
     /// Every database is attempted even if an earlier one fails; the first
     /// error is returned once all of them have been closed.
@@ -6269,9 +6290,10 @@ impl MarmotApp {
         self.storage_closed.store(true, Ordering::Release);
         let _ = self.abort_all_public_indexer_copies();
         self.presentation_signals.catalog_changed();
-        let mut first_error = None;
-        let mut closed = 0usize;
 
+        // Empty the lookup caches so nothing reaches a closed handle through
+        // them, but keep their handles alive until the closers below have
+        // closed them explicitly rather than by a last drop.
         let account_storages = self
             .account_storages
             .lock()
@@ -6302,24 +6324,11 @@ impl MarmotApp {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
 
-        for storage in account_storages {
-            closed += 1;
-            if let Err(error) = storage.close() {
-                first_error.get_or_insert(AppError::from(error));
-            }
-        }
-        for cache in directory_caches {
-            closed += 1;
-            if let Err(error) = cache.close() {
-                first_error.get_or_insert(error);
-            }
-        }
-        if let Some(storage) = shared_storage {
-            closed += 1;
-            if let Err(error) = storage.close() {
-                first_error.get_or_insert(AppError::from(error));
-            }
-        }
+        // Every lock-holding resource in the root registered a closer when it
+        // opened, including each account engine's own `session.sqlite`
+        // connection, which no cache holds (mdk#2323).
+        let (closed, first_error) = self.root_closers.close_all();
+        drop((account_storages, directory_caches, shared_storage));
 
         // Last: the lease guards the databases, so it outlives them.
         drop(
@@ -6501,7 +6510,7 @@ impl MarmotApp {
         }
         probe.record_history();
         probe.phase(NativeStartupStage::StorageAdmission);
-        let _lifecycle = self.begin_storage_open("account storage")?;
+        let lifecycle = self.begin_storage_open("account storage")?;
         let _span = tracing::debug_span!(
             target: "marmot_app::storage",
             "account_storage_open",
@@ -6581,8 +6590,9 @@ impl MarmotApp {
             }
         }
         let storage = opened?;
-        // Publishing under `_lifecycle` is what keeps this connection reachable
-        // by a later `close_storage`; see `begin_storage_open`.
+        // Registering under `lifecycle` is what keeps this connection
+        // reachable by a later `close_storage`; see `begin_storage_open`.
+        self.root_closers.register(&lifecycle, storage.closer());
         let mut storages = self
             .account_storages
             .lock()
@@ -7208,7 +7218,7 @@ impl MarmotApp {
         {
             return Ok(storage);
         }
-        let _lifecycle = self.begin_storage_open("shared storage")?;
+        let lifecycle = self.begin_storage_open("shared storage")?;
         let _span = tracing::debug_span!(
             target: "marmot_app::storage",
             "shared_storage_open",
@@ -7216,6 +7226,7 @@ impl MarmotApp {
         )
         .entered();
         let storage = SqliteSharedStorage::open(self.shared_storage_path())?;
+        self.root_closers.register(&lifecycle, storage.closer());
         let mut shared = self
             .shared_storage
             .lock()

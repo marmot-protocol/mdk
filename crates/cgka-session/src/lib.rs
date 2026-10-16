@@ -66,8 +66,7 @@ impl SessionError {
 }
 
 pub struct SessionConfig {
-    database_path: PathBuf,
-    database_key: SqlCipherKey,
+    storage: SessionStorage,
     identity: Vec<u8>,
     peeler: Box<dyn TransportPeeler>,
     account_identity_proof_signer: Option<Arc<dyn AccountIdentityProofSigner>>,
@@ -82,6 +81,18 @@ pub struct SessionConfig {
     defer_group_hydration: bool,
 }
 
+/// Where [`AccountDeviceSession::open`] gets its database connection.
+enum SessionStorage {
+    /// Open this database with [`SessionConfig::storage_options`].
+    Path { path: PathBuf, key: SqlCipherKey },
+    /// A connection the host opened, and how long that took; see
+    /// [`SessionConfig::with_storage`].
+    Open {
+        storage: SqliteAccountStorage,
+        opened_in: std::time::Duration,
+    },
+}
+
 impl SessionConfig {
     pub fn new(
         database_path: impl Into<PathBuf>,
@@ -89,9 +100,45 @@ impl SessionConfig {
         identity: Vec<u8>,
         peeler: Box<dyn TransportPeeler>,
     ) -> Self {
+        Self::with_session_storage(
+            SessionStorage::Path {
+                path: database_path.into(),
+                key: database_key,
+            },
+            identity,
+            peeler,
+        )
+    }
+
+    /// Run the session on a connection the host has already opened, instead
+    /// of opening one from a path.
+    ///
+    /// A host that must close every connection at a known instant, such as an
+    /// iOS app before suspension, opens `storage` under its own admission and
+    /// keeps its [`SqliteAccountStorage::closer`]. `opened_in` is how long
+    /// that open took; [`SessionOpenTimings`] counts it so open telemetry
+    /// still covers the storage open. [`Self::storage_options`] does not
+    /// apply; the host chose the options when it opened `storage`.
+    pub fn with_storage(
+        storage: SqliteAccountStorage,
+        opened_in: std::time::Duration,
+        identity: Vec<u8>,
+        peeler: Box<dyn TransportPeeler>,
+    ) -> Self {
+        Self::with_session_storage(
+            SessionStorage::Open { storage, opened_in },
+            identity,
+            peeler,
+        )
+    }
+
+    fn with_session_storage(
+        storage: SessionStorage,
+        identity: Vec<u8>,
+        peeler: Box<dyn TransportPeeler>,
+    ) -> Self {
         Self {
-            database_path: database_path.into(),
-            database_key,
+            storage,
             identity,
             peeler,
             account_identity_proof_signer: None,
@@ -166,6 +213,8 @@ impl SessionConfig {
         self
     }
 
+    /// Options for the connection [`AccountDeviceSession::open`] opens. No
+    /// effect on a session built with [`Self::with_storage`].
     pub fn storage_options(mut self, options: SqliteStorageOptions) -> Self {
         self.storage_options = options;
         self
@@ -333,17 +382,25 @@ impl AccountDeviceSession {
             "opening account device session"
         );
         let opened_at = std::time::Instant::now();
-        let storage = SqliteAccountStorage::open_encrypted_with_options(
-            config.database_path,
-            &config.database_key,
-            config.storage_options,
-        )?;
+        // Time the host spent opening a connection it handed over, before
+        // this call started.
+        let (storage, host_storage_open) = match config.storage {
+            SessionStorage::Path { path, key } => (
+                SqliteAccountStorage::open_encrypted_with_options(
+                    path,
+                    &key,
+                    config.storage_options,
+                )?,
+                std::time::Duration::ZERO,
+            ),
+            SessionStorage::Open { storage, opened_in } => (storage, opened_in),
+        };
         // Keep a clone of the same closeable connection for storage-only
         // maintenance that must not widen the generic engine API. The engine
         // and this handle share one underlying connection and terminal close
         // state.
         let maintenance_storage = storage.clone();
-        let storage_open = opened_at.elapsed();
+        let storage_open = opened_at.elapsed() + host_storage_open;
         let build_started = std::time::Instant::now();
         let builder = EngineBuilder::new(storage)
             .identity(config.identity)
@@ -404,7 +461,7 @@ impl AccountDeviceSession {
         // storage on the open critical path nor add a failure mode after
         // hydration already succeeded.
         let open_timings = SessionOpenTimings {
-            total: opened_at.elapsed(),
+            total: opened_at.elapsed() + host_storage_open,
             storage_open,
             engine_build,
             group_hydration,

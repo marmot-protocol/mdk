@@ -255,9 +255,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Keep `MarmotAppRuntime::shutdown_and_close` the one terminal teardown for hosts whose process can be suspended: it
   closes admission, closes every SQLite database and releases the root runtime lease first, then gives graceful worker
   cleanup a bounded budget. The terminal operation must outlive cancellation of its caller. `shutdown` alone does not
-  release file locks. Closing is terminal — do not add a path that transparently reopens a database afterwards, and
-  put shutdown checks at engine-step boundaries (never inside a step, where a snapshot guard may be live). See
-  `docs/marmot-architecture/overview/local-artifact-safety.md`.
+  release file locks. Register every resource that can hold a lock in the root with `root_closers` while holding
+  `begin_storage_open` admission (the engine's own `session.sqlite` connection included); `close_storage` closes that
+  registry, not the handle caches. Closing is terminal — do not add a path that transparently reopens a database
+  afterwards, and put shutdown checks at engine-step boundaries (never inside a step, where a snapshot guard may be
+  live). See `docs/marmot-architecture/overview/local-artifact-safety.md`.
 - Keep legacy message-format promotion after account readiness and bounded to
   one small transaction per steady-state maintenance tick. Log aggregate
   progress only, retry transient contention, and halt durable decode failures

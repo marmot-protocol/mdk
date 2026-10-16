@@ -185,9 +185,49 @@ pub struct CloseableConnection {
     /// racing callers could repeatedly acquire `slot` ahead of the closer and
     /// extend the host's suspension-critical teardown indefinitely.
     closed: AtomicBool,
+    /// Marked once the connection itself is gone, closed by [`Self::close`] or
+    /// by dropping the last handle, so a [`DatabaseCloser`] can wait out a
+    /// drop that is still closing it on another thread.
+    released: Arc<ConnectionRelease>,
     /// Detail carried by the [`StorageError::Closed`] this connection raises,
     /// naming which database is closed.
     closed_detail: &'static str,
+}
+
+#[derive(Debug, Default)]
+struct ConnectionRelease {
+    released: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl ConnectionRelease {
+    fn mark(&self) {
+        *self
+            .released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        self.changed.notify_all();
+    }
+
+    fn is_marked(&self) -> bool {
+        *self
+            .released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn wait(&self) {
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*released {
+            released = self
+                .changed
+                .wait(released)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
 }
 
 impl CloseableConnection {
@@ -198,6 +238,7 @@ impl CloseableConnection {
         Self {
             slot: Mutex::new(Some(connection)),
             closed: AtomicBool::new(false),
+            released: Arc::default(),
             closed_detail,
         }
     }
@@ -252,7 +293,12 @@ impl CloseableConnection {
         let Some(connection) = slot.take() else {
             return Ok(());
         };
+        let result = Self::close_taken(connection);
+        self.released.mark();
+        result
+    }
 
+    fn close_taken(connection: rusqlite::Connection) -> StorageResult<()> {
         // TRUNCATE folds the WAL back into the main database and resets the
         // file to zero length, so the next open starts from a clean sidecar
         // rather than replaying this session's log. It is a no-op error on
@@ -1306,6 +1352,88 @@ impl SqliteAccountStorage {
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.connection.is_closed()
+    }
+
+    /// A [`DatabaseCloser`] for this connection, shared by every clone.
+    #[must_use]
+    pub fn closer(&self) -> DatabaseCloser {
+        DatabaseCloser {
+            target: CloserTarget::Account(Arc::downgrade(&self.connection.inner)),
+            release: self.connection.inner.connection.released.clone(),
+        }
+    }
+}
+
+/// Closes a database without holding it open.
+///
+/// An owner that must close every live connection at a known instant (a host
+/// about to be suspended) keeps one of these per connection instead of a
+/// handle. It holds only a weak reference, so it never keeps a connection
+/// whose handles have all dropped alive, or its file locks held.
+#[derive(Clone, Debug)]
+pub struct DatabaseCloser {
+    target: CloserTarget,
+    release: Arc<ConnectionRelease>,
+}
+
+#[derive(Clone, Debug)]
+enum CloserTarget {
+    Account(std::sync::Weak<SharedConnectionInner>),
+    Connection(std::sync::Weak<CloseableConnection>),
+}
+
+impl DatabaseCloser {
+    /// Close the database if any handle to it is still alive, with the same
+    /// terminal contract as that handle's own `close`.
+    ///
+    /// When every handle has already dropped, dropping the last one closes
+    /// the connection, possibly still in progress on another thread. This
+    /// waits for that to finish, so a return always means the connection is
+    /// gone.
+    pub fn close(&self) -> StorageResult<()> {
+        let result = match &self.target {
+            CloserTarget::Account(inner) => inner
+                .upgrade()
+                .map_or(Ok(()), |inner| SharedConnection { inner }.close()),
+            CloserTarget::Connection(connection) => connection
+                .upgrade()
+                .map_or(Ok(()), |connection| connection.close()),
+        };
+        self.release.wait();
+        result
+    }
+
+    /// Whether the connection is gone, closed or dropped with its last
+    /// handle, leaving nothing to close. Nonblocking, and takes no reference,
+    /// so it cannot extend the connection's life.
+    #[must_use]
+    pub fn is_released(&self) -> bool {
+        self.release.is_marked()
+    }
+}
+
+impl CloseableConnection {
+    /// A [`DatabaseCloser`] for this shared connection.
+    #[must_use]
+    pub fn closer(self: &Arc<Self>) -> DatabaseCloser {
+        DatabaseCloser {
+            target: CloserTarget::Connection(Arc::downgrade(self)),
+            release: self.released.clone(),
+        }
+    }
+}
+
+impl Drop for CloseableConnection {
+    fn drop(&mut self) {
+        // Close before marking, so a closer that is waiting returns only once
+        // the database file is closed.
+        drop(
+            self.slot
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take(),
+        );
+        self.released.mark();
     }
 }
 
@@ -2602,6 +2730,66 @@ mod tests {
             surviving_clone.lock().err(),
             Some(StorageError::Closed(_))
         ));
+    }
+
+    /// A closer reaches a connection its owner never held a handle to, and
+    /// closes it the same way the handle would.
+    #[test]
+    fn closer_closes_every_live_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let key = SqlCipherKey::new("closer closes live handles key").unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("CREATE TABLE closer_probe (id INTEGER);")
+            .unwrap();
+        let closer = store.closer();
+        let clone = store.clone();
+
+        assert!(!closer.is_released());
+        closer
+            .close()
+            .expect("closer should close the live connection");
+        assert!(closer.is_released());
+
+        assert!(store.is_closed() && clone.is_closed());
+        assert!(matches!(clone.lock().err(), Some(StorageError::Closed(_))));
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+            assert!(!sidecar.exists(), "{suffix} must be gone after close");
+        }
+        closer.close().expect("closing again is a no-op");
+    }
+
+    /// The closer must not be what keeps a connection, and its locks, alive.
+    #[test]
+    fn closer_does_not_keep_dropped_handles_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let key = SqlCipherKey::new("closer weak reference key").unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("CREATE TABLE closer_probe (id INTEGER);")
+            .unwrap();
+        let account_closer = store.closer();
+        let shared = crate::SqliteSharedStorage::open(dir.path().join("shared.sqlite")).unwrap();
+        let shared_closer = shared.closer();
+
+        drop(store);
+        drop(shared);
+
+        assert!(account_closer.is_released() && shared_closer.is_released());
+        account_closer.close().expect("nothing left to close");
+        shared_closer.close().expect("nothing left to close");
+        let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        assert!(
+            !wal.exists(),
+            "dropping the last handle closes the database"
+        );
     }
 
     #[test]

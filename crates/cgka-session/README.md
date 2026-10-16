@@ -10,7 +10,8 @@ transport work from each lifecycle method.
 local identity, and a `TransportPeeler`. `AccountDeviceSession::open` also requires an account identity-proof signer
 (`SessionConfig::account_identity_proof_signer`). Optional builder methods set the feature registry, supported
 app-component set, protocol profile, storage options, convergence policy, forensic recorder, and maintenance clock/RNG
-sources.
+sources. `SessionConfig::with_storage(storage, opened_in, identity, peeler)` instead runs the session on a connection the host has
+already opened, for hosts that must close every connection at a known instant (an iOS app before suspension).
 
 Open fails closed before touching storage if the convergence policy is unacceptable or a legacy protocol profile is
 requested without `legacy_compatibility_profile()`. It then opens encrypted storage, builds the engine, retires (for
