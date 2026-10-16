@@ -100,9 +100,16 @@ impl DirectoryCache {
 
     /// Close this cache's database, releasing its file handle and any locks.
     /// Terminal and idempotent: later reads and writes fail with a closed
-    /// storage error and nothing reopens.
+    /// storage error and nothing reopens. `MarmotApp::close_storage` closes
+    /// caches through [`Self::closer`].
+    #[cfg(test)]
     pub(crate) fn close(&self) -> Result<(), AppError> {
         Ok(self.conn.close()?)
+    }
+
+    /// A closer for this cache's database that does not keep it open.
+    pub(crate) fn closer(&self) -> storage_sqlite::DatabaseCloser {
+        self.conn.closer()
     }
 
     pub(crate) fn lock(&self) -> Result<ConnectionGuard<'_>, AppError> {

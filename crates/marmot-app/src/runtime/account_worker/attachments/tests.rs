@@ -198,7 +198,7 @@ fn context() -> (MediaHttpContext, mpsc::UnboundedReceiver<MediaHttpDone>) {
 }
 
 /// Count loopback response bytes once, then prove the retained asset survives a client restart.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_worker_downloads_without_engine_group_or_screen_and_retains_through_restart() {
     download_without_engine_and_retain(false, "received", false).await;
     download_without_engine_and_retain(true, "received", false).await;
@@ -509,7 +509,7 @@ async fn download_without_engine_and_retain(
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_worker_exit_cancels_transfer_and_releases_global_capacity() {
     let shared = RuntimeSharedServices::default();
     let (http, mut completions) = context();
@@ -545,7 +545,7 @@ async fn attachment_worker_exit_cancels_transfer_and_releases_global_capacity() 
     assert_eq!(permits.available_permits(), 4);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_missing_secret_does_not_claim_or_back_off_a_page_of_siblings() {
     let (_dir, client, storage, reference) = offline_fixture().await;
     let entry = storage
@@ -606,7 +606,7 @@ async fn attachment_missing_secret_does_not_claim_or_back_off_a_page_of_siblings
     assert_eq!(shared.attachment_transfer.available_permits(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_missing_secret_deferral_is_bounded_and_explicit_retry_readmits() {
     let (_dir, client, storage, reference) = offline_fixture().await;
     assert!(
@@ -838,7 +838,7 @@ fn attachment_explicit_retry_derives_an_uncached_source_epoch_key() {
     });
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_restart_reclaims_inflight_and_late_publication_cannot_win() {
     let (_dir, client, storage, _) = offline_fixture().await;
     let now = crate::unix_now_seconds();
@@ -923,7 +923,7 @@ async fn attachment_restart_reclaims_inflight_and_late_publication_cannot_win() 
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_publication_digest_bug_is_terminal_and_native_default_is_on() {
     assert!(MarmotAppConfig::default().attachment_acquisition.is_some());
     let (_dir, client, storage, _) = offline_fixture().await;
@@ -968,7 +968,7 @@ async fn attachment_publication_digest_bug_is_terminal_and_native_default_is_on(
 mod resume;
 mod storage_block;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_worker_disk_pause_does_not_consume_attempts() {
     let (_dir, mut client, store, _reference) = offline_fixture().await;
     let now = crate::unix_now_seconds();
@@ -1006,7 +1006,7 @@ async fn attachment_worker_disk_pause_does_not_consume_attempts() {
     assert_eq!(shared.attachment_transfer.available_permits(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_cancellation_observation_error_is_not_cancellation() {
     let (_dir, _client, store, _reference) = offline_fixture().await;
     let now = crate::unix_now_seconds();
@@ -1045,7 +1045,7 @@ fn all_attachment_permission() -> crate::AttachmentAutomaticPermission {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_host_managed_requires_demand_and_fences_permission_generations() {
     let (_dir, mut client, storage, reference) = offline_fixture().await;
     assert!(matches!(
@@ -1242,7 +1242,7 @@ async fn attachment_host_managed_requires_demand_and_fences_permission_generatio
 
 /// Explicit promotion detaches automatic permission while retaining the same
 /// transport lease; later deliberate cancellation still stops that attempt.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn promoted_attempt_survives_automatic_revocation_without_extending_lease() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -1347,7 +1347,7 @@ async fn promoted_attempt_survives_automatic_revocation_without_extending_lease(
 }
 
 /// Keep the real incoming GET and verified local read independent of outgoing SQL failures.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_worker_downloads_despite_outgoing_maintenance_failures() {
     download_without_engine_and_retain(false, "received", true).await;
 }
@@ -1370,7 +1370,7 @@ fn retention_fault_connection(app: &MarmotApp) -> rusqlite::Connection {
 }
 
 /// Every core source entry point must commit despite a deterministic optional byte-write failure.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn outgoing_retention_failure_preserves_all_source_projection_paths() {
     let (_dir, client, storage, reference) = offline_fixture().await;
     let connection = retention_fault_connection(&client.app);
@@ -1463,7 +1463,7 @@ async fn outgoing_retention_failure_preserves_all_source_projection_paths() {
 }
 
 /// Deliberate Retry may fetch a replacement even when a pending sibling holds a quarantine marker.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_worker_quarantined_outgoing_retry_downloads_once_and_retains() {
     download_without_engine_and_retain(true, "sent", false).await;
 }
@@ -1658,12 +1658,12 @@ async fn reuse_skips_download_gates(low_disk: bool) {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_reuse_attaches_a_retained_twin_despite_low_disk() {
     reuse_skips_download_gates(true).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_reuse_attaches_a_retained_twin_without_source_epoch_material() {
     reuse_skips_download_gates(false).await;
 }
@@ -1671,7 +1671,7 @@ async fn attachment_reuse_attaches_a_retained_twin_without_source_epoch_material
 /// A media store is created like a database open: refused once storage
 /// closes, even by a caller still holding a database handle, and every store
 /// created before the close is closed with it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn media_stores_close_with_storage_and_are_refused_afterwards() {
     let (_dir, client, storage, _) = offline_fixture().await;
     let media = client.app.account_media_store("alice", &storage).unwrap();
@@ -1684,7 +1684,7 @@ async fn media_stores_close_with_storage_and_are_refused_afterwards() {
 /// A caller still holding a database handle that removal evicted can neither
 /// recreate the account's media store afterwards nor, once the account is
 /// opened again, replace and close the new store.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn evicted_database_handles_cannot_create_or_replace_media_stores() {
     let (_dir, client, stale, _) = offline_fixture().await;
     let app = &client.app;

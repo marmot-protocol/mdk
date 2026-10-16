@@ -102,7 +102,7 @@ mod tests {
     }
 
     /// Exercise the actual account-scoped materialized read, additions, retractions and target guards.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn complete_details_follow_materialized_changes_and_visibility() {
         use crate::MarmotApp;
         use storage_sqlite::StoredAppEvent;

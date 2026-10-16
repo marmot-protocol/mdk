@@ -108,9 +108,9 @@ pub use chat_presentation::{
 #[allow(deprecated)]
 pub use connection::SqliteStorage;
 pub use connection::{
-    CloseableConnection, ConnectionGuard, SqlCipherHardening, SqlCipherKey, SqliteAccountStorage,
-    SqliteJournalMode, SqliteStorageOptions, SqliteSynchronous, SqliteTimingObserver,
-    SqliteTimingOperation, open_hardened_sqlcipher,
+    CloseableConnection, ConnectionGuard, DatabaseCloser, SqlCipherHardening, SqlCipherKey,
+    SqliteAccountStorage, SqliteJournalMode, SqliteStorageOptions, SqliteSynchronous,
+    SqliteTimingObserver, SqliteTimingOperation, open_hardened_sqlcipher,
 };
 pub use message_drafts::{
     ChatListDraftVersion, MessageDraftCommitObserver, MessageDraftRevision,

@@ -274,7 +274,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn presented_list_coalesces_draft_bursts_and_lag_before_reading() {
         for saves in [16, 2048] {
             let dir = tempfile::tempdir().unwrap();
@@ -345,7 +345,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropping_legacy_list_releases_pump_and_expired_mutes_read_correctly() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
@@ -386,7 +386,7 @@ mod tests {
         runtime.shutdown_and_close().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn presented_preparation_observes_worker_progress_and_reports_stalled_work() {
         let dir = tempfile::tempdir().unwrap();
         let account = AccountHome::open(dir.path())
@@ -438,7 +438,7 @@ mod tests {
         assert_eq!(ready, repeat);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn presented_one_shot_warms_and_refreshes_legacy_projection() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
@@ -477,7 +477,7 @@ mod tests {
         runtime.shutdown_and_close().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn presented_list_prepares_offline_and_orders_nonpresentation_updates() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
@@ -560,7 +560,7 @@ mod tests {
         reopened.shutdown_and_close().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn presented_list_lag_recovers_current_selection_without_raw_row_events() {
         let dir = tempfile::tempdir().unwrap();
         let account = AccountHome::open(dir.path())
