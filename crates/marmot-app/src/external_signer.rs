@@ -269,7 +269,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn account_signer_uses_registered_public_key_for_external_accounts() {
         use nostr::prelude::{EventBuilder, Kind};
 
@@ -298,7 +298,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn registered_external_signer_seals_welcomes_and_authenticates() {
         let keys = nostr::prelude::Keys::generate();
         let receiver = nostr::prelude::Keys::generate();

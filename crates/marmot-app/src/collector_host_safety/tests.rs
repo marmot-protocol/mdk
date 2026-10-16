@@ -13,7 +13,7 @@ async fn resolve(endpoint: &str, ips: &[&str]) -> Result<PinnedCollector, Collec
     resolve_with(endpoint, |_, _| async { Ok(ips) }).await
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_https_addresses_are_accepted_and_keep_hostname_port_path_query() {
     let pin = resolve(
         "https://collector.example:8443/custom/metrics?tenant=one%2Ftwo",
@@ -33,7 +33,7 @@ async fn public_https_addresses_are_accepted_and_keep_hostname_port_path_query()
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsafe_or_mixed_dns_rejects_every_attempt() {
     for ip in [
         "127.0.0.1",
@@ -86,7 +86,7 @@ async fn unsafe_or_mixed_dns_rejects_every_attempt() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn literal_ips_use_the_same_classifier_without_dns() {
     for host in [
         "8.8.8.8",
@@ -115,7 +115,7 @@ async fn literal_ips_use_the_same_classifier_without_dns() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loopback_test_hosts_require_exclusively_loopback_resolution() {
     for scheme in ["http", "https"] {
         let endpoint = format!("{scheme}://localhost:4318/v1/metrics");
@@ -148,7 +148,7 @@ async fn loopback_test_hosts_require_exclusively_loopback_resolution() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invalid_structure_never_resolves() {
     for endpoint in [
         "http://public.example/",
@@ -171,7 +171,7 @@ async fn invalid_structure_never_resolves() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resolution_failures_are_privacy_safe() {
     let endpoint = "https://sensitive.example/secret?token=secret-query";
     let errors = [
@@ -206,7 +206,7 @@ async fn resolution_is_deadline_bound() {
     assert_eq!(start.elapsed(), CONNECT_TIMEOUT);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_attempt_resolves_fresh_and_checks_host_and_port() {
     let calls = AtomicUsize::new(0);
     let resolver = |host: String, port| {
@@ -243,7 +243,7 @@ impl reqwest::dns::Resolve for ForbiddenDns {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::disallowed_methods)]
 async fn reqwest_uses_only_pinned_addresses_and_ignores_proxies() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

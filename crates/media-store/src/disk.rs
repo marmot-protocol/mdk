@@ -43,6 +43,16 @@ impl DiskPolicy {
             .saturating_sub(checkpointed)
             .max(body)
     }
+
+    /// The inverse of [`Self::download_need`]: the fewest checkpointed bytes
+    /// with which a download of `body` bytes still writes at most
+    /// `available`, or `None` when even a complete checkpoint leaves too
+    /// little for the store file. The need falls as the checkpoint grows, so
+    /// every larger checkpoint fits too. For filtering many downloads by one
+    /// threshold, as readmission does.
+    pub fn checkpoint_needed(body: u64, available: u64) -> Option<u64> {
+        (available >= body).then(|| body.saturating_mul(2).saturating_sub(available))
+    }
 }
 
 /// Free bytes on the volume holding `path`.
@@ -64,6 +74,23 @@ mod tests {
             policy.admit(199, needed),
             Admission::StorageFull { headroom: 100 }
         );
+    }
+
+    #[test]
+    fn the_checkpoint_threshold_is_exactly_the_need_inverted() {
+        for body in [0, 1, 7, 50, 1 << 20] {
+            for available in [0, 1, body / 2, body, body + 3, 2 * body, 3 * body] {
+                for checkpointed in [0, 1, body / 3, body, 2 * body, 3 * body] {
+                    let fits = DiskPolicy::download_need(body, checkpointed) <= available;
+                    let threshold = DiskPolicy::checkpoint_needed(body, available);
+                    assert_eq!(
+                        fits,
+                        threshold.is_some_and(|needed| checkpointed >= needed),
+                        "body {body} available {available} checkpointed {checkpointed}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

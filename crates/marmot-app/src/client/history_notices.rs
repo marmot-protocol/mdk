@@ -370,7 +370,7 @@ mod tests {
         assert!(client.delivery_loss_blocks_cursor());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn parked_history_surfaces_and_dismissal_retires_exactly_one_occurrence() {
         let dir = tempfile::tempdir().unwrap();
         let app = app(&dir);
@@ -498,7 +498,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn new_loss_makes_a_notice_stale_and_after_dismissal_is_a_new_occurrence() {
         let dir = tempfile::tempdir().unwrap();
         let app = app(&dir);
@@ -552,7 +552,7 @@ mod tests {
         assert_ne!(third.notice_id, first.notice_id);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn runtime_serves_notices_and_dismissals_through_the_account_worker() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = MarmotAppRuntime::new(app(&dir));

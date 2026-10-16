@@ -32,9 +32,11 @@
   `clear_attachment_partial`, `checkpoint_attachment_partial`,
   `load_attachment_partial_to_writer` and `attachment_acquisition_fits_budget`
   are no longer public.
-- `readmit_storage_blocked_attachments` takes the caller's admission rule as a
-  closure over each parked row's recorded checkpoint, in place of the transfer
-  limit, so readmission and worker admission decide the same way.
+- `readmit_storage_blocked_attachments` takes a `ReadmitAdmission` (the
+  recorded-checkpoint threshold the caller's admission rule implies) in place
+  of the transfer limit, so readmission and worker admission decide the same
+  way. It filters by it before limiting its page, so rows admission refuses
+  cannot hide later ones that pass.
 - `read_retained_attachment` returns an error for a body stored as a media file
   (mdk#2314). Use `retained_attachment_read`, which returns legacy database bytes or
   the media file id to read through the media store.

@@ -53,7 +53,7 @@ struct MemberKeyPackagePrewarmEntry {
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn discovery_recovery_refreshes_routes_for_fresh_commit_resolution() {
         let (_directory, app, accounts, fetcher) =
             crate::tests::invite_recovery::discovery_fixture(1).await;
@@ -93,7 +93,7 @@ mod tests {
         assert!(!cache.order.contains(&newest));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn composition_prewarm_route_reuse_preserves_original_freshness_deadline() {
         let (_directory, app, accounts, _fetcher) =
             crate::tests::member_resolution_fixture(1, false).await;

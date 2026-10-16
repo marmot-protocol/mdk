@@ -93,7 +93,7 @@ fn of_obligation<'rows>(rows: &'rows [Value], reference: &Value) -> Vec<&'rows V
         .collect()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loss_charged_at_authorization_records_its_cause_bound_and_count() {
     let mut fixture = fixture().await;
     let floor = unix_now_seconds().saturating_sub(30);
@@ -160,7 +160,7 @@ async fn loss_charged_at_authorization_records_its_cause_bound_and_count() {
     assert_eq!(notification["event"]["charged"], 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn quiet_passes_record_attempts_verdicts_parking_notice_and_dismissal() {
     let mut fixture = fixture().await;
     // No known start: every served comparison finishes, none can certify.
@@ -321,7 +321,7 @@ async fn quiet_passes_record_attempts_verdicts_parking_notice_and_dismissal() {
     assert_eq!(resumed[0]["event"]["charged"], 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_parked_obligation_that_completes_records_closed() {
     let mut fixture = fixture().await;
     fixture
@@ -351,7 +351,7 @@ async fn a_parked_obligation_that_completes_records_closed() {
     assert_eq!(changes, ["recorded", "notice_shown", "closed"]);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn new_loss_during_a_pass_supersedes_it() {
     let mut fixture = fixture().await;
     fixture
@@ -470,7 +470,7 @@ fn cursor_rows_record_settled_advances_and_only_large_live_promotions() {
 /// Explicit full-history repair whose comparison certifies the whole retained
 /// window closes its request (`BelowRetentionWindow`). The window certificate
 /// is progress, not quiet, and the close is its own verdict, never coverage.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explicit_repair_below_the_window_records_a_searched_pass_and_its_close() {
     let mut fixture = fixture().await;
     fixture.client.test_comparison_results = Some(quiet_routes());
@@ -525,7 +525,7 @@ async fn explicit_repair_below_the_window_records_a_searched_pass_and_its_close(
 
 /// A notification lag schedules the relay plane's lost-EOSE repair. The pass
 /// only queues its report; the worker's publication seam records it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lag_lost_eose_repair_pass_is_recorded_at_the_worker_seam() {
     let fixture = fixture().await;
     let plane = fixture.app.relay_plane.clone();
@@ -581,7 +581,7 @@ async fn a_lag_lost_eose_repair_pass_is_recorded_at_the_worker_seam() {
 /// A relay's `CLOSED` of a live subscription is queued by the adapter and
 /// recorded at the worker seam as one `subscription_refused` row, repeats
 /// coalesced, the relay as a hashed reference and no reason text.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_relay_refusal_is_recorded_at_the_worker_seam() {
     let fixture = fixture().await;
     let inbox = fixture

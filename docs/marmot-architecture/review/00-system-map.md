@@ -220,6 +220,9 @@ shows where seams already exist in practice. These are candidates for Pass 1 to 
 
 ## 7. Proposed Pass 1 order
 
+The structural synthesis of the core crates, their mismatches and a target crate map, is in
+[`core-structure.md`](core-structure.md).
+
 1. **B, app runtime concurrency** first. Drafted: [`b-runtime-concurrency.md`](b-runtime-concurrency.md). Themes 1 and 5 and candidates D1 and D3 depend on it, and the single-thread
    question should be settled with a device trace before anything else is redesigned.
 2. **C, storage, and A, the engine**, in parallel. Themes 2, 3 and 4 run through both.

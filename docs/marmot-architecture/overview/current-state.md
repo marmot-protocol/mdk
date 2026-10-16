@@ -333,11 +333,13 @@ variants.
 Generated-account creation now has an explicit durable local-ready entry point. The identity, default profile, setup
 journal, stable KeyPackage slot, private KeyPackage material, and exact signed initial publication are persisted before
 that entry point returns. Bootstrap/profile/KeyPackage publication then continues as restart-resumable background work;
-the compatibility `create_identity` entry point still waits for `NetworkReady`. Hosts using the local-ready entry point
-must honor `AccountSetupReadiness`: `LocalReady` is sufficient for local reads and profile rendering, while only
-`NetworkReady` means the account may be presented as invite-receivable. `Initializing` means local setup has not yet
-reached durable local readiness. `Publishing` includes bounded in-session retry and restart-resumable publication, and
-`RecoveryRequired` requires an explicit recovery flow.
+the compatibility `create_identity` entry point still waits for `NetworkReady`. Until setup completes, its bootstrap
+batch is the only publisher of the account's relay lists; KeyPackage publication never substitutes the app's configured
+relays for the ones the setup request chose. Hosts using the local-ready entry point must honor `AccountSetupReadiness`:
+`LocalReady` is sufficient for local reads and profile rendering, while only `NetworkReady` means the account may be
+presented as invite-receivable. `Initializing` means local setup has not yet reached durable local readiness.
+`Publishing` includes bounded in-session retry and restart-resumable publication, and `RecoveryRequired` requires an
+explicit recovery flow.
 
 ## Known gaps
 

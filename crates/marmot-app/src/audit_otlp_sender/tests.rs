@@ -94,7 +94,7 @@ fn reply(status: u16, body: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exact_original_bodies_and_full_success_advance_after_reacquiring_ownership() {
     let (_dir, active, state, batch) = prepared();
     let token = batch.token.clone();
@@ -161,7 +161,7 @@ async fn exact_original_bodies_and_full_success_advance_after_reacquiring_owners
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn response_contract_classifies_only_exact_200_as_complete() {
     let (_dir, _active, _state, batch) = prepared();
     for (status, body, expected) in [
@@ -203,7 +203,7 @@ async fn response_contract_classifies_only_exact_200_as_complete() {
     assert_eq!(AuditOtlpSendResult::Blocked.for_finish(), None);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parsed_409_blocks_even_if_its_diagnostic_body_is_incomplete_or_stalled() {
     let (_dir, active, state, batch) = prepared();
     let token = batch.token.clone();
@@ -242,7 +242,7 @@ async fn parsed_409_blocks_even_if_its_diagnostic_body_is_incomplete_or_stalled(
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mismatched_destination_never_dials_or_advances_the_source_cursor() {
     let (_dir, active, state, batch) = prepared();
     let token = batch.token.clone();
@@ -268,7 +268,7 @@ async fn mismatched_destination_never_dials_or_advances_the_source_cursor() {
     assert_eq!(replay.bodies, bodies);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authentication_rejection_leaves_the_prepared_range_replayable() {
     let (_dir, active, state, batch) = prepared();
     let token = batch.token.clone();
@@ -287,7 +287,7 @@ async fn authentication_rejection_leaves_the_prepared_range_replayable() {
     assert_eq!(replay.token, token);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lost_or_unreadable_response_keeps_identical_prepared_bodies() {
     let (_dir, active, state, batch) = prepared();
     let original = batch.bodies.clone();
@@ -332,7 +332,7 @@ async fn lost_or_unreadable_response_keeps_identical_prepared_bodies() {
     task.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn timeout_after_acceptance_is_unknown() {
     let (_dir, active, state, batch) = prepared();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

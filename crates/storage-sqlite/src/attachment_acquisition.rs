@@ -1140,7 +1140,7 @@ pub use access::RetainedAttachmentAsset;
 mod controls;
 pub use controls::{
     AttachmentDownloadPolicy, AttachmentTransferFrame, AttachmentTransferState,
-    AttachmentTransferStatus, STORAGE_READMIT_MARGIN_BYTES,
+    AttachmentTransferStatus, ReadmitAdmission, STORAGE_READMIT_MARGIN_BYTES,
 };
 
 mod outgoing;

@@ -138,7 +138,7 @@ async fn collect_new_deliveries(
 
 /// Real departure and disband settlement can outpace projection in a single
 /// collected batch. Neither history projection nor cleanup may require live MLS.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(feature = "test-policy-overrides")]
 async fn real_departure_then_disband_projects_after_mls_deletion() {
     use cgka_traits::engine::GroupStateChange;
@@ -341,7 +341,7 @@ async fn real_departure_then_disband_projects_after_mls_deletion() {
 /// Document the real runtime's terminal boundary: late competing commits cannot
 /// restore a removed copy through normal delivery or convergence retries. The
 /// engine's retained-history rollback test is intentionally a lower-level proof.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn late_competing_commit_cannot_restore_terminal_app_copy() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -545,14 +545,14 @@ fn can_send(client: &AppClient, group: &GroupId) -> bool {
 }
 
 /// A real sibling SelfRemove must not terminate the surviving device's projection.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sibling_selfremove_preserves_surviving_app_device_after_reopen() {
     sibling_selfremove_through_author_command(false).await;
 }
 
 /// A group command can confirm a retained sibling departure before its own
 /// profile update; the command must observe those native effects as well.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn own_group_command_observes_retained_sibling_departure() {
     sibling_selfremove_through_author_command(true).await;
 }
@@ -632,11 +632,15 @@ async fn sibling_selfremove_through_author_command(profile_command: bool) {
         .outbound_fanouts_for_group(&group)
         .unwrap()
         .remove(0);
+    // Hold the retained send for the whole test. An unavailable target retries
+    // a fixed 5 s after its last attempt, which a loaded run can outlast, so
+    // date the attempts an hour ahead.
+    let held_attempt_ms = u64::try_from(notifications::unix_now_ms()).unwrap() + 60 * 60 * 1_000;
     for index in fanout.outstanding_target_indexes() {
         let failure = fanout.target_failure(index).unwrap().clone();
         for _ in 0..6 {
             fanout
-                .mark_attempt_started_at(index, notifications::unix_now_ms().try_into().unwrap())
+                .mark_attempt_started_at(index, held_attempt_ms)
                 .unwrap();
             fanout
                 .record_target_failure(index, failure.clone())
@@ -887,7 +891,7 @@ async fn sibling_selfremove_through_author_command(profile_command: bool) {
 
 /// Projection contract only: native restoration re-enables the existing unread
 /// aggregate without inserting an invitation or changing the read watermark.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_restoration_restores_projection_unread_without_invitation() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
@@ -975,7 +979,7 @@ async fn native_restoration_restores_projection_unread_without_invitation() {
 /// Explicit projection-seam regression: a termination consumed after the engine
 /// already restored its tree must still withdraw purged sends. This is not a
 /// scheduler-driven rollback test; the engine retained-history test owns that proof.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn termination_then_restoration_preserves_failed_sends_and_archive() {
     #[derive(Clone, Copy)]
     enum Observer {
@@ -1145,7 +1149,7 @@ async fn termination_then_restoration_preserves_failed_sends_and_archive() {
 /// The maintenance boundary observes each native recovery transition once,
 /// even though summary construction and membership projection are separate.
 #[cfg(feature = "product-analytics-export")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn maintenance_counts_one_recovery_transition() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -1182,7 +1186,7 @@ async fn maintenance_counts_one_recovery_transition() {
 
 /// A storage failure after the first native event retains the whole drained
 /// batch. Retrying projects the tail without changing the primary publish result.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn partial_native_projection_retries_without_republishing() {
     for (seam, failed_publish) in [
         (0, false),
@@ -1438,7 +1442,7 @@ async fn partial_native_projection_retries_without_republishing() {
 
 /// Failure in the row-synthesis tail must retain the earlier successful write
 /// and retry the remaining row with its original observation timestamp.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn committed_activity_tail_retries_after_storage_failure() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
@@ -1529,7 +1533,7 @@ async fn committed_activity_tail_retries_after_storage_failure() {
 
 /// Independent hydration repairs must not serialize unrelated groups behind a
 /// persistent storage fault or prevent the account's route refresh from finishing.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_push_sweep_does_not_block_other_groups_or_routes() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())
@@ -1621,13 +1625,13 @@ async fn failed_push_sweep_does_not_block_other_groups_or_routes() {
 
 /// A blocked one-shot activity row survives the managed worker's live receive
 /// boundary and is delivered without another engine event or client reopen.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(feature = "test-policy-overrides")]
 async fn managed_worker_keeps_activity_retry_while_live_delivery_waits() {
     assert_managed_worker_retains_activity(false).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn managed_worker_keeps_activity_after_late_checkpoint_failure() {
     assert_managed_worker_retains_activity(true).await;
 }

@@ -139,9 +139,33 @@ fn capacity(
         recorded.saturating_add(media_store::CHECKPOINT_APPEND_MAX as u64)
     });
     let needed = media_store::DiskPolicy::download_need(max, on_disk);
-    max > 0
-        && max <= crate::media::MAX_ENCRYPTED_MEDIA_BLOB_BYTES
-        && disk.admit(free, needed) == media_store::Admission::Admitted
+    admissible_limit(max) && disk.admit(free, needed) == media_store::Admission::Admitted
+}
+
+fn admissible_limit(max: u64) -> bool {
+    max > 0 && max <= crate::media::MAX_ENCRYPTED_MEDIA_BLOB_BYTES
+}
+
+/// [`capacity`] for every parked job at once, as the one checkpoint
+/// threshold readmission filters by before it limits its page: the inverse
+/// of the same need rule, with the same unrecorded-append credit. The two
+/// must agree for every recorded length (see the unit test).
+fn readmit_admission(
+    policy: &storage_sqlite::AttachmentDownloadPolicy,
+    free: u64,
+) -> storage_sqlite::ReadmitAdmission {
+    let max = policy.transfer_limit;
+    let needed = free
+        .checked_sub(policy.disk_reserve)
+        .filter(|_| admissible_limit(max))
+        .and_then(|available| media_store::DiskPolicy::checkpoint_needed(max, available));
+    match needed {
+        Some(needed) => storage_sqlite::ReadmitAdmission {
+            checkpointed_at_least: needed.saturating_sub(media_store::CHECKPOINT_APPEND_MAX as u64),
+            uncheckpointed: needed == 0,
+        },
+        None => storage_sqlite::ReadmitAdmission::NONE,
+    }
 }
 
 async fn cancelled(
@@ -305,7 +329,7 @@ pub(super) fn schedule(
             policy.disk_reserve,
             free,
             policy.automatic,
-            &|recorded| capacity(&policy, policy.transfer_limit, recorded, free),
+            readmit_admission(&policy, free),
         )?,
         None => 0,
     };

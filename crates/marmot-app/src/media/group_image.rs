@@ -435,7 +435,7 @@ mod tests {
         assert!(!debug.contains(&prepared.input.image_upload_key_hex));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn prepared_upload_retry_reuses_exact_ciphertext_and_hash() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -488,7 +488,7 @@ mod tests {
         assert_eq!(observed[0].0, hash);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stalled_prepared_upload_is_cancellable() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());

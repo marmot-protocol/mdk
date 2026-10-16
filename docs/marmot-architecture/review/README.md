@@ -58,11 +58,14 @@ work should target groups within one account, not parallelism across accounts.
 
 ## Plan
 
+Progress on the review, the structural plan and the fixes it produced is tracked in
+[#2360](https://github.com/marmot-protocol/mdk/issues/2360).
+
 | Pass | Output | Status |
 | --- | --- | --- |
-| 0. System map | [`00-system-map.md`](00-system-map.md) plus the `map-*.md` pages it links | Draft complete, under discussion |
-| 1. System reviews | One page per system, A to H below | Drafted: B [`b-runtime-concurrency.md`](b-runtime-concurrency.md), E [`e-transport.md`](e-transport.md) |
-| 2. Synthesis | Ranked findings and an evolve/refactor/rebuild posture per system | Not started |
+| 0. System map | [`00-system-map.md`](00-system-map.md) plus the `map-*.md` pages it links | Done (#2325) |
+| 1. System reviews | One page per system, A to H below | B [`b-runtime-concurrency.md`](b-runtime-concurrency.md) and E [`e-transport.md`](e-transport.md) done (#2325). The other systems are covered by extraction briefs as their steps come up. |
+| 2. Synthesis | Ranked findings and an evolve/refactor/rebuild posture per system | Structural part drafted: [`core-structure.md`](core-structure.md). Extraction briefs: [relay plane](brief-relay-plane.md) |
 
 Pass 1 systems:
 

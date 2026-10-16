@@ -73,7 +73,7 @@ fn signed_deletion(
     NostrTransportEvent::from_nostr_event(&event).unwrap()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_supports_prewarm_and_multi_member_lookup() {
     let (_directory, app, accounts, fetcher) = discovery_fixture(2).await;
     let refs = accounts
@@ -104,7 +104,7 @@ async fn invite_recovery_supports_prewarm_and_multi_member_lookup() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_keeps_advertised_success_free_of_supplementary_reads() {
     let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
     let published = package(&fetcher, &accounts[0]);
@@ -153,7 +153,7 @@ async fn invite_recovery_keeps_advertised_success_free_of_supplementary_reads() 
     }));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_honors_signed_event_and_coordinate_deletions() {
     for name in ["e", "a"] {
         let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
@@ -189,7 +189,7 @@ async fn invite_recovery_honors_signed_event_and_coordinate_deletions() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_keeps_a_newer_package_after_coordinate_deletion() {
     let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
     let account = &accounts[0];
@@ -217,7 +217,7 @@ async fn invite_recovery_keeps_a_newer_package_after_coordinate_deletion() {
         .unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_does_not_revive_a_newer_malformed_or_deleted_slot() {
     for delete_newest in [false, true] {
         let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
@@ -261,7 +261,7 @@ async fn invite_recovery_does_not_revive_a_newer_malformed_or_deleted_slot() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_unknown_coverage_is_retryable_and_can_recover_after_route_repair() {
     let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
     *fetcher.incomplete_endpoint.lock().unwrap() = Some(OUTBOX.into());
@@ -277,7 +277,7 @@ async fn invite_recovery_unknown_coverage_is_retryable_and_can_recover_after_rou
         .unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_direct_lookup_uses_explicit_bootstrap_discovery() {
     let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
     let events = fetcher.events_by_endpoint.lock().unwrap()[DISCOVERY].clone();
@@ -304,7 +304,7 @@ async fn invite_recovery_direct_lookup_uses_explicit_bootstrap_discovery() {
     }));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_ignores_many_unrelated_deletions() {
     let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
     let account = &accounts[0];
@@ -337,7 +337,7 @@ async fn invite_recovery_ignores_many_unrelated_deletions() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_ignores_wrong_author_and_unsigned_deletions() {
     let (_directory, app, accounts, fetcher) = discovery_fixture(2).await;
     let account = &accounts[0];
@@ -368,7 +368,7 @@ async fn invite_recovery_ignores_wrong_author_and_unsigned_deletions() {
         .unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_does_not_resurrect_an_older_slot_after_revoking_its_winner() {
     let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
     let account = &accounts[0];
@@ -396,7 +396,7 @@ async fn invite_recovery_does_not_resurrect_an_older_slot_after_revoking_its_win
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_mixed_batch_preserves_first_failed_recipient() {
     let (_directory, app, accounts, fetcher) = discovery_fixture(3).await;
     {
@@ -417,7 +417,8 @@ async fn invite_recovery_mixed_batch_preserves_first_failed_recipient() {
     );
 }
 
-#[tokio::test]
+// Pauses the clock, which needs the current-thread runtime.
+#[tokio::test(flavor = "current_thread")]
 async fn invite_recovery_direct_lookup_and_membership_share_bounded_waits() {
     for (direct, kind) in [
         (true, KIND_MARMOT_KEY_PACKAGE),
@@ -451,7 +452,8 @@ async fn invite_recovery_direct_lookup_and_membership_share_bounded_waits() {
     }
 }
 
-#[tokio::test]
+// Pauses the clock, which needs the current-thread runtime.
+#[tokio::test(flavor = "current_thread")]
 async fn resolution_deadline_names_the_member_whose_lookup_did_not_finish() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, true).await;
     // Only the first KeyPackage fetch holds; split relays order accounts[0]'s
@@ -479,7 +481,7 @@ async fn resolution_deadline_names_the_member_whose_lookup_did_not_finish() {
     tokio::time::resume();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_cancellation_does_not_admit_an_unverified_package() {
     let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
     let id = accounts[0].account_id_hex.clone();
@@ -507,7 +509,7 @@ async fn invite_recovery_cancellation_does_not_admit_an_unverified_package() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_limits_safe_canonical_supplementary_endpoints() {
     let (_directory, mut app, accounts, fetcher) = discovery_fixture(1).await;
     let id = &accounts[0].account_id_hex;
@@ -566,7 +568,7 @@ async fn invite_recovery_limits_safe_canonical_supplementary_endpoints() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_preserves_only_unrevoked_future_record_cache_fallback() {
     for revoke_cached in [false, true] {
         let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
@@ -624,7 +626,7 @@ async fn invite_recovery_preserves_only_unrevoked_future_record_cache_fallback()
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_group_preflight_keeps_failed_roster_unchanged_and_allows_retry() {
     let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
     let member = &accounts[0];
@@ -673,7 +675,7 @@ async fn invite_recovery_group_preflight_keeps_failed_roster_unchanged_and_allow
     assert_eq!(client.group_mls_state(&group).unwrap().member_count, 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_runtime_ready_account_group_creation_uses_discovery_only_packages() {
     let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
     app.account_home().create_account("creator").unwrap();
@@ -731,7 +733,7 @@ async fn invite_recovery_runtime_ready_account_group_creation_uses_discovery_onl
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_preserves_known_malformed_error_on_incomplete_primary_empty_supplement() {
     let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
     let account = &accounts[0];
@@ -754,7 +756,7 @@ async fn invite_recovery_preserves_known_malformed_error_on_incomplete_primary_e
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_incomplete_supplement_cannot_authorize_a_usable_copy() {
     let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
     *fetcher.incomplete_endpoint.lock().unwrap() = Some(DISCOVERY.into());
@@ -766,7 +768,7 @@ async fn invite_recovery_incomplete_supplement_cannot_authorize_a_usable_copy() 
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_verified_deletion_rejects_despite_other_incomplete_routes() {
     let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
     let account = &accounts[0];
@@ -788,7 +790,7 @@ async fn invite_recovery_verified_deletion_rejects_despite_other_incomplete_rout
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_revoked_preferred_slot_allows_an_independent_survivor() {
     let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
     let account = &accounts[0];
@@ -814,7 +816,7 @@ async fn invite_recovery_revoked_preferred_slot_allows_an_independent_survivor()
     assert_eq!(recovered.key_package_event_id, alternate.id);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_future_only_cache_requires_its_own_completed_deletion_proof() {
     let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
     let account = &accounts[0];
@@ -869,7 +871,7 @@ async fn invite_recovery_future_only_cache_requires_its_own_completed_deletion_p
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_incomplete_negative_without_new_routes_is_unknown() {
     let (_directory, mut app, accounts, fetcher) = discovery_fixture(1).await;
     let id = &accounts[0].account_id_hex;
@@ -892,7 +894,7 @@ async fn invite_recovery_incomplete_negative_without_new_routes_is_unknown() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_candidate_budget_does_not_accept_an_unchecked_survivor() {
     let (_directory, mut app, accounts, fetcher) = discovery_fixture(1).await;
     let account = &accounts[0];
@@ -944,7 +946,7 @@ async fn invite_recovery_candidate_budget_does_not_accept_an_unchecked_survivor(
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_preserves_incompatible_errors_for_empty_and_failed_supplements() {
     let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
     let account = &accounts[0];
@@ -1016,7 +1018,7 @@ async fn invite_recovery_preserves_incompatible_errors_for_empty_and_failed_supp
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_diagnostic_cache_event_ids_are_canonical_or_ineligible() {
     for empty in [false, true] {
         let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
@@ -1171,12 +1173,12 @@ async fn assert_recovery_keeps_checked_candidate_across_clock_boundary(membershi
     }));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_membership_keeps_checked_candidate_across_clock_boundary() {
     assert_recovery_keeps_checked_candidate_across_clock_boundary(true).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_direct_lookup_keeps_checked_candidate_across_clock_boundary() {
     assert_recovery_keeps_checked_candidate_across_clock_boundary(false).await;
 }
@@ -1392,12 +1394,12 @@ async fn assert_recovery_does_not_switch_after_mls_expiry(membership: bool) {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_direct_lookup_does_not_switch_after_mls_expiry() {
     assert_recovery_does_not_switch_after_mls_expiry(false).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_membership_does_not_switch_after_mls_expiry() {
     assert_recovery_does_not_switch_after_mls_expiry(true).await;
 }

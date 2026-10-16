@@ -159,7 +159,7 @@ fn concurrent_first_account_opens_preserve_reopenability() {
     assert_eq!(fs::read(sqlcipher_salt_path(&path)).unwrap(), salt);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn generated_account_attention_waits_for_local_readiness() {
     use crate::{AccountAttentionState, AccountAttentionUnavailable, MarmotAppRuntime};
     let dir = tempfile::tempdir().unwrap();

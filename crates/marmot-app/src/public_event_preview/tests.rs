@@ -519,7 +519,7 @@ fn present_json(read: &PublicEventPreviewRead) -> Event {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_event_preview_cache_round_trips_across_runtime_restart() {
     let relay = MockRelay::run().await.unwrap();
     let keys = Keys::generate();
@@ -662,7 +662,7 @@ async fn public_event_preview_cache_round_trips_across_runtime_restart() {
 /// Deletions the first query cannot attribute are fetched from the verified
 /// author: crowded event-ID answers, an article linked by ID, and an `naddr`
 /// version deleted by ID on another relay.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deletion_follow_ups_reach_the_verified_author() {
     let relay = MockRelay::run().await.unwrap();
     let stale = MockRelay::run().await.unwrap();
@@ -728,7 +728,7 @@ async fn deletion_follow_ups_reach_the_verified_author() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cached_reads_reject_oversized_batches() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())

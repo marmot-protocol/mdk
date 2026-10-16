@@ -303,7 +303,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn spilled_row_stays_until_its_event_is_seen() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
@@ -358,7 +358,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unreadable_receipts_keep_the_row_without_spending_an_attempt() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
@@ -400,7 +400,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failed_spill_read_waits_instead_of_blocking_live_delivery() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
@@ -441,7 +441,7 @@ mod tests {
         assert_eq!(client.next_spilled_delivery().unwrap(), Some(delivery(4)));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failed_undecodable_discard_keeps_a_paced_retry() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
@@ -489,7 +489,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unsettled_hand_off_is_read_again() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
@@ -532,7 +532,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unadmitted_row_becomes_queue_loss_after_its_last_retry() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())

@@ -23,7 +23,7 @@ fn fixture() -> (
     (dir, app, relay, fetcher, target)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_blocks_publication_failure_and_byte_identical_retry() {
     let (_dir, app, relay, fetcher, target) = fixture();
     let runtime = app.runtime();
@@ -87,7 +87,7 @@ async fn user_blocks_publication_failure_and_byte_identical_retry() {
     event.to_verified_nostr_event().unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_blocks_remote_adoption_survives_failed_edit_and_supersedes_uncertain_intent() {
     let (_dir, app, relay, fetcher, target) = fixture();
     let runtime = app.runtime();
@@ -159,7 +159,7 @@ async fn user_blocks_remote_adoption_survives_failed_edit_and_supersedes_uncerta
     assert!(!published.content.contains(&target));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_blocks_concurrent_local_edits_are_serialized() {
     let (_dir, app, _relay, _fetcher, first) = fixture();
     let second = Keys::generate().public_key().to_hex();
@@ -173,7 +173,7 @@ async fn user_blocks_concurrent_local_edits_are_serialized() {
     assert_eq!(runtime.get_blocked_users("alice").unwrap().len(), 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_blocks_unreadable_live_replacement_fences_later_empty_fetch() {
     let (_dir, app, relay, fetcher, target) = fixture();
     let keys = app.account_home().load_signing_keys("alice").unwrap();
@@ -206,7 +206,7 @@ async fn user_blocks_unreadable_live_replacement_fences_later_empty_fetch() {
     assert!(runtime.is_user_blocked("alice", &target).unwrap());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_blocks_restart_reconciles_each_publication_cut() {
     for phase in 0..3 {
         let (dir, app, relay, fetcher, target) = fixture();

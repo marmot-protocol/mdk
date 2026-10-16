@@ -189,7 +189,7 @@ fn empty_malformed_or_too_long_tokens_are_rejected_without_secret_material() {
     assert!(!err.to_string().contains(&too_long));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_token_gossip_normalizes_relay_hint_before_signing_and_storage() {
     let owner = Keys::generate();
     let token_bytes = b"provider-token".to_vec();
@@ -254,7 +254,7 @@ fn kind_446_content_is_bounded_to_32_encrypted_tokens() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn push_chunks_round_trip_at_wire_size_boundary() {
     let server = Keys::generate();
     let tokens = (0..20)
@@ -289,7 +289,7 @@ async fn push_chunks_round_trip_at_wire_size_boundary() {
     assert_eq!(received, tokens.concat());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kind_446_rumor_only_carries_version_tag_and_no_routing_metadata() {
     use nostr::nips::nip59::UnwrappedGift;
 
@@ -2248,7 +2248,7 @@ fn group_state_wake_uses_only_snapshotted_target_tokens() {
     assert_eq!(filtered[0].member_id_hex, bob);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn group_state_wake_keeps_kind_446_context_free() {
     use nostr::nips::nip59::UnwrappedGift;
 

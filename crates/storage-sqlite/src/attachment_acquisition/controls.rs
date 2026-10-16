@@ -49,6 +49,41 @@ pub enum AttachmentTransferState {
 /// Free space beyond a parked job's recorded target before it is readmitted,
 /// so measurement noise cannot flip a row between parked and queued each tick.
 pub const STORAGE_READMIT_MARGIN_BYTES: u64 = 4 * ATTACHMENT_CHECKPOINT_BYTES as u64;
+/// A parked row `q` readmission may requeue: parked for disk space, not
+/// cancelled, allowed by the automatic switch (`?1`), its recorded headroom
+/// within `?2`, and admitted per `?3`/`?4` (see [`ReadmitAdmission`]).
+const READMITTABLE: &str = "state=4 AND storage_blocked_headroom IS NOT NULL AND cancelled=0
+    AND (explicit_request=1 OR ?1) AND storage_blocked_headroom<=?2
+    AND coalesce((SELECT p.received>=?4 FROM attachment_partial p WHERE p.token=q.token),?3)";
+
+/// Which parked jobs worker admission would let start at the current free
+/// space, as one threshold on their recorded checkpoint: worker admission
+/// lowers its need as a checkpoint grows, so it admits exactly the jobs with
+/// at least `checkpointed_at_least` recorded bytes, and jobs without a
+/// checkpoint only when `uncheckpointed`. The caller derives it from its
+/// admission rule; readmission filters by it before limiting its page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadmitAdmission {
+    pub checkpointed_at_least: u64,
+    pub uncheckpointed: bool,
+}
+
+impl ReadmitAdmission {
+    /// No parked job fits.
+    pub const NONE: Self = Self {
+        checkpointed_at_least: u64::MAX,
+        uncheckpointed: false,
+    };
+
+    /// Whether a job with `recorded` checkpoint bytes (or none) is admitted.
+    pub fn admits(&self, recorded: Option<u64>) -> bool {
+        match recorded {
+            Some(recorded) => recorded >= self.checkpointed_at_least,
+            None => self.uncheckpointed,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttachmentTransferStatus {
     pub reference: Option<AttachmentAssetRef>,
@@ -641,24 +676,23 @@ impl SqliteAccountStorage {
 
     /// Readmit at most one bounded page of storage-parked jobs whose recorded
     /// headroom now fits below `free` less the policy reserve and a fixed
-    /// margin, and that `admits` would let start: it is the worker's own
-    /// admission rule, given the row's recorded checkpoint bytes (if it has a
-    /// checkpoint), so a readmitted row is not bounced back to a timer. It
-    /// must be a pure function; it runs inside the transaction. The margin
-    /// keeps measurement noise from flipping a row every tick, and a job that
-    /// parked more than once waits out its park streak (15 s doubling to an
-    /// hour) before it is due again, so free space that oscillates around a
-    /// target cannot drive a hot loop. Checkpoints get a fresh idle expiry;
-    /// cancelled work, size-policy blocks and, while automatic acquisition is
-    /// disabled, automatic rows stay parked. Nothing is written when no row
-    /// fits.
+    /// margin, and that worker admission would let start, as `admission`
+    /// states it. Both filters apply before the page is limited, so rows that
+    /// fail admission cannot hide later ones that pass. A readmitted row is
+    /// then not bounced back to a timer. The margin keeps measurement noise
+    /// from flipping a row every tick, and a job that parked more than once
+    /// waits out its park streak (15 s doubling to an hour) before it is due
+    /// again, so free space that oscillates around a target cannot drive a
+    /// hot loop. Checkpoints get a fresh idle expiry; cancelled work,
+    /// size-policy blocks and, while automatic acquisition is disabled,
+    /// automatic rows stay parked. Nothing is written when no row fits.
     pub fn readmit_storage_blocked_attachments(
         &self,
         now: u64,
         disk_reserve: u64,
         free: u64,
         automatic: bool,
-        admits: &dyn Fn(Option<u64>) -> bool,
+        admission: ReadmitAdmission,
     ) -> StorageResult<usize> {
         let Some(headroom) =
             free.checked_sub(disk_reserve.saturating_add(STORAGE_READMIT_MARGIN_BYTES))
@@ -666,44 +700,38 @@ impl SqliteAccountStorage {
             return Ok(0);
         };
         let headroom = u64_to_i64(headroom.min(i64::MAX as u64))?;
+        let checkpointed = u64_to_i64(admission.checkpointed_at_least.min(i64::MAX as u64))?;
+        let params = params![
+            automatic,
+            headroom,
+            admission.uncheckpointed,
+            checkpointed,
+            ATTACHMENT_ACQUISITION_BATCH_LIMIT as i64
+        ];
         // The common tick is a read-only index probe for a row that fits.
-        let fits: bool = self.lock()?.query_row(
-            "SELECT EXISTS(SELECT 1 FROM attachment_acquisition WHERE state=4 AND storage_blocked_headroom IS NOT NULL
-                AND cancelled=0 AND (explicit_request=1 OR ?1) AND storage_blocked_headroom<=?2)",
-            params![automatic, headroom], |row| row.get(0),
-        ).storage()?;
+        let fits: bool = self
+            .lock()?
+            .query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM attachment_acquisition q WHERE {READMITTABLE} LIMIT ?5)"),
+                params,
+                |row| row.get(0),
+            )
+            .storage()?;
         if !fits {
             return Ok(0);
         }
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            let rows: Vec<(Vec<u8>, Option<u64>)> = conn
-                .prepare(
-                    "SELECT q.token,(SELECT p.received FROM attachment_partial p WHERE p.token=q.token)
-                    FROM attachment_acquisition q
-                    WHERE state=4 AND storage_blocked_headroom IS NOT NULL AND cancelled=0
-                    AND (explicit_request=1 OR ?1) AND storage_blocked_headroom<=?2
-                    ORDER BY priority_at DESC,token LIMIT ?3",
-                )
+            let tokens: Vec<Vec<u8>> = conn
+                .prepare(&format!(
+                    "SELECT token FROM attachment_acquisition q WHERE {READMITTABLE}
+                    ORDER BY priority_at DESC,token LIMIT ?5"
+                ))
                 .storage()?
-                .query_map(
-                    params![automatic, headroom, ATTACHMENT_ACQUISITION_BATCH_LIMIT as i64],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get::<_, Option<i64>>(1)?
-                                .map(|received| received.max(0) as u64),
-                        ))
-                    },
-                )
+                .query_map(params, |row| row.get(0))
                 .storage()?
                 .collect::<Result<_, _>>()
                 .storage()?;
-            let tokens: Vec<Vec<u8>> = rows
-                .into_iter()
-                .filter(|(_, checkpointed)| admits(*checkpointed))
-                .map(|(token, _)| token)
-                .collect();
             for token in &tokens {
                 conn.execute(
                     "UPDATE attachment_acquisition SET state=0,storage_blocked_headroom=NULL,

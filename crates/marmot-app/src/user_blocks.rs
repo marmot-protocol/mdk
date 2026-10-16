@@ -331,7 +331,7 @@ mod tests {
     use super::*;
     use nostr::prelude::FinalizeEvent;
     use transport_nostr_peeler::MarmotNostrSigner;
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn user_blocks_private_legacy_interop_and_unreadable_event_preserves_state() {
         let dir = tempfile::tempdir().unwrap();
         let app = MarmotApp::with_relays(dir.path(), vec![]);

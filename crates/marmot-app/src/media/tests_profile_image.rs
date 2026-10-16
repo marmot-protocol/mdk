@@ -24,7 +24,7 @@ fn localhost_url(raw: &str) -> String {
     url.into()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn download_profile_image_rejects_loopback_literal_before_network() {
     let err = download_profile_image("https://127.0.0.1/avatar.png".to_owned(), 1024)
         .await
@@ -213,7 +213,7 @@ fn profile_image_vet_resolved_addresses_rejects_private_before_dial() {
     assert!(matches!(err, AppError::UnsafeMediaFetch(_)));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn download_profile_image_follows_redirect_to_local_listener() {
     let final_server = localhost_url(&spawn_http_response(http_ok_response(b"avatar-bytes")));
     let final_url = format!("{final_server}/avatar.png");
@@ -228,7 +228,7 @@ async fn download_profile_image_follows_redirect_to_local_listener() {
     assert_eq!(bytes, b"avatar-bytes");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pinned_media_client_ignores_configured_proxy() {
     let origin_url = spawn_http_response(http_ok_response(b"direct-origin"));
     let origin = Url::parse(&origin_url).expect("origin listener URL");
@@ -256,7 +256,7 @@ async fn pinned_media_client_ignores_configured_proxy() {
     assert_eq!(body.as_ref(), b"direct-origin");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn download_profile_image_rejects_redirect_chain_over_limit() {
     let responses = (0..6)
         .map(|idx| http_redirect_response(&format!("/hop-{idx}/avatar.png")))
@@ -274,7 +274,7 @@ async fn download_profile_image_rejects_redirect_chain_over_limit() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn download_profile_image_classifies_unsafe_redirect_before_dial() {
     let redirecting_server = localhost_url(&spawn_http_response(http_redirect_response(
         "https://127.0.0.1/avatar.png",
@@ -288,7 +288,7 @@ async fn download_profile_image_classifies_unsafe_redirect_before_dial() {
     assert!(matches!(err, AppError::UnsafeMediaFetch(_)));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn download_profile_image_bounds_raw_redirect_before_normalization() {
     let raw_location = format!(
         "/{}/avatar.png",
@@ -309,7 +309,7 @@ async fn download_profile_image_bounds_raw_redirect_before_normalization() {
     assert!(matches!(err, AppError::UnsafeMediaFetch(_)));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::disallowed_methods)]
 async fn profile_image_shared_reader_bounds_content_length_and_chunked_to_caller_max() {
     let caller_max = 5_u64;
@@ -347,7 +347,7 @@ async fn profile_image_shared_reader_bounds_content_length_and_chunked_to_caller
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsafe_profile_url_maps_to_unsafe_media_fetch_not_blob_store() {
     let err = download_profile_image("https://127.0.0.1/avatar.png".into(), 1024)
         .await
@@ -355,7 +355,7 @@ async fn unsafe_profile_url_maps_to_unsafe_media_fetch_not_blob_store() {
     assert!(matches!(err, AppError::UnsafeMediaFetch(_)));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dns_operational_failure_stays_blob_store_for_retryable_runtime() {
     let err = download_profile_image(
         "https://this-host-should-not-resolve.invalid.test/avatar.png".into(),

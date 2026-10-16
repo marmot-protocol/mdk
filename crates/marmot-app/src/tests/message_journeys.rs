@@ -95,7 +95,7 @@ impl NostrRelayClient for CrashRelay {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn message_journey_crash_child() {
     let Some(root) = std::env::var_os(CHILD_ROOT) else {
         return;
@@ -129,7 +129,7 @@ async fn message_journey_crash_child() {
     panic!("crash boundary was not reached");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn message_journey_crash_reopen() {
     for phase in ["projection", "durable", "relay", "response"] {
         let root = tempfile::tempdir().unwrap();
@@ -230,7 +230,7 @@ async fn message_journey_crash_reopen() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn message_journey_queue_cancel() {
     let root = tempfile::tempdir().unwrap();
     AccountHome::open(root.path())
