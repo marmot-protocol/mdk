@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use cgka_conformance_simulator::ScenarioMessageSelectorV2;
 use cgka_conformance_simulator::process_orchestrator::{
@@ -16,7 +15,6 @@ use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
-use tokio::time::{Instant, sleep};
 
 const PUBLICATION_LOG: &str = "publication-log.v1.jsonl";
 const HIDDEN_EVENTS: &str = "hidden-events";
@@ -213,6 +211,20 @@ impl FileProcessRelayControl {
         }
         Ok(publications)
     }
+
+    fn publications_since(
+        &self,
+        before: usize,
+    ) -> Result<Vec<RelayPublicationV1>, ProcessRelayControlError> {
+        let mut publications = self.read_publications()?;
+        if before > publications.len() {
+            return Err(control_error(
+                "relay_publication_cursor_invalid",
+                "the retained relay publication cursor moved backwards",
+            ));
+        }
+        Ok(publications.split_off(before))
+    }
 }
 
 #[async_trait::async_trait]
@@ -221,76 +233,45 @@ impl ProcessRelayControl for FileProcessRelayControl {
         Ok(self.read_publications()?.len())
     }
 
-    async fn wait_for_action_events(
+    async fn action_publication_tokens(
+        &self,
+        before: usize,
+        include_welcomes: bool,
+    ) -> Result<Vec<String>, ProcessRelayControlError> {
+        Ok(self
+            .publications_since(before)?
+            .into_iter()
+            .filter(|event| event.is_addressable(include_welcomes))
+            .map(|event| event.event_token)
+            .collect())
+    }
+
+    fn publication_token(&self, event_id: &str) -> String {
+        opaque_event_token(&self.secret, event_id)
+    }
+
+    async fn record_action_publications(
         &self,
         action_id: &str,
         before: usize,
         include_welcomes: bool,
-        expected_publications: usize,
-        expected_event_ids: &[String],
-        timeout: Duration,
+        tokens: &BTreeSet<String>,
     ) -> Result<(), ProcessRelayControlError> {
-        if expected_event_ids.len() > expected_publications {
-            return Err(control_error(
-                "relay_action_publication_identity_count_mismatch",
-                "the action's expected relay event ids do not match its publication count",
-            ));
-        }
-        let expected_event_tokens = expected_event_ids
-            .iter()
-            .map(|event_id| opaque_event_token(&self.secret, event_id))
-            .collect::<BTreeSet<_>>();
-        let deadline = Instant::now() + timeout;
-        loop {
-            let publication_log = self.read_publications()?;
-            if before > publication_log.len() {
-                return Err(control_error(
-                    "relay_publication_cursor_invalid",
-                    "the retained relay publication cursor moved backwards",
-                ));
-            }
-            let events = publication_log[before..]
-                .iter()
-                .filter(|event| event.is_addressable(include_welcomes))
-                .cloned()
-                .collect::<Vec<_>>();
-            let observed_event_tokens = events
-                .iter()
-                .map(|event| event.event_token.clone())
-                .collect::<BTreeSet<_>>();
-            if expected_event_tokens.len() == expected_publications
-                && observed_event_tokens
-                    .iter()
-                    .any(|event_token| !expected_event_tokens.contains(event_token))
-            {
-                return Err(control_error(
-                    "relay_action_publication_identity_mismatch",
-                    "a retained relay event admitted after the action cursor was not published by that action",
-                ));
-            }
-            if events.len() == expected_publications
-                && expected_event_tokens.is_subset(&observed_event_tokens)
-            {
-                self.action_events
-                    .lock()
-                    .await
-                    .insert(action_id.to_owned(), events);
-                return Ok(());
-            }
-            if events.len() > expected_publications {
-                return Err(control_error(
-                    "relay_action_publication_count_mismatch",
-                    "the process action published more retained relay events than expected",
-                ));
-            }
-            if Instant::now() >= deadline {
-                return Err(control_error(
-                    "relay_action_publication_timeout",
-                    "the action's expected retained relay publications were not admitted before the deadline",
-                ));
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
+        let mut seen = BTreeSet::new();
+        let events = self
+            .publications_since(before)?
+            .into_iter()
+            .filter(|event| {
+                event.is_addressable(include_welcomes)
+                    && tokens.contains(&event.event_token)
+                    && seen.insert(event.event_token.clone())
+            })
+            .collect::<Vec<_>>();
+        self.action_events
+            .lock()
+            .await
+            .insert(action_id.to_owned(), events);
+        Ok(())
     }
 
     async fn set_action_event_visibility(
@@ -404,15 +385,16 @@ mod tests {
         fs_private::write_private(&root.path().join(PUBLICATION_LOG), &bytes).unwrap();
 
         assert_eq!(control.publication_cursor().await.unwrap(), 2);
+        let tokens = control.action_publication_tokens(0, true).await.unwrap();
+        assert_eq!(
+            tokens,
+            [
+                control.publication_token("group-event"),
+                control.publication_token("welcome-event"),
+            ]
+        );
         control
-            .wait_for_action_events(
-                "step-1:invite",
-                0,
-                true,
-                2,
-                &["group-event".into(), "welcome-event".into()],
-                Duration::from_millis(10),
-            )
+            .record_action_publications("step-1:invite", 0, true, &tokens.into_iter().collect())
             .await
             .unwrap();
 
@@ -435,30 +417,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_control_rejects_unattributed_publications() {
+    async fn file_control_attributes_only_the_action_publications() {
         let root = tempfile::tempdir().unwrap();
         let control = FileProcessRelayControl::new(root.path()).unwrap();
-        let unexpected_token = opaque_event_token(&control.secret, "unexpected-event");
-        let mut bytes = serde_json::to_vec(&publication(
-            &unexpected_token,
-            RelayPublicationClassV1::GroupMessage,
-        ))
-        .unwrap();
-        bytes.push(b'\n');
+        let records = [
+            publication(
+                &control.publication_token("unrelated-event"),
+                RelayPublicationClassV1::GroupMessage,
+            ),
+            publication(
+                &control.publication_token("welcome-event"),
+                RelayPublicationClassV1::Welcome,
+            ),
+            publication(
+                &control.publication_token("action-event"),
+                RelayPublicationClassV1::GroupMessage,
+            ),
+        ];
+        let bytes = records
+            .iter()
+            .flat_map(|record| {
+                let mut line = serde_json::to_vec(record).unwrap();
+                line.push(b'\n');
+                line
+            })
+            .collect::<Vec<_>>();
         fs_private::write_private(&root.path().join(PUBLICATION_LOG), &bytes).unwrap();
 
-        let error = control
-            .wait_for_action_events(
+        assert_eq!(
+            control.action_publication_tokens(1, false).await.unwrap(),
+            [control.publication_token("action-event")]
+        );
+        assert_eq!(
+            control
+                .action_publication_tokens(4, false)
+                .await
+                .unwrap_err()
+                .code,
+            "relay_publication_cursor_invalid"
+        );
+        let action_token = control.publication_token("action-event");
+        control
+            .record_action_publications(
                 "step-1:send_app_message",
                 0,
                 false,
-                1,
-                &["expected-event".into()],
-                Duration::from_millis(10),
+                &BTreeSet::from([action_token.clone()]),
             )
             .await
-            .unwrap_err();
-        assert_eq!(error.code, "relay_action_publication_identity_mismatch");
+            .unwrap();
+        let action_events = control.action_events.lock().await;
+        let recorded = action_events["step-1:send_app_message"]
+            .iter()
+            .map(|event| event.event_token.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(recorded, [action_token.as_str()]);
     }
 
     #[test]

@@ -19,9 +19,7 @@ use crate::node_protocol::{
     NODE_OBSERVATION_SCHEMA_VERSION, NODE_PROTOCOL_VERSION, NodeCommandV1, NodeErrorV1,
     NodeFailureCapsuleV1, NodeObservationV1, NodeRequestV1, NodeResponseBodyV1, NodeResponseV1,
 };
-use crate::relay_control::{
-    RELAY_ACTION_PUBLICATION_TIMEOUT, RelayActionEvents, RelayActionExpectation,
-};
+use crate::relay_control::{RELAY_ACTION_PUBLICATION_TIMEOUT, RelayActionEvents};
 use crate::{
     CompiledScenarioV2, ResolvedScenarioInputV1, ScenarioActionScheduleV2,
     ScenarioInputProvenanceV1, ScenarioRelaySyncModeV2, ScenarioSpec, ScenarioStep,
@@ -75,14 +73,31 @@ pub struct ProcessRelayControlError {
 pub trait ProcessRelayControl: Send + Sync {
     async fn publication_cursor(&self) -> Result<usize, ProcessRelayControlError>;
 
-    async fn wait_for_action_events(
+    /// Identities of the group-message (and, with `include_welcomes`,
+    /// Welcome) publications admitted since `before`, in admission order.
+    /// Never waits. Identities are opaque, but one event must have the same
+    /// identity on every control handed to one orchestrator, because a
+    /// publisher stops at its acknowledgement quorum and an action's
+    /// publications are complete only across the union of its relays.
+    async fn action_publication_tokens(
+        &self,
+        before: usize,
+        include_welcomes: bool,
+    ) -> Result<Vec<String>, ProcessRelayControlError>;
+
+    /// The identity [`Self::action_publication_tokens`] reports for a Nostr
+    /// event id.
+    fn publication_token(&self, event_id: &str) -> String;
+
+    /// Attribute to `action_id` exactly the publications admitted since
+    /// `before` whose identities are in `tokens`, in admission order, so
+    /// action selectors address only what this relay actually retained.
+    async fn record_action_publications(
         &self,
         action_id: &str,
         before: usize,
         include_welcomes: bool,
-        expected_publications: usize,
-        expected_event_ids: &[String],
-        timeout: Duration,
+        tokens: &BTreeSet<String>,
     ) -> Result<(), ProcessRelayControlError>;
 
     async fn set_action_event_visibility(
@@ -121,29 +136,39 @@ impl ProcessRelayControl for LocalProcessRelayControl {
             .map_err(process_relay_control_error_value)
     }
 
-    async fn wait_for_action_events(
+    async fn action_publication_tokens(
+        &self,
+        before: usize,
+        include_welcomes: bool,
+    ) -> Result<Vec<String>, ProcessRelayControlError> {
+        self.control
+            .action_publication_ids(before, include_welcomes)
+            .await
+            .map_err(process_relay_control_error_value)
+    }
+
+    fn publication_token(&self, event_id: &str) -> String {
+        event_id.to_owned()
+    }
+
+    async fn record_action_publications(
         &self,
         action_id: &str,
         before: usize,
         include_welcomes: bool,
-        expected_publications: usize,
-        expected_event_ids: &[String],
-        timeout: Duration,
+        tokens: &BTreeSet<String>,
     ) -> Result<(), ProcessRelayControlError> {
         let mut action_events = self.action_events.lock().await;
         self.control
-            .wait_for_action_events(
+            .record_action_publication_ids(
                 &mut action_events,
                 action_id,
                 before,
-                RelayActionExpectation {
-                    include_welcomes,
-                    expected_publications,
-                    expected_event_ids,
-                    timeout,
-                },
+                include_welcomes,
+                tokens,
             )
             .await
+            .map(|_| ())
             .map_err(process_relay_control_error_value)
     }
 
@@ -294,6 +319,10 @@ pub struct ProcessOrchestrator {
     executed_scenario_ir_sha256: String,
     expected_outcomes: Vec<TraceExpectation>,
     accepted_publications: BTreeMap<String, BTreeSet<String>>,
+    /// Relay publication identities already attributed to an earlier action.
+    /// A relay that lost an action's quorum race can still admit its copy
+    /// later; that copy must not count toward the next action.
+    attributed_relay_publications: BTreeSet<String>,
 }
 
 struct NodeProcess {
@@ -474,6 +503,7 @@ impl ProcessOrchestrator {
             executed_scenario_ir_sha256,
             expected_outcomes: Vec::new(),
             accepted_publications: BTreeMap::new(),
+            attributed_relay_publications: BTreeSet::new(),
         };
         for client in &clients {
             orchestrator.launch_participant(client, "launch").await?;
@@ -654,6 +684,7 @@ impl ProcessOrchestrator {
         expected_publications: usize,
         expected_event_ids: &[String],
     ) -> Result<(), ProcessOrchestratorError> {
+        let mut controls = Vec::with_capacity(cursors.len());
         for (relay, before) in cursors {
             let control = self.relay_controls.get(&relay).ok_or_else(|| {
                 ProcessOrchestratorError::new(
@@ -661,23 +692,73 @@ impl ProcessOrchestrator {
                     "the process adapter does not own the selected relay control",
                 )
             })?;
-            // A node acknowledges its command after the durable app-runtime
-            // mutation, while the Nostr transport may still be admitting the
-            // resulting events on the relay task. Wait for the action's known
-            // publication count so a delayed Welcome cannot be omitted from
-            // this action or admitted after the next action's cursor.
+            controls.push((Arc::clone(control), before));
+        }
+        let Some((first, _)) = controls.first() else {
+            return Ok(());
+        };
+        if expected_event_ids.len() > expected_publications {
+            return Err(ProcessOrchestratorError::new(
+                "relay_action_publication_identity_count_mismatch",
+                "the action's expected relay event ids do not match its publication count",
+            ));
+        }
+        let expected_tokens = expected_event_ids
+            .iter()
+            .map(|event_id| first.publication_token(event_id))
+            .collect::<BTreeSet<_>>();
+        // A node acknowledges its command after the durable app-runtime
+        // mutation, while the Nostr transport may still be admitting the
+        // resulting events. The transport also stops at its acknowledgement
+        // quorum and abandons the slower relays, so one relay may never retain
+        // a publication another relay already holds. Wait until the union of
+        // the action's relays holds the known publication count, so a delayed
+        // Welcome cannot be omitted from this action or counted by the next.
+        let deadline = tokio::time::Instant::now() + RELAY_ACTION_PUBLICATION_TIMEOUT;
+        let action_tokens = loop {
+            let mut admitted = BTreeSet::new();
+            for (control, before) in &controls {
+                admitted.extend(
+                    control
+                        .action_publication_tokens(*before, include_welcomes)
+                        .await
+                        .map_err(process_relay_control_error)?
+                        .into_iter()
+                        .filter(|token| !self.attributed_relay_publications.contains(token)),
+                );
+            }
+            if expected_tokens.len() == expected_publications
+                && !admitted.is_subset(&expected_tokens)
+            {
+                return Err(ProcessOrchestratorError::new(
+                    "relay_action_publication_identity_mismatch",
+                    "a retained relay event admitted after the action cursor was not published by that action",
+                ));
+            }
+            if admitted.len() == expected_publications && expected_tokens.is_subset(&admitted) {
+                break admitted;
+            }
+            if admitted.len() > expected_publications {
+                return Err(ProcessOrchestratorError::new(
+                    "relay_action_publication_count_mismatch",
+                    "the process action published more retained relay events than expected",
+                ));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ProcessOrchestratorError::new(
+                    "relay_action_publication_timeout",
+                    "the action's expected retained relay publications were not admitted before the deadline",
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        for (control, before) in &controls {
             control
-                .wait_for_action_events(
-                    action_id,
-                    before,
-                    include_welcomes,
-                    expected_publications,
-                    expected_event_ids,
-                    RELAY_ACTION_PUBLICATION_TIMEOUT,
-                )
+                .record_action_publications(action_id, *before, include_welcomes, &action_tokens)
                 .await
                 .map_err(process_relay_control_error)?;
         }
+        self.attributed_relay_publications.extend(action_tokens);
         Ok(())
     }
 
@@ -2208,6 +2289,7 @@ mod tests {
             executed_scenario_ir_sha256: String::new(),
             expected_outcomes: Vec::new(),
             accepted_publications: BTreeMap::new(),
+            attributed_relay_publications: BTreeSet::new(),
         };
         let report = orchestrator.run().await.unwrap();
         let path = artifacts.path().join("report.json");
@@ -2371,5 +2453,181 @@ mod tests {
             .expect_err("arbitrary virtual-time actions remain unsupported");
         assert_eq!(error.kind, "unsupported_subject_capability");
         assert_eq!(error.step_index, Some(0));
+    }
+
+    /// In-memory retained relay: `(identity, is_welcome)` in admission order.
+    #[derive(Default)]
+    struct FakeRelayControl {
+        log: std::sync::Mutex<Vec<(String, bool)>>,
+        recorded: std::sync::Mutex<BTreeMap<String, Vec<String>>>,
+    }
+
+    impl FakeRelayControl {
+        fn admit(&self, token: &str, welcome: bool) {
+            self.log.lock().unwrap().push((token.into(), welcome));
+        }
+
+        fn recorded(&self, action_id: &str) -> Vec<String> {
+            self.recorded.lock().unwrap()[action_id].clone()
+        }
+
+        fn since(&self, before: usize, include_welcomes: bool) -> Vec<String> {
+            self.log.lock().unwrap()[before..]
+                .iter()
+                .filter(|(_, welcome)| include_welcomes || !welcome)
+                .map(|(token, _)| token.clone())
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessRelayControl for FakeRelayControl {
+        async fn publication_cursor(&self) -> Result<usize, ProcessRelayControlError> {
+            Ok(self.log.lock().unwrap().len())
+        }
+
+        async fn action_publication_tokens(
+            &self,
+            before: usize,
+            include_welcomes: bool,
+        ) -> Result<Vec<String>, ProcessRelayControlError> {
+            Ok(self.since(before, include_welcomes))
+        }
+
+        fn publication_token(&self, event_id: &str) -> String {
+            event_id.to_owned()
+        }
+
+        async fn record_action_publications(
+            &self,
+            action_id: &str,
+            before: usize,
+            include_welcomes: bool,
+            tokens: &BTreeSet<String>,
+        ) -> Result<(), ProcessRelayControlError> {
+            let events = self
+                .since(before, include_welcomes)
+                .into_iter()
+                .filter(|token| tokens.contains(token))
+                .collect();
+            self.recorded
+                .lock()
+                .unwrap()
+                .insert(action_id.into(), events);
+            Ok(())
+        }
+
+        async fn set_action_event_visibility(
+            &self,
+            _selector: &crate::ScenarioMessageSelectorV2,
+            _visible: bool,
+        ) -> Result<(), ProcessRelayControlError> {
+            unreachable!("relay attribution never changes visibility")
+        }
+    }
+
+    fn relay_attribution_orchestrator(
+        controls: &[(&str, Arc<FakeRelayControl>)],
+    ) -> ProcessOrchestrator {
+        let spec = ScenarioSpec {
+            name: "relay-attribution".into(),
+            spec_version: "2".into(),
+            clients: vec!["alice".into()],
+            topology: Default::default(),
+            steps: vec![ScenarioStep::DeliverAll],
+        };
+        ProcessOrchestrator {
+            node_launch: ProcessNodeLaunchV1::executable(Path::new("/bin/sh")),
+            run_root: tempfile::tempdir().unwrap(),
+            artifact_directory: PathBuf::new(),
+            compiled: compile_scenario(&spec).unwrap(),
+            relay_controls: controls
+                .iter()
+                .map(|(label, control)| {
+                    (
+                        (*label).to_owned(),
+                        Arc::clone(control) as Arc<dyn ProcessRelayControl>,
+                    )
+                })
+                .collect(),
+            relay_urls: BTreeMap::new(),
+            nodes: BTreeMap::new(),
+            account_ids: BTreeMap::new(),
+            processes: BTreeMap::new(),
+            process_relays: BTreeMap::new(),
+            groups: BTreeMap::new(),
+            offline_observations: BTreeMap::new(),
+            lifecycle: Vec::new(),
+            input_provenance: None,
+            executed_scenario_ir_sha256: String::new(),
+            expected_outcomes: Vec::new(),
+            accepted_publications: BTreeMap::new(),
+            attributed_relay_publications: BTreeSet::new(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_attribution_accepts_publications_held_by_only_part_of_the_quorum() {
+        let relay_a = Arc::new(FakeRelayControl::default());
+        let relay_b = Arc::new(FakeRelayControl::default());
+        let mut orchestrator = relay_attribution_orchestrator(&[
+            ("relay:a", Arc::clone(&relay_a)),
+            ("relay:b", Arc::clone(&relay_b)),
+        ]);
+        let cursors = |a: usize, b: usize| {
+            BTreeMap::from([("relay:a".to_owned(), a), ("relay:b".to_owned(), b)])
+        };
+
+        // The Welcome met its one-relay quorum on relay:a; the transport
+        // abandoned its relay:b send, so relay:b never retained it.
+        relay_a.admit("welcome", true);
+        orchestrator
+            .record_relay_action_events("create", cursors(0, 0), true, 1, &[])
+            .await
+            .unwrap();
+        assert_eq!(relay_a.recorded("create"), ["welcome"]);
+        assert!(relay_b.recorded("create").is_empty());
+
+        // The abandoned copy lands on relay:b after the next action's cursor
+        // and must not count toward that action.
+        relay_b.admit("welcome", true);
+        relay_b.admit("commit", false);
+        orchestrator
+            .record_relay_action_events("invite", cursors(1, 0), true, 1, &["commit".into()])
+            .await
+            .unwrap();
+        assert!(relay_a.recorded("invite").is_empty());
+        assert_eq!(relay_b.recorded("invite"), ["commit"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_attribution_still_rejects_missing_extra_and_foreign_publications() {
+        let relay_a = Arc::new(FakeRelayControl::default());
+        let relay_b = Arc::new(FakeRelayControl::default());
+        let mut orchestrator = relay_attribution_orchestrator(&[
+            ("relay:a", Arc::clone(&relay_a)),
+            ("relay:b", Arc::clone(&relay_b)),
+        ]);
+        let cursors = || BTreeMap::from([("relay:a".to_owned(), 0), ("relay:b".to_owned(), 0)]);
+
+        let missing = orchestrator
+            .record_relay_action_events("missing", cursors(), false, 1, &[])
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code, "relay_action_publication_timeout");
+
+        relay_a.admit("foreign", false);
+        let foreign = orchestrator
+            .record_relay_action_events("foreign", cursors(), false, 1, &["expected".into()])
+            .await
+            .unwrap_err();
+        assert_eq!(foreign.code, "relay_action_publication_identity_mismatch");
+
+        relay_b.admit("second", false);
+        let extra = orchestrator
+            .record_relay_action_events("extra", cursors(), false, 1, &[])
+            .await
+            .unwrap_err();
+        assert_eq!(extra.code, "relay_action_publication_count_mismatch");
     }
 }

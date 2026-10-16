@@ -4,6 +4,7 @@ use crate::relay_control::{RelayActionEvents, RelayActionExpectation, RelayContr
 use crate::{ScenarioMessageSelectorV2, SubjectError};
 use nostr_relay_builder::LocalRelay;
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -204,6 +205,47 @@ impl RelayBackend {
                 .map_err(|e| e.subject()),
         }
     }
+    /// Admitted action-addressable event ids since `before`; never waits.
+    pub async fn action_publication_ids(
+        &self,
+        before: usize,
+        include_welcomes: bool,
+    ) -> Result<Vec<String>, SubjectError> {
+        match self {
+            Self::Local(c) => c
+                .action_publication_ids(before, include_welcomes)
+                .await
+                .map_err(super::relay_control_error),
+            Self::Remote(p) => p
+                .client
+                .call_async("action_publication_ids", json!([before, include_welcomes]))
+                .await
+                .map_err(|e| e.subject()),
+        }
+    }
+    pub async fn record_action_publication_ids(
+        &self,
+        events: &mut RelayActionEvents,
+        action: &str,
+        before: usize,
+        include_welcomes: bool,
+        event_ids: &BTreeSet<String>,
+    ) -> Result<usize, SubjectError> {
+        match self {
+            Self::Local(c) => c
+                .record_action_publication_ids(events, action, before, include_welcomes, event_ids)
+                .await
+                .map_err(super::relay_control_error),
+            Self::Remote(p) => p
+                .client
+                .call_async(
+                    "record_action_publication_ids",
+                    json!([action, before, include_welcomes, event_ids]),
+                )
+                .await
+                .map_err(|e| e.subject()),
+        }
+    }
     pub async fn wait_for_action_events(
         &self,
         events: &mut RelayActionEvents,
@@ -373,6 +415,35 @@ impl RelayServer {
                     _ => return Err(WireError::environment("app_relay_wait_mode_invalid")),
                 };
                 encode(count)
+            }
+            "action_publication_ids" => {
+                let (before, include_welcomes): (usize, bool) = decode(args)?;
+                encode(
+                    self.control
+                        .action_publication_ids(before, include_welcomes)
+                        .await
+                        .map_err(super::relay_control_error)?,
+                )
+            }
+            "record_action_publication_ids" => {
+                let (action, before, include_welcomes, ids): (
+                    String,
+                    usize,
+                    bool,
+                    BTreeSet<String>,
+                ) = decode(args)?;
+                encode(
+                    self.control
+                        .record_action_publication_ids(
+                            &mut self.events,
+                            &action,
+                            before,
+                            include_welcomes,
+                            &ids,
+                        )
+                        .await
+                        .map_err(super::relay_control_error)?,
+                )
             }
             "visibility" => {
                 let (selector, visible): (ScenarioMessageSelectorV2, bool) = decode(args)?;

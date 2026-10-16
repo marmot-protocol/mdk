@@ -998,7 +998,9 @@ The process report retains the compiler's expanded action schedule, records an o
 uses the node's versioned layered observation schema. Explicit topology relay labels become parent-owned local relay
 instances; a process may connect to any declared subset, while client-only legacy scenarios resolve to one shared
 relay. The process adapter defines settlement only from public projection commitments and observable node progress.
-It does not query engine queues or child databases.
+It does not query engine queues or child databases. The Nostr transport stops at its acknowledgement quorum and abandons
+slower relays, so an action's publications are complete once the union of the actor's relays retains them; each relay
+attributes only the copies it retained, and a copy a losing relay admits later never counts toward another action.
 
 ### Milestone 5 Exit Gate
 

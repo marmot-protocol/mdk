@@ -201,6 +201,51 @@ impl RelayControl {
         Ok(recorded)
     }
 
+    /// Event ids of the action-addressable publications admitted since
+    /// `before`, in admission order. This never waits: a publisher that met
+    /// its acknowledgement quorum elsewhere may never reach this relay.
+    pub async fn action_publication_ids(
+        &self,
+        before: usize,
+        include_welcomes: bool,
+    ) -> Result<Vec<String>, RelayControlError> {
+        let publication_log = self.publication_log.lock().await;
+        if before > publication_log.len() {
+            return Err(RelayControlError {
+                code: "relay_publication_cursor_invalid",
+                message: "the retained relay publication cursor moved backwards",
+            });
+        }
+        Ok(publication_log[before..]
+            .iter()
+            .filter(|event| {
+                event.kind == Kind::MlsGroupMessage
+                    || (include_welcomes && event.kind == Kind::GiftWrap)
+            })
+            .map(|event| event.id.to_hex())
+            .collect())
+    }
+
+    /// Attribute to `action_id` exactly the admitted publications whose ids
+    /// are in `event_ids`, in admission order, and return how many there were.
+    pub async fn record_action_publication_ids(
+        &self,
+        action_events: &mut RelayActionEvents,
+        action_id: &str,
+        before: usize,
+        include_welcomes: bool,
+        event_ids: &BTreeSet<String>,
+    ) -> Result<usize, RelayControlError> {
+        self.record_action_events(action_events, action_id, before, include_welcomes)
+            .await?;
+        let mut seen = BTreeSet::new();
+        let events = action_events.entry(action_id.to_owned()).or_default();
+        events.retain(|event| {
+            event_ids.contains(&event.event.id.to_hex()) && seen.insert(event.event.id)
+        });
+        Ok(events.len())
+    }
+
     pub async fn wait_for_action_events(
         &self,
         action_events: &mut RelayActionEvents,
