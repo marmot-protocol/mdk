@@ -5788,6 +5788,19 @@ async fn live_muted_chat_notifies_direct_mentions_but_not_ordinary_messages() {
     let group_hex = hex::encode(group_id.as_slice());
     app.set_local_notifications_enabled(&bob_id, true).unwrap();
     runtime.catch_up_accounts().await.unwrap();
+    // Catch-up completion does not fence the Welcome's ingestion on a
+    // multi-thread runtime: muting needs the group installed for Bob.
+    timeout(Duration::from_secs(20), async {
+        while !app
+            .group(&bob_id, &group_hex)
+            .unwrap()
+            .is_some_and(|group| group.self_membership == SelfMembership::Member)
+        {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the recipient must install the Welcome before muting the chat");
     let mut subscription = runtime.subscribe_notifications().unwrap();
     runtime.set_chat_muted(&bob_id, &group_hex, None).unwrap();
 
