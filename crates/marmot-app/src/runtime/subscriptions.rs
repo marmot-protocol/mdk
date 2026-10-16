@@ -2196,7 +2196,7 @@ pub(crate) async fn send_atomic_chat_list_snapshot(
 mod presented_invalidation_tests {
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn replacement_read_discards_queued_invalidations_but_keeps_future_updates() {
         let (tx, rx) = mpsc::channel(8);
         let (_stopping, stopping) = watch::channel(false);

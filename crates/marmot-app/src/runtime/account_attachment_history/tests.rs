@@ -20,7 +20,7 @@ fn add(s: &storage_sqlite::SqliteAccountStorage, group: &str, id: u64) {
     })
     .unwrap();
 }
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_pages_are_local_account_isolated_and_keep_typed_rejections() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -90,7 +90,7 @@ async fn account_pages_are_local_account_isolated_and_keep_typed_rejections() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_block_policy_fences_global_pages_and_never_returns_hidden_sender_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let account = AccountHome::open(dir.path())

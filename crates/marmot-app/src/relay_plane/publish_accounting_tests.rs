@@ -251,7 +251,7 @@ fn failure(endpoint: &TransportEndpoint) -> TransportEndpointFailure {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn signed_fanout_counts_once() {
     use nostr_relay_builder::builder::{RelayBuilderNip42, RelayBuilderNip42Mode};
     use nostr_relay_builder::{LocalRelay, RelayBuilder};
@@ -317,7 +317,7 @@ async fn signed_fanout_counts_once() {
     plane.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_publish_classifies_against_met_required_acks() {
     let fixture = AccountPublishFixture::activate().await;
     let admitted = fixture
@@ -396,7 +396,7 @@ async fn account_publish_classifies_against_met_required_acks() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_admission_and_unpolled_future_do_not_publish() {
     let fixture = AccountPublishFixture::activate().await;
     let wrong = fixture
@@ -480,7 +480,7 @@ async fn account_admission_and_unpolled_future_do_not_publish() {
     assert_eq!(counts(&fixture.plane).await, (0, 0, 0, 0));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_and_direct_cancellation_finalize_without_double_counting() {
     let fixture = AccountPublishFixture::activate().await;
     let (entered, _release) = fixture.client.arm_wait();
@@ -510,7 +510,7 @@ async fn account_and_direct_cancellation_finalize_without_double_counting() {
 /// `drive_outbound_fanout` in `marmot-account`). Those abandoned calls are
 /// cancellations, not relay failures, so a healthy multi-relay send does not
 /// inflate `publish_failures`.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn quorum_early_release_counts_cancellations_not_failures() {
     let fixture = AccountPublishFixture::activate().await;
     let (mut entered, _release) = fixture.client.arm_wait();
@@ -531,7 +531,7 @@ async fn quorum_early_release_counts_cancellations_not_failures() {
     assert_eq!(counts(&fixture.plane).await, (2, 1, 0, 1));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancellation_during_local_fanout_keeps_the_success() {
     let fixture = AccountPublishFixture::activate().await;
     let handle = {
@@ -574,7 +574,7 @@ async fn cancellation_during_local_fanout_keeps_the_success() {
     assert_eq!(counts(&fixture.plane).await, (1, 1, 0, 0));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn successful_fanout_delivers_once_per_route_and_keeps_the_message_id() {
     let client = CountingClient::new(PublishScript::Accept);
     let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), client.clone());
@@ -647,7 +647,7 @@ async fn successful_fanout_delivers_once_per_route_and_keeps_the_message_id() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rejected_and_failed_publishes_do_not_invent_local_delivery() {
     let fixture = AccountPublishFixture::activate().await;
     let bob_id = MemberId::new(vec![0xB2; 32]);
@@ -695,7 +695,7 @@ async fn rejected_and_failed_publishes_do_not_invent_local_delivery() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_and_direct_clones_share_one_counter() {
     let fixture = AccountPublishFixture::activate().await;
     let bob_id = MemberId::new(vec![0xB2; 32]);

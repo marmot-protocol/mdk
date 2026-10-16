@@ -58,7 +58,8 @@ impl QueryPolicy for HeldComparisonId {
     }
 }
 
-#[tokio::test]
+// `run_held_comparison` pauses the clock, which needs the current-thread runtime.
+#[tokio::test(flavor = "current_thread")]
 async fn comparison_worker_held_sdk_request_keeps_status_command_ready() {
     run_held_comparison(false, HeldCaller::None, false).await;
 }
@@ -66,22 +67,26 @@ async fn comparison_worker_held_sdk_request_keeps_status_command_ready() {
 /// A host catch-up only drains, so it and the commands behind it complete
 /// while the worker's comparison is held, without joining or reserving
 /// recovery work (mdk#2110).
-#[tokio::test]
+// `run_held_comparison` pauses the clock, which needs the current-thread runtime.
+#[tokio::test(flavor = "current_thread")]
 async fn catch_up_crosses_held_comparison_without_revising_it() {
     run_held_comparison(false, HeldCaller::CatchUp, false).await;
 }
 
-#[tokio::test]
+// `run_held_comparison` pauses the clock, which needs the current-thread runtime.
+#[tokio::test(flavor = "current_thread")]
 async fn repair_waits_for_held_comparison_before_revising_it() {
     run_held_comparison(false, HeldCaller::Repair, false).await;
 }
 
-#[tokio::test]
+// `run_held_comparison` pauses the clock, which needs the current-thread runtime.
+#[tokio::test(flavor = "current_thread")]
 async fn prebarrier_media_runs_before_deferred_repair() {
     run_held_comparison(false, HeldCaller::Repair, true).await;
 }
 
-#[tokio::test]
+// `run_held_comparison` pauses the clock, which needs the current-thread runtime.
+#[tokio::test(flavor = "current_thread")]
 async fn comparison_shutdown_reaps_task_and_releases_credit() {
     run_held_comparison(true, HeldCaller::None, false).await;
 }
@@ -501,7 +506,8 @@ async fn run_held_comparison(
     );
 }
 
-#[tokio::test]
+// Pauses the clock, which needs the current-thread runtime.
+#[tokio::test(flavor = "current_thread")]
 async fn comparison_credit_exhaustion_does_not_spend_reservation() {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let relay = LocalRelay::new(RelayBuilder::default());
@@ -564,7 +570,7 @@ async fn comparison_credit_exhaustion_does_not_spend_reservation() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let relay = MockRelay::run().await.unwrap();

@@ -136,7 +136,7 @@ async fn request_or_completed<T: std::fmt::Debug>(
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_recorder_exact_bodies_success_and_partial_block() {
     let f = Fixture::new();
     assert!(
@@ -213,7 +213,7 @@ async fn real_recorder_exact_bodies_success_and_partial_block() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn configured_manual_tracker_delivers_real_v5_rows() {
     let f = Fixture::new();
     let original: Vec<String> = std::fs::read_to_string(&f.active)
@@ -242,7 +242,7 @@ async fn configured_manual_tracker_delivers_real_v5_rows() {
     assert!(f.cursor()["journals"][0]["acknowledged"].as_u64().unwrap() > 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn configured_activity_trigger_delivers_v5_rows() {
     let f = Fixture::new();
     let (endpoint, observed, release, server) = held_receiver(200).await;
@@ -279,7 +279,7 @@ async fn configured_activity_trigger_delivers_v5_rows() {
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reconfiguring_a_configured_tracker_fences_an_old_ack() {
     let f = Fixture::new();
     let (endpoint, observed, release, server) = held_receiver(200).await;
@@ -315,7 +315,7 @@ async fn reconfiguring_a_configured_tracker_fences_an_old_ack() {
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disable_reenable_cannot_finish_old_http_and_replays_exact_range() {
     let f = Fixture::new();
     let (endpoint, observed, release, server) = held_receiver(200).await;
@@ -380,7 +380,7 @@ async fn disable_reenable_cannot_finish_old_http_and_replays_exact_range() {
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_caller_replays_prepared_range_without_acknowledging_it() {
     let f = Fixture::new();
     let (endpoint, observed, release, server) = held_receiver(200).await;
@@ -424,7 +424,7 @@ async fn cancelled_caller_replays_prepared_range_without_acknowledging_it() {
     replay_server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retryable_response_retains_the_prepared_range() {
     let f = Fixture::new();
     let (endpoint, observed, release, server) = held_receiver(503).await;
@@ -473,7 +473,7 @@ async fn retryable_response_retains_the_prepared_range() {
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn different_destination_cancels_old_result_and_does_not_retarget_cursor() {
     let f = Fixture::new();
     let (endpoint, observed, release, server) = held_receiver(200).await;
@@ -512,7 +512,7 @@ async fn different_destination_cancels_old_result_and_does_not_retarget_cursor()
     assert_eq!(f.cursor(), prepared);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_delete_direct_delete_and_account_removal_cancel_late_success() {
     for action in ["runtime_delete", "direct_delete", "remove_account"] {
         let f = Fixture::new();
@@ -552,7 +552,7 @@ async fn runtime_delete_direct_delete_and_account_removal_cancel_late_success() 
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deleting_one_account_file_does_not_cancel_another_account() {
     let f = Fixture::new();
     f.app.account_home().create_account("bob").unwrap();
@@ -583,7 +583,7 @@ async fn deleting_one_account_file_does_not_cancel_another_account() {
     server.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queued_worker_delete_still_fences_after_its_caller_is_cancelled() {
     let f = Fixture::new();
     let held_worker = Arc::new(tokio::sync::Barrier::new(2));
@@ -647,7 +647,7 @@ async fn queued_worker_delete_still_fences_after_its_caller_is_cancelled() {
     f.runtime.shutdown_and_close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_close_releases_root_before_stalled_http_and_late_success_cannot_finish() {
     let f = Fixture::new();
     let (endpoint, observed, release, server) = held_receiver(200).await;
@@ -685,7 +685,7 @@ async fn terminal_close_releases_root_before_stalled_http_and_late_success_canno
     replacement.close_storage().unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_app_close_rejects_a_late_response() {
     let f = Fixture::new();
     let (endpoint, observed, release, server) = held_receiver(200).await;
@@ -712,7 +712,7 @@ async fn direct_app_close_rejects_a_late_response() {
     assert_eq!(f.cursor(), prepared);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explicit_attempt_requires_the_exclusive_root_lease() {
     let temp = tempfile::tempdir().unwrap();
     AccountHome::open(temp.path())
