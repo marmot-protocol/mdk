@@ -30,8 +30,6 @@ use tokio::sync::Notify;
 use transport_nostr_adapter::{NostrRelayEvent, NostrSubscription};
 use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NOSTR_SOURCE, NostrPeelerError};
 
-use crate::directory::DirectorySyncBatch;
-
 use super::*;
 
 #[test]

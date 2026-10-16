@@ -36,8 +36,6 @@ use transport_nostr_adapter::{
 
 use transport_nostr_peeler::NostrTransportEvent;
 
-use crate::directory::DirectorySyncPlan;
-
 mod delivery_spill;
 mod directory;
 mod directory_wire;
@@ -73,7 +71,8 @@ pub(crate) use delivery_spill::{AccountDeliverySpillStore, DeliverySpillDisposit
 pub(crate) use directory::{
     DirectoryEventQuery, DirectoryFetchOutcome, DirectoryFetchRequest, DirectoryInspectionError,
     DirectoryRelayEventRecord, DirectoryRelayFetcher, DirectoryRelayPlane, DirectoryRelayStats,
-    DirectorySubscriptionFilter, DirectorySubscriptionSyncSummary, NostrSdkDirectoryRelayFetcher,
+    DirectorySubscriptionFilter, DirectorySubscriptionSyncSummary, DirectorySyncBatch,
+    DirectorySyncPlan, NostrSdkDirectoryRelayFetcher,
 };
 pub(crate) use safety::{RelaySafetyPolicy, recovery_required_endpoints, same_relay};
 pub(crate) use telemetry::rollup_from_snapshots;

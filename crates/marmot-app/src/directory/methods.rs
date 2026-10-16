@@ -32,7 +32,7 @@ use crate::directory::records::{
     user_record_match,
 };
 use crate::directory::{
-    DirectoryCache, DirectorySyncHandle, DirectorySyncPlan, sort_user_search_results,
+    DirectoryCache, DirectorySyncHandle, plan_directory_sync, sort_user_search_results,
 };
 use crate::ids::{
     normalize_account_ids, npub_for_account_id, npub_for_account_id_lossy, parse_account_id_hex,
@@ -42,6 +42,7 @@ use crate::key_package_records::{
     latest_fresh_key_package_from_records, merge_relay_list_status,
     publish_endpoints_from_bootstrap, relay_list_queries,
 };
+use crate::relay_plane::DirectorySyncPlan;
 use crate::relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 use crate::{
     APP_CACHE_DB_FILE, AccountRelayListBootstrap, AccountRelayListStatus, AppError,
@@ -1373,7 +1374,7 @@ impl MarmotApp {
             .map(|entry| entry.account_id_hex)
             .collect::<Vec<_>>();
         known_user_ids.extend(local_account_ids.iter().cloned());
-        Ok(DirectorySyncPlan::from_known_users(
+        Ok(plan_directory_sync(
             self.relay_endpoints(),
             local_account_ids,
             known_user_ids,

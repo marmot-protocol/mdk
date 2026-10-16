@@ -10,6 +10,7 @@ use cgka_traits::TransportEndpoint;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
+use crate::relay_plane::{DirectorySyncBatch, DirectorySyncPlan};
 use crate::{
     AppError, KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
     KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp, MarmotRelayPlane, blocking_app_task,
@@ -41,21 +42,6 @@ pub(crate) const DIRECTORY_SYNC_LOCAL_ACCOUNT_KINDS: &[u64] = &[
     KIND_MARMOT_INBOX_RELAY_LIST,
     KIND_MARMOT_KEY_PACKAGE,
 ];
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DirectorySyncPlan {
-    pub(crate) endpoints: Vec<TransportEndpoint>,
-    pub(crate) watched_user_count: usize,
-    pub(crate) batches: Vec<DirectorySyncBatch>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DirectorySyncBatch {
-    pub(crate) subscription_id: String,
-    pub(crate) authors: Vec<String>,
-    pub(crate) kinds: Vec<u64>,
-    pub(crate) since: Option<u64>,
-}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DirectorySyncRunSummary {
@@ -142,97 +128,96 @@ impl DirectoryRecoveryRebuildQueue {
     }
 }
 
-impl DirectorySyncPlan {
-    /// Build a sync plan over the app's local accounts and the broader set of
-    /// known directory users.
-    ///
-    /// `local_account_ids` are the app's own signed-in identities; they sync
-    /// the full [`DIRECTORY_SYNC_LOCAL_ACCOUNT_KINDS`] including contact lists.
-    /// `known_user_ids` are every known directory user (including the local
-    /// accounts); the non-local subset syncs only [`DIRECTORY_SYNC_KINDS`],
-    /// which omits contact lists so transitively discovered users cannot feed
-    /// new kind-3 subscriptions back into the plan (mdk#687).
-    pub(crate) fn from_known_users(
-        endpoints: Vec<TransportEndpoint>,
-        local_account_ids: Vec<String>,
-        known_user_ids: Vec<String>,
-        since: Option<u64>,
-    ) -> Self {
-        Self::from_known_users_with_batch_size(
-            endpoints,
-            local_account_ids,
-            known_user_ids,
-            since,
-            DIRECTORY_SYNC_USER_BATCH_SIZE,
-        )
+/// Build a sync plan over the app's local accounts and the broader set of
+/// known directory users. The plan's type belongs to the relay plane; the
+/// batching policy below is the app's.
+///
+/// `local_account_ids` are the app's own signed-in identities; they sync
+/// the full [`DIRECTORY_SYNC_LOCAL_ACCOUNT_KINDS`] including contact lists.
+/// `known_user_ids` are every known directory user (including the local
+/// accounts); the non-local subset syncs only [`DIRECTORY_SYNC_KINDS`],
+/// which omits contact lists so transitively discovered users cannot feed
+/// new kind-3 subscriptions back into the plan (mdk#687).
+pub(crate) fn plan_directory_sync(
+    endpoints: Vec<TransportEndpoint>,
+    local_account_ids: Vec<String>,
+    known_user_ids: Vec<String>,
+    since: Option<u64>,
+) -> DirectorySyncPlan {
+    plan_directory_sync_with_batch_size(
+        endpoints,
+        local_account_ids,
+        known_user_ids,
+        since,
+        DIRECTORY_SYNC_USER_BATCH_SIZE,
+    )
+}
+
+fn plan_directory_sync_with_batch_size(
+    mut endpoints: Vec<TransportEndpoint>,
+    mut local_account_ids: Vec<String>,
+    mut known_user_ids: Vec<String>,
+    since: Option<u64>,
+    batch_size: usize,
+) -> DirectorySyncPlan {
+    endpoints.sort();
+    endpoints.dedup();
+    local_account_ids.sort();
+    local_account_ids.dedup();
+    known_user_ids.sort();
+    known_user_ids.dedup();
+
+    // Non-local known users only get the contact-list-free kinds. Local
+    // accounts are handled in their own batches with the full kind set, so
+    // drop them from the remote group to avoid duplicate authors/kinds.
+    let remote_user_ids = known_user_ids
+        .iter()
+        .filter(|account_id| !local_account_ids.contains(account_id))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let batch_size = batch_size.max(1);
+    let mut batches = Vec::new();
+    extend_directory_sync_batches(
+        &mut batches,
+        "local",
+        &local_account_ids,
+        DIRECTORY_SYNC_LOCAL_ACCOUNT_KINDS,
+        since,
+        batch_size,
+    );
+    extend_directory_sync_batches(
+        &mut batches,
+        "users",
+        &remote_user_ids,
+        DIRECTORY_SYNC_KINDS,
+        since,
+        batch_size,
+    );
+
+    DirectorySyncPlan {
+        endpoints,
+        watched_user_count: local_account_ids.len() + remote_user_ids.len(),
+        batches,
     }
+}
 
-    fn from_known_users_with_batch_size(
-        mut endpoints: Vec<TransportEndpoint>,
-        mut local_account_ids: Vec<String>,
-        mut known_user_ids: Vec<String>,
-        since: Option<u64>,
-        batch_size: usize,
-    ) -> Self {
-        endpoints.sort();
-        endpoints.dedup();
-        local_account_ids.sort();
-        local_account_ids.dedup();
-        known_user_ids.sort();
-        known_user_ids.dedup();
-
-        // Non-local known users only get the contact-list-free kinds. Local
-        // accounts are handled in their own batches with the full kind set, so
-        // drop them from the remote group to avoid duplicate authors/kinds.
-        let remote_user_ids = known_user_ids
-            .iter()
-            .filter(|account_id| !local_account_ids.contains(account_id))
-            .cloned()
-            .collect::<Vec<_>>();
-
-        let batch_size = batch_size.max(1);
-        let mut batches = Vec::new();
-        Self::extend_batches(
-            &mut batches,
-            "local",
-            &local_account_ids,
-            DIRECTORY_SYNC_LOCAL_ACCOUNT_KINDS,
+fn extend_directory_sync_batches(
+    batches: &mut Vec<DirectorySyncBatch>,
+    group: &str,
+    account_ids: &[String],
+    kinds: &[u64],
+    since: Option<u64>,
+    batch_size: usize,
+) {
+    for (index, authors) in account_ids.chunks(batch_size).enumerate() {
+        let authors = authors.to_vec();
+        batches.push(DirectorySyncBatch {
+            subscription_id: directory_subscription_id(group, index, &authors),
+            authors,
+            kinds: kinds.to_vec(),
             since,
-            batch_size,
-        );
-        Self::extend_batches(
-            &mut batches,
-            "users",
-            &remote_user_ids,
-            DIRECTORY_SYNC_KINDS,
-            since,
-            batch_size,
-        );
-
-        Self {
-            endpoints,
-            watched_user_count: local_account_ids.len() + remote_user_ids.len(),
-            batches,
-        }
-    }
-
-    fn extend_batches(
-        batches: &mut Vec<DirectorySyncBatch>,
-        group: &str,
-        account_ids: &[String],
-        kinds: &[u64],
-        since: Option<u64>,
-        batch_size: usize,
-    ) {
-        for (index, authors) in account_ids.chunks(batch_size).enumerate() {
-            let authors = authors.to_vec();
-            batches.push(DirectorySyncBatch {
-                subscription_id: directory_subscription_id(group, index, &authors),
-                authors,
-                kinds: kinds.to_vec(),
-                since,
-            });
-        }
+        });
     }
 }
 
@@ -506,7 +491,7 @@ mod tests {
     fn sync_plan_chunks_known_users_with_privacy_safe_ids() {
         let users = vec![account_id(3), account_id(1), account_id(2), account_id(1)];
 
-        let plan = DirectorySyncPlan::from_known_users_with_batch_size(
+        let plan = plan_directory_sync_with_batch_size(
             vec![
                 TransportEndpoint("wss://relay.example".to_owned()),
                 TransportEndpoint("wss://relay.example".to_owned()),
@@ -539,7 +524,7 @@ mod tests {
         let local = account_id(1);
         let remote = account_id(2);
 
-        let plan = DirectorySyncPlan::from_known_users_with_batch_size(
+        let plan = plan_directory_sync_with_batch_size(
             vec![TransportEndpoint("wss://relay.example".to_owned())],
             vec![local.clone()],
             vec![local.clone(), remote.clone()],

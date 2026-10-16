@@ -54,6 +54,24 @@ pub(crate) struct DirectoryRelayEventRecord {
     pub(crate) event: NostrTransportEvent,
 }
 
+/// The directory subscriptions the plane keeps live: the relays to read and
+/// one batch per REQ. The app decides the batching policy and builds it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DirectorySyncPlan {
+    pub(crate) endpoints: Vec<TransportEndpoint>,
+    pub(crate) watched_user_count: usize,
+    pub(crate) batches: Vec<DirectorySyncBatch>,
+}
+
+/// One directory REQ: its subscription id, authors, kinds and floor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DirectorySyncBatch {
+    pub(crate) subscription_id: String,
+    pub(crate) authors: Vec<String>,
+    pub(crate) kinds: Vec<u64>,
+    pub(crate) since: Option<u64>,
+}
+
 /// The `(authors, kinds)` an active directory subscription was issued with.
 ///
 /// A live SDK relay event is only forwarded into the directory cache when its

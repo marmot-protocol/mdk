@@ -25,6 +25,4 @@ pub use search::{
     OFF_GRAPH_SEARCH_RADIUS, SearchUpdateTrigger, UserSearchParams, UserSearchSubscription,
     UserSearchUpdate, sort_user_search_results,
 };
-#[cfg(test)]
-pub(crate) use sync::DirectorySyncBatch;
-pub(crate) use sync::{DirectorySyncHandle, DirectorySyncPlan};
+pub(crate) use sync::{DirectorySyncHandle, plan_directory_sync};
