@@ -9,8 +9,9 @@ status: proposed, needs approval before implementation
 # Extraction Brief — Relay Plane into `transport-nostr`
 
 Step 2 of the [core structure plan](core-structure.md#5-sequencing). It moves the relay plane out of `marmot-app` into
-a new `transport-nostr` crate, without changing behaviour. Baseline `b76b5338e`, which includes the multi-thread
-runtime from #2340. Line counts are production code. Following the [review's evidence rules](README.md#evidence-rules),
+a new `transport-nostr` crate, without changing behaviour. Line counts are production code, measured at baseline
+`b76b5338e`, which includes the multi-thread runtime from #2340. `path:line` citations are at `15c4b4aab`, the
+master that #2346 merged, after #2341, #2354 and #2361. Following the [review's evidence rules](README.md#evidence-rules),
 statements are observed in source unless marked (hypothesis).
 
 ## Why this seam first
@@ -110,7 +111,8 @@ Each PR is green on its own and changes no behaviour.
      `app.relay_plane.inner.transport.sdk_relay_client` (`relay_plane/tests.rs:5500-5506`). Rewrite those assertions
      to use the accessors, so PR 2 can move the tests without dropping any.
    - Adapt `relay_label_resolution_is_gated_behind_opt_in` to the new export-gate trait. Today it builds the app's
-     `RelayTelemetryRuntimeConfig` from `crate::config` (`relay_plane/tests.rs:33-51`, `:2352-2360`).
+     `RelayTelemetryRuntimeConfig` from `crate::config` (`relay_plane/tests.rs:33-51`) and the
+     `RelayTelemetryExportConfig` values the gate replaces (`:2352-2360`).
    - Proof: `relay_plane/` has no production `crate::` or `storage_sqlite::` imports.
 2. **Move the eight tests that build a whole `MarmotApp` or runtime** out of `relay_plane/tests.rs` into the app's
    tests, using the accessors from PR 1. Tests only.
