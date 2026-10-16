@@ -305,21 +305,28 @@ impl AttachmentResume {
     /// measurement (taken once that staging is gone) does not see. Unknown
     /// free space is a transient failure.
     fn check_capacity(&self, needed: u64, held: u64) -> Result<(), AttachmentDownloadFailure> {
-        let policy = self
-            .storage
-            .attachment_download_policy(&self.policy)
-            .map_err(|_| retry("attachment publication policy unavailable"))?;
+        let disk = self.disk_policy()?;
         let free =
             available_space(&self.directory).map_err(|_| retry("free disk space unavailable"))?;
-        let disk = DiskPolicy {
-            reserve_bytes: policy.disk_reserve,
-        };
         match disk.admit(free, needed) {
             Admission::Admitted => Ok(()),
             Admission::StorageFull { headroom } => {
                 Err(storage_blocked(headroom.saturating_add(held)))
             }
         }
+    }
+
+    /// The [`DiskPolicy`] every attempt-level disk check uses: the durable
+    /// policy's current reserve, not the snapshot taken when the job was
+    /// claimed, which a policy change since then has made stale.
+    fn disk_policy(&self) -> Result<DiskPolicy, AttachmentDownloadFailure> {
+        let policy = self
+            .storage
+            .attachment_download_policy(&self.policy)
+            .map_err(|_| retry("attachment publication policy unavailable"))?;
+        Ok(DiskPolicy {
+            reserve_bytes: policy.disk_reserve,
+        })
     }
 
     /// A download of a `bytes`-byte body needs the reserve plus
@@ -503,11 +510,9 @@ impl AttachmentResume {
             // what its next attempt needs: the rest of the body beyond the
             // saved `offset`, and its store file. Space that cannot be
             // measured is a transient failure, not a full disk.
+            let disk = this.disk_policy()?;
             let free = available_space(&this.directory)
                 .map_err(|_| retry("free disk space unavailable"))?;
-            let disk = DiskPolicy {
-                reserve_bytes: this.policy.disk_reserve,
-            };
             let body = identity
                 .total
                 .saturating_sub(super::file_transfer::MEDIA_AEAD_TAG_BYTES);
