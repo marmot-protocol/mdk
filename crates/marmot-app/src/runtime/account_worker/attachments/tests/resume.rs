@@ -2402,16 +2402,29 @@ async fn attachment_disk_pressure_parks_before_receipt_and_readmits_when_space_f
     let free = fs4::available_space(dir.path()).unwrap();
     assert_eq!(
         store
-            .readmit_storage_blocked_attachments(now, unavailable_reserve, free, true, &|_| {
-                free >= unavailable_reserve
-            })
+            .readmit_storage_blocked_attachments(
+                now,
+                unavailable_reserve,
+                free,
+                true,
+                storage_sqlite::ReadmitAdmission::NONE,
+            )
             .unwrap(),
         0,
         "still parked while the reserve stays out of reach"
     );
     assert_eq!(
         store
-            .readmit_storage_blocked_attachments(now, 0, free, true, &|_| true)
+            .readmit_storage_blocked_attachments(
+                now,
+                0,
+                free,
+                true,
+                storage_sqlite::ReadmitAdmission {
+                    checkpointed_at_least: 0,
+                    uncheckpointed: true,
+                },
+            )
             .unwrap(),
         1
     );

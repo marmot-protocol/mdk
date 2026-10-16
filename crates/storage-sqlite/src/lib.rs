@@ -169,7 +169,8 @@ pub use timeline::reports::{
 
 pub use attachment_acquisition::{
     AttachmentDownloadPolicy, AttachmentTransferFrame, AttachmentTransferState,
-    AttachmentTransferStatus, STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS, STORAGE_READMIT_MARGIN_BYTES,
+    AttachmentTransferStatus, ReadmitAdmission, STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS,
+    STORAGE_READMIT_MARGIN_BYTES,
 };
 
 mod open_progress;

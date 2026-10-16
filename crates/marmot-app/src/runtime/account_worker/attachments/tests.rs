@@ -38,6 +38,52 @@ fn attachment_capacity_reserves_disk_overhead_and_never_evicts() {
     ));
 }
 
+/// Readmission's checkpoint threshold admits exactly the parked jobs worker
+/// admission would let start, whatever their recorded checkpoint.
+#[test]
+fn readmission_threshold_agrees_with_worker_admission() {
+    let mib = 1024 * 1024;
+    let slack = media_store::CHECKPOINT_APPEND_MAX as u64;
+    for limit in [mib, 3 * mib, 64 * mib] {
+        let mut policy =
+            super::super::super::attachment_controls::default_policy(&MarmotAppConfig::default());
+        policy.transfer_limit = limit;
+        policy.disk_reserve = 7 * mib;
+        for available in [
+            0,
+            slack - 1,
+            limit - 1,
+            limit,
+            limit + slack,
+            2 * limit - 1,
+            2 * limit,
+            3 * limit,
+        ] {
+            let free = policy.disk_reserve + available;
+            let threshold = readmit_admission(&policy, free);
+            for recorded in [
+                None,
+                Some(0),
+                Some(1),
+                Some(limit / 2),
+                Some(limit - slack),
+                Some(limit),
+                Some(2 * limit),
+            ] {
+                assert_eq!(
+                    threshold.admits(recorded),
+                    capacity(&policy, limit, recorded, free),
+                    "limit {limit} available {available} recorded {recorded:?}"
+                );
+            }
+        }
+        assert_eq!(
+            readmit_admission(&policy, policy.disk_reserve - 1),
+            storage_sqlite::ReadmitAdmission::NONE
+        );
+    }
+}
+
 use crate::tests::ScriptedPushRelayClient;
 use crate::{MarmotApp, MarmotAppConfig};
 use marmot_account::AccountHome;

@@ -1078,11 +1078,18 @@ fn attachment_partial_storage_is_provisioned_without_network() {
     assert_eq!(count, 0);
 }
 
-/// The worker's admission rule as the app hands it to readmission: room for
-/// a download of up to `limit` bytes less its recorded checkpoint.
-fn admission(reserve: u64, free: u64, limit: u64) -> impl Fn(Option<u64>) -> bool {
-    move |checkpointed| {
-        free >= reserve + media_store::DiskPolicy::download_need(limit, checkpointed.unwrap_or(0))
+/// Worker admission as the app hands it to readmission: room for a download
+/// of up to `limit` bytes less its recorded checkpoint, as one threshold.
+fn admission(reserve: u64, free: u64, limit: u64) -> ReadmitAdmission {
+    match free
+        .checked_sub(reserve)
+        .and_then(|available| media_store::DiskPolicy::checkpoint_needed(limit, available))
+    {
+        Some(needed) => ReadmitAdmission {
+            checkpointed_at_least: needed,
+            uncheckpointed: needed == 0,
+        },
+        None => ReadmitAdmission::NONE,
     }
 }
 
@@ -2834,7 +2841,7 @@ fn readmit(
             reserve,
             free,
             automatic,
-            &admission(reserve, free, 1),
+            admission(reserve, free, 1),
         )
         .unwrap()
 }
@@ -3058,7 +3065,7 @@ fn storage_readmission_waits_for_admission_capacity() {
                 1000,
                 1000 + 2 * limit - 1,
                 true,
-                &admission(1000, 1000 + 2 * limit - 1, limit)
+                admission(1000, 1000 + 2 * limit - 1, limit)
             )
             .unwrap(),
         0
@@ -3074,7 +3081,7 @@ fn storage_readmission_waits_for_admission_capacity() {
                 1000,
                 1000 + 2 * limit,
                 true,
-                &admission(1000, 1000 + 2 * limit, limit)
+                admission(1000, 1000 + 2 * limit, limit)
             )
             .unwrap(),
         1
@@ -3109,7 +3116,7 @@ fn storage_readmission_credits_the_saved_checkpoint() {
                 1000,
                 1000 + needed - 1,
                 true,
-                &admission(1000, 1000 + needed - 1, limit)
+                admission(1000, 1000 + needed - 1, limit)
             )
             .unwrap(),
         0
@@ -3121,7 +3128,7 @@ fn storage_readmission_credits_the_saved_checkpoint() {
                 1000,
                 1000 + needed,
                 true,
-                &admission(1000, 1000 + needed, limit)
+                admission(1000, 1000 + needed, limit)
             )
             .unwrap(),
         1
@@ -3129,6 +3136,65 @@ fn storage_readmission_credits_the_saved_checkpoint() {
     assert_eq!(
         transfer(&store, "saved", true).state,
         AttachmentTransferState::Queued
+    );
+}
+
+/// Admission filters parked rows before the page is limited: a full page of
+/// higher-priority jobs that admission refuses (no checkpoint, so they need
+/// two whole limits) cannot hide a lower-priority checkpointed job that fits.
+#[test]
+fn readmission_is_not_starved_by_a_page_admission_refuses() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let limit = 8 * 1024 * 1024;
+    let saved = 6 * 1024 * 1024;
+    let prioritize = |asset: &AttachmentAssetRef, priority: i64| {
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE attachment_acquisition SET priority_at=?2 WHERE token=?1",
+                params![asset.token, priority],
+            )
+            .unwrap();
+    };
+    for index in 0..ATTACHMENT_ACQUISITION_BATCH_LIMIT {
+        let message = format!("busy{index}");
+        seed(&store, &message);
+        let asset = request(&store, &message);
+        let job = store
+            .claim_attachment_acquisition(&asset, 12, 100)
+            .unwrap()
+            .unwrap();
+        park(&store, &job, 1024, 12);
+        prioritize(&asset, 100);
+    }
+    seed(&store, "saved");
+    let asset = request(&store, "saved");
+    let job = store
+        .claim_attachment_acquisition(&asset, 12, 100)
+        .unwrap()
+        .unwrap();
+    let identity = partial_identity(limit);
+    assert!(checkpoint(&store, &job, &identity, 0, &vec![7; saved as usize], 12).unwrap());
+    park(&store, &job, 1024, 12);
+    prioritize(&asset, 0);
+    // Room for the saved job's remaining checkpoint and store file only.
+    let free = 1000 + 2 * limit - saved;
+    let admission = admission(1000, free, limit);
+    assert!(!admission.admits(None) && admission.admits(Some(saved)));
+    assert_eq!(
+        store
+            .readmit_storage_blocked_attachments(13, 1000, free, true, admission)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        transfer(&store, "saved", true).state,
+        AttachmentTransferState::Queued
+    );
+    assert_eq!(
+        transfer(&store, "busy0", true).state,
+        AttachmentTransferState::StorageBlocked
     );
 }
 
@@ -3676,7 +3742,7 @@ fn storage_readmission_probe_is_read_only_while_nothing_fits() {
     );
     assert!(
         store
-            .readmit_storage_blocked_attachments(13, 0, u64::MAX, true, &|_| true)
+            .readmit_storage_blocked_attachments(13, 0, u64::MAX, true, admission(0, u64::MAX, 1))
             .is_err(),
         "a row that fits does write, so the guard is effective"
     );
