@@ -510,12 +510,16 @@ fn profile_relay_status(
 }
 
 /// Async tests in this crate, unit and integration, default to the
-/// multi-thread flavor every production binding uses. A test that needs one
+/// multi-thread flavor every production binding uses, whether through
+/// `#[tokio::test]` or `run_composed_app_runtime_test`. A test that needs one
 /// thread uses `start_paused = true` for a clock paused from the start, or says
 /// why (a clock paused later, or an interleaving it builds by never yielding)
-/// in a `//` comment above `flavor = "current_thread"`.
+/// in a `//` comment above `flavor = "current_thread"` or a
+/// `run_composed_app_runtime_test_on_one_thread` call.
 #[test]
 fn async_suites_choose_their_tokio_flavor() {
+    const ONE_THREAD_COMPOSED_RUNNER: &str = "run_composed_app_runtime_test_on_one_thread(";
+
     fn visit(dir: &std::path::Path, offenders: &mut Vec<String>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
@@ -526,7 +530,11 @@ fn async_suites_choose_their_tokio_flavor() {
                 let mut previous = "";
                 for (index, line) in source.lines().enumerate() {
                     let line = line.trim();
-                    let unexplained_pin = line == "#[tokio::test(flavor = \"current_thread\")]"
+                    let pins_one_thread = line == "#[tokio::test(flavor = \"current_thread\")]"
+                        || line
+                            .trim_start_matches("crate::tests::")
+                            .starts_with(ONE_THREAD_COMPOSED_RUNNER);
+                    let unexplained_pin = pins_one_thread
                         && (!previous.starts_with("//") || previous.starts_with("///"));
                     if line == "#[tokio::test]" || unexplained_pin {
                         offenders.push(format!("{}:{}", path.display(), index + 1));
@@ -544,9 +552,20 @@ fn async_suites_choose_their_tokio_flavor() {
     }
     assert!(
         offenders.is_empty(),
-        "use #[tokio::test(flavor = \"multi_thread\", worker_threads = 2)], or an explicit \
-         current_thread flavor under a `//` comment saying why: {offenders:#?}"
+        "use #[tokio::test(flavor = \"multi_thread\", worker_threads = 2)] or \
+         run_composed_app_runtime_test, or an explicit current_thread flavor or \
+         run_composed_app_runtime_test_on_one_thread under a `//` comment saying why: \
+         {offenders:#?}"
     );
+
+    crate::tests::run_composed_app_runtime_test("composed-runner-flavor", || async {
+        let runtime = tokio::runtime::Handle::current();
+        assert_eq!(
+            runtime.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        );
+        assert_eq!(runtime.metrics().num_workers(), 2);
+    });
 }
 
 #[test]

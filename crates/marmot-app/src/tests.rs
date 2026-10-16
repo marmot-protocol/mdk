@@ -1500,7 +1500,9 @@ const EXPLICIT_CATCH_UP_BACKFILL_DEADLINE: Duration = Duration::from_secs(5);
 #[cfg(feature = "test-policy-overrides")]
 #[test]
 fn cancelled_sync_keeps_profile() {
-    run_composed_app_runtime_test("cancelled-sync-profile", || async {
+    // Pauses the clock to freeze receive timers mid-sync; Tokio allows that
+    // only on a current-thread runtime.
+    run_composed_app_runtime_test_on_one_thread("cancelled-sync-profile", || async {
         use cgka_traits::storage::GroupStorage;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1632,7 +1634,9 @@ fn comparison_fetches_probe(
 
 #[test]
 fn catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
-    run_composed_app_runtime_test("explicit-catch-up-backfill", || async {
+    // Pauses the clock to step past the owner's backoff tick; Tokio allows
+    // that only on a current-thread runtime.
+    run_composed_app_runtime_test_on_one_thread("explicit-catch-up-backfill", || async {
         let dir = tempfile::tempdir().unwrap();
         let alice = AccountHome::open(dir.path())
             .create_account("alice")
@@ -3638,20 +3642,57 @@ fn unresolved_epoch_backfill_scope_does_not_starve_another_group() {
     });
 }
 
-/// Run app-runtime integration chains on a stack large enough for debug
-/// OpenMLS group creation. Smaller stacks are insufficient once a
-/// test composes the account worker with maintenance and push lifecycle work.
+/// Stack for every thread of a composed app-runtime test: debug OpenMLS group
+/// creation outgrows the default once a test composes the account worker with
+/// maintenance and push lifecycle work.
+const COMPOSED_APP_RUNTIME_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// Run app-runtime integration chains on the multi-thread flavor every
+/// production binding uses, with two workers. The thread driving `body` and
+/// the runtime's workers and blocking threads all get a stack large enough for
+/// debug OpenMLS group creation.
 pub(crate) fn run_composed_app_runtime_test<F, Fut>(thread_name: &str, body: F)
 where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + 'static,
 {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.worker_threads(2);
+    run_composed_app_runtime(thread_name, builder, body);
+}
+
+/// [`run_composed_app_runtime_test`] on a current-thread runtime, for a test
+/// that pauses the clock (Tokio allows `time::pause` only there) or builds an
+/// interleaving that needs one thread. Say why with a `//` comment on the line
+/// above the call; `async_suites_choose_their_tokio_flavor` rejects a call
+/// without one.
+pub(crate) fn run_composed_app_runtime_test_on_one_thread<F, Fut>(thread_name: &str, body: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    run_composed_app_runtime(
+        thread_name,
+        tokio::runtime::Builder::new_current_thread(),
+        body,
+    );
+}
+
+fn run_composed_app_runtime<F, Fut>(
+    thread_name: &str,
+    mut builder: tokio::runtime::Builder,
+    body: F,
+) where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
     let test_thread = std::thread::Builder::new()
         .name(thread_name.to_owned())
-        .stack_size(8 * 1024 * 1024)
+        .stack_size(COMPOSED_APP_RUNTIME_STACK_BYTES)
         .spawn(move || {
-            let test_runtime = tokio::runtime::Builder::new_current_thread()
+            let test_runtime = builder
                 .enable_all()
+                .thread_stack_size(COMPOSED_APP_RUNTIME_STACK_BYTES)
                 .build()
                 .unwrap();
             test_runtime.block_on(body());
@@ -13559,7 +13600,9 @@ fn account_worker_reconnect_backoff_doubles_caps_and_resets() {
 
 #[test]
 fn connectivity_recovery_interrupts_max_account_worker_reconnect_backoff() {
-    run_composed_app_runtime_test("connectivity-recovery-wake", || async {
+    // Pauses the clock to step the worker through its reconnect backoffs;
+    // Tokio allows that only on a current-thread runtime.
+    run_composed_app_runtime_test_on_one_thread("connectivity-recovery-wake", || async {
         tokio::time::pause();
 
         async fn wait_for_inbox_subscriptions(
