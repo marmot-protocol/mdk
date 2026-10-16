@@ -509,11 +509,11 @@ fn profile_relay_status(
     status
 }
 
-/// Every async suite in this crate, unit and integration, runs on the
+/// Async tests in this crate, unit and integration, default to the
 /// multi-thread flavor every production binding uses. A test that needs one
-/// thread (a paused clock, or an interleaving it builds by never yielding) says
-/// so with `flavor = "current_thread"` and a `//` comment on the line above
-/// saying why.
+/// thread uses `start_paused = true` for a clock paused from the start, or says
+/// why (a clock paused later, or an interleaving it builds by never yielding)
+/// in a `//` comment above `flavor = "current_thread"`.
 #[test]
 fn async_suites_choose_their_tokio_flavor() {
     fn visit(dir: &std::path::Path, offenders: &mut Vec<String>) {
