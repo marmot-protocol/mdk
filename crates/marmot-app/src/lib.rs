@@ -51,9 +51,9 @@ use cgka_traits::{
     TransportPublishTarget,
 };
 use marmot_account::{
-    AccountDeviceRuntime, AccountHome, AccountHomeError, AccountSummary, KeyPackagePublication,
-    KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher, TransportRoutingError,
-    TransportRoutingPolicy,
+    AccountDeviceRuntime, AccountHome, AccountHomeError, AccountSetupKind, AccountSummary,
+    KeyPackagePublication, KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher,
+    TransportRoutingError, TransportRoutingPolicy,
 };
 use nostr_sdk::prelude::{
     EventBuilder, FinalizeUnsignedEvent, Kind, PublicKey, Tag, Timestamp as NostrTimestamp,
@@ -2622,8 +2622,23 @@ impl MarmotApp {
         label: &str,
     ) -> Result<AccountRelayListStatus, AppError> {
         let account = self.account_home().account(label)?;
+        // Read the journal before the projection. Setup clears it only after
+        // its bootstrap has projected the chosen lists, so once it is gone the
+        // status read below already reflects them.
+        let setup_owns_relay_lists = self
+            .account_home()
+            .account_setup_state(&account.label)?
+            .is_some_and(|state| state.kind == AccountSetupKind::GeneratedIdentity);
         let status = self.account_relay_list_status_for_account_id(&account.account_id_hex)?;
         if status.complete {
+            return Ok(status);
+        }
+        if setup_owns_relay_lists {
+            // An open generated setup publishes the relays the user chose in
+            // its bootstrap batch, and runtime start resumes it. The app's
+            // relays published here would stay advertised as this account's
+            // write and inbox relays wherever that batch never lands
+            // (mdk#2359).
             return Ok(status);
         }
         let default_relays = self.relay_endpoints();

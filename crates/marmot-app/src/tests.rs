@@ -7341,11 +7341,13 @@ async fn concurrent_generated_identity_calls_converge_on_one_local_attempt() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn confirmed_generated_bootstrap_republishes_when_projection_is_missing() {
     let directory = tempfile::tempdir().unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
-    relay.block_next_publish();
+    // The worker's setup KeyPackage and the bootstrap batch publish
+    // concurrently. Hold both so the bootstrap never lands its projection.
+    relay.block_next_publishes(usize::MAX);
     let app = MarmotApp::with_relay(directory.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let runtime = MarmotAppRuntime::new(app.clone());
@@ -7357,10 +7359,21 @@ async fn confirmed_generated_bootstrap_republishes_when_projection_is_missing() 
         })
         .await
         .unwrap();
-    relay.wait_for_blocked_publish().await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !relay
+            .attempted_events()
+            .iter()
+            .any(|event| event.kind == KIND_NIP65_RELAY_LIST)
+        {
+            relay.wait_for_blocked_publish().await;
+        }
+    })
+    .await
+    .expect("the bootstrap batch must reach the relay");
     runtime.shutdown().await;
     drop(runtime);
     drop(app);
+    relay.block_next_publishes(0);
 
     AccountHome::open(directory.path())
         .set_account_setup_phase(
@@ -7402,6 +7415,73 @@ async fn confirmed_generated_bootstrap_republishes_when_projection_is_missing() 
         batch_calls_before + 1,
         "projection recovery should issue one idempotent bootstrap batch"
     );
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generated_setup_publishes_only_the_requested_relay_lists() {
+    // mdk#2359: the worker's setup KeyPackage lane published the app's relays
+    // as the account's lists alongside the setup bootstrap's chosen lists.
+    let directory = tempfile::tempdir().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(directory.path(), "wss://app-default.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = MarmotAppRuntime::new(app);
+    let chosen = TransportEndpoint("wss://chosen.example".into());
+    let local = runtime
+        .create_identity_local_ready(AccountSetupRequest {
+            default_relays: vec![chosen.clone()],
+            bootstrap_relays: vec![chosen.clone()],
+            inbox_relays: vec![chosen.clone()],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if runtime
+                .account_setup_readiness(&local.account.label)
+                .unwrap()
+                == AccountSetupReadiness::NetworkReady
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("generated setup must reach network readiness");
+
+    let relay_lists = relay
+        .attempted_events()
+        .into_iter()
+        .filter(|event| [KIND_NIP65_RELAY_LIST, KIND_MARMOT_INBOX_RELAY_LIST].contains(&event.kind))
+        .collect::<Vec<_>>();
+    let mut kinds = relay_lists
+        .iter()
+        .map(|event| event.kind)
+        .collect::<Vec<_>>();
+    kinds.sort_unstable();
+    assert_eq!(
+        kinds,
+        vec![KIND_NIP65_RELAY_LIST, KIND_MARMOT_INBOX_RELAY_LIST],
+        "setup must publish each relay list once"
+    );
+    for event in &relay_lists {
+        let listed = event
+            .tags
+            .iter()
+            .filter(|tag| matches!(tag.first().map(String::as_str), Some("r" | "relay")))
+            .filter_map(|tag| tag.get(1).cloned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listed,
+            vec![chosen.0.clone()],
+            "kind {} must list only the requested relays",
+            event.kind
+        );
+    }
     runtime.shutdown().await;
 }
 
