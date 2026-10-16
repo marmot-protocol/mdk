@@ -18,6 +18,14 @@
 //!   shard.
 //! - **Reuse:** identical content is stored once, but a ready row is reused
 //!   only if its file is on disk; a missing one is marked `lost` instead.
+//! - **Download checkpoints:** a resumable download's ciphertext goes to an
+//!   append-only `<shard>/<id>.wire` file through a [`CheckpointTarget`]. The
+//!   row commits before its file exists and is deleted before the file is.
+//!   Each append is synced before the row records it, so the file can be at
+//!   most one append ([`CHECKPOINT_APPEND_MAX`]) longer than recorded. A
+//!   refused or failed append is cut off again at once; opening a checkpoint
+//!   and the sweep cut off a tail a crash left. Operations on one checkpoint
+//!   serialize in the store.
 //!
 //! Live publishes register their id in the store's in-flight set so a
 //! concurrent sweep leaves their `pending` row alone. The set lives in this
@@ -30,15 +38,15 @@ use std::fs::File;
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::catalog::{
-    CatalogError, CatalogResult, Category, ExistingOutcome, FileId, FilePresence, FileState,
-    MediaCatalog, NewFile, PublishTarget, ReadyOutcome,
+    CatalogError, CatalogResult, Category, CheckpointTarget, ExistingOutcome, FileId, FilePresence,
+    FileState, MediaCatalog, NewFile, PublishTarget, ReadyOutcome,
 };
 use crate::error::{MediaError, MediaResult, io_error};
 use crate::format::{
@@ -56,6 +64,11 @@ const TRACE_TARGET: &str = "media_store";
 
 /// Directory name of the store inside an account directory.
 pub const MEDIA_DIRECTORY: &str = "media";
+
+/// Largest single checkpoint append. It bounds what a crash between an
+/// append and its record can leave on disk unrecorded: callers that measure
+/// free space against a checkpoint's recorded length allow this much slack.
+pub const CHECKPOINT_APPEND_MAX: usize = 1024 * 1024;
 /// Suffix of a download checkpoint's wire file, beside the store's files.
 const WIRE_SUFFIX: &str = ".wire";
 
@@ -110,6 +123,9 @@ struct Inner<C> {
     in_flight: Mutex<HashSet<FileId>>,
     sweep: Mutex<SweepCursor>,
     readers: Mutex<Vec<CachedReader>>,
+    /// Keys of checkpoints an operation holds; see [`CheckpointLock`].
+    checkpoints: Mutex<Vec<Vec<u8>>>,
+    checkpoint_released: Condvar,
     #[cfg(any(test, feature = "test-support"))]
     full_disk_for_test: AtomicBool,
     #[cfg(any(test, feature = "test-support"))]
@@ -230,6 +246,8 @@ impl<C: MediaCatalog> MediaStore<C> {
                 in_flight: Mutex::new(HashSet::new()),
                 sweep: Mutex::new(SweepCursor::default()),
                 readers: Mutex::new(Vec::new()),
+                checkpoints: Mutex::new(Vec::new()),
+                checkpoint_released: Condvar::new(),
                 #[cfg(any(test, feature = "test-support"))]
                 full_disk_for_test: AtomicBool::new(false),
                 #[cfg(any(test, feature = "test-support"))]
@@ -259,7 +277,7 @@ impl<C: MediaCatalog> MediaStore<C> {
         self.inner.full_disk_for_test.store(full, Ordering::Release);
     }
 
-    /// Makes every wire checkpoint append fail as if the disk filled midway:
+    /// Makes every checkpoint append fail as if the disk filled midway:
     /// half the chunk reaches the file, then the write is refused. Until
     /// reset. Test support only.
     #[cfg(any(test, feature = "test-support"))]
@@ -559,10 +577,121 @@ impl<C: MediaCatalog> MediaStore<C> {
             .join(format!("{}{WIRE_SUFFIX}", hex::encode(id.0)))
     }
 
+    /// Appends `bytes` at `offset` to `target`'s checkpoint and records the
+    /// new length. Offset zero begins a new checkpoint, replacing any earlier
+    /// one: its row commits before its wire file is created, and the replaced
+    /// checkpoint's file is unlinked. Otherwise the checkpoint must already
+    /// hold exactly `offset` recorded bytes.
+    ///
+    /// The bytes are synced before the row records them. If the append or
+    /// the record fails, or the target refuses the record, the file is cut
+    /// back to `offset` before this returns, so no unrecorded bytes hold
+    /// disk. `false` means the target no longer owns a checkpoint at
+    /// `offset`. A full volume or database is [`MediaError::Capacity`].
+    pub fn checkpoint_append(
+        &self,
+        target: &dyn CheckpointTarget,
+        offset: u64,
+        bytes: &[u8],
+    ) -> MediaResult<bool> {
+        self.inner.ensure_open()?;
+        if bytes.len() > CHECKPOINT_APPEND_MAX {
+            return Err(MediaError::InvalidBody("checkpoint append too large"));
+        }
+        if bytes.is_empty() {
+            return Ok(false);
+        }
+        let _held = self.lock_checkpoint(target.key());
+        let (id, mut wire) = if offset == 0 {
+            let Some(start) = target.begin()? else {
+                return Ok(false);
+            };
+            if let Some(replaced) = start.replaced {
+                self.remove_wire(&replaced);
+            }
+            (start.wire, self.create_wire(&start.wire)?)
+        } else {
+            match target.current()? {
+                Some((id, received)) if received == offset => match self.open_wire(&id, offset)? {
+                    Some(wire) => (id, wire),
+                    None => return Ok(false),
+                },
+                _ => return Ok(false),
+            }
+        };
+        if let Err(error) = wire.append(bytes) {
+            let _ = wire.truncate(offset);
+            return Err(error);
+        }
+        let received = offset.saturating_add(bytes.len() as u64);
+        match target.record(id, received) {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                let _ = wire.truncate(offset);
+                Ok(false)
+            }
+            Err(error) => {
+                let _ = wire.truncate(offset);
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Copies `target`'s recorded checkpoint into `out` and returns its
+    /// length. Bytes past the recorded length are cut off first. A wire file
+    /// that is missing or shorter than recorded cannot resume: the checkpoint
+    /// is cleared (row, then file) and this returns `None`, as it does when
+    /// the target owns no checkpoint.
+    pub fn checkpoint_restore(
+        &self,
+        target: &dyn CheckpointTarget,
+        out: &mut dyn Write,
+    ) -> MediaResult<Option<u64>> {
+        self.inner.ensure_open()?;
+        let _held = self.lock_checkpoint(target.key());
+        let Some((id, received)) = target.current()? else {
+            return Ok(None);
+        };
+        let Some(mut wire) = self.open_wire(&id, received)? else {
+            if let Some(cleared) = target.clear()? {
+                self.remove_wire(&cleared);
+            }
+            return Ok(None);
+        };
+        wire.copy_to(out).map(Some)
+    }
+
+    /// Deletes `target`'s checkpoint: the row, then its wire file. The sweep
+    /// removes a file this misses.
+    pub fn checkpoint_clear(&self, target: &dyn CheckpointTarget) -> MediaResult<()> {
+        self.inner.ensure_open()?;
+        let _held = self.lock_checkpoint(target.key());
+        if let Some(id) = target.clear()? {
+            self.remove_wire(&id);
+        }
+        Ok(())
+    }
+
+    /// Waits until no other operation holds the checkpoint `key`.
+    fn lock_checkpoint(&self, key: &[u8]) -> CheckpointLock<'_, C> {
+        let mut held = lock(&self.inner.checkpoints);
+        while held.iter().any(|other| other.as_slice() == key) {
+            held = self
+                .inner
+                .checkpoint_released
+                .wait(held)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        held.push(key.to_vec());
+        CheckpointLock {
+            inner: &self.inner,
+            key: key.to_vec(),
+        }
+    }
+
     /// Creates the wire file for a checkpoint row that has just committed,
     /// replacing anything left at that name.
-    pub fn create_wire(&self, id: &FileId) -> MediaResult<WireFile<C>> {
-        self.inner.ensure_open()?;
+    fn create_wire(&self, id: &FileId) -> MediaResult<WireFile<C>> {
         fs_private::create_dir_all_private(&self.shard_dir(id.0[0])).map_err(|e| io_error(&e))?;
         let path = self.wire_path(id);
         remove_if_present(&path).map_err(|e| io_error(&e))?;
@@ -581,8 +710,7 @@ impl<C: MediaCatalog> MediaStore<C> {
     /// Opens a checkpoint's wire file at its recorded length. Bytes past
     /// `received` were never recorded and are dropped. `None` means the file
     /// is missing or shorter than recorded: the checkpoint cannot resume.
-    pub fn open_wire(&self, id: &FileId, received: u64) -> MediaResult<Option<WireFile<C>>> {
-        self.inner.ensure_open()?;
+    fn open_wire(&self, id: &FileId, received: u64) -> MediaResult<Option<WireFile<C>>> {
         let file = match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -618,7 +746,7 @@ impl<C: MediaCatalog> MediaStore<C> {
 
     /// Unlinks a wire file whose checkpoint row is already gone. Best
     /// effort: the sweep removes anything left.
-    pub fn remove_wire(&self, id: &FileId) {
+    fn remove_wire(&self, id: &FileId) {
         let _ = remove_if_present(&self.wire_path(id));
     }
 
@@ -800,11 +928,29 @@ impl<C: MediaCatalog> MediaStore<C> {
     }
 }
 
+/// Held while one operation works on a checkpoint, from the row lookup
+/// through the file change and the record: a stale attempt's operation can
+/// then never act on a recorded length a newer one has moved.
+struct CheckpointLock<'a, C> {
+    inner: &'a Inner<C>,
+    key: Vec<u8>,
+}
+
+impl<C> Drop for CheckpointLock<'_, C> {
+    fn drop(&mut self) {
+        let mut held = lock(&self.inner.checkpoints);
+        if let Some(index) = held.iter().position(|other| *other == self.key) {
+            held.swap_remove(index);
+        }
+        self.inner.checkpoint_released.notify_all();
+    }
+}
+
 /// An append-only download checkpoint: the wire ciphertext exactly as
 /// received. Its identity and recorded length live in the catalog's
 /// checkpoint row, which is written before the file and deleted before it.
 /// Every operation stops once the store or its catalog closes.
-pub struct WireFile<C> {
+struct WireFile<C> {
     inner: Arc<Inner<C>>,
     /// Held in the in-flight set until this handle drops.
     id: FileId,
@@ -834,18 +980,9 @@ fn trim_wire(path: &Path, received: u64) -> io::Result<bool> {
 }
 
 impl<C: MediaCatalog> WireFile<C> {
-    /// Bytes on disk, all of them recorded or about to be.
-    pub fn len(&self) -> u64 {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
     /// Appends `bytes` and syncs them, so they are durable before the caller
     /// records the new length in the checkpoint row.
-    pub fn append(&mut self, bytes: &[u8]) -> MediaResult<()> {
+    fn append(&mut self, bytes: &[u8]) -> MediaResult<()> {
         self.inner.ensure_open()?;
         // A short write: part of the chunk reaches the file, then the volume
         // refuses the rest.
@@ -871,7 +1008,7 @@ impl<C: MediaCatalog> WireFile<C> {
     /// length: a failed `append` may have left part of its chunk on disk
     /// without advancing the handle. `len` past the handle's length is a
     /// no-op.
-    pub fn truncate(&mut self, len: u64) -> MediaResult<()> {
+    fn truncate(&mut self, len: u64) -> MediaResult<()> {
         self.inner.ensure_open()?;
         if len <= self.len {
             self.file.set_len(len).map_err(|e| io_error(&e))?;
@@ -881,7 +1018,7 @@ impl<C: MediaCatalog> WireFile<C> {
     }
 
     /// Copies the whole checkpoint into `out`.
-    pub fn copy_to(&mut self, out: &mut dyn Write) -> MediaResult<u64> {
+    fn copy_to(&mut self, out: &mut dyn Write) -> MediaResult<u64> {
         self.inner.ensure_open()?;
         self.file
             .seek(io::SeekFrom::Start(0))

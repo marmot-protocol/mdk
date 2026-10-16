@@ -22,14 +22,19 @@
   `attachment_partial.wire_file_id` and `progress_floor`: checkpoint
   ciphertext now lives in a media store `.wire` file and the row keeps only
   its metadata (mdk#2314). Checkpoints no longer reserve retained budget
-  (`attachment_partial_usage.reserved_bytes` stays zero), and storage
-  readmission's admission floor is the reserve plus twice the transfer limit.
-- Download checkpoints are metadata only. `begin_attachment_partial` starts one
-  and returns its wire file id, `record_attachment_partial` records bytes the
-  caller appended to that file, and `load_attachment_partial` returns
+  (`attachment_partial_usage.reserved_bytes` stays zero).
+- Download checkpoints are metadata only, written through the media store.
+  `attachment_checkpoint` and `attachment_checkpoint_matching` return an
+  `AttachmentCheckpoint`, the job's `media_store::CheckpointTarget`; save,
+  restore and clear a checkpoint with `MediaStore::checkpoint_append`,
+  `checkpoint_restore` and `checkpoint_clear`. `load_attachment_partial` returns
   `AttachmentPartial { identity, received, wire_file }` instead of the bytes.
-  `checkpoint_attachment_partial`, `load_attachment_partial_to_writer` and
-  `attachment_acquisition_fits_budget` are removed.
+  `clear_attachment_partial`, `checkpoint_attachment_partial`,
+  `load_attachment_partial_to_writer` and `attachment_acquisition_fits_budget`
+  are no longer public.
+- `readmit_storage_blocked_attachments` takes the caller's admission rule as a
+  closure over each parked row's recorded checkpoint, in place of the transfer
+  limit, so readmission and worker admission decide the same way.
 - `read_retained_attachment` returns an error for a body stored as a media file
   (mdk#2314). Use `retained_attachment_read`, which returns legacy database bytes or
   the media file id to read through the media store.

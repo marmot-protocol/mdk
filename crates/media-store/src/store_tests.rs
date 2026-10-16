@@ -58,18 +58,16 @@ impl Harness for MemoryHarness {
     /// which a fresh `MediaStore` models.
     fn restart(&mut self) {}
 
-    fn begin_wire_partial(&self, slot: u32) -> FileId {
-        let id = FileId([slot as u8 ^ 0x5c; 16]);
-        self.catalog.begin_wire_partial(slot, id);
-        id
+    fn checkpoint(&self, slot: u32) -> Box<dyn CheckpointTarget + '_> {
+        Box::new(self.catalog.checkpoint(slot))
     }
 
-    fn record_wire_partial(&self, slot: u32, received: u64) {
-        self.catalog.record_wire_partial(slot, received);
+    fn supersede_checkpoint(&self, slot: u32) {
+        self.catalog.supersede_checkpoint(slot);
     }
 
-    fn end_wire_partial(&self, slot: u32) {
-        self.catalog.end_wire_partial(slot);
+    fn end_checkpoint(&self, slot: u32) {
+        self.catalog.end_checkpoint(slot);
     }
 }
 
@@ -395,5 +393,214 @@ fn consecutive_reads_reuse_one_cached_reader_and_key() {
     assert_eq!(
         store.read_at(&other, 0, &mut window),
         Err(MediaError::Closed)
+    );
+}
+
+type Hook = Box<dyn FnOnce() + Send>;
+
+/// What a [`Hooked`] target's record answers.
+#[derive(Clone, Copy)]
+enum Record {
+    Pass,
+    Refuse,
+    Full,
+}
+
+/// A memory checkpoint target with hooks, for interleavings and failures
+/// the catalog alone cannot produce.
+struct Hooked {
+    inner: crate::memory::MemoryCheckpoint,
+    after_current: Mutex<Option<Hook>>,
+    before_record: Mutex<Option<Hook>>,
+    record: Record,
+}
+
+impl Hooked {
+    fn new(inner: crate::memory::MemoryCheckpoint, record: Record) -> Self {
+        Self {
+            inner,
+            after_current: Mutex::new(None),
+            before_record: Mutex::new(None),
+            record,
+        }
+    }
+}
+
+fn run(hook: &Mutex<Option<Hook>>) {
+    if let Some(hook) = hook.lock().unwrap().take() {
+        hook();
+    }
+}
+
+impl CheckpointTarget for Hooked {
+    fn key(&self) -> &[u8] {
+        self.inner.key()
+    }
+
+    fn current(&self) -> CatalogResult<Option<(FileId, u64)>> {
+        let current = self.inner.current();
+        run(&self.after_current);
+        current
+    }
+
+    fn begin(&self) -> CatalogResult<Option<crate::catalog::CheckpointStart>> {
+        self.inner.begin()
+    }
+
+    fn record(&self, wire: FileId, received: u64) -> CatalogResult<bool> {
+        run(&self.before_record);
+        match self.record {
+            Record::Pass => self.inner.record(wire, received),
+            Record::Refuse => Ok(false),
+            Record::Full => Err(CatalogError::Capacity),
+        }
+    }
+
+    fn clear(&self) -> CatalogResult<Option<FileId>> {
+        self.inner.clear()
+    }
+}
+
+fn wire_len(store: &MediaStore<MemoryCatalog>, catalog: &MemoryCatalog, slot: u32) -> u64 {
+    let (id, _) = catalog.checkpoint(slot).current().unwrap().unwrap();
+    std::fs::metadata(store.wire_path(&id)).unwrap().len()
+}
+
+fn restored(store: &MediaStore<MemoryCatalog>, target: &dyn CheckpointTarget) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    store
+        .checkpoint_restore(target, &mut bytes)
+        .unwrap()
+        .map(|_| bytes)
+}
+
+#[test]
+fn refused_or_failed_records_cut_their_appended_bytes_off() {
+    for (record, expected) in [
+        (Record::Refuse, Ok(false)),
+        (Record::Full, Err(MediaError::Capacity)),
+    ] {
+        let (harness, store) = fixture();
+        let catalog = &harness.catalog;
+        assert!(
+            store
+                .checkpoint_append(&catalog.checkpoint(0), 0, b"abc")
+                .unwrap()
+        );
+        let hooked = Hooked::new(catalog.checkpoint(0), record);
+        assert_eq!(store.checkpoint_append(&hooked, 3, b"defg"), expected);
+        assert_eq!(wire_len(&store, catalog, 0), 3);
+        assert_eq!(
+            restored(&store, &catalog.checkpoint(0)).unwrap(),
+            b"abc".to_vec()
+        );
+    }
+}
+
+#[test]
+fn a_short_write_is_cut_off_and_reports_a_full_disk() {
+    let (harness, store) = fixture();
+    let catalog = &harness.catalog;
+    let target = catalog.checkpoint(0);
+    store.simulate_full_wire_for_test(true);
+    assert_eq!(
+        store.checkpoint_append(&target, 0, b"abcd"),
+        Err(MediaError::Capacity)
+    );
+    assert_eq!(
+        wire_len(&store, catalog, 0),
+        0,
+        "the new checkpoint stays empty"
+    );
+    store.simulate_full_wire_for_test(false);
+    assert!(store.checkpoint_append(&target, 0, b"abc").unwrap());
+    store.simulate_full_wire_for_test(true);
+    assert_eq!(
+        store.checkpoint_append(&target, 3, b"defg"),
+        Err(MediaError::Capacity)
+    );
+    assert_eq!(wire_len(&store, catalog, 0), 3);
+    store.simulate_full_wire_for_test(false);
+    assert!(store.checkpoint_append(&target, 3, b"defg").unwrap());
+    assert_eq!(restored(&store, &target).unwrap(), b"abcdefg".to_vec());
+}
+
+#[test]
+fn an_oversized_append_is_refused_before_any_write() {
+    let (harness, store) = fixture();
+    let target = harness.catalog.checkpoint(0);
+    assert!(matches!(
+        store.checkpoint_append(&target, 0, &vec![0; CHECKPOINT_APPEND_MAX + 1]),
+        Err(MediaError::InvalidBody(_))
+    ));
+    assert_eq!(target.current().unwrap(), None);
+}
+
+/// A stale attempt's operation, held between its row lookup and its file
+/// change while a newer attempt takes the job, finishes before the newer
+/// attempt's append starts, so it can neither cut nor overwrite the newer
+/// attempt's bytes.
+#[test]
+fn a_stale_checkpoint_operation_finishes_before_a_newer_one_starts() {
+    let (harness, store) = fixture();
+    let catalog = harness.catalog.clone();
+    assert!(
+        store
+            .checkpoint_append(&catalog.checkpoint(0), 0, b"abc")
+            .unwrap()
+    );
+    let stale = Hooked::new(catalog.checkpoint(0), Record::Pass);
+    let (entered, waiting) = std::sync::mpsc::channel();
+    let (release, resume) = std::sync::mpsc::channel::<()>();
+    *stale.after_current.lock().unwrap() = Some(Box::new(move || {
+        entered.send(()).unwrap();
+        resume.recv().unwrap();
+    }));
+    let stale_store = store.clone();
+    let stale = std::thread::spawn(move || stale_store.checkpoint_append(&stale, 3, b"old"));
+    waiting.recv().unwrap();
+    catalog.supersede_checkpoint(0);
+    let newer_store = store.clone();
+    let newer_catalog = catalog.clone();
+    let newer = std::thread::spawn(move || {
+        newer_store.checkpoint_append(&newer_catalog.checkpoint(0), 3, b"new")
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        !newer.is_finished(),
+        "the newer append waits for the stale one"
+    );
+    release.send(()).unwrap();
+    assert_eq!(stale.join().unwrap(), Ok(false));
+    assert_eq!(newer.join().unwrap(), Ok(true));
+    assert_eq!(
+        restored(&store, &catalog.checkpoint(0)).unwrap(),
+        b"abcnew".to_vec()
+    );
+}
+
+/// A sweep that runs while an append's bytes are synced but not yet recorded
+/// leaves them alone: the file is in flight.
+#[test]
+fn the_sweep_leaves_an_unrecorded_append_in_flight_alone() {
+    let (harness, store) = fixture();
+    let catalog = &harness.catalog;
+    assert!(
+        store
+            .checkpoint_append(&catalog.checkpoint(0), 0, b"abc")
+            .unwrap()
+    );
+    let hooked = Hooked::new(catalog.checkpoint(0), Record::Pass);
+    let sweeper = store.clone();
+    *hooked.before_record.lock().unwrap() =
+        Some(Box::new(
+            move || {
+                while !sweeper.sweep(64).unwrap().complete {}
+            },
+        ));
+    assert!(store.checkpoint_append(&hooked, 3, b"def").unwrap());
+    assert_eq!(
+        restored(&store, &catalog.checkpoint(0)).unwrap(),
+        b"abcdef".to_vec()
     );
 }

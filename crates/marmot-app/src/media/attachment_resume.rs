@@ -67,90 +67,11 @@ pub(crate) fn available_space(path: &std::path::Path) -> std::io::Result<u64> {
     media_store::free_space(path)
 }
 
-/// Jobs whose checkpoint a blocking task is reading or writing. A cancelled
-/// download does not stop a checkpoint task already on the blocking pool, so
-/// a stale attempt's task could otherwise open the wire file at its own
-/// recorded length after a newer attempt recorded more, truncating that
-/// suffix or writing over it. Each checkpoint operation holds its job here
-/// from the metadata lookup through the file change and the record, so the
-/// file's recorded prefix is always the one the operation read.
-static CHECKPOINT_JOBS: std::sync::Mutex<Vec<storage_sqlite::AttachmentAssetRef>> =
-    std::sync::Mutex::new(Vec::new());
-static CHECKPOINT_RELEASED: std::sync::Condvar = std::sync::Condvar::new();
-
-struct CheckpointLock(storage_sqlite::AttachmentAssetRef);
-
-impl CheckpointLock {
-    /// Blocks until no other checkpoint operation holds `job`'s asset.
-    fn acquire(job: &AttachmentAcquisition) -> Self {
-        let mut held = CHECKPOINT_JOBS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while held.contains(&job.reference) {
-            held = CHECKPOINT_RELEASED
-                .wait(held)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-        held.push(job.reference.clone());
-        Self(job.reference.clone())
-    }
-}
-
-impl Drop for CheckpointLock {
-    fn drop(&mut self) {
-        let mut held = CHECKPOINT_JOBS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(index) = held.iter().position(|reference| *reference == self.0) {
-            held.swap_remove(index);
-        }
-        CHECKPOINT_RELEASED.notify_all();
-    }
-}
-
-/// Test hooks run between a checkpoint write's metadata lookup and its file
-/// change, keyed by job so parallel tests do not see each other's hooks.
-#[cfg(test)]
-pub(crate) mod checkpoint_hooks {
-    use storage_sqlite::AttachmentAssetRef;
-
-    type Hook = Box<dyn FnOnce() + Send>;
-    static HOOKS: std::sync::Mutex<Vec<(AttachmentAssetRef, Hook)>> =
-        std::sync::Mutex::new(Vec::new());
-
-    pub(crate) fn after_lookup(
-        reference: &AttachmentAssetRef,
-        hook: impl FnOnce() + Send + 'static,
-    ) {
-        HOOKS
-            .lock()
-            .unwrap()
-            .push((reference.clone(), Box::new(hook)));
-    }
-
-    pub(super) fn run(reference: &AttachmentAssetRef) {
-        let hook = {
-            let mut hooks = HOOKS.lock().unwrap();
-            hooks
-                .iter()
-                .position(|(held, _)| held == reference)
-                .map(|index| hooks.swap_remove(index).1)
-        };
-        if let Some(hook) = hook {
-            hook();
-        }
-    }
-}
-
-/// Appends `bytes` at `offset` to this attempt's `.wire` checkpoint and
-/// records the new length (mdk#2314 step 2b). Offset zero starts a new
-/// checkpoint, replacing any earlier one: its row commits before its file is
-/// created. Bytes reach the file and are synced before the row records them,
-/// so a crash leaves at most an unrecorded tail that the next open truncates.
-/// `false` means the attempt no longer owns a matching checkpoint. Bytes it
-/// appended but could not record are cut off again, so they do not hold disk
-/// the next attempt's admission needs.
-/// Blocking.
+/// Saves `bytes` at `offset` into the job's download checkpoint (mdk#2314
+/// step 2b). The media store owns the `.wire` file, the order of every step,
+/// cleanup when a step fails and serialization against other attempts; this
+/// only names the checkpoint. `false` means the attempt no longer owns a
+/// checkpoint at `offset`. Blocking.
 pub(crate) fn write_checkpoint(
     storage: &SqliteAccountStorage,
     media: &AccountMediaStore,
@@ -158,89 +79,14 @@ pub(crate) fn write_checkpoint(
     identity: &AttachmentPartialIdentity,
     offset: u64,
     bytes: &[u8],
-    now: u64,
-) -> Result<bool, CheckpointWriteError> {
-    let _lock = CheckpointLock::acquire(job);
-    let (id, mut wire) = if offset == 0 {
-        let previous = storage.load_attachment_partial(job, now, u64::MAX, None)?;
-        let Some(id) = storage.begin_attachment_partial(job, identity, now)? else {
-            return Ok(false);
-        };
-        if let Some(previous) = previous {
-            media.remove_wire(&previous.wire_file);
-        }
-        (id, media.create_wire(&id).map_err(wire_error)?)
-    } else {
-        let expected = (&identity.ciphertext_digest, &identity.locator_digest);
-        let Some(part) = storage.load_attachment_partial(job, now, u64::MAX, Some(expected))?
-        else {
-            return Ok(false);
-        };
-        if part.received != offset || part.identity != *identity {
-            return Ok(false);
-        }
-        #[cfg(test)]
-        checkpoint_hooks::run(&job.reference);
-        let Some(wire) = media
-            .open_wire(&part.wire_file, offset)
-            .map_err(wire_error)?
-        else {
-            return Ok(false);
-        };
-        (part.wire_file, wire)
-    };
-    if let Err(error) = wire.append(bytes) {
-        // A short write (a full volume) may have left part of `bytes`.
-        let _ = wire.truncate(offset);
-        return Err(wire_error(error));
-    }
-    let received = offset.saturating_add(bytes.len() as u64);
-    // Still under this job's lock: nothing else wrote this file since the
-    // lookup, so `offset` is its recorded length whenever the record does
-    // not commit.
-    match storage.record_attachment_partial(job, identity, &id, received, now) {
-        Ok(true) => Ok(true),
-        Ok(false) => {
-            let _ = wire.truncate(offset);
-            Ok(false)
-        }
-        Err(error) => {
-            let _ = wire.truncate(offset);
-            Err(error.into())
-        }
-    }
+) -> media_store::MediaResult<bool> {
+    let target = storage.attachment_checkpoint(job, identity.clone(), crate::unix_now_seconds);
+    media.checkpoint_append(&target, offset, bytes)
 }
 
-/// Why a checkpoint write failed.
-#[derive(Debug)]
-pub(crate) enum CheckpointWriteError {
-    /// The volume refused the checkpoint's bytes: the job parks for space.
-    Full,
-    /// Any other storage or file failure: a transient retry.
-    Failed,
-}
-
-impl From<cgka_traits::StorageError> for CheckpointWriteError {
-    /// The database's own full disk (`SQLITE_FULL`) parks like a full wire
-    /// file; anything else is a transient retry.
-    fn from(error: cgka_traits::StorageError) -> Self {
-        match error {
-            cgka_traits::StorageError::Capacity(_) => Self::Full,
-            _ => Self::Failed,
-        }
-    }
-}
-
-fn wire_error(error: media_store::MediaError) -> CheckpointWriteError {
-    match error {
-        media_store::MediaError::Capacity => CheckpointWriteError::Full,
-        _ => CheckpointWriteError::Failed,
-    }
-}
-
-/// The current checkpoint and its recorded prefix, read from its wire file.
-/// A wire file that is missing or shorter than its row records discards the
-/// checkpoint. The prefix buffer is reserved fallibly. Blocking.
+/// The job's checkpoint and its recorded prefix. The prefix buffer is
+/// reserved fallibly. A checkpoint whose file cannot resume is discarded by
+/// the store and reads as `None`. Blocking.
 pub(crate) fn read_checkpoint(
     storage: &SqliteAccountStorage,
     media: &AccountMediaStore,
@@ -249,60 +95,34 @@ pub(crate) fn read_checkpoint(
     max: u64,
     expected: Option<(&[u8; 32], &[u8; 32])>,
 ) -> Result<Option<RestoredPartial>, AppError> {
-    let _lock = CheckpointLock::acquire(job);
     let Some(part) = storage.load_attachment_partial(job, now, max, expected)? else {
-        return Ok(None);
-    };
-    let Some(mut wire) = media
-        .open_wire(&part.wire_file, part.received)
-        .map_err(media_error)?
-    else {
-        discard_checkpoint(storage, media, job, now, &part)?;
         return Ok(None);
     };
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(usize::try_from(part.received).unwrap_or(usize::MAX))
         .map_err(|_| AppError::BlobStore("attachment checkpoint buffer unavailable".into()))?;
-    wire.copy_to(&mut bytes).map_err(media_error)?;
-    Ok(Some((part, bytes)))
+    let target = storage.attachment_checkpoint(job, part.identity.clone(), crate::unix_now_seconds);
+    match media
+        .checkpoint_restore(&target, &mut bytes)
+        .map_err(media_error)?
+    {
+        Some(received) if received == part.received => Ok(Some((part, bytes))),
+        _ => Ok(None),
+    }
 }
 
-/// Removes this attempt's checkpoint row, then its wire file. Candidate
+/// Removes the job's checkpoint: the row, then its wire file. Candidate
 /// failures pass the expected identity; `None` clears whatever the job holds.
-/// The media sweep removes a wire file this misses. Blocking.
+/// Blocking.
 pub(crate) fn clear_checkpoint(
     storage: &SqliteAccountStorage,
     media: &AccountMediaStore,
     job: &AttachmentAcquisition,
-    now: u64,
-    expected: Option<(&[u8; 32], &[u8; 32])>,
+    expected: Option<([u8; 32], [u8; 32])>,
 ) -> Result<(), AppError> {
-    let _lock = CheckpointLock::acquire(job);
-    let part = storage.load_attachment_partial(job, now, u64::MAX, expected)?;
-    if storage.clear_attachment_partial(job, now, expected)?
-        && let Some(part) = part
-    {
-        media.remove_wire(&part.wire_file);
-    }
-    Ok(())
-}
-
-fn discard_checkpoint(
-    storage: &SqliteAccountStorage,
-    media: &AccountMediaStore,
-    job: &AttachmentAcquisition,
-    now: u64,
-    part: &AttachmentPartial,
-) -> Result<(), AppError> {
-    let identity = (
-        &part.identity.ciphertext_digest,
-        &part.identity.locator_digest,
-    );
-    if storage.clear_attachment_partial(job, now, Some(identity))? {
-        media.remove_wire(&part.wire_file);
-    }
-    Ok(())
+    let target = storage.attachment_checkpoint_matching(job, expected, crate::unix_now_seconds);
+    media.checkpoint_clear(&target).map_err(media_error)
 }
 
 fn media_error(_: media_store::MediaError) -> AppError {
@@ -408,13 +228,15 @@ impl AttachmentResume {
             .await
     }
 
-    /// The in-memory sink's receipt. Its checkpoint is already on disk and
-    /// stops growing, so only the store file is still to be written.
+    /// The in-memory sink's receipt. Its checkpoint stops growing here, so
+    /// only the store file is still to be written.
     pub(crate) async fn completed_body(
         &self,
         plaintext_len: usize,
     ) -> Result<(), AttachmentDownloadFailure> {
-        self.record_completed_body(plaintext_len as u64, 0).await
+        let len = plaintext_len as u64;
+        self.record_completed_body(DiskPolicy::download_need(len, len), 0)
+            .await
     }
 
     /// `held` is the staging this attempt occupies at the receipt.
@@ -520,7 +342,7 @@ impl AttachmentResume {
     ) -> Result<(), AttachmentDownloadFailure> {
         let this = Arc::clone(self);
         let checked = tokio::task::spawn_blocking(move || {
-            this.check_capacity(memory_sink_bytes(bytes, on_disk), 0)
+            this.check_capacity(DiskPolicy::download_need(bytes, on_disk), 0)
         })
         .await
         .map_err(|_| retry("attachment capacity task failed"))
@@ -638,13 +460,7 @@ impl AttachmentResume {
             )
         });
         tokio::task::spawn_blocking(move || {
-            clear_checkpoint(
-                &this.storage,
-                &this.media,
-                &this.job,
-                crate::unix_now_seconds(),
-                identity.as_ref().map(|(c, l)| (c, l)),
-            )
+            clear_checkpoint(&this.storage, &this.media, &this.job, identity)
         })
         .await
         .map_err(|_| retry("partial checkpoint task failed"))?
@@ -672,11 +488,13 @@ impl AttachmentResume {
             let body = identity
                 .total
                 .saturating_sub(super::file_transfer::MEDIA_AEAD_TAG_BYTES);
+            let need = DiskPolicy::download_need(body, offset as u64);
             if disk.admit(free, bytes.len() as u64) != Admission::Admitted {
-                return Err(storage_blocked(memory_sink_bytes(body, offset as u64)));
+                return Err(storage_blocked(need));
             }
-            // The volume can still fill between the measurement and the
-            // write: a refused write parks the same way.
+            // The volume or the database can still fill between the
+            // measurement and the write: the store reports that as
+            // `Capacity`, and it parks the same way.
             write_checkpoint(
                 &this.storage,
                 &this.media,
@@ -684,13 +502,10 @@ impl AttachmentResume {
                 &identity,
                 offset as u64,
                 &bytes,
-                crate::unix_now_seconds(),
             )
             .map_err(|error| match error {
-                CheckpointWriteError::Full => {
-                    storage_blocked(memory_sink_bytes(body, offset as u64))
-                }
-                CheckpointWriteError::Failed => retry("partial checkpoint write failed"),
+                media_store::MediaError::Capacity => storage_blocked(need),
+                _ => retry("partial checkpoint write failed"),
             })
         })
         .await
@@ -736,7 +551,6 @@ impl AttachmentResume {
                     .saturating_add(saved),
                 0,
             )?;
-            let _lock = CheckpointLock::acquire(&this.job);
             let now = crate::unix_now_seconds();
             let expected = (&this.ciphertext_digest, &locator_digest);
             let Some(part) = this
@@ -746,24 +560,27 @@ impl AttachmentResume {
             else {
                 return Ok(None);
             };
-            let Some(mut wire) = this
-                .media
-                .open_wire(&part.wire_file, part.received)
-                .map_err(|_| retry("partial file checkpoint unavailable"))?
-            else {
-                discard_checkpoint(&this.storage, &this.media, &this.job, now, &part)
-                    .map_err(|_| retry("partial file checkpoint cleanup failed"))?;
-                return Ok(None);
-            };
             let mut file = super::file_transfer::PrivateMediaFile::create(&directory)?;
             let mut writer = file.writer()?;
-            wire.copy_to(&mut writer)
+            let target = this.storage.attachment_checkpoint(
+                &this.job,
+                part.identity.clone(),
+                crate::unix_now_seconds,
+            );
+            let restored = this
+                .media
+                .checkpoint_restore(&target, &mut writer)
                 .map_err(|_| retry("partial file checkpoint unavailable"))?;
             std::io::Write::flush(&mut writer)
                 .map_err(|_| retry("partial file checkpoint unavailable"))?;
             drop(writer);
-            file.len = part.received;
-            Ok(Some((file, part.identity)))
+            match restored {
+                Some(received) if received == part.received => {
+                    file.len = received;
+                    Ok(Some((file, part.identity)))
+                }
+                _ => Ok(None),
+            }
         })
         .await
         .map_err(|_| retry("partial file checkpoint task failed"))?
@@ -959,17 +776,10 @@ pub(super) async fn read_body(
         .await?;
     Ok(bytes)
 }
-/// What the in-memory sink needs free beyond the reserve for a body of
-/// `bytes`: its wire checkpoint and its store file, less the `on_disk`
-/// checkpoint bytes already written, and never less than the store file.
-fn memory_sink_bytes(bytes: u64, on_disk: u64) -> u64 {
-    DiskPolicy::download_bytes(bytes)
-        .saturating_sub(on_disk)
-        .max(bytes)
-}
-
 /// What the file sink needs free beyond the reserve to publish a body of
-/// `bytes`, with `ahead` still to stage or checkpoint first.
+/// `bytes`, with `ahead` still to stage or checkpoint first. It still holds a
+/// staging copy and a decrypted copy beside the checkpoint and the store
+/// file; mdk#2314 step 2b-2 moves it onto [`DiskPolicy::download_need`].
 fn file_sink_bytes(bytes: u64, ahead: u64) -> u64 {
     bytes.saturating_mul(4).saturating_add(ahead)
 }

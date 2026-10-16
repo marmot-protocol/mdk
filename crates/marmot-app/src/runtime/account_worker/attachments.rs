@@ -118,21 +118,27 @@ fn admit_demands(
 }
 
 /// Admits a download of up to `max` body bytes under the app's
-/// [`media_store::DiskPolicy`]: the reserve plus room for its wire checkpoint
-/// and its store file, less the `checkpointed` bytes already on disk, and
-/// never less than the store file.
+/// [`media_store::DiskPolicy`]: the reserve plus what
+/// [`DiskPolicy::download_need`](media_store::DiskPolicy::download_need) says
+/// the download still writes. A job with a checkpoint (`recorded` bytes) is
+/// credited one more append ([`media_store::CHECKPOINT_APPEND_MAX`]): a crash
+/// between an append and its record can leave that much on disk unrecorded,
+/// and free space already excludes it. The attempt cuts any such tail off
+/// before its own checks, which use the exact length; worker admission and
+/// readmission both decide through this function.
 fn capacity(
     policy: &storage_sqlite::AttachmentDownloadPolicy,
     max: u64,
-    checkpointed: u64,
+    recorded: Option<u64>,
     free: u64,
 ) -> bool {
     let disk = media_store::DiskPolicy {
         reserve_bytes: policy.disk_reserve,
     };
-    let needed = media_store::DiskPolicy::download_bytes(max)
-        .saturating_sub(checkpointed)
-        .max(max);
+    let on_disk = recorded.map_or(0, |recorded| {
+        recorded.saturating_add(media_store::CHECKPOINT_APPEND_MAX as u64)
+    });
+    let needed = media_store::DiskPolicy::download_need(max, on_disk);
     max > 0
         && max <= crate::media::MAX_ENCRYPTED_MEDIA_BLOB_BYTES
         && disk.admit(free, needed) == media_store::Admission::Admitted
@@ -298,8 +304,8 @@ pub(super) fn schedule(
             now,
             policy.disk_reserve,
             free,
-            policy.transfer_limit,
             policy.automatic,
+            &|recorded| capacity(&policy, policy.transfer_limit, recorded, free),
         )?,
         None => 0,
     };
@@ -412,8 +418,8 @@ pub(super) fn schedule(
         // automatic-sized object even for explicit work, then enforce actual
         // checkpoint/publication capacity as the transfer grows.
         let reservation = policy.transfer_limit;
-        let checkpointed = storage.attachment_checkpoint_bytes(&candidate)?;
-        if !capacity(&policy, reservation, checkpointed, free) {
+        let recorded = storage.attachment_checkpoint_recorded(&candidate)?;
+        if !capacity(&policy, reservation, recorded, free) {
             storage.finish_attachment_preparation(&candidate, now, Some(now.saturating_add(15)))?;
             continue;
         }
@@ -694,11 +700,11 @@ pub(super) fn complete_acquired_stored(
                 cancelled,
             );
             let saved = storage
-                .attachment_checkpoint_bytes(&job.reference)
+                .attachment_checkpoint_recorded(&job.reference)
+                .ok()
+                .flatten()
                 .unwrap_or(0);
-            let required = media_store::DiskPolicy::download_bytes(len)
-                .saturating_sub(saved)
-                .max(len);
+            let required = media_store::DiskPolicy::download_need(len, saved);
             (published, len, required, 0, None)
         }
         crate::client::AcquiredMediaBody::Retained => return Ok(()),

@@ -4,12 +4,13 @@ use std::io::Cursor;
 use std::path::PathBuf;
 
 use media_store::conformance::{self, Harness};
-use media_store::{MEDIA_DIRECTORY, MediaStore, PublishOutcome};
+use media_store::{CheckpointTarget, MEDIA_DIRECTORY, MediaStore, PublishOutcome};
 use sha2::{Digest, Sha256};
 
 use super::*;
 use crate::{
-    AttachmentDemand, AttachmentHistoryEntry, SqlCipherKey, SqliteAccountStorage, StoredAppEvent,
+    AttachmentAcquisition, AttachmentAssetRef, AttachmentDemand, AttachmentHistoryEntry,
+    AttachmentPartialIdentity, SqlCipherKey, SqliteAccountStorage, StoredAppEvent,
 };
 
 const GROUP: &str = "abababababababababababababababab";
@@ -19,7 +20,9 @@ struct SqliteHarness {
     dir: tempfile::TempDir,
     key: SqlCipherKey,
     storage: SqliteAccountStorage,
-    slots: RefCell<HashMap<u32, Vec<u8>>>,
+    slots: RefCell<HashMap<u32, (Vec<u8>, AttachmentAssetRef)>>,
+    /// Each slot's claimed download attempt, for its checkpoint target.
+    jobs: RefCell<HashMap<u32, AttachmentAcquisition>>,
 }
 
 impl SqliteHarness {
@@ -41,12 +44,13 @@ impl SqliteHarness {
             key,
             storage,
             slots: RefCell::new(HashMap::new()),
+            jobs: RefCell::new(HashMap::new()),
         }
     }
 
     /// A real attachment slot (acquisition token) per test slot number.
     fn token(&self, slot: u32) -> Vec<u8> {
-        if let Some(token) = self.slots.borrow().get(&slot) {
+        if let Some((token, _)) = self.slots.borrow().get(&slot) {
             return token.clone();
         }
         let message = format!("{:064x}", slot + 1);
@@ -84,12 +88,13 @@ impl SqliteHarness {
             received_at: NOW,
             slot: serde_json::to_value(&tag).unwrap(),
         };
-        assert!(matches!(
-            self.storage
-                .request_attachment_acquisition(GROUP, &entry, digest, NOW)
-                .unwrap(),
-            AttachmentDemand::Requested(_)
-        ));
+        let AttachmentDemand::Requested(asset) = self
+            .storage
+            .request_attachment_acquisition(GROUP, &entry, digest, NOW)
+            .unwrap()
+        else {
+            panic!("the slot's acquisition is requested");
+        };
         let token: Vec<u8> = self
             .storage
             .lock()
@@ -100,8 +105,24 @@ impl SqliteHarness {
                 |r| r.get(0),
             )
             .unwrap();
-        self.slots.borrow_mut().insert(slot, token.clone());
+        self.slots.borrow_mut().insert(slot, (token.clone(), asset));
         token
+    }
+
+    /// `slot`'s claimed download attempt, claiming it on first use.
+    fn job(&self, slot: u32) -> AttachmentAcquisition {
+        if let Some(job) = self.jobs.borrow().get(&slot) {
+            return job.clone();
+        }
+        self.token(slot);
+        let asset = self.slots.borrow()[&slot].1.clone();
+        let job = self
+            .storage
+            .claim_attachment_acquisition(&asset, NOW, NOW + 1_000)
+            .unwrap()
+            .expect("the slot's download is claimed");
+        self.jobs.borrow_mut().insert(slot, job.clone());
+        job
     }
 
     fn sql(&self, sql: &str, param: &[u8]) {
@@ -160,35 +181,31 @@ impl Harness for SqliteHarness {
                 .unwrap();
     }
 
-    fn begin_wire_partial(&self, slot: u32) -> FileId {
-        let token = self.token(slot);
-        self.storage
-            .lock()
-            .unwrap()
-            .query_row(
-                "INSERT INTO attachment_partial(token,ciphertext_digest,locator_digest,etag,total,expires_at,wire_file_id)
-                 VALUES(?1,zeroblob(32),zeroblob(32),'\"tag\"',100,9999999999,randomblob(16))
-                 ON CONFLICT(token) DO UPDATE SET wire_file_id=randomblob(16),received=0
-                 RETURNING wire_file_id",
-                [&token],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .map(|id| FileId::from_slice(&id).unwrap())
-            .unwrap()
+    fn checkpoint(&self, slot: u32) -> Box<dyn CheckpointTarget + '_> {
+        let identity = AttachmentPartialIdentity {
+            ciphertext_digest: [1; 32],
+            locator_digest: [2; 32],
+            etag: "\"tag\"".into(),
+            total: 100,
+        };
+        Box::new(
+            self.storage
+                .attachment_checkpoint(&self.job(slot), identity, || NOW),
+        )
     }
 
-    fn record_wire_partial(&self, slot: u32, received: u64) {
+    /// A worker restart requeues the claimed job; claiming it again starts
+    /// a newer attempt and fences the old one.
+    fn supersede_checkpoint(&self, slot: u32) {
+        self.job(slot);
+        self.jobs.borrow_mut().remove(&slot);
         self.storage
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE attachment_partial SET received=?2 WHERE token=?1",
-                rusqlite::params![self.token(slot), received as i64],
-            )
+            .resume_attachment_acquisitions(NOW, 64)
             .unwrap();
+        self.job(slot);
     }
 
-    fn end_wire_partial(&self, slot: u32) {
+    fn end_checkpoint(&self, slot: u32) {
         self.sql(
             "DELETE FROM attachment_partial WHERE token=?1",
             &self.token(slot),

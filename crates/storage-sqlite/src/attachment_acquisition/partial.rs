@@ -1,12 +1,16 @@
 //! Download checkpoints. The ciphertext prefix lives in an append-only
 //! `.wire` file in the media store; this row records its identity, the
-//! length received so far and the wire file's id (mdk#2314 step 2b). The row
-//! is written before its file exists and deleted before the file is.
-use media_store::FileId;
+//! length received so far and the wire file's id (mdk#2314 step 2b). The
+//! media store drives the file and the ordering through
+//! [`AttachmentCheckpoint`](super::AttachmentCheckpoint); these are its row
+//! operations, each under the job's attempt fences.
+use media_store::{CheckpointStart, FileId};
 
 use super::*;
 
-pub const ATTACHMENT_CHECKPOINT_BYTES: usize = 1024 * 1024;
+/// Bytes a download saves per checkpoint append: the media store's largest
+/// append, which bounds what a crash can leave unrecorded.
+pub const ATTACHMENT_CHECKPOINT_BYTES: usize = media_store::CHECKPOINT_APPEND_MAX;
 /// Idle expiry of a checkpoint, measured from its last progress. Parking a job
 /// for disk space, readmitting it and explicitly retrying it all refresh this
 /// deadline, so a prefix kept through a long park is still loadable when the
@@ -160,32 +164,16 @@ impl SqliteAccountStorage {
         .storage()
     }
 
-    /// Bytes `reference`'s checkpoint holds on disk, or zero. Unfenced: worker
-    /// admission credits them against the space a resumed download needs,
-    /// and the attempt's own checks repeat under its fences.
-    pub fn attachment_checkpoint_bytes(
-        &self,
-        reference: &AttachmentAssetRef,
-    ) -> StorageResult<u64> {
-        self.lock()?
-            .query_row(
-                "SELECT coalesce((SELECT received FROM attachment_partial WHERE token=?1),0)",
-                [&reference.token],
-                |row| nonnegative(row, 0),
-            )
-            .storage()
-    }
-
     /// Starts a new checkpoint for this attempt, replacing any earlier one,
-    /// and returns the id of the wire file to create. The row commits before
-    /// that file exists, with nothing received. `None` means the attempt no
-    /// longer owns the job.
-    pub fn begin_attachment_partial(
+    /// and returns the wire file to create and the replaced one's. The row
+    /// commits before that file exists, with nothing received. `None` means
+    /// the attempt no longer owns the job.
+    pub(crate) fn begin_attachment_partial(
         &self,
         job: &AttachmentAcquisition,
         identity: &AttachmentPartialIdentity,
         now: u64,
-    ) -> StorageResult<Option<FileId>> {
+    ) -> StorageResult<Option<CheckpointStart>> {
         validate_identity(identity)?;
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
@@ -193,15 +181,19 @@ impl SqliteAccountStorage {
                 return Ok(None);
             }
             // Re-receiving the prefix this replaces is not forward progress.
-            let floor: u64 = conn
+            let replaced: Option<(u64, Option<Vec<u8>>)> = conn
                 .query_row(
-                    "SELECT max(received,progress_floor) FROM attachment_partial WHERE token=?1",
+                    "SELECT max(received,progress_floor),wire_file_id FROM attachment_partial
+                     WHERE token=?1",
                     [&job.reference.token],
-                    |row| nonnegative(row, 0),
+                    |row| Ok((nonnegative(row, 0)?, row.get(1)?)),
                 )
                 .optional()
-                .storage()?
-                .unwrap_or(0);
+                .storage()?;
+            let floor = replaced.as_ref().map_or(0, |(floor, _)| *floor);
+            let replaced = replaced
+                .and_then(|(_, wire)| wire)
+                .and_then(|wire| FileId::from_slice(&wire));
             conn.execute(
                 "DELETE FROM attachment_partial WHERE token=?1",
                 [&job.reference.token],
@@ -225,9 +217,9 @@ impl SqliteAccountStorage {
                     |row| row.get(0),
                 )
                 .storage()?;
-            FileId::from_slice(&wire)
-                .map(Some)
-                .ok_or_else(|| invalid("invalid partial wire file"))
+            let wire =
+                FileId::from_slice(&wire).ok_or_else(|| invalid("invalid partial wire file"))?;
+            Ok(Some(CheckpointStart { wire, replaced }))
         })
     }
 
@@ -235,7 +227,7 @@ impl SqliteAccountStorage {
     /// `received` bytes of this checkpoint's representation. The caller has
     /// appended and synced them first. Only growth of this attempt's own
     /// checkpoint is accepted.
-    pub fn record_attachment_partial(
+    pub(crate) fn record_attachment_partial(
         &self,
         job: &AttachmentAcquisition,
         identity: &AttachmentPartialIdentity,
@@ -382,36 +374,91 @@ impl SqliteAccountStorage {
     /// Clear only this live attempt's checkpoint; stale/cancelled work cannot
     /// erase a newer attempt's progress. Candidate failures must supply the
     /// expected ciphertext/locator identity; None is for whole-job cleanup.
-    pub fn clear_attachment_partial(
+    /// Returns the removed checkpoint's wire file, for the store to unlink.
+    pub(crate) fn clear_attachment_partial(
         &self,
         job: &AttachmentAcquisition,
         now: u64,
         expected: Option<(&[u8; 32], &[u8; 32])>,
-    ) -> StorageResult<bool> {
+    ) -> StorageResult<Option<FileId>> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             if !valid_attempt(&conn, job, now)? {
-                return Ok(false);
+                return Ok(None);
             }
-            let removed = if let Some((ciphertext, locator)) = expected {
-                conn.execute(
+            let wire: Option<Option<Vec<u8>>> = if let Some((ciphertext, locator)) = expected {
+                conn.query_row(
                     "DELETE FROM attachment_partial WHERE token=?1
-                     AND ciphertext_digest=?2 AND locator_digest=?3",
+                     AND ciphertext_digest=?2 AND locator_digest=?3 RETURNING wire_file_id",
                     params![
                         job.reference.token,
                         ciphertext.as_slice(),
                         locator.as_slice()
                     ],
+                    |row| row.get(0),
                 )
             } else {
-                conn.execute(
-                    "DELETE FROM attachment_partial WHERE token=?1",
+                conn.query_row(
+                    "DELETE FROM attachment_partial WHERE token=?1 RETURNING wire_file_id",
                     [&job.reference.token],
+                    |row| row.get(0),
                 )
             }
+            .optional()
             .storage()?;
-            Ok(removed > 0)
+            Ok(wire.flatten().and_then(|wire| FileId::from_slice(&wire)))
         })
+    }
+
+    /// This attempt's checkpoint for the media store: its wire file and
+    /// recorded length, if it matches `expected` and has not expired. Reads
+    /// only; an expired row is left for pruning.
+    pub(crate) fn current_attachment_partial(
+        &self,
+        job: &AttachmentAcquisition,
+        now: u64,
+        expected: Option<(&[u8; 32], &[u8; 32])>,
+        identity: Option<&AttachmentPartialIdentity>,
+    ) -> StorageResult<Option<(FileId, u64)>> {
+        let conn = self.lock()?;
+        if !valid_attempt(&conn, job, now)? {
+            return Ok(None);
+        }
+        let row = conn
+            .query_row(
+                "SELECT ciphertext_digest,locator_digest,etag,total,received,wire_file_id
+                 FROM attachment_partial WHERE token=?1 AND expires_at>?2 AND received<=total",
+                params![job.reference.token, u64_to_i64(now)?],
+                |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, Vec<u8>>(1)?,
+                        r.get::<_, String>(2)?,
+                        nonnegative(r, 3)?,
+                        nonnegative(r, 4)?,
+                        r.get::<_, Option<Vec<u8>>>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .storage()?;
+        let Some((cipher, locator, etag, total, received, wire)) = row else {
+            return Ok(None);
+        };
+        if expected.is_some_and(|(c, l)| cipher != c || locator != l)
+            || identity.is_some_and(|identity| {
+                cipher != identity.ciphertext_digest
+                    || locator != identity.locator_digest
+                    || etag != identity.etag
+                    || total != identity.total
+            })
+        {
+            return Ok(None);
+        }
+        Ok(wire
+            .as_deref()
+            .and_then(FileId::from_slice)
+            .map(|wire| (wire, received)))
     }
 
     /// Storage-parked jobs are exempt until
@@ -439,6 +486,23 @@ impl SqliteAccountStorage {
                  ORDER BY p.expires_at,p.token LIMIT ?2)",
                 params![u64_to_i64(now)?, limit as i64, u64_to_i64(exempt_after)?],
             )
+            .storage()
+    }
+
+    /// Bytes `reference`'s checkpoint has recorded, if it has one. Unfenced:
+    /// worker admission credits them against what a resumed download still
+    /// writes, and the attempt's own checks repeat under its fences.
+    pub fn attachment_checkpoint_recorded(
+        &self,
+        reference: &AttachmentAssetRef,
+    ) -> StorageResult<Option<u64>> {
+        self.lock()?
+            .query_row(
+                "SELECT received FROM attachment_partial WHERE token=?1",
+                [&reference.token],
+                |row| nonnegative(row, 0),
+            )
+            .optional()
             .storage()
     }
 

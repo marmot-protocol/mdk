@@ -1078,6 +1078,14 @@ fn attachment_partial_storage_is_provisioned_without_network() {
     assert_eq!(count, 0);
 }
 
+/// The worker's admission rule as the app hands it to readmission: room for
+/// a download of up to `limit` bytes less its recorded checkpoint.
+fn admission(reserve: u64, free: u64, limit: u64) -> impl Fn(Option<u64>) -> bool {
+    move |checkpointed| {
+        free >= reserve + media_store::DiskPolicy::download_need(limit, checkpointed.unwrap_or(0))
+    }
+}
+
 fn partial_identity(total: u64) -> AttachmentPartialIdentity {
     AttachmentPartialIdentity {
         ciphertext_digest: [1; 32],
@@ -1121,7 +1129,12 @@ fn attachment_partial_reopen_preserves_prefix_and_fences_old_attempts() {
         .unwrap()
         .unwrap();
     assert!(!checkpoint(&store, &old, &identity, 3, b"old", 13).unwrap());
-    assert!(!store.clear_attachment_partial(&old, 13, None).unwrap());
+    assert!(
+        !store
+            .clear_attachment_partial(&old, 13, None)
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(
         store
             .load_attachment_partial(&job, 13, 10, None)
@@ -1143,23 +1156,26 @@ fn attachment_partial_reopen_preserves_prefix_and_fences_old_attempts() {
     assert_eq!(partial_usage(&store), 0);
     assert!(!checkpoint(&store, &job, &identity, 0, b"late", 13).unwrap());
 }
-/// A checkpoint record the database has no room for fails with
-/// `StorageError::Capacity`, which the app parks as a full disk, and leaves
-/// the recorded length unchanged.
+/// A checkpoint append the database has no room to record (`SQLITE_FULL`)
+/// reaches the media store as a full disk, which the app parks on, and the
+/// store cuts the appended bytes off again: the recorded length and the
+/// file both stay where they were.
 #[test]
-fn attachment_partial_record_on_a_full_database_reports_capacity() {
+fn a_checkpoint_append_on_a_full_database_reports_capacity() {
+    let dir = tempfile::tempdir().unwrap();
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let media = media_store::MediaStore::new(
+        dir.path().join(media_store::MEDIA_DIRECTORY),
+        crate::SqliteMediaCatalog::new(store.clone()),
+    );
     seed(&store, "full");
     let asset = request(&store, "full");
     let job = store
         .claim_attachment_acquisition(&asset, 12, 100)
         .unwrap()
         .unwrap();
-    let identity = partial_identity(10);
-    let wire = store
-        .begin_attachment_partial(&job, &identity, 12)
-        .unwrap()
-        .unwrap();
+    let target = store.attachment_checkpoint(&job, partial_identity(10), || 12);
+    assert!(media.checkpoint_append(&target, 0, b"abc").unwrap());
     // Recording the length needs more pages than the database may grow.
     sql(
         &store,
@@ -1168,18 +1184,21 @@ fn attachment_partial_record_on_a_full_database_reports_capacity() {
          BEGIN INSERT INTO filler VALUES(zeroblob(1048576)); END;",
     );
     store.limit_database_pages_for_test(16).unwrap();
-    assert!(matches!(
-        store.record_attachment_partial(&job, &identity, &wire, 3, 12),
-        Err(StorageError::Capacity(_))
-    ));
-    store.limit_database_pages_for_test(1 << 30).unwrap();
     assert_eq!(
-        store
-            .load_attachment_partial(&job, 12, 10, None)
+        media.checkpoint_append(&target, 3, b"defg"),
+        Err(media_store::MediaError::Capacity)
+    );
+    store.limit_database_pages_for_test(1 << 30).unwrap();
+    let part = store
+        .load_attachment_partial(&job, 12, 10, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(part.received, 3);
+    assert_eq!(
+        std::fs::metadata(media.wire_path(&part.wire_file))
             .unwrap()
-            .unwrap()
-            .received,
-        0
+            .len(),
+        3
     );
 }
 
@@ -1301,6 +1320,7 @@ fn attachment_partial_cleanup_is_locator_ciphertext_and_attempt_scoped() {
             !store
                 .clear_attachment_partial(&old, 12, Some((&pair.0, &pair.1)))
                 .unwrap()
+                .is_some()
         );
         assert_eq!(partial_usage(&store), 3);
     }
@@ -1313,12 +1333,14 @@ fn attachment_partial_cleanup_is_locator_ciphertext_and_attempt_scoped() {
         !store
             .clear_attachment_partial(&old, 13, Some((&[1; 32], &[2; 32])))
             .unwrap()
+            .is_some()
     );
     assert_eq!(partial_usage(&store), 3);
     assert!(
         store
             .clear_attachment_partial(&current, 13, Some((&[1; 32], &[2; 32])))
             .unwrap()
+            .is_some()
     );
     assert_eq!(partial_usage(&store), 0);
 }
@@ -2807,7 +2829,13 @@ fn readmit(
     automatic: bool,
 ) -> usize {
     store
-        .readmit_storage_blocked_attachments(now, reserve, free, 1, automatic)
+        .readmit_storage_blocked_attachments(
+            now,
+            reserve,
+            free,
+            automatic,
+            &admission(reserve, free, 1),
+        )
         .unwrap()
 }
 
@@ -3025,7 +3053,13 @@ fn storage_readmission_waits_for_admission_capacity() {
     );
     assert_eq!(
         store
-            .readmit_storage_blocked_attachments(13, 1000, 1000 + 2 * limit - 1, limit, true)
+            .readmit_storage_blocked_attachments(
+                13,
+                1000,
+                1000 + 2 * limit - 1,
+                true,
+                &admission(1000, 1000 + 2 * limit - 1, limit)
+            )
             .unwrap(),
         0
     );
@@ -3035,7 +3069,13 @@ fn storage_readmission_waits_for_admission_capacity() {
     );
     assert_eq!(
         store
-            .readmit_storage_blocked_attachments(13, 1000, 1000 + 2 * limit, limit, true)
+            .readmit_storage_blocked_attachments(
+                13,
+                1000,
+                1000 + 2 * limit,
+                true,
+                &admission(1000, 1000 + 2 * limit, limit)
+            )
             .unwrap(),
         1
     );
@@ -3064,13 +3104,25 @@ fn storage_readmission_credits_the_saved_checkpoint() {
     assert!(needed < 2 * limit && fits(1024) < needed);
     assert_eq!(
         store
-            .readmit_storage_blocked_attachments(13, 1000, 1000 + needed - 1, limit, true)
+            .readmit_storage_blocked_attachments(
+                13,
+                1000,
+                1000 + needed - 1,
+                true,
+                &admission(1000, 1000 + needed - 1, limit)
+            )
             .unwrap(),
         0
     );
     assert_eq!(
         store
-            .readmit_storage_blocked_attachments(13, 1000, 1000 + needed, limit, true)
+            .readmit_storage_blocked_attachments(
+                13,
+                1000,
+                1000 + needed,
+                true,
+                &admission(1000, 1000 + needed, limit)
+            )
             .unwrap(),
         1
     );
@@ -3624,7 +3676,7 @@ fn storage_readmission_probe_is_read_only_while_nothing_fits() {
     );
     assert!(
         store
-            .readmit_storage_blocked_attachments(13, 0, u64::MAX, 1, true)
+            .readmit_storage_blocked_attachments(13, 0, u64::MAX, true, &|_| true)
             .is_err(),
         "a row that fits does write, so the guard is effective"
     );

@@ -33,10 +33,15 @@ impl DiskPolicy {
         }
     }
 
-    /// Bytes a download of a `body`-byte attachment occupies at its peak:
-    /// its wire checkpoint plus the store file being published from it.
-    pub fn download_bytes(body: u64) -> u64 {
+    /// Bytes a download of a `body`-byte attachment still writes when
+    /// `checkpointed` bytes of its wire checkpoint are already on disk: the
+    /// rest of the checkpoint, then the store file published from it. Every
+    /// download disk check uses this one rule, with `checkpointed` as large
+    /// as the caller can vouch for. Never less than the store file.
+    pub fn download_need(body: u64, checkpointed: u64) -> u64 {
         body.saturating_mul(2)
+            .saturating_sub(checkpointed)
+            .max(body)
     }
 }
 
@@ -52,12 +57,19 @@ mod tests {
     #[test]
     fn admission_keeps_the_reserve_free() {
         let policy = DiskPolicy { reserve_bytes: 100 };
-        let needed = DiskPolicy::download_bytes(50);
+        let needed = DiskPolicy::download_need(50, 0);
         assert_eq!(needed, 100);
         assert_eq!(policy.admit(200, needed), Admission::Admitted);
         assert_eq!(
             policy.admit(199, needed),
             Admission::StorageFull { headroom: 100 }
         );
+    }
+
+    #[test]
+    fn a_saved_checkpoint_lowers_the_need_to_the_store_file() {
+        assert_eq!(DiskPolicy::download_need(50, 20), 80);
+        assert_eq!(DiskPolicy::download_need(50, 50), 50);
+        assert_eq!(DiskPolicy::download_need(50, 1 << 40), 50);
     }
 }
