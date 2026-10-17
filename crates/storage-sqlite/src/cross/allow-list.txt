@@ -1,0 +1,77 @@
+# Crossings between the protocol and app sides of storage-sqlite that still have to move into cross/.
+# One line per file (or schema object) and target: <channel> <where> <target>. base::boundary_tests
+# fails on a crossing missing from this list and on a listed one that no longer occurs.
+# See docs/marmot-architecture/review/brief-storage-boundaries.md.
+
+# Module paths that name the other side (the base handle names both: it holds the OpenMLS store and the draft observer).
+path app/account_projection.rs crate::protocol::storage::groups
+path app/chat_list.rs crate::protocol::storage::disband_requests
+path app/chat_list.rs crate::protocol::storage::leave_requests
+path base/connection.rs crate::app::message_drafts
+path base/connection.rs crate::protocol::openmls_storage
+path base/connection.rs crate::protocol::storage::snapshots
+path protocol/storage/groups.rs crate::app::account_recovery
+path protocol/storage/messages.rs crate::app::account_recovery
+path protocol/storage/outbound.rs crate::app::message_drafts
+path protocol/storage/transport_routes.rs crate::app::account_recovery
+
+# Calls through self or Self to a method the other side defines.
+method app/account_projection.rs is_group_forgotten
+method app/account_recovery/comparison.rs with_transaction
+method app/account_recovery/stall.rs with_transaction
+method app/recovery_health.rs with_transaction
+method protocol/storage/groups.rs forget_group_local_data
+method protocol/storage/outbound.rs accept_local_submission_tx
+method protocol/storage/outbound.rs notify_message_draft_committed
+
+# SQL naming the other side's tables. base/migrations.rs: the legacy migration 9 reconcile adds a column to two app tables.
+sql app/account_projection.rs cgka_disband_tombstones
+sql app/account_projection.rs cgka_groups
+sql app/account_projection.rs cgka_messages
+sql app/account_projection.rs cgka_transport_group_routes
+sql app/account_projection.rs cgka_welcomes
+sql app/account_projection.rs locally_forgotten_groups
+sql app/account_projection.rs pending_application_events
+sql app/chat_list.rs cgka_disband_tombstones
+sql app/chat_list/pages.rs cgka_disband_candidates
+sql app/chat_list/pages.rs cgka_disband_requests
+sql app/chat_list/pages.rs cgka_leave_requests
+sql app/timeline.rs cgka_messages
+sql app/timeline/capture.rs cgka_disband_tombstones
+sql app/timeline/capture.rs cgka_leave_requests
+sql app/timeline/reports.rs cgka_messages
+sql app/timeline/reports.rs pending_application_authority
+sql app/transport/delivery_spill.rs cgka_released_transport_receipts
+sql base/migrations.rs app_events
+sql base/migrations.rs message_timeline
+sql protocol/storage/groups.rs encrypted_media_epoch_secret_retirement_watermarks
+sql protocol/storage/groups.rs transport_reconciliation_route_state
+sql protocol/storage/groups.rs transport_reconciliation_scheduler
+sql protocol/storage/messages.rs account_state
+sql protocol/storage/messages.rs seen_events
+sql protocol/storage/transport_routes.rs transport_reconciliation_route_state
+sql protocol/storage/transport_routes.rs transport_reconciliation_scheduler
+
+# Foreign keys from app tables to protocol tables (schema; stays).
+fk account_recovery_obligations cgka_groups
+fk app_epoch_stall_evidence cgka_groups
+fk app_group_recovery_failures cgka_groups
+
+# Triggers that span the sides, all from migration 0072 (schema; stays).
+trigger account_groups chat_list_keys_account_groups_DELETE
+trigger account_groups chat_list_keys_account_groups_INSERT
+trigger account_groups chat_list_keys_account_groups_UPDATE
+trigger cgka_disband_candidates chat_list_keys_cgka_disband_candidates_DELETE
+trigger cgka_disband_candidates chat_list_keys_cgka_disband_candidates_INSERT
+trigger cgka_disband_candidates chat_list_keys_cgka_disband_candidates_UPDATE
+trigger cgka_disband_requests chat_list_keys_cgka_disband_requests_DELETE
+trigger cgka_disband_requests chat_list_keys_cgka_disband_requests_INSERT
+trigger cgka_disband_requests chat_list_keys_cgka_disband_requests_UPDATE
+trigger cgka_disband_tombstones chat_list_keys_cgka_disband_tombstones_DELETE
+trigger cgka_disband_tombstones chat_list_keys_cgka_disband_tombstones_INSERT
+trigger cgka_disband_tombstones chat_list_keys_cgka_disband_tombstones_UPDATE
+trigger cgka_leave_requests chat_list_keys_cgka_leave_requests_DELETE
+trigger cgka_leave_requests chat_list_keys_cgka_leave_requests_INSERT
+trigger cgka_leave_requests chat_list_keys_cgka_leave_requests_UPDATE
+trigger chat_list_rows chat_list_keys_chat_list_rows_INSERT
+trigger chat_list_rows chat_list_keys_chat_list_rows_UPDATE

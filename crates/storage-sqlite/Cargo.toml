@@ -25,6 +25,9 @@ zeroize.workspace = true
 
 [dev-dependencies]
 media-store = { workspace = true, features = ["catalog-conformance"] }
+proc-macro2.workspace = true
+quote.workspace = true
+syn = { workspace = true, features = ["visit"] }
 tempfile.workspace = true
 tracing-subscriber.workspace = true
 
