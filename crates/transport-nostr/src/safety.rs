@@ -243,6 +243,7 @@ impl RelaySafetyPolicy {
 }
 
 impl super::MarmotRelayPlaneAccountAdapter {
+    #[doc(hidden)]
     pub fn recovery_admitted_endpoints(&self, endpoints: &[TransportEndpoint]) -> Vec<String> {
         let admitted: std::collections::HashSet<_> = self
             .relay_plane

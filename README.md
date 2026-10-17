@@ -92,12 +92,13 @@ and reasoned about on its own:
 ```text
  apps (MarmotKit / C)    wn CLI · wnd · TUI    wn-agent ──► agent runtimes
             └────────────────┬─────┴──────────────┘
-                     marmot-app        multi-account runtime, projections, relay plane
+                     marmot-app        multi-account runtime, projections
                      marmot-account    account homes, keys, transport orchestration
                      cgka-session      one encrypted account-device lifecycle
                      cgka-engine       OpenMLS group state machine + commit convergence
                      storage-sqlite    SQLCipher persistence (one DB per account-device)
 
+ transport-nostr                     the relay plane: shared relay sessions, delivery, directory fetches
  transport-nostr-peeler / -adapter   Nostr events ⇄ engine messages, relay I/O
  transport-quic-stream / -broker     transient live previews for agent replies
 ```

@@ -125,7 +125,7 @@ impl RelayRollupEntry {
 /// Engine-side relay-tuning metrics folded into the export rollup.
 ///
 /// Owned by the engine (the parallel `observed_reorg_rate` workstream), not the
-/// adapter. This is the seam: [`MarmotRelayPlane::telemetry_rollup`] accepts it
+/// adapter. This is the seam: [`crate::MarmotRelayPlane::telemetry_rollup`] accepts it
 /// as an optional input and the exporter ships it over the same OTLP path.
 /// `None` until the engine metric lands. Shapes mirror `relay-delivery-telemetry.md`
 /// "Validation: post-settle reorg rate"; the engine session may extend it

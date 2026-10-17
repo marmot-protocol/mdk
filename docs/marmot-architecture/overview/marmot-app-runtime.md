@@ -23,7 +23,7 @@ MarmotAppRuntime
   SharedServices
     account home
     shared directory cache
-    Nostr relay plane
+    Nostr relay plane (transport-nostr)
     app event hubs
     projection stores
     background maintenance tasks
@@ -117,8 +117,8 @@ independent of scheduling.
 Nostr events, how to peel inbound Nostr events into transport deliveries, how to publish to endpoint sets, and how to
 manage low-level relay client calls behind an injectable boundary.
 
-The Nostr relay plane should live inside `marmot-app` as a module or subsystem. It is the runtime owner for Nostr
-subscriptions and relay policy:
+The Nostr relay plane is the `transport-nostr` crate, which `marmot-app` runs as a shared service. It is the runtime
+owner for Nostr subscriptions and relay policy:
 
 - keep discovery and directory subscriptions coalesced across accounts;
 - keep account inbox subscriptions for signed-in accounts;
@@ -127,7 +127,8 @@ subscriptions and relay policy:
 - apply reconnect, catch-up, replay-window, and relay-safety policy;
 - emit typed runtime events after account sessions ingest deliveries.
 
-The adapter is transport plumbing. The relay plane is app-runtime orchestration.
+The adapter is transport plumbing. The relay plane is the shared orchestration above it, and the app drives it per
+account.
 
 ## Inbound / Convergence Boundary Contracts
 
@@ -307,7 +308,8 @@ The remaining work is narrower than the original refactor, but still real:
 - `crates/cgka-engine`: OpenMLS-backed engine and convergence.
 - `crates/cgka-session`: one encrypted account-device session.
 - `crates/marmot-account`: account/session coordinator for publish-before-apply and transport activation.
-- `crates/marmot-app`: multi-account runtime, shared services, relay plane, projections, app events.
+- `crates/marmot-app`: multi-account runtime, shared services, projections, app events.
+- `crates/transport-nostr`: the shared Nostr relay plane.
 - `crates/transport-nostr-adapter`: reusable Nostr transport adapter and SDK bridge.
 - `crates/transport-nostr-peeler`: Nostr event peeling and wrapping.
 - `crates/transport-quic-stream`: transient agent text stream transport.
