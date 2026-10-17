@@ -99,21 +99,20 @@ Rules once the layout holds, checked by a test the way the relay-plane move chec
 - App and transport helpers are `pub(in crate::app)` / `pub(in crate::transport)`; protocol helpers are
   `pub(in crate::protocol)`.
 
-## The decision this brief needs: a typed app handle
+## The app handle type (decided 2026-10-17)
 
 Folders and narrowed helper visibility make the couplings visible and stop new path-level reaches. They do not
 stop a protocol module calling one of the 366 `pub` app methods on `SqliteAccountStorage`, because those methods
 are callable wherever the type is.
 
-**Recommended:** give the app side its own handle type over the same database, for example
-`SqliteAppStorage` (sharing the account's connection and lifecycle), and move the app and transport methods onto it.
-`SqliteAccountStorage` keeps the protocol traits. `marmot-app` reaches app storage through the new handle; only
-`cross/` holds both. This is the type the app store crate gets in step 8, so the work is not thrown away. It is
-mechanical but wide: about 318 call sites in `marmot-app` change from `storage.x()` to `app_storage.x()` (or
-`storage.app().x()`).
+**Decision:** step 4 gives the app side its own handle type, `SqliteAppStorage`, as PR 4, after the folders,
+`cross/` and the boundary test. The app and transport methods move onto it; `SqliteAccountStorage` keeps the
+protocol traits. `marmot-app` reaches app storage through the new handle, and only `cross/` holds both. The handle
+shares the account's existing connection and lifecycle, so it opens no second connection and closing the account
+storage closes it too. It is the type the app store crate gets in step 8, so the work is not thrown away. It is
+mechanical but wide: about 318 call sites in `marmot-app` change from `storage.x()` to `app_storage.x()`.
 
-**Alternative:** stop at folders, visibility and `cross/`, and leave the type split to step 8. Cheaper now; the
-wall stays a convention until then.
+Declined: stopping at folders, visibility and `cross/`, which would leave the wall a convention until step 8.
 
 ## PR sequence
 
@@ -130,8 +129,10 @@ Each PR is green on its own and changes no behaviour or schema.
    citations.
 3. **Narrow visibility and add the boundary test.** Helpers become folder-private; the test fails on any path
    from `protocol/` into `app/` or `transport/`, or back, outside `cross/`.
-4. **(If approved) the app handle type**, in mechanical slices: introduce `SqliteAppStorage`, move the app methods
-   to it a folder at a time, and repoint `marmot-app` and `cgka-session`'s draft observer.
+4. **The app handle type**, in mechanical slices: introduce `SqliteAppStorage` over the account's connection, move
+   the app and transport methods to it a folder at a time, and repoint `marmot-app` and `cgka-session`'s draft
+   observer. Extend the boundary test: protocol code never names `SqliteAppStorage`, and app code never calls the
+   protocol traits on `SqliteAccountStorage` outside `cross/`.
 5. **Tracing targets.** Rename the 18 targets to the new module paths in one PR, and update the docs and simulator
    filters that match them.
 
@@ -145,6 +146,9 @@ Each PR is green on its own and changes no behaviour or schema.
 - The migration ledger matches entries by name (`migrations.rs:976-984`), so moving bodies is safe; the strictly
   ordered registry (`:1020`) and the hard-coded migration 9 reconcile (`:1067`) stay.
 - No public API change in PRs 1–3: `cargo check --workspace --all-features` with the `lib.rs` re-exports unchanged.
+- PR 4 changes the crate's API (a new handle type, methods moving to it) but not behaviour: run
+  `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` and the test suites above on each
+  slice; the DTOs `marmot-app` re-exports to hosts stay as they are.
 
 ## Risks
 
@@ -168,10 +172,9 @@ Each PR is green on its own and changes no behaviour or schema.
 
 - The crate has `base/`, `protocol/`, `app/`, `transport/` and `cross/`, and the boundary test passes.
 - Every coupling in the table is either a named `cross/` function or listed in `cross/README.md`.
-- If the app handle is approved: `marmot-app` reaches app storage only through it.
+- `marmot-app` reaches app storage only through `SqliteAppStorage`, and the boundary test covers the handle.
 
 ## Open questions
 
-1. The app handle type: now (PR 4) or in step 8?
-2. Should `transport/` stay inside this crate until `transport-nostr` can own its tables, or fold into `app/` for
+1. Should `transport/` stay inside this crate until `transport-nostr` can own its tables, or fold into `app/` for
    now?
